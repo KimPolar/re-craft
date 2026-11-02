@@ -2061,6 +2061,28 @@ fn tree_grass_block(state: &BlockState) -> bool {
         )
 }
 
+fn tree_mushroom_block(state: &BlockState) -> Result<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:red_mushroom_block"
+            | "minecraft:brown_mushroom_block"
+            | "minecraft:mushroom_stem"
+    ) {
+        return Ok(false);
+    }
+    ensure!(
+        state.properties.len() == 6
+            && ["up", "down", "north", "south", "east", "west"]
+                .iter()
+                .all(|face| matches!(
+                    state.properties.get(*face).map(String::as_str),
+                    Some("true" | "false")
+                )),
+        "invalid giant mushroom block state"
+    );
+    Ok(true)
+}
+
 fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
     if matches!(
         state.name.as_str(),
@@ -2133,6 +2155,7 @@ impl DecorationRegion<'_> {
         let allowed = tree_generated_leaf(state)?
             || tree_generated_log(state)
             || tree_leaf_litter(state)?
+            || (flags == 2 && tree_mushroom_block(state)?)
             || (flags == 2 && tree_grass_block(state))
             || (flags == 2 && state.name == "minecraft:air" && state.properties.is_empty())
             || (matches!(
@@ -2144,11 +2167,18 @@ impl DecorationRegion<'_> {
             return Ok(());
         }
         let old = self.read(pos)?;
+        if tree_mushroom_block(state)? {
+            ensure!(
+                old.name == state.name && tree_mushroom_block(&old)?,
+                "unsupported tree mushroom replacement"
+            );
+        }
         ensure!(
             disk_safe_solid(&old.name).is_some()
                 || tree_generated_leaf(&old)?
                 || tree_generated_log(&old)
                 || tree_leaf_litter(&old)?
+                || tree_mushroom_block(&old)?
                 || simple_plant_kind(&old).is_ok()
                 || tree_edge_plant(&old)?.is_some(),
             "unsupported tree source effects"
@@ -3121,6 +3151,25 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 {
                     SimpleBlockWorld::schedule_simple_tick(self, pos)?;
                 }
+            }
+        } else if tree_mushroom_block(state)? {
+            if neighbor.name == state.name {
+                ensure!(
+                    tree_mushroom_block(neighbor)?,
+                    "invalid neighboring giant mushroom"
+                );
+                let face = match direction {
+                    [0, -1, 0] => "down",
+                    [0, 1, 0] => "up",
+                    [0, 0, -1] => "north",
+                    [0, 0, 1] => "south",
+                    [-1, 0, 0] => "west",
+                    [1, 0, 0] => "east",
+                    _ => bail!("invalid mushroom edge direction"),
+                };
+                let mut updated = state.clone();
+                updated.properties.insert(face.into(), "false".into());
+                return Ok(updated);
             }
         } else if tree_grass_block(state) {
             if direction == [0, 1, 0] {
@@ -5977,6 +6026,158 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_mushroom_edge_updates_match_java() {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeEdgeMushroomOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeEdgeMushroomOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeEdgeMushroomOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let (mut terrain, tags, _, _) = fixture();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let names = [
+            "red_mushroom_block",
+            "brown_mushroom_block",
+            "mushroom_stem",
+        ];
+        let faces = ["down", "up", "north", "south", "west", "east"];
+        let directions = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        let mut count = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("M ")) {
+            let values: Vec<usize> = line
+                .split_whitespace()
+                .map(|part| part.parse().unwrap())
+                .collect();
+            assert_eq!(values.len(), 5);
+            let [kind, mask, direction, neighbor, expected] =
+                <[usize; 5]>::try_from(values).unwrap();
+            let mut original = state(names[kind]);
+            for (bit, face) in faces.iter().enumerate() {
+                original
+                    .properties
+                    .insert((*face).into(), ((mask & (1 << bit)) != 0).to_string());
+            }
+            let neighbor_name =
+                ["air", "oak_log", names[kind], names[0], names[1], names[2]][neighbor];
+            let mut neighbor = state(neighbor_name);
+            if names.contains(&neighbor_name) {
+                neighbor.properties = faces
+                    .iter()
+                    .map(|face| ((*face).into(), "true".into()))
+                    .collect();
+            }
+            let actual = region
+                .update_shape(
+                    [8, 8, 8],
+                    &original,
+                    directions[direction],
+                    [0, 0, 0],
+                    &neighbor,
+                )
+                .unwrap();
+            let actual_mask = faces.iter().enumerate().fold(0usize, |value, (bit, face)| {
+                value | (usize::from(actual.properties[*face] == "true") << bit)
+            });
+            assert_eq!(actual_mask, expected, "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 3 * 64 * 6 * 6);
+        let mut block = state("red_mushroom_block");
+        block.properties = faces
+            .iter()
+            .map(|face| ((*face).into(), "true".into()))
+            .collect();
+        region.set_section_block([8, 8, 8], &block).unwrap();
+        let updated = region
+            .update_shape([8, 8, 8], &block, [1, 0, 0], [9, 8, 8], &block)
+            .unwrap();
+        ShapeEdgeWorld::set_block(&mut region, [8, 8, 8], &updated, 2).unwrap();
+        region.finish().unwrap();
+        assert_eq!(
+            terrain.snapshot().block(8, 8, 8).unwrap().properties["east"],
+            "false"
+        );
+        let (mut terrain, _, _, _) = fixture();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        region.set_section_block([8, 8, 8], &block).unwrap();
+        region.set_section_block([9, 8, 8], &block).unwrap();
+        native_resources::tree_leaf_update::update_shape_at_edges(
+            &mut region,
+            native_resources::tree_leaf_update::TreeBounds {
+                min: [8, 8, 8],
+                max: [8, 8, 8],
+            },
+            &BTreeSet::from([[8, 8, 8]]),
+            3,
+        )
+        .unwrap();
+        region.finish().unwrap();
+        let snapshot = terrain.snapshot();
+        assert_eq!(snapshot.block(8, 8, 8).unwrap().properties["east"], "false");
+        assert_eq!(snapshot.block(9, 8, 8).unwrap().properties["west"], "false");
     }
 
     #[test]

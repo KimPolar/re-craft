@@ -27,6 +27,7 @@ use serde_json::Value;
 
 mod carving;
 mod generated_chest;
+pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
 

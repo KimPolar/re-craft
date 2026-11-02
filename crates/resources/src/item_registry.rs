@@ -685,6 +685,16 @@ impl Class {
                         initialized = true;
                     }
                 }
+                0xb8 => {
+                    let (owner, method, descriptor) = self.member(r.u16()?)?;
+                    let constant = owner == "net/minecraft/util/valueproviders/ConstantInt"
+                        && descriptor == "(I)Lnet/minecraft/util/valueproviders/ConstantInt;";
+                    let uniform = owner == "net/minecraft/util/valueproviders/UniformInt"
+                        && descriptor == "(II)Lnet/minecraft/util/valueproviders/UniformInt;";
+                    if method != "of" || !(constant || uniform) {
+                        return Ok(None);
+                    }
+                }
                 0xb0 if initialized && r.pos == r.bytes.len() => return Ok(Some(class)),
                 _ => return Ok(None),
             }
@@ -865,6 +875,15 @@ mod tests {
                 ),
                 Constant::NameType(3, 4),
                 Constant::Member(2, 5),
+                Constant::Utf8(b"net/minecraft/util/valueproviders/ConstantInt".to_vec()),
+                Constant::Class(7),
+                Constant::Utf8(b"of".to_vec()),
+                Constant::Utf8(b"(I)Lnet/minecraft/util/valueproviders/ConstantInt;".to_vec()),
+                Constant::NameType(9, 10),
+                Constant::Member(8, 11),
+                Constant::Utf8(b"example/UnexpectedHelper".to_vec()),
+                Constant::Class(13),
+                Constant::Member(14, 11),
             ],
             code: None,
             methods: Default::default(),
@@ -886,13 +905,28 @@ mod tests {
                     "after_init".into(),
                     vec![0xbb, 0, 2, 0x59, 0x2a, 0xb7, 0, 6, 0x59, 0xb0],
                 ),
+                (
+                    "constant".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x03, 0xb8, 0, 12, 0x2a, 0xb7, 0, 6, 0xb0],
+                ),
+                (
+                    "foreign".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x03, 0xb8, 0, 15, 0x2a, 0xb7, 0, 6, 0xb0],
+                ),
             ]),
         };
         assert_eq!(
             class.block_lambda_constructor("good").unwrap().as_deref(),
             Some("net/minecraft/world/level/block/SandBlock")
         );
-        for name in ["branch", "helper", "after_init", "missing"] {
+        assert_eq!(
+            class
+                .block_lambda_constructor("constant")
+                .unwrap()
+                .as_deref(),
+            Some("net/minecraft/world/level/block/SandBlock")
+        );
+        for name in ["branch", "helper", "foreign", "after_init", "missing"] {
             assert_eq!(
                 class.block_lambda_constructor(name).unwrap(),
                 None,

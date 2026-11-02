@@ -6626,6 +6626,38 @@ impl LoadedSession {
         });
     }
 
+    /// Read a sensor's visible block entity and listener from a resident
+    /// chunk. This does not yet register or advance the listener.
+    pub fn saved_sculk_sensor(
+        &self,
+        position: IVec3,
+        event_registry: &BTreeSet<String>,
+    ) -> anyhow::Result<Option<crate::saved_sculk::SavedSculkSensor>> {
+        use anyhow::{Context, ensure};
+        let block = self
+            .world
+            .block(position.x, position.y, position.z)
+            .context("sensor block or chunk is unavailable")?;
+        let sensor = crate::sculk_sensor::Sensor::from_block(block)
+            .context("block is not a valid sculk sensor")?;
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let payload = self
+            .world
+            .visible_block_entities(&chunk)
+            .context("sensor block entities are unavailable")?;
+        let entity = crate::saved_sculk::read(payload, chunk, position, event_registry)?;
+        if let Some(entity) = &entity {
+            ensure!(
+                entity.calibrated == sensor.facing.is_some(),
+                "sensor block and block entity disagree"
+            );
+        }
+        Ok(entity)
+    }
+
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
         let Cell::State(id) = cell(
             &self.world,
@@ -33032,6 +33064,68 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(state.phase, crate::sculk_sensor::Phase::Cooldown);
+    }
+
+    #[test]
+    fn saved_sensor_lookup_checks_resident_block_and_block_entity() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        let mut session = session();
+        let relative = IVec3::new(4, 2, 4);
+        let position = session.origin + relative;
+        let sensor = crate::sculk_sensor::Sensor {
+            phase: crate::sculk_sensor::Phase::Inactive,
+            power: 0,
+            waterlogged: false,
+            facing: None,
+        };
+        let id = session.intern_block(sensor.to_block().unwrap());
+        assert!(session.set(relative, id));
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let payload = |id: &str| {
+            let entity = Tag::Compound(vec![
+                ("id".into(), Tag::String(id.into())),
+                ("x".into(), Tag::Int(position.x)),
+                ("y".into(), Tag::Int(position.y)),
+                ("z".into(), Tag::Int(position.z)),
+                ("last_vibration_frequency".into(), Tag::Int(7)),
+            ]);
+            let data = NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity],
+                },
+            };
+            native_world::loaded::SavedBlockEntities::Encoded(nbt::write(&data).unwrap().into())
+        };
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, payload("minecraft:sculk_sensor"));
+        let loaded = session
+            .saved_sculk_sensor(position, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.last_frequency, 7);
+        assert!(!loaded.reload_vibration_particle);
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, payload("minecraft:calibrated_sculk_sensor"));
+        assert!(
+            session
+                .saved_sculk_sensor(position, &BTreeSet::new())
+                .is_err()
+        );
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(chunk, native_world::loaded::SavedBlockEntities::Unavailable);
+        assert!(
+            session
+                .saved_sculk_sensor(position, &BTreeSet::new())
+                .is_err()
+        );
     }
 
     #[test]

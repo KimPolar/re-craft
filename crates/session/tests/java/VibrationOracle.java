@@ -192,5 +192,19 @@ public class VibrationOracle {
         }
         var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);
         Files.writeString(Path.of(args[0]), result.toString());
+        var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
+        var sensorNbt=new net.minecraft.nbt.CompoundTag();
+        for(int n=0;n<4;n++) {
+            boolean calibrated=(n&1)!=0;
+            var position=new BlockPos(-1,42,3);
+            var state=(calibrated ? Blocks.CALIBRATED_SCULK_SENSOR : Blocks.SCULK_SENSOR).defaultBlockState();
+            var blockEntity=calibrated ? new CalibratedSculkSensorBlockEntity(position,state) : new SculkSensorBlockEntity(position,state);
+            blockEntity.setLastVibrationFrequency(n+1);
+            var vibration=blockEntity.getVibrationData();
+            if(n==1 || n==3) vibration.getSelectionStrategy().addCandidate(new VibrationInfo(GameEvent.SPLASH,1.25f,new Vec3(-1.25,42.5,3.75),new UUID(1,2),null),99);
+            if(n>=2) { vibration.setCurrentVibration(new VibrationInfo(GameEvent.STEP,4.5f,new Vec3(2.25,42.0,-3.5),new UUID(3,4),new UUID(5,6)));vibration.setTravelTimeInTicks(3); }
+            sensorNbt.put("sensor"+n,blockEntity.saveWithFullMetadata(registryLookup));
+        }
+        net.minecraft.nbt.NbtIo.write(sensorNbt,Path.of(args[0]+".nbt"));
     }
 }

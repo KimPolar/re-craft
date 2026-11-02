@@ -54,6 +54,7 @@ mod saved_entity;
 pub mod saved_falling_block;
 pub mod saved_item;
 pub mod saved_orb;
+pub mod saved_sculk;
 pub mod sculk_sensor;
 mod sky_lighting;
 mod slab_mining;

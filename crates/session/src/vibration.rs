@@ -281,6 +281,25 @@ pub struct VibrationTick {
 }
 
 impl VibrationData {
+    pub(crate) fn from_saved(
+        current: Option<Vibration>,
+        remaining: i32,
+        pending: Option<(i64, Vibration)>,
+    ) -> Self {
+        Self {
+            selector: VibrationSelector { pending },
+            current,
+            remaining,
+        }
+    }
+
+    pub fn pending(&self) -> Option<(i64, &Vibration)> {
+        self.selector
+            .pending
+            .as_ref()
+            .map(|(tick, event)| (*tick, event))
+    }
+
     pub fn offer(&mut self, candidate: Vibration, tick: i64) -> bool {
         if self.current.is_some() || !candidate.distance.is_finite() || candidate.distance < 0.0 {
             return false;
@@ -472,6 +491,78 @@ mod tests {
         let frequencies = data["frequencies"].as_object().unwrap();
         assert_eq!(frequencies.len(), 61);
         let registry = frequencies.keys().cloned().collect();
+        let sensors = native_persistence::nbt::read(
+            &std::fs::read(temp.path().join("output.json.nbt")).unwrap(),
+        )
+        .unwrap();
+        for n in 0..4 {
+            use native_persistence::nbt::{NamedTag, Tag, TagType};
+            let entity = sensors.value.get(&format!("sensor{n}")).unwrap().clone();
+            let bytes = native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity.clone()],
+                },
+            })
+            .unwrap();
+            let saved = crate::saved_sculk::read(
+                &native_world::loaded::SavedBlockEntities::Encoded(bytes.into()),
+                native_world::loaded::ChunkPos { x: -1, z: 0 },
+                IVec3::new(-1, 42, 3),
+                &registry,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(saved.calibrated, n % 2 == 1);
+            assert_eq!(saved.last_frequency, n + 1);
+            assert!(saved.reload_vibration_particle);
+            assert_eq!(saved.source(), &entity);
+            if n == 1 || n == 3 {
+                let (tick, pending) = saved.vibration.pending().unwrap();
+                assert_eq!(
+                    (
+                        tick,
+                        pending.event.as_str(),
+                        pending.distance,
+                        pending.position,
+                        pending.source
+                    ),
+                    (
+                        99,
+                        "minecraft:splash",
+                        1.25,
+                        DVec3::new(-1.25, 42.5, 3.75),
+                        Some([0, 1, 0, 2])
+                    )
+                );
+            } else {
+                assert!(saved.vibration.pending().is_none());
+            }
+            if n >= 2 {
+                let current = saved.vibration.current().unwrap();
+                assert_eq!(
+                    (
+                        current.event.as_str(),
+                        current.distance,
+                        current.position,
+                        current.source,
+                        current.projectile_owner,
+                        saved.vibration.remaining()
+                    ),
+                    (
+                        "minecraft:step",
+                        4.5,
+                        DVec3::new(2.25, 42.0, -3.5),
+                        Some([0, 3, 0, 4]),
+                        Some([0, 5, 0, 6]),
+                        3
+                    )
+                );
+            } else {
+                assert!(saved.vibration.current().is_none());
+            }
+        }
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let tags =
             native_resources::game_event_tags::GameEventTags::load(&mut resources, &registry)

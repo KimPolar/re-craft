@@ -59,6 +59,9 @@ pub trait DiskWorld: OreWorld {
     fn mushroom_survives(&mut self, _pos: [i32; 3]) -> Result<bool> {
         bail!("mushroom survival context unavailable")
     }
+    fn small_dripleaf_survives(&mut self, _state: &Value, _pos: [i32; 3]) -> Result<bool> {
+        bail!("small dripleaf survival context unavailable")
+    }
     fn would_survive(&mut self, state: &Value, pos: [i32; 3]) -> Result<bool> {
         let raw = state
             .as_str()
@@ -81,6 +84,9 @@ pub trait DiskWorld: OreWorld {
         }
         if matches!(id.path.as_str(), "brown_mushroom" | "red_mushroom") {
             return self.mushroom_survives(pos);
+        }
+        if id.path == "small_dripleaf" {
+            return self.small_dripleaf_survives(state, pos);
         }
         if let Some(tag) = vegetation_support(&id) {
             let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
@@ -375,6 +381,12 @@ impl Predicate {
                     ResourceId::parse("minecraft:overrides_mushroom_light_requirement")
                         .expect("constant tag"),
                 );
+            }
+            Self::WouldSurvive(_, id, _)
+                if id.namespace == "minecraft" && id.path == "small_dripleaf" =>
+            {
+                tags.insert(ResourceId::parse("minecraft:supports_small_dripleaf").unwrap());
+                tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
             }
             Self::WouldSurvive(_, id, _) if id.namespace == "minecraft" && id.path == "cactus" => {
                 tags.insert(ResourceId::parse("minecraft:supports_cactus").expect("constant tag"));

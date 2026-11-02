@@ -233,10 +233,12 @@ impl ConfiguredDecoration {
     fn needs_water_fluids(&self) -> bool {
         match self {
             Self::Lake(_) => true,
-            Self::Simple(v) => v
-                .possible_states()
-                .iter()
-                .any(|s| s.name == "minecraft:tall_seagrass"),
+            Self::Simple(v) => v.possible_states().iter().any(|s| {
+                matches!(
+                    s.name.as_str(),
+                    "minecraft:tall_seagrass" | "minecraft:small_dripleaf"
+                )
+            }),
             Self::VegetationPatch(_, nested) => nested.needs_water_fluids(),
             Self::RootSystem(_, _) => true,
             Self::Selector(values) => values
@@ -538,6 +540,12 @@ impl ConfiguredDecoration {
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
+                    if matches!(simple_plant_kind(state), Ok(SimplePlantKind::SmallDripleaf)) {
+                        tags.insert(
+                            ResourceId::parse("minecraft:supports_small_dripleaf").unwrap(),
+                        );
+                        tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
+                    }
                     let tag = match simple_plant_kind(state) {
                         Ok(SimplePlantKind::Vegetation | SimplePlantKind::Double) => {
                             Some("minecraft:supports_vegetation")
@@ -3857,6 +3865,36 @@ impl DiskWorld for DecorationRegion<'_> {
     fn mushroom_survives(&mut self, pos: [i32; 3]) -> Result<bool> {
         self.mushroom_survival(pos)
     }
+    fn small_dripleaf_survives(&mut self, value: &Value, pos: [i32; 3]) -> Result<bool> {
+        let mut state = BlockState {
+            name: "minecraft:small_dripleaf".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("half".into(), "lower".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        if let Some(properties) = value.get("properties") {
+            for (name, value) in properties
+                .as_object()
+                .context("invalid dripleaf properties")?
+            {
+                ensure!(
+                    state.properties.contains_key(name),
+                    "unknown dripleaf property"
+                );
+                state.properties.insert(
+                    name.clone(),
+                    value
+                        .as_str()
+                        .context("invalid dripleaf property value")?
+                        .into(),
+                );
+            }
+        }
+        generated_dripleaf(&state)?;
+        self.small_dripleaf_survival(pos, &state)
+    }
     fn inside_build_height(&mut self, y: i32) -> Result<bool> {
         Ok(!self.is_outside(y))
     }
@@ -4011,6 +4049,7 @@ enum SimplePlantKind {
     LeafLitter,
     Seagrass,
     TallSeagrass,
+    SmallDripleaf,
 }
 
 // All states of these vanilla blocks have been checked for their Java
@@ -4044,6 +4083,10 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
                 "invalid tall seagrass state"
             );
             SimplePlantKind::TallSeagrass
+        }
+        "minecraft:small_dripleaf" => {
+            generated_dripleaf(state)?;
+            SimplePlantKind::SmallDripleaf
         }
         "minecraft:short_grass"
         | "minecraft:fern"
@@ -4110,6 +4153,33 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
 }
 
 impl DecorationRegion<'_> {
+    fn small_dripleaf_survival(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        generated_dripleaf(state)?;
+        let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
+        let support = self.block(below)?;
+        if state.properties["half"] == "upper" {
+            return Ok(support.name == state.name
+                && support.properties.get("half").map(String::as_str) == Some("lower"));
+        }
+        if self.tags.contains(
+            &ResourceId::parse("minecraft:supports_small_dripleaf")?,
+            &support.name,
+        )? {
+            return Ok(true);
+        }
+        let current = self.block(pos)?;
+        let source = native_world::fluid::FluidState::from_block(&current)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|fluid| {
+                fluid.kind == native_world::fluid::FluidKind::Water && fluid.source
+            });
+        Ok(source
+            && self.tags.contains(
+                &ResourceId::parse("minecraft:supports_vegetation")?,
+                &support.name,
+            )?)
+    }
+
     fn mushroom_survival(&mut self, pos: [i32; 3]) -> Result<bool> {
         let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
         static OVERRIDE: OnceLock<ResourceId> = OnceLock::new();
@@ -4162,7 +4232,9 @@ impl DecorationRegion<'_> {
         }
         let old = self.read(p)?;
         ensure!(
-            disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
+            disk_safe_solid(&old.name).is_some()
+                || generated_dripleaf(&old)?
+                || simple_plant_kind(&old).is_ok(),
             "unsupported simple-block source effects"
         );
         self.set_section_block(p, state)?;
@@ -4221,6 +4293,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                         }
                     }
                 }
+                SimplePlantKind::SmallDripleaf => self.small_dripleaf_survival(pos, state)?,
                 SimplePlantKind::Double
                     if state.properties.get("half").map(String::as_str) == Some("upper") =>
                 {
@@ -4243,7 +4316,9 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             }
             if matches!(
                 kind,
-                SimplePlantKind::Double | SimplePlantKind::TallSeagrass
+                SimplePlantKind::Double
+                    | SimplePlantKind::TallSeagrass
+                    | SimplePlantKind::SmallDripleaf
             ) {
                 let above = [pos[0], pos[1].wrapping_add(1), pos[2]];
                 let upper = self.block(above)?;
@@ -4253,11 +4328,12 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                     native_world::fluid::FluidState::from_block(&upper)
                         .map_err(anyhow::Error::msg)?
                 {
-                    if matches!(kind, SimplePlantKind::TallSeagrass)
-                        && upper_fluid
-                            == native_world::fluid::FluidState::from_block(state)
-                                .map_err(anyhow::Error::msg)?
-                                .context("missing tall seagrass fluid")?
+                    if matches!(
+                        kind,
+                        SimplePlantKind::TallSeagrass | SimplePlantKind::SmallDripleaf
+                    ) && Some(upper_fluid)
+                        == native_world::fluid::FluidState::from_block(state)
+                            .map_err(anyhow::Error::msg)?
                     {
                         match upper.name.as_str() {
                             "minecraft:water" => true,
@@ -4266,7 +4342,8 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                                 true
                             }
                             _ if disk_safe_solid(&upper.name).is_some()
-                                || tree_generated_leaf(&upper)? =>
+                                || tree_generated_leaf(&upper)?
+                                || generated_dripleaf(&upper)? =>
                             {
                                 false
                             }
@@ -4303,6 +4380,19 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                 lower.properties.insert("half".into(), "lower".into());
                 let mut upper = state.clone();
                 upper.properties.insert("half".into(), "upper".into());
+                if matches!(kind, SimplePlantKind::SmallDripleaf) {
+                    let water_tag = ResourceId::parse("minecraft:water")?;
+                    let current = self.block(pos)?;
+                    lower.properties.insert(
+                        "waterlogged".into(),
+                        DiskWorld::fluid_in_tag(self, &current, &water_tag)?.to_string(),
+                    );
+                    let current_upper = self.block(above)?;
+                    upper.properties.insert(
+                        "waterlogged".into(),
+                        DiskWorld::fluid_in_tag(self, &current_upper, &water_tag)?.to_string(),
+                    );
+                }
                 self.write_simple_block(pos, &lower)?;
                 self.write_simple_block(above, &upper)?;
             } else {
@@ -9107,6 +9197,214 @@ mod tests {
             predicate
                 .required_tags()
                 .contains(&ResourceId::parse("minecraft:supports_azalea").unwrap())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn small_dripleaf_feature_matches_java_placement() {
+        use std::{path::PathBuf, process::Command};
+        struct DripleafData(i32);
+        impl ResourceProvider for DripleafData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let enabled = match path {
+                    "data/minecraft/tags/block/supports_small_dripleaf.json" => {
+                        Some(self.0 & 1 != 0)
+                    }
+                    "data/minecraft/tags/block/supports_vegetation.json" => Some(self.0 & 2 != 0),
+                    _ => None,
+                };
+                if let Some(enabled) = enabled {
+                    return Ok(Some(if enabled {
+                        br#"{"values":["minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    }));
+                }
+                Data.read_data(path)
+            }
+        }
+        fn sample(i: i32) -> BlockState {
+            let mut block = state(match i {
+                0 => "air",
+                1 | 2 => "water",
+                3 => "lava",
+                4 | 5 => "small_dripleaf",
+                6 => "seagrass",
+                7 => "stone",
+                _ => unreachable!(),
+            });
+            match i {
+                1 | 2 | 3 => {
+                    block
+                        .properties
+                        .insert("level".into(), if i == 2 { "1" } else { "0" }.into());
+                }
+                4 | 5 => {
+                    block
+                        .properties
+                        .insert("half".into(), if i == 4 { "lower" } else { "upper" }.into());
+                    block.properties.insert("facing".into(), "north".into());
+                    block
+                        .properties
+                        .insert("waterlogged".into(), (i == 5).to_string());
+                }
+                _ => {}
+            }
+            block
+        }
+        fn key(block: &BlockState) -> String {
+            let mut value = format!("{}|", block.name);
+            for (k, v) in &block.properties {
+                value.push_str(&format!("{k}={v};"));
+            }
+            value
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SmallDripleafFeatureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/SmallDripleafFeatureOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SmallDripleafFeatureOracle"));
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:lava".into(),
+            "minecraft:seagrass".into(),
+            "minecraft:small_dripleaf".into(),
+        ]);
+        let motion = HeightmapTags::load(&mut DripleafData(0), &registry).unwrap();
+        let mut checked = 0;
+        for mode in 0..32 {
+            let required = BTreeSet::from([
+                ResourceId::parse("minecraft:supports_small_dripleaf").unwrap(),
+                ResourceId::parse("minecraft:supports_vegetation").unwrap(),
+            ]);
+            let tags = OreBlockTags::load(&mut DripleafData(mode), &registry, &required).unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            let mut water = BTreeSet::new();
+            if mode & 4 != 0 {
+                water.insert("minecraft:water".into());
+            }
+            if mode & 8 != 0 {
+                water.insert("minecraft:flowing_water".into());
+            }
+            if mode & 16 != 0 {
+                water.insert("minecraft:lava".into());
+            }
+            region.lake_water_fluids = Some(&water);
+            for line in output
+                .lines()
+                .filter(|line| line.starts_with(&format!("S {mode} ")))
+            {
+                let p: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(p.len(), 13, "{line}");
+                let half: i32 = p[2].parse().unwrap();
+                let wet: i32 = p[3].parse().unwrap();
+                let base: i32 = p[4].parse().unwrap();
+                let here: i32 = p[5].parse().unwrap();
+                let above: i32 = p[6].parse().unwrap();
+                let support = match base {
+                    0 => state("stone"),
+                    1 => state("air"),
+                    2 => sample(4),
+                    3 => sample(5),
+                    _ => unreachable!(),
+                };
+                region.set_section_block([8, 7, 8], &support).unwrap();
+                region.set_section_block([8, 8, 8], &sample(here)).unwrap();
+                region.set_section_block([8, 9, 8], &sample(above)).unwrap();
+                let mut target = sample(4);
+                target.properties.insert(
+                    "half".into(),
+                    if half == 0 { "lower" } else { "upper" }.into(),
+                );
+                target
+                    .properties
+                    .insert("waterlogged".into(), (wet != 0).to_string());
+                let predicate = BlockPredicate::decode(&json!({
+                    "type":"minecraft:would_survive",
+                    "state":{"id":target.name,"properties":target.properties}
+                }))
+                .unwrap();
+                assert_eq!(
+                    predicate.test(&mut region, [8, 8, 8]).unwrap(),
+                    p[7] == "true",
+                    "survival {line}"
+                );
+                let feature=SimpleBlockFeature::decode(&json!({"type":"minecraft:simple_block","to_place":{"id":target.name,"properties":target.properties}}),&mut resolve_tree_test).unwrap();
+                let mut random = DecorationRandom::new(42);
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[8] == "true",
+                    "{line}"
+                );
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[9] == "true",
+                    "second {line}"
+                );
+                assert_eq!(key(&region.read([8, 8, 8]).unwrap()), p[10], "{line}");
+                assert_eq!(key(&region.read([8, 9, 8]).unwrap()), p[11], "{line}");
+                assert_eq!(random.next_long(), p[12].parse::<i64>().unwrap(), "{line}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 32 * 2 * 2 * 4 * 8 * 8);
+        let predicate = BlockPredicate::decode(
+            &json!({"type":"minecraft:would_survive","state":{"id":"minecraft:small_dripleaf"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            predicate.required_tags(),
+            BTreeSet::from([
+                ResourceId::parse("minecraft:supports_small_dripleaf").unwrap(),
+                ResourceId::parse("minecraft:supports_vegetation").unwrap(),
+            ])
         );
     }
 

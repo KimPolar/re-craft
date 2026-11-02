@@ -2022,6 +2022,31 @@ fn tree_leaf_litter(state: &BlockState) -> Result<bool> {
     Ok(true)
 }
 
+fn tree_cave_vines(state: &BlockState) -> Result<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:cave_vines" | "minecraft:cave_vines_plant"
+    ) {
+        return Ok(false);
+    }
+    let valid_berries = matches!(
+        state.properties.get("berries").map(String::as_str),
+        Some("true" | "false")
+    );
+    let valid = if state.name == "minecraft:cave_vines" {
+        state.properties.len() == 2
+            && state.properties.get("age").is_some_and(|raw| {
+                raw.parse::<u8>()
+                    .ok()
+                    .is_some_and(|age| age <= 25 && age.to_string() == *raw)
+            })
+    } else {
+        state.properties.len() == 1
+    };
+    ensure!(valid && valid_berries, "invalid cave vines state");
+    Ok(true)
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if tree_generated_log(state) {
         return Ok(true);
@@ -2029,7 +2054,11 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if tree_mushroom_block(state)? {
         return Ok(true);
     }
-    if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
+    if tree_generated_leaf(state)?
+        || tree_leaf_litter(state)?
+        || tree_cave_vines(state)?
+        || state.name == "minecraft:vine"
+    {
         return Ok(false);
     }
     vanilla_full_occlusion(&state.name)
@@ -2043,7 +2072,11 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if tree_mushroom_block(state)? {
         return Ok(true);
     }
-    if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
+    if tree_generated_leaf(state)?
+        || tree_leaf_litter(state)?
+        || tree_cave_vines(state)?
+        || state.name == "minecraft:vine"
+    {
         return Ok(false);
     }
     if let Ok(kind) = simple_plant_kind(state)
@@ -4405,25 +4438,7 @@ impl ColumnWorld for DecorationRegion<'_> {
                     state.properties.len() == 1 && age.is_some_and(|v| v <= 15)
                 }
                 "minecraft:cactus_flower" => state.properties.is_empty(),
-                "minecraft:cave_vines_plant" => {
-                    state.properties.len() == 1
-                        && matches!(
-                            state.properties.get("berries").map(String::as_str),
-                            Some("true" | "false")
-                        )
-                }
-                "minecraft:cave_vines" => {
-                    state.properties.len() == 2
-                        && matches!(
-                            state.properties.get("berries").map(String::as_str),
-                            Some("true" | "false")
-                        )
-                        && state.properties.get("age").is_some_and(|raw| {
-                            raw.parse::<u8>()
-                                .ok()
-                                .is_some_and(|v| v <= 25 && v.to_string() == *raw)
-                        })
-                }
+                "minecraft:cave_vines_plant" | "minecraft:cave_vines" => tree_cave_vines(state)?,
                 _ => false,
             };
             ensure!(valid, "unsupported column replacement effects");
@@ -4737,6 +4752,8 @@ mod tests {
             "flowering_azalea_leaves",
             "vine",
             "leaf_litter",
+            "cave_vines",
+            "cave_vines_plant",
         ];
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -4807,6 +4824,15 @@ mod tests {
                     ("segment_amount".into(), "1".into()),
                 ]);
             }
+            if name == "cave_vines" {
+                block.properties = BTreeMap::from([
+                    ("age".into(), "0".into()),
+                    ("berries".into(), "false".into()),
+                ]);
+            }
+            if name == "cave_vines_plant" {
+                block.properties.insert("berries".into(), "false".into());
+            }
             assert_eq!(
                 *line,
                 format!(
@@ -4827,6 +4853,36 @@ mod tests {
                 "leaf solid state {name}"
             );
         }
+        let variants: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("V "))
+            .collect();
+        assert_eq!(variants.len(), 54);
+        for line in variants {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 10, "{line}");
+            let mut block = state(fields[0]);
+            if fields[1] != "-1" {
+                block.properties.insert("age".into(), fields[1].into());
+            }
+            block.properties.insert("berries".into(), fields[2].into());
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                fields[3].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for face in &fields[4..] {
+                assert_eq!(
+                    tree_sturdy_up(&block).unwrap(),
+                    face.parse::<bool>().unwrap(),
+                    "{line}"
+                );
+            }
+        }
+        let mut invalid = state("cave_vines");
+        invalid.properties.insert("berries".into(), "true".into());
+        invalid.properties.insert("age".into(), "26".into());
+        assert!(tree_sturdy_up(&invalid).is_err());
     }
     fn fixture() -> (
         CarvedTerrainWorld,

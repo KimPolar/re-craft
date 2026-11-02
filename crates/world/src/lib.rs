@@ -11,6 +11,7 @@ pub mod fluid;
 pub mod fluid_sim;
 pub mod generation_block_light;
 pub mod generation_light;
+pub mod generation_sky_light;
 pub mod lighting;
 pub mod loaded;
 pub mod movement;

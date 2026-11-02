@@ -192,6 +192,34 @@ impl CarvedTerrainWorld {
         &self,
         center: native_world::loaded::ChunkPos,
     ) -> Result<native_world::generation_light::VisibleLayers> {
+        let bounds = self.generated_light_bounds(center)?;
+        native_world::generation_block_light::initialize_generated_block_light(
+            &self.world,
+            bounds,
+            center,
+        )
+        .context("generated block-light inputs are missing or unsupported")
+    }
+
+    /// Calculate draft sky light for a dimension known to have skylight.
+    /// The result is invalid after subsequent block edits and is not published.
+    pub fn calculate_generated_sky_light(
+        &self,
+        center: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
+        let bounds = self.generated_light_bounds(center)?;
+        native_world::generation_sky_light::initialize_generated_sky_light(
+            &self.world,
+            bounds,
+            center,
+        )
+        .context("generated sky-light inputs are missing or unsupported")
+    }
+
+    fn generated_light_bounds(
+        &self,
+        center: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::block_light::LightBounds> {
         for dz in -2i32..=2 {
             for dx in -2i32..=2 {
                 let position = native_world::loaded::ChunkPos {
@@ -208,14 +236,8 @@ impl CarvedTerrainWorld {
             .min_y
             .checked_add(self.height)
             .context("light height overflow")?;
-        let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
-            .context("unsupported generated light bounds")?;
-        native_world::generation_block_light::initialize_generated_block_light(
-            &self.world,
-            bounds,
-            center,
-        )
-        .context("generated light inputs are missing or unsupported")
+        native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported generated light bounds")
     }
 
     /// Known nests produced by tree decoration in these intermediate chunks.

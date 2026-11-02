@@ -3564,14 +3564,17 @@ mod tests {
             .completed_decoration
             .remove(&ChunkPos { x: 2, z: 2 });
         assert!(terrain.calculate_generated_block_light(center).is_err());
+        assert!(terrain.calculate_generated_sky_light(center).is_err());
         terrain.completed_decoration.insert(ChunkPos { x: 2, z: 2 });
         let world = Arc::make_mut(&mut terrain.world);
         let torch = world.intern_state(state("torch"));
         world.set_block_id(-1, 10, 8, torch).unwrap();
         let before = terrain.snapshot();
         let light = terrain.calculate_generated_block_light(center).unwrap();
+        let sky = terrain.calculate_generated_sky_light(center).unwrap();
         let index = 8 * 16 + 10 * 256;
         assert_eq!(light[&0][index / 2] & 15, 13);
+        assert_eq!(sky[&0][index / 2] & 15, 15);
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
         let world = Arc::make_mut(&mut terrain.world);
         let air = world.intern_state(state("air"));

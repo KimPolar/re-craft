@@ -42,6 +42,7 @@ pub mod placed_feature;
 pub mod recipes;
 pub mod respawn_environment;
 pub mod respawn_tags;
+pub mod simple_block_feature;
 pub mod sounds;
 pub mod sprites;
 pub mod structure_biomes;

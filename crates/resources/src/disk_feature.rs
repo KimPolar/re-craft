@@ -20,7 +20,7 @@ pub trait DiskWorld: OreWorld {
 }
 
 #[derive(Clone, Debug)]
-enum Predicate {
+pub(crate) enum Predicate {
     True,
     Blocks([i32; 3], Vec<ResourceId>),
     Tag([i32; 3], ResourceId),
@@ -237,15 +237,19 @@ impl Predicate {
 }
 
 #[derive(Clone, Debug)]
-enum Provider<S> {
+pub(crate) enum Provider<S> {
     State(S),
+    Weighted {
+        entries: Vec<(i32, S)>,
+        total: i32,
+    },
     Rules {
         fallback: Option<Box<Provider<S>>>,
         rules: Vec<(Predicate, Provider<S>)>,
     },
 }
 impl<S: Clone> Provider<S> {
-    fn decode(
+    pub(crate) fn decode(
         value: &Value,
         resolve: &mut impl FnMut(&Value) -> Result<S>,
         depth: u8,
@@ -268,6 +272,36 @@ impl<S: Clone> Provider<S> {
             "simple" => Ok(Self::State(resolve(
                 value.get("state").context("missing provider state")?,
             )?)),
+            "weighted" => {
+                let values = value
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .context("missing weighted states")?;
+                ensure!(
+                    !values.is_empty() && values.len() <= 4096,
+                    "invalid weighted state count"
+                );
+                let mut entries = Vec::with_capacity(values.len());
+                let mut total = 0i32;
+                for value in values {
+                    let weight = i32::try_from(
+                        value
+                            .get("weight")
+                            .and_then(Value::as_i64)
+                            .context("invalid state weight")?,
+                    )?;
+                    ensure!(weight >= 0, "negative state weight");
+                    total = total
+                        .checked_add(weight)
+                        .context("state weight sum overflow")?;
+                    entries.push((
+                        weight,
+                        resolve(value.get("data").context("missing weighted state")?)?,
+                    ));
+                }
+                ensure!(total > 0, "weighted state provider has no positive weight");
+                Ok(Self::Weighted { entries, total })
+            }
             "rule_based" => {
                 let fallback = value
                     .get("fallback")
@@ -297,7 +331,7 @@ impl<S: Clone> Provider<S> {
             other => bail!("unsupported disk state provider {other}"),
         }
     }
-    fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
+    pub(crate) fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
         if let Self::Rules { fallback, rules } = self {
             if let Some(fallback) = fallback {
                 fallback.tags(tags);
@@ -308,7 +342,7 @@ impl<S: Clone> Provider<S> {
             }
         }
     }
-    fn blocks(&self, blocks: &mut BTreeSet<ResourceId>) {
+    pub(crate) fn blocks(&self, blocks: &mut BTreeSet<ResourceId>) {
         if let Self::Rules { fallback, rules } = self {
             if let Some(fallback) = fallback {
                 fallback.blocks(blocks);
@@ -319,22 +353,53 @@ impl<S: Clone> Provider<S> {
             }
         }
     }
-    fn state<W: DiskWorld<State = S>>(&self, world: &mut W, pos: [i32; 3]) -> Result<Option<S>>
+    pub(crate) fn states<'a>(&'a self, states: &mut Vec<&'a S>) {
+        match self {
+            Self::State(state) => states.push(state),
+            Self::Weighted { entries, .. } => states.extend(entries.iter().map(|(_, state)| state)),
+            Self::Rules { fallback, rules } => {
+                if let Some(fallback) = fallback {
+                    fallback.states(states);
+                }
+                for (_, provider) in rules {
+                    provider.states(states);
+                }
+            }
+        }
+    }
+    pub(crate) fn state<W: DiskWorld<State = S>>(
+        &self,
+        world: &mut W,
+        random: &mut DecorationRandom,
+        pos: [i32; 3],
+    ) -> Result<Option<S>>
     where
         S: Eq,
     {
         match self {
             Self::State(state) => Ok(Some(state.clone())),
+            Self::Weighted { entries, total } => {
+                let mut choice = random
+                    .next_int_bound(*total)
+                    .context("invalid state weight total")?;
+                for (weight, state) in entries {
+                    choice -= weight;
+                    if choice < 0 {
+                        return Ok(Some(state.clone()));
+                    }
+                }
+                unreachable!("validated state weight sum")
+            }
             Self::Rules { fallback, rules } => {
                 for (predicate, provider) in rules {
                     if predicate.test(world, pos)? {
-                        if let Some(state) = provider.state(world, pos)? {
+                        if let Some(state) = provider.state(world, random, pos)? {
                             return Ok(Some(state));
                         }
                     }
                 }
                 if let Some(fallback) = fallback {
-                    fallback.state(world, pos)
+                    fallback.state(world, random, pos)
                 } else {
                     Ok(None)
                 }
@@ -433,7 +498,7 @@ impl<S: Clone + Eq> DiskFeature<S> {
                 for dy in (-self.half_height..=self.half_height).rev() {
                     let pos = [x, origin[1].wrapping_add(dy), z];
                     if self.target.test(world, pos)? {
-                        if let Some(state) = self.provider.state(world, pos)? {
+                        if let Some(state) = self.provider.state(world, random, pos)? {
                             world.set_disk_block(pos, &state)?;
                             if !previous {
                                 let mut above = pos;

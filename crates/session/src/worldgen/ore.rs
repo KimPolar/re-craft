@@ -16,6 +16,7 @@ use native_resources::{
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
+    simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
 };
 use native_world::loaded::{BlockState, BlockStateId, ChunkPos, World};
 use serde_json::Value;
@@ -53,6 +54,7 @@ pub struct PlacedDecorationFeature {
 enum ConfiguredDecoration {
     Ore(ConfiguredOre<BlockState>),
     Disk(DiskFeature<BlockState>),
+    Simple(SimpleBlockFeature<BlockState>),
 }
 impl ConfiguredDecoration {
     fn decode(
@@ -70,6 +72,9 @@ impl ConfiguredDecoration {
                 Ok(Self::Ore(ConfiguredOre::decode(value, resolve)?))
             }
             ("minecraft", "disk") => Ok(Self::Disk(DiskFeature::decode(value, resolve)?)),
+            ("minecraft", "simple_block") => {
+                Ok(Self::Simple(SimpleBlockFeature::decode(value, resolve)?))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -81,6 +86,24 @@ impl ConfiguredDecoration {
         match self {
             Self::Ore(v) => v.required_tags(),
             Self::Disk(v) => v.required_tags(),
+            Self::Simple(v) => {
+                let mut tags = v.required_tags();
+                for state in v.possible_states() {
+                    let tag = match simple_plant_kind(state) {
+                        Ok(SimplePlantKind::Vegetation | SimplePlantKind::Double) => {
+                            Some("minecraft:supports_vegetation")
+                        }
+                        Ok(SimplePlantKind::DryVegetation) => {
+                            Some("minecraft:supports_dry_vegetation")
+                        }
+                        _ => None,
+                    };
+                    if let Some(tag) = tag {
+                        tags.insert(ResourceId::parse(tag).expect("constant tag ID"));
+                    }
+                }
+                tags
+            }
         }
     }
     fn place(
@@ -92,6 +115,7 @@ impl ConfiguredDecoration {
         match self {
             Self::Ore(v) => v.place(world, random, pos),
             Self::Disk(v) => v.place(world, random, pos),
+            Self::Simple(v) => v.place(world, random, pos),
         }
     }
 }
@@ -148,6 +172,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 let mut blocks = feature.placed.placement.required_blocks();
                 if let ConfiguredDecoration::Disk(disk) = &feature.placed.feature {
                     blocks.extend(disk.required_blocks());
+                }
+                if let ConfiguredDecoration::Simple(simple) = &feature.placed.feature {
+                    blocks.extend(simple.required_blocks());
                 }
                 for id in blocks {
                     ensure!(
@@ -931,6 +958,182 @@ impl DiskWorld for DecorationRegion<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SimplePlantKind {
+    Vegetation,
+    DryVegetation,
+    Double,
+    Unconditional,
+}
+
+// All states of these vanilla blocks have been checked for their Java
+// survival implementation, POI/block-entity effects and postprocessing.
+fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
+    let name = state.name.as_str();
+    let kind = match name {
+        "minecraft:short_grass"
+        | "minecraft:fern"
+        | "minecraft:bush"
+        | "minecraft:dandelion"
+        | "minecraft:poppy"
+        | "minecraft:blue_orchid"
+        | "minecraft:allium"
+        | "minecraft:azure_bluet"
+        | "minecraft:red_tulip"
+        | "minecraft:orange_tulip"
+        | "minecraft:white_tulip"
+        | "minecraft:pink_tulip"
+        | "minecraft:oxeye_daisy"
+        | "minecraft:cornflower"
+        | "minecraft:lily_of_the_valley"
+        | "minecraft:firefly_bush"
+        | "minecraft:closed_eyeblossom" => {
+            ensure!(state.properties.is_empty(), "invalid vegetation state");
+            SimplePlantKind::Vegetation
+        }
+        "minecraft:sweet_berry_bush" => {
+            ensure!(
+                state.properties.len() == 1
+                    && matches!(
+                        state.properties.get("age").map(String::as_str),
+                        Some("0" | "1" | "2" | "3")
+                    ),
+                "invalid berry bush state"
+            );
+            SimplePlantKind::Vegetation
+        }
+        "minecraft:short_dry_grass" | "minecraft:tall_dry_grass" | "minecraft:dead_bush" => {
+            ensure!(state.properties.is_empty(), "invalid dry vegetation state");
+            SimplePlantKind::DryVegetation
+        }
+        "minecraft:sunflower"
+        | "minecraft:tall_grass"
+        | "minecraft:large_fern"
+        | "minecraft:rose_bush"
+        | "minecraft:peony"
+        | "minecraft:lilac" => {
+            ensure!(
+                state.properties.len() == 1
+                    && matches!(
+                        state.properties.get("half").map(String::as_str),
+                        Some("lower" | "upper")
+                    ),
+                "invalid double vegetation state"
+            );
+            SimplePlantKind::Double
+        }
+        "minecraft:melon" | "minecraft:pumpkin" => {
+            ensure!(state.properties.is_empty(), "invalid simple block state");
+            SimplePlantKind::Unconditional
+        }
+        _ => bail!("unsupported simple-block survival for {name}"),
+    };
+    Ok(kind)
+}
+
+impl DecorationRegion<'_> {
+    fn write_simple_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<bool> {
+        if !self.writable.contains(&chunk(p)) {
+            return Ok(false);
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(p)),
+            "generation block chunk is missing"
+        );
+        if self.is_outside(p[1]) {
+            return Ok(true);
+        }
+        let old = self.read(p)?;
+        ensure!(
+            disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
+            "unsupported simple-block source effects"
+        );
+        self.set_section_block(p, state)?;
+        self.update_final_heightmaps(p, state)?;
+        Ok(true)
+    }
+}
+
+impl SimpleBlockWorld for DecorationRegion<'_> {
+    fn place_simple_state(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            let kind = simple_plant_kind(state)?;
+            let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
+            let survives = match kind {
+                SimplePlantKind::Unconditional => true,
+                SimplePlantKind::Double
+                    if state.properties.get("half").map(String::as_str) == Some("upper") =>
+                {
+                    let below = self.block(below)?;
+                    below.name == state.name
+                        && below.properties.get("half").map(String::as_str) == Some("lower")
+                }
+                _ => {
+                    let below = self.block(below)?;
+                    let tag = match kind {
+                        SimplePlantKind::DryVegetation => "minecraft:supports_dry_vegetation",
+                        _ => "minecraft:supports_vegetation",
+                    };
+                    self.tags.contains(&ResourceId::parse(tag)?, &below.name)?
+                }
+            };
+            if !survives {
+                return Ok(false);
+            }
+            if matches!(kind, SimplePlantKind::Double) {
+                let above = [pos[0], pos[1].wrapping_add(1), pos[2]];
+                let upper = self.block(above)?;
+                let free = if is_air(&upper) {
+                    true
+                } else if native_world::fluid::FluidState::from_block(&upper)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some()
+                {
+                    false
+                } else {
+                    match upper.name.as_str() {
+                        "minecraft:short_grass"
+                        | "minecraft:fern"
+                        | "minecraft:bush"
+                        | "minecraft:short_dry_grass"
+                        | "minecraft:tall_dry_grass"
+                        | "minecraft:dead_bush"
+                        | "minecraft:tall_grass"
+                        | "minecraft:large_fern" => true,
+                        _ if disk_safe_solid(&upper.name).is_some()
+                            || simple_plant_kind(&upper).is_ok() =>
+                        {
+                            false
+                        }
+                        _ => bail!("unsupported double-plant replacement state"),
+                    }
+                };
+                if !free {
+                    return Ok(false);
+                }
+                let mut lower = state.clone();
+                lower.properties.insert("half".into(), "lower".into());
+                let mut upper = state.clone();
+                upper.properties.insert("half".into(), "upper".into());
+                self.write_simple_block(pos, &lower)?;
+                self.write_simple_block(above, &upper)?;
+            } else {
+                self.write_simple_block(pos, state)?;
+            }
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn schedule_simple_tick(&mut self, _: [i32; 3]) -> Result<()> {
+        self.failed = true;
+        bail!("simple-block scheduled ticks are not implemented")
+    }
+}
+
 impl OreVeinWorld for DecorationRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
@@ -993,6 +1196,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
 mod disk_tests;
 #[cfg(test)]
 mod scattered_tests;
+#[cfg(test)]
+mod simple_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1015,6 +1220,13 @@ mod tests {
                 "data/minecraft/tags/block/base_stone_overworld.json" => {
                     Some(br#"{"values":["minecraft:stone"]}"#.to_vec())
                 }
+                "data/minecraft/tags/block/supports_vegetation.json" => {
+                    Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore"]}"#.to_vec())
+                }
+                "data/minecraft/tags/block/air.json" => Some(
+                    br#"{"values":["minecraft:air","minecraft:cave_air","minecraft:void_air"]}"#
+                        .to_vec(),
+                ),
                 _ => None,
             })
         }
@@ -1038,6 +1250,7 @@ mod tests {
             "minecraft:water",
             "minecraft:ancient_debris",
             "minecraft:clay",
+            "minecraft:short_grass",
             "minecraft:cave_air",
             "minecraft:void_air",
             "minecraft:netherrack",
@@ -1865,6 +2078,9 @@ mod tests {
             "minecraft:diamond_ore",
             "minecraft:ancient_debris",
             "minecraft:clay",
+            "minecraft:short_grass",
+            "minecraft:cave_air",
+            "minecraft:void_air",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -2008,6 +2224,72 @@ mod tests {
         assert!((-2..=2).any(|x| (-2..=2).any(|z| {
             (0..8).any(|y| terrain.snapshot().block(x, y, z).unwrap().name == "minecraft:clay")
         })));
+    }
+
+    #[test]
+    fn prepared_batch_places_grass_after_ore_using_noise_and_pack_tags() {
+        struct MixedData;
+        impl ResourceProvider for MixedData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let grass = json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"}},"placement":[
+                        {"type":"minecraft:noise_threshold_count","noise_level":0.0,"below_noise":4,"above_noise":4},
+                        {"type":"minecraft:in_square"},
+                        {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":8},"max_inclusive":{"absolute":8}}},
+                        {"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"}},
+                        {"type":"minecraft:biome"}
+                    ]});
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[["test:ore",grass]]}),
+                    )?));
+                }
+                ScheduledData { heightmap: None }.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let schedule =
+            FeatureSchedule::load(&mut MixedData, std::slice::from_ref(&plains), &registry)
+                .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut MixedData, &plan, &batch_registry(), &mut resolve_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let results = prepared.execute(&mut terrain, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[1]);
+        let world = terrain.snapshot();
+        assert!((0..16).any(|x| {
+            (0..16).any(|z| world.block(x, 8, z).unwrap().name == "minecraft:short_grass")
+        }));
+    }
+
+    #[test]
+    fn unsupported_simple_tick_does_not_publish_plant() {
+        let (mut terrain, _, motion, _) = fixture();
+        let tags = OreBlockTags::load(
+            &mut Data,
+            &batch_registry(),
+            &BTreeSet::from([ResourceId::parse("minecraft:supports_vegetation").unwrap()]),
+        )
+        .unwrap();
+        let before = terrain.snapshot();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let feature=SimpleBlockFeature::decode(&json!({"type":"minecraft:simple_block","to_place":{"id":"minecraft:short_grass"},"schedule_tick":true}),&mut resolve_test).unwrap();
+        let mut random = DecorationRandom::new(0);
+        assert!(feature.place(&mut region, &mut random, [0, 8, 0]).is_err());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]

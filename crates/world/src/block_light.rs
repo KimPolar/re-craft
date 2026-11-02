@@ -459,7 +459,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (1, 0)
         }
-        "minecraft:basalt" | "minecraft:muddy_mangrove_roots"
+        "minecraft:basalt" | "minecraft:deepslate" | "minecraft:muddy_mangrove_roots"
             if state.properties.len() == 1 && axis() =>
         {
             (15, 0)
@@ -491,7 +491,6 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         }
         "minecraft:magma_block" if state.properties.is_empty() => (15, 3),
         "minecraft:stone"
-        | "minecraft:deepslate"
         | "minecraft:dirt"
         | "minecraft:granite"
         | "minecraft:diorite"
@@ -1637,6 +1636,22 @@ mod tests {
     }
 
     #[test]
+    fn deepslate_light_properties_require_a_valid_axis() {
+        for axis in ["x", "y", "z"] {
+            let block = BlockState {
+                name: "minecraft:deepslate".into(),
+                properties: BTreeMap::from([("axis".into(), axis.into())]),
+            };
+            assert_eq!(properties(&block), Some((15, 0)));
+            assert_eq!(
+                same_light_behavior(&block, &state("gravel", None)),
+                Some(true)
+            );
+        }
+        assert_eq!(properties(&state("deepslate", None)), None);
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn build_height_padding_matches_vanilla_light_engine() {
@@ -2603,7 +2618,6 @@ mod tests {
             "cave_air",
             "void_air",
             "stone",
-            "deepslate",
             "dirt",
             "granite",
             "diorite",
@@ -2627,6 +2641,12 @@ mod tests {
             "snow_block",
         ] {
             states.push(state(name, None));
+        }
+        for axis in ["x", "y", "z"] {
+            states.push(BlockState {
+                name: "minecraft:deepslate".into(),
+                properties: BTreeMap::from([("axis".into(), axis.into())]),
+            });
         }
         for name in ["redstone_ore", "deepslate_redstone_ore", "redstone_lamp"] {
             for lit in [false, true] {

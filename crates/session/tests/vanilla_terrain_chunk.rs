@@ -511,6 +511,79 @@ fn terrain_matches_java_before_and_after_carvers() {
             resolve_generated_terrain_state(state, &generated_registry)
         })
         .unwrap();
+        if i == 0 {
+            use native_session::worldgen::schedule::{GenerationSchedule, GenerationStage};
+            use native_world::loaded::ChunkPos;
+            let center = ChunkPos {
+                x: pos[0],
+                z: pos[1],
+            };
+            let mut scheduled_generator = TerrainGenerator::without_terrain_adjustments(
+                &mut resources,
+                &generator_definition,
+                seed,
+                min_y,
+                height,
+            )
+            .unwrap();
+            let mut scheduled_eval = DensityEvaluator::default();
+            let mut scheduled_biomes = scheduled_generator.biome_neighborhood().unwrap();
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(center, GenerationStage::Terrain).unwrap();
+            while !schedule.ready(center, GenerationStage::Terrain) {
+                let (position, stage) = schedule.next_ready().unwrap();
+                match stage {
+                    GenerationStage::Biomes => schedule
+                        .run_biomes(
+                            &mut scheduled_generator,
+                            &mut scheduled_eval,
+                            &mut scheduled_biomes,
+                            position,
+                        )
+                        .unwrap(),
+                    // Structures are disabled in both compared generators.
+                    GenerationStage::StructureStarts | GenerationStage::StructureReferences => {
+                        schedule.complete(position, stage).unwrap()
+                    }
+                    _ => panic!("unexpected generation stage {stage:?}"),
+                }
+            }
+            let mut scheduled_world = None;
+            schedule
+                .run_terrain(
+                    &mut scheduled_generator,
+                    &mut resources,
+                    &mut scheduled_eval,
+                    &mut CarverCache::default(),
+                    &scheduled_biomes,
+                    &tags,
+                    &mut scheduled_world,
+                    center,
+                    dimension,
+                    false,
+                    classify,
+                    |state| resolve_generated_terrain_state(state, &generated_registry),
+                )
+                .unwrap();
+            let scheduled = scheduled_world.unwrap().snapshot();
+            assert_eq!(schedule.completed(center), Some(GenerationStage::Terrain));
+            for y in min_y..min_y + height {
+                for z in bz..bz + 16 {
+                    for x in bx..bx + 16 {
+                        assert_eq!(
+                            scheduled.block(x, y, z),
+                            generated.world().block(x, y, z),
+                            "scheduled terrain at {x},{y},{z}"
+                        );
+                        assert_eq!(
+                            scheduled.biome(x, y, z),
+                            generated.world().biome(x, y, z),
+                            "scheduled biome at {x},{y},{z}"
+                        );
+                    }
+                }
+            }
+        }
         assert_eq!(generated.noise_postprocessing(), Some(&marks));
         assert_eq!(generated.surface_postprocessing(), Some(&surface_marks));
         assert_eq!(generated.carver_postprocessing(), Some(&carver_marks));

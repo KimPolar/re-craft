@@ -2511,6 +2511,200 @@ mod tests {
         }})
     }
     #[test]
+    fn schedule_runs_biomes_and_carved_terrain_transactionally() {
+        use native_resources::carver::tags::CarverBlockTags;
+        use native_world::loaded::{BlockState, ChunkPos};
+        use schedule::{GenerationSchedule, GenerationStage};
+        let mut data = Data;
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut neighborhood = generator.biome_neighborhood().unwrap();
+        let mut plan = GenerationSchedule::new();
+        let center = ChunkPos { x: 0, z: 0 };
+        plan.request(center, GenerationStage::Terrain).unwrap();
+        assert!(
+            plan.run_biomes(&mut generator, &mut evaluator, &mut neighborhood, center)
+                .is_err()
+        );
+        while !plan.ready(center, GenerationStage::Terrain) {
+            let (pos, stage) = plan.next_ready().unwrap();
+            match stage {
+                GenerationStage::Biomes => plan
+                    .run_biomes(&mut generator, &mut evaluator, &mut neighborhood, pos)
+                    .unwrap(),
+                // This test has no structure generation enabled.
+                GenerationStage::StructureStarts | GenerationStage::StructureReferences => {
+                    plan.complete(pos, stage).unwrap()
+                }
+                _ => panic!("unexpected stage {stage:?}"),
+            }
+        }
+        assert!(neighborhood.chunk([0, 0]).is_some());
+        assert!(
+            plan.run_biomes(&mut generator, &mut evaluator, &mut neighborhood, center)
+                .is_err()
+        );
+        let registry: BTreeSet<_> = ["air", "bedrock", "stone", "dirt", "water", "lava"]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}"))
+            .collect();
+        let tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let mut cache = CarverCache::default();
+        let mut assembled = None;
+        let classify = |v: &Value| -> Result<CarverBlockState> {
+            let name = v.as_str().context("expected simple fixture state")?;
+            Ok(CarverBlockState {
+                is_air: name == "minecraft:air",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let resolve = |v: &Value| -> Result<BlockState> {
+            Ok(BlockState {
+                name: v.as_str().context("expected simple fixture state")?.into(),
+                properties: BTreeMap::new(),
+            })
+        };
+        assert!(
+            plan.run_terrain(
+                &mut generator,
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                &neighborhood,
+                &tags,
+                &mut assembled,
+                center,
+                "minecraft:overworld",
+                true,
+                classify,
+                resolve
+            )
+            .is_err()
+        );
+        assert_eq!(plan.completed(center), Some(GenerationStage::Biomes));
+        assert!(
+            plan.run_terrain(
+                &mut generator,
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                &neighborhood,
+                &tags,
+                &mut assembled,
+                center,
+                "minecraft:overworld",
+                false,
+                classify,
+                |_| anyhow::bail!("unsupported fixture state")
+            )
+            .is_err()
+        );
+        assert_eq!(plan.completed(center), Some(GenerationStage::Biomes));
+        assert!(assembled.is_none());
+        // Retry with a new generator and caches after a failed generation.
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut cache = CarverCache::default();
+        plan.run_terrain(
+            &mut generator,
+            &mut data,
+            &mut evaluator,
+            &mut cache,
+            &neighborhood,
+            &tags,
+            &mut assembled,
+            center,
+            "minecraft:overworld",
+            false,
+            classify,
+            resolve,
+        )
+        .unwrap();
+        let terrain = assembled.as_ref().unwrap().snapshot();
+        assert_eq!(plan.completed(center), Some(GenerationStage::Terrain));
+        assert_eq!(
+            terrain.chunks[&center].status.as_deref(),
+            Some("minecraft:terrain")
+        );
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(terrain.block(x, y, z).unwrap().name, "minecraft:dirt");
+                }
+            }
+        }
+        let east = ChunkPos { x: 1, z: 0 };
+        plan.request(east, GenerationStage::Terrain).unwrap();
+        while !plan.ready(east, GenerationStage::Terrain) {
+            let (pos, stage) = plan.next_ready().unwrap();
+            match stage {
+                GenerationStage::Biomes => plan
+                    .run_biomes(&mut generator, &mut evaluator, &mut neighborhood, pos)
+                    .unwrap(),
+                GenerationStage::StructureStarts | GenerationStage::StructureReferences => {
+                    plan.complete(pos, stage).unwrap()
+                }
+                _ => panic!("unexpected stage {stage:?}"),
+            }
+        }
+        assert!(
+            plan.run_terrain(
+                &mut generator,
+                &mut data,
+                &mut evaluator,
+                &mut cache,
+                &neighborhood,
+                &tags,
+                &mut assembled,
+                east,
+                "minecraft:the_nether",
+                false,
+                classify,
+                resolve
+            )
+            .is_err()
+        );
+        assert_eq!(plan.completed(east), Some(GenerationStage::Biomes));
+        assert!(Arc::ptr_eq(
+            &terrain,
+            &assembled.as_ref().unwrap().snapshot()
+        ));
+        let mut generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+                .unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        let mut cache = CarverCache::default();
+        plan.run_terrain(
+            &mut generator,
+            &mut data,
+            &mut evaluator,
+            &mut cache,
+            &neighborhood,
+            &tags,
+            &mut assembled,
+            east,
+            "minecraft:overworld",
+            false,
+            classify,
+            resolve,
+        )
+        .unwrap();
+        assert_eq!(plan.completed(east), Some(GenerationStage::Terrain));
+        assert!(!terrain.chunks.contains_key(&east));
+        assert!(
+            assembled
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .chunks
+                .contains_key(&east)
+        );
+    }
+    #[test]
     fn generator_compiles_feature_schedule_from_its_biome_source() {
         use native_resources::feature_order::FeatureKey;
         struct BiomeData;

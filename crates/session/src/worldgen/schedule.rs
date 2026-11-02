@@ -309,6 +309,106 @@ impl GenerationSchedule {
         Ok(())
     }
 
+    /// Generate and store a biome volume before marking BIOMES complete. The
+    /// generator and neighborhood must use the same active packs and seed.
+    /// On a generation error the caller must discard the generator/evaluator
+    /// before retrying, because their search history may have advanced.
+    pub fn run_biomes(
+        &mut self,
+        generator: &mut super::TerrainGenerator,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        neighborhood: &mut super::BiomeNeighborhood,
+        pos: ChunkPos,
+    ) -> Result<()> {
+        ensure!(self.ready(pos, Biomes), "biome dependencies are incomplete");
+        ensure!(
+            neighborhood.seed == generator.seed
+                && neighborhood.min_y == generator.min_y
+                && neighborhood.height == generator.height,
+            "biome neighborhood differs from generator"
+        );
+        ensure!(
+            neighborhood.chunk([pos.x, pos.z]).is_none(),
+            "biome chunk already exists"
+        );
+        let chunk = generator.generate_biomes([pos.x, pos.z], evaluator)?;
+        neighborhood.insert(std::sync::Arc::new(chunk))?;
+        self.complete(pos, Biomes)
+    }
+
+    /// Generate and assemble an intermediate terrain chunk with structures
+    /// explicitly disabled. It is neither a full playable chunk nor safe to
+    /// save. All assembled chunks must use the same generator and pack stack;
+    /// matching seed, dimension and height cannot prove that. Discard mutable
+    /// generator caches after an error before retrying to preserve their history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_terrain<P: native_resources::packs::ResourceProvider>(
+        &mut self,
+        generator: &mut super::TerrainGenerator,
+        provider: &mut P,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        cache: &mut native_resources::carver::schedule::CarverCache,
+        neighborhood: &super::BiomeNeighborhood,
+        tags: &native_resources::carver::tags::CarverBlockTags,
+        assembled: &mut Option<super::CarvedTerrainWorld>,
+        pos: ChunkPos,
+        dimension: &str,
+        structures_enabled: bool,
+        classify: impl FnMut(&serde_json::Value) -> Result<super::CarverBlockState>,
+        resolve: impl FnMut(&serde_json::Value) -> Result<native_world::loaded::BlockState>,
+    ) -> Result<()> {
+        ensure!(
+            self.ready(pos, Terrain),
+            "terrain dependencies are incomplete"
+        );
+        ensure!(
+            !structures_enabled && !generator.structure_context,
+            "structure terrain generation is not implemented by this path"
+        );
+        let dimension_id = native_resources::packs::ResourceId::parse(dimension)?;
+        if let Some(world) = assembled.as_ref() {
+            ensure!(
+                world.world.dimension
+                    == format!("{}:{}", dimension_id.namespace, dimension_id.path),
+                "terrain dimension differs"
+            );
+            ensure!(
+                world.seed == generator.seed
+                    && world.min_y == generator.min_y
+                    && world.height == generator.height,
+                "terrain generator differs from assembled world"
+            );
+            ensure!(
+                !world.postprocessing.contains_key(&pos) && !world.world.chunks.contains_key(&pos),
+                "terrain chunk already exists"
+            );
+        }
+        neighborhood.validate(
+            [pos.x, pos.z],
+            generator.seed,
+            generator.min_y,
+            generator.height,
+        )?;
+        let biome = neighborhood
+            .chunk([pos.x, pos.z])
+            .context("terrain biome chunk missing")?;
+        let chunk = generator.generate_carved_surface(
+            provider,
+            evaluator,
+            cache,
+            [pos.x, pos.z],
+            neighborhood,
+            tags,
+            classify,
+        )?;
+        let terrain = super::materialize_carved_terrain(chunk, biome, dimension, resolve)?;
+        match assembled {
+            Some(world) => world.insert(&terrain)?,
+            None => *assembled = Some(super::CarvedTerrainWorld::new(terrain)),
+        }
+        self.complete(pos, Terrain)
+    }
+
     /// Apply supported decoration and record FEATURES only after it succeeds.
     pub fn run_features(
         &mut self,

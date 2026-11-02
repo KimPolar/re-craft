@@ -8,6 +8,7 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.BubbleColumnBlock;
@@ -48,11 +49,21 @@ public class ItemBubbleTraversalOracle {
         @Override public void setDeltaMovement(Vec3 value) { velocity=value; }
         @Override protected AABB makeBoundingBox(Vec3 pos) { return new AABB(pos.x-.25,pos.y,pos.z-.25,pos.x+.25,pos.y+.5,pos.z+.25); }
     }
+    static class Falling extends FallingBlockEntity {
+        Vec3 velocity;
+        Falling() { super(null,null); }
+        @Override public boolean isAlive() { return true; }
+        @Override public Vec3 getDeltaMovement() { return velocity; }
+        @Override public void setDeltaMovement(double x,double y,double z) { velocity=new Vec3(x,y,z); }
+        @Override public void setDeltaMovement(Vec3 value) { velocity=value; }
+        @Override protected AABB makeBoundingBox(Vec3 pos) { double width=(double)0.98f, half=width/2; return new AABB(pos.x-half,pos.y,pos.z-half,pos.x+half,pos.y+width,pos.z+half); }
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var world=(World)unsafe.allocateInstance(World.class);
-        var item=(Entity)unsafe.allocateInstance(args.length>1 && args[1].equals("orb")?Orb.class:Item.class);
+        var type=args.length>1 && args[1].equals("falling")?Falling.class:args.length>1 && args[1].equals("orb")?Orb.class:Item.class;
+        var item=(Entity)unsafe.allocateInstance(type);
         var level=Entity.class.getDeclaredField("level"); unsafe.putObject(item,unsafe.objectFieldOffset(level),world);
         var visited=Entity.class.getDeclaredField("visitedBlocks"); unsafe.putObject(item,unsafe.objectFieldOffset(visited),new LongOpenHashSet());
         var movement=Class.forName("net.minecraft.world.entity.Entity$Movement").getDeclaredConstructor(Vec3.class,Vec3.class,Vec3.class); movement.setAccessible(true);

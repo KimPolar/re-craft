@@ -13929,7 +13929,11 @@ impl LoadedSession {
                                 .and_then(Option::as_deref)
                                 .is_none()
                                 || (self.fluids.get(id.0 as usize).copied().flatten().is_some()
-                                    && self.ordinary_fluid(id).is_none())
+                                    && self.ordinary_fluid(id).is_none()
+                                    && !self
+                                        .world
+                                        .state(id)
+                                        .is_some_and(|state| bubble_column_drag(state).is_some()))
                             {
                                 complete = false;
                                 break 'check;
@@ -13948,19 +13952,64 @@ impl LoadedSession {
             let bounds = self.bounds;
             let air = self.states[0];
             let template = entity.motion;
-            let collision = entity.motion.tick_with_collision(|position, movement| {
-                let mut local = template;
-                local.position = position - origin.as_dvec3();
-                crate::movement::resolve_box(local.bounds(), movement, false, 0.0, |p| {
-                    match cell(world, origin, bounds, p, air) {
-                        Cell::State(id) => shapes
-                            .get(id.0 as usize)
-                            .and_then(Option::as_deref)
-                            .unwrap_or_else(|| unknown_barrier()),
-                        Cell::Missing => unknown_barrier(),
+            let fluid_view = FluidView {
+                world,
+                shapes,
+                fluids: &self.fluids,
+                origin,
+                bounds,
+                air,
+            };
+            let mut bubble_contacts = None;
+            let collision = entity.motion.tick_with_collision_and_effects(
+                |position, movement| {
+                    let mut local = template;
+                    local.position = position - origin.as_dvec3();
+                    crate::movement::resolve_box(local.bounds(), movement, false, 0.0, |p| {
+                        match cell(world, origin, bounds, p, air) {
+                            Cell::State(id) => shapes
+                                .get(id.0 as usize)
+                                .and_then(Option::as_deref)
+                                .unwrap_or_else(|| unknown_barrier()),
+                            Cell::Missing => unknown_barrier(),
+                        }
+                    })
+                },
+                |velocity, requested, actual| {
+                    let contacts = fluid_view.bubble_contacts(probe.bounds(), actual, requested);
+                    if let Some(contacts) = &contacts {
+                        for contact in contacts {
+                            *velocity = crate::bubble_column::player_velocity(
+                                *velocity,
+                                contact.drag_down,
+                                contact.surface,
+                                false,
+                            );
+                        }
                     }
-                })
-            });
+                    bubble_contacts = Some(contacts);
+                },
+            );
+            match bubble_contacts.expect("movement effect callback runs once") {
+                Some(contacts) => {
+                    for contact in contacts {
+                        self.unresolved_bubble_tick = true;
+                        if contact.surface {
+                            if let Some(position) = add(origin, contact.position) {
+                                queue_bubble_surface_particles(
+                                    &mut self.bubble_surface_particles,
+                                    &mut self.level_random,
+                                    self.tick,
+                                    position,
+                                );
+                            }
+                        } else {
+                            entity.fall_distance = 0.0;
+                        }
+                    }
+                }
+                None => self.unresolved_bubble_tick = true,
+            }
             entity.on_ground = collision.on_ground;
             if entity.fall_distance_verified {
                 let safe = path_cache.safe(
@@ -30328,7 +30377,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
-    fn item_and_orb_bubble_traversal_match_java() {
+    fn item_orb_and_falling_bubble_traversal_match_java() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -30352,6 +30401,7 @@ pub(crate) mod tests {
         let source = temp.path().join("ItemBubbleTraversalOracle.java");
         let output = temp.path().join("item-traversal.json");
         let orb_output = temp.path().join("orb-traversal.json");
+        let falling_output = temp.path().join("falling-traversal.json");
         std::fs::write(
             &source,
             include_str!("../tests/java/ItemBubbleTraversalOracle.java"),
@@ -30373,6 +30423,12 @@ pub(crate) mod tests {
                 .arg("ItemBubbleTraversalOracle")
                 .arg(&orb_output)
                 .arg("orb"),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ItemBubbleTraversalOracle")
+                .arg(&falling_output)
+                .arg("falling"),
         ] {
             let result = command.output().unwrap();
             assert!(
@@ -30382,15 +30438,15 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(&result.stderr)
             );
         }
-        let rows = [(false, output), (true, orb_output)]
+        let rows = [(0, output), (1, orb_output), (2, falling_output)]
             .into_iter()
-            .flat_map(|(orb, output)| {
+            .flat_map(|(kind, output)| {
                 let values: Vec<serde_json::Value> =
                     serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
                 assert_eq!(values.len(), 56);
-                values.into_iter().map(move |value| (orb, value))
+                values.into_iter().map(move |value| (kind, value))
             });
-        for (orb, row) in rows {
+        for (kind, row) in rows {
             let mut session = session();
             let bubble = session.intern_block(state(
                 "minecraft:bubble_column",
@@ -30413,7 +30469,11 @@ pub(crate) mod tests {
             let from = DVec3::new(number(0), number(1), number(2));
             let requested = DVec3::new(number(3), number(4), number(5));
             let movement = (from + requested) - from;
-            let half = if orb { 0.25 } else { 0.125 };
+            let half = match kind {
+                0 => 0.125,
+                1 => 0.25,
+                _ => f64::from(0.98_f32) / 2.0,
+            };
             let bounds = BoundingBox {
                 min: from + DVec3::new(-half, 0.0, -half),
                 max: from + DVec3::new(half, half * 2.0, half),
@@ -30442,6 +30502,62 @@ pub(crate) mod tests {
             }
             assert_eq!(velocity.y, row["velocity"].as_f64().unwrap(), "{row}");
             assert_eq!(fall, row["fall"].as_f64().unwrap(), "{row}");
+        }
+    }
+
+    #[test]
+    fn falling_sand_moves_through_bubble_and_preserves_save_guard() {
+        for (surface, drag) in [(true, false), (false, true)] {
+            let mut session = session();
+            let bubble = session.intern_block(state(
+                "minecraft:bubble_column",
+                &[("drag", if drag { "true" } else { "false" })],
+            ));
+            assert!(session.set(IVec3::new(8, 1, 8), bubble));
+            if !surface {
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set(IVec3::new(8, 2, 8), water));
+            }
+            let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.05, 8.5);
+            session.falling_sand.push(FallingSand {
+                motion: crate::falling_block::AirborneMotion {
+                    position,
+                    velocity: DVec3::ZERO,
+                    age: 0,
+                    no_gravity: false,
+                },
+                previous: position,
+                fall_distance: 4.0,
+                fall_distance_verified: true,
+                kind: FallingKind::Sand,
+                drop_item: true,
+                cancel_drop: false,
+                on_ground: false,
+                source: None,
+                created: None,
+            });
+            session.advance_falling_sand();
+            assert_eq!(session.falling_sand.len(), 1);
+            let entity = &session.falling_sand[0];
+            let expected = crate::bubble_column::player_velocity(
+                DVec3::new(0.0, -0.04, 0.0),
+                drag,
+                surface,
+                false,
+            ) * f64::from(0.98_f32);
+            assert_eq!(entity.motion.velocity, expected);
+            assert!(session.unresolved_bubble_tick);
+            assert!(!entity.fall_distance_verified);
+            if !surface {
+                assert_eq!(entity.fall_distance, 0.0);
+            }
+            let particles = session.take_bubble_surface_particles();
+            assert_eq!(particles.len(), if surface { 4 } else { 0 });
+            assert!(
+                particles
+                    .iter()
+                    .all(|event| event.position.y == 2.0 && event.tick == 1)
+            );
         }
     }
 

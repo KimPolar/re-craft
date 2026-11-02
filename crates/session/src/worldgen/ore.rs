@@ -3159,6 +3159,13 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                     SimpleBlockWorld::schedule_simple_tick(self, pos)?;
                 }
             }
+        } else if state.properties.is_empty()
+            && matches!(
+                state.name.as_str(),
+                "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+            )
+        {
+            SimpleBlockWorld::schedule_simple_tick(self, pos)?;
         } else if tree_mushroom_block(state)? {
             if neighbor.name == state.name {
                 ensure!(
@@ -10993,6 +11000,111 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_edge_falling_updates_match_java() {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeEdgeFallingOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeEdgeFallingOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeEdgeFallingOracle"));
+        let (mut terrain, tags, _, _) = fixture();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let names = ["sand", "red_sand", "gravel"];
+        let neighbors = ["air", "stone", "oak_log"];
+        let mut count = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("F ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 5, "{line}");
+            let kind: usize = parts[0].parse().unwrap();
+            let direction = match parts[1] {
+                "down" => [0, -1, 0],
+                "up" => [0, 1, 0],
+                "north" => [0, 0, -1],
+                "south" => [0, 0, 1],
+                "west" => [-1, 0, 0],
+                "east" => [1, 0, 0],
+                _ => panic!("unexpected direction"),
+            };
+            let neighbor: usize = parts[2].parse().unwrap();
+            let block = state(names[kind]);
+            let pos = [8, 8, 8];
+            region.set_section_block(pos, &block).unwrap();
+            region.world.saved_block_ticks.clear();
+            region.block_tick_keys.clear();
+            let updated = ShapeEdgeWorld::update_shape(
+                &mut region,
+                pos,
+                &block,
+                direction,
+                [8 + direction[0], 8 + direction[1], 8 + direction[2]],
+                &state(neighbors[neighbor]),
+            )
+            .unwrap();
+            assert_eq!(
+                updated == block,
+                parts[3].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            let ticks = region.world.saved_block_ticks.get(&center).unwrap();
+            assert_eq!(ticks.len(), 1, "{line}");
+            assert_eq!(parts[4], format!("B:minecraft:{}:2", names[kind]), "{line}");
+            assert_eq!(ticks[0].block, block.name, "{line}");
+            assert_eq!(ticks[0].position, pos, "{line}");
+            // ProtoChunkTicks stores zero rather than the requested delay.
+            assert_eq!(ticks[0].delay, 0, "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 3 * 6 * 3);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tree_edge_fluid_updates_match_java() {
         use std::{path::PathBuf, process::Command};
         struct BubbleData;
@@ -12024,14 +12136,14 @@ mod tests {
     #[test]
     fn unsupported_tree_edge_discards_generated_writes_and_ticks() {
         let (schedule, neighborhood, mut registry) = prepare_tree_fixture();
-        registry.insert("minecraft:sand".into());
+        registry.insert("minecraft:oak_planks".into());
         let plan = fixture_plan(&schedule, &neighborhood);
         let prepared =
             PreparedDecoration::load(&mut TreeData, &plan, &registry, &mut resolve_tree_test)
                 .unwrap();
         let (mut terrain, _, _, _) = fixture();
         let world = Arc::make_mut(&mut terrain.world);
-        let id = world.intern_state(state("sand"));
+        let id = world.intern_state(state("oak_planks"));
         let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;

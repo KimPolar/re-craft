@@ -9,11 +9,13 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
 use native_core::beardifier::Beardifier;
+use native_core::random::DecorationRandom;
 use native_persistence::heightmap::BlockHeightFlags;
 use native_resources::{
     biome_source::{BiomeSource, ClimateVolume},
     carver::{CarvingMask, schedule::CarverCache},
     density::DensityEvaluator,
+    feature_order::{FeatureSchedule, SelectedFeature},
     noise_stage::{BaseNoiseColumn, NoiseMaterial, NoiseStageGenerator},
     packs::{ResourceId, ResourceProvider},
     structure_start::{
@@ -456,6 +458,22 @@ pub struct BiomeNeighborhood {
     height: i32,
     chunks: BTreeMap<[i32; 2], Arc<QuartBiomeChunk>>,
 }
+
+/// Selected decoration features for one chunk. Structure placements still
+/// have to run before the corresponding feature step.
+pub struct DecorationPlan<'a> {
+    pub origin: [i32; 3],
+    pub decoration_seed: i64,
+    pub features: Vec<SelectedFeature<'a>>,
+}
+impl DecorationPlan<'_> {
+    /// Java reseeds the shared decoration RNG for every selected feature.
+    pub fn feature_random(&self, feature: &SelectedFeature<'_>) -> DecorationRandom {
+        let mut random = DecorationRandom::new(0);
+        random.set_feature_seed(self.decoration_seed, feature.index, feature.step);
+        random
+    }
+}
 impl BiomeNeighborhood {
     pub fn new(seed: i64, min_y: i32, height: i32) -> Result<Self> {
         ensure!(
@@ -528,6 +546,7 @@ pub struct TerrainGenerator {
     structure_context: bool,
     source: BiomeSource,
     possible_biomes: std::collections::BTreeSet<ResourceId>,
+    possible_biomes_ordered: Vec<ResourceId>,
     surface: SurfaceRule,
     seed: i64,
     min_y: i32,
@@ -700,11 +719,13 @@ impl TerrainGenerator {
             "dimension must fully contain the noise height range"
         );
         let possible_biomes = source.possible_biomes();
+        let possible_biomes_ordered = source.possible_biomes_in_order();
         Ok(Self {
             noise,
             structure_context,
             source,
             possible_biomes,
+            possible_biomes_ordered,
             surface,
             seed,
             min_y,
@@ -733,9 +754,46 @@ impl TerrainGenerator {
     ) -> Result<native_resources::feature_order::FeatureSchedule> {
         native_resources::feature_order::FeatureSchedule::load(
             provider,
-            &self.source.possible_biomes_in_order(),
+            &self.possible_biomes_ordered,
             registry,
         )
+    }
+    /// Prepare Java's feature subset from all biome cells in the 3x3 chunk
+    /// neighborhood. The schedule and biome chunks must use the same active
+    /// packs and generator settings; source order and bounds are checked here.
+    pub fn decoration_plan<'a>(
+        &self,
+        schedule: &'a FeatureSchedule,
+        neighborhood: &BiomeNeighborhood,
+        target: [i32; 2],
+    ) -> Result<DecorationPlan<'a>> {
+        ensure!(
+            schedule.possible_biomes() == self.possible_biomes_ordered,
+            "feature schedule uses a different biome source"
+        );
+        neighborhood.validate(target, self.seed, self.min_y, self.height)?;
+        let mut present = std::collections::BTreeSet::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let key = [
+                    target[0].checked_add(dx).context("neighbor X overflow")?,
+                    target[1].checked_add(dz).context("neighbor Z overflow")?,
+                ];
+                present.extend(neighborhood.chunks[&key].values.iter());
+            }
+        }
+        let origin = [
+            target[0].checked_mul(16).context("decoration X overflow")?,
+            self.min_y,
+            target[1].checked_mul(16).context("decoration Z overflow")?,
+        ];
+        let mut random = DecorationRandom::new(0);
+        let decoration_seed = random.set_decoration_seed(self.seed, origin[0], origin[2]);
+        Ok(DecorationPlan {
+            origin,
+            decoration_seed,
+            features: schedule.select(present),
+        })
     }
     /// Check a set's candidate chunk after the biome-source filter, including
     /// concentric rings and exclusion references. This does not generate starts.
@@ -1606,7 +1664,7 @@ mod tests {
             .feature_schedule(&mut BiomeData, &registry)
             .unwrap();
         assert_eq!(
-            schedule.steps,
+            schedule.steps(),
             vec![
                 vec![
                     FeatureKey::Registered(ids[0].clone()),
@@ -1616,6 +1674,248 @@ mod tests {
                 vec![FeatureKey::Registered(ids[2].clone())]
             ]
         );
+    }
+
+    struct PlanningData;
+    impl ResourceProvider for PlanningData {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            let features = match path {
+                "data/minecraft/worldgen/biome/plains.json" => Some(json!([
+                    ["test:f0", "test:f2"],
+                    ["test:f3"],
+                    [],
+                    ["test:f6"]
+                ])),
+                "data/minecraft/worldgen/biome/desert.json" => {
+                    Some(json!([["test:f1", "test:f2"], [], ["test:f4"]]))
+                }
+                "data/minecraft/worldgen/biome/forest.json" => {
+                    Some(json!([["test:f1", "test:f2"], ["test:f5"]]))
+                }
+                _ => None,
+            };
+            match features {
+                Some(features) => Ok(Some(serde_json::to_vec(&json!({"features":features}))?)),
+                None => Data.read_data(path),
+            }
+        }
+        fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+            ensure!(folder == "worldgen/biome", "unexpected registry");
+            ["plains", "desert", "forest"]
+                .into_iter()
+                .map(ResourceId::parse)
+                .collect()
+        }
+    }
+    fn planning_definition() -> Value {
+        let mut value = definition();
+        let parameters = json!({"temperature":0,"humidity":0,"continentalness":0,"erosion":0,"depth":0,"weirdness":0,"offset":0});
+        value["biome_source"] = json!({"type":"minecraft:multi_noise","biomes":[
+            {"biome":"minecraft:plains","parameters":parameters},
+            {"biome":"minecraft:desert","parameters":parameters},
+            {"biome":"minecraft:forest","parameters":parameters}
+        ]});
+        value
+    }
+    fn planning_neighborhood(
+        generator: &TerrainGenerator,
+        target: [i32; 2],
+        mask: u32,
+    ) -> BiomeNeighborhood {
+        let mut result = generator.biome_neighborhood().unwrap();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let chunk = [target[0] + dx, target[1] + dz];
+                let mut values = vec![ResourceId::parse("example:other").unwrap(); 128];
+                let candidate = match (dx, dz) {
+                    (-1, -1) => Some((1, "plains")),
+                    (1, 1) => Some((2, "desert")),
+                    (-1, 1) => Some((4, "forest")),
+                    _ => None,
+                };
+                if let Some((bit, biome)) = candidate {
+                    if mask & bit != 0 {
+                        values[127] = ResourceId::parse(biome).unwrap();
+                    }
+                }
+                result
+                    .insert(Arc::new(
+                        QuartBiomeChunk::from_values(chunk, generator.seed, -16, 32, values)
+                            .unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn decoration_plan_checks_neighborhood_and_source() {
+        let generator = TerrainGenerator::without_terrain_adjustments(
+            &mut PlanningData,
+            &planning_definition(),
+            42,
+            -16,
+            32,
+        )
+        .unwrap();
+        let registry = (0..7)
+            .map(|i| ResourceId::parse(&format!("test:f{i}")).unwrap())
+            .collect();
+        let schedule = generator
+            .feature_schedule(&mut PlanningData, &registry)
+            .unwrap();
+        let mut neighborhood = planning_neighborhood(&generator, [-2, 3], 3);
+        let plan = generator
+            .decoration_plan(&schedule, &neighborhood, [-2, 3])
+            .unwrap();
+        assert_eq!(plan.origin, [-32, -16, 48]);
+        let names: Vec<_> = plan.features.iter().map(|f| f.feature).collect();
+        assert!(
+            !names.contains(&&native_resources::feature_order::FeatureKey::Registered(
+                ResourceId::parse("test:f5").unwrap()
+            ))
+        );
+        assert!(
+            names.contains(&&native_resources::feature_order::FeatureKey::Registered(
+                ResourceId::parse("test:f4").unwrap()
+            ))
+        );
+        neighborhood.chunks.remove(&[-3, 2]);
+        assert!(
+            generator
+                .decoration_plan(&schedule, &neighborhood, [-2, 3])
+                .is_err()
+        );
+        let wrong = FeatureSchedule::load(
+            &mut PlanningData,
+            &[
+                ResourceId::parse("desert").unwrap(),
+                ResourceId::parse("plains").unwrap(),
+                ResourceId::parse("forest").unwrap(),
+            ],
+            &registry,
+        )
+        .unwrap();
+        assert!(
+            generator
+                .decoration_plan(
+                    &wrong,
+                    &planning_neighborhood(&generator, [-2, 3], 3),
+                    [-2, 3]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
+    fn decoration_selection_and_randomness_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("DecorationPlanOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/DecorationPlanOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "Java decoration oracle failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let registry = (0..7)
+            .map(|i| ResourceId::parse(&format!("test:f{i}")).unwrap())
+            .collect();
+        let mut cases = Vec::new();
+        let mut rust = Vec::new();
+        for seed in [0i64, 1, -1, i64::MIN] {
+            for mask in 0..8u32 {
+                let target = [mask as i32 - 4, 3 - mask as i32];
+                let mut present = vec![3, 3];
+                for bit in 0..3 {
+                    if mask & (1 << bit) != 0 {
+                        present.push(bit);
+                    }
+                }
+                cases.push(json!({"seed":seed,"x":target[0],"z":target[1],"present":present}));
+                let generator = TerrainGenerator::without_terrain_adjustments(
+                    &mut PlanningData,
+                    &planning_definition(),
+                    seed,
+                    -16,
+                    32,
+                )
+                .unwrap();
+                let schedule = generator
+                    .feature_schedule(&mut PlanningData, &registry)
+                    .unwrap();
+                let neighborhood = planning_neighborhood(&generator, target, mask);
+                let plan = generator
+                    .decoration_plan(&schedule, &neighborhood, target)
+                    .unwrap();
+                assert_eq!(plan.origin, [target[0] * 16, -16, target[1] * 16]);
+                let mut features = Vec::new();
+                for feature in &plan.features {
+                    let native_resources::feature_order::FeatureKey::Registered(id) =
+                        feature.feature
+                    else {
+                        panic!("unexpected inline feature")
+                    };
+                    let id: i32 = id.path.strip_prefix('f').unwrap().parse().unwrap();
+                    let mut random = plan.feature_random(feature);
+                    features.push(json!([feature.step, feature.index, id, random.next_long()]));
+                }
+                rust.push(json!({"deco":plan.decoration_seed,"features":features}));
+            }
+        }
+        let input = temp.path().join("decoration.json");
+        std::fs::write(
+            &input,
+            serde_json::to_vec(
+                &json!({"biomes":[[[0,2],[3],[],[6]],[[1,2],[],[4]],[[1,2],[5]]],"cases":cases}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("DecorationPlanOracle")
+            .arg(input));
+        let expected: Vec<Value> = serde_json::from_str(output.lines().last().unwrap()).unwrap();
+        assert_eq!(rust, expected);
+        assert_eq!(rust.len(), 32);
     }
     #[test]
     fn generates_biomes_and_surface_only_with_complete_matching_neighbors() {

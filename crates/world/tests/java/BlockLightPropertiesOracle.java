@@ -6,6 +6,8 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.block.RedStoneOreBlock;
 import net.minecraft.world.level.block.ChestBlock;
+import net.minecraft.world.level.block.CaveVines;
+import net.minecraft.world.level.block.GrowingPlantHeadBlock;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.core.Direction;
 
@@ -20,6 +22,8 @@ public class BlockLightPropertiesOracle {
             var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse(entry.get("name").getAsString()));
             var state = block.defaultBlockState();
             if (entry.has("lit")) state = state.setValue(RedStoneOreBlock.LIT, entry.get("lit").getAsBoolean());
+            if (entry.has("berries")) state = state.setValue(CaveVines.BERRIES, entry.get("berries").getAsBoolean());
+            if (entry.has("age")) state = state.setValue(GrowingPlantHeadBlock.AGE, entry.get("age").getAsInt());
             if (entry.has("facing")) state = state.setValue(ChestBlock.FACING, Direction.byName(entry.get("facing").getAsString()))
                 .setValue(ChestBlock.TYPE, ChestType.valueOf(entry.get("type").getAsString().toUpperCase(java.util.Locale.ROOT)))
                 .setValue(ChestBlock.WATERLOGGED, entry.get("waterlogged").getAsBoolean());

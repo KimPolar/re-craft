@@ -199,6 +199,16 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         "minecraft:redstone_lamp" if state.properties.len() == 1 => {
             (15, if boolean("lit")? { 15 } else { 0 })
         }
+        "minecraft:cave_vines" | "minecraft:cave_vines_plant" => {
+            let head = state.name == "minecraft:cave_vines";
+            if state.properties.len() != if head { 2 } else { 1 } {
+                return None;
+            }
+            if head {
+                bounded("age", 25)?;
+            }
+            (0, if boolean("berries")? { 14 } else { 0 })
+        }
         "minecraft:redstone_block" if state.properties.is_empty() => (15, 0),
         "minecraft:chest" | "minecraft:trapped_chest"
             if state.properties.len() == 3 && facing() =>
@@ -2584,6 +2594,25 @@ mod tests {
                 states.push(state(name, Some(lit)));
             }
         }
+        for name in ["cave_vines", "cave_vines_plant"] {
+            for berries in [false, true] {
+                let ages: &[u8] = if name == "cave_vines" {
+                    &[0, 23, 25]
+                } else {
+                    &[0]
+                };
+                for &age in ages {
+                    let mut properties = BTreeMap::from([("berries".into(), berries.to_string())]);
+                    if name == "cave_vines" {
+                        properties.insert("age".into(), age.to_string());
+                    }
+                    states.push(BlockState {
+                        name: format!("minecraft:{name}"),
+                        properties,
+                    });
+                }
+            }
+        }
         for name in ["chest", "trapped_chest"] {
             for facing in ["north", "south", "west", "east"] {
                 for kind in ["single", "left", "right"] {
@@ -2609,6 +2638,12 @@ mod tests {
                 let mut row = serde_json::json!({"name": s.name});
                 if let Some(lit) = s.properties.get("lit") {
                     row["lit"] = serde_json::json!(lit == "true");
+                }
+                if let Some(berries) = s.properties.get("berries") {
+                    row["berries"] = serde_json::json!(berries == "true");
+                }
+                if let Some(age) = s.properties.get("age") {
+                    row["age"] = serde_json::json!(age.parse::<u8>().unwrap());
                 }
                 if let Some(facing) = s.properties.get("facing") {
                     row["facing"] = serde_json::json!(facing);

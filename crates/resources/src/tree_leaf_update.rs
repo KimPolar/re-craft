@@ -35,7 +35,6 @@ struct PositionSet {
 struct Bucket {
     order: Vec<Pos>,
     tree: Option<TreeBin>,
-    removed_from_tree: bool,
 }
 
 struct TreeNode {
@@ -50,6 +49,7 @@ struct TreeNode {
 struct TreeBin {
     nodes: Vec<TreeNode>,
     root: Option<usize>,
+    free: Vec<usize>,
 }
 impl TreeBin {
     fn rotate(&mut self, at: usize, left: bool) {
@@ -108,14 +108,20 @@ impl TreeBin {
                 self.nodes[i].right
             };
         }
-        let index = self.nodes.len();
-        self.nodes.push(TreeNode {
+        let node = TreeNode {
             pos,
             parent,
             left: None,
             right: None,
             red: true,
-        });
+        };
+        let index = if let Some(index) = self.free.pop() {
+            self.nodes[index] = node;
+            index
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        };
         if let Some(p) = parent {
             if hash < PositionSet::hash(self.nodes[p].pos) as i32 {
                 self.nodes[p].left = Some(index);
@@ -165,6 +171,154 @@ impl TreeBin {
     }
     fn root_pos(&self) -> Pos {
         self.nodes[self.root.unwrap()].pos
+    }
+
+    fn replace(&mut self, old: usize, new: Option<usize>) {
+        let parent = self.nodes[old].parent;
+        if let Some(parent) = parent {
+            if self.nodes[parent].left == Some(old) {
+                self.nodes[parent].left = new;
+            } else {
+                self.nodes[parent].right = new;
+            }
+        } else {
+            self.root = new;
+        }
+        if let Some(new) = new {
+            self.nodes[new].parent = parent;
+        }
+    }
+
+    fn is_red(&self, node: Option<usize>) -> bool {
+        node.is_some_and(|node| self.nodes[node].red)
+    }
+
+    fn child(&self, node: Option<usize>, left: bool) -> Option<usize> {
+        node.and_then(|node| {
+            if left {
+                self.nodes[node].left
+            } else {
+                self.nodes[node].right
+            }
+        })
+    }
+
+    fn fix_removal(
+        &mut self,
+        mut node: Option<usize>,
+        mut parent: Option<usize>,
+        mut absent_left: bool,
+    ) {
+        while node != self.root && !self.is_red(node) {
+            let Some(p) = parent else {
+                break;
+            };
+            let left = node.map_or(absent_left, |node| self.nodes[p].left == Some(node));
+            let mut sibling = self.child(Some(p), !left);
+            if self.is_red(sibling) {
+                self.nodes[sibling.unwrap()].red = false;
+                self.nodes[p].red = true;
+                self.rotate(p, left);
+                sibling = self.child(Some(p), !left);
+            }
+            if !self.is_red(self.child(sibling, true)) && !self.is_red(self.child(sibling, false)) {
+                if let Some(sibling) = sibling {
+                    self.nodes[sibling].red = true;
+                }
+                node = Some(p);
+                parent = self.nodes[p].parent;
+                absent_left = false;
+            } else {
+                if !self.is_red(self.child(sibling, !left)) {
+                    if let Some(near) = self.child(sibling, left) {
+                        self.nodes[near].red = false;
+                    }
+                    if let Some(s) = sibling {
+                        self.nodes[s].red = true;
+                        self.rotate(s, !left);
+                    }
+                    sibling = self.child(Some(p), !left);
+                }
+                if let Some(s) = sibling {
+                    self.nodes[s].red = self.nodes[p].red;
+                }
+                self.nodes[p].red = false;
+                if let Some(far) = self.child(sibling, !left) {
+                    self.nodes[far].red = false;
+                }
+                self.rotate(p, left);
+                node = self.root;
+                parent = None;
+            }
+        }
+        if let Some(node) = node {
+            self.nodes[node].red = false;
+        }
+    }
+
+    /// Remove a node from the balanced tree without changing its bucket's
+    /// iteration order, matching removal through a Java HashSet iterator.
+    fn remove(&mut self, pos: Pos) {
+        let hash = PositionSet::hash(pos) as i32;
+        let mut node = self.root;
+        let index = loop {
+            let i = node.expect("tree position is present");
+            let h = PositionSet::hash(self.nodes[i].pos) as i32;
+            if hash == h {
+                assert_eq!(pos, self.nodes[i].pos);
+                break i;
+            }
+            node = if hash < h {
+                self.nodes[i].left
+            } else {
+                self.nodes[i].right
+            };
+        };
+        let left = self.nodes[index].left;
+        let right = self.nodes[index].right;
+        let mut removed_red = self.nodes[index].red;
+        let replacement;
+        let replacement_parent;
+        let replacement_left;
+        if left.is_none() || right.is_none() {
+            replacement = left.or(right);
+            replacement_parent = self.nodes[index].parent;
+            replacement_left =
+                replacement_parent.is_some_and(|p| self.nodes[p].left == Some(index));
+            self.replace(index, replacement);
+        } else {
+            let mut successor = right.unwrap();
+            while let Some(next) = self.nodes[successor].left {
+                successor = next;
+            }
+            removed_red = self.nodes[successor].red;
+            replacement = self.nodes[successor].right;
+            if self.nodes[successor].parent == Some(index) {
+                replacement_parent = Some(successor);
+                replacement_left = false;
+                if let Some(replacement) = replacement {
+                    self.nodes[replacement].parent = Some(successor);
+                }
+            } else {
+                replacement_parent = self.nodes[successor].parent;
+                replacement_left = true;
+                self.replace(successor, replacement);
+                self.nodes[successor].right = right;
+                self.nodes[right.unwrap()].parent = Some(successor);
+            }
+            self.replace(index, Some(successor));
+            self.nodes[successor].left = left;
+            self.nodes[left.unwrap()].parent = Some(successor);
+            self.nodes[successor].red = self.nodes[index].red;
+        }
+        if !removed_red {
+            self.fix_removal(replacement, replacement_parent, replacement_left);
+        }
+        // Reuse the detached slot without changing any other node's index.
+        self.nodes[index].parent = None;
+        self.nodes[index].left = None;
+        self.nodes[index].right = None;
+        self.free.push(index);
     }
 }
 
@@ -233,7 +387,6 @@ impl PositionSet {
                     entry.treeify()?;
                 } else {
                     entry.tree = tree.take();
-                    entry.removed_from_tree = bucket.removed_from_tree;
                 }
             }
         }
@@ -249,10 +402,6 @@ impl PositionSet {
             return Ok(());
         }
         if self.buckets[i].tree.is_some() {
-            ensure!(
-                !self.buckets[i].removed_from_tree,
-                "unsupported insertion after Java tree-bin removal"
-            );
             let parent = self.buckets[i]
                 .tree
                 .as_mut()
@@ -286,13 +435,12 @@ impl PositionSet {
         for bucket in &mut self.buckets {
             if !bucket.order.is_empty() {
                 self.len -= 1;
-                if bucket.tree.is_some() {
-                    bucket.removed_from_tree = true;
-                }
                 let pos = bucket.order.remove(0);
+                if let Some(tree) = &mut bucket.tree {
+                    tree.remove(pos);
+                }
                 if bucket.order.is_empty() {
                     bucket.tree = None;
-                    bucket.removed_from_tree = false;
                 }
                 return Some(pos);
             }
@@ -392,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_dependent_tree_collisions_and_stale_tree_inserts_are_rejected() {
+    fn identity_dependent_tree_collisions_are_rejected() {
         let mut collisions = capacity_64();
         for k in 0..8 {
             collisions.insert([31 + 64 * k, 0, 0]).unwrap();
@@ -410,11 +558,83 @@ mod tests {
             set.insert([64 * k, 0, 0]).unwrap();
         }
         set.pop_first().unwrap();
+        set.insert([64 * 10, 0, 0]).unwrap();
+        assert!(set.values().any(|p| p == [64 * 10, 0, 0]));
+    }
+
+    #[test]
+    #[ignore = "requires Java 25 JDK"]
+    fn tree_bin_insertions_and_iterator_removals_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin/java.exe");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("PositionSetOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PositionSetOracle.java"),
+        )
+        .unwrap();
+        let output = Command::new(java).arg(source).output().unwrap();
         assert!(
-            set.insert([64 * 10, 0, 0])
-                .unwrap_err()
-                .to_string()
-                .contains("after Java tree-bin removal")
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let java = String::from_utf8(output.stdout).unwrap();
+        let mut expected = Vec::new();
+        for scenario in 0..4 {
+            let mut set = PositionSet::default();
+            let mut step = 0;
+            let point = |i: i32| match scenario {
+                0 => [i * 64, 0, 0],
+                1 => [(i - 150) * 64, 0, 0],
+                2 => [i * 256, 0, 0],
+                3 => [if i % 2 == 0 { i * 256 } else { -i * 256 }, 0, 0],
+                _ => unreachable!(),
+            };
+            let record = |set: &PositionSet, step: &mut i32, output: &mut Vec<String>| {
+                let parts = set
+                    .values()
+                    .map(|p| format!("{},{},{}", p[0], p[1], p[2]))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                output.push(format!("C {scenario} {step} {parts}"));
+                *step += 1;
+            };
+            for i in 0..100 {
+                set.insert(point(i)).unwrap();
+                record(&set, &mut step, &mut expected);
+            }
+            for i in 100..240 {
+                set.pop_first().unwrap();
+                record(&set, &mut step, &mut expected);
+                set.insert(point(i)).unwrap();
+                record(&set, &mut step, &mut expected);
+                if i % 7 == 0 {
+                    set.insert(point(i)).unwrap();
+                    record(&set, &mut step, &mut expected);
+                }
+                if i % 9 == 0 {
+                    set.pop_first().unwrap();
+                    record(&set, &mut step, &mut expected);
+                }
+            }
+            while set.len > 0 {
+                set.pop_first().unwrap();
+                record(&set, &mut step, &mut expected);
+            }
+            for i in 300..320 {
+                set.insert(point(i)).unwrap();
+                record(&set, &mut step, &mut expected);
+            }
+        }
+        let actual: Vec<_> = java.lines().collect();
+        assert_eq!(actual.len(), expected.len());
+        for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(*actual, expected, "operation {i}");
+        }
     }
 }

@@ -1782,7 +1782,10 @@ fn valid_tree_leaf_properties(state: &BlockState) -> Result<bool> {
 fn tree_generated_leaf(state: &BlockState) -> Result<bool> {
     if matches!(
         state.name.as_str(),
-        "minecraft:oak_leaves" | "minecraft:dark_oak_leaves"
+        "minecraft:oak_leaves"
+            | "minecraft:dark_oak_leaves"
+            | "minecraft:azalea_leaves"
+            | "minecraft:flowering_azalea_leaves"
     ) {
         valid_tree_leaf_properties(state)
     } else {
@@ -1949,7 +1952,10 @@ impl DecorationRegion<'_> {
             || tree_leaf_litter(state)?
             || (flags == 2 && tree_grass_block(state))
             || (flags == 2 && state.name == "minecraft:air" && state.properties.is_empty())
-            || (state.name == "minecraft:dirt" && state.properties.is_empty());
+            || (matches!(
+                state.name.as_str(),
+                "minecraft:dirt" | "minecraft:rooted_dirt"
+            ) && state.properties.is_empty());
         ensure!(allowed, "unsupported tree replacement effects");
         if self.is_outside(pos[1]) {
             return Ok(());
@@ -2950,6 +2956,7 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                                 | "minecraft:void_air"
                                 | "minecraft:stone"
                                 | "minecraft:dirt"
+                                | "minecraft:rooted_dirt"
                         )),
                 "unsupported tree edge shape update for {}",
                 state.name
@@ -3318,7 +3325,13 @@ impl DiskWorld for DecorationRegion<'_> {
             ("minecraft:sugar_cane" | "minecraft:cactus", "age") => Some((0, 15)),
             ("minecraft:sweet_berry_bush", "age") => Some((0, 3)),
             ("minecraft:water" | "minecraft:lava", "level") => Some((0, 15)),
-            ("minecraft:oak_leaves" | "minecraft:dark_oak_leaves", "distance") => Some((1, 7)),
+            (
+                "minecraft:oak_leaves"
+                | "minecraft:dark_oak_leaves"
+                | "minecraft:azalea_leaves"
+                | "minecraft:flowering_azalea_leaves",
+                "distance",
+            ) => Some((1, 7)),
             ("minecraft:leaf_litter", "segment_amount") => Some((1, 4)),
             ("minecraft:snow", "layers") => Some((1, 8)),
             (
@@ -8053,6 +8066,78 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn planned_azalea_tree_updates_generated_leaves_and_soil() {
+        struct AzaleaData;
+        impl ResourceProvider for AzaleaData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/worldgen/biome/plains.json" => {
+                        let mut v: Value =
+                            serde_json::from_slice(&TreeData.read_data(path)?.unwrap())?;
+                        let tree = &mut v["features"][0][0]["feature"];
+                        tree["below_trunk_provider"] = json!({"id":"minecraft:rooted_dirt"});
+                        tree["trunk_placer"] = json!({"type":"minecraft:bending_trunk_placer","base_height":4,"height_rand_a":2,"height_rand_b":0,"min_height_for_leaves":3,"bend_length":{"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":2}});
+                        tree["foliage_provider"] = json!({"type":"minecraft:weighted","entries":[
+                            {"data":{"id":"minecraft:azalea_leaves","properties":{"distance":"7","persistent":"false","waterlogged":"false"}},"weight":3},
+                            {"data":{"id":"minecraft:flowering_azalea_leaves","properties":{"distance":"7","persistent":"false","waterlogged":"false"}},"weight":1}]});
+                        tree["foliage_placer"] = json!({"type":"minecraft:random_spread_foliage_placer","radius":3,"offset":0,"foliage_height":2,"leaf_placement_attempts":50});
+                        v
+                    }
+                    "data/minecraft/tags/block/replaceable_by_trees.json" => {
+                        json!({"values":["minecraft:azalea_leaves","minecraft:flowering_azalea_leaves"]})
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json" => {
+                        json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:rooted_dirt","minecraft:grass_block","minecraft:oak_log","minecraft:azalea_leaves","minecraft:flowering_azalea_leaves"]})
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:rooted_dirt","minecraft:grass_block","minecraft:oak_log"]})
+                    }
+                    _ => return TreeData.read_data(path),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(&mut AzaleaData, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let (_, _, mut registry) = prepare_tree_fixture();
+        registry.extend([
+            "minecraft:rooted_dirt".into(),
+            "minecraft:azalea_leaves".into(),
+            "minecraft:flowering_azalea_leaves".into(),
+        ]);
+        let prepared =
+            PreparedDecoration::load(&mut AzaleaData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+        let world = terrain.snapshot();
+        assert_eq!(world.block(8, 7, 8).unwrap().name, "minecraft:rooted_dirt");
+        let mut leaves = 0;
+        for x in 2..=14 {
+            for y in 8..16 {
+                for z in 2..=14 {
+                    let state = world.block(x, y, z).unwrap();
+                    if matches!(
+                        state.name.as_str(),
+                        "minecraft:azalea_leaves" | "minecraft:flowering_azalea_leaves"
+                    ) {
+                        leaves += 1;
+                        assert!(
+                            (1..=7).contains(&state.properties["distance"].parse::<u8>().unwrap())
+                        );
+                    }
+                }
+            }
+        }
+        assert!(leaves > 10);
     }
 
     #[test]

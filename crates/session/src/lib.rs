@@ -65,6 +65,7 @@ mod stair_mining;
 pub mod stair_placement;
 pub mod survival;
 pub mod time_command;
+pub mod vibration;
 mod water_entry;
 pub mod weather;
 pub mod weather_command;

@@ -216,6 +216,10 @@ impl ConfiguredDecoration {
     fn needs_water_fluids(&self) -> bool {
         match self {
             Self::Lake(_) => true,
+            Self::Simple(v) => v
+                .possible_states()
+                .iter()
+                .any(|s| s.name == "minecraft:tall_seagrass"),
             Self::VegetationPatch(_, nested) => nested.needs_water_fluids(),
             Self::RootSystem(_, _) => true,
             Self::Selector(values) => values
@@ -525,6 +529,9 @@ impl ConfiguredDecoration {
                         }
                         Ok(SimplePlantKind::Mushroom) => {
                             Some("minecraft:overrides_mushroom_light_requirement")
+                        }
+                        Ok(SimplePlantKind::Seagrass | SimplePlantKind::TallSeagrass) => {
+                            Some("minecraft:cannot_support_seagrass")
                         }
                         _ => None,
                     };
@@ -3752,6 +3759,8 @@ enum SimplePlantKind {
     Unconditional,
     Mushroom,
     LeafLitter,
+    Seagrass,
+    TallSeagrass,
 }
 
 // All states of these vanilla blocks have been checked for their Java
@@ -3762,6 +3771,21 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
         "minecraft:leaf_litter" => {
             tree_leaf_litter(state)?;
             SimplePlantKind::LeafLitter
+        }
+        "minecraft:seagrass" => {
+            ensure!(state.properties.is_empty(), "invalid seagrass state");
+            SimplePlantKind::Seagrass
+        }
+        "minecraft:tall_seagrass" => {
+            ensure!(
+                state.properties.len() == 1
+                    && matches!(
+                        state.properties.get("half").map(String::as_str),
+                        Some("lower" | "upper")
+                    ),
+                "invalid tall seagrass state"
+            );
+            SimplePlantKind::TallSeagrass
         }
         "minecraft:short_grass"
         | "minecraft:fern"
@@ -3908,6 +3932,36 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                     let state = self.block(below)?;
                     DiskWorld::face_sturdy(self, &state, below, [0, 1, 0])?
                 }
+                SimplePlantKind::Seagrass | SimplePlantKind::TallSeagrass => {
+                    if matches!(kind, SimplePlantKind::TallSeagrass)
+                        && state.properties["half"] == "upper"
+                    {
+                        let support = self.block(below)?;
+                        support.name == state.name
+                            && support.properties.get("half").map(String::as_str) == Some("lower")
+                    } else {
+                        let support = self.block(below)?;
+                        let sturdy = DiskWorld::face_sturdy(self, &support, below, [0, 1, 0])?;
+                        let allowed = sturdy
+                            && !self.tags.contains(
+                                &ResourceId::parse("minecraft:cannot_support_seagrass")?,
+                                &support.name,
+                            )?;
+                        if allowed && matches!(kind, SimplePlantKind::TallSeagrass) {
+                            let current = self.block(pos)?;
+                            let fluid = native_world::fluid::FluidState::from_block(&current)
+                                .map_err(anyhow::Error::msg)?;
+                            fluid.is_some_and(|f| f.amount == 8)
+                                && DiskWorld::fluid_in_tag(
+                                    self,
+                                    &current,
+                                    &ResourceId::parse("minecraft:water")?,
+                                )?
+                        } else {
+                            allowed
+                        }
+                    }
+                }
                 SimplePlantKind::Double
                     if state.properties.get("half").map(String::as_str) == Some("upper") =>
                 {
@@ -3927,16 +3981,43 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             if !survives {
                 return Ok(false);
             }
-            if matches!(kind, SimplePlantKind::Double) {
+            if matches!(
+                kind,
+                SimplePlantKind::Double | SimplePlantKind::TallSeagrass
+            ) {
                 let above = [pos[0], pos[1].wrapping_add(1), pos[2]];
                 let upper = self.block(above)?;
                 let free = if is_air(&upper) {
                     true
-                } else if native_world::fluid::FluidState::from_block(&upper)
-                    .map_err(anyhow::Error::msg)?
-                    .is_some()
+                } else if let Some(upper_fluid) =
+                    native_world::fluid::FluidState::from_block(&upper)
+                        .map_err(anyhow::Error::msg)?
                 {
-                    false
+                    if matches!(kind, SimplePlantKind::TallSeagrass)
+                        && upper_fluid
+                            == native_world::fluid::FluidState::from_block(state)
+                                .map_err(anyhow::Error::msg)?
+                                .context("missing tall seagrass fluid")?
+                    {
+                        match upper.name.as_str() {
+                            "minecraft:water" => true,
+                            "minecraft:seagrass" | "minecraft:tall_seagrass" => {
+                                simple_plant_kind(&upper)?;
+                                true
+                            }
+                            _ if disk_safe_solid(&upper.name).is_some()
+                                || tree_generated_leaf(&upper)? =>
+                            {
+                                false
+                            }
+                            _ => bail!(
+                                "unsupported fluid-filled double-plant replacement {}",
+                                upper.name
+                            ),
+                        }
+                    } else {
+                        false
+                    }
                 } else {
                     match upper.name.as_str() {
                         "minecraft:short_grass"
@@ -6992,6 +7073,257 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn seagrass_features_match_java_placement() {
+        use std::{path::PathBuf, process::Command};
+        struct GrassData(bool);
+        impl ResourceProvider for GrassData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/cannot_support_seagrass.json" {
+                    return Ok(Some(if self.0 {
+                        br#"{"values":["minecraft:magma_block","minecraft:stone"]}"#.to_vec()
+                    } else {
+                        br#"{"values":["minecraft:magma_block"]}"#.to_vec()
+                    }));
+                }
+                Data.read_data(path)
+            }
+        }
+        fn sample(i: i32) -> BlockState {
+            let mut s = state(match i {
+                0 => "air",
+                1 | 2 | 3 => "water",
+                4 => "lava",
+                5 => "seagrass",
+                6 | 7 => "tall_seagrass",
+                _ => unreachable!(),
+            });
+            match i {
+                1 => {
+                    s.properties.insert("level".into(), "0".into());
+                }
+                2 => {
+                    s.properties.insert("level".into(), "1".into());
+                }
+                3 => {
+                    s.properties.insert("level".into(), "8".into());
+                }
+                4 => {
+                    s.properties.insert("level".into(), "0".into());
+                }
+                6 | 7 => {
+                    s.properties
+                        .insert("half".into(), if i == 6 { "lower" } else { "upper" }.into());
+                }
+                _ => {}
+            }
+            s
+        }
+        fn key(s: &BlockState) -> String {
+            let mut text = format!("{}|", s.name);
+            for (k, v) in &s.properties {
+                text.push_str(&format!("{k}={v};"));
+            }
+            text
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SeagrassFeatureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/SeagrassFeatureOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SeagrassFeatureOracle"));
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:lava".into(),
+            "minecraft:sand".into(),
+            "minecraft:magma_block".into(),
+            "minecraft:seagrass".into(),
+            "minecraft:tall_seagrass".into(),
+        ]);
+        let motion = HeightmapTags::load(&mut GrassData(false), &registry).unwrap();
+        let mut checked = 0;
+        for mode in 0..8 {
+            let tags = OreBlockTags::load(
+                &mut GrassData(mode & 4 != 0),
+                &registry,
+                &BTreeSet::from([ResourceId::parse("minecraft:cannot_support_seagrass").unwrap()]),
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            let mut water = BTreeSet::new();
+            if mode & 1 != 0 {
+                water.insert("minecraft:water".into());
+            }
+            if mode & 2 != 0 {
+                water.insert("minecraft:flowing_water".into());
+            }
+            region.lake_water_fluids = Some(&water);
+            for line in output
+                .lines()
+                .filter(|line| line.starts_with(&format!("S {mode} ")))
+            {
+                let p: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(p.len(), 11, "{line}");
+                let kind: i32 = p[2].parse().unwrap();
+                let base: i32 = p[3].parse().unwrap();
+                let here: i32 = p[4].parse().unwrap();
+                let above: i32 = p[5].parse().unwrap();
+                let support = match base {
+                    0 => state("stone"),
+                    1 => state("sand"),
+                    2 => state("magma_block"),
+                    3 => state("air"),
+                    _ => sample(6),
+                };
+                region.set_section_block([8, 7, 8], &support).unwrap();
+                region.set_section_block([8, 8, 8], &sample(here)).unwrap();
+                region.set_section_block([8, 9, 8], &sample(above)).unwrap();
+                let target = if kind == 0 {
+                    sample(5)
+                } else if kind == 1 {
+                    sample(6)
+                } else {
+                    sample(7)
+                };
+                let mut random = DecorationRandom::new(42);
+                let feature=SimpleBlockFeature::decode(&json!({"type":"minecraft:simple_block","to_place":{"id":target.name,"properties":target.properties}}),&mut resolve_tree_test).unwrap();
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[6] == "true",
+                    "{line}"
+                );
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[7] == "true",
+                    "second {line}"
+                );
+                assert_eq!(key(&region.read([8, 8, 8]).unwrap()), p[8], "{line}");
+                assert_eq!(key(&region.read([8, 9, 8]).unwrap()), p[9], "{line}");
+                assert_eq!(random.next_long(), p[10].parse::<i64>().unwrap(), "{line}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8 * 3 * 5 * 8 * 8);
+    }
+
+    #[test]
+    fn weighted_tall_seagrass_writes_both_halves_in_chunk() {
+        struct GrassData;
+        impl ResourceProvider for GrassData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/cannot_support_seagrass.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        let value = json!({"feature":{"type":"minecraft:weighted_random_selector","features":[{"weight":1,"data":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:tall_seagrass","properties":{"half":"lower"}}},"placement":[]}}]},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut GrassData,
+            PlacedFeature::decode(&value).unwrap(),
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        assert!(placed.needs_water_fluids());
+        assert!(
+            placed
+                .required_tags()
+                .contains(&ResourceId::parse("minecraft:cannot_support_seagrass").unwrap())
+        );
+        let mut registry = batch_registry();
+        registry.extend(["minecraft:water".into(), "minecraft:tall_seagrass".into()]);
+        let tags = OreBlockTags::load(&mut GrassData, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut GrassData, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let water_tags = BTreeSet::from([
+            "minecraft:water".to_string(),
+            "minecraft:flowing_water".to_string(),
+        ]);
+        region.lake_water_fluids = Some(&water_tags);
+        let mut water = state("water");
+        water.properties.insert("level".into(), "0".into());
+        for y in [8, 9] {
+            region.set_section_block([8, y, 8], &water).unwrap();
+            region.update_final_heightmaps([8, y, 8], &water).unwrap();
+        }
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(
+                    &placed,
+                    &mut DecorationRandom::new(42),
+                    [8, 8, 8],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:air");
+        for (y, half) in [(8, "lower"), (9, "upper")] {
+            let state = after.block(8, y, 8).unwrap();
+            assert_eq!(state.name, "minecraft:tall_seagrass");
+            assert_eq!(state.properties["half"], half);
+        }
     }
 
     #[test]

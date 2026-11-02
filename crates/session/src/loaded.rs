@@ -6558,7 +6558,6 @@ impl LoadedSession {
         if flying {
             return;
         }
-        self.unresolved_bubble_tick = true;
         self.motion.velocity =
             crate::bubble_column::player_velocity(self.motion.velocity, drag_down, surface, false);
         if surface {
@@ -16842,25 +16841,48 @@ impl LoadedSession {
                         {
                             continue;
                         }
-                        self.unresolved_bubble_tick = true;
                         let Some(above) = add(contact.position, IVec3::Y) else {
+                            self.unresolved_bubble_tick = true;
                             continue;
                         };
                         let Cell::State(id) =
                             cell(&self.world, self.origin, self.bounds, above, self.states[0])
                         else {
+                            self.unresolved_bubble_tick = true;
                             continue;
                         };
+                        let Some(state) = self.world.state(id) else {
+                            self.unresolved_bubble_tick = true;
+                            continue;
+                        };
+                        if (state.name == "minecraft:bubble_column"
+                            && bubble_column_drag(state).is_none())
+                            || state
+                                .properties
+                                .get("waterlogged")
+                                .is_some_and(|v| v != "true" && v != "false")
+                            || (matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
+                                && (state.properties.len() != 1
+                                    || !state.properties.contains_key("level")))
+                            || FluidState::from_block(state).is_err()
+                        {
+                            self.unresolved_bubble_tick = true;
+                            continue;
+                        }
                         let Some(shape) = self.shapes.get(id.0 as usize).and_then(Option::as_deref)
                         else {
+                            self.unresolved_bubble_tick = true;
                             continue;
                         };
                         let Some(fluid) = self.fluids.get(id.0 as usize) else {
+                            self.unresolved_bubble_tick = true;
                             continue;
                         };
                         let surface = shape.is_empty() && fluid.is_none();
                         if let Some(position) = add(self.origin, contact.position) {
                             self.apply_player_bubble_contact(drag_down, surface, flying, position);
+                        } else {
+                            self.unresolved_bubble_tick = true;
                         }
                     }
                 }
@@ -30694,9 +30716,109 @@ pub(crate) mod tests {
                     expected_random.next_int(),
                     "surface={surface}, drag={drag}"
                 );
-                assert!(actual.unresolved_bubble_tick);
+                assert!(!actual.unresolved_bubble_tick);
             }
         }
+    }
+
+    #[test]
+    fn player_bubble_contact_is_preserved_in_player_draft() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        for surface in [false, true] {
+            for drag in [false, true] {
+                let mut session = session();
+                session.set_random_tick_speed(0);
+                let bubble = session.intern_block(state(
+                    "minecraft:bubble_column",
+                    &[("drag", if drag { "true" } else { "false" })],
+                ));
+                assert!(session.set_with_notify(IVec3::new(8, 1, 8), bubble, false));
+                if !surface {
+                    let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                    assert!(session.set_with_notify(IVec3::new(8, 2, 8), water, false));
+                }
+                let position = DVec3::new(8.5, 1.2, 8.5);
+                let velocity = DVec3::new(0.0, -0.2, 0.0);
+                let saved = crate::player_data::SavedPlayerMotion {
+                    velocity,
+                    on_ground: false,
+                    fall_distance: 5.0,
+                };
+                session.restore_saved_motion(position, saved).unwrap();
+                let list = |v: DVec3| Tag::List {
+                    element_type: TagType::Double,
+                    values: v.to_array().into_iter().map(Tag::Double).collect(),
+                };
+                let original = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        (
+                            "Dimension".into(),
+                            Tag::String("minecraft:overworld".into()),
+                        ),
+                        ("Pos".into(), list(position + session.origin.as_dvec3())),
+                        ("Motion".into(), list(velocity)),
+                        ("OnGround".into(), Tag::Byte(0)),
+                        ("fall_distance".into(), Tag::Double(5.0)),
+                        ("future".into(), Tag::Int(7)),
+                    ]),
+                };
+                session.restore_saved_player_inventory(&original).unwrap();
+                session.update(TICK);
+                assert!(
+                    !session.unresolved_bubble_tick,
+                    "surface={surface} drag={drag}"
+                );
+                let draft = session.draft_player_state(&original).unwrap();
+                assert!(draft.matches_source(&original).unwrap());
+                assert_eq!(
+                    crate::player_data::read_saved_motion(draft.document()).unwrap(),
+                    crate::player_data::SavedPlayerMotion {
+                        velocity: session.motion.velocity,
+                        on_ground: session.motion.on_ground,
+                        fall_distance: session.fall_distance,
+                    }
+                );
+                assert_eq!(
+                    crate::player_data::read_saved_position(draft.document()).unwrap(),
+                    Some(session.origin.as_dvec3() + session.motion.position)
+                );
+                assert_eq!(draft.document().value.get("future"), Some(&Tag::Int(7)));
+                let mut changed = original.clone();
+                if let Tag::Compound(fields) = &mut changed.value {
+                    fields.push(("unexpected".into(), Tag::Int(1)));
+                }
+                assert!(session.draft_player_state(&changed).is_err());
+                session.unresolved_bubble_tick = true;
+                assert!(session.draft_player_state(&original).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn player_bubble_contact_rejects_malformed_fluid_above() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let bubble = session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+        let invalid_water = session.intern_block(state("minecraft:water", &[("level", "invalid")]));
+        assert!(session.set_with_notify(IVec3::new(8, 1, 8), bubble, false));
+        assert!(session.set_with_notify(IVec3::new(8, 2, 8), invalid_water, false));
+        session.motion.position = DVec3::new(8.5, 1.2, 8.5);
+        session.motion.velocity = DVec3::ZERO;
+        session.motion.on_ground = false;
+        session.player.position = session.motion.position.as_vec3();
+        session.player.on_ground = false;
+        session.update(TICK);
+        assert!(session.unresolved_bubble_tick || session.unresolved_player_fire_contact);
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "DataVersion".into(),
+                native_persistence::nbt::Tag::Int(5023),
+            )]),
+        };
+        assert!(session.draft_player_state(&original).is_err());
     }
 
     #[test]

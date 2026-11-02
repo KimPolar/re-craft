@@ -4468,6 +4468,11 @@ impl LoadedSession {
             )
             .filter(|(_, sensor, _)| sensor.position.z.div_euclid(16) == position.z)
             .peekable();
+        crate::saved_sculk::validate_chunk_sources(
+            &original.value,
+            position,
+            sensors.clone().map(|(_, sensor, _)| sensor),
+        )?;
         if sensors.peek().is_none() {
             return Ok(());
         }
@@ -32514,6 +32519,70 @@ pub(crate) mod tests {
             },
         ));
         let source_bytes = nbt::write(&source).unwrap();
+        // Unchanged listeners still have to match the source and every sensor
+        // in the source must have been registered by this session.
+        let mut stale_unchanged = source.clone();
+        let Tag::Compound(fields) = &mut stale_unchanged.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_entities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(entity) = &mut values[0] else {
+            unreachable!()
+        };
+        entity.push(("untracked".into(), Tag::Int(1)));
+        let mut unchanged_draft = session
+            .draft_unchanged_chunk(chunk, &stale_unchanged)
+            .unwrap();
+        let unchanged_before = nbt::write(unchanged_draft.document()).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &stale_unchanged, &mut unchanged_draft)
+                .is_err()
+        );
+        assert_eq!(
+            nbt::write(unchanged_draft.document()).unwrap(),
+            unchanged_before
+        );
+
+        let tracked = session
+            .sculk_listeners
+            .remove(&sensor_pos.to_array())
+            .unwrap();
+        let mut untracked_draft = session.draft_unchanged_chunk(chunk, &source).unwrap();
+        let untracked_before = nbt::write(untracked_draft.document()).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &source, &mut untracked_draft)
+                .is_err()
+        );
+        assert_eq!(
+            nbt::write(untracked_draft.document()).unwrap(),
+            untracked_before
+        );
+        session
+            .sculk_listeners
+            .insert(sensor_pos.to_array(), tracked);
+
+        let mut missing_source = source.clone();
+        let Tag::Compound(fields) = &mut missing_source.value else {
+            unreachable!()
+        };
+        fields.retain(|(name, _)| !name.matches("block_entities"));
+        let mut missing_draft = session
+            .draft_unchanged_chunk(chunk, &missing_source)
+            .unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &missing_source, &mut missing_draft)
+                .is_err()
+        );
         session.dispatch_item_splash(crate::ItemWaterEntry {
             tick: 0,
             entity_id: 1,

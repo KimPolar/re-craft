@@ -203,6 +203,72 @@ fn unique<'a>(tag: &'a Tag, name: &str) -> Result<Option<&'a Tag>> {
     Ok(value)
 }
 
+/// Check every original sensor, including unchanged listeners, against the
+/// session's complete set of active and removed sensors before staging edits.
+pub(crate) fn validate_chunk_sources<'a>(
+    root: &Tag,
+    chunk: ChunkPos,
+    sensors: impl Iterator<Item = &'a SavedSculkSensor>,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut expected = BTreeMap::new();
+    for sensor in sensors {
+        let pos = sensor.position;
+        ensure!(
+            pos.x.div_euclid(16) == chunk.x && pos.z.div_euclid(16) == chunk.z,
+            "sensor is outside chunk"
+        );
+        ensure!(
+            expected.insert(pos.to_array(), sensor.source()).is_none(),
+            "duplicate sensor listener"
+        );
+    }
+    let values = match unique(root, "block_entities")? {
+        None => &[][..],
+        Some(Tag::List {
+            element_type,
+            values,
+        }) if *element_type == TagType::Compound || values.is_empty() => values.as_slice(),
+        _ => bail!("chunk block entities are not a compound list"),
+    };
+    let mut positions = BTreeSet::new();
+    for entity in values {
+        let coord = |field| match unique(entity, field)? {
+            Some(Tag::Int(value)) => Ok(*value),
+            _ => bail!("invalid block entity {field}"),
+        };
+        let pos = [coord("x")?, coord("y")?, coord("z")?];
+        ensure!(
+            pos[0].div_euclid(16) == chunk.x && pos[2].div_euclid(16) == chunk.z,
+            "block entity outside chunk"
+        );
+        ensure!(positions.insert(pos), "duplicate block entity position");
+        let Some(Tag::String(id)) = unique(entity, "id")? else {
+            bail!("invalid block entity id")
+        };
+        let is_sensor = [
+            "minecraft:sculk_sensor",
+            "sculk_sensor",
+            "minecraft:calibrated_sculk_sensor",
+            "calibrated_sculk_sensor",
+        ]
+        .iter()
+        .any(|name| id.matches(name));
+        if is_sensor {
+            ensure!(
+                expected.remove(&pos) == Some(entity),
+                "sensor block entity is untracked or changed since loading"
+            );
+        }
+    }
+    ensure!(
+        expected.is_empty(),
+        "tracked sensor block entity is missing"
+    );
+    Ok(())
+}
+
 fn number(tag: &Tag) -> Option<f64> {
     match tag {
         Tag::Byte(v) => Some(f64::from(*v)),
@@ -445,6 +511,69 @@ mod tests {
             ),
             ("unknown".into(), Tag::Int(37)),
         ])
+    }
+    #[test]
+    fn chunk_source_validation_requires_exact_complete_unique_sensors() {
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let original = sensor();
+        let saved = read(
+            &payload(vec![original.clone()]),
+            chunk,
+            IVec3::new(1, 4, 2),
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let chest = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(3)),
+            ("y".into(), Tag::Int(4)),
+            ("z".into(), Tag::Int(2)),
+        ]);
+        let root = |values| {
+            Tag::Compound(vec![(
+                "block_entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values,
+                },
+            )])
+        };
+        assert!(
+            validate_chunk_sources(
+                &root(vec![original.clone(), chest.clone()]),
+                chunk,
+                [&saved].into_iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_chunk_sources(&root(vec![original.clone()]), chunk, std::iter::empty())
+                .is_err()
+        );
+        assert!(validate_chunk_sources(&root(vec![chest]), chunk, [&saved].into_iter()).is_err());
+        assert!(
+            validate_chunk_sources(
+                &root(vec![original.clone(), original.clone()]),
+                chunk,
+                [&saved].into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_chunk_sources(
+                &root(vec![original.clone()]),
+                chunk,
+                [&saved, &saved].into_iter()
+            )
+            .is_err()
+        );
+        let mut changed = original;
+        let Tag::Compound(fields) = &mut changed else {
+            unreachable!()
+        };
+        fields.push(("extra".into(), Tag::Int(1)));
+        assert!(validate_chunk_sources(&root(vec![changed]), chunk, [&saved].into_iter()).is_err());
     }
     #[test]
     fn unavailable_duplicate_and_invalid_listener_are_not_treated_as_empty() {

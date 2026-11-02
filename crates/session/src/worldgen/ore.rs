@@ -36,7 +36,9 @@ use native_world::loaded::{
 };
 use serde_json::Value;
 
-use super::{CarvedTerrainWorld, DecorationPlan, FreshGenerationLightTracker};
+use super::{
+    CarvedTerrainWorld, DecorationPlan, FreshGenerationLightTracker, StagedGenerationLightEngine,
+};
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
@@ -665,6 +667,45 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&block),
             Some(&raw),
             Some(tracker),
+        )
+    }
+
+    /// Read a staged engine revision before FEATURES begins. Registered
+    /// chunks remain immutable; writes to them roll back the entire attempt.
+    pub fn execute_with_staged_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        engine: &StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<bool>> {
+        let center = self.center_chunk();
+        let mut covered = BTreeSet::new();
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                covered.insert(ChunkPos {
+                    x: center.x.checked_add(dx).context("light X overflow")?,
+                    z: center.z.checked_add(dz).context("light Z overflow")?,
+                });
+            }
+        }
+        let light = engine.snapshot(terrain, covered, registry)?;
+        let block = |p| {
+            light
+                .block_light(p)
+                .context("block-light column not captured")
+        };
+        let raw = |_: &World, p| {
+            light
+                .raw_brightness(p, 0)
+                .context("raw-brightness column not captured")
+        };
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            Some(&block),
+            Some(&raw),
+            Some(&engine.fresh),
         )
     }
 
@@ -4190,7 +4231,7 @@ mod tests {
                             &BTreeSet::from([center]),
                             &vanilla
                         )
-                        .is_err()
+                        .is_ok()
                 );
                 for z in -1..=1 {
                     for x in -1..=1 {
@@ -4242,6 +4283,66 @@ mod tests {
             assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
             if x == 8 {
                 assert!(tracker.sky_sources(&terrain, center).is_err());
+            }
+        }
+        // A neighboring initialized chunk may already emit while the target
+        // is still at FEATURES. Compare the same placement before and after
+        // the source is activated, and reject recomputation after later edits.
+        for active in [false, true] {
+            let schedule = FeatureSchedule::load(
+                &mut MushroomAt(15),
+                std::slice::from_ref(&plains),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let (_, _, neighborhood) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let mut registry = batch_registry();
+            registry.extend(["minecraft:brown_mushroom".into(), "minecraft:torch".into()]);
+            let prepared =
+                PreparedDecoration::load(&mut MushroomAt(15), &plan, &registry, &mut resolve_test)
+                    .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let east = ChunkPos { x: 1, z: 0 };
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -3..=3 {
+                for x in -3..=3 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            let torch = world.intern_state(state("torch"));
+            world.set_block_id(16, 8, 8, torch).unwrap();
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker.initialize_chunk(&terrain, east, &vanilla).unwrap();
+            let mut engine = super::super::StagedGenerationLightEngine::new(tracker);
+            if active {
+                engine.activate(&terrain, east, [center], &vanilla).unwrap();
+            }
+            let mut steps = super::super::schedule::GenerationSchedule::new();
+            use super::super::schedule::GenerationStage;
+            steps.request(center, GenerationStage::Features).unwrap();
+            while !steps.ready(center, GenerationStage::Features) {
+                let (pos, stage) = steps.next_ready().unwrap();
+                steps.complete(pos, stage).unwrap();
+            }
+            let result = steps
+                .run_features_with_staged_light(&mut terrain, &prepared, false, &engine, &vanilla)
+                .unwrap();
+            assert_eq!(result, [!active]);
+            assert_eq!(steps.completed(center), Some(GenerationStage::Features));
+            if active {
+                let world = Arc::make_mut(&mut terrain.world);
+                let stone = world.intern_state(state("stone"));
+                world.set_block_id(14, 8, 8, stone).unwrap();
+                assert!(engine.snapshot(&terrain, [center], &vanilla).is_err());
             }
         }
         let (mut invalid, _, _, _) = fixture();

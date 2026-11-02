@@ -338,6 +338,26 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Execute FEATURES using an already published staged-light revision.
+    pub fn run_features_with_staged_light(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures_enabled: bool,
+        engine: &super::StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<bool>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result =
+            prepared.execute_with_staged_light(terrain, structures_enabled, engine, registry)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Calculate direct-sky sources and register sections before advancing the
     /// fresh INITIALIZE_LIGHT stage. No light propagation is performed here.
     pub fn run_light_initialization(

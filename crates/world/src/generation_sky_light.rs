@@ -20,7 +20,7 @@ pub fn initialize_generated_sky_light(
     bounds: LightBounds,
     center: ChunkPos,
 ) -> Option<VisibleLayers> {
-    calculate_generated_sky_light(world, bounds, center, None, None)
+    calculate_generated_sky_light(world, bounds, center, None, None, None)
 }
 
 /// Preview a fresh sky engine after activating the specified chunks. The source
@@ -32,7 +32,40 @@ pub fn generated_sky_light_from_active_chunks(
     active: &BTreeSet<ChunkPos>,
     fresh_storage: &VisibleLightSnapshot,
 ) -> Option<VisibleLayers> {
-    calculate_generated_sky_light(world, bounds, center, Some(active), Some(fresh_storage))
+    calculate_generated_sky_light(
+        world,
+        bounds,
+        center,
+        Some(active),
+        Some(fresh_storage),
+        None,
+    )
+}
+
+/// Model a fresh engine whose section registrations and sky-source
+/// initializations have only reached some chunks. Uninitialized chunks must
+/// still have the default, never-updated Java sky-source heightmap. All
+/// registration events and prior activations must be included in these sets.
+pub fn generated_sky_light_with_initialization_history(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    active: &BTreeSet<ChunkPos>,
+    fresh_storage: &VisibleLightSnapshot,
+    registered: &BTreeSet<ChunkPos>,
+    initialized: &BTreeSet<ChunkPos>,
+) -> Option<VisibleLayers> {
+    if !active.is_subset(initialized) || !initialized.is_subset(registered) {
+        return None;
+    }
+    calculate_generated_sky_light(
+        world,
+        bounds,
+        center,
+        Some(active),
+        Some(fresh_storage),
+        Some((registered, initialized)),
+    )
 }
 
 fn calculate_generated_sky_light(
@@ -41,6 +74,7 @@ fn calculate_generated_sky_light(
     center: ChunkPos,
     active: Option<&BTreeSet<ChunkPos>>,
     fresh_storage: Option<&VisibleLightSnapshot>,
+    history: Option<(&BTreeSet<ChunkPos>, &BTreeSet<ChunkPos>)>,
 ) -> Option<VisibleLayers> {
     const SIDE: usize = 48;
     const PLANE: usize = SIDE * SIDE;
@@ -111,6 +145,13 @@ fn calculate_generated_sky_light(
     if fresh_storage.is_some() {
         for cz in 0..3usize {
             for cx in 0..3usize {
+                let pos = ChunkPos {
+                    x: center.x.checked_add(cx as i32 - 1)?,
+                    z: center.z.checked_add(cz as i32 - 1)?,
+                };
+                if history.is_some_and(|(registered, _)| !registered.contains(&pos)) {
+                    continue;
+                }
                 for section in 0..sections {
                     if empty[(cz * 3 + cx) * sections + section] {
                         continue;
@@ -149,7 +190,10 @@ fn calculate_generated_sky_light(
             };
             let mut above = 0usize;
             let mut lowest = 0usize;
-            'scan: for sy in (0..sections).rev() {
+            'scan: for sy in (0..sections)
+                .rev()
+                .filter(|_| history.is_none_or(|(_, initialized)| initialized.contains(&pos)))
+            {
                 if empty[((z / 16) * 3 + x / 16) * sections + sy] {
                     above = 0;
                     continue;

@@ -64,8 +64,12 @@ public class SparseSkyLightStagesOracle implements LightChunkGetter,BlockGetter 
                 if(Math.floorDiv(p.getX(),16)==x && Math.floorDiv(p.getZ(),16)==z)
                     fake.sections[p.getY()/16].setBlockState(Math.floorMod(p.getX(),16),p.getY()%16,Math.floorMod(p.getZ(),16),entry.getValue());
             }
-            for(int sy=0;sy<6;sy++)if(!fake.sections[sy].hasOnlyAir())e.updateSectionStatus(SectionPos.of(x,sy,z),false);
-            chunk.sources.fillFrom(fake);
+            boolean initialized=args.length<=3 || Arrays.asList(args[3].split(",")).contains(x+":"+z);
+            boolean registered=args.length<=4 ? initialized : Arrays.asList(args[4].split(",")).contains(x+":"+z);
+            if(registered){
+                for(int sy=0;sy<6;sy++)if(!fake.sections[sy].hasOnlyAir())e.updateSectionStatus(SectionPos.of(x,sy,z),false);
+            }
+            if(initialized)chunk.sources.fillFrom(fake);
         }
         while(e.hasLightWork())e.runLightUpdates();var out=new JsonArray();out.add(capture(e));
         var order=(args.length>2?args[2]:"0,1,-1").split(",");

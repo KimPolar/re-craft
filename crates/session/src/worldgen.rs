@@ -381,7 +381,9 @@ impl FreshGenerationLightTracker {
         .context("active generated block-light inputs are incomplete or unsupported")
     }
 
-    /// Preview sky light for activated chunks in a fresh engine.
+    /// Preview sky light for activated chunks in a fresh engine. Registered
+    /// chunks without initialized sources and unregistered chunks are
+    /// assumed to retain their never-updated default sky-source heightmap.
     pub fn calculate_sky_light_for_active_chunks(
         &self,
         terrain: &CarvedTerrainWorld,
@@ -401,10 +403,6 @@ impl FreshGenerationLightTracker {
                     x: center.x.checked_add(dx).context("light X overflow")?,
                     z: center.z.checked_add(dz).context("light Z overflow")?,
                 };
-                ensure!(
-                    self.sky_sources.contains_key(&pos),
-                    "surrounding sky sources are not initialized"
-                );
                 covered.insert(pos);
             }
         }
@@ -415,12 +413,16 @@ impl FreshGenerationLightTracker {
             .context("light height overflow")?;
         let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
             .context("unsupported light height")?;
-        native_world::generation_sky_light::generated_sky_light_from_active_chunks(
+        let registered = self.registered.keys().copied().collect();
+        let initialized = self.sky_sources.keys().copied().collect();
+        native_world::generation_sky_light::generated_sky_light_with_initialization_history(
             &terrain.world,
             bounds,
             center,
             active,
             &storage,
+            &registered,
+            &initialized,
         )
         .context("active generated sky-light inputs are incomplete or unsupported")
     }
@@ -471,11 +473,13 @@ impl FreshGenerationLightTracker {
 /// activated light sources. This is separate from the live world: it cannot
 /// accept section updates, block changes, restored light or new registrations.
 /// Every initialized chunk that affects the batch must be registered before
-/// the tracker is moved here. Requested columns need their 3x3 neighborhood
-/// and, for sky light, its initialized source heights.
+/// the tracker is moved here. Requested columns need their 3x3 neighborhood;
+/// uninitialized chunks must retain their default sky-source heightmaps.
+/// Once propagation starts, changed neighboring blocks invalidate later reads.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,
+    frozen_world: Option<Arc<native_world::loaded::World>>,
 }
 
 impl StagedGenerationLightEngine {
@@ -483,6 +487,7 @@ impl StagedGenerationLightEngine {
         Self {
             fresh,
             active: BTreeSet::new(),
+            frozen_world: None,
         }
     }
 
@@ -514,6 +519,9 @@ impl StagedGenerationLightEngine {
         let mut active = self.active.clone();
         active.insert(pos);
         let snapshot = self.snapshot_for(terrain, covered, registry, &active)?;
+        if self.frozen_world.is_none() {
+            self.frozen_world = Some(Arc::clone(&terrain.world));
+        }
         self.active = active;
         Ok(snapshot)
     }
@@ -545,6 +553,31 @@ impl StagedGenerationLightEngine {
             });
             if !affected {
                 continue;
+            }
+            // Recomputing old propagation against changed, uninitialized
+            // neighboring blocks would fabricate updates Java never ran.
+            if let Some(frozen) = &self.frozen_world {
+                for dz in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let neighbor = ChunkPos {
+                            x: pos.x.checked_add(dx).context("light X overflow")?,
+                            z: pos.z.checked_add(dz).context("light Z overflow")?,
+                        };
+                        let before = frozen
+                            .chunks
+                            .get(&neighbor)
+                            .context("light input was not captured")?;
+                        let current = terrain
+                            .world
+                            .chunks
+                            .get(&neighbor)
+                            .context("light input is missing")?;
+                        ensure!(
+                            Arc::ptr_eq(before, current),
+                            "light input changed after activation"
+                        );
+                    }
+                }
             }
             let block = self
                 .fresh

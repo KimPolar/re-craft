@@ -1135,7 +1135,50 @@ impl DecorationRegion<'_> {
             self.pending_monster_spawners == 0,
             "unfinished generated spawner data"
         );
-        self.target.world = Arc::new(self.world);
+        let mut world = self.world;
+        let mut affected = BTreeSet::new();
+        for (pos, chunk) in &world.chunks {
+            if self
+                .target
+                .world
+                .chunks
+                .get(pos)
+                .is_some_and(|old| Arc::ptr_eq(old, chunk))
+            {
+                continue;
+            }
+            // Light from a changed block reaches at most one neighboring chunk.
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if let (Some(x), Some(z)) = (pos.x.checked_add(dx), pos.z.checked_add(dz)) {
+                        affected.insert(ChunkPos { x, z });
+                    }
+                }
+            }
+        }
+        for pos in affected {
+            let Some(chunk) = world.chunks.get_mut(&pos) else {
+                continue;
+            };
+            if !chunk.block_light_correct
+                && chunk
+                    .sections
+                    .values()
+                    .all(|s| s.block_light.is_none() && s.sky_light.is_none())
+            {
+                continue;
+            }
+            let chunk = Arc::make_mut(chunk);
+            chunk.block_light_correct = false;
+            for section in chunk.sections.values_mut() {
+                if section.block_light.is_some() || section.sky_light.is_some() {
+                    let section = Arc::make_mut(section);
+                    section.block_light = None;
+                    section.sky_light = None;
+                }
+            }
+        }
+        self.target.world = Arc::new(world);
         self.target.ore_ocean_floor_heights = self.heights;
         self.target.feature_world_surface_heights = self.surface_heights;
         self.target.final_heightmaps = self.final_heights;
@@ -3482,6 +3525,7 @@ mod tests {
             "minecraft:ancient_debris",
             "minecraft:clay",
             "minecraft:short_grass",
+            "minecraft:torch",
             "minecraft:cave_air",
             "minecraft:void_air",
             "minecraft:netherrack",
@@ -3582,6 +3626,71 @@ mod tests {
         let updated = terrain.calculate_generated_block_light(center).unwrap();
         assert_eq!(updated[&0][index / 2] & 15, 0);
         assert_eq!(light[&0][index / 2] & 15, 13);
+    }
+
+    #[test]
+    fn generated_lighting_is_atomic_and_invalidated_by_neighbor_edits() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        for z in -2..=2 {
+            for x in -2..=2 {
+                terrain.completed_decoration.insert(ChunkPos { x, z });
+            }
+        }
+        let world = Arc::make_mut(&mut terrain.world);
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(-1, 10, 8, torch).unwrap();
+        let before = terrain.snapshot();
+        terrain.initialize_generated_lighting(center, true).unwrap();
+        let lit = terrain.snapshot();
+        assert!(!before.chunks[&center].block_light_correct);
+        assert!(lit.chunks[&center].block_light_correct);
+        assert_eq!(
+            lit.chunks[&center].status.as_deref(),
+            Some("minecraft:carvers")
+        );
+        assert_eq!(lit.light(0, 10, 8, false), Some(13));
+        assert_eq!(lit.light(0, 10, 8, true), Some(15));
+        assert_eq!(lit.light(0, 16, 8, true), Some(15));
+
+        terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &lit.chunks[&center],
+            &terrain.snapshot().chunks[&center]
+        ));
+
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: -1, z: 0 }]))
+            .unwrap();
+        region
+            .set_section_block([-1, 10, 8], &state("air"))
+            .unwrap();
+        region.finish().unwrap();
+        let invalidated = terrain.snapshot();
+        assert!(!invalidated.chunks[&center].block_light_correct);
+        assert_eq!(invalidated.light(0, 10, 8, false), None);
+        assert_eq!(invalidated.light(0, 10, 8, true), None);
+        assert_eq!(lit.light(0, 10, 8, false), Some(13));
+        terrain
+            .initialize_generated_lighting(center, false)
+            .unwrap();
+        let no_sky = terrain.snapshot();
+        assert_eq!(no_sky.light(0, 10, 8, false), Some(0));
+        assert_eq!(no_sky.light(0, 10, 8, true), None);
+
+        let world = Arc::make_mut(&mut terrain.world);
+        let unknown = world.intern_state(BlockState {
+            name: "example:unknown".into(),
+            properties: BTreeMap::new(),
+        });
+        world.set_block_id(17, 10, 8, unknown).unwrap();
+        let failed_input = terrain.snapshot();
+        assert!(terrain.initialize_generated_lighting(center, true).is_err());
+        assert!(Arc::ptr_eq(&failed_input, &terrain.snapshot()));
     }
 
     #[test]

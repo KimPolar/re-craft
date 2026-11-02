@@ -173,8 +173,9 @@ pub struct Section {
 pub struct Chunk {
     pub position: ChunkPos,
     pub status: Option<String>,
-    /// True only when the source explicitly marks its saved lighting complete.
-    /// A missing block-light array then represents a zero-filled layer.
+    /// True when saved lighting was marked complete or generated lighting was
+    /// calculated for the current blocks. A missing block-light array then
+    /// represents a zero-filled layer.
     pub block_light_correct: bool,
     pub sections: BTreeMap<i8, Arc<Section>>,
 }

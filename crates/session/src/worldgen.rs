@@ -216,6 +216,56 @@ impl CarvedTerrainWorld {
         .context("generated sky-light inputs are missing or unsupported")
     }
 
+    /// Publish calculated light arrays into an intermediate chunk snapshot.
+    /// The caller must resolve the active dimension type's skylight capability.
+    /// This neither changes the generation status nor makes the chunk saveable.
+    pub fn initialize_generated_lighting(
+        &mut self,
+        center: native_world::loaded::ChunkPos,
+        has_sky_light: bool,
+    ) -> Result<()> {
+        use native_world::loaded::Section;
+
+        let block = self.calculate_generated_block_light(center)?;
+        let sky = if has_sky_light {
+            Some(self.calculate_generated_sky_light(center)?)
+        } else {
+            None
+        };
+        let mut chunk = (**self
+            .world
+            .chunks
+            .get(&center)
+            .context("light chunk is missing")?)
+        .clone();
+        for (&section_y, block_layer) in &block {
+            let key = i8::try_from(section_y).context("light section outside supported range")?;
+            let section = chunk.sections.entry(key).or_insert_with(|| {
+                Arc::new(Section {
+                    blocks: None,
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                })
+            });
+            let section = Arc::make_mut(section);
+            section.block_light = Some(Box::new(**block_layer));
+            section.sky_light = match &sky {
+                Some(layers) => Some(Box::new(
+                    **layers
+                        .get(&section_y)
+                        .context("sky-light section missing")?,
+                )),
+                None => None,
+            };
+        }
+        chunk.block_light_correct = true;
+        Arc::make_mut(&mut self.world)
+            .chunks
+            .insert(center, Arc::new(chunk));
+        Ok(())
+    }
+
     fn generated_light_bounds(
         &self,
         center: native_world::loaded::ChunkPos,

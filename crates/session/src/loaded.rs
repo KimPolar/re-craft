@@ -737,6 +737,23 @@ enum BubbleTickKind {
     Column,
 }
 
+impl BubbleTickKind {
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "minecraft:water" | "water" => Some(Self::Water),
+            "minecraft:bubble_column" | "bubble_column" => Some(Self::Column),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Water => "minecraft:water",
+            Self::Column => "minecraft:bubble_column",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct BubbleTickKey {
     x: i32,
@@ -7222,21 +7239,13 @@ impl LoadedSession {
         )
     }
 
-    /// Collect supported falling-block, button, and soil ticks in Java's saved
+    /// Collect supported block ticks in Java's saved
     /// sub-tick order. This alone does not authorize writing a chunk.
     pub fn draft_block_ticks(&self, pos: ChunkPos) -> anyhow::Result<Vec<SavedBlockTick>> {
         use anyhow::{Context, ensure};
         ensure!(
             !self.unresolved_bubble_tick,
             "bubble column effects are not yet fully tracked for saving"
-        );
-        ensure!(
-            !self
-                .bubble_ticks
-                .values()
-                .chain(self.bubble_deferred.values())
-                .any(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z),
-            "bubble column tick storage is not yet supported"
         );
         ensure!(
             self.commands.is_empty(),
@@ -7260,6 +7269,7 @@ impl LoadedSession {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
                         || native_core::button::Button::from_id(&tick.block).is_some()
+                        || BubbleTickKind::from_id(&tick.block).is_some()
                         || matches!(
                             tick.block.as_str(),
                             "minecraft:redstone_lamp" | "redstone_lamp"
@@ -7373,6 +7383,34 @@ impl LoadedSession {
                 .filter(|(x, _, z, _)| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
                 .all(|key| queued_soil.contains(key)),
             "soil tick is missing its scheduled order"
+        );
+        let mut queued_bubbles = BTreeSet::new();
+        for (order, &key) in self
+            .bubble_ticks
+            .iter()
+            .chain(&self.bubble_deferred)
+            .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+        {
+            queued_bubbles.insert(key);
+            let delay = i32::try_from(order.0 - i128::from(self.tick))
+                .context("bubble tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: key.kind.id().into(),
+                    position: [key.x, key.y, key.z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.bubble_pending
+                .iter()
+                .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+                .all(|key| queued_bubbles.contains(key)),
+            "bubble tick is missing its scheduled order"
         );
         // Java packs saved ticks by sub-tick order, independently of target
         // time and priority. The shared sequence breaks new-tick ties.
@@ -12682,16 +12720,13 @@ impl LoadedSession {
 
     fn enqueue_saved_bubble(&mut self, ticks: &[SavedBlockTick]) {
         for (index, tick) in ticks.iter().enumerate() {
-            let kind = match tick.block.as_str() {
-                "minecraft:water" | "water" => BubbleTickKind::Water,
-                "minecraft:bubble_column" | "bubble_column" => BubbleTickKind::Column,
-                _ => continue,
+            let Some(kind) = BubbleTickKind::from_id(&tick.block) else {
+                continue;
             };
             let [x, y, z] = tick.position;
             let key = BubbleTickKey { x, y, z, kind };
-            if !self.bubble_pending.insert(key) {
-                continue;
-            }
+            // Saved ticks are unpacked without deduplication by LevelChunkTicks.
+            self.bubble_pending.insert(key);
             self.tick_chunks_needing_dirty.insert(ChunkPos {
                 x: x.div_euclid(16),
                 z: z.div_euclid(16),
@@ -55722,6 +55757,12 @@ pub(crate) mod tests {
                 priority: 0,
             },
             SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 20,
+                priority: -2,
+            },
+            SavedBlockTick {
                 block: "minecraft:sand".into(),
                 position,
                 delay: 2,
@@ -55746,6 +55787,12 @@ pub(crate) mod tests {
                 priority: 0,
             },
             SavedBlockTick {
+                block: "minecraft:bubble_column".into(),
+                position,
+                delay: 5,
+                priority: 2,
+            },
+            SavedBlockTick {
                 block: "minecraft:gravel".into(),
                 position,
                 delay: 3,
@@ -55759,9 +55806,219 @@ pub(crate) mod tests {
         session.enqueue_saved_buttons(&source_ticks);
         session.enqueue_saved_lamps(&source_ticks);
         session.enqueue_saved_soil(&source_ticks);
+        session.enqueue_saved_bubble(&source_ticks);
 
         let drafted = session.draft_block_ticks(home).unwrap();
         assert_eq!(drafted, source_ticks);
+    }
+
+    #[test]
+    fn pending_bubble_ticks_round_trip_without_weakening_save_guards() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let original = fixture_chunk_document(home);
+        let position = (session.origin + IVec3::new(8, 5, 8)).to_array();
+        let source_ticks = vec![
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 20,
+                priority: -1,
+            },
+            SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position,
+                delay: 3,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:bubble_column".into(),
+                position,
+                delay: 5,
+                priority: 1,
+            },
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 6,
+                priority: -2,
+            },
+        ];
+        let mut source = native_persistence::edit::draft_chunk_blocks(
+            &original,
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        source.replace_block_ticks(&source_ticks).unwrap();
+        let source = source.document().clone();
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, source_ticks.clone());
+        session.enqueue_saved_sand(&source_ticks);
+        session.enqueue_saved_bubble(&source_ticks);
+        let (order, key) = session.bubble_ticks.pop_first().unwrap();
+        session.bubble_deferred.insert(order, key);
+        session.mark_tick_chunk_dirty(home.x * 16, home.z * 16);
+        let draft = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                home,
+                &source,
+                &test_heightmap_tags(),
+                |_| anyhow::bail!("tick-only draft must not rebuild heightmaps"),
+            )
+            .unwrap();
+        assert_eq!(
+            draft.document().value.get("block_ticks"),
+            source.value.get("block_ticks")
+        );
+        assert!(draft.matches_source(&source).unwrap());
+
+        let missing = BubbleTickKey {
+            x: key.x + 1,
+            ..key
+        };
+        session.bubble_pending.insert(missing);
+        assert!(session.draft_block_ticks(home).is_err());
+        session.bubble_pending.remove(&missing);
+        session.bubble_deferred.insert((99, 0, 42, 99), key);
+        assert_eq!(session.draft_block_ticks(home).unwrap().len(), 5);
+        session.bubble_deferred.remove(&(99, 0, 42, 99));
+        session.unresolved_bubble_tick = true;
+        assert!(session.draft_block_ticks(home).is_err());
+    }
+
+    #[test]
+    fn saved_duplicate_bubble_ticks_remain_scheduled_after_the_first_poll() {
+        let mut session = session();
+        let relative = IVec3::new(8, 5, 8);
+        let position = (session.origin + relative).to_array();
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        assert!(session.set(relative, stone));
+        let first = SavedBlockTick {
+            block: "minecraft:water".into(),
+            position,
+            delay: 0,
+            priority: 0,
+        };
+        let second = SavedBlockTick {
+            delay: 10,
+            ..first.clone()
+        };
+        session.enqueue_saved_bubble(&[first, second]);
+        assert_eq!(session.bubble_ticks.len(), 2);
+        session.advance_block_ticks();
+        assert_eq!(session.bubble_ticks.len(), 1);
+        assert!(session.bubble_pending.is_empty());
+        session.schedule_bubble(relative, BubbleTickKind::Water, 20);
+        assert_eq!(session.bubble_ticks.len(), 2);
+        assert_eq!(session.bubble_pending.len(), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn pending_bubble_tick_nbt_round_trips_in_java() {
+        use std::{path::PathBuf, process::Command};
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let position = (session.origin + IVec3::new(8, 5, 8)).to_array();
+        let ticks = vec![
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 20,
+                priority: -1,
+            },
+            SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position,
+                delay: 3,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:bubble_column".into(),
+                position,
+                delay: 5,
+                priority: 1,
+            },
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 6,
+                priority: -2,
+            },
+        ];
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, ticks.clone());
+        session.enqueue_saved_sand(&ticks);
+        session.enqueue_saved_bubble(&ticks);
+        let mut draft = native_persistence::edit::draft_chunk_blocks(
+            &fixture_chunk_document(home),
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        draft
+            .replace_block_ticks(&session.draft_block_ticks(home).unwrap())
+            .unwrap();
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BubbleSavedTickOracle.java");
+        let nbt = temp.path().join("chunk.nbt");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BubbleSavedTickOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &nbt,
+            native_persistence::nbt::write(draft.document()).unwrap(),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BubbleSavedTickOracle")
+                .arg(&nbt),
+        ] {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

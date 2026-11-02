@@ -41,17 +41,18 @@ pub struct PlacedOreVein {
 }
 
 /// A placed ore resolved from one exact entry of the decoration schedule.
-pub struct ScheduledOreVein {
+pub struct ScheduledOreVein<'a> {
     key: FeatureKey,
     placed: PlacedOreVein,
+    schedule: &'a FeatureSchedule,
 }
 
-impl ScheduledOreVein {
+impl<'a> ScheduledOreVein<'a> {
     /// Read both named and inline placed features from the same active packs
     /// and block registry that were used to prepare the schedule.
     pub fn load(
         provider: &mut impl ResourceProvider,
-        schedule: &FeatureSchedule,
+        schedule: &'a FeatureSchedule,
         key: &FeatureKey,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Self> {
@@ -78,10 +79,30 @@ impl ScheduledOreVein {
         Ok(Self {
             key: key.clone(),
             placed,
+            schedule,
         })
     }
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
         self.placed.required_tags()
+    }
+
+    /// Java `BiomeGenerationSettings.hasFeature` tests value equality. Exact
+    /// schedule identity is always equal; independently decoded uniform and
+    /// trapezoid heights prove that any other feature object is unequal.
+    pub fn biome_allows(&self, biome: &ResourceId) -> Result<bool> {
+        let settings = self
+            .schedule
+            .biome(biome)
+            .context("biome is absent from the feature schedule")?;
+        if self.schedule.biome_contains_identity(biome, &self.key)? {
+            return Ok(true);
+        }
+        if self.placed.placement.has_independent_height_provider()
+            || settings.steps.iter().all(Vec::is_empty)
+        {
+            return Ok(false);
+        }
+        bail!("cannot determine Java feature equality for this biome")
     }
 }
 
@@ -202,7 +223,7 @@ impl OreVeinRegion<'_> {
         &mut self,
         plan: &DecorationPlan<'_>,
         index: usize,
-        ore: &ScheduledOreVein,
+        ore: &ScheduledOreVein<'_>,
         biome_allows: &mut impl FnMut(&FeatureKey, &ResourceId) -> Result<bool>,
     ) -> Result<bool> {
         ensure!(!self.failed, "generation attempt previously failed");
@@ -243,6 +264,35 @@ impl OreVeinRegion<'_> {
         }
         self.failed = false;
         Ok(result)
+    }
+
+    /// Resolve biome membership from the active schedule for ordinary ores.
+    /// Distinct placed features with uniform/trapezoid height providers are
+    /// never equal in Java because each decoded provider has object identity.
+    /// Ambiguous data-pack feature equality and unknown biomes are errors.
+    pub fn place_planned_auto(
+        &mut self,
+        plan: &DecorationPlan<'_>,
+        index: usize,
+        ore: &ScheduledOreVein<'_>,
+    ) -> Result<bool> {
+        let selected = plan
+            .features
+            .get(index)
+            .context("planned feature index is out of range")?;
+        let step = usize::try_from(selected.step).context("invalid feature step")?;
+        let feature_index = usize::try_from(selected.index).context("invalid feature index")?;
+        let canonical = ore
+            .schedule
+            .steps()
+            .get(step)
+            .and_then(|features| features.get(feature_index))
+            .context("feature is absent from the loaded schedule")?;
+        ensure!(
+            std::ptr::eq(selected.feature, canonical),
+            "plan and ore use different feature schedules"
+        );
+        self.place_planned(plan, index, ore, &mut |_, biome| ore.biome_allows(biome))
     }
 
     /// Publish this intermediate state; it is not a finished or saveable chunk.
@@ -693,7 +743,9 @@ mod tests {
                 json!({"type":"minecraft:count","count":4}),
                 json!({"type":"minecraft:in_square"}),
             ];
-            if let Some(kind) = self.heightmap {
+            if self.heightmap == Some("no_height") {
+                // Exercise the equality case where a distinct feature can match.
+            } else if let Some(kind) = self.heightmap {
                 placement.push(json!({"type":"minecraft:heightmap","heightmap":kind}));
             } else {
                 placement.push(json!({"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":4},"max_inclusive":{"absolute":4}}}));
@@ -711,6 +763,10 @@ mod tests {
                 "data/minecraft/worldgen/biome/plains.json" => {
                     Some(json!({"features":[["test:ore",self.definition()]]}))
                 }
+                "data/minecraft/worldgen/biome/desert.json" => {
+                    Some(json!({"features":[[self.definition()]]}))
+                }
+                "data/minecraft/worldgen/biome/forest.json" => Some(json!({"features":[[]]})),
                 "data/test/worldgen/placed_feature/ore.json" => Some(self.definition()),
                 _ => None,
             };
@@ -895,6 +951,85 @@ mod tests {
                 .unwrap()
         );
         region.finish().unwrap();
+    }
+
+    #[test]
+    fn scheduled_ore_resolves_biome_membership_and_rejects_ambiguity() {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let desert = ResourceId::parse("minecraft:desert").unwrap();
+        let forest = ResourceId::parse("minecraft:forest").unwrap();
+        let missing = ResourceId::parse("example:missing").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let mut data = ScheduledData { heightmap: None };
+        let schedule = FeatureSchedule::load(
+            &mut data,
+            &[plains.clone(), desert.clone(), forest.clone()],
+            &registry,
+        )
+        .unwrap();
+        let key = FeatureKey::Registered(ResourceId::parse("test:ore").unwrap());
+        let ore = ScheduledOreVein::load(&mut data, &schedule, &key, &mut resolve_test).unwrap();
+        assert!(ore.biome_allows(&plains).unwrap());
+        assert!(
+            !ore.biome_allows(&desert).unwrap(),
+            "distinct uniform providers are not equal"
+        );
+        assert!(!ore.biome_allows(&forest).unwrap());
+        assert!(ore.biome_allows(&missing).is_err());
+
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let index = plan
+            .features
+            .iter()
+            .position(|item| *item.feature == key)
+            .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .unwrap();
+        assert!(region.place_planned_auto(&plan, index, &ore).unwrap());
+        region.finish().unwrap();
+
+        let mut other_data = ScheduledData { heightmap: None };
+        let other_schedule = FeatureSchedule::load(
+            &mut other_data,
+            &[plains.clone(), desert.clone(), forest.clone()],
+            &registry,
+        )
+        .unwrap();
+        let other_ore =
+            ScheduledOreVein::load(&mut other_data, &other_schedule, &key, &mut resolve_test)
+                .unwrap();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .unwrap();
+        assert!(region.place_planned_auto(&plan, index, &other_ore).is_err());
+        region.finish().unwrap();
+        assert!(Arc::ptr_eq(
+            &before.chunks[&native_world::loaded::ChunkPos { x: 0, z: 0 }],
+            &terrain.snapshot().chunks[&native_world::loaded::ChunkPos { x: 0, z: 0 }]
+        ));
+
+        let mut ambiguous = ScheduledData {
+            heightmap: Some("no_height"),
+        };
+        let ambiguous_schedule = FeatureSchedule::load(
+            &mut ambiguous,
+            &[plains.clone(), desert.clone(), forest.clone()],
+            &registry,
+        )
+        .unwrap();
+        let ambiguous_ore =
+            ScheduledOreVein::load(&mut ambiguous, &ambiguous_schedule, &key, &mut resolve_test)
+                .unwrap();
+        assert!(ambiguous_ore.biome_allows(&plains).unwrap());
+        assert!(ambiguous_ore.biome_allows(&desert).is_err());
+        assert!(!ambiguous_ore.biome_allows(&forest).unwrap());
     }
 
     #[test]
@@ -1179,9 +1314,11 @@ mod tests {
             assert_eq!(random.next_long(), *next, "integrated random stream {seed}");
         }
         let key = FeatureKey::Registered(ResourceId::parse("example:ore").unwrap());
+        let (_, java_schedule, _) = scheduled_fixture(None);
         let scheduled = ScheduledOreVein {
             key: key.clone(),
             placed,
+            schedule: &java_schedule,
         };
         for seed in 0..8i64 {
             let mut terrain = oracle_terrain();

@@ -37,6 +37,10 @@ fn state(name: &str) -> BlockState {
         "water" => BTreeMap::from([("level".into(), "0".into())]),
         "sunflower" | "tall_grass" => BTreeMap::from([("half".into(), "lower".into())]),
         "sweet_berry_bush" => BTreeMap::from([("age".into(), "0".into())]),
+        "leaf_litter" => BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("segment_amount".into(), "1".into()),
+        ]),
         _ => BTreeMap::new(),
     };
     BlockState {
@@ -194,6 +198,7 @@ fn registry() -> BTreeSet<String> {
         "sweet_berry_bush",
         "melon",
         "closed_eyeblossom",
+        "leaf_litter",
     ]
     .into_iter()
     .map(|s| format!("minecraft:{s}"))
@@ -212,7 +217,12 @@ fn feature(kind: i32) -> Value {
         4 => json!({"id":"minecraft:sunflower","properties":{"half":"upper"}}),
         5 => json!({"id":"minecraft:sweet_berry_bush","properties":{"age":"3"}}),
         6 => json!({"id":"minecraft:melon"}),
-        _ => json!({"id":"minecraft:closed_eyeblossom"}),
+        7 => json!({"id":"minecraft:closed_eyeblossom"}),
+        8 => json!({"id":"minecraft:leaf_litter"}),
+        9 => {
+            json!({"id":"minecraft:leaf_litter","properties":{"facing":"west","segment_amount":"4"}})
+        }
+        _ => unreachable!(),
     };
     json!({"type":"minecraft:simple_block","to_place":to_place})
 }
@@ -325,7 +335,7 @@ fn simple_features_match_java_survival_writes_and_randomness() {
         }
     }
     assert!(safe);
-    assert_eq!(cases.len(), 512);
+    assert_eq!(cases.len(), 640);
     let registry = registry();
     let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
     let required = [

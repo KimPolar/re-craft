@@ -1944,6 +1944,11 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
         return Ok(false);
     }
+    if let Ok(kind) = simple_plant_kind(state)
+        && !matches!(kind, SimplePlantKind::Unconditional)
+    {
+        return Ok(false);
+    }
     vanilla_full_occlusion(&state.name)
         .with_context(|| format!("unsupported tree support shape {}", state.name))
 }
@@ -3673,6 +3678,7 @@ enum SimplePlantKind {
     Double,
     Unconditional,
     Mushroom,
+    LeafLitter,
 }
 
 // All states of these vanilla blocks have been checked for their Java
@@ -3680,6 +3686,10 @@ enum SimplePlantKind {
 fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
     let name = state.name.as_str();
     let kind = match name {
+        "minecraft:leaf_litter" => {
+            tree_leaf_litter(state)?;
+            SimplePlantKind::LeafLitter
+        }
         "minecraft:short_grass"
         | "minecraft:fern"
         | "minecraft:bush"
@@ -3821,6 +3831,10 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             let survives = match kind {
                 SimplePlantKind::Unconditional => true,
                 SimplePlantKind::Mushroom => self.mushroom_survival(pos)?,
+                SimplePlantKind::LeafLitter => {
+                    let state = self.block(below)?;
+                    DiskWorld::face_sturdy(self, &state, below, [0, 1, 0])?
+                }
                 SimplePlantKind::Double
                     if state.properties.get("half").map(String::as_str) == Some("upper") =>
                 {

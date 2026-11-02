@@ -45,6 +45,8 @@ public class SimpleChunkOracle {
       case 5 -> BlockStateProvider.of(Blocks.SWEET_BERRY_BUSH.defaultBlockState().setValue(SweetBerryBushBlock.AGE,3));
       case 6 -> BlockStateProvider.of(Blocks.MELON);
       case 7 -> BlockStateProvider.of(Blocks.CLOSED_EYEBLOSSOM);
+      case 8 -> BlockStateProvider.of(Blocks.LEAF_LITTER);
+      case 9 -> BlockStateProvider.of(Blocks.LEAF_LITTER.defaultBlockState().setValue(LeafLitterBlock.FACING,Direction.WEST).setValue(SegmentableBlock.AMOUNT,4));
       default -> throw new AssertionError();
     };
     return new SimpleBlockFeature(Holder.direct(p),schedule);
@@ -55,14 +57,14 @@ public class SimpleChunkOracle {
     for(var b:List.of(Blocks.STONE,Blocks.DIRT,Blocks.GRASS_BLOCK))bind.invoke(b.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_VEGETATION,BlockTags.SUPPORTS_DRY_VEGETATION,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES));
     bind.invoke(Blocks.SAND.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_DRY_VEGETATION,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES));
     bind.invoke(Blocks.MELON.builtInRegistryHolder(),List.of(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES));
-    var safe=List.of(Blocks.SHORT_GRASS,Blocks.FERN,Blocks.BUSH,Blocks.DANDELION,Blocks.POPPY,Blocks.BLUE_ORCHID,Blocks.ALLIUM,Blocks.AZURE_BLUET,Blocks.RED_TULIP,Blocks.ORANGE_TULIP,Blocks.WHITE_TULIP,Blocks.PINK_TULIP,Blocks.OXEYE_DAISY,Blocks.CORNFLOWER,Blocks.LILY_OF_THE_VALLEY,Blocks.FIREFLY_BUSH,Blocks.CLOSED_EYEBLOSSOM,Blocks.SWEET_BERRY_BUSH,Blocks.SHORT_DRY_GRASS,Blocks.TALL_DRY_GRASS,Blocks.DEAD_BUSH,Blocks.SUNFLOWER,Blocks.TALL_GRASS,Blocks.LARGE_FERN,Blocks.ROSE_BUSH,Blocks.PEONY,Blocks.LILAC,Blocks.MELON,Blocks.PUMPKIN);
+    var safe=List.of(Blocks.SHORT_GRASS,Blocks.FERN,Blocks.BUSH,Blocks.DANDELION,Blocks.POPPY,Blocks.BLUE_ORCHID,Blocks.ALLIUM,Blocks.AZURE_BLUET,Blocks.RED_TULIP,Blocks.ORANGE_TULIP,Blocks.WHITE_TULIP,Blocks.PINK_TULIP,Blocks.OXEYE_DAISY,Blocks.CORNFLOWER,Blocks.LILY_OF_THE_VALLEY,Blocks.FIREFLY_BUSH,Blocks.CLOSED_EYEBLOSSOM,Blocks.SWEET_BERRY_BUSH,Blocks.SHORT_DRY_GRASS,Blocks.TALL_DRY_GRASS,Blocks.DEAD_BUSH,Blocks.SUNFLOWER,Blocks.TALL_GRASS,Blocks.LARGE_FERN,Blocks.ROSE_BUSH,Blocks.PEONY,Blocks.LILAC,Blocks.MELON,Blocks.PUMPKIN,Blocks.LEAF_LITTER);
     for(var b:safe) for(var s:b.getStateDefinition().getPossibleStates()) if(s.hasBlockEntity()||PoiTypes.hasPoi(s)||s.getPostProcessPos(null,BlockPos.ZERO)!=null)throw new AssertionError("unsafe plant "+s);
     out.println("E safe");
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);var unsafe=(sun.misc.Unsafe)f.get(null);
     var biome=Holder.direct((Biome)unsafe.allocateInstance(Biome.class));var ids=new IdMapper<Holder<Biome>>();ids.add(biome);
     var palette=new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState(),null,Strategy.createForBiomes(ids),biome,null);
     var height=LevelHeightAccessor.create(-16,32);
-    for(int kind=0;kind<8;kind++)for(int restricted=0;restricted<2;restricted++)for(int n=0;n<8;n++)for(long seed:new long[]{0,7})for(int scheduled=0;scheduled<2;scheduled++) {
+    for(int kind=0;kind<10;kind++)for(int restricted=0;restricted<2;restricted++)for(int n=0;n<8;n++)for(long seed:new long[]{0,7})for(int scheduled=0;scheduled<2;scheduled++) {
       int x=-16+n,z=32;final int limit=restricted;
       var c=new ProtoChunk(new ChunkPos(-1,2),UpgradeData.EMPTY,height,palette,null);c.setPersistedStatus(ChunkStatus.TERRAIN);
       for(int y=-16;y<16;y++)for(int dz=0;dz<16;dz++)for(int dx=0;dx<16;dx++){var s=initial(-16+dx,y,32+dz);if(!s.isAir())c.getSection((y+16)>>4).setBlockState(dx,y&15,dz,s,false);}

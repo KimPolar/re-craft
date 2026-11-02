@@ -111,8 +111,14 @@ fn carving_application_matches_java() {
         states: vec![Arc::new(json!("minecraft:stone")); 4096],
         fluid_updates: vec![false; 4096],
         noise_postprocessing: None,
-        surface_postprocessing: None,
+        surface_postprocessing: {
+            let mut marks = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
+            marks.mark(0, 7, 0);
+            Some(marks)
+        },
+        carver_postprocessing: None,
     };
+    chunk.fluid_updates[7] = true;
     for (y, name) in [
         (2, "minecraft:dirt"),
         (6, "minecraft:dirt"),
@@ -145,13 +151,25 @@ fn carving_application_matches_java() {
                 chunk.fluid_updates[y]
             )
         }))
+        .chain(
+            chunk.carver_postprocessing.as_ref().unwrap().sections()[0]
+                .iter()
+                .map(|packed| format!("M {}", (packed >> 4) & 15)),
+        )
         .collect();
     let actual: Vec<_> = output
         .lines()
-        .filter(|line| line.starts_with("T ") || line.starts_with("P "))
+        .filter(|line| line.starts_with("T ") || line.starts_with("P ") || line.starts_with("M "))
         .collect();
     assert_eq!(
         actual,
         expected.iter().map(String::as_str).collect::<Vec<_>>()
     );
+    assert_eq!(
+        chunk.carver_postprocessing.as_ref().unwrap().sections()[0],
+        [0x70, 0x70, 0x60]
+    );
+    let previous = chunk.carver_postprocessing.clone();
+    assert!(apply_mask(&mut chunk, &mask, &mut inputs).is_err());
+    assert_eq!(chunk.carver_postprocessing, previous);
 }

@@ -18,12 +18,12 @@ import net.minecraft.world.level.levelgen.material.rule.MaterialRule;
 public class CarverApplyOracle {
   static void set(Object o,String name,Object value)throws Exception { var f=o.getClass().getDeclaredField(name);f.setAccessible(true);f.set(o,value); }
   static class Chunk extends ProtoChunk {
-    BlockState[] blocks; boolean[] updates;
+    BlockState[] blocks; boolean[] updates; List<Integer> ordered;
     Chunk(){super(null,null,null,null,null);}
     public ChunkPos getPos(){return new ChunkPos(0,0);}
     public BlockState getBlockState(BlockPos p){return p.getY()<0 || p.getY()>=16?Blocks.AIR.defaultBlockState():blocks[p.getY()];}
     public BlockState setBlockState(BlockPos p,BlockState s,int flags){var old=blocks[p.getY()];blocks[p.getY()]=s;return old;}
-    public void markPosForPostProcessing(BlockPos p){updates[p.getY()]=true;}
+    public void markPosForPostProcessing(BlockPos p){updates[p.getY()]=true;ordered.add(p.getY());}
   }
   static class Material extends MaterialSystem {
     Material(){super(null,null,0,null,null);}
@@ -38,7 +38,8 @@ public class CarverApplyOracle {
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
     bind.invoke(Blocks.BEDROCK.builtInRegistryHolder(),List.of(BlockTags.UNCARVABLE));
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);var unsafe=(sun.misc.Unsafe)f.get(null);
-    var chunk=(Chunk)unsafe.allocateInstance(Chunk.class);chunk.blocks=new BlockState[16];chunk.updates=new boolean[16];
+    var chunk=(Chunk)unsafe.allocateInstance(Chunk.class);chunk.blocks=new BlockState[16];chunk.updates=new boolean[16];chunk.ordered=new ArrayList<>();
+    chunk.markPosForPostProcessing(new BlockPos(0,7,0));
     Arrays.fill(chunk.blocks,Blocks.STONE.defaultBlockState());
     chunk.blocks[2]=Blocks.DIRT.defaultBlockState();chunk.blocks[6]=Blocks.DIRT.defaultBlockState();
     chunk.blocks[7]=Blocks.GRASS_BLOCK.defaultBlockState();chunk.blocks[8]=Blocks.BEDROCK.defaultBlockState();chunk.blocks[10]=Blocks.DIRT.defaultBlockState();
@@ -51,5 +52,6 @@ public class CarverApplyOracle {
     CarvingMask.Filter filter=(x,y,z)->y!=5;
     method.invoke(generator,chunk,mask,random,null,null,noise,null,filter);
     for(int y=0;y<16;y++)out.printf("P %d %s %s%n",y,chunk.blocks[y].getBlock().builtInRegistryHolder().key().identifier(),chunk.updates[y]);
+    for(int y:chunk.ordered)out.printf("M %d%n",y);
   }
 }

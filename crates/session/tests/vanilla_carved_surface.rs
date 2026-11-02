@@ -107,6 +107,7 @@ fn aquifer_and_surface_repair_match_java() {
         fluid_updates: vec![false; 4096],
         noise_postprocessing: None,
         surface_postprocessing: None,
+        carver_postprocessing: None,
     };
     let idx = |x: usize, y: usize, z: usize| (z * 16 + x) * 16 + y;
     for z in 0..16 {

@@ -481,6 +481,17 @@ fn terrain_matches_java_before_and_after_carvers() {
                 classify,
             )
             .unwrap();
+        let carver_marks = chunk.carver_postprocessing.as_ref().unwrap().clone();
+        for (section, values) in carver_marks.sections().iter().enumerate() {
+            let expected: Vec<i16> = ordered_updates[i * 3 + 2]
+                .get(&section)
+                .map(|values| values.iter().map(|&value| value as i16).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                *values, expected,
+                "carver postprocessing {dimension} {seed} {pos:?} section {section}"
+            );
+        }
         compare(
             &format!("carvers {dimension} {seed} {pos:?}"),
             &chunk,
@@ -496,6 +507,7 @@ fn terrain_matches_java_before_and_after_carvers() {
         .unwrap();
         assert_eq!(generated.noise_postprocessing(), Some(&marks));
         assert_eq!(generated.surface_postprocessing(), Some(&surface_marks));
+        assert_eq!(generated.carver_postprocessing(), Some(&carver_marks));
         let world = generated.world();
         let mut names = BTreeMap::new();
         let expected = &groups[i * 3 + 2];
@@ -558,6 +570,7 @@ fn terrain_matches_java_before_and_after_carvers() {
             let first = native_world::loaded::ChunkPos { x: 0, z: 0 };
             let second = native_world::loaded::ChunkPos { x: 1, z: 0 };
             assert_eq!(assembled.noise_postprocessing(second), Some(&marks));
+            assert_eq!(assembled.carver_postprocessing(second), Some(&carver_marks));
             assert_eq!(
                 assembled.surface_postprocessing(second),
                 Some(&surface_marks)

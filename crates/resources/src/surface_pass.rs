@@ -32,6 +32,8 @@ pub struct SurfaceStageChunk {
     pub noise_postprocessing: Option<native_core::postprocessing::PostProcessing>,
     /// Noise and surface marks, in Java insertion order. Carver marks are not included.
     pub surface_postprocessing: Option<native_core::postprocessing::PostProcessing>,
+    /// Noise, surface and carver marks in insertion order, once carving succeeds.
+    pub carver_postprocessing: Option<native_core::postprocessing::PostProcessing>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,6 +420,7 @@ pub fn apply_surface<P: ResourceProvider>(
         fluid_updates,
         noise_postprocessing: Some(noise_postprocessing),
         surface_postprocessing: Some(surface_postprocessing),
+        carver_postprocessing: None,
     })
 }
 

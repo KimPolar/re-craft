@@ -50,6 +50,7 @@ pub struct MaterializedTerrain {
     postprocessing: Arc<[bool]>,
     noise_postprocessing: Option<Arc<native_core::postprocessing::PostProcessing>>,
     surface_postprocessing: Option<Arc<native_core::postprocessing::PostProcessing>>,
+    carver_postprocessing: Option<Arc<native_core::postprocessing::PostProcessing>>,
 }
 
 /// A collection of intermediate generated chunks sharing one world registry.
@@ -63,6 +64,8 @@ pub struct CarvedTerrainWorld {
     noise_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     surface_postprocessing:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
+    carver_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
 }
 
@@ -78,6 +81,7 @@ impl CarvedTerrainWorld {
             postprocessing,
             noise_postprocessing,
             surface_postprocessing,
+            carver_postprocessing,
         } = first;
         Self {
             world: Arc::new(world),
@@ -90,6 +94,10 @@ impl CarvedTerrainWorld {
                 .map(|value| (position, value))
                 .collect(),
             surface_postprocessing: surface_postprocessing
+                .into_iter()
+                .map(|value| (position, value))
+                .collect(),
+            carver_postprocessing: carver_postprocessing
                 .into_iter()
                 .map(|value| (position, value))
                 .collect(),
@@ -127,6 +135,10 @@ impl CarvedTerrainWorld {
             self.surface_postprocessing
                 .insert(terrain.position, Arc::clone(surface));
         }
+        if let Some(carver) = &terrain.carver_postprocessing {
+            self.carver_postprocessing
+                .insert(terrain.position, Arc::clone(carver));
+        }
         Ok(())
     }
 
@@ -154,6 +166,14 @@ impl CarvedTerrainWorld {
         pos: native_world::loaded::ChunkPos,
     ) -> Option<&native_core::postprocessing::PostProcessing> {
         self.surface_postprocessing.get(&pos).map(AsRef::as_ref)
+    }
+
+    /// Ordered marks through the carver stage, when all prior history is known.
+    pub fn carver_postprocessing(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<&native_core::postprocessing::PostProcessing> {
+        self.carver_postprocessing.get(&pos).map(AsRef::as_ref)
     }
 }
 
@@ -186,6 +206,11 @@ impl MaterializedTerrain {
         self.surface_postprocessing.as_deref()
     }
 
+    /// Ordered marks through the carver stage, when all prior history is known.
+    pub fn carver_postprocessing(&self) -> Option<&native_core::postprocessing::PostProcessing> {
+        self.carver_postprocessing.as_deref()
+    }
+
     /// Query a local X/Z and absolute Y without exposing the storage layout.
     pub fn fluid_postprocessing_at(&self, x: u8, y: i32, z: u8) -> Option<bool> {
         if x >= 16 || z >= 16 {
@@ -216,12 +241,14 @@ impl MaterializedTerrain {
         Arc<[bool]>,
         Option<Arc<native_core::postprocessing::PostProcessing>>,
         Option<Arc<native_core::postprocessing::PostProcessing>>,
+        Option<Arc<native_core::postprocessing::PostProcessing>>,
     ) {
         (
             self.world,
             self.postprocessing,
             self.noise_postprocessing,
             self.surface_postprocessing,
+            self.carver_postprocessing,
         )
     }
 }
@@ -356,6 +383,7 @@ pub fn materialize_carved_terrain(
         postprocessing: Arc::from(terrain.fluid_updates.into_boxed_slice()),
         noise_postprocessing: terrain.noise_postprocessing.map(Arc::new),
         surface_postprocessing: terrain.surface_postprocessing.map(Arc::new),
+        carver_postprocessing: terrain.carver_postprocessing.map(Arc::new),
     })
 }
 impl QuartBiomeChunk {
@@ -1141,6 +1169,10 @@ impl TerrainGenerator {
             chunk.min_y == self.min_y && chunk.height == self.height,
             "surface chunk height does not match generator"
         );
+        ensure!(
+            chunk.carver_postprocessing.is_none(),
+            "carving was already applied"
+        );
         if !mask.is_empty() {
             let structure = evaluator.structure_terrain_context().cloned();
             let aquifer = self
@@ -1159,6 +1191,8 @@ impl TerrainGenerator {
                 &mut classify,
             );
             native_resources::carver::apply::apply_mask(chunk, mask, &mut inputs)?;
+        } else {
+            chunk.carver_postprocessing = chunk.surface_postprocessing.clone();
         }
         Ok(())
     }
@@ -1199,6 +1233,7 @@ mod tests {
                 fluid_updates: updates,
                 noise_postprocessing: Some(noise),
                 surface_postprocessing: Some(surface),
+                carver_postprocessing: None,
             };
             let biomes = QuartBiomeChunk::from_values(
                 position,
@@ -1338,6 +1373,7 @@ mod tests {
             fluid_updates: updates.clone(),
             noise_postprocessing: None,
             surface_postprocessing: None,
+            carver_postprocessing: None,
         };
         let mut resolved = 0;
         let generated =
@@ -1408,10 +1444,11 @@ mod tests {
                 }
             }
         }
-        let (world, flags, noise, surface) = generated.into_parts();
+        let (world, flags, noise, surface, carver) = generated.into_parts();
         assert_eq!(flags.as_ref(), updates);
         assert!(noise.is_none());
         assert!(surface.is_none());
+        assert!(carver.is_none());
         assert_eq!(world.chunks.len(), 1);
     }
 
@@ -1433,6 +1470,7 @@ mod tests {
             fluid_updates: vec![false; 4096],
             noise_postprocessing: None,
             surface_postprocessing: None,
+            carver_postprocessing: None,
         };
         assert!(
             materialize_carved_terrain(
@@ -1756,6 +1794,7 @@ mod tests {
                 fluid_updates: vec![false; 4096],
                 noise_postprocessing: None,
                 surface_postprocessing: None,
+                carver_postprocessing: None,
             };
             chunk.states[index + 5] = Arc::new(json!("minecraft:dirt"));
             chunk.states[index + 6] = Arc::new(json!("minecraft:grass_block"));

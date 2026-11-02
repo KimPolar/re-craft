@@ -76,6 +76,11 @@ pub fn apply_mask(
         .context("chunk Z overflow")?;
     origin_x.checked_add(15).context("block X overflow")?;
     origin_z.checked_add(15).context("block Z overflow")?;
+    ensure!(
+        chunk.carver_postprocessing.is_none(),
+        "carving was already applied"
+    );
+    let mut ordered = chunk.surface_postprocessing.clone();
     for (x, z, bottom, top) in mask.segments() {
         let mut has_grass = false;
         let world_x = origin_x + i32::from(x);
@@ -100,6 +105,9 @@ pub fn apply_mask(
             chunk.states[index] = replacement.block.state;
             if replacement.schedule_fluid_update && under_fluid {
                 chunk.fluid_updates[index] = true;
+                if let Some(ordered) = &mut ordered {
+                    ordered.mark(world_x, y, world_z);
+                }
             }
             if has_grass && y > chunk.min_y && is_block(&chunk.states[index - 1], "dirt")? {
                 if let Some(top) =
@@ -108,11 +116,15 @@ pub fn apply_mask(
                     chunk.states[index - 1] = top.state;
                     if top.has_fluid {
                         chunk.fluid_updates[index - 1] = true;
+                        if let Some(ordered) = &mut ordered {
+                            ordered.mark(world_x, y - 1, world_z);
+                        }
                     }
                 }
             }
         }
     }
+    chunk.carver_postprocessing = ordered;
     Ok(())
 }
 
@@ -183,6 +195,7 @@ mod tests {
             fluid_updates: vec![false; 256 * height],
             noise_postprocessing: None,
             surface_postprocessing: None,
+            carver_postprocessing: None,
         };
         for (y, name) in [
             (2, "minecraft:dirt"),

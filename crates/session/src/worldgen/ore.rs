@@ -14,6 +14,7 @@ use native_resources::{
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
     feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
+    lake_feature::{LakeFeature, LakeWorld},
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
@@ -44,6 +45,7 @@ pub struct DecorationRegion<'a> {
     fluid_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     sugar_cane_fluids: Option<&'a BTreeSet<String>>,
     cactus_lava_fluids: Option<&'a BTreeSet<String>>,
+    lake_water_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -67,6 +69,7 @@ enum ConfiguredDecoration {
     Spring(SpringFeature<BlockState>),
     Magma(UnderwaterMagma<BlockState>),
     Column(BlockColumnFeature<BlockState>),
+    Lake(LakeFeature<BlockState>),
 }
 impl ConfiguredDecoration {
     fn decode(
@@ -96,6 +99,7 @@ impl ConfiguredDecoration {
             ("minecraft", "block_column") => {
                 Ok(Self::Column(BlockColumnFeature::decode(value, resolve)?))
             }
+            ("minecraft", "lake") => Ok(Self::Lake(LakeFeature::decode(value, resolve)?)),
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -110,6 +114,7 @@ impl ConfiguredDecoration {
             Self::Spring(v) => v.required_tags(),
             Self::Magma(_) => BTreeSet::new(),
             Self::Column(v) => v.required_tags(),
+            Self::Lake(v) => v.required_tags(),
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
@@ -143,6 +148,7 @@ impl ConfiguredDecoration {
             Self::Spring(v) => v.place(world, pos),
             Self::Magma(v) => v.place(world, random, pos),
             Self::Column(v) => v.place(world, random, pos),
+            Self::Lake(v) => v.place(world, random, pos),
         }
     }
 }
@@ -165,6 +171,7 @@ pub struct PreparedDecoration<'p, 's> {
     motion: HeightmapTags,
     sugar_cane_fluids: Option<BTreeSet<String>>,
     cactus_lava_fluids: Option<BTreeSet<String>>,
+    lake_water_fluids: Option<BTreeSet<String>>,
 }
 
 impl<'p, 's> PreparedDecoration<'p, 's> {
@@ -180,6 +187,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut required = BTreeSet::new();
         let mut needs_sugar_cane = false;
         let mut needs_cactus = false;
+        let mut needs_lake = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
             let index = usize::try_from(selected.index).context("invalid feature index")?;
@@ -222,6 +230,12 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     needs_sugar_cane |= column.needs_sugar_cane_survival();
                     needs_cactus |= column.needs_survival("cactus");
                 }
+                if let ConfiguredDecoration::Lake(lake) = &feature.placed.feature {
+                    blocks.extend(lake.required_blocks());
+                    needs_sugar_cane |= lake.needs_survival("sugar_cane");
+                    needs_cactus |= lake.needs_survival("cactus");
+                    needs_lake = true;
+                }
                 for id in blocks {
                     ensure!(
                         block_registry.contains(&format!("{}:{}", id.namespace, id.path)),
@@ -242,6 +256,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let cactus_lava_fluids = needs_cactus
             .then(|| native_resources::fluid_tags::load_lava(provider))
             .transpose()?;
+        let lake_water_fluids = needs_lake
+            .then(|| native_resources::fluid_tags::load_water(provider))
+            .transpose()?;
         Ok(Self {
             plan,
             features,
@@ -249,6 +266,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             motion,
             sugar_cane_fluids,
             cactus_lava_fluids,
+            lake_water_fluids,
         })
     }
 
@@ -297,6 +315,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
         region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
+        region.lake_water_fluids = self.lake_water_fluids.as_ref();
         let mut results = Vec::with_capacity(self.plan.features.len());
         for (index, selected) in self.plan.features.iter().enumerate() {
             let ore = self
@@ -449,6 +468,7 @@ impl CarvedTerrainWorld {
             fluid_tick_keys: BTreeMap::new(),
             sugar_cane_fluids: None,
             cactus_lava_fluids: None,
+            lake_water_fluids: None,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -946,6 +966,9 @@ impl DiskWorld for DecorationRegion<'_> {
             ("minecraft", "lava") => self
                 .cactus_lava_fluids
                 .context("lava fluid tags were not prepared")?,
+            ("minecraft", "water") => self
+                .lake_water_fluids
+                .context("lake water fluid tags were not prepared")?,
             _ => bail!("unsupported survival fluid tag"),
         };
         let fluid =
@@ -1417,6 +1440,89 @@ impl ColumnWorld for DecorationRegion<'_> {
             self.failed = true;
         }
         result
+    }
+}
+
+impl LakeWorld for DecorationRegion<'_> {
+    fn min_y(&self) -> i32 {
+        self.target.min_y
+    }
+    fn set_lake_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "generation block chunk is missing"
+            );
+            let valid = match state.name.as_str() {
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:stone" | "minecraft:ice" => {
+                    state.properties.is_empty()
+                }
+                "minecraft:water" | "minecraft:lava" => {
+                    native_world::fluid::FluidState::from_block(state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some()
+                }
+                _ => false,
+            };
+            ensure!(valid, "unsupported lake replacement effects");
+            if self.is_outside(pos[1]) {
+                return Ok(true);
+            }
+            let old = self.read(pos)?;
+            ensure!(
+                disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
+                "unsupported lake source effects"
+            );
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn schedule_lake_air_tick(&mut self, pos: [i32; 3]) -> Result<()> {
+        let result = (|| {
+            let chunk = chunk(pos);
+            ensure!(
+                self.world.chunks.contains_key(&chunk),
+                "generation tick chunk is missing"
+            );
+            let block = "minecraft:cave_air".to_owned();
+            let keys = self.block_tick_keys.entry(chunk).or_insert_with(|| {
+                self.world
+                    .saved_block_ticks
+                    .get(&chunk)
+                    .into_iter()
+                    .flatten()
+                    .map(|tick| (tick.position, tick.block.clone()))
+                    .collect()
+            });
+            if keys.insert((pos, block.clone())) {
+                self.world
+                    .saved_block_ticks
+                    .entry(chunk)
+                    .or_default()
+                    .push(SavedBlockTick {
+                        block,
+                        position: pos,
+                        delay: 0,
+                        priority: 0,
+                    });
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn should_freeze_lake(&mut self, _: [i32; 3]) -> Result<bool> {
+        bail!("lake biome freezing is not yet available")
     }
 }
 
@@ -2744,6 +2850,101 @@ mod tests {
     }
 
     #[test]
+    fn prepared_lava_lake_commits_blocks_ticks_and_postprocessing() {
+        struct LakeData;
+        impl ResourceProvider for LakeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{"feature":{
+                    "type":"minecraft:lake","fluid":{"id":"minecraft:lava"},"barrier":{"id":"minecraft:stone"},
+                    "can_place_feature":{"type":"minecraft:true"},"can_replace_with_air_or_fluid":{"type":"minecraft:true"},"can_replace_with_barrier":{"type":"minecraft:true"}
+                },"placement":[{"type":"minecraft:offset","x":0,"y":12,"z":0}]}]]}))?));
+                }
+                if path == "data/minecraft/tags/fluid/water.json" {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:water","minecraft:flowing_water"]}"#.to_vec(),
+                    ));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut LakeData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:lava".into(),
+            "minecraft:ice".into(),
+        ]);
+        let prepared = PreparedDecoration::load(&mut LakeData, &plan, &registry, &mut |v| {
+            let mut s = resolve_test(v)?;
+            if matches!(s.name.as_str(), "minecraft:water" | "minecraft:lava") {
+                s.properties.insert("level".into(), "0".into());
+            }
+            Ok(s)
+        })
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut setup = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        for x in -8..8 {
+            for z in -8..8 {
+                for y in 8..12 {
+                    setup.set_section_block([x, y, z], &state("stone")).unwrap();
+                }
+            }
+        }
+        setup.finish().unwrap();
+        let before = terrain.snapshot();
+        assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+        let world = terrain.snapshot();
+        assert!((-8..8).any(|x| {
+            (-8..8).any(|z| (8..12).any(|y| world.block(x, y, z).unwrap().name == "minecraft:lava"))
+        }));
+        assert!(
+            world
+                .saved_block_ticks
+                .values()
+                .flatten()
+                .any(|tick| tick.block == "minecraft:cave_air"
+                    && tick.delay == 0
+                    && tick.priority == 0)
+        );
+        assert!(!Arc::ptr_eq(&before, &world));
+        assert!(
+            [
+                ChunkPos { x: -1, z: -1 },
+                ChunkPos { x: -1, z: 0 },
+                ChunkPos { x: 0, z: -1 },
+                ChunkPos { x: 0, z: 0 }
+            ]
+            .iter()
+            .any(|pos| terrain.feature_postprocessing(*pos).is_some())
+        );
+        let previous = terrain.snapshot();
+        let writable = previous.chunks.keys().copied().collect();
+        let mut failed = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        failed.schedule_lake_air_tick([0, 8, 0]).unwrap();
+        assert!(
+            failed
+                .set_lake_block([0, 8, 0], &state("diamond_ore"))
+                .is_err()
+        );
+        assert!(failed.finish().is_err());
+        assert!(Arc::ptr_eq(&previous, &terrain.snapshot()));
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn installed_spring_and_magma_definitions_load_with_the_block_registry() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -2759,6 +2960,8 @@ mod tests {
             "underwater_magma",
             "patch_sugar_cane",
             "patch_cactus_desert",
+            "lake_lava_surface",
+            "lake_lava_underground",
         ] {
             let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
             PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {

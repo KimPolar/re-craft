@@ -5,6 +5,32 @@ use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
 use serde_json::json;
 use std::{path::PathBuf, process::Command};
 
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn pale_garden_flower_is_excluded_from_plains() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let blocks = resources.vanilla_generated_block_registry().unwrap();
+    let registry = resources
+        .list_data("worldgen/placed_feature")
+        .unwrap()
+        .into_iter()
+        .collect();
+    let pale = ResourceId::parse("minecraft:pale_garden").unwrap();
+    let plains = ResourceId::parse("minecraft:plains").unwrap();
+    let schedule =
+        FeatureSchedule::load(&mut resources, &[pale.clone(), plains.clone()], &registry).unwrap();
+    let key = FeatureKey::Registered(ResourceId::parse("minecraft:flower_pale_garden").unwrap());
+    let flower = ScheduledDecorationFeature::load(&mut resources, &schedule, &key, &mut |value| {
+        super::super::resolve_generated_terrain_state(value, &blocks)
+    })
+    .unwrap();
+    assert!(flower.biome_allows(&pale).unwrap());
+    assert!(!flower.biome_allows(&plains).unwrap());
+}
+
 fn state(name: &str) -> BlockState {
     let properties = match name {
         "grass_block" => BTreeMap::from([("snowy".into(), "false".into())]),

@@ -52,6 +52,11 @@ fn height_provider_identity_controls_java_biome_membership() {
         .arg("-classpath")
         .arg(&cp)
         .arg("BiomeFeatureEqualityOracle"));
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "holders true false false")
+    );
     let lines: Vec<_> = output
         .lines()
         .filter(|line| {

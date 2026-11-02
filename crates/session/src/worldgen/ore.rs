@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
-    feature_order::{FeatureKey, FeatureSchedule},
+    feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
@@ -127,6 +127,7 @@ pub struct ScheduledDecorationFeature<'a> {
     placed: PlacedDecorationFeature,
     schedule: &'a FeatureSchedule,
     independent_modifier: bool,
+    holder_index: Option<&'a FeatureHolderIndex>,
 }
 
 /// A fully resolved chunk decoration attempt. Unsupported selected
@@ -286,11 +287,13 @@ impl<'a> ScheduledDecorationFeature<'a> {
             }
         };
         let independent_modifier = placed.placement.has_independent_modifier();
+        let holder_index = (!independent_modifier).then(|| schedule.feature_holder_index(provider));
         Ok(Self {
             key: key.clone(),
             placed,
             schedule,
             independent_modifier,
+            holder_index,
         })
     }
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
@@ -310,6 +313,11 @@ impl<'a> ScheduledDecorationFeature<'a> {
         }
         if self.independent_modifier || settings.steps.iter().all(Vec::is_empty) {
             return Ok(false);
+        }
+        if let Some(index) = self.holder_index {
+            if index.excludes(biome, &self.placed.placement.feature)? {
+                return Ok(false);
+            }
         }
         bail!("cannot determine Java feature equality for this biome")
     }
@@ -2784,6 +2792,7 @@ mod tests {
         let scheduled = ScheduledDecorationFeature {
             key: key.clone(),
             independent_modifier: placed.placement.has_independent_modifier(),
+            holder_index: None,
             placed,
             schedule: &java_schedule,
         };

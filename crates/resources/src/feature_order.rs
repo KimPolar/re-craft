@@ -4,6 +4,7 @@
 //! caller must supply the generator's possible biomes in Java iteration order
 //! and a complete, validated placed-feature registry for the active packs.
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -38,6 +39,113 @@ pub struct FeatureSchedule {
     possible_biomes: Vec<ResourceId>,
     indices: BTreeMap<ResourceId, Vec<Vec<usize>>>,
     membership: BTreeMap<ResourceId, BTreeSet<FeatureKey>>,
+    feature_holders: OnceLock<FeatureHolderIndex>,
+}
+
+/// Conservative summary of configured-feature holders in each biome.
+/// Missing or unreadable definitions prevent an inequality conclusion.
+pub struct FeatureHolderIndex {
+    biomes: BTreeMap<ResourceId, BiomeHolders>,
+}
+
+#[derive(Default)]
+struct BiomeHolders {
+    references: BTreeSet<ResourceId>,
+    direct: bool,
+    unknown: bool,
+}
+
+enum FeatureHolder {
+    Reference(ResourceId),
+    Direct,
+    Unknown,
+}
+
+impl FeatureHolder {
+    fn from_placed(value: &Value) -> Self {
+        Self::from_configured(value.get("feature").unwrap_or(&Value::Null))
+    }
+
+    fn from_configured(value: &Value) -> Self {
+        match value {
+            Value::String(name) => ResourceId::parse(name)
+                .map(Self::Reference)
+                .unwrap_or(Self::Unknown),
+            Value::Object(_) => Self::Direct,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl FeatureHolderIndex {
+    fn load(schedule: &FeatureSchedule, provider: &mut impl ResourceProvider) -> Self {
+        let mut holders = BTreeMap::new();
+        for key in schedule.steps.iter().flatten() {
+            if holders.contains_key(key) {
+                continue;
+            }
+            let value = match key {
+                FeatureKey::Registered(id) => {
+                    let path = format!(
+                        "data/{}/worldgen/placed_feature/{}.json",
+                        id.namespace, id.path
+                    );
+                    provider
+                        .read_data(&path)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                }
+                FeatureKey::Inline { biome, .. } => schedule
+                    .biomes
+                    .get(biome)
+                    .and_then(|features| features.inline.get(key))
+                    .cloned(),
+            };
+            holders.insert(
+                key.clone(),
+                value
+                    .as_ref()
+                    .map(FeatureHolder::from_placed)
+                    .unwrap_or(FeatureHolder::Unknown),
+            );
+        }
+        let biomes = schedule
+            .biomes
+            .iter()
+            .map(|(id, features)| {
+                let mut summary = BiomeHolders::default();
+                for key in features.steps.iter().flatten() {
+                    match holders.get(key) {
+                        Some(FeatureHolder::Reference(id)) => {
+                            summary.references.insert(id.clone());
+                        }
+                        Some(FeatureHolder::Direct) => summary.direct = true,
+                        _ => summary.unknown = true,
+                    }
+                }
+                (id.clone(), summary)
+            })
+            .collect();
+        Self { biomes }
+    }
+
+    /// Return true only when no holder in the biome can equal this holder.
+    /// Java registry references compare by identity and never equal direct holders.
+    pub fn excludes(&self, biome: &ResourceId, configured: &Value) -> Result<bool> {
+        let summary = self
+            .biomes
+            .get(biome)
+            .context("biome is absent from the feature schedule")?;
+        if summary.unknown {
+            return Ok(false);
+        }
+        Ok(match FeatureHolder::from_configured(configured) {
+            FeatureHolder::Reference(id) => !summary.references.contains(&id),
+            FeatureHolder::Direct => !summary.direct,
+            FeatureHolder::Unknown => false,
+        })
+    }
 }
 
 /// A selected feature retains its global index even when earlier features are
@@ -108,6 +216,7 @@ impl FeatureSchedule {
             possible_biomes: possible_biomes.to_vec(),
             indices,
             membership,
+            feature_holders: OnceLock::new(),
         })
     }
 
@@ -119,6 +228,14 @@ impl FeatureSchedule {
     }
     pub fn possible_biomes(&self) -> &[ResourceId] {
         &self.possible_biomes
+    }
+    /// The provider must describe the same immutable pack stack as this schedule.
+    pub fn feature_holder_index(
+        &self,
+        provider: &mut impl ResourceProvider,
+    ) -> &FeatureHolderIndex {
+        self.feature_holders
+            .get_or_init(|| FeatureHolderIndex::load(self, provider))
     }
     /// Identity lookup only; Java's `hasFeature` can also match a distinct
     /// structurally equal placed feature. Callers must account for that case.
@@ -418,6 +535,62 @@ mod tests {
                 .map(|v| serde_json::to_vec(v).unwrap())
                 .collect(),
         );
+    }
+
+    #[test]
+    fn holder_index_only_excludes_provably_distinct_holders() {
+        let mut data = Data::default();
+        for (biome, features) in [
+            ("reference", json!(["test:first"])),
+            ("same", json!(["test:second"])),
+            ("different", json!(["test:third"])),
+            (
+                "direct",
+                json!([{"feature":{"type":"test:feature"},"placement":[]} ]),
+            ),
+            ("unknown", json!(["test:missing"])),
+        ] {
+            insert(
+                &mut data,
+                &format!("data/test/worldgen/biome/{biome}.json"),
+                &[json!({"features":[features]})],
+            );
+        }
+        for (name, feature) in [
+            ("first", "test:shared"),
+            ("second", "test:shared"),
+            ("third", "test:other"),
+        ] {
+            insert(
+                &mut data,
+                &format!("data/test/worldgen/placed_feature/{name}.json"),
+                &[json!({"feature":feature,"placement":[]})],
+            );
+        }
+        let biomes: Vec<_> = ["reference", "same", "different", "direct", "unknown"]
+            .iter()
+            .map(|s| id(&format!("test:{s}")))
+            .collect();
+        let registry = ["first", "second", "third", "missing"]
+            .iter()
+            .map(|s| id(&format!("test:{s}")))
+            .collect();
+        let schedule = FeatureSchedule::load(&mut data, &biomes, &registry).unwrap();
+        let index = schedule.feature_holder_index(&mut data);
+        let shared = json!("test:shared");
+        let direct = json!({"type":"test:feature"});
+        assert!(!index.excludes(&id("test:same"), &shared).unwrap());
+        assert!(index.excludes(&id("test:different"), &shared).unwrap());
+        assert!(index.excludes(&id("test:direct"), &shared).unwrap());
+        assert!(index.excludes(&id("test:reference"), &direct).unwrap());
+        assert!(!index.excludes(&id("test:direct"), &direct).unwrap());
+        assert!(!index.excludes(&id("test:unknown"), &shared).unwrap());
+        assert!(!index.excludes(&id("test:different"), &Value::Null).unwrap());
+        assert!(index.excludes(&id("test:absent"), &shared).is_err());
+        assert!(std::ptr::eq(
+            index,
+            schedule.feature_holder_index(&mut data)
+        ));
     }
 
     #[test]

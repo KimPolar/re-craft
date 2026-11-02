@@ -2791,6 +2791,8 @@ mod tests {
         let before = batch.light_snapshot([center]).unwrap();
         let original = batch.snapshot().unwrap();
         let before_view = batch.lit_snapshot([center]).unwrap();
+        assert!(batch.lit_render_snapshot([center]).is_err());
+        assert!(batch.lit_render_snapshot([]).is_err());
         assert!(Arc::ptr_eq(
             &before_view,
             &batch.lit_snapshot([center]).unwrap()
@@ -2850,6 +2852,14 @@ mod tests {
             Some("minecraft:terrain")
         );
         assert!(!after_view.chunks[&center].block_light_correct);
+        let render = batch.lit_render_snapshot([center]).unwrap();
+        assert_eq!(render.light(8, 8, 8, false), Some(1));
+        assert_eq!(render.light(16, 8, 8, true), Some(0));
+        assert!(Arc::ptr_eq(
+            &original.chunks[&ChunkPos { x: 2, z: 0 }],
+            &render.chunks[&ChunkPos { x: 2, z: 0 }]
+        ));
+        assert!(!Arc::ptr_eq(&original.chunks[&east], &render.chunks[&east]));
         assert_eq!(after.block_light([8, 8, 8]), Some(1));
         assert_eq!(after.sky_light([8, 8, 8]), Some(0));
         assert_eq!(before.block_light([8, 8, 8]), Some(0));

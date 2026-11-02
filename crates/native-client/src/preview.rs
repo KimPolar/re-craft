@@ -1062,6 +1062,42 @@ impl IncrementalPreview {
         max_atlas_side: u32,
         blend: u8,
     ) -> Result<PreviewScene> {
+        self.prepare_selected(world, source, requested_origin, max_atlas_side, blend, None)
+    }
+
+    /// Prepare only LIGHT-complete generated targets, using their lit 3x3
+    /// neighborhoods for culling, tint and light sampling. The returned world
+    /// is an intermediate rendering view, not a playable or saveable world.
+    pub fn prepare_generated(
+        &mut self,
+        batch: &mut native_session::worldgen::FreshTerrainBatch,
+        targets: &BTreeSet<ChunkPos>,
+        source: &mut impl ResourceProvider,
+        requested_origin: IVec3,
+        max_atlas_side: u32,
+        blend: u8,
+    ) -> Result<(Arc<World>, PreviewScene)> {
+        let world = batch.lit_render_snapshot(targets.iter().copied())?;
+        let scene = self.prepare_selected(
+            &world,
+            source,
+            requested_origin,
+            max_atlas_side,
+            blend,
+            Some(targets),
+        )?;
+        Ok((world, scene))
+    }
+
+    fn prepare_selected(
+        &mut self,
+        world: &World,
+        source: &mut impl ResourceProvider,
+        requested_origin: IVec3,
+        max_atlas_side: u32,
+        blend: u8,
+        selected: Option<&BTreeSet<ChunkPos>>,
+    ) -> Result<PreviewScene> {
         let blend = blend.min(7);
         if self.biome_blend != Some(blend) {
             self.biome_blend = Some(blend);
@@ -1241,6 +1277,9 @@ impl IncrementalPreview {
             self.last_rebuilt = 0;
         }
         for (&pos, chunk) in &world.chunks {
+            if selected.is_some_and(|selected| !selected.contains(&pos)) {
+                continue;
+            }
             let neighbors = neighborhood(world, pos);
             if self
                 .chunks
@@ -1270,6 +1309,7 @@ impl IncrementalPreview {
             chunks: self
                 .chunks
                 .iter()
+                .filter(|(pos, _)| selected.is_none_or(|selected| selected.contains(pos)))
                 .map(|(pos, chunk)| (*pos, Arc::clone(&chunk.mesh)))
                 .collect(),
             origin,
@@ -2765,6 +2805,227 @@ mod tests {
         assert!(scene.translucent_len() == 0);
         assert_eq!(scene.warnings.len(), 1);
         assert!(scene.warnings[0].contains("example:unknown"));
+    }
+
+    #[test]
+    fn selected_meshes_keep_neighbor_culling_and_reuse_cached_chunks() {
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let block = world.intern_state(BlockState {
+            name: "example:unknown".into(),
+            properties: BTreeMap::new(),
+        });
+        for x in 0..=1 {
+            let pos = ChunkPos { x, z: 0 };
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            blocks[if x == 0 { 15 } else { 0 }] = block;
+            world.chunks.insert(
+                pos,
+                Arc::new(Chunk {
+                    block_light_correct: false,
+                    position: pos,
+                    status: Some("minecraft:terrain".into()),
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+        }
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let mut renderer = IncrementalPreview::default();
+        let a = renderer
+            .prepare_selected(
+                &world,
+                &mut Empty,
+                IVec3::ZERO,
+                128,
+                0,
+                Some(&BTreeSet::from([center])),
+            )
+            .unwrap();
+        assert_eq!(a.chunks.len(), 1);
+        assert_eq!(a.opaque_len(), 30);
+        assert_eq!(renderer.last_rebuilt, 1);
+        let b = renderer
+            .prepare_selected(
+                &world,
+                &mut Empty,
+                IVec3::ZERO,
+                128,
+                0,
+                Some(&BTreeSet::from([east])),
+            )
+            .unwrap();
+        assert_eq!(b.chunks.len(), 1);
+        assert_eq!(b.opaque_len(), 30);
+        assert_eq!(renderer.last_rebuilt, 1);
+        let both = renderer
+            .prepare_selected(
+                &world,
+                &mut Empty,
+                IVec3::ZERO,
+                128,
+                0,
+                Some(&BTreeSet::from([center, east])),
+            )
+            .unwrap();
+        assert_eq!(both.chunks.len(), 2);
+        assert_eq!(both.opaque_len(), 60);
+        assert_eq!(renderer.last_rebuilt, 0);
+        assert!(Arc::ptr_eq(&a.chunks[&center], &both.chunks[&center]));
+        assert!(Arc::ptr_eq(&b.chunks[&east], &both.chunks[&east]));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 assets"]
+    fn generated_lit_terrain_prepares_only_requested_meshes() {
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+        };
+        use native_session::worldgen::{CarverBlockState, FreshTerrainBatch, TerrainGenerator};
+        use serde_json::{Value, json};
+        struct Fixture;
+        impl ResourceProvider for Fixture {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(if path == "data/minecraft/worldgen/biome/plains.json" {
+                    Some(br#"{"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[]}"#.to_vec())
+                } else if path == "data/minecraft/tags/block/uncarvable.json" {
+                    Some(br#"{"values":[]}"#.to_vec())
+                } else if path == "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    || path == "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                {
+                    Some(br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec())
+                } else if path.starts_with("data/minecraft/worldgen/noise/") {
+                    Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
+                } else {
+                    None
+                })
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let mut registry: BTreeSet<String> = generated.ids().map(str::to_owned).collect();
+        registry.extend(
+            [
+                "air", "cave_air", "void_air", "bedrock", "stone", "dirt", "water", "lava",
+            ]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}")),
+        );
+        let mut data = Fixture;
+        let tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
+            "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
+            "default_block":"minecraft:stone","default_fluid":"minecraft:water",
+            "material_rule":{"type":"block","result_state":"minecraft:dirt"},
+            "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
+        }});
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition, 42, 0, 16)
+                .unwrap();
+        let mut batch =
+            FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
+                .unwrap();
+        let lighting = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            dimension_type: None,
+            min_y: 0,
+            height: 16,
+            has_skylight: true,
+        };
+        batch
+            .enable_decoration(&mut data, &BTreeSet::new(), registry, &lighting)
+            .unwrap();
+        batch.enable_light_initialization(generated).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                batch
+                    .request_light_initialization(ChunkPos { x, z })
+                    .unwrap();
+            }
+        }
+        let mut classify = |v: &Value| -> Result<CarverBlockState> {
+            let name = v
+                .as_str()
+                .or_else(|| v.get("id").and_then(Value::as_str))
+                .context("state ID")?;
+            Ok(CarverBlockState {
+                is_air: name == "minecraft:air",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let mut resolve = |v: &Value| -> Result<BlockState> {
+            Ok(BlockState {
+                name: v
+                    .as_str()
+                    .or_else(|| v.get("id").and_then(Value::as_str))
+                    .context("state ID")?
+                    .into(),
+                properties: BTreeMap::new(),
+            })
+        };
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        batch.seal_for_light_propagation().unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let targets = BTreeSet::from([center]);
+        let mut renderer = IncrementalPreview::default();
+        assert!(
+            renderer
+                .prepare_generated(&mut batch, &targets, &mut resources, IVec3::ZERO, 2048, 0)
+                .is_err()
+        );
+        batch.request_light(center).unwrap();
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        let (world, scene) = renderer
+            .prepare_generated(&mut batch, &targets, &mut resources, IVec3::ZERO, 2048, 0)
+            .unwrap();
+        assert_eq!(scene.chunks.len(), 1);
+        assert!(scene.chunks.contains_key(&center));
+        assert!(scene.opaque_len() > 0);
+        assert_eq!(world.light(8, 16, 8, true), Some(15));
+        assert!(
+            scene
+                .opaque_vertices()
+                .any(|v| (v.position[1] - 16.0).abs() < 0.0001 && v.light / 16 == 15)
+        );
+        assert!(!world.chunks[&center].block_light_correct);
+        let (repeated_world, repeated_scene) = renderer
+            .prepare_generated(&mut batch, &targets, &mut resources, IVec3::ZERO, 2048, 0)
+            .unwrap();
+        assert!(Arc::ptr_eq(&world, &repeated_world));
+        assert!(Arc::ptr_eq(
+            &scene.chunks[&center],
+            &repeated_scene.chunks[&center]
+        ));
+        assert_eq!(renderer.last_rebuilt, 0);
     }
 
     #[test]

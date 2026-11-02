@@ -354,6 +354,35 @@ impl FreshTerrainBatch {
         Ok(world)
     }
 
+    /// Capture the 3x3 light and block neighborhood of each render target.
+    /// Targets must have completed LIGHT; callers must draw only the targets,
+    /// because farther chunks in the returned world are not light-covered.
+    pub fn lit_render_snapshot(
+        &mut self,
+        targets: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<Arc<World>> {
+        let targets: BTreeSet<_> = targets.into_iter().collect();
+        ensure!(!targets.is_empty(), "no generated render targets");
+        let mut covered = BTreeSet::new();
+        for pos in targets {
+            ensure!(
+                self.schedule
+                    .completed(pos)
+                    .is_some_and(|stage| stage >= GenerationStage::Light),
+                "render target has not completed lighting"
+            );
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    covered.insert(ChunkPos {
+                        x: pos.x.checked_add(dx).context("render X overflow")?,
+                        z: pos.z.checked_add(dz).context("render Z overflow")?,
+                    });
+                }
+            }
+        }
+        self.lit_snapshot(covered)
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.failed && self.schedule.is_complete()
     }

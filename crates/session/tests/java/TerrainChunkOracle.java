@@ -15,6 +15,9 @@ import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.levelgen.blending.Blender;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
+import net.minecraft.world.level.levelgen.material.rule.*;
+import net.minecraft.world.level.levelgen.material.MaterialRuleContext;
+import com.mojang.serialization.MapCodec;
 import net.minecraft.world.level.dimension.LevelStem;
 
 public class TerrainChunkOracle {
@@ -64,9 +67,14 @@ public class TerrainChunkOracle {
     var registries=VanillaRegistries.createWorldLookup();
     var dimensions=WorldPresets.createNormalWorldDimensions(registries);
     for(int arg=0;arg<args.length;arg+=4){
-    var dimension=switch(args[arg]) {case "overworld"->LevelStem.OVERWORLD;case "nether"->LevelStem.NETHER;case "end"->LevelStem.END;default->throw new IllegalArgumentException(args[arg]);};
+    var dimension=switch(args[arg]) {case "overworld","custom"->LevelStem.OVERWORLD;case "nether"->LevelStem.NETHER;case "end"->LevelStem.END;default->throw new IllegalArgumentException(args[arg]);};
     var stem=dimensions.get(dimension).orElseThrow();
     var generator=(NoiseBasedChunkGenerator)stem.generator();var settings=generator.generatorSettings().value();
+    MaterialRule rule=settings.materialRule().value();
+    if(args[arg].equals("custom"))rule=new MaterialRule() {
+      public MapCodec<? extends MaterialRule> codec(){return null;}
+      public RuleEvaluator compile(MaterialRuleContext c){return (x,y,z)->y>=-60?Blocks.WATER.defaultBlockState():null;}
+    };
     long seed=Long.parseLong(args[arg+1]);int cx=Integer.parseInt(args[arg+2]),cz=Integer.parseInt(args[arg+3]);
     var random=RandomState.create(registries.lookupOrThrow(Registries.NOISE),seed,settings);
     var resolver=generator.getBiomeSource().createUncachedResolver(random);
@@ -94,9 +102,9 @@ public class TerrainChunkOracle {
     try(var noise=new NoiseChunk(random,null,settings,picker,Blender.empty(),volume)) {
       method("doFill").invoke(generator,noise,chunk);
       dump("noise",chunk,dim.minY(),dim.height());
-      method("buildSurface").invoke(generator,chunk,noise,random,biomeManager,generator.getBiomeSource().possibleBiomes(),settings.materialRule().value());
+      method("buildSurface").invoke(generator,chunk,noise,random,biomeManager,generator.getBiomeSource().possibleBiomes(),rule);
       dump("surface",chunk,dim.minY(),dim.height());
-      method("generateCarvers").invoke(generator,chunk,Blender.empty(),noise,random,biomeManager,null,settings.materialRule().value());
+      method("generateCarvers").invoke(generator,chunk,Blender.empty(),noise,random,biomeManager,null,rule);
       dump("carvers",chunk,dim.minY(),dim.height());
     }
     }

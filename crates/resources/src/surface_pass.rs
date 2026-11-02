@@ -30,6 +30,8 @@ pub struct SurfaceStageChunk {
     /// Ordered marks made during noise fill only. Surface and carver marks are
     /// not included; None means the source did not retain this history.
     pub noise_postprocessing: Option<native_core::postprocessing::PostProcessing>,
+    /// Noise and surface marks, in Java insertion order. Carver marks are not included.
+    pub surface_postprocessing: Option<native_core::postprocessing::PostProcessing>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +60,7 @@ fn extend_badlands_column(
     peak: i32,
     default_block: &Arc<Value>,
     default_kind: SurfaceBlockKind,
+    mut mark_fluid: impl FnMut(i32),
 ) -> Result<()> {
     if peak < start || peak < min_y {
         return Ok(());
@@ -83,6 +86,7 @@ fn extend_badlands_column(
         kinds[i] = default_kind;
         if default_kind == SurfaceBlockKind::Fluid {
             updates[i] = true;
+            mark_fluid(min_y + i as i32);
         }
     }
     Ok(())
@@ -102,6 +106,7 @@ fn extend_iceberg_column(
     random: &mut SurfaceRandom,
     snow: &(Arc<Value>, SurfaceBlockKind),
     ice: &(Arc<Value>, SurfaceBlockKind),
+    mut mark_fluid: impl FnMut(i32),
 ) -> Result<()> {
     let snow_limit = 2 + random.next_int_bound(4);
     let snow_height = sea.wrapping_add(18).wrapping_add(random.next_int_bound(10));
@@ -141,6 +146,7 @@ fn extend_iceberg_column(
                 kinds[i] = choice.1;
                 if choice.1 == SurfaceBlockKind::Fluid {
                     updates[i] = true;
+                    mark_fluid(y);
                 }
             }
         }
@@ -254,6 +260,7 @@ pub fn apply_surface<P: ResourceProvider>(
             .context("unclassified noise material")?;
         Ok(*kind == SurfaceBlockKind::Fluid)
     })?;
+    let mut surface_postprocessing = noise_postprocessing.clone();
     let h = height as usize;
     ensure!(states.len() == 256 * h, "invalid noise chunk buffer");
     let mut heights = [min_y - 1; 256];
@@ -290,6 +297,9 @@ pub fn apply_surface<P: ResourceProvider>(
                         peak,
                         &default_block,
                         default_kind,
+                        |y| {
+                            surface_postprocessing.mark(world_x, y, world_z);
+                        },
                     )?;
                     heights[column] = kinds[range]
                         .iter()
@@ -346,6 +356,7 @@ pub fn apply_surface<P: ResourceProvider>(
                     kinds[index] = kind;
                     if kind == SurfaceBlockKind::Fluid {
                         fluid_updates[index] = true;
+                        surface_postprocessing.mark(world_x, step.y, world_z);
                     }
                 }
                 Ok(())
@@ -386,6 +397,9 @@ pub fn apply_surface<P: ResourceProvider>(
                         &mut random,
                         &snow,
                         &ice,
+                        |y| {
+                            surface_postprocessing.mark(world_x, y, world_z);
+                        },
                     )?;
                 }
             }
@@ -403,6 +417,7 @@ pub fn apply_surface<P: ResourceProvider>(
         states,
         fluid_updates,
         noise_postprocessing: Some(noise_postprocessing),
+        surface_postprocessing: Some(surface_postprocessing),
     })
 }
 
@@ -682,6 +697,7 @@ mod tests {
                             peak,
                             &stone,
                             SurfaceBlockKind::Solid,
+                            |_| {},
                         )
                         .unwrap();
                     }
@@ -867,6 +883,7 @@ mod tests {
                             &mut random,
                             &snow,
                             &ice,
+                            |_| {},
                         )
                         .unwrap();
                     }

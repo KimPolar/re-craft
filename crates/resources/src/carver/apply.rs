@@ -182,6 +182,7 @@ mod tests {
             states: vec![Arc::new(json!("minecraft:stone")); 256 * height],
             fluid_updates: vec![false; 256 * height],
             noise_postprocessing: None,
+            surface_postprocessing: None,
         };
         for (y, name) in [
             (2, "minecraft:dirt"),

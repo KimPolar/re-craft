@@ -208,6 +208,10 @@ fn terrain_matches_java_before_and_after_carvers() {
             "-1",
             "100",
             "-70",
+            "custom",
+            "2345",
+            "0",
+            "0",
         ]));
     let cases = [
         ("minecraft:overworld", 2345, [0, 0], -64, 384),
@@ -219,6 +223,7 @@ fn terrain_matches_java_before_and_after_carvers() {
         ("minecraft:the_nether", -1, [100, -70], 0, 256),
         ("minecraft:the_end", 42, [0, 0], 0, 256),
         ("minecraft:the_end", -1, [100, -70], 0, 256),
+        ("minecraft:overworld", 2345, [0, 0], -64, 384),
     ];
     let mut groups = Vec::<Vec<Vec<usize>>>::new();
     let mut registry = BTreeSet::new();
@@ -363,9 +368,21 @@ fn terrain_matches_java_before_and_after_carvers() {
                 probes[i].get(&section).map(Vec::as_slice).unwrap_or(&[])
             );
         }
+        let mut generator_definition = preset["dimensions"][dimension]["generator"].clone();
+        if i == cases.len() - 1 {
+            let bytes = resources
+                .read_builtin_data("data/minecraft/worldgen/noise_settings/overworld.json")
+                .unwrap()
+                .unwrap();
+            let mut settings: Value = serde_json::from_slice(&bytes).unwrap();
+            settings["material_rule"] = serde_json::json!({"type":"minecraft:condition",
+                "if_true":{"type":"minecraft:y_above", "anchor":{"absolute":-60}, "surface_depth_multiplier":0, "add_stone_depth":false},
+                "then_run":{"type":"minecraft:block", "result_state":{"id":"minecraft:water"}}});
+            generator_definition["settings"] = settings;
+        }
         let mut generator = TerrainGenerator::without_terrain_adjustments(
             &mut resources,
-            &preset["dimensions"][dimension]["generator"],
+            &generator_definition,
             seed,
             min_y,
             height,
@@ -422,6 +439,22 @@ fn terrain_matches_java_before_and_after_carvers() {
                 },
             )
             .unwrap();
+        let surface_marks = chunk.surface_postprocessing.as_ref().unwrap().clone();
+        let mut count = 0;
+        for (section, values) in surface_marks.sections().iter().enumerate() {
+            let expected: Vec<i16> = ordered_updates[i * 3 + 1]
+                .get(&section)
+                .map(|values| values.iter().map(|&value| value as i16).collect())
+                .unwrap_or_default();
+            count += expected.len();
+            assert_eq!(
+                *values, expected,
+                "surface postprocessing {dimension} {seed} {pos:?} section {section}"
+            );
+        }
+        if i == cases.len() - 1 {
+            assert!(count > 0, "custom water rule must mark positions");
+        }
         compare(
             &format!("surface {dimension} {seed} {pos:?}"),
             &chunk,
@@ -462,6 +495,7 @@ fn terrain_matches_java_before_and_after_carvers() {
         })
         .unwrap();
         assert_eq!(generated.noise_postprocessing(), Some(&marks));
+        assert_eq!(generated.surface_postprocessing(), Some(&surface_marks));
         let world = generated.world();
         let mut names = BTreeMap::new();
         let expected = &groups[i * 3 + 2];
@@ -524,6 +558,10 @@ fn terrain_matches_java_before_and_after_carvers() {
             let first = native_world::loaded::ChunkPos { x: 0, z: 0 };
             let second = native_world::loaded::ChunkPos { x: 1, z: 0 };
             assert_eq!(assembled.noise_postprocessing(second), Some(&marks));
+            assert_eq!(
+                assembled.surface_postprocessing(second),
+                Some(&surface_marks)
+            );
             assert_eq!(combined.chunks.len(), 2);
             assert!(Arc::ptr_eq(
                 &previous.chunks[&first],

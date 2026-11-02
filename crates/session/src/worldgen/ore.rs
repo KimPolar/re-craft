@@ -1394,13 +1394,17 @@ impl DecorationRegion<'_> {
                 positions.next(&mut random, &mut env)?
             };
             let Some(position) = next else { break };
-            result |= ore.placed.feature.place(
-                self,
-                &mut random,
-                position,
-                plan.generator_min_y,
-                plan.generator_height,
-            )?;
+            result |= ore
+                .placed
+                .feature
+                .place(
+                    self,
+                    &mut random,
+                    position,
+                    plan.generator_min_y,
+                    plan.generator_height,
+                )
+                .with_context(|| format!("placing {:?} at {position:?}", selected.feature))?;
         }
         self.failed = false;
         Ok(result)
@@ -3552,7 +3556,8 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
-        disk_safe_solid(&state.name).context("unsupported disk solid predicate block")
+        disk_safe_solid(&state.name)
+            .with_context(|| format!("unsupported disk solid predicate block {}", state.name))
     }
     fn is_liquid(&mut self, state: &BlockState) -> Result<bool> {
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {

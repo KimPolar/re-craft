@@ -2049,6 +2049,43 @@ fn tree_cave_vines(state: &BlockState) -> Result<bool> {
     Ok(true)
 }
 
+// All vanilla dripleaf states have no block entity, POI, or placement
+// postprocessing. Block-column features write their supplied states directly.
+fn generated_dripleaf(state: &BlockState) -> Result<bool> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:big_dripleaf" | "minecraft:big_dripleaf_stem" | "minecraft:small_dripleaf"
+    ) {
+        return Ok(false);
+    }
+    let common = matches!(
+        state.properties.get("facing").map(String::as_str),
+        Some("north" | "south" | "east" | "west")
+    ) && matches!(
+        state.properties.get("waterlogged").map(String::as_str),
+        Some("true" | "false")
+    );
+    let extra = match state.name.as_str() {
+        "minecraft:big_dripleaf" => {
+            state.properties.len() == 3
+                && matches!(
+                    state.properties.get("tilt").map(String::as_str),
+                    Some("none" | "unstable" | "partial" | "full")
+                )
+        }
+        "minecraft:small_dripleaf" => {
+            state.properties.len() == 3
+                && matches!(
+                    state.properties.get("half").map(String::as_str),
+                    Some("lower" | "upper")
+                )
+        }
+        _ => state.properties.len() == 2,
+    };
+    ensure!(common && extra, "invalid generated dripleaf state");
+    Ok(true)
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if tree_generated_log(state) {
         return Ok(true);
@@ -4441,6 +4478,9 @@ impl ColumnWorld for DecorationRegion<'_> {
                 }
                 "minecraft:cactus_flower" => state.properties.is_empty(),
                 "minecraft:cave_vines_plant" | "minecraft:cave_vines" => tree_cave_vines(state)?,
+                "minecraft:big_dripleaf"
+                | "minecraft:big_dripleaf_stem"
+                | "minecraft:small_dripleaf" => generated_dripleaf(state)?,
                 _ => false,
             };
             ensure!(
@@ -4458,6 +4498,7 @@ impl ColumnWorld for DecorationRegion<'_> {
                         old.name.as_str(),
                         "minecraft:cave_vines" | "minecraft:cave_vines_plant"
                     )
+                    || generated_dripleaf(&old)?
                     || simple_plant_kind(&old).is_ok(),
                 "unsupported column source effects"
             );
@@ -9457,6 +9498,179 @@ mod tests {
             "minecraft:hanging_roots"
         );
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:melon");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn dripleaf_column_states_and_placement_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("DripleafColumnOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/DripleafColumnOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("DripleafColumnOracle"));
+        let mut blocks = batch_registry();
+        blocks.extend([
+            "minecraft:big_dripleaf".into(),
+            "minecraft:big_dripleaf_stem".into(),
+            "minecraft:small_dripleaf".into(),
+        ]);
+        let tags = OreBlockTags::load(&mut Data, &blocks, &BTreeSet::new()).unwrap();
+        let motion = HeightmapTags::load(&mut Data, &blocks).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut count = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 11, "{line}");
+            let properties = fields[1]
+                .split(',')
+                .map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap();
+                    (key.to_owned(), value.to_owned())
+                })
+                .collect();
+            let block = BlockState {
+                name: fields[0].into(),
+                properties,
+            };
+            assert!(generated_dripleaf(&block).unwrap(), "{line}");
+            assert_eq!(
+                &fields[2..6],
+                &["false", "false", "false", "none"],
+                "{line}"
+            );
+            let fluid = native_world::fluid::FluidState::from_block(&block).unwrap();
+            assert_eq!(
+                fluid.is_none(),
+                fields[6].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            let height_flags = region.final_predicates(&block).unwrap();
+            for kind in 0..4 {
+                assert_eq!(
+                    height_flags[kind],
+                    fields[7 + kind].parse::<bool>().unwrap(),
+                    "{line}"
+                );
+            }
+            assert!(region.set_column_block([8, 8, 8], &block).unwrap());
+            assert_eq!(region.read([8, 8, 8]).unwrap(), block, "{line}");
+            count += 1;
+        }
+        assert_eq!(count, 56);
+        assert!(region.feature_marks.is_empty());
+        assert!(region.world.saved_block_ticks.is_empty());
+        assert!(region.world.saved_fluid_ticks.is_empty());
+        let mut invalid = state("big_dripleaf");
+        invalid.properties = BTreeMap::from([
+            ("facing".into(), "east".into()),
+            ("tilt".into(), "none".into()),
+            ("waterlogged".into(), "invalid".into()),
+        ]);
+        assert!(generated_dripleaf(&invalid).is_err());
+        assert!(region.set_column_block([8, 8, 8], &invalid).is_err());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("C ") || line.starts_with("B "));
+        for _ in 0..8 {
+            let line = rows.next().unwrap();
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 5, "{line}");
+            let facing = fields[1];
+            let wet = fields[2];
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let feature=BlockColumnFeature::decode(&json!({"type":"minecraft:block_column","direction":"up",
+                "allowed_placement":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"},
+                "prioritize_tip":true,"layers":[
+                    {"height":2,"provider":{"id":"minecraft:big_dripleaf_stem","properties":{"facing":facing,"waterlogged":wet}}},
+                    {"height":1,"provider":{"id":"minecraft:big_dripleaf","properties":{"facing":facing,"tilt":"none","waterlogged":wet}}}
+                ]}),&mut resolve_tree_test).unwrap();
+            let mut random = DecorationRandom::new(42);
+            assert_eq!(
+                feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                fields[3].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert_eq!(
+                random.next_long(),
+                fields[4].parse::<i64>().unwrap(),
+                "{line}"
+            );
+            for _ in 0..3 {
+                let line = rows.next().unwrap();
+                let fields: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(fields.len(), 6, "{line}");
+                let pos = [
+                    fields[1].parse().unwrap(),
+                    fields[2].parse().unwrap(),
+                    fields[3].parse().unwrap(),
+                ];
+                let block = region.read(pos).unwrap();
+                let key = block
+                    .properties
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                assert_eq!(block.name, fields[4], "{line}");
+                assert_eq!(key, fields[5], "{line}");
+            }
+            assert!(region.feature_marks.is_empty());
+            assert!(region.world.saved_block_ticks.is_empty());
+            assert!(region.world.saved_fluid_ticks.is_empty());
+            region.finish().unwrap();
+        }
+        assert!(rows.next().is_none());
     }
 
     #[test]

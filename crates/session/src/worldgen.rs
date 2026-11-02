@@ -33,7 +33,7 @@ mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
-pub use ore::{OreVeinRegion, PlacedOreVein};
+pub use ore::{OreVeinRegion, PlacedOreVein, ScheduledOreVein};
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
@@ -465,6 +465,9 @@ pub struct DecorationPlan<'a> {
     pub origin: [i32; 3],
     pub decoration_seed: i64,
     pub features: Vec<SelectedFeature<'a>>,
+    biomes: &'a BiomeNeighborhood,
+    generator_min_y: i32,
+    generator_height: i32,
 }
 impl DecorationPlan<'_> {
     /// Java reseeds the shared decoration RNG for every selected feature.
@@ -764,7 +767,7 @@ impl TerrainGenerator {
     pub fn decoration_plan<'a>(
         &self,
         schedule: &'a FeatureSchedule,
-        neighborhood: &BiomeNeighborhood,
+        neighborhood: &'a BiomeNeighborhood,
         target: [i32; 2],
     ) -> Result<DecorationPlan<'a>> {
         ensure!(
@@ -793,6 +796,9 @@ impl TerrainGenerator {
             origin,
             decoration_seed,
             features: schedule.select(present),
+            biomes: neighborhood,
+            generator_min_y: self.noise.router().min_y,
+            generator_height: self.noise.router().height,
         })
     }
     /// Check a set's candidate chunk after the biome-source filter, including

@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
+    feature_order::{FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
     ore_feature::{OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
@@ -18,7 +19,7 @@ use native_resources::{
 use native_world::loaded::{BlockState, BlockStateId, ChunkPos, World};
 use serde_json::Value;
 
-use super::CarvedTerrainWorld;
+use super::{CarvedTerrainWorld, DecorationPlan};
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
@@ -37,6 +38,51 @@ pub struct OreVeinRegion<'a> {
 pub struct PlacedOreVein {
     placement: PlacedFeature,
     ore: OreVein<BlockState>,
+}
+
+/// A placed ore resolved from one exact entry of the decoration schedule.
+pub struct ScheduledOreVein {
+    key: FeatureKey,
+    placed: PlacedOreVein,
+}
+
+impl ScheduledOreVein {
+    /// Read both named and inline placed features from the same active packs
+    /// and block registry that were used to prepare the schedule.
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        schedule: &FeatureSchedule,
+        key: &FeatureKey,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        ensure!(
+            schedule.steps().iter().flatten().any(|item| item == key),
+            "feature is absent from the schedule"
+        );
+        let placed = match key {
+            FeatureKey::Registered(id) => PlacedOreVein::load(provider, id, resolve)?,
+            FeatureKey::Inline { biome, .. } => {
+                let definition = schedule
+                    .biome(biome)
+                    .context("inline feature biome is missing")?
+                    .inline
+                    .get(key)
+                    .context("inline feature definition is missing")?;
+                PlacedOreVein::from_placement(
+                    provider,
+                    PlacedFeature::decode(definition)?,
+                    resolve,
+                )?
+            }
+        };
+        Ok(Self {
+            key: key.clone(),
+            placed,
+        })
+    }
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        self.placed.required_tags()
+    }
 }
 
 impl PlacedOreVein {
@@ -148,6 +194,57 @@ impl OreVeinRegion<'_> {
         Ok(result)
     }
 
+    /// Place one planned ore using its own Java feature seed and the plan's
+    /// biome neighborhood. Callers must execute every preceding feature and
+    /// structure in order, and provide Java `hasFeature` semantics from the
+    /// active biome settings; unknown equivalence must be an error.
+    pub fn place_planned(
+        &mut self,
+        plan: &DecorationPlan<'_>,
+        index: usize,
+        ore: &ScheduledOreVein,
+        biome_allows: &mut impl FnMut(&FeatureKey, &ResourceId) -> Result<bool>,
+    ) -> Result<bool> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let selected = plan
+            .features
+            .get(index)
+            .context("planned feature index is out of range")?;
+        ensure!(
+            *selected.feature == ore.key,
+            "planned feature does not match loaded ore"
+        );
+        ensure!(
+            self.target.seed == plan.biomes.seed
+                && self.target.min_y == plan.biomes.min_y
+                && self.target.height == plan.biomes.height,
+            "planned biome neighborhood does not match generated terrain"
+        );
+        let mut random = plan.feature_random(selected);
+        let mut positions = ore.placed.placement.positions(
+            plan.origin,
+            plan.generator_min_y,
+            plan.generator_height,
+        )?;
+        self.failed = true;
+        let mut result = false;
+        loop {
+            let next = {
+                let mut env = PlannedOreEnvironment {
+                    region: self,
+                    plan,
+                    key: &ore.key,
+                    biome_allows,
+                };
+                positions.next(&mut random, &mut env)?
+            };
+            let Some(position) = next else { break };
+            result |= ore.placed.ore.place(self, &mut random, position)?;
+        }
+        self.failed = false;
+        Ok(result)
+    }
+
     /// Publish this intermediate state; it is not a finished or saveable chunk.
     pub fn finish(self) -> Result<()> {
         ensure!(!self.failed, "cannot publish a failed generation attempt");
@@ -209,6 +306,31 @@ impl OreVeinRegion<'_> {
         }
         self.heights.insert(pos, Arc::from(values));
         Ok(())
+    }
+}
+
+struct PlannedOreEnvironment<'a, 'b, F> {
+    region: &'a mut OreVeinRegion<'b>,
+    plan: &'a DecorationPlan<'a>,
+    key: &'a FeatureKey,
+    biome_allows: &'a mut F,
+}
+impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
+    for PlannedOreEnvironment<'_, '_, F>
+{
+    fn min_y(&self) -> i32 {
+        self.region.target.min_y
+    }
+    fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32> {
+        ensure!(
+            kind == "OCEAN_FLOOR_WG",
+            "unsupported generation heightmap {kind}"
+        );
+        self.region.ocean_floor_height(x, z)
+    }
+    fn biome_allows(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let biome = self.plan.biomes.biome_at_block(pos[0], pos[1], pos[2])?;
+        (self.biome_allows)(self.key, biome)
     }
 }
 
@@ -562,6 +684,219 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
+    struct ScheduledData {
+        heightmap: Option<&'static str>,
+    }
+    impl ScheduledData {
+        fn definition(&self) -> Value {
+            let mut placement = vec![
+                json!({"type":"minecraft:count","count":4}),
+                json!({"type":"minecraft:in_square"}),
+            ];
+            if let Some(kind) = self.heightmap {
+                placement.push(json!({"type":"minecraft:heightmap","heightmap":kind}));
+            } else {
+                placement.push(json!({"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":4},"max_inclusive":{"absolute":4}}}));
+            }
+            placement.push(json!({"type":"minecraft:biome"}));
+            json!({"feature":{"type":"minecraft:ore","size":33,"discard_chance_on_air_exposure":0.0,"targets":[{"target":{"predicate_type":"minecraft:block_match","block":"minecraft:stone"},"state":"minecraft:diamond_ore"}]},"placement":placement})
+        }
+    }
+    impl ResourceProvider for ScheduledData {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            let value = match path {
+                "data/minecraft/worldgen/biome/plains.json" => {
+                    Some(json!({"features":[["test:ore",self.definition()]]}))
+                }
+                "data/test/worldgen/placed_feature/ore.json" => Some(self.definition()),
+                _ => None,
+            };
+            match value {
+                Some(value) => Ok(Some(serde_json::to_vec(&value)?)),
+                None => Data.read_data(path),
+            }
+        }
+    }
+    fn scheduled_fixture(
+        kind: Option<&'static str>,
+    ) -> (
+        ScheduledData,
+        FeatureSchedule,
+        super::super::BiomeNeighborhood,
+    ) {
+        let mut data = ScheduledData { heightmap: kind };
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let schedule =
+            FeatureSchedule::load(&mut data, std::slice::from_ref(&plains), &registry).unwrap();
+        let mut neighborhood = super::super::BiomeNeighborhood::new(0, 0, 16).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                neighborhood
+                    .insert(Arc::new(
+                        super::super::QuartBiomeChunk::from_values(
+                            [x, z],
+                            0,
+                            0,
+                            16,
+                            vec![plains.clone(); 64],
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        (data, schedule, neighborhood)
+    }
+    fn fixture_plan<'a>(
+        schedule: &'a FeatureSchedule,
+        neighborhood: &'a super::super::BiomeNeighborhood,
+    ) -> DecorationPlan<'a> {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let mut random = DecorationRandom::new(0);
+        DecorationPlan {
+            origin: [0, 0, 0],
+            decoration_seed: random.set_decoration_seed(0, 0, 0),
+            features: schedule.select([&plains]),
+            biomes: neighborhood,
+            generator_min_y: 0,
+            generator_height: 16,
+        }
+    }
+    fn resolve_test(v: &Value) -> Result<BlockState> {
+        Ok(state(
+            v.as_str()
+                .context("expected test block")?
+                .strip_prefix("minecraft:")
+                .context("expected minecraft namespace")?,
+        ))
+    }
+
+    #[test]
+    fn scheduled_ores_use_plan_biomes_and_reject_mismatched_entries() {
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        assert_eq!(plan.features.len(), 2);
+        let named = ScheduledOreVein::load(
+            &mut data,
+            &schedule,
+            plan.features[0].feature,
+            &mut resolve_test,
+        )
+        .unwrap();
+        let inline = ScheduledOreVein::load(
+            &mut data,
+            &schedule,
+            plan.features[1].feature,
+            &mut resolve_test,
+        )
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let previous = terrain.snapshot();
+        let writable = previous.chunks.keys().copied().collect();
+        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut calls = 0;
+        let mut allows = |_: &FeatureKey, biome: &ResourceId| {
+            calls += 1;
+            Ok(*biome == ResourceId::parse("minecraft:plains")?)
+        };
+        assert!(
+            region
+                .place_planned(&plan, 0, &inline, &mut allows)
+                .is_err()
+        );
+        assert!(region.place_planned(&plan, 0, &named, &mut allows).unwrap());
+        region
+            .place_planned(&plan, 1, &inline, &mut allows)
+            .unwrap();
+        assert_eq!(calls, 8);
+        region.finish().unwrap();
+        let current = terrain.snapshot();
+        assert!((0..16).any(|x| {
+            (0..16).any(|z| (0..8).any(|y| current.block(x, y, z) != previous.block(x, y, z)))
+        }));
+    }
+
+    #[test]
+    fn scheduled_biome_failure_discards_prior_writes_and_unsupported_heightmaps_fail() {
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let ore = ScheduledOreVein::load(
+            &mut data,
+            &schedule,
+            plan.features[0].feature,
+            &mut resolve_test,
+        )
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .unwrap();
+        let mut calls = 0;
+        assert!(
+            region
+                .place_planned(&plan, 0, &ore, &mut |_, _| {
+                    calls += 1;
+                    ensure!(calls < 2, "unresolved biome feature equivalence");
+                    Ok(true)
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 2);
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+
+        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("WORLD_SURFACE_WG"));
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let ore = ScheduledOreVein::load(
+            &mut data,
+            &schedule,
+            plan.features[0].feature,
+            &mut resolve_test,
+        )
+        .unwrap();
+        let mut region = terrain
+            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .unwrap();
+        assert!(
+            region
+                .place_planned(&plan, 0, &ore, &mut |_, _| Ok(true))
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn scheduled_ore_uses_live_ocean_floor_heightmap() {
+        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("OCEAN_FLOOR_WG"));
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let ore = ScheduledOreVein::load(
+            &mut data,
+            &schedule,
+            plan.features[0].feature,
+            &mut resolve_test,
+        )
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .unwrap();
+        assert!(
+            region
+                .place_planned(&plan, 0, &ore, &mut |_, _| Ok(true))
+                .unwrap()
+        );
+        region.finish().unwrap();
+    }
+
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn generated_chunk_veins_match_java() {
@@ -842,6 +1177,73 @@ mod tests {
             let (writes, next) = &integrated[&seed];
             assert_eq!(&actual, writes, "integrated blocks {seed}");
             assert_eq!(random.next_long(), *next, "integrated random stream {seed}");
+        }
+        let key = FeatureKey::Registered(ResourceId::parse("example:ore").unwrap());
+        let scheduled = ScheduledOreVein {
+            key: key.clone(),
+            placed,
+        };
+        for seed in 0..8i64 {
+            let mut terrain = oracle_terrain();
+            terrain.seed = seed;
+            let previous = terrain.snapshot();
+            let mut neighborhood = super::super::BiomeNeighborhood::new(seed, -16, 32).unwrap();
+            for z in 2..=4 {
+                for x in -3..=-1 {
+                    let biomes = vec![ResourceId::parse("minecraft:plains").unwrap(); 128];
+                    neighborhood
+                        .insert(Arc::new(
+                            super::super::QuartBiomeChunk::from_values(
+                                [x, z],
+                                seed,
+                                -16,
+                                32,
+                                biomes,
+                            )
+                            .unwrap(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let mut random = DecorationRandom::new(0);
+            let decoration_seed = random.set_decoration_seed(seed, -32, 48);
+            let plan = DecorationPlan {
+                origin: [-32, -16, 48],
+                decoration_seed,
+                features: vec![native_resources::feature_order::SelectedFeature {
+                    step: 3,
+                    index: 7,
+                    feature: &key,
+                }],
+                biomes: &neighborhood,
+                generator_min_y: -16,
+                generator_height: 32,
+            };
+            let mut region = terrain
+                .ore_vein_region(&tags, &motion, previous.chunks.keys().copied().collect())
+                .unwrap();
+            region
+                .place_planned(&plan, 0, &scheduled, &mut |_, _| {
+                    bail!("fixture contains no biome filter")
+                })
+                .unwrap();
+            region.finish().unwrap();
+            let world = terrain.snapshot();
+            let mut actual = BTreeMap::new();
+            for z in 16..80 {
+                for x in -48..16 {
+                    for y in -16..16 {
+                        let after = world.block(x, y, z).unwrap();
+                        if previous.block(x, y, z).unwrap() != after {
+                            actual.insert([x, y, z], after.name.clone());
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                &actual, &integrated[&seed].0,
+                "planned Java ore blocks {seed}"
+            );
         }
     }
 }

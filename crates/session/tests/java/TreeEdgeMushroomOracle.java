@@ -20,6 +20,7 @@ public class TreeEdgeMushroomOracle {
       BlockState state=blocks[type].defaultBlockState();
       for(int i=0;i<6;i++)state=state.setValue(properties[i],(mask&(1<<i))!=0);
       if(state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null,BlockPos.ZERO)!=null)throw new AssertionError("unsupported mushroom effects "+state);
+      for(int dir=0;dir<6;dir++)out.printf("S %d %d %d %s %s%n",type,mask,dir,state.isFaceSturdy(null,BlockPos.ZERO,directions[dir]),state.isSolidRender());
       BlockState[] neighbors={Blocks.AIR.defaultBlockState(),Blocks.OAK_LOG.defaultBlockState(),blocks[type].defaultBlockState(),blocks[0].defaultBlockState(),blocks[1].defaultBlockState(),blocks[2].defaultBlockState()};
       for(int dir=0;dir<6;dir++)for(int n=0;n<neighbors.length;n++){
         var random=RandomSource.create(42);var pos=new BlockPos(8,8,8);

@@ -2029,6 +2029,9 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if tree_generated_log(state) {
         return Ok(true);
     }
+    if tree_mushroom_block(state)? {
+        return Ok(true);
+    }
     if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
         return Ok(false);
     }
@@ -2038,6 +2041,9 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if tree_generated_log(state) {
+        return Ok(true);
+    }
+    if tree_mushroom_block(state)? {
         return Ok(true);
     }
     if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
@@ -6103,6 +6109,51 @@ mod tests {
             [-1, 0, 0],
             [1, 0, 0],
         ];
+        let mut supports = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
+            let values: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(values.len(), 5);
+            let kind: usize = values[0].parse().unwrap();
+            let mask: usize = values[1].parse().unwrap();
+            let direction: usize = values[2].parse().unwrap();
+            let mut block = state(names[kind]);
+            for (bit, face) in faces.iter().enumerate() {
+                block
+                    .properties
+                    .insert((*face).into(), ((mask & (1 << bit)) != 0).to_string());
+            }
+            assert_eq!(
+                DiskWorld::face_sturdy(&mut region, &block, [8, 8, 8], directions[direction])
+                    .unwrap(),
+                values[3].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                values[4].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            supports += 1;
+        }
+        assert_eq!(supports, 3 * 64 * 6);
+        for name in names {
+            let mut block = state(name);
+            block.properties = faces
+                .iter()
+                .map(|face| ((*face).into(), "false".into()))
+                .collect();
+            region.set_section_block([8, 9, 8], &block).unwrap();
+            for face in faces {
+                let predicate = BlockPredicate::decode(&json!({
+                    "type":"minecraft:has_sturdy_face", "offset":[0,1,0], "direction":face
+                }))
+                .unwrap();
+                assert!(
+                    predicate.test(&mut region, [8, 8, 8]).unwrap(),
+                    "{name} {face}"
+                );
+            }
+        }
         let mut count = 0;
         for line in output.lines().filter_map(|line| line.strip_prefix("M ")) {
             let values: Vec<usize> = line

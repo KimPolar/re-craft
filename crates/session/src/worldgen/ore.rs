@@ -1632,6 +1632,10 @@ fn tree_oak_leaf(state: &BlockState) -> Result<bool> {
     if state.name != "minecraft:oak_leaves" {
         return Ok(false);
     }
+    valid_tree_leaf_properties(state)
+}
+
+fn valid_tree_leaf_properties(state: &BlockState) -> Result<bool> {
     ensure!(state.properties.len() == 3, "unsupported oak leaf state");
     ensure!(
         state
@@ -1651,6 +1655,17 @@ fn tree_oak_leaf(state: &BlockState) -> Result<bool> {
         );
     }
     Ok(true)
+}
+
+fn tree_generated_leaf(state: &BlockState) -> Result<bool> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:oak_leaves" | "minecraft:dark_oak_leaves"
+    ) {
+        valid_tree_leaf_properties(state)
+    } else {
+        Ok(false)
+    }
 }
 
 fn tree_decay_tag() -> &'static ResourceId {
@@ -1677,6 +1692,17 @@ fn tree_oak_log(state: &BlockState) -> bool {
         )
 }
 
+fn tree_generated_log(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:oak_log" | "minecraft:dark_oak_log"
+    ) && state.properties.len() == 1
+        && matches!(
+            state.properties.get("axis").map(String::as_str),
+            Some("x" | "y" | "z")
+        )
+}
+
 fn tree_leaf_litter(state: &BlockState) -> Result<bool> {
     if state.name != "minecraft:leaf_litter" {
         return Ok(false);
@@ -1697,10 +1723,10 @@ fn tree_leaf_litter(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
-    if tree_oak_log(state) {
+    if tree_generated_log(state) {
         return Ok(true);
     }
-    if tree_oak_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
+    if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
         return Ok(false);
     }
     vanilla_full_occlusion(&state.name)
@@ -1708,10 +1734,10 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
-    if tree_oak_log(state) {
+    if tree_generated_log(state) {
         return Ok(true);
     }
-    if tree_oak_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
+    if tree_generated_leaf(state)? || tree_leaf_litter(state)? || state.name == "minecraft:vine" {
         return Ok(false);
     }
     vanilla_full_occlusion(&state.name)
@@ -1785,7 +1811,7 @@ fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
 }
 
 impl DecorationRegion<'_> {
-    /// Known-shape writes used by the supported oak tree states. Unknown
+    /// Known-shape writes used by supported tree states. Unknown
     /// block-entity, POI or postprocessing effects abort the transaction.
     fn set_tree_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
         ensure!(flags == 19 || flags == 2, "unsupported tree write flags");
@@ -1796,8 +1822,8 @@ impl DecorationRegion<'_> {
             self.world.chunks.contains_key(&chunk(pos)),
             "tree write chunk is missing"
         );
-        let allowed = tree_oak_leaf(state)?
-            || tree_oak_log(state)
+        let allowed = tree_generated_leaf(state)?
+            || tree_generated_log(state)
             || tree_leaf_litter(state)?
             || (flags == 2 && tree_grass_block(state))
             || (flags == 2 && state.name == "minecraft:air" && state.properties.is_empty())
@@ -1809,8 +1835,8 @@ impl DecorationRegion<'_> {
         let old = self.read(pos)?;
         ensure!(
             disk_safe_solid(&old.name).is_some()
-                || tree_oak_leaf(&old)?
-                || tree_oak_log(&old)
+                || tree_generated_leaf(&old)?
+                || tree_generated_log(&old)
                 || tree_leaf_litter(&old)?
                 || simple_plant_kind(&old).is_ok()
                 || tree_edge_plant(&old)?.is_some(),
@@ -1857,7 +1883,10 @@ impl TreeWorld for DecorationRegion<'_> {
         }
     }
     fn foliage_state(&mut self, pos: [i32; 3], mut state: BlockState) -> Result<BlockState> {
-        ensure!(tree_oak_leaf(&state)?, "unsupported tree foliage state");
+        ensure!(
+            tree_generated_leaf(&state)?,
+            "unsupported tree foliage state"
+        );
         let old = OreWorld::block(self, pos)?;
         let water = native_world::fluid::FluidState::from_block(&old)
             .map_err(anyhow::Error::msg)?
@@ -1934,7 +1963,7 @@ impl MushroomWorld for DecorationRegion<'_> {
         }
         let old = self.read(pos)?;
         ensure!(
-            is_air(&old) || tree_oak_leaf(&old)?,
+            is_air(&old) || tree_generated_leaf(&old)?,
             "unsupported mushroom source effects"
         );
         self.set_section_block(pos, state)?;
@@ -2559,7 +2588,10 @@ impl LeafUpdateWorld for DecorationRegion<'_> {
     }
     fn set_leaf_distance(&mut self, pos: [i32; 3], distance: u8) -> Result<()> {
         let mut state = OreWorld::block(self, pos)?;
-        ensure!(tree_oak_leaf(&state)?, "unsupported distance-bearing block");
+        ensure!(
+            tree_generated_leaf(&state)?,
+            "unsupported distance-bearing block"
+        );
         state
             .properties
             .insert("distance".into(), distance.to_string());
@@ -2580,7 +2612,7 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
-        if tree_oak_leaf(state)? {
+        if tree_generated_leaf(state)? {
             if state
                 .properties
                 .get("waterlogged")
@@ -2662,7 +2694,7 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
             }
         } else {
             ensure!(
-                tree_oak_log(state)
+                tree_generated_log(state)
                     || (state.name == "minecraft:bee_nest"
                         && state.properties.len() == 2
                         && state.properties.get("facing").is_some_and(|v| v == "south")
@@ -7498,6 +7530,174 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_dark_oak_chunk_and_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        struct DarkData;
+        impl ResourceProvider for DarkData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/worldgen/biome/plains.json" => {
+                        let mut v: Value =
+                            serde_json::from_slice(&TreeData.read_data(path)?.unwrap())?;
+                        let tree = &mut v["features"][0][0]["feature"];
+                        tree["trunk_provider"] =
+                            json!({"id":"minecraft:dark_oak_log","properties":{"axis":"y"}});
+                        tree["trunk_placer"] = json!({"type":"minecraft:dark_oak_trunk_placer","base_height":6,"height_rand_a":2,"height_rand_b":1});
+                        tree["foliage_provider"] = json!({"id":"minecraft:dark_oak_leaves","properties":{"distance":"7","persistent":"false","waterlogged":"false"}});
+                        tree["foliage_placer"] = json!({"type":"minecraft:dark_oak_foliage_placer","radius":0,"offset":0});
+                        tree["minimum_size"] =
+                            json!({"type":"minecraft:three_layers_feature_size","upper_size":2});
+                        v["features"][0][0]["placement"][0]["y"] = json!(5);
+                        v
+                    }
+                    "data/minecraft/tags/block/replaceable_by_trees.json"
+                    | "data/minecraft/tags/block/leaves.json" => {
+                        json!({"values":["minecraft:dark_oak_leaves"]})
+                    }
+                    "data/minecraft/tags/block/logs.json"
+                    | "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" => {
+                        json!({"values":["minecraft:dark_oak_log"]})
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json" => {
+                        json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:dirt","minecraft:grass_block","minecraft:dark_oak_log","minecraft:dark_oak_leaves"]})
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:dirt","minecraft:grass_block","minecraft:dark_oak_log"]})
+                    }
+                    _ => return TreeData.read_data(path),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("DarkOakChunkOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/DarkOakChunkOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("DarkOakChunkOracle"));
+        let actual = output.lines().find(|v| v.starts_with("RESULT ")).unwrap();
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(&mut DarkData, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let (_, _, mut registry) = prepare_tree_fixture();
+        registry.extend([
+            "minecraft:dark_oak_log".into(),
+            "minecraft:dark_oak_leaves".into(),
+        ]);
+        let prepared =
+            PreparedDecoration::load(&mut DarkData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let air = world.intern_state(state("air"));
+        for chunk in world.chunks.values_mut() {
+            let chunk = Arc::make_mut(chunk);
+            let blocks = Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap();
+            for y in 5..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        blocks[x + z * 16 + y * 256] = air;
+                    }
+                }
+            }
+        }
+        let success = prepared.execute(&mut terrain, false).unwrap();
+        let world = terrain.snapshot();
+        let mut blocks = Vec::new();
+        for x in 0..16 {
+            for y in 4..16 {
+                for z in 0..16 {
+                    let block = world.block(x, y, z).unwrap();
+                    if !matches!(
+                        block.name.as_str(),
+                        "minecraft:dirt" | "minecraft:dark_oak_log" | "minecraft:dark_oak_leaves"
+                    ) {
+                        continue;
+                    }
+                    let extra = match block.name.as_str() {
+                        "minecraft:dark_oak_log" => format!(",axis={}", block.properties["axis"]),
+                        "minecraft:dark_oak_leaves" => format!(
+                            ",distance={},persistent={},waterlogged={}",
+                            block.properties["distance"],
+                            block.properties["persistent"],
+                            block.properties["waterlogged"]
+                        ),
+                        _ => String::new(),
+                    };
+                    blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                }
+            }
+        }
+        let ticks = world
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                format!(
+                    "{},{},{},{}",
+                    t.position[0], t.position[1], t.position[2], t.block
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            format!(
+                "RESULT {} B {} T {}",
+                success[0],
+                blocks.join(";"),
+                ticks.join(";")
+            )
+        );
+        assert!(success[0]);
     }
 
     #[test]

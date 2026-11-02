@@ -2424,14 +2424,17 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
                     && native_world::fluid::FluidState::from_block(state)
                         .map_err(anyhow::Error::msg)?
                         .is_some())
-                || tree_generated_leaf(state)?;
+                || tree_generated_leaf(state)?
+                || generated_dripleaf(state)?;
             ensure!(valid, "unsupported vegetation patch replacement effects");
             if self.is_outside(pos[1]) {
                 return Ok(());
             }
             let old = self.read(pos)?;
             ensure!(
-                disk_safe_solid(&old.name).is_some() || tree_generated_leaf(&old)?,
+                disk_safe_solid(&old.name).is_some()
+                    || tree_generated_leaf(&old)?
+                    || generated_dripleaf(&old)?,
                 "unsupported vegetation patch source effects"
             );
             self.set_section_block(pos, state)?;
@@ -2448,8 +2451,9 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
             None | Some("true") => Ok(None),
             Some("false") => {
                 ensure!(
-                    tree_generated_leaf(&state)?,
-                    "unsupported vegetation patch waterlogging"
+                    tree_generated_leaf(&state)? || generated_dripleaf(&state)?,
+                    "unsupported vegetation patch waterlogging for {:?}",
+                    state
                 );
                 state.properties.insert("waterlogged".into(), "true".into());
                 Ok(Some(state))
@@ -8801,6 +8805,195 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn waterlogged_dripleaf_patches_match_java() {
+        use std::{path::PathBuf, process::Command};
+        fn key(block: &BlockState) -> String {
+            let mut result = format!("{}|", block.name);
+            for (name, value) in &block.properties {
+                result.push_str(&format!("{name}={value};"));
+            }
+            result
+        }
+        fn parse(value: &str) -> BlockState {
+            let (name, properties) = value.split_once('|').unwrap();
+            let properties = properties
+                .split(';')
+                .filter(|v| !v.is_empty())
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap();
+                    (name.into(), value.into())
+                })
+                .collect();
+            BlockState {
+                name: name.into(),
+                properties,
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let helper = temp.path().join("VegetationPatchOracle.java");
+        std::fs::write(
+            &helper,
+            include_str!("../../../resources/tests/java/VegetationPatchOracle.java"),
+        )
+        .unwrap();
+        let source = temp.path().join("WaterloggedDripleafPatchOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/WaterloggedDripleafPatchOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&helper)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("WaterloggedDripleafPatchOracle"));
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:big_dripleaf".into(),
+            "minecraft:big_dripleaf_stem".into(),
+            "minecraft:small_dripleaf".into(),
+        ]);
+        let tags = OreBlockTags::load(&mut Data, &registry, &BTreeSet::new()).unwrap();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let (mut terrain, _, _, _) = fixture();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut states = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "{line}");
+            let old = parse(parts[0]);
+            region.set_section_block([8, 8, 8], &old).unwrap();
+            let next = region.patch_waterlogged(old.clone()).unwrap();
+            assert_eq!(next.is_some(), parts[2].parse::<bool>().unwrap(), "{line}");
+            if let Some(next) = next {
+                assert_eq!(key(&next), parts[1], "{line}");
+                region.set_patch_block([8, 8, 8], &next).unwrap();
+                assert_eq!(key(&region.read([8, 8, 8]).unwrap()), parts[1], "{line}");
+            } else {
+                assert_eq!(key(&old), parts[1], "{line}");
+            }
+            states += 1;
+        }
+        assert_eq!(states, 56);
+        assert!(region.feature_marks.is_empty());
+        assert!(region.world.saved_block_ticks.is_empty());
+        assert!(region.world.saved_fluid_ticks.is_empty());
+        drop(region);
+
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("P ") || line.starts_with("B "));
+        for _ in 0..18 {
+            let line = rows.next().unwrap();
+            let p: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(p.len(), 6, "{line}");
+            let kind: usize = p[1].parse().unwrap();
+            let wet = p[2];
+            let seed: i64 = p[3].parse().unwrap();
+            let name = ["big_dripleaf", "big_dripleaf_stem", "small_dripleaf"][kind];
+            let mut props = BTreeMap::from([
+                ("facing".to_owned(), "north".to_owned()),
+                ("waterlogged".to_owned(), wet.to_owned()),
+            ]);
+            if kind == 0 {
+                props.insert("tilt".into(), "none".into());
+            }
+            if kind == 2 {
+                props.insert("half".into(), "lower".into());
+            }
+            let definition = json!({"feature":{"type":"minecraft:waterlogged_vegetation_patch",
+                "replaceable":["minecraft:stone"],"ground_state":{"id":"minecraft:clay"},
+                "vegetation_feature":{"feature":{"type":"minecraft:block_column","direction":"up",
+                    "allowed_placement":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"},
+                    "prioritize_tip":true,"layers":[{"height":1,"provider":{"id":format!("minecraft:{name}"),"properties":props}}]},"placement":[]},
+                "surface":"floor","depth":1,"extra_bottom_block_chance":0.0,"vertical_range":3,
+                "vegetation_chance":1.0,"xz_radius":0,"extra_edge_column_chance":0.0},"placement":[]});
+            let placed = PlacedDecorationFeature::from_placement(
+                &mut Data,
+                PlacedFeature::decode(&definition).unwrap(),
+                &mut |value| {
+                    let mut state = resolve_tree_test(value)?;
+                    if state.name == "minecraft:water" {
+                        state.properties.insert("level".into(), "0".into());
+                    }
+                    Ok(state)
+                },
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            let mut random = DecorationRandom::new(seed);
+            assert_eq!(
+                region
+                    .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                    .unwrap(),
+                p[4].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert_eq!(random.next_long(), p[5].parse::<i64>().unwrap(), "{line}");
+            let b = rows.next().unwrap();
+            let fields: Vec<_> = b.split_whitespace().collect();
+            assert_eq!(fields.len(), 5, "{b}");
+            let pos = [
+                fields[1].parse().unwrap(),
+                fields[2].parse().unwrap(),
+                fields[3].parse().unwrap(),
+            ];
+            assert_eq!(key(&region.read(pos).unwrap()), fields[4], "{b}");
+            assert!(region.feature_marks.is_empty());
+            assert!(region.world.saved_block_ticks.is_empty());
+            assert!(region.world.saved_fluid_ticks.is_empty());
+            region.finish().unwrap();
+        }
+        assert!(rows.next().is_none());
     }
 
     #[test]

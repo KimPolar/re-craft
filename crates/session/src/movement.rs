@@ -56,6 +56,23 @@ pub(super) fn no_collision<'a>(
     true
 }
 
+/// Block portion of ServerPlayerGameMode's one-block flight-disable probe.
+pub(super) fn ground_within_flight_range<'a>(
+    position: DVec3,
+    height: f32,
+    mut block_shape: impl FnMut(IVec3) -> &'a [Aabb],
+) -> bool {
+    let body = player_bounds(position, height);
+    if !no_collision(body, &mut block_shape) {
+        return false;
+    }
+    let below = BoundingBox {
+        min: DVec3::new(body.min.x, body.min.y - 1.0, body.min.z),
+        max: DVec3::new(body.max.x, body.min.y, body.max.z),
+    };
+    !no_collision(below, &mut block_shape)
+}
+
 pub(super) fn can_fit<'a>(
     position: DVec3,
     height: f32,

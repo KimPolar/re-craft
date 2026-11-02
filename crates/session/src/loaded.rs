@@ -16345,6 +16345,29 @@ impl LoadedSession {
                     } else if self.game_mode != mode {
                         self.game_mode_changed_during_session = true;
                         self.set_game_mode(mode);
+                        if mode == GameMode::Creative && self.flight.flying {
+                            let grounded = crate::movement::ground_within_flight_range(
+                                self.motion.position,
+                                self.player.pose.height(),
+                                |pos| match cell(
+                                    &self.world,
+                                    self.origin,
+                                    self.bounds,
+                                    pos,
+                                    self.states[0],
+                                ) {
+                                    Cell::Missing => unknown_barrier(),
+                                    Cell::State(id) => self
+                                        .shapes
+                                        .get(id.0 as usize)
+                                        .and_then(Option::as_deref)
+                                        .unwrap_or_else(|| unknown_barrier()),
+                                },
+                            );
+                            if grounded {
+                                self.flight.flying = false;
+                            }
+                        }
                         crate::push_system_message(
                             &mut self.system_messages,
                             crate::SystemMessageKind::GameModeChanged(mode),
@@ -20711,6 +20734,28 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("game mode transitions")
         );
+    }
+
+    #[test]
+    fn creative_mode_only_clears_spectator_flight_near_the_floor() {
+        for (y, flying) in [
+            (1.0, false),
+            (1.25, false),
+            (1.9999, false),
+            (2.0, true),
+            (2.01, true),
+        ] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_game_master_permission(true);
+            session.motion.position = DVec3::new(8.5, y, 8.5);
+            session.motion.velocity = DVec3::ZERO;
+            session.set_game_mode(GameMode::Spectator);
+            session.submit_command(PlayerCommand::SetGameMode(GameMode::Creative));
+            session.update(TICK);
+            assert_eq!(session.game_mode, GameMode::Creative);
+            assert_eq!(session.flight.flying, flying, "height {y}");
+        }
     }
 
     #[test]

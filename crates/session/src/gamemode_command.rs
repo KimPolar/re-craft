@@ -111,5 +111,26 @@ mod tests {
                 "{row}"
             );
         }
+        let full = [native_world::collision::Aabb {
+            min: glam::Vec3::ZERO,
+            max: glam::Vec3::ONE,
+        }];
+        let empty: [native_world::collision::Aabb; 0] = [];
+        for row in data["ground"].as_array().unwrap() {
+            let y = row["y"].as_f64().unwrap();
+            let blocked = row["blocked"].as_bool().unwrap();
+            let actual = crate::movement::ground_within_flight_range(
+                glam::DVec3::new(0.5, y, 0.5),
+                1.8,
+                |pos| {
+                    if pos.x == 0 && pos.z == 0 && (pos.y == 0 || (blocked && pos.y == 1)) {
+                        &full[..]
+                    } else {
+                        &empty[..]
+                    }
+                },
+            );
+            assert_eq!(actual, row["near"].as_bool().unwrap(), "{row}");
+        }
     }
 }

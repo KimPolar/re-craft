@@ -254,6 +254,91 @@ pub fn place_straight_trunk(
     })
 }
 
+/// Emit a bending trunk and its foliage attachments in Java's placement order.
+pub(crate) fn place_bending_trunk(
+    random: &mut DecorationRandom,
+    origin: [i32; 3],
+    height: i32,
+    min_height_for_leaves: i32,
+    bend_length: &crate::placed_feature::IntProvider,
+    mut place: impl FnMut([i32; 3], bool, &mut DecorationRandom) -> Result<()>,
+) -> Result<Vec<FoliageAttachment>> {
+    ensure!((0..=80).contains(&height), "invalid bending trunk height");
+    let direction = [[0, -1], [1, 0], [0, 1], [-1, 0]][random.next_int_bound(4).unwrap() as usize];
+    let last = height - 1;
+    let mut pos = origin;
+    place([pos[0], pos[1].wrapping_sub(1), pos[2]], true, random)?;
+    let mut attachments = Vec::new();
+    for i in 0..=last {
+        if i + 1 >= last + random.next_int_bound(2).unwrap() {
+            pos[0] = pos[0].wrapping_add(direction[0]);
+            pos[2] = pos[2].wrapping_add(direction[1]);
+        }
+        place(pos, false, random)?;
+        if i >= min_height_for_leaves {
+            attachments.push(FoliageAttachment {
+                position: pos,
+                radius_offset: 0,
+                height_offset: 0,
+                double_trunk: false,
+            });
+        }
+        pos[1] = pos[1].wrapping_add(1);
+    }
+    for _ in 0..=bend_length.sample(random) {
+        place(pos, false, random)?;
+        attachments.push(FoliageAttachment {
+            position: pos,
+            radius_offset: 0,
+            height_offset: 0,
+            double_trunk: false,
+        });
+        pos[0] = pos[0].wrapping_add(direction[0]);
+        pos[2] = pos[2].wrapping_add(direction[1]);
+    }
+    Ok(attachments)
+}
+
+/// Random spread ignores the sampled vertical offset but still consumes it in
+/// the caller, before drawing the six coordinates for each placement attempt.
+pub fn place_random_spread_foliage(
+    random: &mut DecorationRandom,
+    attachment: FoliageAttachment,
+    foliage_height: i32,
+    radius: i32,
+    attempts: i32,
+    mut place: impl FnMut([i32; 3], &mut DecorationRandom) -> Result<()>,
+) -> Result<()> {
+    ensure!(
+        (1..=512).contains(&foliage_height),
+        "invalid random spread foliage height"
+    );
+    ensure!(
+        (0..=16).contains(&radius) && (0..=256).contains(&attempts),
+        "invalid random spread foliage configuration"
+    );
+    // Java's nextInt(0) fails if the data pack requests attempts with radius 0.
+    ensure!(
+        radius > 0 || attempts == 0,
+        "random spread foliage radius is zero"
+    );
+    for _ in 0..attempts {
+        let x = random.next_int_bound(radius).unwrap() - random.next_int_bound(radius).unwrap();
+        let y = random.next_int_bound(foliage_height).unwrap()
+            - random.next_int_bound(foliage_height).unwrap();
+        let z = random.next_int_bound(radius).unwrap() - random.next_int_bound(radius).unwrap();
+        place(
+            [
+                attachment.position[0].wrapping_add(x),
+                attachment.position[1].wrapping_add(y),
+                attachment.position[2].wrapping_add(z),
+            ],
+            random,
+        )?;
+    }
+    Ok(())
+}
+
 /// Enumerate the vanilla blob foliage placer's candidate writes in order.
 /// The callback performs the actual validity check and state-provider sampling;
 /// it receives the same RNG so those calls interleave with corner selection.

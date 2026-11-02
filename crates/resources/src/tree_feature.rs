@@ -16,7 +16,8 @@ use crate::{
     tree_ground_decorator::{GroundDecorationWorld, PlaceOnGroundDecorator},
     tree_placers::{
         TreeFeatureSize, TrunkHeight, VanillaTreeClearance, permitted_tree_height,
-        place_blob_foliage, place_fancy_foliage, place_straight_trunk,
+        place_bending_trunk, place_blob_foliage, place_fancy_foliage, place_random_spread_foliage,
+        place_straight_trunk,
     },
 };
 
@@ -43,7 +44,6 @@ pub struct TreeFeature<S> {
     below: Provider<S>,
     trunk_height: TrunkHeight,
     trunk_kind: TrunkKind,
-    foliage_height: i32,
     foliage_kind: FoliageKind,
     radius: IntProvider,
     offset: IntProvider,
@@ -57,17 +57,20 @@ enum TreeDecorator<S> {
     PlaceOnGround(PlaceOnGroundDecorator<S>),
 }
 
-#[derive(Clone, Copy)]
 enum TrunkKind {
     Straight,
     Fancy,
     DarkOak,
+    Bending {
+        min_leaves: i32,
+        bend_length: IntProvider,
+    },
 }
-#[derive(Clone, Copy)]
 enum FoliageKind {
-    Blob,
-    Fancy,
+    Blob(i32),
+    Fancy(i32),
     DarkOak,
+    RandomSpread { height: IntProvider, attempts: i32 },
 }
 
 impl<S: Clone + Eq> TreeFeature<S> {
@@ -135,25 +138,48 @@ impl<S: Clone + Eq> TreeFeature<S> {
             }
             id if id == ResourceId::parse("minecraft:fancy_trunk_placer")? => TrunkKind::Fancy,
             id if id == ResourceId::parse("minecraft:dark_oak_trunk_placer")? => TrunkKind::DarkOak,
+            id if id == ResourceId::parse("minecraft:bending_trunk_placer")? => {
+                let min_leaves = match trunk_placer.get("min_height_for_leaves") {
+                    Some(_) => integer(trunk_placer, "min_height_for_leaves")?,
+                    None => 1,
+                };
+                ensure!(min_leaves > 0, "invalid bending minimum foliage height");
+                let bend_length = IntProvider::parse(field(trunk_placer, "bend_length")?, 0)?;
+                let (min, max) = bend_length.bounds();
+                ensure!(min >= 1 && max <= 64, "invalid bend length");
+                TrunkKind::Bending {
+                    min_leaves,
+                    bend_length,
+                }
+            }
             _ => anyhow::bail!("unsupported tree trunk placer"),
         };
         let foliage_placer = field(value, "foliage_placer")?;
         let foliage_kind = match name(foliage_placer)? {
-            id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => FoliageKind::Blob,
-            id if id == ResourceId::parse("minecraft:fancy_foliage_placer")? => FoliageKind::Fancy,
+            id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => {
+                FoliageKind::Blob(integer(foliage_placer, "height")?)
+            }
+            id if id == ResourceId::parse("minecraft:fancy_foliage_placer")? => {
+                FoliageKind::Fancy(integer(foliage_placer, "height")?)
+            }
             id if id == ResourceId::parse("minecraft:dark_oak_foliage_placer")? => {
                 FoliageKind::DarkOak
             }
+            id if id == ResourceId::parse("minecraft:random_spread_foliage_placer")? => {
+                let height = IntProvider::parse(field(foliage_placer, "foliage_height")?, 0)?;
+                let (min, max) = height.bounds();
+                let attempts = integer(foliage_placer, "leaf_placement_attempts")?;
+                ensure!(
+                    min >= 1 && max <= 512 && (0..=256).contains(&attempts),
+                    "invalid random spread foliage"
+                );
+                FoliageKind::RandomSpread { height, attempts }
+            }
             _ => anyhow::bail!("unsupported tree foliage placer"),
         };
-        let foliage_height = match foliage_kind {
-            FoliageKind::DarkOak => 4,
-            _ => integer(foliage_placer, "height")?,
-        };
-        ensure!(
-            (0..=16).contains(&foliage_height),
-            "invalid blob foliage height"
-        );
+        if let FoliageKind::Blob(height) | FoliageKind::Fancy(height) = &foliage_kind {
+            ensure!((0..=16).contains(height), "invalid foliage height");
+        }
         let radius = IntProvider::parse(field(foliage_placer, "radius")?, 0)?;
         let offset = IntProvider::parse(field(foliage_placer, "offset")?, 0)?;
         for p in [&radius, &offset] {
@@ -174,7 +200,6 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 integer(trunk_placer, "height_rand_b")?,
             )?,
             trunk_kind,
-            foliage_height,
             foliage_kind,
             radius,
             offset,
@@ -191,7 +216,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
         self.trunk.tags(&mut tags);
         self.foliage.tags(&mut tags);
         self.below.tags(&mut tags);
-        if matches!(self.trunk_kind, TrunkKind::DarkOak) {
+        if matches!(&self.trunk_kind, TrunkKind::DarkOak) {
             tags.insert(ResourceId::parse("minecraft:leaves").unwrap());
         }
         for decorator in &self.decorators {
@@ -250,6 +275,11 @@ impl<S: Clone + Eq> TreeFeature<S> {
         origin: [i32; 3],
     ) -> Result<bool> {
         let height = self.trunk_height.sample(random);
+        let foliage_height = match &self.foliage_kind {
+            FoliageKind::Blob(height) | FoliageKind::Fancy(height) => *height,
+            FoliageKind::DarkOak => 4,
+            FoliageKind::RandomSpread { height, .. } => height.sample(random),
+        };
         let radius = self.radius.sample(random);
         let min_y = world.tree_min_y();
         let max_y = world.tree_max_y();
@@ -266,7 +296,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
         else {
             return Ok(false);
         };
-        let attachments = match self.trunk_kind {
+        let attachments = match &self.trunk_kind {
             TrunkKind::Fancy => place_fancy_trunk(
                 &mut FancyTreeAdapter { tree: self, world },
                 random,
@@ -278,6 +308,30 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 random,
                 origin,
                 height,
+            )?,
+            TrunkKind::Bending {
+                min_leaves,
+                bend_length,
+            } => place_bending_trunk(
+                random,
+                origin,
+                height,
+                *min_leaves,
+                bend_length,
+                |pos, soil, random| {
+                    if soil {
+                        if let Some(state) = self.below.state(world, random, pos)? {
+                            world.write_tree(pos, &state, TreeWrite::Trunk)?;
+                        }
+                    } else if valid_tree_pos(world, pos)? {
+                        let state = self
+                            .trunk
+                            .state(world, random, pos)?
+                            .context("tree trunk provider returned no state")?;
+                        world.write_tree(pos, &state, TreeWrite::Trunk)?;
+                    }
+                    Ok(())
+                },
             )?,
             TrunkKind::Straight => vec![place_straight_trunk(
                 random,
@@ -312,19 +366,19 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 }
                 Ok(())
             };
-            match self.foliage_kind {
-                FoliageKind::Fancy => place_fancy_foliage(
+            match &self.foliage_kind {
+                FoliageKind::Fancy(_) => place_fancy_foliage(
                     random,
                     attachment,
-                    self.foliage_height,
+                    foliage_height,
                     radius,
                     offset,
                     &mut place,
                 )?,
-                FoliageKind::Blob => place_blob_foliage(
+                FoliageKind::Blob(_) => place_blob_foliage(
                     random,
                     attachment,
-                    self.foliage_height,
+                    foliage_height,
                     radius,
                     offset,
                     &mut place,
@@ -332,6 +386,14 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 FoliageKind::DarkOak => {
                     place_dark_oak_foliage(random, attachment, radius, offset, &mut place)?
                 }
+                FoliageKind::RandomSpread { attempts, .. } => place_random_spread_foliage(
+                    random,
+                    attachment,
+                    foliage_height,
+                    radius,
+                    *attempts,
+                    &mut place,
+                )?,
             }
         }
         Ok(true)

@@ -45,7 +45,7 @@ public class IceBubbleTagOracle {
         }
         @Override public void scheduleTick(BlockPos pos, Block block, int delay) {
             if (block == Blocks.WATER) bubble = true;
-            String id=block==Blocks.WATER?"water":block==Blocks.FROSTED_ICE?"ice":"other";
+            String id=block==Blocks.WATER?"water":block==Blocks.FROSTED_ICE?"ice":block==Blocks.BUBBLE_COLUMN?"bubble":"other";
             if(!pending.add("b:"+pos.toShortString()+":"+id)) return;
             var entry=new JsonArray(); entry.add(id); entry.add(pos.getX()); entry.add(pos.getY()); entry.add(pos.getZ()); entry.add(delay); blockTicks.add(entry);
         }

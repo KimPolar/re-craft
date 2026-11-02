@@ -13,6 +13,8 @@ pub enum Cell {
     Air,
     Solid,
     Fluid(FluidState),
+    /// A bubble column contains source water but its block is not ordinary water.
+    BubbleWater(FluidState),
     /// Source water inside a copper grate; its block must not be replaced.
     GrateWater(FluidState),
     /// A half slab, optionally holding source water.
@@ -192,7 +194,7 @@ fn at(world: &impl Fn(IVec3) -> Cell, pos: Option<IVec3>) -> Cell {
 }
 
 fn source(cell: Cell, kind: FluidKind) -> bool {
-    matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) if state.kind == kind && state.source)
+    matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) | Cell::BubbleWater(state) if state.kind == kind && state.source)
         || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Chest { waterlogged: true } if kind == FluidKind::Water)
@@ -200,7 +202,7 @@ fn source(cell: Cell, kind: FluidKind) -> bool {
 
 fn fluid(cell: Cell) -> Option<FluidState> {
     match cell {
-        Cell::Fluid(state) | Cell::GrateWater(state) => Some(state),
+        Cell::Fluid(state) | Cell::GrateWater(state) | Cell::BubbleWater(state) => Some(state),
         Cell::Slab {
             waterlogged: true, ..
         }
@@ -216,7 +218,7 @@ fn fluid(cell: Cell) -> Option<FluidState> {
 // only if it covers the whole face. Solid and unknown cells block all faces.
 fn face(cell: Cell, direction: IVec3) -> u8 {
     match cell {
-        Cell::Air | Cell::Fluid(_) | Cell::Chest { .. } => 0,
+        Cell::Air | Cell::Fluid(_) | Cell::BubbleWater(_) | Cell::Chest { .. } => 0,
         Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 15,
         Cell::Slab { top, .. } if direction == IVec3::Y => {
             if top {
@@ -349,7 +351,7 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
         Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } => !source(cell, kind),
-        Cell::Solid | Cell::GrateWater(_) | Cell::Unknown => false,
+        Cell::Solid | Cell::GrateWater(_) | Cell::BubbleWater(_) | Cell::Unknown => false,
     }
 }
 
@@ -360,6 +362,7 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
     }
     match below {
         Cell::Air | Cell::Fluid(_) => true,
+        Cell::BubbleWater(_) => kind == FluidKind::Water,
         Cell::Slab {
             waterlogged: true, ..
         }
@@ -549,7 +552,7 @@ pub fn tick(
         if pos == position {
             if matches!(
                 original,
-                Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+                Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::BubbleWater(_)
             ) {
                 original
             } else {

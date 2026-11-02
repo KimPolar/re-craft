@@ -20,7 +20,7 @@ public class WaterBubblePlacementOracle {
         var world=(IceBubbleTagOracle.World)unsafe.allocateInstance(IceBubbleTagOracle.World.class);
         world.attributes=EnvironmentAttributeSystem.builder().build();
         var rows=new JsonArray();
-        for(int tags=0;tags<4;tags++) for(boolean waterTagged:new boolean[]{false,true}) for(int scenario=0;scenario<6;scenario++) {
+        for(int tags=0;tags<4;tags++) for(boolean waterTagged:new boolean[]{false,true}) for(int scenario=0;scenario<9;scenario++) {
             BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK,Map.of(
                 BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN,(tags & 1)!=0?List.of(Blocks.STONE.builtInRegistryHolder()):List.of(),
                 BlockTags.ENABLES_BUBBLE_COLUMN_PUSH_UP,(tags & 2)!=0?List.of(Blocks.STONE.builtInRegistryHolder()):List.of()))).apply();
@@ -33,8 +33,9 @@ public class WaterBubblePlacementOracle {
             if(scenario==0 || scenario==4) { target=CENTER; world.blocks.put(CENTER.below(),stone); if(scenario==4) world.blocks.put(CENTER,flowing); }
             else if(scenario==1) { target=CENTER.below(); world.blocks.put(CENTER,water); }
             else if(scenario==5) { target=CENTER; for(var side:new Direction[]{Direction.WEST,Direction.EAST}) { var pos=CENTER.relative(side); world.blocks.put(pos,water); world.blocks.put(pos.below(),stone); } }
+            else if(scenario>=6) { world.blocks.put(CENTER,Blocks.BUBBLE_COLUMN.defaultBlockState()); if(scenario!=8) world.blocks.put(CENTER.below(),stone); target=scenario==6?CENTER.below():scenario==7?CENTER.above():CENTER.east(); }
             else { target=CENTER.east(); world.blocks.put(CENTER.below(),stone); world.blocks.put(CENTER,scenario==3?flowing:water); }
-            world.setBlock(target,(scenario==0||scenario==4)?water:stone,3,512);
+            world.setBlock(target,scenario==6?Blocks.AIR.defaultBlockState():(scenario==0||scenario==4||scenario==7)?water:stone,3,512);
             var row=new JsonObject(); row.addProperty("tags",tags); row.addProperty("water",waterTagged); row.addProperty("scenario",scenario);
             row.add("blockTicks",world.blockTicks); row.add("fluidTicks",world.fluidTicks); rows.add(row);
         }

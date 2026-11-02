@@ -12446,6 +12446,9 @@ impl LoadedSession {
         }
         let fluid = self.fluids.get(id.0 as usize).copied().flatten()?;
         let state = self.world.state(id)?;
+        if bubble_column_drag(state).is_some() {
+            return Some(fluid);
+        }
         if self.slab_top(state).is_none()
             && self.stair_voxels(id).is_none()
             && !(matches!(
@@ -12708,8 +12711,76 @@ impl LoadedSession {
             self.unresolved_bubble_tick = true;
             return;
         };
+        if support.name == "minecraft:bubble_column" && bubble_column_drag(support).is_none() {
+            self.unresolved_bubble_tick = true;
+            return;
+        }
         if tags.enables(&support.name) {
             self.schedule_bubble(position, BubbleTickKind::Water, 20);
+        }
+    }
+
+    fn schedule_column_shape_check(
+        &mut self,
+        neighbor: IVec3,
+        direction: IVec3,
+        id: BlockStateId,
+        new: BlockStateId,
+    ) {
+        let Some(state) = self.world.state(id) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        if state.name != "minecraft:bubble_column" {
+            return;
+        }
+        // Related fluid and block ticks are not yet persisted as a complete unit.
+        self.unresolved_bubble_tick = true;
+        if bubble_column_drag(state).is_none() {
+            self.unresolved_bubble_tick = true;
+            return;
+        }
+        let Some(tags) = self.bubble_column_tags.as_ref() else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let Some(below) = add(neighbor, IVec3::NEG_Y) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let Cell::State(support) =
+            cell(&self.world, self.origin, self.bounds, below, self.states[0])
+        else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let Some(support) = self.world.state(support) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        if support.name == "minecraft:bubble_column" && bubble_column_drag(support).is_none() {
+            self.unresolved_bubble_tick = true;
+            return;
+        }
+        let survives = bubble_column_drag(support).is_some() || tags.enables(&support.name);
+        let Some(changed) = self.world.state(new) else {
+            self.unresolved_bubble_tick = true;
+            return;
+        };
+        let above_occupiable =
+            if direction == IVec3::NEG_Y && changed.name != "minecraft:bubble_column" {
+                match crate::bubble_column::can_occupy(changed, tags) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        self.unresolved_bubble_tick = true;
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
+        if !survives || direction == IVec3::Y || above_occupiable {
+            self.schedule_bubble(neighbor, BubbleTickKind::Column, 5);
         }
     }
 
@@ -14133,6 +14204,7 @@ impl LoadedSession {
         let old_support = self.world.state(old).and_then(button_support_direction);
         let new_support = self.world.state(new).and_then(button_support_direction);
         if (changed_kind || new_name == Some("minecraft:water"))
+            && new_name != Some("minecraft:bubble_column")
             && matches!(cell(&self.world, self.origin, self.bounds, position, self.states[0]), Cell::State(id) if id == new)
             && let Some(fluid) = self.simulated_fluid(new)
             && !(fluid.kind == FluidKind::Lava && self.react_lava(position))
@@ -14252,6 +14324,7 @@ impl LoadedSession {
             if let Some(kind) = sand {
                 self.schedule_sand(neighbor, kind);
             }
+            self.schedule_column_shape_check(neighbor, direction, id, new);
             if let Some(fluid) = self.simulated_fluid(id)
                 && !(fluid.kind == FluidKind::Lava && self.react_lava(neighbor))
             {
@@ -14523,6 +14596,11 @@ impl LoadedSession {
         if let Some(fluid) = self.ordinary_fluid(id) {
             return fluid_sim::Cell::Fluid(fluid);
         }
+        if bubble_column_drag(state).is_some()
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::BubbleWater(fluid);
+        }
         if native_world::fluid::is_copper_grate(&state.name)
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
@@ -14661,17 +14739,22 @@ impl LoadedSession {
                 unloaded.push((order, scheduled));
                 continue;
             };
-            // Bubble columns expose source water, but their fluid-spread
-            // callbacks are not simulated yet. Retain the scheduled tick.
+            // Preserve ticks for malformed bubble states rather than losing them.
             if scheduled.key.kind == FluidKind::Water
                 && scheduled.key.source
-                && self
-                    .world
-                    .state(id)
-                    .is_some_and(|state| state.name == "minecraft:bubble_column")
+                && self.world.state(id).is_some_and(|state| {
+                    state.name == "minecraft:bubble_column" && bubble_column_drag(state).is_none()
+                })
             {
                 unloaded.push((order, scheduled));
                 continue;
+            }
+            if self
+                .world
+                .state(id)
+                .is_some_and(|state| state.name == "minecraft:bubble_column")
+            {
+                self.unresolved_bubble_tick = true;
             }
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
             self.fluid_pending.remove(&scheduled.key);
@@ -18152,6 +18235,17 @@ fn cell(
 }
 
 /// States whose neighbor callbacks are handled by the generic block updater.
+fn bubble_column_drag(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:bubble_column" || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("drag")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn frost_supported_terrain(state: &BlockState) -> bool {
     state.properties.is_empty()
         && matches!(
@@ -18455,12 +18549,7 @@ impl BubbleTickStage<'_> {
 
     fn column(&self, state: &BlockState) -> anyhow::Result<()> {
         anyhow::ensure!(
-            state.name == "minecraft:bubble_column"
-                && state.properties.len() == 1
-                && matches!(
-                    state.properties.get("drag").map(String::as_str),
-                    Some("true" | "false")
-                ),
+            bubble_column_drag(state).is_some(),
             "unsupported bubble column state"
         );
         Ok(())
@@ -29782,7 +29871,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 48);
+        assert_eq!(rows.len(), 72);
         let center = IVec3::new(8, 10, 8);
         for row in rows {
             let mut session = session();
@@ -29828,6 +29917,19 @@ pub(crate) mod tests {
                     }
                     center
                 }
+                6..=8 => {
+                    let bubble =
+                        session.intern_block(state("minecraft:bubble_column", &[("drag", "true")]));
+                    assert!(session.set_with_notify(center, bubble, false));
+                    if scenario != 8 {
+                        assert!(session.set_with_notify(center - IVec3::Y, stone, false));
+                    }
+                    match scenario {
+                        6 => center - IVec3::Y,
+                        7 => center + IVec3::Y,
+                        _ => center + IVec3::X,
+                    }
+                }
                 _ => {
                     assert!(session.set_with_notify(center - IVec3::Y, stone, false));
                     assert!(session.set_with_notify(
@@ -29840,7 +29942,9 @@ pub(crate) mod tests {
             };
             assert!(session.set(
                 target,
-                if scenario == 0 || scenario == 4 {
+                if scenario == 6 {
+                    session.states[0]
+                } else if scenario == 0 || scenario == 4 || scenario == 7 {
                     water
                 } else {
                     stone
@@ -29853,7 +29957,10 @@ pub(crate) mod tests {
                     (
                         order.3,
                         serde_json::json!([
-                            "water",
+                            match key.kind {
+                                BubbleTickKind::Water => "water",
+                                BubbleTickKind::Column => "bubble",
+                            },
                             key.x - session.origin.x,
                             key.y - session.origin.y,
                             key.z - session.origin.z,
@@ -29894,8 +30001,317 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn saved_bubble_ticks_apply_atomically_and_keep_unhandled_fluid_ticks() {
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn bubble_water_scheduled_tick_callbacks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BubbleWaterTickSessionOracle.java");
+        let dependency = temp.path().join("IceBubbleTagOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BubbleWaterTickSessionOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &dependency,
+            include_str!("../tests/java/IceBubbleTagOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source)
+                .arg(&dependency),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BubbleWaterTickSessionOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 64);
+        let center = IVec3::new(8, 10, 8);
+        let sides = [IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        for row in rows {
+            let mut session = session();
+            session.sky_lighting.set_enabled(false);
+            let bubble =
+                session.intern_block(state("minecraft:bubble_column", &[("drag", "true")]));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let air = session.states[0];
+            let chunk = session.player_chunk().unwrap();
+            let world = Arc::make_mut(&mut session.world);
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            let blocks = section.blocks.as_mut().unwrap();
+            blocks.fill(stone);
+            let index = |p: IVec3| (p.x + p.z * 16 + p.y * 256) as usize;
+            blocks[index(center)] = bubble;
+            if row["hole"].as_bool().unwrap() {
+                blocks[index(center - IVec3::Y)] = air;
+            }
+            let mask = row["mask"].as_u64().unwrap();
+            for (index_side, side) in sides.iter().enumerate() {
+                if mask & (1 << index_side) != 0 {
+                    blocks[index(center + *side)] = air;
+                }
+            }
+            let down = if row["tagged"].as_bool().unwrap() {
+                BTreeSet::from(["minecraft:stone".into()])
+            } else {
+                BTreeSet::new()
+            };
+            session.set_bubble_column_tags(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::new(down, BTreeSet::new()),
+            ));
+            let fluid = FluidState::from_block(session.world.state(bubble).unwrap())
+                .unwrap()
+                .unwrap();
+            session.schedule_fluid(center, fluid, 0);
+            session.advance_fluid_ticks();
+            assert!(session.unresolved_bubble_tick, "{row}");
+            let mut changes: Vec<_> = session
+                .block_edits
+                .values()
+                .flat_map(|edits| edits.iter())
+                .map(|(&(x, y, z), edit)| {
+                    let state = session.world.state(edit.current).unwrap();
+                    serde_json::json!([
+                        x - session.origin.x,
+                        y - session.origin.y,
+                        z - session.origin.z,
+                        state.name,
+                        state
+                            .properties
+                            .get("level")
+                            .and_then(|level| level.parse::<i32>().ok())
+                            .unwrap_or(-1)
+                    ])
+                })
+                .collect();
+            let mut expected = row["changes"].as_array().unwrap().to_vec();
+            let position_key = |event: &serde_json::Value| {
+                (
+                    event[0].as_i64().unwrap(),
+                    event[1].as_i64().unwrap(),
+                    event[2].as_i64().unwrap(),
+                )
+            };
+            changes.sort_by_key(position_key);
+            expected.sort_by_key(position_key);
+            assert_eq!(changes, expected, "{row}");
+            let mut blocks: Vec<_> = session
+                .bubble_ticks
+                .iter()
+                .map(|(order, key)| {
+                    (
+                        order.3,
+                        serde_json::json!([
+                            match key.kind {
+                                BubbleTickKind::Water => "water",
+                                BubbleTickKind::Column => "bubble",
+                            },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            blocks.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(blocks.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["blockTicks"],
+                "{row}"
+            );
+            let mut fluids: Vec<_> = session
+                .fluid_ticks
+                .iter()
+                .map(|(order, scheduled)| {
+                    let key = scheduled.key;
+                    (
+                        order.3,
+                        serde_json::json!([
+                            if key.source { "water" } else { "flowing_water" },
+                            key.x - session.origin.x,
+                            key.y - session.origin.y,
+                            key.z - session.origin.z,
+                            order.0
+                        ]),
+                    )
+                })
+                .collect();
+            fluids.sort_by_key(|event| event.0);
+            assert_eq!(
+                serde_json::json!(fluids.into_iter().map(|event| event.1).collect::<Vec<_>>()),
+                row["fluidTicks"],
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn bubble_water_spread_matches_java_fluid_tick() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("BubbleWaterFluidOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BubbleWaterFluidOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BubbleWaterFluidOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1024);
+        let source = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let flowing = FluidState {
+            kind: FluidKind::Water,
+            amount: 7,
+            source: false,
+            falling: false,
+        };
+        let center = IVec3::new(8, 10, 8);
+        let sides = [IVec3::NEG_Z, IVec3::Z, IVec3::NEG_X, IVec3::X];
+        for row in rows {
+            let below = row["below"].as_u64().unwrap();
+            let mask = row["mask"].as_u64().unwrap();
+            let variant = row["variant"].as_u64().unwrap();
+            let holes = row["holes"].as_bool().unwrap();
+            let mut cells = std::collections::HashMap::new();
+            cells.insert(center, fluid_sim::Cell::BubbleWater(source));
+            cells.insert(
+                center - IVec3::Y,
+                match below {
+                    0 => fluid_sim::Cell::Air,
+                    1 => fluid_sim::Cell::Solid,
+                    2 => fluid_sim::Cell::Fluid(source),
+                    _ => fluid_sim::Cell::BubbleWater(source),
+                },
+            );
+            for (index, side) in sides.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    cells.insert(
+                        center + *side,
+                        match variant {
+                            0 => fluid_sim::Cell::Air,
+                            1 => fluid_sim::Cell::Fluid(source),
+                            2 => fluid_sim::Cell::BubbleWater(source),
+                            _ => fluid_sim::Cell::Fluid(flowing),
+                        },
+                    );
+                    if holes {
+                        cells.insert(center + *side - IVec3::Y, fluid_sim::Cell::Air);
+                    }
+                }
+            }
+            let changes = fluid_sim::tick(
+                &|pos| cells.get(&pos).copied().unwrap_or(fluid_sim::Cell::Solid),
+                center,
+                FluidKind::Water,
+                fluid_sim::Settings::default(),
+            );
+            let actual: Vec<_> = changes
+                .iter()
+                .map(|change| {
+                    let fluid = match change.block {
+                        fluid_sim::ChangedBlock::Fluid(fluid) => fluid,
+                        _ => panic!("unexpected fluid change: {row}"),
+                    };
+                    let level = if fluid.source {
+                        0
+                    } else {
+                        8 - fluid.amount + if fluid.falling { 8 } else { 0 }
+                    };
+                    serde_json::json!([
+                        change.position.x,
+                        change.position.y,
+                        change.position.z,
+                        "minecraft:water",
+                        level
+                    ])
+                })
+                .collect();
+            assert_eq!(serde_json::json!(actual), row["changes"], "{row}");
+        }
+    }
+
+    #[test]
+    fn saved_bubble_ticks_apply_atomically_and_water_spreads_from_column() {
         let setup = |unsupported: bool| {
             let mut session = session();
             session.set_bubble_column_tags(Arc::new(
@@ -29954,6 +30370,25 @@ pub(crate) mod tests {
         );
         session.tick = 5;
         session.advance_fluid_ticks();
+        assert_eq!(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap()
+                .name,
+            "minecraft:bubble_column"
+        );
+        assert!(
+            [IVec3::NEG_X, IVec3::X, IVec3::NEG_Z, IVec3::Z]
+                .into_iter()
+                .any(|direction| {
+                    let pos = position + direction;
+                    session
+                        .world
+                        .block(pos.x, pos.y, pos.z)
+                        .is_some_and(|state| state.name == "minecraft:water")
+                })
+        );
         assert!(
             session
                 .fluid_ticks

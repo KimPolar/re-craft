@@ -410,6 +410,16 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (0, 0)
         }
+        "minecraft:seagrass" if state.properties.is_empty() => (1, 0),
+        "minecraft:tall_seagrass"
+            if state.properties.len() == 1
+                && matches!(
+                    state.properties.get("half").map(String::as_str),
+                    Some("lower" | "upper")
+                ) =>
+        {
+            (1, 0)
+        }
         "minecraft:pointed_dripstone" if state.properties.len() == 3 => {
             if !matches!(
                 state.properties.get("thickness").map(String::as_str),
@@ -2697,6 +2707,16 @@ mod tests {
                     ]),
                 });
             }
+        }
+        states.push(BlockState {
+            name: "minecraft:seagrass".into(),
+            properties: BTreeMap::new(),
+        });
+        for half in ["lower", "upper"] {
+            states.push(BlockState {
+                name: "minecraft:tall_seagrass".into(),
+                properties: BTreeMap::from([("half".into(), half.into())]),
+            });
         }
         let cases: Vec<_> = states
             .iter()

@@ -155,6 +155,100 @@ pub struct ScatteredOre<S> {
     discard: f32,
     targets: Vec<Target<S>>,
 }
+
+fn load_feature(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Value> {
+    let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
+    let bytes = provider
+        .read_data(&path)?
+        .with_context(|| format!("missing feature {path}"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid feature {path}"))
+}
+
+fn parse_config<S: Clone + Eq>(
+    value: &Value,
+    expected: &str,
+    resolve: &mut impl FnMut(&Value) -> Result<S>,
+) -> Result<(i32, f32, Vec<Target<S>>)> {
+    let kind = id(value, "type")?;
+    ensure!(
+        kind.namespace == "minecraft" && kind.path == expected,
+        "wrong ore feature type"
+    );
+    let size = integer(value, "size")?;
+    ensure!((0..=64).contains(&size), "invalid ore size");
+    let discard = probability(value, "discard_chance_on_air_exposure")?;
+    ensure!(
+        (0.0..=1.0).contains(&discard),
+        "invalid air exposure chance"
+    );
+    let entries = value
+        .get("targets")
+        .and_then(Value::as_array)
+        .context("missing ore targets")?;
+    ensure!(entries.len() <= 4096, "too many ore targets");
+    let mut targets = Vec::with_capacity(entries.len());
+    for target in entries {
+        targets.push(Target {
+            rule: Rule::parse(
+                target.get("target").context("missing ore rule")?,
+                resolve,
+                0,
+            )?,
+            replacement: resolve(target.get("state").context("missing replacement state")?)?,
+        });
+    }
+    Ok((size, discard, targets))
+}
+
+fn choose_target<'a, S: Clone + Eq, W: OreWorld<State = S>>(
+    targets: &'a [Target<S>],
+    discard: f32,
+    world: &mut W,
+    state: &S,
+    pos: [i32; 3],
+    random: &mut DecorationRandom,
+    mut neighbor: impl FnMut(&mut W, [i32; 3]) -> Result<S>,
+) -> Result<Option<&'a S>> {
+    for target in targets {
+        if !target.rule.test(world, state, pos, random)? {
+            continue;
+        }
+        let skip = if discard <= 0.0 {
+            true
+        } else if discard >= 1.0 {
+            false
+        } else {
+            random.next_float() >= discard
+        };
+        if !skip {
+            let mut adjacent = false;
+            for offset in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ] {
+                let p = [
+                    pos[0].wrapping_add(offset[0]),
+                    pos[1].wrapping_add(offset[1]),
+                    pos[2].wrapping_add(offset[2]),
+                ];
+                let block = neighbor(world, p)?;
+                if world.is_air(&block)? {
+                    adjacent = true;
+                    break;
+                }
+            }
+            if adjacent {
+                continue;
+            }
+        }
+        return Ok(Some(&target.replacement));
+    }
+    Ok(None)
+}
 impl<S: Clone + Eq> ScatteredOre<S> {
     /// Tags referenced anywhere in the configured replacement predicates.
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
@@ -169,43 +263,12 @@ impl<S: Clone + Eq> ScatteredOre<S> {
         id: &ResourceId,
         resolve: &mut impl FnMut(&Value) -> Result<S>,
     ) -> Result<Self> {
-        let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
-        let bytes = provider
-            .read_data(&path)?
-            .with_context(|| format!("missing feature {path}"))?;
-        let value: Value =
-            serde_json::from_slice(&bytes).with_context(|| format!("invalid feature {path}"))?;
-        Self::decode(&value, resolve).with_context(|| format!("in feature {path}"))
+        let value = load_feature(provider, id)?;
+        Self::decode(&value, resolve)
+            .with_context(|| format!("in feature {}:{}", id.namespace, id.path))
     }
     pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
-        let kind = id(value, "type")?;
-        ensure!(
-            kind.namespace == "minecraft" && kind.path == "scattered_ore",
-            "not a scattered ore feature"
-        );
-        let size = integer(value, "size")?;
-        ensure!((0..=64).contains(&size), "invalid ore size");
-        let discard = probability(value, "discard_chance_on_air_exposure")?;
-        ensure!(
-            (0.0..=1.0).contains(&discard),
-            "invalid air exposure chance"
-        );
-        let entries = value
-            .get("targets")
-            .and_then(Value::as_array)
-            .context("missing ore targets")?;
-        ensure!(entries.len() <= 4096, "too many ore targets");
-        let mut targets = Vec::with_capacity(entries.len());
-        for target in entries {
-            targets.push(Target {
-                rule: Rule::parse(
-                    target.get("target").context("missing ore rule")?,
-                    resolve,
-                    0,
-                )?,
-                replacement: resolve(target.get("state").context("missing replacement state")?)?,
-            });
-        }
+        let (size, discard, targets) = parse_config(value, "scattered_ore", resolve)?;
         Ok(Self {
             size,
             discard,
@@ -233,48 +296,220 @@ impl<S: Clone + Eq> ScatteredOre<S> {
                 origin[2].wrapping_add(offset()),
             ];
             let state = world.block(pos)?;
-            for target in &self.targets {
-                if !target.rule.test(world, &state, pos, random)? {
-                    continue;
-                }
-                let skip_air = if self.discard <= 0.0 {
-                    true
-                } else if self.discard >= 1.0 {
-                    false
-                } else {
-                    random.next_float() >= self.discard
-                };
-                if !skip_air {
-                    let mut adjacent = false;
-                    for offset in [
-                        [0, -1, 0],
-                        [0, 1, 0],
-                        [0, 0, -1],
-                        [0, 0, 1],
-                        [-1, 0, 0],
-                        [1, 0, 0],
-                    ] {
-                        let neighbour = [
-                            pos[0].wrapping_add(offset[0]),
-                            pos[1].wrapping_add(offset[1]),
-                            pos[2].wrapping_add(offset[2]),
-                        ];
-                        let block = world.block(neighbour)?;
-                        if world.is_air(&block)? {
-                            adjacent = true;
-                            break;
-                        }
-                    }
-                    if adjacent {
-                        continue;
-                    }
-                }
-                let _ = world.set_block(pos, &target.replacement, 2)?;
-                break;
+            if let Some(replacement) = choose_target(
+                &self.targets,
+                self.discard,
+                world,
+                &state,
+                pos,
+                random,
+                |w, p| w.block(p),
+            )? {
+                let _ = world.set_block(pos, replacement, 2)?;
             }
         }
         Ok(true)
     }
+}
+
+/// The ordinary 26.3 ellipsoid ore vein used for coal, iron and other ores.
+pub struct OreVein<S> {
+    size: i32,
+    discard: f32,
+    targets: Vec<Target<S>>,
+}
+impl<S: Clone + Eq> OreVein<S> {
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        id: &ResourceId,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+    ) -> Result<Self> {
+        let value = load_feature(provider, id)?;
+        Self::decode(&value, resolve)
+            .with_context(|| format!("in feature {}:{}", id.namespace, id.path))
+    }
+    pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let (size, discard, targets) = parse_config(value, "ore", resolve)?;
+        Ok(Self {
+            size,
+            discard,
+            targets,
+        })
+    }
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        let mut result = BTreeSet::new();
+        for target in &self.targets {
+            target.rule.collect_tags(&mut result);
+        }
+        result
+    }
+    /// Applies the feature directly to generation sections. An error can leave
+    /// partial changes and consumed randomness; discard the generation attempt.
+    pub fn place(
+        &self,
+        world: &mut impl OreVeinWorld<State = S>,
+        random: &mut DecorationRandom,
+        origin: [i32; 3],
+    ) -> Result<bool> {
+        let angle = random.next_float() * std::f32::consts::PI;
+        let length = self.size as f32 / 8.0;
+        let padding = ((self.size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
+        let dx = f64::from(angle).sin() * f64::from(length);
+        let dz = f64::from(angle).cos() * f64::from(length);
+        let ends = [
+            f64::from(origin[0]) + dx,
+            f64::from(origin[0]) - dx,
+            f64::from(origin[2]) + dz,
+            f64::from(origin[2]) - dz,
+            f64::from(
+                origin[1]
+                    .wrapping_add(random.next_int_bound(3).unwrap())
+                    .wrapping_sub(2),
+            ),
+            f64::from(
+                origin[1]
+                    .wrapping_add(random.next_int_bound(3).unwrap())
+                    .wrapping_sub(2),
+            ),
+        ];
+        let reach = length.ceil() as i32;
+        let min_x = origin[0]
+            .checked_sub(reach + padding)
+            .context("ore X bounds overflow")?;
+        let min_y = origin[1]
+            .checked_sub(2 + padding)
+            .context("ore Y bounds overflow")?;
+        let min_z = origin[2]
+            .checked_sub(reach + padding)
+            .context("ore Z bounds overflow")?;
+        let width = 2 * (reach + padding);
+        let height = 2 * (2 + padding);
+        let max_x = min_x.checked_add(width).context("ore X bounds overflow")?;
+        let max_z = min_z.checked_add(width).context("ore Z bounds overflow")?;
+        let mut has_ground = false;
+        'surface: for x in min_x..=max_x {
+            for z in min_z..=max_z {
+                if min_y <= world.ocean_floor_height(x, z)? {
+                    has_ground = true;
+                    break 'surface;
+                }
+            }
+        }
+        if !has_ground {
+            return Ok(false);
+        }
+        let mut spheres = Vec::with_capacity(self.size as usize);
+        for i in 0..self.size {
+            let t = i as f32 / self.size as f32;
+            let t64 = f64::from(t);
+            let lerp = |a: f64, b: f64| a + t64 * (b - a);
+            let scale = random.next_double() * f64::from(self.size) / 16.0;
+            let wave = crate::carver::cave::sin(f64::from(std::f32::consts::PI * t)) + 1.0;
+            spheres.push([
+                lerp(ends[0], ends[1]),
+                lerp(ends[4], ends[5]),
+                lerp(ends[2], ends[3]),
+                (f64::from(wave) * scale + 1.0) / 2.0,
+            ]);
+        }
+        for i in 0..spheres.len().saturating_sub(1) {
+            if spheres[i][3] <= 0.0 {
+                continue;
+            }
+            for j in i + 1..spheres.len() {
+                if spheres[j][3] <= 0.0 {
+                    continue;
+                }
+                let dx = spheres[i][0] - spheres[j][0];
+                let dy = spheres[i][1] - spheres[j][1];
+                let dz = spheres[i][2] - spheres[j][2];
+                let dr = spheres[i][3] - spheres[j][3];
+                if dr * dr > dx * dx + dy * dy + dz * dz {
+                    if dr > 0.0 {
+                        spheres[j][3] = -1.0
+                    } else {
+                        spheres[i][3] = -1.0
+                    }
+                }
+            }
+        }
+        let initial = (width as usize) * (height as usize) * (width as usize);
+        let mut visited = vec![false; initial];
+        let mut placed = 0usize;
+        for [cx, cy, cz, radius] in spheres {
+            if radius < 0.0 {
+                continue;
+            }
+            let floor = |value: f64| value.floor() as i32;
+            let x0 = floor(cx - radius).max(min_x);
+            let y0 = floor(cy - radius).max(min_y);
+            let z0 = floor(cz - radius).max(min_z);
+            let x1 = floor(cx + radius).max(x0);
+            let y1 = floor(cy + radius).max(y0);
+            let z1 = floor(cz + radius).max(z0);
+            for x in x0..=x1 {
+                let nx = (f64::from(x) + 0.5 - cx) / radius;
+                if nx * nx >= 1.0 {
+                    continue;
+                }
+                for y in y0..=y1 {
+                    let ny = (f64::from(y) + 0.5 - cy) / radius;
+                    if nx * nx + ny * ny >= 1.0 {
+                        continue;
+                    }
+                    for z in z0..=z1 {
+                        let nz = (f64::from(z) + 0.5 - cz) / radius;
+                        if nx * nx + ny * ny + nz * nz >= 1.0 || world.outside_build_height(y) {
+                            continue;
+                        }
+                        let index = (x - min_x) as usize
+                            + (y - min_y) as usize * width as usize
+                            + (z - min_z) as usize * width as usize * height as usize;
+                        if index >= visited.len() {
+                            visited.resize(index + 1, false);
+                        }
+                        if visited[index] {
+                            continue;
+                        }
+                        visited[index] = true;
+                        let pos = [x, y, z];
+                        if !world.ensure_can_write(pos)? {
+                            continue;
+                        }
+                        let Some(state) = world.section_block(pos)? else {
+                            continue;
+                        };
+                        if let Some(replacement) = choose_target(
+                            &self.targets,
+                            self.discard,
+                            world,
+                            &state,
+                            pos,
+                            random,
+                            |w, p| w.section_neighbor(p),
+                        )? {
+                            world.set_section_block(pos, replacement)?;
+                            placed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(placed > 0)
+    }
+}
+
+/// Java's regular ore feature reads and writes LevelChunkSection directly.
+pub trait OreVeinWorld: OreWorld {
+    /// OCEAN_FLOOR_WG first-available Y.
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32>;
+    fn outside_build_height(&self, y: i32) -> bool;
+    fn ensure_can_write(&mut self, pos: [i32; 3]) -> Result<bool>;
+    /// None corresponds to BulkSectionAccess returning no section.
+    fn section_block(&mut self, pos: [i32; 3]) -> Result<Option<Self::State>>;
+    /// Neighbor reads use BulkSectionAccess, including its outside-height air.
+    fn section_neighbor(&mut self, pos: [i32; 3]) -> Result<Self::State>;
+    fn set_section_block(&mut self, pos: [i32; 3], state: &Self::State) -> Result<()>;
 }
 
 /// Tag resolution against the complete active block registry and data-pack stack.

@@ -312,7 +312,7 @@ impl CaveCarver {
         Ok(true)
     }
 }
-pub(super) fn sin(v: f64) -> f32 {
+pub(crate) fn sin(v: f64) -> f32 {
     trig(v, 0.0)
 }
 pub(super) fn cos(v: f64) -> f32 {

@@ -4,6 +4,63 @@
 
 use glam::{DVec3, IVec3};
 
+/// The fixed Java 26.3 built-in game-event registry.
+pub fn vanilla_game_events() -> std::collections::BTreeSet<String> {
+    let mut ids: std::collections::BTreeSet<_> = [
+        "block_activate",
+        "block_attach",
+        "block_change",
+        "block_close",
+        "block_deactivate",
+        "block_destroy",
+        "block_detach",
+        "block_open",
+        "block_place",
+        "bounce",
+        "container_close",
+        "container_open",
+        "drink",
+        "eat",
+        "elytra_glide",
+        "entity_damage",
+        "entity_die",
+        "entity_dismount",
+        "entity_interact",
+        "entity_mount",
+        "entity_place",
+        "entity_action",
+        "equip",
+        "explode",
+        "flap",
+        "fluid_pickup",
+        "fluid_place",
+        "hit_ground",
+        "instrument_play",
+        "item_interact_finish",
+        "item_interact_start",
+        "jukebox_play",
+        "jukebox_stop_play",
+        "lightning_strike",
+        "note_block_play",
+        "prime_fuse",
+        "projectile_land",
+        "projectile_shoot",
+        "sculk_sensor_tendrils_clicking",
+        "shear",
+        "shriek",
+        "splash",
+        "step",
+        "swim",
+        "teleport",
+        "unequip",
+    ]
+    .into_iter()
+    .map(|id| format!("minecraft:{id}"))
+    .collect();
+    ids.extend((1..=15).map(|n| format!("minecraft:resonate_{n}")));
+    ids
+}
+
 /// Frequency used by vanilla's vibration system. Unregistered events have no
 /// frequency; data-pack tags determine separately whether an event is heard.
 pub fn frequency(id: &str) -> u8 {
@@ -491,6 +548,7 @@ mod tests {
         let frequencies = data["frequencies"].as_object().unwrap();
         assert_eq!(frequencies.len(), 61);
         let registry = frequencies.keys().cloned().collect();
+        assert_eq!(vanilla_game_events(), registry);
         let sensors = native_persistence::nbt::read(
             &std::fs::read(temp.path().join("output.json.nbt")).unwrap(),
         )
@@ -879,6 +937,7 @@ mod tests {
         }
         let arrivals = data["sensor_arrivals"].as_array().unwrap();
         assert_eq!(arrivals.len(), 2 * 3 * 2 * 4 * 5);
+        crate::loaded::tests::compare_saved_sensor_arrivals_with_java(arrivals);
         for row in arrivals {
             let before = parse_sensor(row);
             let change = before.arrive(

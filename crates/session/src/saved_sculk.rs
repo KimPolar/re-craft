@@ -117,18 +117,9 @@ fn listener(tag: &Tag, registry: &BTreeSet<String>) -> Result<VibrationData> {
 }
 
 /// The registry must be the complete set of game-event IDs in the active world.
-pub fn read(
-    payload: &SavedBlockEntities,
-    chunk: ChunkPos,
-    position: IVec3,
-    registry: &BTreeSet<String>,
-) -> Result<Option<SavedSculkSensor>> {
-    ensure!(
-        position.x.div_euclid(16) == chunk.x && position.z.div_euclid(16) == chunk.z,
-        "sensor is outside chunk"
-    );
+fn entities(payload: &SavedBlockEntities, chunk: ChunkPos) -> Result<Vec<(IVec3, Tag)>> {
     let bytes = match payload {
-        SavedBlockEntities::Empty => return Ok(None),
+        SavedBlockEntities::Empty => return Ok(Vec::new()),
         SavedBlockEntities::Unavailable => bail!("block entity data is unavailable"),
         SavedBlockEntities::Encoded(bytes) => bytes,
     };
@@ -141,7 +132,7 @@ pub fn read(
         bail!("block entities are not a compound list")
     };
     let mut positions = BTreeSet::new();
-    let mut found = None;
+    let mut found = Vec::with_capacity(values.len());
     for entity in values {
         let coord = |field: &str| -> Result<i32> {
             match unique(&entity, field)? {
@@ -158,11 +149,12 @@ pub fn read(
             positions.insert(point.to_array()),
             "duplicate block entity position"
         );
-        if point == position {
-            found = Some(entity);
-        }
+        found.push((point, entity));
     }
-    let Some(entity) = found else { return Ok(None) };
+    Ok(found)
+}
+
+fn decode(entity: Tag, position: IVec3, registry: &BTreeSet<String>) -> Result<SavedSculkSensor> {
     let calibrated = match unique(&entity, "id")? {
         Some(Tag::String(id))
             if id.matches("minecraft:sculk_sensor") || id.matches("sculk_sensor") =>
@@ -188,14 +180,60 @@ pub fn read(
         .map(|tag| listener(tag, registry))
         .transpose()?
         .unwrap_or_default();
-    Ok(Some(SavedSculkSensor {
+    Ok(SavedSculkSensor {
         position,
         calibrated,
         last_frequency,
         vibration,
         reload_vibration_particle: saved_listener.is_some(),
         source: Arc::new(entity),
-    }))
+    })
+}
+
+/// The registry must be the complete set of game-event IDs in the active world.
+pub fn read(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    position: IVec3,
+    registry: &BTreeSet<String>,
+) -> Result<Option<SavedSculkSensor>> {
+    ensure!(
+        position.x.div_euclid(16) == chunk.x && position.z.div_euclid(16) == chunk.z,
+        "sensor is outside chunk"
+    );
+    let Some((_, entity)) = entities(payload, chunk)?
+        .into_iter()
+        .find(|(point, _)| *point == position)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode(entity, position, registry)?))
+}
+
+/// Decode a chunk's block entities once, preserving their stored order.
+pub fn read_chunk(
+    payload: &SavedBlockEntities,
+    chunk: ChunkPos,
+    registry: &BTreeSet<String>,
+) -> Result<Vec<SavedSculkSensor>> {
+    let mut sensors = Vec::new();
+    for (position, entity) in entities(payload, chunk)? {
+        let is_sensor = match unique(&entity, "id")? {
+            Some(Tag::String(id)) => [
+                "minecraft:sculk_sensor",
+                "sculk_sensor",
+                "minecraft:calibrated_sculk_sensor",
+                "calibrated_sculk_sensor",
+            ]
+            .iter()
+            .any(|name| id.matches(name)),
+            _ => bail!("invalid block entity id"),
+        };
+        if is_sensor {
+            sensors.push(decode(entity, position, registry)?);
+        }
+    }
+    Ok(sensors)
 }
 
 #[cfg(test)]
@@ -310,5 +348,50 @@ mod tests {
         };
         fields.push(("source".into(), Tag::IntArray(vec![1, 2, 3])));
         assert!(listener(&build(Tag::Compound(fields), 2), &registry).is_err());
+    }
+
+    #[test]
+    fn chunk_loading_preserves_sensor_order_and_checks_all_positions() {
+        let first = sensor();
+        let Tag::Compound(mut fields) = sensor() else {
+            unreachable!()
+        };
+        for (key, value) in &mut fields {
+            if key.matches("x") {
+                *value = Tag::Int(3);
+            }
+            if key.matches("id") {
+                *value = Tag::String("minecraft:calibrated_sculk_sensor".into());
+            }
+        }
+        let second = Tag::Compound(fields);
+        let chest = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(5)),
+            ("y".into(), Tag::Int(4)),
+            ("z".into(), Tag::Int(2)),
+        ]);
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let result = read_chunk(
+            &payload(vec![second.clone(), chest, first.clone()]),
+            chunk,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|sensor| (sensor.position.x, sensor.calibrated))
+                .collect::<Vec<_>>(),
+            vec![(3, true), (1, false)]
+        );
+        assert!(
+            read_chunk(
+                &payload(vec![first.clone(), first]),
+                chunk,
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
     }
 }

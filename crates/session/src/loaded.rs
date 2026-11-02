@@ -648,6 +648,9 @@ pub struct LoadedSession {
     sensor_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32, bool)>,
     sensor_deferred_revision: Option<u64>,
     sensor_pending: BTreeSet<(i32, i32, i32, bool)>,
+    sculk_listeners: BTreeMap<[i32; 3], crate::saved_sculk::SavedSculkSensor>,
+    active_sculk_listeners: BTreeSet<[i32; 3]>,
+    registered_sculk_chunks: BTreeSet<ChunkPos>,
     unresolved_ice_tick: bool,
     applying_ice_tick: bool,
     bubble_ticks: BTreeMap<(i128, i32, i64, u64), BubbleTickKey>,
@@ -5454,6 +5457,9 @@ impl LoadedSession {
             sensor_deferred: BTreeMap::new(),
             sensor_deferred_revision: None,
             sensor_pending: BTreeSet::new(),
+            sculk_listeners: BTreeMap::new(),
+            active_sculk_listeners: BTreeSet::new(),
+            registered_sculk_chunks: BTreeSet::new(),
             unresolved_ice_tick: false,
             applying_ice_tick: false,
             bubble_ticks: BTreeMap::new(),
@@ -5512,6 +5518,10 @@ impl LoadedSession {
             session.enqueue_saved_sensors(&ticks);
             session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
+        }
+        let resident: Vec<_> = session.world.chunks.keys().copied().collect();
+        for chunk in resident {
+            session.register_saved_sculk_chunk(chunk);
         }
         Ok(session)
     }
@@ -6656,6 +6666,178 @@ impl LoadedSession {
             );
         }
         Ok(entity)
+    }
+
+    fn register_saved_sculk_chunk(&mut self, chunk: ChunkPos) {
+        if self.registered_sculk_chunks.contains(&chunk) {
+            return;
+        }
+        let Some(payload) = self.world.visible_block_entities(&chunk) else {
+            return;
+        };
+        static EVENTS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+        let registry = EVENTS.get_or_init(crate::vibration::vanilla_game_events);
+        let sensors = match crate::saved_sculk::read_chunk(payload, chunk, registry) {
+            Ok(sensors) => sensors,
+            Err(error) => {
+                self.stream_errors.push(format!(
+                    "sculk listeners in chunk {}, {}: {error:#}",
+                    chunk.x, chunk.z
+                ));
+                return;
+            }
+        };
+        self.registered_sculk_chunks.insert(chunk);
+        for saved in sensors {
+            let p = saved.position;
+            let valid = self
+                .world
+                .block(p.x, p.y, p.z)
+                .and_then(crate::sculk_sensor::Sensor::from_block)
+                .is_some_and(|sensor| sensor.facing.is_some() == saved.calibrated);
+            if !valid {
+                self.stream_errors
+                    .push(format!("sculk listener at {p} disagrees with its block"));
+                continue;
+            }
+            let key = p.to_array();
+            if self.sculk_listeners.contains_key(&key) {
+                continue;
+            }
+            if saved.vibration.current().is_some() || saved.vibration.pending().is_some() {
+                self.active_sculk_listeners.insert(key);
+            }
+            self.sculk_listeners.insert(key, saved);
+        }
+    }
+
+    fn sculk_adjacent_chunks_loaded(&self, position: IVec3) -> bool {
+        let x = position.x.div_euclid(16);
+        let z = position.z.div_euclid(16);
+        (-1..=1).all(|dx| {
+            (-1..=1).all(|dz| {
+                x.checked_add(dx)
+                    .zip(z.checked_add(dz))
+                    .and_then(|(x, z)| self.world.chunks.get(&ChunkPos { x, z }))
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            })
+        })
+    }
+
+    /// Resume persisted vibrations. Particle restoration and secondary
+    /// game events are not yet simulated; world saving remains disabled.
+    fn advance_saved_sculk_listeners(&mut self) {
+        let active: Vec<_> = self.active_sculk_listeners.iter().copied().collect();
+        for key in active {
+            let position = IVec3::from_array(key);
+            let chunk = ChunkPos {
+                x: position.x.div_euclid(16),
+                z: position.z.div_euclid(16),
+            };
+            if !self
+                .world
+                .chunks
+                .get(&chunk)
+                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            {
+                continue;
+            }
+            let Some(block) = self.world.block(position.x, position.y, position.z) else {
+                continue;
+            };
+            let Some(sensor) = crate::sculk_sensor::Sensor::from_block(block) else {
+                self.active_sculk_listeners.remove(&key);
+                self.sculk_listeners.remove(&key);
+                continue;
+            };
+            let ready = self.sculk_adjacent_chunks_loaded(position);
+            let Some(saved) = self.sculk_listeners.get(&key) else {
+                self.active_sculk_listeners.remove(&key);
+                continue;
+            };
+            if saved.calibrated != sensor.facing.is_some() {
+                continue;
+            }
+            let mut vibration = saved.vibration.clone();
+            let tick = vibration.tick(self.game_time, ready);
+            if let Some(event) = tick.arrived {
+                let floored = event.position.floor();
+                if floored.min_element() < f64::from(i32::MIN)
+                    || floored.max_element() > f64::from(i32::MAX)
+                {
+                    continue;
+                }
+                let distance = crate::vibration::block_distance(floored.as_ivec3(), position);
+                if let Some(change) = sensor.arrive(&event.event, distance) {
+                    let Some(relative) = subtract(position, self.origin) else {
+                        continue;
+                    };
+                    let Some(next) = change.state.to_block() else {
+                        continue;
+                    };
+                    let next = self.intern_block(next);
+                    if self.check_block_set(relative, next, false, false).is_none()
+                        || !self.set_with_notify(relative, next, false)
+                    {
+                        continue;
+                    }
+                    if let Some(delay) = change.tick_after {
+                        self.schedule_sensor(position, sensor.facing.is_some(), delay);
+                    }
+                    if change.notify_neighbors {
+                        for center in [Some(relative), add(relative, IVec3::NEG_Y)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            for direction in [
+                                IVec3::NEG_Y,
+                                IVec3::Y,
+                                IVec3::NEG_Z,
+                                IVec3::Z,
+                                IVec3::NEG_X,
+                                IVec3::X,
+                            ] {
+                                if let Some(neighbor) = add(center, direction) {
+                                    self.update_lamp(neighbor);
+                                }
+                            }
+                        }
+                    }
+                    if change.play_click {
+                        let pitch = self.level_random.next_float() * 0.2_f32 + 0.8_f32;
+                        if self.consume_sounds.len() == 4096 {
+                            self.consume_sounds.pop_front();
+                        }
+                        self.consume_sounds.push_back(crate::ConsumeSound {
+                            position: position.as_dvec3() + DVec3::splat(0.5),
+                            info: crate::ConsumeSoundInfo {
+                                event: "minecraft:block.sculk_sensor.clicking".into(),
+                                volume: 1.0,
+                                pitch,
+                                category: crate::ConsumeSoundCategory::Block,
+                            },
+                        });
+                    }
+                    if let Some(saved) = self.sculk_listeners.get_mut(&key) {
+                        saved.last_frequency = i32::from(change.last_frequency.unwrap_or(0));
+                    }
+                }
+            }
+            let active = vibration.current().is_some() || vibration.pending().is_some();
+            let changed = self
+                .sculk_listeners
+                .get(&key)
+                .is_some_and(|saved| saved.vibration != vibration);
+            if changed {
+                self.mark_tick_chunk_dirty(position.x, position.z);
+            }
+            if let Some(saved) = self.sculk_listeners.get_mut(&key) {
+                saved.vibration = vibration;
+            }
+            if !active {
+                self.active_sculk_listeners.remove(&key);
+            }
+        }
     }
 
     fn redstone_source(&self, relative: IVec3, direction: IVec3) -> Option<(u8, u8, bool)> {
@@ -8429,6 +8611,19 @@ impl LoadedSession {
                         self.parked_chunks.insert(pos, chunk);
                         respawn_changed = true;
                     } else {
+                        self.registered_sculk_chunks.remove(&pos);
+                        let sensors: Vec<_> = self
+                            .sculk_listeners
+                            .keys()
+                            .copied()
+                            .filter(|p| {
+                                p[0].div_euclid(16) == pos.x && p[2].div_euclid(16) == pos.z
+                            })
+                            .collect();
+                        for key in sensors {
+                            self.sculk_listeners.remove(&key);
+                            self.active_sculk_listeners.remove(&key);
+                        }
                         world.saved_block_entities.remove(&pos);
                         world.live_block_entities.remove(&pos);
                         self.poi_chunks.remove(&pos);
@@ -8485,6 +8680,7 @@ impl LoadedSession {
                     self.enqueue_saved_sensors(&sand_ticks);
                     self.enqueue_saved_bubble(&sand_ticks);
                     self.enqueue_saved_soil(&sand_ticks);
+                    self.register_saved_sculk_chunk(pos);
                 }
             }
         }
@@ -8504,6 +8700,17 @@ impl LoadedSession {
             .collect();
         for pos in unused {
             self.parked_chunks.remove(&pos);
+            self.registered_sculk_chunks.remove(&pos);
+            let sensors: Vec<_> = self
+                .sculk_listeners
+                .keys()
+                .copied()
+                .filter(|p| p[0].div_euclid(16) == pos.x && p[2].div_euclid(16) == pos.z)
+                .collect();
+            for key in sensors {
+                self.sculk_listeners.remove(&key);
+                self.active_sculk_listeners.remove(&key);
+            }
             self.poi_chunks.remove(&pos);
             Arc::make_mut(&mut self.world)
                 .saved_block_entities
@@ -8694,6 +8901,7 @@ impl LoadedSession {
                                     self.enqueue_saved_bubble(&saved_sand_ticks);
                                     self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
+                                self.register_saved_sculk_chunk(pos);
                                 changed = true;
                             } else {
                                 let chunk = Arc::make_mut(&mut self.world)
@@ -15352,6 +15560,7 @@ impl LoadedSession {
         self.advance_fluid_ticks();
         self.advance_random_block_ticks();
         self.advance_falling_sand();
+        self.advance_saved_sculk_listeners();
         if self.death.is_some() {
             let requested = self
                 .commands
@@ -20421,6 +20630,166 @@ pub(crate) mod tests {
                 .first_key_value()
                 .map_or(0, |(order, _)| order.0);
             assert_eq!(delay, i128::from(row["delay"].as_i64().unwrap()), "{row}");
+            let sounds = session.take_consume_sounds();
+            assert_eq!(
+                sounds.len() as u64,
+                row["sounds"].as_u64().unwrap(),
+                "{row}"
+            );
+            if let Some(sound) = sounds.first() {
+                assert_eq!(sound.info.event, row["sound"].as_str().unwrap(), "{row}");
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    row["pitch_bits"].as_i64().unwrap() as u32,
+                    "{row}"
+                );
+            }
+            assert_eq!(
+                i64::from(session.level_random.next_int()),
+                row["next_random"].as_i64().unwrap(),
+                "{row}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_saved_sensor_arrivals_with_java(rows: &[serde_json::Value]) {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        for row in rows {
+            let mut session = session();
+            let calibrated = row["calibrated"].as_bool().unwrap();
+            let phase = match row["phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            let sensor = crate::sculk_sensor::Sensor {
+                phase,
+                power: 0,
+                waterlogged: row["wet"].as_bool().unwrap(),
+                facing: calibrated.then_some(IVec3::NEG_Z),
+            };
+            let relative = IVec3::new(4, 2, 4);
+            let pos = session.origin + relative;
+            let id = session.intern_block(sensor.to_block().unwrap());
+            assert!(session.set(relative, id));
+            let chunk = ChunkPos {
+                x: pos.x.div_euclid(16),
+                z: pos.z.div_euclid(16),
+            };
+            let event = Tag::Compound(vec![
+                (
+                    "game_event".into(),
+                    Tag::String(row["event"].as_str().unwrap().into()),
+                ),
+                (
+                    "distance".into(),
+                    Tag::Float(row["distance"].as_f64().unwrap() as f32),
+                ),
+                (
+                    "pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: vec![
+                            Tag::Double(f64::from(pos.x) + row["distance"].as_f64().unwrap() + 0.5),
+                            Tag::Double(f64::from(pos.y) + 0.5),
+                            Tag::Double(f64::from(pos.z) + 0.5),
+                        ],
+                    },
+                ),
+            ]);
+            let listener = Tag::Compound(vec![
+                ("event".into(), event),
+                ("event_delay".into(), Tag::Int(0)),
+                (
+                    "selector".into(),
+                    Tag::Compound(vec![("tick".into(), Tag::Long(-1))]),
+                ),
+            ]);
+            let entity = Tag::Compound(vec![
+                (
+                    "id".into(),
+                    Tag::String(
+                        if calibrated {
+                            "minecraft:calibrated_sculk_sensor"
+                        } else {
+                            "minecraft:sculk_sensor"
+                        }
+                        .into(),
+                    ),
+                ),
+                ("x".into(), Tag::Int(pos.x)),
+                ("y".into(), Tag::Int(pos.y)),
+                ("z".into(), Tag::Int(pos.z)),
+                ("listener".into(), listener),
+            ]);
+            let encoded = nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity],
+                },
+            })
+            .unwrap();
+            Arc::make_mut(&mut session.world)
+                .saved_block_entities
+                .insert(
+                    chunk,
+                    native_world::loaded::SavedBlockEntities::Encoded(encoded.into()),
+                );
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let c = ChunkPos {
+                        x: chunk.x + dx,
+                        z: chunk.z + dz,
+                    };
+                    Arc::make_mut(&mut session.world).chunks.insert(
+                        c,
+                        Arc::new(Chunk {
+                            position: c,
+                            status: Some("minecraft:full".into()),
+                            block_light_correct: false,
+                            sections: BTreeMap::new(),
+                        }),
+                    );
+                }
+            }
+            session.register_saved_sculk_chunk(chunk);
+            session.level_random = native_core::random::LegacyRandom::new(42);
+            session.advance_saved_sculk_listeners();
+            let actual = crate::sculk_sensor::Sensor::from_block(
+                session.world.block(pos.x, pos.y, pos.z).unwrap(),
+            )
+            .unwrap();
+            let expected_phase = match row["after_phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                (actual.phase, u64::from(actual.power)),
+                (expected_phase, row["after_power"].as_u64().unwrap()),
+                "{row}"
+            );
+            assert_eq!(
+                session
+                    .sensor_ticks
+                    .first_key_value()
+                    .map_or(0, |(order, _)| order.0),
+                i128::from(row["delay"].as_i64().unwrap()),
+                "{row}"
+            );
+            assert_eq!(
+                i64::from(session.sculk_listeners[&pos.to_array()].last_frequency),
+                row["frequency"].as_i64().unwrap(),
+                "{row}"
+            );
+            assert!(session.active_sculk_listeners.is_empty(), "{row}");
             let sounds = session.take_consume_sounds();
             assert_eq!(
                 sounds.len() as u64,
@@ -33190,6 +33559,173 @@ pub(crate) mod tests {
                 .unwrap()
                 .phase,
             crate::sculk_sensor::Phase::Inactive
+        );
+    }
+
+    #[test]
+    fn saved_vibration_waits_for_neighbors_then_activates_sensor_and_lamp() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        let (mut world, origin, player) = fixture();
+        let relative = IVec3::new(4, 2, 4);
+        let position = origin + relative;
+        let sensor = crate::sculk_sensor::Sensor {
+            phase: crate::sculk_sensor::Phase::Inactive,
+            power: 0,
+            waterlogged: false,
+            facing: None,
+        };
+        let id = world.intern_state(sensor.to_block().unwrap());
+        let lamp = world.intern_state(state("minecraft:redstone_lamp", &[("lit", "false")]));
+        let chunk_pos = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        let blocks = section.blocks.as_mut().unwrap();
+        blocks[4 + 4 * 16 + 2 * 256] = id;
+        blocks[5 + 4 * 16 + 2 * 256] = lamp;
+        let event = Tag::Compound(vec![
+            ("game_event".into(), Tag::String("minecraft:splash".into())),
+            ("distance".into(), Tag::Float(2.0)),
+            (
+                "pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: vec![
+                        Tag::Double(f64::from(position.x) + 2.25),
+                        Tag::Double(f64::from(position.y) + 0.5),
+                        Tag::Double(f64::from(position.z) + 0.5),
+                    ],
+                },
+            ),
+        ]);
+        let listener = Tag::Compound(vec![
+            ("event".into(), event),
+            ("event_delay".into(), Tag::Int(2)),
+            (
+                "selector".into(),
+                Tag::Compound(vec![("tick".into(), Tag::Long(-1))]),
+            ),
+        ]);
+        let entity = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:sculk_sensor".into())),
+            ("x".into(), Tag::Int(position.x)),
+            ("y".into(), Tag::Int(position.y)),
+            ("z".into(), Tag::Int(position.z)),
+            ("listener".into(), listener),
+        ]);
+        let payload = nbt::write(&NamedTag {
+            name: "".into(),
+            value: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![entity],
+            },
+        })
+        .unwrap();
+        world.saved_block_entities.insert(
+            chunk_pos,
+            native_world::loaded::SavedBlockEntities::Encoded(payload.into()),
+        );
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_random_tick_speed(0);
+        assert_eq!(session.active_sculk_listeners.len(), 1);
+        session.update(TICK);
+        assert!(session.tick_dirty_chunks.contains(&chunk_pos));
+        assert_eq!(
+            session.sculk_listeners[&position.to_array()]
+                .vibration
+                .remaining(),
+            1
+        );
+        session.queue_chunk_window(
+            ChunkPos {
+                x: chunk_pos.x + 10,
+                z: chunk_pos.z,
+            },
+            0,
+        );
+        session.update(TICK);
+        assert!(session.parked_chunks.contains_key(&chunk_pos));
+        assert_eq!(
+            session.sculk_listeners[&position.to_array()]
+                .vibration
+                .remaining(),
+            1
+        );
+        session.queue_chunk_window(chunk_pos, 0);
+        session.update(TICK);
+        assert_eq!(
+            session.sculk_listeners[&position.to_array()]
+                .vibration
+                .remaining(),
+            0
+        );
+        assert!(
+            session.sculk_listeners[&position.to_array()]
+                .vibration
+                .current()
+                .is_some()
+        );
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let pos = ChunkPos {
+                    x: chunk_pos.x + dx,
+                    z: chunk_pos.z + dz,
+                };
+                Arc::make_mut(&mut session.world).chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:full".into()),
+                        block_light_correct: false,
+                        sections: BTreeMap::new(),
+                    }),
+                );
+            }
+        }
+        session.queue_chunk_window(chunk_pos, 1);
+        session.update(TICK);
+        let actual = crate::sculk_sensor::Sensor::from_block(
+            session
+                .world
+                .block(position.x, position.y, position.z)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (actual.phase, actual.power),
+            (crate::sculk_sensor::Phase::Active, 12)
+        );
+        assert!(session.active_sculk_listeners.is_empty());
+        assert_eq!(
+            session.sculk_listeners[&position.to_array()].last_frequency,
+            2
+        );
+        assert_eq!(
+            redstone_lamp_lit(
+                session
+                    .world
+                    .block(position.x + 1, position.y, position.z)
+                    .unwrap()
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            session.take_consume_sounds()[0].info.event,
+            "minecraft:block.sculk_sensor.clicking"
         );
     }
 

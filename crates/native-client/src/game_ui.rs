@@ -187,6 +187,7 @@ pub struct GameUi {
     current_down_sprite_result:
         std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     surface_packet_random: crate::surface_particles::SurfacePacketRandom,
+    water_entry_emitter: crate::water_entry_particles::WaterEntryEmitter,
     splash_particles: crate::surface_particles::SplashSystem,
     splash_sprites: Option<crate::particle_sprites::ParticleSprites>,
     splash_sprite_result:
@@ -347,6 +348,7 @@ impl GameUi {
             current_down_sprites: None,
             current_down_sprite_result,
             surface_packet_random: crate::surface_particles::SurfacePacketRandom::default(),
+            water_entry_emitter: crate::water_entry_particles::WaterEntryEmitter::default(),
             splash_particles: crate::surface_particles::SplashSystem::default(),
             splash_sprites: None,
             splash_sprite_result,
@@ -470,6 +472,16 @@ impl GameUi {
             }
         }
         self.bubble_particles.enqueue(bubbles);
+    }
+
+    pub fn queue_item_water_entries(&mut self, entries: Vec<native_session::ItemWaterEntry>) {
+        for entry in entries {
+            let (bubbles, splashes) = self.water_entry_emitter.emit(entry);
+            self.bubble_particles.enqueue(bubbles);
+            for splash in splashes {
+                self.splash_particles.enqueue(splash);
+            }
+        }
     }
 
     pub fn update_ambient_bubbles(

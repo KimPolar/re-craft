@@ -14,12 +14,17 @@ import net.minecraft.world.phys.Vec3;
 
 public class ItemWaterSplashOracle {
     static class World extends ClientLevel {
-        int bubbles, splashes;
+        int bubbles, splashes; JsonArray particles;
         World() { super(null, null, null, null, 0, 0, null, false, 0L, 0); }
         @Override public void addParticle(ParticleOptions type, double x, double y, double z, double dx, double dy, double dz) {
             if (type == ParticleTypes.BUBBLE) bubbles++;
             else if (type == ParticleTypes.SPLASH) splashes++;
             else throw new AssertionError("unexpected particle");
+            var event = new JsonObject();
+            event.addProperty("bubble", type == ParticleTypes.BUBBLE);
+            var data = new JsonArray();
+            for (double value : new double[]{x, y, z, dx, dy, dz}) data.add(Double.doubleToRawLongBits(value));
+            event.add("data", data); particles.add(event);
         }
     }
     static class Item extends ItemEntity {
@@ -50,11 +55,12 @@ public class ItemWaterSplashOracle {
             var random = new LegacyRandomSource(seed);
             unsafe.putObject(item, unsafe.objectFieldOffset(randomField), random);
             item.velocity = new Vec3(0.3, y, -0.4); item.events = 0;
-            world.bubbles = 0; world.splashes = 0; item.splash();
+            world.bubbles = 0; world.splashes = 0; world.particles = new JsonArray(); item.splash();
             var row = new JsonObject(); row.addProperty("seed", seed); row.addProperty("y", y);
             row.addProperty("event", item.sound); row.addProperty("volume", Float.floatToRawIntBits(item.volume));
             row.addProperty("pitch", Float.floatToRawIntBits(item.pitch)); row.addProperty("next", random.nextInt());
             row.addProperty("bubbles", world.bubbles); row.addProperty("splashes", world.splashes);
+            row.add("particles", world.particles);
             row.addProperty("events", item.events); rows.add(row);
         }
         Files.writeString(Path.of(args[0]), rows.toString());

@@ -624,6 +624,7 @@ pub(crate) struct ItemEntities {
     pickup_sounds: VecDeque<DVec3>,
     extinguish_sounds: VecDeque<crate::ExtinguishSound>,
     water_entry_sounds: VecDeque<crate::ConsumeSound>,
+    water_entries: VecDeque<crate::ItemWaterEntry>,
     removed_created_chunks: BTreeSet<native_world::loaded::ChunkPos>,
     invalid_removed_created_position: bool,
     saved_merges: Vec<SavedItemMerge>,
@@ -651,6 +652,7 @@ impl Default for ItemEntities {
             pickup_sounds: VecDeque::new(),
             extinguish_sounds: VecDeque::new(),
             water_entry_sounds: VecDeque::new(),
+            water_entries: VecDeque::new(),
             removed_created_chunks: BTreeSet::new(),
             invalid_removed_created_position: false,
             saved_merges: Vec::new(),
@@ -1319,6 +1321,12 @@ impl ItemEntities {
         &mut self,
     ) -> impl Iterator<Item = crate::ConsumeSound> + '_ {
         self.water_entry_sounds.drain(..)
+    }
+
+    pub(crate) fn drain_water_entries(
+        &mut self,
+    ) -> impl Iterator<Item = crate::ItemWaterEntry> + '_ {
+        self.water_entries.drain(..)
     }
 
     #[cfg(test)]
@@ -2425,6 +2433,15 @@ impl ItemEntities {
                 &mut entity.random,
             );
             if let Some(info) = splash {
+                if self.water_entries.len() == 4096 {
+                    self.water_entries.pop_front();
+                }
+                self.water_entries.push_back(crate::ItemWaterEntry {
+                    tick: 0,
+                    entity_id: entity.id,
+                    position: entity.item.position,
+                    velocity: entity.velocity,
+                });
                 let silent = entity
                     ._saved_source
                     .as_ref()
@@ -4758,6 +4775,7 @@ mod tests {
             let mut items = ItemEntities::default();
             items.spawn_saved(saved);
             let mut events = Vec::new();
+            let mut entries = Vec::new();
             for in_water in [false, true, true, false, true] {
                 items.tick_with_fluid_and_proof(
                     IVec3::ZERO,
@@ -4782,8 +4800,10 @@ mod tests {
                     |_| Some(false),
                 );
                 events.extend(items.drain_water_entry_sounds());
+                entries.extend(items.drain_water_entries());
             }
             assert_eq!(events.len(), if silent { 0 } else { 2 });
+            assert_eq!(entries.len(), 2);
             assert!(
                 events
                     .iter()

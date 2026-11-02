@@ -442,6 +442,7 @@ pub struct LoadedSession {
     pickup_sounds: VecDeque<crate::PickupSound>,
     extinguish_sounds: VecDeque<crate::ExtinguishSound>,
     consume_sounds: VecDeque<crate::ConsumeSound>,
+    item_water_entries: VecDeque<crate::ItemWaterEntry>,
     consume_particles: VecDeque<crate::consume_particles::ConsumeParticleSpawn>,
     block_drops: bool,
     entity_drops: bool,
@@ -1414,6 +1415,10 @@ impl LoadedSession {
 
     pub fn take_consume_sounds(&mut self) -> Vec<crate::ConsumeSound> {
         self.consume_sounds.drain(..).collect()
+    }
+
+    pub fn take_item_water_entries(&mut self) -> Vec<crate::ItemWaterEntry> {
+        self.item_water_entries.drain(..).collect()
     }
 
     pub fn take_consume_particles(
@@ -5248,6 +5253,7 @@ impl LoadedSession {
             pickup_sounds: VecDeque::new(),
             extinguish_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
+            item_water_entries: VecDeque::new(),
             consume_particles: VecDeque::new(),
             block_drops: true,
             entity_drops: true,
@@ -17351,6 +17357,11 @@ impl GameSession for LoadedSession {
                 &mut self.experience_orbs,
             );
             crate::collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
+            crate::collect_item_water_entries(
+                &mut self.item_water_entries,
+                &mut self.dropped_items,
+                self.tick,
+            );
             processed += 1;
         }
         if processed > 0 {
@@ -30691,6 +30702,10 @@ pub(crate) mod tests {
             sounds[0].position,
             session.snapshot().dropped_items[0].previous_position
         );
+        let entries = session.take_item_water_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].position, sounds[0].position);
+        assert_eq!(entries[0].tick, session.snapshot().tick);
         session.update(TICK);
         assert!(
             session
@@ -30698,6 +30713,7 @@ pub(crate) mod tests {
                 .iter()
                 .all(|event| event.info.event != "entity.generic.splash")
         );
+        assert!(session.take_item_water_entries().is_empty());
     }
 
     #[test]

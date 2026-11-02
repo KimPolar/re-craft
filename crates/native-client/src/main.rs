@@ -82,6 +82,7 @@ mod toggle_key;
 mod tooltip;
 mod video_ui;
 mod visual_look;
+mod water_entry_particles;
 mod water_overlay;
 #[cfg(test)]
 mod weather_column_tests;
@@ -2920,7 +2921,11 @@ impl ApplicationHandler for App {
             }
             let snapshot = self.session.snapshot();
             let particles = self.session.take_consume_particles();
+            let item_water_entries = self.session.take_item_water_entries();
             if let Some(ui) = &mut self.ui {
+                ui.queue_item_water_entries(item_water_entries);
+                ui.update_drown_particles(&snapshot, Vec::new());
+                ui.update_splash_particles(&snapshot);
                 ui.update_consume_particles(&snapshot, particles);
             }
             if let Some(audio) = &self.audio {

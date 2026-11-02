@@ -148,6 +148,29 @@ pub struct ConsumeSound {
     pub info: ConsumeSoundInfo,
 }
 
+/// Client-visible water entry of a dropped item. Coordinates are absolute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ItemWaterEntry {
+    pub tick: u64,
+    pub entity_id: u32,
+    pub position: DVec3,
+    pub velocity: DVec3,
+}
+
+fn collect_item_water_entries(
+    queue: &mut VecDeque<ItemWaterEntry>,
+    items: &mut items::ItemEntities,
+    tick: u64,
+) {
+    for mut event in items.drain_water_entries() {
+        event.tick = tick;
+        if queue.len() == 4096 {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
+}
+
 fn collect_water_entry_sounds(queue: &mut VecDeque<ConsumeSound>, items: &mut items::ItemEntities) {
     for event in items.drain_water_entry_sounds() {
         if queue.len() == 4096 {
@@ -674,6 +697,7 @@ pub struct LocalSession {
     pickup_sounds: VecDeque<PickupSound>,
     extinguish_sounds: VecDeque<ExtinguishSound>,
     consume_sounds: VecDeque<ConsumeSound>,
+    item_water_entries: VecDeque<ItemWaterEntry>,
     consume_particles: VecDeque<consume_particles::ConsumeParticleSpawn>,
     player_random: native_core::random::LegacyRandom,
     player_client_random: native_core::random::LegacyRandom,
@@ -951,6 +975,10 @@ impl LocalSession {
         self.consume_sounds.drain(..).collect()
     }
 
+    pub fn take_item_water_entries(&mut self) -> Vec<ItemWaterEntry> {
+        self.item_water_entries.drain(..).collect()
+    }
+
     pub fn take_consume_particles(&mut self) -> Vec<consume_particles::ConsumeParticleSpawn> {
         self.consume_particles.drain(..).collect()
     }
@@ -1031,6 +1059,7 @@ impl LocalSession {
             pickup_sounds: VecDeque::new(),
             extinguish_sounds: VecDeque::new(),
             consume_sounds: VecDeque::new(),
+            item_water_entries: VecDeque::new(),
             consume_particles: VecDeque::new(),
             player_random: native_core::random::LegacyRandom::new(0),
             player_client_random: native_core::random::LegacyRandom::new(fresh_session_seed()),
@@ -2330,6 +2359,11 @@ impl GameSession for LocalSession {
                 &mut self.experience_orbs,
             );
             collect_water_entry_sounds(&mut self.consume_sounds, &mut self.dropped_items);
+            collect_item_water_entries(
+                &mut self.item_water_entries,
+                &mut self.dropped_items,
+                self.tick,
+            );
             processed += 1;
         }
         if processed > 0 {

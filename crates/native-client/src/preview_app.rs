@@ -716,6 +716,7 @@ impl Viewer {
             let honey_slides = play.session.take_honey_particles();
             let drown_particles = play.session.take_drown_particles();
             let surface_particles = play.session.take_bubble_surface_particles();
+            let item_water_entries = play.session.take_item_water_entries();
             let soul_particles = play.session.take_soul_particles();
             let smoke = play.session.take_evaporation_smoke();
             let fizz = play.session.take_lava_fizz();
@@ -723,6 +724,7 @@ impl Viewer {
                 ui.queue_plant_break_particles(plant_breaks);
                 ui.queue_honey_particles(honey_slides);
                 ui.queue_bubble_surface_particles(surface_particles);
+                ui.queue_item_water_entries(item_water_entries);
                 ui.update_drown_particles(&snapshot, drown_particles);
                 ui.update_splash_particles(&snapshot);
                 ui.update_soul_particles(&snapshot, soul_particles);

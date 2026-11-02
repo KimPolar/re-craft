@@ -16851,34 +16851,16 @@ impl LoadedSession {
                             self.unresolved_bubble_tick = true;
                             continue;
                         };
-                        let Some(state) = self.world.state(id) else {
+                        let Some(surface) = self.world.state(id).and_then(|state| {
+                            bubble_surface_state(
+                                state,
+                                self.shapes.get(id.0 as usize)?.as_deref()?,
+                                *self.fluids.get(id.0 as usize)?,
+                            )
+                        }) else {
                             self.unresolved_bubble_tick = true;
                             continue;
                         };
-                        if (state.name == "minecraft:bubble_column"
-                            && bubble_column_drag(state).is_none())
-                            || state
-                                .properties
-                                .get("waterlogged")
-                                .is_some_and(|v| v != "true" && v != "false")
-                            || (matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
-                                && (state.properties.len() != 1
-                                    || !state.properties.contains_key("level")))
-                            || FluidState::from_block(state).is_err()
-                        {
-                            self.unresolved_bubble_tick = true;
-                            continue;
-                        }
-                        let Some(shape) = self.shapes.get(id.0 as usize).and_then(Option::as_deref)
-                        else {
-                            self.unresolved_bubble_tick = true;
-                            continue;
-                        };
-                        let Some(fluid) = self.fluids.get(id.0 as usize) else {
-                            self.unresolved_bubble_tick = true;
-                            continue;
-                        };
-                        let surface = shape.is_empty() && fluid.is_none();
                         if let Some(position) = add(self.origin, contact.position) {
                             self.apply_player_bubble_contact(drag_down, surface, flying, position);
                         } else {
@@ -19268,6 +19250,29 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
     }
 }
 
+/// A column's callback distinguishes an exposed surface from a submerged one.
+/// An unparseable fluid state must not be mistaken for an empty fluid.
+fn bubble_surface_state(
+    state: &BlockState,
+    shape: &[Aabb],
+    fluid: Option<FluidState>,
+) -> Option<bool> {
+    if (state.name == "minecraft:bubble_column" && bubble_column_drag(state).is_none())
+        || state
+            .properties
+            .get("waterlogged")
+            .is_some_and(|v| v != "true" && v != "false")
+        || (matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
+            && (state.properties.len() != 1 || !state.properties.contains_key("level")))
+    {
+        return None;
+    }
+    if FluidState::from_block(state).ok()? != fluid {
+        return None;
+    }
+    Some(shape.is_empty() && fluid.is_none())
+}
+
 struct FluidView<'a> {
     world: &'a World,
     shapes: &'a [Option<Vec<Aabb>>],
@@ -19376,11 +19381,12 @@ impl FluidView<'_> {
                 return None;
             };
             let shape = self.shapes.get(id.0 as usize)?.as_deref()?;
-            let fluid = self.fluids.get(id.0 as usize)?;
+            let fluid = *self.fluids.get(id.0 as usize)?;
+            let surface = bubble_surface_state(self.world.state(id)?, shape, fluid)?;
             result.push(crate::bubble_column::EntityContact {
                 position: hit.position,
                 drag_down,
-                surface: shape.is_empty() && fluid.is_none(),
+                surface,
             });
         }
         Some(result)
@@ -30367,6 +30373,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn entity_bubble_contact_requires_a_known_state_above_the_column() {
+        assert_eq!(
+            bubble_surface_state(&state("minecraft:water", &[("level", "0")]), &[], None),
+            None
+        );
+        for (above, expected) in [
+            (state("minecraft:air", &[]), Some(true)),
+            (state("minecraft:water", &[("level", "0")]), Some(false)),
+            (state("minecraft:water", &[("level", "3")]), Some(false)),
+            (
+                state("minecraft:bubble_column", &[("drag", "true")]),
+                Some(false),
+            ),
+            (state("minecraft:stone", &[]), Some(false)),
+            (state("minecraft:water", &[("level", "invalid")]), None),
+            (state("minecraft:water", &[]), None),
+            (
+                state("minecraft:bubble_column", &[("drag", "invalid")]),
+                None,
+            ),
+            (
+                state("minecraft:stone", &[("waterlogged", "invalid")]),
+                None,
+            ),
+        ] {
+            let mut session = session();
+            let column =
+                session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+            let above = session.intern_block(above);
+            assert!(session.set_with_notify(IVec3::new(8, 1, 8), column, false));
+            if above != session.states[0] {
+                assert!(session.set_with_notify(IVec3::new(8, 2, 8), above, false));
+            }
+            let view = FluidView {
+                world: &session.world,
+                shapes: &session.shapes,
+                fluids: &session.fluids,
+                origin: session.origin,
+                bounds: session.bounds,
+                air: session.states[0],
+            };
+            let bounds = BoundingBox {
+                min: DVec3::new(8.375, 1.05, 8.375),
+                max: DVec3::new(8.625, 1.3, 8.625),
+            };
+            let contacts = view.bubble_contacts(bounds, DVec3::ZERO, DVec3::ZERO);
+            match expected {
+                Some(surface) => {
+                    let contacts = contacts.unwrap();
+                    assert_eq!(contacts.len(), 1);
+                    assert_eq!(contacts[0].surface, surface);
+                }
+                None => assert!(contacts.is_none()),
+            }
+        }
+    }
+
+    #[test]
     fn item_bubble_fast_scan_matches_full_traversal() {
         let mut session = session();
         let bubble = session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
@@ -30584,6 +30648,41 @@ pub(crate) mod tests {
                 particles
                     .iter()
                     .all(|event| event.position.y == 2.0 && event.tick == 1)
+            );
+        }
+    }
+
+    #[test]
+    fn item_and_orb_reject_bubble_effects_for_malformed_water_above() {
+        for orb in [false, true] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            let bubble =
+                session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+            let invalid_water =
+                session.intern_block(state("minecraft:water", &[("level", "invalid")]));
+            assert!(session.set_with_notify(IVec3::new(8, 1, 8), bubble, false));
+            assert!(session.set_with_notify(IVec3::new(8, 2, 8), invalid_water, false));
+            session.motion.position = DVec3::new(2.5, 5.0, 2.5);
+            session.player.position = session.motion.position.as_vec3();
+            let position = session.origin.as_dvec3() + DVec3::new(8.5, 1.05, 8.5);
+            if orb {
+                session.experience_orbs.award(position, 1);
+            } else {
+                let stack = ItemStack::new(
+                    "minecraft:stone".into(),
+                    1,
+                    64,
+                    native_persistence::nbt::Tag::Compound(vec![]),
+                )
+                .unwrap();
+                session.dropped_items.spawn_from_entity(position, stack);
+            }
+            session.update(TICK);
+            assert!(session.unresolved_bubble_tick, "orb={orb}");
+            assert!(
+                session.take_bubble_surface_particles().is_empty(),
+                "orb={orb}"
             );
         }
     }

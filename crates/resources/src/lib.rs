@@ -35,6 +35,7 @@ pub mod noise;
 pub mod noise_router;
 pub mod noise_stage;
 pub mod packs;
+pub mod placed_feature;
 pub mod recipes;
 pub mod respawn_environment;
 pub mod respawn_tags;

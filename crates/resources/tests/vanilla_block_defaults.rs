@@ -108,3 +108,84 @@ fn local_block_report_matches_all_vanilla_default_states() {
     assert!(!expected.is_empty());
     assert_eq!(defaults, expected);
 }
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn stateless_block_registrations_have_no_properties_in_java() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_minecraft_dir().unwrap());
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_stateless_block_registry().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let pack = temp.path().join("pack");
+    let blockstates = pack.join("assets/minecraft/blockstates");
+    std::fs::create_dir_all(&blockstates).unwrap();
+    std::fs::write(
+        blockstates.join("stone.json"),
+        b"not a vanilla block registry",
+    )
+    .unwrap();
+    resources.push_pack(&pack).unwrap();
+    let with_pack = resources.vanilla_stateless_block_registry().unwrap();
+    assert_eq!(
+        registry.ids().collect::<Vec<_>>(),
+        with_pack.ids().collect::<Vec<_>>()
+    );
+    let source = temp.path().join("BlockDefaultsOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("BlockDefaultsOracle"));
+    let expected: BTreeMap<_, _> = output
+        .lines()
+        .filter(|line| line.starts_with("minecraft:"))
+        .map(|line| {
+            let mut parts = line.split('\t');
+            (
+                parts.next().unwrap().to_owned(),
+                parts
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert!(
+        registry.len() >= 100,
+        "plain block registry is unexpectedly small"
+    );
+    assert!(registry.contains("minecraft:stone"));
+    assert!(registry.contains("minecraft:dirt"));
+    assert!(registry.contains("minecraft:air"));
+    assert!(registry.contains("minecraft:sand"));
+    assert!(registry.contains("minecraft:powder_snow"));
+    assert!(!registry.contains("minecraft:powder_snow_bucket"));
+    println!(
+        "verified {} stateless blocks; air={}, sand={}, powder_snow={}",
+        registry.len(),
+        registry.contains("minecraft:air"),
+        registry.contains("minecraft:sand"),
+        registry.contains("minecraft:powder_snow")
+    );
+    assert!(!registry.contains("minecraft:grass_block"));
+    assert!(!registry.contains("minecraft:water"));
+    for id in registry.ids() {
+        assert!(
+            expected
+                .get(id)
+                .unwrap_or_else(|| panic!("Java block missing: {id}"))
+                .is_empty(),
+            "plain block has Java properties: {id}"
+        );
+    }
+}

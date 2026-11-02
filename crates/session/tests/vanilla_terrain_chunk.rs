@@ -6,7 +6,9 @@ use native_resources::{
     packs::{ResourceProvider, ResourceStack},
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk},
 };
-use native_session::worldgen::{CarverBlockState, TerrainGenerator, materialize_carved_terrain};
+use native_session::worldgen::{
+    CarverBlockState, TerrainGenerator, materialize_carved_terrain, resolve_stateless_terrain_state,
+};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -262,6 +264,33 @@ fn terrain_matches_java_before_and_after_carvers() {
     assert_eq!(updates.len(), groups.len());
     assert!(registry.len() > 1000);
     let mut resources = ResourceStack::open(&game).unwrap();
+    let stateless_registry = resources.vanilla_stateless_block_registry().unwrap();
+    let stone =
+        resolve_stateless_terrain_state(&serde_json::json!("stone"), &stateless_registry).unwrap();
+    assert_eq!(stone.name, "minecraft:stone");
+    assert!(stone.properties.is_empty());
+    assert!(
+        resolve_stateless_terrain_state(
+            &serde_json::json!({"id":"minecraft:stone","properties":{}}),
+            &stateless_registry
+        )
+        .is_ok()
+    );
+    assert!(
+        resolve_stateless_terrain_state(
+            &serde_json::json!({"id":"minecraft:stone","properties":{"unknown":"x"}}),
+            &stateless_registry
+        )
+        .is_err()
+    );
+    assert!(
+        resolve_stateless_terrain_state(&serde_json::json!("minecraft:water"), &stateless_registry)
+            .is_err()
+    );
+    assert!(
+        resolve_stateless_terrain_state(&serde_json::json!("example:stone"), &stateless_registry)
+            .is_err()
+    );
     let preset: Value = serde_json::from_slice(
         &resources
             .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")
@@ -343,7 +372,12 @@ fn terrain_matches_java_before_and_after_carvers() {
             &updates[i * 2 + 1],
         );
         let biome_chunk = neighborhood.chunk(pos).unwrap();
+        let mut stateless_resolutions = 0;
         let generated = materialize_carved_terrain(chunk, biome_chunk, dimension, |state| {
+            if let Ok(resolved) = resolve_stateless_terrain_state(state, &stateless_registry) {
+                stateless_resolutions += 1;
+                return Ok(resolved);
+            }
             let raw = state
                 .as_str()
                 .or_else(|| state.get("id").and_then(Value::as_str))
@@ -366,6 +400,10 @@ fn terrain_matches_java_before_and_after_carvers() {
             Ok(native_world::loaded::BlockState { name, properties })
         })
         .unwrap();
+        assert!(
+            stateless_resolutions > 0,
+            "expected a stateless block in {dimension} {pos:?}"
+        );
         let world = generated.world();
         let mut names = BTreeMap::new();
         let expected = &groups[i * 2 + 1];

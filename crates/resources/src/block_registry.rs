@@ -1,9 +1,11 @@
-//! Optional block defaults from a locally generated vanilla block report.
-//!
-//! This is data preparation for the read-only viewer, not a game runtime or a
-//! replacement for implementing the complete block registry in Rust.
+//! Read verified stateless block registrations and optional local block reports.
 
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -12,6 +14,181 @@ use sha1::{Digest, Sha1};
 use crate::{Manifest, TARGET_VERSION, open_verified_client, packs::ResourceId};
 
 pub type DefaultProperties = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Blocks proven to inherit the empty base block state definition. Blocks
+/// with state properties still require separate default-state decoding.
+pub struct StatelessBlockRegistry {
+    ids: BTreeSet<String>,
+}
+
+impl StatelessBlockRegistry {
+    /// Read class files from a hash-verified 26.3 client JAR.
+    pub fn load(mut read_class: impl FnMut(&str) -> Result<Option<Vec<u8>>>) -> Result<Self> {
+        const BLOCKS: &str = "net/minecraft/world/level/block/Blocks";
+        const IDS: &str = "net/minecraft/references/BlockItemIds";
+        const DIRECT: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
+        const FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
+        const BASE: &str = "net/minecraft/world/level/block/Block";
+        let mut load = |name: &str| -> Result<crate::item_registry::Class> {
+            let bytes = read_class(&format!("{name}.class"))?
+                .with_context(|| format!("missing class {name}"))?;
+            let class = crate::item_registry::Class::read(&bytes)?;
+            ensure!(class.name == name, "class name does not match {name}");
+            Ok(class)
+        };
+        let names = load(IDS)?.block_reference_names()?;
+        let blocks = load(BLOCKS)?;
+        let mut candidates = BTreeSet::new();
+        let mut registration = None;
+        let mut constructors = BTreeSet::new();
+        let mut registered_classes = BTreeMap::new();
+        for ins in blocks.instructions()? {
+            if ins.op == 0xba {
+                if !candidates.is_empty()
+                    && let Some(class) = blocks.block_factory_constructor(
+                        ins.index.context("missing invokedynamic reference")?,
+                    )?
+                {
+                    constructors.insert(class);
+                }
+                continue;
+            }
+            if !matches!(ins.op, 0xb2 | 0xb3 | 0xb8) {
+                continue;
+            }
+            let (owner, member, descriptor) =
+                blocks.member(ins.index.context("missing class reference")?)?;
+            if ins.op == 0xb2 && owner == IDS {
+                candidates.insert(member.to_owned());
+            } else if ins.op == 0xb8
+                && owner == BLOCKS
+                && member == "register"
+                && descriptor == DIRECT
+            {
+                ensure!(registration.is_none(), "ambiguous block registration");
+                registration = Some(true);
+            } else if ins.op == 0xb8
+                && owner == BLOCKS
+                && member == "register"
+                && descriptor == FACTORY
+            {
+                ensure!(registration.is_none(), "ambiguous block registration");
+                registration = Some(false);
+            } else if ins.op == 0xb3 && owner == BLOCKS {
+                let class = match registration {
+                    Some(true) => Some(BASE.to_owned()),
+                    Some(false) if constructors.len() == 1 => constructors.first().cloned(),
+                    _ => None,
+                };
+                if let Some(class) = class
+                    && candidates.len() == 1
+                    && candidates.contains(member)
+                {
+                    let name = names
+                        .get(member)
+                        .with_context(|| format!("missing block reference {member}"))?;
+                    let id = ResourceId::parse(name)?;
+                    ensure!(
+                        id.namespace == "minecraft",
+                        "unexpected block reference namespace"
+                    );
+                    ensure!(
+                        registered_classes
+                            .insert(format!("{}:{}", id.namespace, id.path), class)
+                            .is_none(),
+                        "duplicate block registration"
+                    );
+                }
+                candidates.clear();
+                constructors.clear();
+                registration = None;
+            }
+        }
+        drop(load);
+        let mut cache = BTreeMap::new();
+        let mut ids = BTreeSet::new();
+        for (id, class) in registered_classes {
+            if stateless_class(&class, &mut read_class, &mut cache, &mut BTreeSet::new())? {
+                ids.insert(id);
+            }
+        }
+        ensure!(
+            ids.contains("minecraft:stone") && ids.contains("minecraft:dirt"),
+            "stateless block registration format is unsupported"
+        );
+        Ok(Self { ids })
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.ids.iter().map(String::as_str)
+    }
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+fn stateless_class(
+    name: &str,
+    read_class: &mut impl FnMut(&str) -> Result<Option<Vec<u8>>>,
+    cache: &mut BTreeMap<String, bool>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<bool> {
+    const BASE: &str = "net/minecraft/world/level/block/Block";
+    const DESCRIPTOR: &str = "(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V";
+    if let Some(result) = cache.get(name) {
+        return Ok(*result);
+    }
+    ensure!(
+        name.starts_with("net/minecraft/world/level/block/")
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/_$".contains(&c)),
+        "invalid block class name"
+    );
+    ensure!(
+        visiting.insert(name.to_owned()) && visiting.len() <= 64,
+        "cyclic block inheritance"
+    );
+    let result = (|| {
+        let bytes = read_class(&format!("{name}.class"))?
+            .with_context(|| format!("missing block class {name}"))?;
+        let class = crate::item_registry::Class::read(&bytes)?;
+        ensure!(
+            class.name == name,
+            "block class name does not match its path"
+        );
+        if name == BASE {
+            ensure!(
+                class.declares_method("createBlockStateDefinition", DESCRIPTOR),
+                "base block state method is missing"
+            );
+            Ok(true)
+        } else if class.declares_method("createBlockStateDefinition", DESCRIPTOR) {
+            Ok(false)
+        } else {
+            stateless_class(
+                class
+                    .superclass
+                    .as_deref()
+                    .context("missing block superclass")?,
+                read_class,
+                cache,
+                visiting,
+            )
+        }
+    })();
+    visiting.remove(name);
+    if let Ok(value) = result {
+        cache.insert(name.to_owned(), value);
+    }
+    result
+}
 
 #[derive(Deserialize)]
 struct Metadata {
@@ -122,6 +299,12 @@ mod tests {
       "minecraft:grass_block":{"properties":{"snowy":["true","false"]},
         "states":[{"id":2,"properties":{"snowy":"true"}},{"id":3,"default":true,"properties":{"snowy":"false"}}]}
     }"#;
+
+    #[test]
+    fn stateless_registry_rejects_missing_and_malformed_classes() {
+        assert!(StatelessBlockRegistry::load(|_| Ok(None)).is_err());
+        assert!(StatelessBlockRegistry::load(|_| Ok(Some(vec![0xca, 0xfe, 0xba, 0xbe]))).is_err());
+    }
 
     #[test]
     fn report_requires_a_single_complete_valid_default() {

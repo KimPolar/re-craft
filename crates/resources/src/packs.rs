@@ -282,6 +282,14 @@ impl ResourceStack {
     pub fn vanilla_item_registry(&mut self) -> Result<crate::item_registry::ItemRegistry> {
         crate::item_registry::ItemRegistry::load(|path| read_zip(&mut self.base, path))
     }
+
+    /// Read stateless block registrations from the verified client, without
+    /// allowing resource packs to redefine Java block classes.
+    pub fn vanilla_stateless_block_registry(
+        &mut self,
+    ) -> Result<crate::block_registry::StatelessBlockRegistry> {
+        crate::block_registry::StatelessBlockRegistry::load(|path| read_zip(&mut self.base, path))
+    }
 }
 
 fn collect_texture_name(name: &str, folder: &str, out: &mut BTreeSet<ResourceId>) -> Result<()> {

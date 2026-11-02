@@ -330,6 +330,8 @@ enum Constant {
     String(u16),
     NameType(u16, u16),
     Member(u16, u16),
+    MethodHandle(u8, u16),
+    InvokeDynamic(u16, u16),
     Other,
 }
 struct Reader<'a> {
@@ -353,17 +355,21 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into()?))
     }
 }
-struct Ins {
-    op: u8,
-    index: Option<u16>,
+pub(crate) struct Ins {
+    pub(crate) op: u8,
+    pub(crate) index: Option<u16>,
 }
-struct Class {
-    name: String,
+pub(crate) struct Class {
+    pub(crate) name: String,
+    pub(crate) superclass: Option<String>,
     constants: Vec<Constant>,
-    code: Vec<u8>,
+    code: Option<Vec<u8>>,
+    methods: std::collections::BTreeSet<(String, String)>,
+    bootstraps: Vec<(u16, Vec<u16>)>,
+    block_factory_lambdas: HashMap<String, Vec<u8>>,
 }
 impl Class {
-    fn read(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader { bytes, pos: 0 };
         ensure!(r.u32()? == 0xcafe_babe, "invalid class magic");
         r.take(4)?;
@@ -380,7 +386,8 @@ impl Class {
                 8 => Constant::String(r.u16()?),
                 9..=11 => Constant::Member(r.u16()?, r.u16()?),
                 12 => Constant::NameType(r.u16()?, r.u16()?),
-                3 | 4 | 17 | 18 => {
+                18 => Constant::InvokeDynamic(r.u16()?, r.u16()?),
+                3 | 4 | 17 => {
                     r.take(4)?;
                     Constant::Other
                 }
@@ -393,10 +400,7 @@ impl Class {
                     r.take(2)?;
                     Constant::Other
                 }
-                15 => {
-                    r.take(3)?;
-                    Constant::Other
-                }
+                15 => Constant::MethodHandle(r.u8()?, r.u16()?),
                 tag => bail!("unsupported constant tag {tag}"),
             };
             constants.push(value);
@@ -404,7 +408,7 @@ impl Class {
         ensure!(constants.len() == count, "invalid constant pool");
         r.u16()?;
         let this = r.u16()?;
-        r.u16()?;
+        let parent = r.u16()?;
         let class = |index: u16| -> Result<&str> {
             let Some(Constant::Class(name)) = constants.get(index as usize) else {
                 bail!("invalid class reference")
@@ -415,6 +419,11 @@ impl Class {
             Ok(std::str::from_utf8(value)?)
         };
         let name = class(this)?.to_owned();
+        let superclass = if parent == 0 {
+            None
+        } else {
+            Some(class(parent)?.to_owned())
+        };
         let interfaces = r.u16()? as usize;
         r.take(interfaces * 2)?;
         for _ in 0..r.u16()? {
@@ -426,14 +435,24 @@ impl Class {
             }
         }
         let mut code = None;
+        let mut block_factory_lambdas = HashMap::new();
+        let mut methods = std::collections::BTreeSet::new();
         for _ in 0..r.u16()? {
             r.u16()?;
             let name_index = r.u16()?;
-            r.u16()?;
+            let descriptor_index = r.u16()?;
             let method_name = match constants.get(name_index as usize) {
                 Some(Constant::Utf8(value)) => std::str::from_utf8(value)?,
                 _ => bail!("invalid method name"),
             };
+            let descriptor = match constants.get(descriptor_index as usize) {
+                Some(Constant::Utf8(value)) => std::str::from_utf8(value)?,
+                _ => bail!("invalid method descriptor"),
+            };
+            ensure!(
+                methods.insert((method_name.to_owned(), descriptor.to_owned())),
+                "duplicate class method"
+            );
             for _ in 0..r.u16()? {
                 let attribute = r.u16()?;
                 let size = r.u32()? as usize;
@@ -442,28 +461,70 @@ impl Class {
                     Some(Constant::Utf8(value)) => value.as_slice(),
                     _ => bail!("invalid attribute name"),
                 };
-                if method_name == "<clinit>" && attr == b"Code" {
-                    ensure!(code.is_none(), "duplicate class initializer");
+                let factory_lambda = method_name.starts_with("lambda$static$")
+                    && descriptor
+                        == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
+                if (method_name == "<clinit>" || factory_lambda) && attr == b"Code" {
                     let mut inner = Reader {
                         bytes: content,
                         pos: 0,
                     };
                     inner.take(4)?;
                     let len = inner.u32()? as usize;
-                    code = Some(inner.take(len)?.to_vec());
+                    let method_code = inner.take(len)?.to_vec();
+                    if method_name == "<clinit>" {
+                        ensure!(
+                            code.replace(method_code).is_none(),
+                            "duplicate class initializer"
+                        );
+                    } else {
+                        ensure!(
+                            block_factory_lambdas
+                                .insert(method_name.to_owned(), method_code)
+                                .is_none(),
+                            "duplicate block factory lambda"
+                        );
+                    }
                 }
             }
         }
+        let mut bootstraps = Vec::new();
+        let mut has_bootstraps = false;
         for _ in 0..r.u16()? {
-            r.u16()?;
+            let name_index = r.u16()?;
             let size = r.u32()? as usize;
-            r.take(size)?;
+            let content = r.take(size)?;
+            if matches!(constants.get(name_index as usize), Some(Constant::Utf8(value)) if value == b"BootstrapMethods")
+            {
+                ensure!(!has_bootstraps, "duplicate bootstrap methods");
+                has_bootstraps = true;
+                let mut inner = Reader {
+                    bytes: content,
+                    pos: 0,
+                };
+                for _ in 0..inner.u16()? {
+                    let method = inner.u16()?;
+                    let mut args = Vec::new();
+                    for _ in 0..inner.u16()? {
+                        args.push(inner.u16()?);
+                    }
+                    bootstraps.push((method, args));
+                }
+                ensure!(
+                    inner.pos == content.len(),
+                    "invalid bootstrap methods length"
+                );
+            }
         }
         ensure!(r.pos == bytes.len(), "trailing class bytes");
         Ok(Self {
             name,
+            superclass,
             constants,
-            code: code.context("missing class initializer")?,
+            code,
+            methods,
+            bootstraps,
+            block_factory_lambdas,
         })
     }
     fn utf8(&self, index: u16) -> Result<&str> {
@@ -472,7 +533,7 @@ impl Class {
         };
         Ok(std::str::from_utf8(value)?)
     }
-    fn member(&self, index: u16) -> Result<(&str, &str, &str)> {
+    pub(crate) fn member(&self, index: u16) -> Result<(&str, &str, &str)> {
         let Some(Constant::Member(owner, name)) = self.constants.get(index as usize) else {
             bail!("invalid member reference")
         };
@@ -488,9 +549,9 @@ impl Class {
             self.utf8(*descriptor)?,
         ))
     }
-    fn instructions(&self) -> Result<Vec<Ins>> {
+    pub(crate) fn instructions(&self) -> Result<Vec<Ins>> {
         let mut r = Reader {
-            bytes: &self.code,
+            bytes: self.code.as_deref().context("missing class initializer")?,
             pos: 0,
         };
         let mut out = Vec::new();
@@ -523,7 +584,114 @@ impl Class {
         );
         Ok(out)
     }
-    fn reference_names(&self) -> Result<HashMap<String, String>> {
+    pub(crate) fn declares_method(&self, name: &str, descriptor: &str) -> bool {
+        self.methods
+            .contains(&(name.to_owned(), descriptor.to_owned()))
+    }
+
+    /// Extract a constructor or a simple uncaptured constructor lambda.
+    pub(crate) fn block_factory_constructor(&self, index: u16) -> Result<Option<String>> {
+        let Some(Constant::InvokeDynamic(bootstrap, name_type)) =
+            self.constants.get(index as usize)
+        else {
+            bail!("invalid invokedynamic reference")
+        };
+        let Some(Constant::NameType(_, descriptor)) = self.constants.get(*name_type as usize)
+        else {
+            bail!("invalid invokedynamic signature")
+        };
+        if self.utf8(*descriptor)? != "()Ljava/util/function/Function;" {
+            return Ok(None);
+        }
+        let (bootstrap_method, args) = self
+            .bootstraps
+            .get(*bootstrap as usize)
+            .context("missing bootstrap entry")?;
+        let Some(Constant::MethodHandle(6, target)) =
+            self.constants.get(*bootstrap_method as usize)
+        else {
+            return Ok(None);
+        };
+        let (owner, name, _) = self.member(*target)?;
+        if owner != "java/lang/invoke/LambdaMetafactory" || name != "metafactory" || args.len() != 3
+        {
+            return Ok(None);
+        }
+        let Some(Constant::MethodHandle(kind, target)) = self.constants.get(args[1] as usize)
+        else {
+            return Ok(None);
+        };
+        let (class, name, descriptor) = self.member(*target)?;
+        match *kind {
+            8 if name == "<init>"
+                && descriptor
+                    == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V" =>
+            {
+                Ok(Some(class.to_owned()))
+            }
+            6 if class == self.name
+                && descriptor
+                    == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;" =>
+            {
+                self.block_lambda_constructor(name)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Accept straight-line constructors returning their first allocated
+    /// object. Reject branches, helper calls, mutations and stack shuffling.
+    fn block_lambda_constructor(&self, name: &str) -> Result<Option<String>> {
+        let Some(code) = self.block_factory_lambdas.get(name) else {
+            return Ok(None);
+        };
+        let mut r = Reader {
+            bytes: code,
+            pos: 0,
+        };
+        if r.u8()? != 0xbb {
+            return Ok(None);
+        }
+        let Some(Constant::Class(index)) = self.constants.get(r.u16()? as usize) else {
+            bail!("invalid block constructor class")
+        };
+        let class = self.utf8(*index)?.to_owned();
+        if r.u8()? != 0x59 {
+            return Ok(None);
+        }
+        let mut initialized = false;
+        while r.pos < r.bytes.len() {
+            let op = r.u8()?;
+            if initialized && op != 0xb0 {
+                return Ok(None);
+            }
+            match op {
+                0x03..=0x08 | 0x0b..=0x0d | 0x2a | 0x59 => {}
+                0x10 | 0x12 => {
+                    r.u8()?;
+                }
+                0x11 | 0x13 | 0xbb => {
+                    r.u16()?;
+                }
+                0xb7 => {
+                    let (owner, method, _) = self.member(r.u16()?)?;
+                    if method != "<init>" {
+                        return Ok(None);
+                    }
+                    if owner == class {
+                        if initialized {
+                            return Ok(None);
+                        }
+                        initialized = true;
+                    }
+                }
+                0xb0 if initialized && r.pos == r.bytes.len() => return Ok(Some(class)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+    pub(crate) fn reference_names(&self) -> Result<HashMap<String, String>> {
         let mut values = HashMap::new();
         let mut last = None;
         let mut generator = None;
@@ -570,11 +738,121 @@ impl Class {
         }
         Ok(values)
     }
+
+    /// BlockItemId can use different names for the block and its item (for
+    /// example powder snow and its bucket); take the first create argument.
+    pub(crate) fn block_reference_names(&self) -> Result<HashMap<String, String>> {
+        const ID_CLASS: &str = "net/minecraft/references/BlockItemId";
+        const FIELD_TYPE: &str = "Lnet/minecraft/references/BlockItemId;";
+        const ONE: &str = "(Ljava/lang/String;)Lnet/minecraft/references/BlockItemId;";
+        const TWO: &str =
+            "(Ljava/lang/String;Ljava/lang/String;)Lnet/minecraft/references/BlockItemId;";
+        ensure!(self.name == BLOCK_IDS, "not a block item reference class");
+        let mut strings = Vec::new();
+        let mut created = None;
+        let mut values = HashMap::new();
+        for ins in self.instructions()? {
+            if matches!(ins.op, 0x12 | 0x13) {
+                if let Some(Constant::String(index)) =
+                    self.constants.get(ins.index.unwrap() as usize)
+                {
+                    strings.push(self.utf8(*index)?.to_owned());
+                }
+            } else if ins.op == 0xb8 {
+                let (owner, method, descriptor) = self.member(ins.index.unwrap())?;
+                if owner == ID_CLASS && method == "create" {
+                    let count = match descriptor {
+                        ONE => 1,
+                        TWO => 2,
+                        _ => bail!("unsupported block reference factory"),
+                    };
+                    ensure!(
+                        created.is_none() && strings.len() == count,
+                        "ambiguous block reference arguments"
+                    );
+                    created = Some(strings[0].clone());
+                    strings.clear();
+                }
+            } else if ins.op == 0xb3 {
+                let (owner, field, descriptor) = self.member(ins.index.unwrap())?;
+                ensure!(owner == self.name, "unexpected block reference owner");
+                if descriptor == FIELD_TYPE {
+                    let name = created
+                        .take()
+                        .context("block reference was not created directly")?;
+                    ensure!(
+                        values.insert(field.to_owned(), name).is_none(),
+                        "duplicate block reference"
+                    );
+                } else {
+                    ensure!(
+                        created.is_none(),
+                        "block reference assigned to another field type"
+                    );
+                }
+                strings.clear();
+            }
+        }
+        ensure!(created.is_none(), "unfinished block reference");
+        Ok(values)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factory_lambda_only_accepts_straight_line_return_of_constructed_block() {
+        let class = Class {
+            name: "net/minecraft/world/level/block/Blocks".into(),
+            superclass: None,
+            constants: vec![
+                Constant::Other,
+                Constant::Utf8(b"net/minecraft/world/level/block/SandBlock".to_vec()),
+                Constant::Class(1),
+                Constant::Utf8(b"<init>".to_vec()),
+                Constant::Utf8(
+                    b"(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+                        .to_vec(),
+                ),
+                Constant::NameType(3, 4),
+                Constant::Member(2, 5),
+            ],
+            code: None,
+            methods: Default::default(),
+            bootstraps: vec![],
+            block_factory_lambdas: HashMap::from([
+                (
+                    "good".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x2a, 0xb7, 0, 6, 0xb0],
+                ),
+                (
+                    "branch".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x2a, 0x99, 0, 3, 0xb7, 0, 6, 0xb0],
+                ),
+                (
+                    "helper".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x2a, 0xb8, 0, 6, 0xb7, 0, 6, 0xb0],
+                ),
+                (
+                    "after_init".into(),
+                    vec![0xbb, 0, 2, 0x59, 0x2a, 0xb7, 0, 6, 0x59, 0xb0],
+                ),
+            ]),
+        };
+        assert_eq!(
+            class.block_lambda_constructor("good").unwrap().as_deref(),
+            Some("net/minecraft/world/level/block/SandBlock")
+        );
+        for name in ["branch", "helper", "after_init", "missing"] {
+            assert_eq!(
+                class.block_lambda_constructor(name).unwrap(),
+                None,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn malformed_or_missing_registry_classes_fail_closed() {

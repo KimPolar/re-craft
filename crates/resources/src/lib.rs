@@ -33,6 +33,7 @@ pub mod game_event_tags;
 pub mod geode_feature;
 pub mod geometry;
 pub mod heightmap_tags;
+pub mod huge_mushroom_feature;
 pub mod item_registry;
 pub mod lake_feature;
 pub mod loot;

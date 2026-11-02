@@ -16,6 +16,7 @@ use native_resources::{
     freeze_feature::freeze_top_layer,
     geode_feature::{Direction as GeodeDirection, GeodeEnvironment, GeodeFeature},
     heightmap_tags::HeightmapTags,
+    huge_mushroom_feature::{HugeMushroomFeature, MushroomWorld},
     lake_feature::{LakeFeature, LakeWorld},
     monster_room::{RoomBlock, RoomMob, place_monster_room},
     multiface_growth::{BlockSet as MultifaceBlockSet, Face as MultifaceFace, MultifaceGrowth},
@@ -103,6 +104,7 @@ enum ConfiguredDecoration {
     MonsterRoom,
     Geode(GeodeFeature<BlockState>),
     Multiface(MultifaceGrowth),
+    HugeMushroom(HugeMushroomFeature<BlockState>),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -128,6 +130,7 @@ impl ConfiguredDecoration {
             Self::FallenTree(v) => v.required_blocks(),
             Self::Geode(v) => v.required_blocks(),
             Self::Multiface(v) => v.required_blocks(),
+            Self::HugeMushroom(v) => v.required_blocks(),
             Self::Freeze => ["minecraft:ice", "minecraft:snow"]
                 .into_iter()
                 .map(|v| ResourceId::parse(v).unwrap())
@@ -163,6 +166,7 @@ impl ConfiguredDecoration {
             Self::Column(v) => v.needs_survival(name),
             Self::Lake(v) => v.needs_survival(name),
             Self::Geode(v) => v.needs_survival(name),
+            Self::HugeMushroom(v) => v.needs_survival(name),
             Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
@@ -231,6 +235,9 @@ impl ConfiguredDecoration {
             ("minecraft", "multiface_growth") => {
                 Ok(Self::Multiface(MultifaceGrowth::decode(value)?))
             }
+            ("minecraft", "huge_brown_mushroom" | "huge_red_mushroom") => Ok(Self::HugeMushroom(
+                HugeMushroomFeature::decode(provider, value, resolve)?,
+            )),
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -306,6 +313,7 @@ impl ConfiguredDecoration {
             Self::FallenTree(v) => v.required_tags(),
             Self::Geode(v) => v.required_tags(),
             Self::Multiface(v) => v.required_tags(),
+            Self::HugeMushroom(v) => v.required_tags(),
             Self::Freeze => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
@@ -365,6 +373,7 @@ impl ConfiguredDecoration {
             Self::MonsterRoom => place_monster_room(world, random, pos),
             Self::Geode(v) => v.place(world, random, world.target.seed, pos),
             Self::Multiface(v) => v.place(world, random, pos),
+            Self::HugeMushroom(v) => v.place(world, random, pos),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -1819,6 +1828,73 @@ impl TreeWorld for DecorationRegion<'_> {
             TreeWrite::Foliage => self.tree_leaves.push(pos),
         }
         self.set_tree_block(pos, state, 19)
+    }
+}
+
+impl MushroomWorld for DecorationRegion<'_> {
+    fn mushroom_min_y(&self) -> i32 {
+        self.target.min_y
+    }
+    fn mushroom_max_y(&self) -> i32 {
+        self.target.min_y + self.target.height - 1
+    }
+    fn mushroom_cap_faces(
+        &mut self,
+        mut state: BlockState,
+        faces: &[(&str, bool)],
+    ) -> Result<BlockState> {
+        if faces
+            .iter()
+            .all(|(name, _)| state.properties.contains_key(*name))
+        {
+            for &(name, value) in faces {
+                let current = state
+                    .properties
+                    .get_mut(name)
+                    .expect("checked cap property");
+                ensure!(
+                    matches!(current.as_str(), "true" | "false"),
+                    "invalid mushroom face"
+                );
+                *current = value.to_string();
+            }
+        }
+        Ok(state)
+    }
+    fn write_mushroom_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "mushroom write chunk is missing"
+        );
+        ensure!(
+            matches!(
+                state.name.as_str(),
+                "minecraft:brown_mushroom_block"
+                    | "minecraft:red_mushroom_block"
+                    | "minecraft:mushroom_stem"
+            ) && state.properties.len() == 6
+                && ["up", "down", "north", "south", "east", "west"]
+                    .iter()
+                    .all(|name| matches!(
+                        state.properties.get(*name).map(String::as_str),
+                        Some("true" | "false")
+                    )),
+            "unsupported mushroom replacement effects"
+        );
+        if self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        let old = self.read(pos)?;
+        ensure!(
+            is_air(&old) || tree_oak_leaf(&old)?,
+            "unsupported mushroom source effects"
+        );
+        self.set_section_block(pos, state)?;
+        self.update_final_heightmaps(pos, state)?;
+        Ok(())
     }
 }
 
@@ -5993,6 +6069,78 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    #[test]
+    fn huge_mushroom_updates_generated_terrain_and_heightmaps() {
+        struct MushroomData;
+        impl ResourceProvider for MushroomData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/minecraft/tags/block/leaves.json" | "data/minecraft/tags/block/replaceable_by_mushrooms.json" => Ok(Some(br#"{"values":[]}"#.to_vec())),
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json" | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:brown_mushroom_block","minecraft:mushroom_stem"]}"#.to_vec())),
+                    _ => Data.read_data(path),
+                }
+            }
+        }
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:brown_mushroom_block".into(),
+            "minecraft:mushroom_stem".into(),
+        ]);
+        let definition = json!({
+            "type":"minecraft:huge_brown_mushroom", "foliage_radius":2,
+            "cap_provider":{"id":"minecraft:brown_mushroom_block"},
+            "stem_provider":{"id":"minecraft:mushroom_stem"},
+            "can_place_on":{"type":"minecraft:matching_blocks","blocks":["minecraft:stone"]}
+        });
+        let feature = HugeMushroomFeature::decode(&mut MushroomData, &definition, &mut |value| {
+            let mut result = resolve_test(value)?;
+            result.properties = ["up", "down", "north", "south", "west", "east"]
+                .into_iter()
+                .map(|name| (name.into(), "true".into()))
+                .collect();
+            Ok(result)
+        })
+        .unwrap();
+        let tags =
+            OreBlockTags::load(&mut MushroomData, &registry, &feature.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut MushroomData, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let seed = (0..100)
+            .find(|&seed| {
+                let mut random = DecorationRandom::new(seed);
+                let _ = random.next_int_bound(3);
+                random.next_int_bound(12) != Some(0)
+            })
+            .unwrap();
+        let mut expected_random = DecorationRandom::new(seed);
+        let height = expected_random.next_int_bound(3).unwrap() + 4;
+        assert!(
+            feature
+                .place(&mut region, &mut DecorationRandom::new(seed), [8, 8, 8])
+                .unwrap()
+        );
+        assert_eq!(region.final_height(0, 8, 8).unwrap(), 9 + height);
+        assert_eq!(region.final_height(1, 8, 8).unwrap(), 9 + height);
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert_eq!(
+            after.block(8, 8, 8).unwrap().name,
+            "minecraft:mushroom_stem"
+        );
+        assert_eq!(
+            after.block(8, 8 + height, 8).unwrap().name,
+            "minecraft:brown_mushroom_block"
+        );
+        assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:air");
     }
 
     struct TreeData;

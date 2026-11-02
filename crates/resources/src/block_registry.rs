@@ -44,6 +44,7 @@ enum StateSchema {
     BigDripleaf,
     BigDripleafStem,
     HangingRoots,
+    Vine,
 }
 
 impl StateSchema {
@@ -76,6 +77,12 @@ impl StateSchema {
                 .into_iter()
                 .map(|name| (name.into(), "false".into()))
                 .collect();
+            }
+            Self::Vine => {
+                return ["up", "north", "south", "west", "east"]
+                    .into_iter()
+                    .map(|name| (name.into(), "false".into()))
+                    .collect();
             }
             Self::HugeMushroom => {
                 return ["down", "up", "north", "south", "west", "east"]
@@ -128,6 +135,12 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Vine
+                if matches!(name, "up" | "north" | "south" | "west" | "east")
+                    && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
             Self::HangingRoots if name == "waterlogged" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
@@ -363,6 +376,7 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::AmethystCluster)
                 }
                 "net/minecraft/world/level/block/GlowLichenBlock" => Some(StateSchema::Multiface),
+                "net/minecraft/world/level/block/VineBlock" => Some(StateSchema::Vine),
                 "net/minecraft/world/level/block/HugeMushroomBlock" => {
                     Some(StateSchema::HugeMushroom)
                 }

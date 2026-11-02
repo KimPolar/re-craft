@@ -700,7 +700,11 @@ impl Class {
                         && method == "noAmbientSound"
                         && descriptor
                             == "()Lnet/minecraft/world/level/block/sounds/AmbientLeavesBlockSoundPlayer;";
-                    if !(method == "of" && (constant || uniform)) && !ambient_leaves {
+                    let colored_particle = class == "net/minecraft/world/level/block/UntintedParticleLeavesBlock"
+                        && owner == "net/minecraft/core/particles/ColorParticleOption"
+                        && method == "create"
+                        && descriptor == "(Lnet/minecraft/core/particles/ParticleType;I)Lnet/minecraft/core/particles/ColorParticleOption;";
+                    if !(method == "of" && (constant || uniform)) && !ambient_leaves && !colored_particle {
                         return Ok(None);
                     }
                 }

@@ -451,7 +451,7 @@ pub struct LoadedSession {
     block_drops: bool,
     entity_drops: bool,
     game_mode: GameMode,
-    game_mode_changed_during_session: bool,
+    game_mode_trace: Option<GameModeTrace>,
     game_master_permission: bool,
     world_seed: Option<i64>,
     registered_clocks: Option<Arc<BTreeSet<native_persistence::world::DimensionId>>>,
@@ -703,6 +703,14 @@ pub struct LoadedSession {
     block_notifications: VecDeque<(IVec3, BlockStateId, BlockStateId)>,
     pending_stair_updates: BTreeMap<ChunkPos, BTreeSet<BlockPosition>>,
     notifying_blocks: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GameModeTrace {
+    initial: GameMode,
+    previous: GameMode,
+    current: GameMode,
+    valid: bool,
 }
 
 struct EffectSaveTracking {
@@ -3277,12 +3285,39 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Stage only the game-mode fields. This does not authorize writing a
+    /// player or world save; all other simulation effects remain separate.
+    pub fn draft_changed_game_mode(
+        &self,
+        original: &native_persistence::nbt::NamedTag,
+    ) -> anyhow::Result<native_persistence::nbt::NamedTag> {
+        anyhow::ensure!(
+            self.commands.is_empty(),
+            "pending player commands have not reached a tick"
+        );
+        let trace = self
+            .game_mode_trace
+            .ok_or_else(|| anyhow::anyhow!("game mode was not changed"))?;
+        anyhow::ensure!(
+            trace.valid && trace.current == self.game_mode,
+            "game mode transition history is incomplete"
+        );
+        self.validate_player_draft_source(original)?;
+        crate::player_data::draft_game_mode_transition(
+            original,
+            trace.initial,
+            trace.previous,
+            trace.current,
+            self.flight.flying,
+        )
+    }
+
     fn draft_player_state_inner(
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
         anyhow::ensure!(
-            !self.game_mode_changed_during_session,
+            self.game_mode_trace.is_none(),
             "game mode transitions and abilities are not yet coordinated for saving"
         );
         // Sensor step events, listener state, and redstone side effects are
@@ -4652,6 +4687,15 @@ impl LoadedSession {
     }
 
     pub fn set_game_mode(&mut self, mode: GameMode) {
+        if let Some(trace) = &mut self.game_mode_trace
+            && mode != self.game_mode
+        {
+            trace.valid = false;
+        }
+        self.apply_game_mode(mode);
+    }
+
+    fn apply_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
         self.flight.flying = mode.flight_after_change(self.flight.flying);
@@ -5455,7 +5499,7 @@ impl LoadedSession {
             block_drops: true,
             entity_drops: true,
             game_mode: GameMode::default(),
-            game_mode_changed_during_session: false,
+            game_mode_trace: None,
             game_master_permission: false,
             world_seed: None,
             registered_clocks: None,
@@ -16343,8 +16387,18 @@ impl LoadedSession {
                             self.tick.saturating_add(1),
                         );
                     } else if self.game_mode != mode {
-                        self.game_mode_changed_during_session = true;
-                        self.set_game_mode(mode);
+                        let previous = self.game_mode;
+                        let initial = self.game_mode_trace.map_or(previous, |trace| trace.initial);
+                        let valid = self
+                            .game_mode_trace
+                            .is_none_or(|trace| trace.valid && trace.current == previous);
+                        self.game_mode_trace = Some(GameModeTrace {
+                            initial,
+                            previous,
+                            current: mode,
+                            valid,
+                        });
+                        self.apply_game_mode(mode);
                         if mode == GameMode::Creative && self.flight.flying {
                             let grounded = crate::movement::ground_within_flight_range(
                                 self.motion.position,
@@ -20700,7 +20754,7 @@ pub(crate) mod tests {
             session.system_messages.last().unwrap().kind,
             crate::SystemMessageKind::TimePermissionDenied
         );
-        assert!(!session.game_mode_changed_during_session);
+        assert!(session.game_mode_trace.is_none());
 
         session.set_game_master_permission(true);
         for (mode, flying) in [
@@ -20756,6 +20810,49 @@ pub(crate) mod tests {
             assert_eq!(session.game_mode, GameMode::Creative);
             assert_eq!(session.flight.flying, flying, "height {y}");
         }
+    }
+
+    #[test]
+    fn mode_transition_draft_tracks_last_mode_and_rejects_stale_or_untracked_sources() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("playerGameType".into(), Tag::Int(0)),
+                ("other".into(), Tag::Int(42)),
+            ]),
+        };
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.restore_saved_player_inventory(&original).unwrap();
+        session.set_game_master_permission(true);
+        assert!(session.draft_changed_game_mode(&original).is_err());
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Creative));
+        assert!(session.draft_changed_game_mode(&original).is_err());
+        session.update(TICK);
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Adventure));
+        session.update(TICK);
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Survival));
+        session.update(TICK);
+        let draft = session.draft_changed_game_mode(&original).unwrap();
+        assert_eq!(draft.value.get("playerGameType"), Some(&Tag::Int(0)));
+        assert_eq!(
+            draft.value.get("previousPlayerGameType"),
+            Some(&Tag::Int(2))
+        );
+        assert_eq!(draft.value.get("other"), Some(&Tag::Int(42)));
+        assert!(session.draft_player_state_inner(&original).is_err());
+        let mut stale = original.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        fields.push(("new".into(), Tag::Int(1)));
+        assert!(session.draft_changed_game_mode(&stale).is_err());
+        session.set_game_mode(GameMode::Creative);
+        assert!(session.draft_changed_game_mode(&original).is_err());
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Survival));
+        session.update(TICK);
+        assert!(session.draft_changed_game_mode(&original).is_err());
     }
 
     #[test]

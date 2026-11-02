@@ -1427,6 +1427,84 @@ impl PlayerInventoryDraft {
     }
 }
 
+/// Prepare just the Java mode and abilities fields. The caller must verify
+/// the session source and coordinate every other changed world/player field.
+pub(crate) fn draft_game_mode_transition(
+    original: &NamedTag,
+    initial: GameMode,
+    previous: GameMode,
+    current: GameMode,
+    flying: bool,
+) -> Result<NamedTag> {
+    ensure!(
+        matches!(unique_field(&original.value, "playerGameType")?, Some(Tag::Int(id)) if *id == initial.legacy_id()),
+        "source game mode is missing, invalid, or differs from the session"
+    );
+    if let Some(previous) = unique_field(&original.value, "previousPlayerGameType")? {
+        ensure!(
+            matches!(previous, Tag::Int(0..=3)),
+            "previous game mode is invalid"
+        );
+    }
+    ensure!(
+        match current {
+            GameMode::Spectator => flying,
+            GameMode::Creative => true,
+            GameMode::Survival | GameMode::Adventure => !flying,
+        },
+        "flight state is inconsistent with the game mode"
+    );
+    let mut abilities = match unique_field(&original.value, "abilities")? {
+        None => Tag::Compound(Vec::new()),
+        Some(value @ Tag::Compound(_)) => value.clone(),
+        Some(_) => bail!("saved abilities cannot be preserved safely"),
+    };
+    for name in ["invulnerable", "flying", "mayfly", "instabuild", "mayBuild"] {
+        if let Some(value) = unique_field(&abilities, name)? {
+            ensure!(matches!(value, Tag::Byte(0 | 1)), "invalid ability {name}");
+        }
+    }
+    for (name, default) in [("flySpeed", 0.05_f32), ("walkSpeed", 0.1_f32)] {
+        match unique_field(&abilities, name)? {
+            Some(Tag::Float(value)) if value.is_finite() => {}
+            None => set_field(&mut abilities, name, Some(Tag::Float(default)))?,
+            _ => bail!("invalid ability {name}"),
+        }
+    }
+    for (name, value) in [
+        (
+            "invulnerable",
+            matches!(current, GameMode::Creative | GameMode::Spectator),
+        ),
+        ("flying", flying),
+        (
+            "mayfly",
+            matches!(current, GameMode::Creative | GameMode::Spectator),
+        ),
+        ("instabuild", current == GameMode::Creative),
+        (
+            "mayBuild",
+            matches!(current, GameMode::Survival | GameMode::Creative),
+        ),
+    ] {
+        set_field(&mut abilities, name, Some(Tag::Byte(i8::from(value))))?;
+    }
+    let mut document = original.clone();
+    set_field(
+        &mut document.value,
+        "playerGameType",
+        Some(Tag::Int(current.legacy_id())),
+    )?;
+    set_field(
+        &mut document.value,
+        "previousPlayerGameType",
+        Some(Tag::Int(previous.legacy_id())),
+    )?;
+    set_field(&mut document.value, "abilities", Some(abilities))?;
+    native_persistence::nbt::write(&document).context("game mode draft cannot be encoded")?;
+    Ok(document)
+}
+
 fn unique_field<'a>(parent: &'a Tag, field: &str) -> Result<Option<&'a Tag>> {
     let Tag::Compound(entries) = parent else {
         bail!("{field} parent is not a compound");
@@ -3341,6 +3419,109 @@ mod tests {
             value: Tag::Compound(vec![("active_effects".into(), Tag::Int(0))]),
         };
         assert!(advance_saved_effects(&malformed, 1).is_err());
+    }
+
+    #[test]
+    fn mode_draft_preserves_unrelated_fields_and_rejects_ambiguous_sources() {
+        let original = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("playerGameType".into(), Tag::Int(0)),
+                ("previousPlayerGameType".into(), Tag::Int(2)),
+                ("unknown".into(), Tag::Int(12)),
+                (
+                    "abilities".into(),
+                    Tag::Compound(vec![
+                        ("flySpeed".into(), Tag::Float(0.12)),
+                        ("walkSpeed".into(), Tag::Float(0.2)),
+                        ("custom".into(), Tag::String("keep".into())),
+                    ]),
+                ),
+            ]),
+        };
+        let before = native_persistence::nbt::write(&original).unwrap();
+        let draft = draft_game_mode_transition(
+            &original,
+            GameMode::Survival,
+            GameMode::Adventure,
+            GameMode::Creative,
+            true,
+        )
+        .unwrap();
+        assert_eq!(draft.value.get("playerGameType"), Some(&Tag::Int(1)));
+        assert_eq!(
+            draft.value.get("previousPlayerGameType"),
+            Some(&Tag::Int(2))
+        );
+        assert_eq!(draft.value.get("unknown"), Some(&Tag::Int(12)));
+        let abilities = draft.value.get("abilities").unwrap();
+        assert_eq!(abilities.get("custom"), Some(&Tag::String("keep".into())));
+        assert_eq!(abilities.get("flySpeed"), Some(&Tag::Float(0.12)));
+        for name in ["flying", "mayfly", "invulnerable", "instabuild", "mayBuild"] {
+            assert_eq!(abilities.get(name), Some(&Tag::Byte(1)), "{name}");
+        }
+        assert_eq!(native_persistence::nbt::write(&original).unwrap(), before);
+        assert!(
+            draft_game_mode_transition(
+                &original,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Survival,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            draft_game_mode_transition(
+                &original,
+                GameMode::Survival,
+                GameMode::Adventure,
+                GameMode::Survival,
+                true
+            )
+            .is_err()
+        );
+        let mut malformed = original.clone();
+        set_field(
+            &mut malformed.value,
+            "previousPlayerGameType",
+            Some(Tag::String("future".into())),
+        )
+        .unwrap();
+        assert!(
+            draft_game_mode_transition(
+                &malformed,
+                GameMode::Survival,
+                GameMode::Adventure,
+                GameMode::Creative,
+                false
+            )
+            .is_err()
+        );
+        let mut malformed = original.clone();
+        let Tag::Compound(root) = &mut malformed.value else {
+            unreachable!()
+        };
+        let Tag::Compound(abilities) = &mut root
+            .iter_mut()
+            .find(|(key, _)| key.matches("abilities"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        abilities.push(("mayfly".into(), Tag::Byte(1)));
+        abilities.push(("mayfly".into(), Tag::Byte(0)));
+        assert!(
+            draft_game_mode_transition(
+                &malformed,
+                GameMode::Survival,
+                GameMode::Adventure,
+                GameMode::Creative,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]

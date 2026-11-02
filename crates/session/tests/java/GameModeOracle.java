@@ -3,6 +3,8 @@ import com.mojang.brigadier.StringReader;
 import java.nio.file.*;
 import net.minecraft.commands.arguments.GameModeArgument;
 import net.minecraft.world.entity.player.Abilities;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.server.level.ServerLevel;
@@ -63,7 +65,18 @@ public class GameModeOracle {
             player.setBoundingBox(new AABB(0.5-(double)(0.6f/2),y,0.5-(double)(0.6f/2),0.5+(double)(0.6f/2),y+(double)1.8f,0.5+(double)(0.6f/2)));
             var row=new JsonObject(); row.addProperty("y",y); row.addProperty("blocked",blocked); row.addProperty("near",(boolean)probe.invoke(gameMode)); ground.add(row);
         }
-        var result = new JsonObject(); result.add("arguments", rows); result.add("abilities", abilities); result.add("ground",ground);
+        var drafts=new JsonArray();
+        for(int i=0;i<5;i++) {
+            var tag=NbtIo.read(Path.of(args[0]+".draft"+i));
+            var packed=Abilities.Packed.CODEC.parse(NbtOps.INSTANCE,tag.get("abilities")).getOrThrow();
+            var current=GameType.LEGACY_ID_CODEC.parse(NbtOps.INSTANCE,tag.get("playerGameType")).getOrThrow();
+            var previous=GameType.LEGACY_ID_CODEC.parse(NbtOps.INSTANCE,tag.get("previousPlayerGameType")).getOrThrow();
+            var row=new JsonObject(); row.addProperty("mode",current.getName());row.addProperty("previous",previous.getName());
+            row.addProperty("flying",packed.flying());row.addProperty("mayfly",packed.mayFly());row.addProperty("invulnerable",packed.invulnerable());
+            row.addProperty("instabuild",packed.instabuild());row.addProperty("mayBuild",packed.mayBuild());
+            row.addProperty("flySpeed",packed.flyingSpeed());row.addProperty("walkSpeed",packed.walkingSpeed());drafts.add(row);
+        }
+        var result = new JsonObject(); result.add("arguments", rows); result.add("abilities", abilities); result.add("ground",ground);result.add("drafts",drafts);
         Files.writeString(Path.of(args[0]), result.toString());
     }
 }

@@ -290,6 +290,14 @@ pub enum GameMode {
 }
 
 impl GameMode {
+    pub(crate) fn legacy_id(self) -> i32 {
+        match self {
+            Self::Survival => 0,
+            Self::Creative => 1,
+            Self::Adventure => 2,
+            Self::Spectator => 3,
+        }
+    }
     pub(crate) fn flight_after_change(self, flying: bool) -> bool {
         match self {
             Self::Spectator => true,

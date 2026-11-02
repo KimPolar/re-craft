@@ -73,6 +73,48 @@ mod tests {
         let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
         let source = temp.path().join("GameModeOracle.java");
         let output = temp.path().join("output.json");
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![
+                (
+                    "playerGameType".into(),
+                    native_persistence::nbt::Tag::Int(0),
+                ),
+                (
+                    "abilities".into(),
+                    native_persistence::nbt::Tag::Compound(vec![
+                        (
+                            "flySpeed".into(),
+                            native_persistence::nbt::Tag::Float(0.075),
+                        ),
+                        (
+                            "walkSpeed".into(),
+                            native_persistence::nbt::Tag::Float(0.15),
+                        ),
+                        ("unknown".into(), native_persistence::nbt::Tag::Int(42)),
+                    ]),
+                ),
+            ]),
+        };
+        let drafts = [
+            (GameMode::Survival, false),
+            (GameMode::Creative, false),
+            (GameMode::Creative, true),
+            (GameMode::Adventure, false),
+            (GameMode::Spectator, true),
+        ];
+        for (index, (current, flying)) in drafts.into_iter().enumerate() {
+            let draft = crate::player_data::draft_game_mode_transition(
+                &original,
+                GameMode::Survival,
+                GameMode::Adventure,
+                current,
+                flying,
+            )
+            .unwrap();
+            let path = temp.path().join(format!("output.json.draft{index}"));
+            std::fs::write(path, native_persistence::nbt::write(&draft).unwrap()).unwrap();
+        }
         std::fs::write(&source, include_str!("../tests/java/GameModeOracle.java")).unwrap();
         for command in [
             Command::new(java.join("javac.exe"))
@@ -95,6 +137,26 @@ mod tests {
         }
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for ((current, flying), row) in drafts.into_iter().zip(data["drafts"].as_array().unwrap()) {
+            assert_eq!(mode(row["mode"].as_str().unwrap()), Some(current));
+            assert_eq!(row["previous"], "adventure");
+            assert_eq!(row["flying"], flying);
+            assert_eq!(
+                row["mayfly"],
+                matches!(current, GameMode::Creative | GameMode::Spectator)
+            );
+            assert_eq!(
+                row["invulnerable"],
+                matches!(current, GameMode::Creative | GameMode::Spectator)
+            );
+            assert_eq!(row["instabuild"], current == GameMode::Creative);
+            assert_eq!(
+                row["mayBuild"],
+                matches!(current, GameMode::Survival | GameMode::Creative)
+            );
+            assert_eq!(row["flySpeed"].as_f64().unwrap() as f32, 0.075_f32);
+            assert_eq!(row["walkSpeed"].as_f64().unwrap() as f32, 0.15_f32);
+        }
         for row in data["arguments"].as_array().unwrap() {
             let value = row["input"].as_str().unwrap();
             assert_eq!(

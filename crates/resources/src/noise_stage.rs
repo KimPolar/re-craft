@@ -198,6 +198,53 @@ impl NoiseStageChunk {
     pub fn fluid_updates(&self) -> &[bool] {
         &self.fluid_updates
     }
+
+    /// Reconstruct the ordered marks made by Java's noise fill. The caller
+    /// resolves each selected material's actual fluid state from the registry.
+    /// Surface and carver marks happen later and are not included here.
+    pub fn ordered_fluid_postprocessing(
+        &self,
+        mut has_fluid: impl FnMut(NoiseMaterial) -> Result<bool>,
+    ) -> Result<native_core::postprocessing::PostProcessing> {
+        let mut result = native_core::postprocessing::PostProcessing::new(self.min_y, self.height)
+            .context("noise chunk has unsupported postprocessing bounds")?;
+        let height = usize::try_from(self.height)?;
+        ensure!(
+            self.materials.len() == height * 256 && self.fluid_updates.len() == height * 256,
+            "invalid noise chunk buffers"
+        );
+        let mut fluid_cache = [None; 4];
+        // NoiseBasedChunkGenerator.doFill walks Z, X, then Y descending.
+        for z in 0..16usize {
+            for x in 0..16usize {
+                for offset in (0..height).rev() {
+                    let index = (z * 16 + x) * height + offset;
+                    if !self.fluid_updates[index] {
+                        continue;
+                    }
+                    let material = self.materials[index];
+                    let slot = match material {
+                        NoiseMaterial::DefaultBlock => 0,
+                        NoiseMaterial::DefaultFluid => 1,
+                        NoiseMaterial::Lava => 2,
+                        NoiseMaterial::Air => 3,
+                    };
+                    let fluid = match fluid_cache[slot] {
+                        Some(value) => value,
+                        None => {
+                            let value = has_fluid(material)?;
+                            fluid_cache[slot] = Some(value);
+                            value
+                        }
+                    };
+                    if fluid {
+                        result.mark(x as i32, self.min_y + offset as i32, z as i32);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
     pub fn get(&self, x: u8, y: i32, z: u8) -> Option<NoiseMaterial> {
         if x >= 16 || z >= 16 || y < self.min_y || y >= self.min_y + self.height {
             return None;
@@ -766,6 +813,55 @@ mod tests {
         json!({"noise":{"min_y":0,"height":16},"legacy_random_source":true,
             "default_block":{"id":"minecraft:stone","properties":{"example":"value"}},"default_fluid":"minecraft:water","sea_level":8,
             "noise_router":{"final_density":-1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":0}})
+    }
+
+    #[test]
+    fn noise_postprocessing_uses_java_fill_order_and_resolved_fluid_state() {
+        let height = 32usize;
+        let mut chunk = NoiseStageChunk {
+            chunk_x: -1,
+            chunk_z: 2,
+            min_y: -16,
+            height: 32,
+            generation_min_y: -16,
+            generation_height: 32,
+            default_block: json!("minecraft:stone"),
+            default_fluid: json!("minecraft:water"),
+            materials: vec![NoiseMaterial::Air; 256 * height],
+            fluid_updates: vec![false; 256 * height],
+        };
+        for (x, y, z, material) in [
+            (0, -16, 0, NoiseMaterial::DefaultFluid),
+            (0, -1, 0, NoiseMaterial::DefaultFluid),
+            (1, -3, 0, NoiseMaterial::Lava),
+            (0, -2, 1, NoiseMaterial::DefaultFluid),
+            (1, -4, 1, NoiseMaterial::DefaultBlock),
+            (0, 0, 0, NoiseMaterial::DefaultFluid),
+        ] {
+            let index = (z * 16 + x) * height + (y + 16) as usize;
+            chunk.materials[index] = material;
+            chunk.fluid_updates[index] = true;
+        }
+        let mut calls = Vec::new();
+        let updates = chunk
+            .ordered_fluid_postprocessing(|material| {
+                calls.push(material);
+                Ok(matches!(
+                    material,
+                    NoiseMaterial::DefaultFluid | NoiseMaterial::Lava
+                ))
+            })
+            .unwrap();
+        assert_eq!(updates.sections()[0], [0x0f0, 0x000, 0x0d1, 0x1e0]);
+        assert_eq!(updates.sections()[1], [0x000]);
+        assert_eq!(
+            calls,
+            [
+                NoiseMaterial::DefaultFluid,
+                NoiseMaterial::Lava,
+                NoiseMaterial::DefaultBlock
+            ]
+        );
     }
 
     #[test]

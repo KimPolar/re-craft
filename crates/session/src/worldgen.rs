@@ -48,6 +48,7 @@ pub struct MaterializedTerrain {
     min_y: i32,
     height: i32,
     postprocessing: Arc<[bool]>,
+    noise_postprocessing: Option<Arc<native_core::postprocessing::PostProcessing>>,
 }
 
 /// A collection of intermediate generated chunks sharing one world registry.
@@ -58,6 +59,8 @@ pub struct CarvedTerrainWorld {
     min_y: i32,
     height: i32,
     postprocessing: BTreeMap<native_world::loaded::ChunkPos, Arc<[bool]>>,
+    noise_postprocessing:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
 }
 
 impl CarvedTerrainWorld {
@@ -70,6 +73,7 @@ impl CarvedTerrainWorld {
             min_y,
             height,
             postprocessing,
+            noise_postprocessing,
         } = first;
         Self {
             world: Arc::new(world),
@@ -77,6 +81,10 @@ impl CarvedTerrainWorld {
             min_y,
             height,
             postprocessing: BTreeMap::from([(position, postprocessing)]),
+            noise_postprocessing: noise_postprocessing
+                .into_iter()
+                .map(|value| (position, value))
+                .collect(),
         }
     }
 
@@ -103,6 +111,10 @@ impl CarvedTerrainWorld {
         ensure!(inserted, "terrain chunk already exists in world");
         self.postprocessing
             .insert(terrain.position, Arc::clone(&terrain.postprocessing));
+        if let Some(noise) = &terrain.noise_postprocessing {
+            self.noise_postprocessing
+                .insert(terrain.position, Arc::clone(noise));
+        }
         Ok(())
     }
 
@@ -114,6 +126,14 @@ impl CarvedTerrainWorld {
     /// Z, X, Y order, with Y measured from this collection's minimum height.
     pub fn fluid_postprocessing(&self, pos: native_world::loaded::ChunkPos) -> Option<&[bool]> {
         self.postprocessing.get(&pos).map(AsRef::as_ref)
+    }
+
+    /// Only the ordered noise-fill marks; later generation marks are separate.
+    pub fn noise_postprocessing(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<&native_core::postprocessing::PostProcessing> {
+        self.noise_postprocessing.get(&pos).map(AsRef::as_ref)
     }
 }
 
@@ -134,6 +154,11 @@ impl MaterializedTerrain {
     /// Z, X, Y order, matching the generated terrain's original flags.
     pub fn fluid_postprocessing(&self) -> &[bool] {
         &self.postprocessing
+    }
+
+    /// Only the ordered noise-fill marks, not the later surface/carver marks.
+    pub fn noise_postprocessing(&self) -> Option<&native_core::postprocessing::PostProcessing> {
+        self.noise_postprocessing.as_deref()
     }
 
     /// Query a local X/Z and absolute Y without exposing the storage layout.
@@ -159,8 +184,14 @@ impl MaterializedTerrain {
     }
 
     /// Transfer the chunk and its unconsumed postprocessing flags together.
-    pub fn into_parts(self) -> (native_world::loaded::World, Arc<[bool]>) {
-        (self.world, self.postprocessing)
+    pub fn into_parts(
+        self,
+    ) -> (
+        native_world::loaded::World,
+        Arc<[bool]>,
+        Option<Arc<native_core::postprocessing::PostProcessing>>,
+    ) {
+        (self.world, self.postprocessing, self.noise_postprocessing)
     }
 }
 
@@ -292,6 +323,7 @@ pub fn materialize_carved_terrain(
         min_y: terrain.min_y,
         height: terrain.height,
         postprocessing: Arc::from(terrain.fluid_updates.into_boxed_slice()),
+        noise_postprocessing: terrain.noise_postprocessing.map(Arc::new),
     })
 }
 impl QuartBiomeChunk {
@@ -886,6 +918,17 @@ impl TerrainGenerator {
             .context("incomplete biome volume")?;
         QuartBiomeChunk::from_values(chunk, self.seed, min_y, height, values)
     }
+    /// Generate the intermediate noise volume before surface rules or carvers.
+    pub fn generate_noise(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        chunk: [i32; 2],
+    ) -> Result<native_resources::noise_stage::NoiseStageChunk> {
+        self.noise
+            .generate(evaluator, chunk[0], chunk[1])?
+            .expand_to_dimension(self.min_y(), self.height())
+    }
+
     /// The result is an intermediate SURFACE-stage chunk; it must not be saved
     /// or treated as a complete generated chunk.
     pub fn generate_surface(
@@ -897,10 +940,7 @@ impl TerrainGenerator {
         classify: impl FnMut(&Value) -> Result<SurfaceBlockKind>,
     ) -> Result<SurfaceStageChunk> {
         neighborhood.validate(chunk, self.seed, self.min_y(), self.height())?;
-        let blocks = self
-            .noise
-            .generate(evaluator, chunk[0], chunk[1])?
-            .expand_to_dimension(self.min_y(), self.height())?;
+        let blocks = self.generate_noise(evaluator, chunk)?;
         let preliminary = self
             .noise
             .preliminary_surface(evaluator, chunk[0], chunk[1])?;
@@ -1120,6 +1160,13 @@ mod tests {
                 height: 16,
                 states,
                 fluid_updates: updates,
+                noise_postprocessing: {
+                    let mut marks =
+                        native_core::postprocessing::PostProcessing::new(min_y, 16).unwrap();
+                    marks.mark(position[0] * 16, min_y, position[1] * 16);
+                    marks.mark(position[0] * 16, min_y, position[1] * 16);
+                    Some(marks)
+                },
             };
             let biomes = QuartBiomeChunk::from_values(
                 position,
@@ -1166,6 +1213,20 @@ mod tests {
         assert_eq!(after.block(0, -16, 0).unwrap().name, "minecraft:water");
         assert_eq!(after.biome(-1, -16, 0), Some("minecraft:plains"));
         assert_eq!(after.biome(0, -16, 0), Some("minecraft:desert"));
+        assert_eq!(
+            assembled
+                .noise_postprocessing(first_pos)
+                .unwrap()
+                .sections()[0],
+            [0, 0]
+        );
+        assert_eq!(
+            assembled
+                .noise_postprocessing(second_pos)
+                .unwrap()
+                .sections()[0],
+            [0, 0]
+        );
         assert_eq!(
             assembled.fluid_postprocessing(second_pos),
             Some(second_flags.as_slice())
@@ -1229,6 +1290,7 @@ mod tests {
             height: height as i32,
             states,
             fluid_updates: updates.clone(),
+            noise_postprocessing: None,
         };
         let mut resolved = 0;
         let generated =
@@ -1299,8 +1361,9 @@ mod tests {
                 }
             }
         }
-        let (world, flags) = generated.into_parts();
+        let (world, flags, noise) = generated.into_parts();
         assert_eq!(flags.as_ref(), updates);
+        assert!(noise.is_none());
         assert_eq!(world.chunks.len(), 1);
     }
 
@@ -1320,6 +1383,7 @@ mod tests {
             height: 16,
             states: vec![Arc::new(json!("minecraft:stone")); 4096],
             fluid_updates: vec![false; 4096],
+            noise_postprocessing: None,
         };
         assert!(
             materialize_carved_terrain(
@@ -1641,6 +1705,7 @@ mod tests {
                 height: 16,
                 states: vec![Arc::new(json!("minecraft:stone")); 4096],
                 fluid_updates: vec![false; 4096],
+                noise_postprocessing: None,
             };
             chunk.states[index + 5] = Arc::new(json!("minecraft:dirt"));
             chunk.states[index + 6] = Arc::new(json!("minecraft:grass_block"));

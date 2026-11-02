@@ -110,6 +110,7 @@ fn carving_application_matches_java() {
         height: 16,
         states: vec![Arc::new(json!("minecraft:stone")); 4096],
         fluid_updates: vec![false; 4096],
+        noise_postprocessing: None,
     };
     for (y, name) in [
         (2, "minecraft:dirt"),

@@ -27,6 +27,9 @@ pub struct SurfaceStageChunk {
     /// Block state encodings in Z, X, Y order.
     pub states: Vec<Arc<Value>>,
     pub fluid_updates: Vec<bool>,
+    /// Ordered marks made during noise fill only. Surface and carver marks are
+    /// not included; None means the source did not retain this history.
+    pub noise_postprocessing: Option<native_core::postprocessing::PostProcessing>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +242,18 @@ pub fn apply_surface<P: ResourceProvider>(
         states.push(Arc::clone(state));
         kinds.push(kind);
     }
+    let noise_postprocessing = chunk.ordered_fluid_postprocessing(|material| {
+        let state = match material {
+            NoiseMaterial::DefaultBlock => &default_block,
+            NoiseMaterial::DefaultFluid => &default_fluid,
+            NoiseMaterial::Lava => &lava,
+            NoiseMaterial::Air => &air,
+        };
+        let kind = cache
+            .get(state.as_ref())
+            .context("unclassified noise material")?;
+        Ok(*kind == SurfaceBlockKind::Fluid)
+    })?;
     let h = height as usize;
     ensure!(states.len() == 256 * h, "invalid noise chunk buffer");
     let mut heights = [min_y - 1; 256];
@@ -387,6 +402,7 @@ pub fn apply_surface<P: ResourceProvider>(
         height,
         states,
         fluid_updates,
+        noise_postprocessing: Some(noise_postprocessing),
     })
 }
 

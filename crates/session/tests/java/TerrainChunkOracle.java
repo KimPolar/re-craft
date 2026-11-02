@@ -52,6 +52,11 @@ public class TerrainChunkOracle {
       int y=p.getY()-min;if(y>=0 && y<height)scheduled.set(((p.getZ()&15)*16+(p.getX()&15))*height+y);
     }
     var words=scheduled.toLongArray();var line=new StringBuilder("F");for(long word:words)line.append(' ').append(Long.toUnsignedString(word,16));output.println(line);
+    for(int section=0;section<lists.length;section++)if(lists[section]!=null) {
+      var ordered=new StringBuilder("O ").append(section);
+      for(short packed:lists[section])ordered.append(' ').append(Short.toUnsignedInt(packed));
+      output.println(ordered);
+    }
   }
   public static void main(String[] args)throws Exception {
     var out=System.out;output=out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
@@ -71,11 +76,24 @@ public class TerrainChunkOracle {
     var palette=new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState(),null,Strategy.createForBiomes(ids),plains,null);
     var dim=stem.type().value();var height=LevelHeightAccessor.create(dim.minY(),dim.height());
     var chunk=new ProtoChunk(new ChunkPos(cx,cz),UpgradeData.EMPTY,height,palette,null);
+    var probe=new ProtoChunk(new ChunkPos(cx,cz),UpgradeData.EMPTY,height,palette,null);
+    int bx=cx*16,bz=cz*16,lo=dim.minY(),hi=lo+dim.height();
+    for(var p:List.of(new BlockPos(bx-1,lo,bz-1),new BlockPos(bx,lo+15,bz),
+        new BlockPos(bx-1,lo,bz-1),new BlockPos(bx+2,lo+16,bz+3),
+        new BlockPos(bx,lo-1,bz),new BlockPos(bx,hi,bz)))probe.markPosForPostProcessing(p);
+    output.println("QBEGIN");
+    var probeLists=probe.getPostProcessing();
+    for(int section=0;section<probeLists.length;section++)if(probeLists[section]!=null) {
+      var line=new StringBuilder("Q ").append(section);
+      for(short packed:probeLists[section])line.append(' ').append(packed);
+      output.println(line);
+    }
     var ns=settings.noiseSettings().clampToHeightAccessor(height);
     var picker=(Aquifer.FluidPicker)(x,y,z)->y<Math.min(-54,settings.seaLevel())?new Aquifer.FluidStatus(-54,Blocks.LAVA.defaultBlockState()):new Aquifer.FluidStatus(settings.seaLevel(),settings.defaultFluid());
     var volume=new DensityVolume(16,ns.height(),16,cx*16,ns.minY(),cz*16);
     try(var noise=new NoiseChunk(random,null,settings,picker,Blender.empty(),volume)) {
       method("doFill").invoke(generator,noise,chunk);
+      dump("noise",chunk,dim.minY(),dim.height());
       method("buildSurface").invoke(generator,chunk,noise,random,biomeManager,generator.getBiomeSource().possibleBiomes(),settings.materialRule().value());
       dump("surface",chunk,dim.minY(),dim.height());
       method("generateCarvers").invoke(generator,chunk,Blender.empty(),noise,random,biomeManager,null,settings.materialRule().value());

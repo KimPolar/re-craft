@@ -5,6 +5,7 @@ pub mod button;
 pub mod normal_noise;
 pub mod ore;
 pub mod perlin;
+pub mod postprocessing;
 pub mod random;
 pub mod replace_disk;
 pub mod simplex;

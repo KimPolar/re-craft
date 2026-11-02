@@ -105,6 +105,7 @@ fn aquifer_and_surface_repair_match_java() {
         height: 16,
         states: vec![Arc::new(json!("minecraft:air")); 4096],
         fluid_updates: vec![false; 4096],
+        noise_postprocessing: None,
     };
     let idx = |x: usize, y: usize, z: usize| (z * 16 + x) * 16 + y;
     for z in 0..16 {

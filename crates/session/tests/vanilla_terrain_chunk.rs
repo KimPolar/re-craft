@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use native_resources::{
     carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
+    noise_stage::NoiseMaterial,
     packs::{ResourceProvider, ResourceStack},
     surface_pass::{SurfaceBlockKind, SurfaceStageChunk},
 };
@@ -224,9 +225,19 @@ fn terrain_matches_java_before_and_after_carvers() {
     let mut defaults = BTreeMap::<String, BTreeMap<String, String>>::new();
     let mut palette = Vec::new();
     let mut updates = Vec::<Vec<u64>>::new();
+    let mut ordered_updates = Vec::<BTreeMap<usize, Vec<u16>>>::new();
+    let mut probes = Vec::<BTreeMap<usize, Vec<i16>>>::new();
     for line in output.lines() {
-        if line.starts_with("S ") {
+        if line == "QBEGIN" {
+            probes.push(BTreeMap::new());
+        } else if let Some(line) = line.strip_prefix("Q ") {
+            let mut words = line.split_whitespace();
+            let section = words.next().unwrap().parse().unwrap();
+            let values = words.map(|value| value.parse().unwrap()).collect();
+            assert!(probes.last_mut().unwrap().insert(section, values).is_none());
+        } else if line.starts_with("S ") {
             groups.push(Vec::new());
+            ordered_updates.push(BTreeMap::new());
         } else if let Some(line) = line.strip_prefix("P ") {
             let mut p = line.splitn(3, ' ');
             let _x = p.next().unwrap();
@@ -250,6 +261,17 @@ fn terrain_matches_java_before_and_after_carvers() {
                     .map(|word| u64::from_str_radix(word, 16).unwrap())
                     .collect(),
             );
+        } else if let Some(line) = line.strip_prefix("O ") {
+            let mut words = line.split_whitespace();
+            let section = words.next().unwrap().parse().unwrap();
+            let values = words.map(|value| value.parse().unwrap()).collect();
+            assert!(
+                ordered_updates
+                    .last_mut()
+                    .unwrap()
+                    .insert(section, values)
+                    .is_none()
+            );
         } else if let Some(key) = line.strip_prefix("R ") {
             let (id, properties) = key.split_once('|').unwrap();
             registry.insert(id.to_owned());
@@ -266,8 +288,19 @@ fn terrain_matches_java_before_and_after_carvers() {
             );
         }
     }
-    assert_eq!(groups.len(), cases.len() * 2);
+    assert_eq!(groups.len(), cases.len() * 3);
+    assert_eq!(probes.len(), cases.len());
     assert_eq!(updates.len(), groups.len());
+    let mut total = 0;
+    let mut duplicates = 0;
+    for stage in &ordered_updates {
+        for values in stage.values() {
+            let unique: BTreeSet<_> = values.iter().collect();
+            total += values.len();
+            duplicates += values.len() - unique.len();
+        }
+    }
+    eprintln!("Java postprocessing entries: {total}, duplicate entries: {duplicates}");
     assert!(registry.len() > 1000);
     let mut resources = ResourceStack::open(&game).unwrap();
     let generated_registry = resources.vanilla_generated_block_registry().unwrap();
@@ -311,6 +344,25 @@ fn terrain_matches_java_before_and_after_carvers() {
     let tags = CarverBlockTags::load(&mut resources, &registry).unwrap();
     let mut assembled = None;
     for (i, (dimension, seed, pos, min_y, height)) in cases.into_iter().enumerate() {
+        let mut probe = native_core::postprocessing::PostProcessing::new(min_y, height).unwrap();
+        let bx = pos[0] * 16;
+        let bz = pos[1] * 16;
+        for (x, y, z) in [
+            (bx - 1, min_y, bz - 1),
+            (bx, min_y + 15, bz),
+            (bx - 1, min_y, bz - 1),
+            (bx + 2, min_y + 16, bz + 3),
+            (bx, min_y - 1, bz),
+            (bx, min_y + height, bz),
+        ] {
+            probe.mark(x, y, z);
+        }
+        for (section, values) in probe.sections().iter().enumerate() {
+            assert_eq!(
+                values.as_slice(),
+                probes[i].get(&section).map(Vec::as_slice).unwrap_or(&[])
+            );
+        }
         let mut generator = TerrainGenerator::without_terrain_adjustments(
             &mut resources,
             &preset["dimensions"][dimension]["generator"],
@@ -320,6 +372,28 @@ fn terrain_matches_java_before_and_after_carvers() {
         )
         .unwrap();
         let mut evaluator = DensityEvaluator::default();
+        let noise = generator.generate_noise(&mut evaluator, pos).unwrap();
+        let marks = noise
+            .ordered_fluid_postprocessing(|material| {
+                let value = match material {
+                    NoiseMaterial::DefaultBlock => noise.default_block().clone(),
+                    NoiseMaterial::DefaultFluid => noise.default_fluid().clone(),
+                    NoiseMaterial::Lava => serde_json::json!("minecraft:lava"),
+                    NoiseMaterial::Air => serde_json::json!("minecraft:air"),
+                };
+                Ok(classify(&value)?.has_fluid)
+            })
+            .unwrap();
+        for (section, values) in marks.sections().iter().enumerate() {
+            let expected: Vec<i16> = ordered_updates[i * 3]
+                .get(&section)
+                .map(|values| values.iter().map(|&value| value as i16).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                *values, expected,
+                "noise postprocessing {dimension} {pos:?} section {section}"
+            );
+        }
         let mut neighborhood = generator.biome_neighborhood().unwrap();
         for x in pos[0] - 1..=pos[0] + 1 {
             for z in pos[1] - 1..=pos[1] + 1 {
@@ -351,10 +425,10 @@ fn terrain_matches_java_before_and_after_carvers() {
         compare(
             &format!("surface {dimension} {seed} {pos:?}"),
             &chunk,
-            &groups[i * 2],
+            &groups[i * 3 + 1],
             &palette,
             &defaults,
-            &updates[i * 2],
+            &updates[i * 3 + 1],
         );
         let mask = generator
             .generate_carving_mask(
@@ -377,20 +451,21 @@ fn terrain_matches_java_before_and_after_carvers() {
         compare(
             &format!("carvers {dimension} {seed} {pos:?}"),
             &chunk,
-            &groups[i * 2 + 1],
+            &groups[i * 3 + 2],
             &palette,
             &defaults,
-            &updates[i * 2 + 1],
+            &updates[i * 3 + 2],
         );
         let biome_chunk = neighborhood.chunk(pos).unwrap();
         let generated = materialize_carved_terrain(chunk, biome_chunk, dimension, |state| {
             resolve_generated_terrain_state(state, &generated_registry)
         })
         .unwrap();
+        assert_eq!(generated.noise_postprocessing(), Some(&marks));
         let world = generated.world();
         let mut names = BTreeMap::new();
-        let expected = &groups[i * 2 + 1];
-        let words = &updates[i * 2 + 1];
+        let expected = &groups[i * 3 + 2];
+        let words = &updates[i * 3 + 2];
         for z in 0..16usize {
             for x in 0..16usize {
                 for y in 0..height as usize {
@@ -448,6 +523,7 @@ fn terrain_matches_java_before_and_after_carvers() {
             let combined = assembled.snapshot();
             let first = native_world::loaded::ChunkPos { x: 0, z: 0 };
             let second = native_world::loaded::ChunkPos { x: 1, z: 0 };
+            assert_eq!(assembled.noise_postprocessing(second), Some(&marks));
             assert_eq!(combined.chunks.len(), 2);
             assert!(Arc::ptr_eq(
                 &previous.chunks[&first],

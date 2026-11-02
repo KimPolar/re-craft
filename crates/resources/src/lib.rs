@@ -27,6 +27,7 @@ pub mod entity_collision;
 pub mod feature_order;
 pub mod fluid_environment;
 pub mod fluid_tags;
+pub mod freeze_feature;
 pub mod game_event_tags;
 pub mod geometry;
 pub mod heightmap_tags;

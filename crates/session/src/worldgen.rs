@@ -516,6 +516,7 @@ pub struct DecorationPlan<'a> {
     biomes: &'a BiomeNeighborhood,
     generator_min_y: i32,
     generator_height: i32,
+    sea_level: i32,
 }
 impl DecorationPlan<'_> {
     pub fn origin(&self) -> [i32; 3] {
@@ -857,6 +858,7 @@ impl TerrainGenerator {
             biomes: neighborhood,
             generator_min_y: self.noise.router().min_y,
             generator_height: self.noise.router().height,
+            sea_level: self.noise.sea_level(),
         })
     }
     /// Check a set's candidate chunk after the biome-source filter, including

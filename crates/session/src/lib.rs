@@ -43,6 +43,7 @@ mod location_enchantments;
 pub mod lodestone;
 pub mod mining;
 mod movement;
+mod movement_events;
 pub mod orbs;
 pub mod physics;
 pub mod player_data;

@@ -554,6 +554,56 @@ mod tests {
         }
         let data: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let rows = data["movement"].as_array().unwrap();
+        assert_eq!(rows.len(), 1024);
+        let mut movement = crate::movement_events::MovementEvents::default();
+        for (index, row) in rows.iter().enumerate() {
+            if index % 8 == 0 {
+                movement = crate::movement_events::MovementEvents::default();
+            }
+            let contact = |name: &str| {
+                let kind = row[name].as_u64().unwrap();
+                Some(crate::movement_events::Contact {
+                    air: kind == 0,
+                    climbable: kind >= 2,
+                })
+            };
+            let flag = |name: &str| row[name].as_bool().unwrap();
+            let event = movement.advance(crate::movement_events::Input {
+                movement: DVec3::new(
+                    row["x"].as_f64().unwrap(),
+                    row["y"].as_f64().unwrap(),
+                    row["z"].as_f64().unwrap(),
+                ),
+                enabled: flag("enabled"),
+                modern: contact("modern"),
+                legacy: contact("legacy"),
+                same_block: flag("same"),
+                on_ground: flag("ground"),
+                crouching: flag("crouching"),
+                on_rails: flag("rails"),
+                swimming: flag("swimming"),
+                in_water: flag("water"),
+            });
+            let expected_event = match row["event"].as_str().unwrap() {
+                "step" => Some(crate::movement_events::Event::Step),
+                "swim" => Some(crate::movement_events::Event::Swim),
+                "none" => None,
+                other => panic!("unexpected Java event: {other}"),
+            };
+            assert_eq!(event, expected_event, "movement row {index}: {row}");
+            for (actual, name) in [
+                (movement.distance, "distance"),
+                (movement.flying_distance, "flying_distance"),
+                (movement.next_step, "next"),
+            ] {
+                assert_eq!(
+                    actual.to_bits(),
+                    row[name].as_i64().unwrap() as u32,
+                    "movement row {index}, {name}: {row}"
+                );
+            }
+        }
         let frequencies = data["frequencies"].as_object().unwrap();
         assert_eq!(frequencies.len(), 61);
         let registry = frequencies.keys().cloned().collect();

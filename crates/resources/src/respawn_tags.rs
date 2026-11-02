@@ -45,6 +45,25 @@ pub fn load_fire_tag(
     .context("cannot resolve falling-block fire tag")
 }
 
+/// Resolve the active climbable tag for movement event distance accounting.
+pub fn load_climbable_tag(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:climbable")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve movement climbable tag")
+}
+
 /// Resolve the active block tag that disables restitution on contact.
 pub fn load_bounce_suppression_tag(
     provider: &mut impl ResourceProvider,
@@ -304,6 +323,28 @@ mod tests {
         assert!(tags.for_block("campfire", &lit).unwrap().dangerous);
         lit.insert("lit".into(), "false".into());
         assert!(!tags.for_block("campfire", &lit).unwrap().dangerous);
+    }
+
+    #[test]
+    fn movement_climbable_tag_respects_nested_pack_replacements() {
+        let mut provider = Provider(BTreeMap::from([
+            (
+                "data/minecraft/tags/block/climbable.json".into(),
+                vec![
+                    br#"{"values":["minecraft:ladder"]}"#.to_vec(),
+                    br##"{"replace":true,"values":["#minecraft:more_climbable"]}"##.to_vec(),
+                ],
+            ),
+            (
+                "data/minecraft/tags/block/more_climbable.json".into(),
+                vec![br#"{"values":["minecraft:stone"]}"#.to_vec()],
+            ),
+        ]));
+        let registry = BTreeSet::from(["minecraft:ladder".into(), "minecraft:stone".into()]);
+        assert_eq!(
+            load_climbable_tag(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:stone".into()])
+        );
     }
 
     #[test]

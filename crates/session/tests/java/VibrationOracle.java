@@ -26,11 +26,11 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId; net.minecraft.world.level.block.entity.BlockEntity sensorEntity;
+        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState, movementState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId; net.minecraft.world.level.block.entity.BlockEntity sensorEntity; String movementEvent;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
-        @Override public BlockState getBlockState(BlockPos pos) { return occluders != null && occluders.contains(pos) ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(); }
+        @Override public BlockState getBlockState(BlockPos pos) { if(movementState != null && pos.equals(BlockPos.ZERO)) return movementState; return occluders != null && occluders.contains(pos) ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(); }
         @Override public net.minecraft.world.level.block.entity.BlockEntity getBlockEntity(BlockPos pos) { return sensorEntity; }
         @Override public int getSignal(BlockPos pos, Direction direction) { signalPosition=pos;signalDirection=direction;return signal; }
         @Override public boolean setBlockAndUpdate(BlockPos pos, BlockState state) { sensorState=state; return true; }
@@ -41,6 +41,7 @@ public class VibrationOracle {
         @Override public void playSound(Entity entity, BlockPos pos, SoundEvent event, SoundSource source, float volume, float pitch) { sounds++;soundPitch=pitch;soundId=event.location().toString(); }
         @Override public void playSound(Entity entity, double x,double y,double z,SoundEvent event,SoundSource source,float volume,float pitch) { sounds++;soundPitch=pitch;soundId=event.location().toString(); }
         @Override public void gameEvent(Entity entity, Holder<GameEvent> event, BlockPos pos) { events++; }
+        @Override public void gameEvent(Holder<GameEvent> event, Vec3 pos, GameEvent.Context context) { movementEvent=event==GameEvent.STEP ? "step" : "other"; }
         @Override public <T extends ParticleOptions> int sendParticles(T type, double x, double y, double z, int count, double dx, double dy, double dz, double speed) { return 0; }
     }
     static class User implements VibrationSystem.User {
@@ -60,6 +61,18 @@ public class VibrationOracle {
         @Override public boolean dampensVibrations() { return dampens; }
         @Override public Vec3 position() { return testPosition; }
         @Override public UUID getUUID() { return new UUID(1,2); }
+    }
+    static class MovementSource extends Source {
+        World testWorld; boolean ground, crouching, swimming, water, rails;
+        MovementSource() { super(); }
+        @Override public net.minecraft.world.level.Level level() { return testWorld; }
+        @Override public BlockPos getOnPos() { return BlockPos.ZERO; }
+        @Override public boolean onGround() { return ground; }
+        @Override public boolean isCrouching() { return crouching; }
+        @Override public boolean isSwimming() { return swimming; }
+        @Override public boolean isInWater() { return water; }
+        @Override public boolean isOnRails() { return rails; }
+        @Override public void gameEvent(Holder<GameEvent> event) { testWorld.movementEvent=event==GameEvent.SWIM ? "swim" : "other"; }
     }
     public static void main(String[] args) throws Exception {
         net.minecraft.SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap();
@@ -221,7 +234,29 @@ public class VibrationOracle {
             var selected=blockEntity.getVibrationData().getSelectionStrategy().chosenCandidate(101);
             var row=new JsonObject();row.addProperty("calibrated",calibrated);row.addProperty("phase",phase.getSerializedName());row.addProperty("input",input);row.addProperty("current",current);row.addProperty("careful",careful);row.addProperty("scheduled",selected.isPresent());sensorStep.add(row);
         }
-        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);
+        bind.invoke(Blocks.LADDER.builtInRegistryHolder(),List.of(BlockTags.CLIMBABLE));
+        var mover=(MovementSource)unsafe.allocateInstance(MovementSource.class); mover.testWorld=world; mover.testPosition=Vec3.ZERO;
+        var emissionClass=Class.forName("net.minecraft.world.entity.Entity$MovementEmission");
+        var emission=emissionClass.getDeclaredField("EVENTS").get(null);
+        var movementMethod=Entity.class.getDeclaredMethod("applyMovementEmissionAndPlaySound",emissionClass,Vec3.class,BlockPos.class,BlockState.class); movementMethod.setAccessible(true);
+        var nextStep=Entity.class.getDeclaredField("nextStep"); nextStep.setAccessible(true);
+        var movementRows=new JsonArray(); var movementRandom=new Random(26423);
+        var states=new BlockState[]{Blocks.AIR.defaultBlockState(),Blocks.STONE.defaultBlockState(),Blocks.LADDER.defaultBlockState(),Blocks.POWDER_SNOW.defaultBlockState()};
+        for(int group=0;group<128;group++) {
+            mover.moveDist=0; mover.flyDist=0; nextStep.setFloat(mover,1.0f);
+            for(int tick=0;tick<8;tick++) {
+                int modern=movementRandom.nextInt(states.length), legacy=movementRandom.nextInt(states.length);
+                boolean same=movementRandom.nextBoolean(); if(same)legacy=modern;
+                mover.ground=movementRandom.nextBoolean();mover.crouching=movementRandom.nextBoolean();mover.swimming=movementRandom.nextBoolean();mover.water=movementRandom.nextBoolean();mover.rails=movementRandom.nextBoolean();
+                boolean enabled=movementRandom.nextBoolean();
+                double x=(movementRandom.nextInt(9)-4)*0.37,y=(movementRandom.nextInt(5)-2)*0.41,z=(movementRandom.nextInt(9)-4)*0.29;
+                world.movementState=states[modern];world.movementEvent="none";
+                if(enabled)movementMethod.invoke(mover,emission,new Vec3(x,y,z),same ? BlockPos.ZERO : new BlockPos(1,0,0),states[legacy]);
+                var row=new JsonObject(); row.addProperty("group",group);row.addProperty("modern",modern);row.addProperty("legacy",legacy);row.addProperty("same",same);row.addProperty("enabled",enabled);row.addProperty("ground",mover.ground);row.addProperty("crouching",mover.crouching);row.addProperty("swimming",mover.swimming);row.addProperty("water",mover.water);row.addProperty("rails",mover.rails);row.addProperty("x",x);row.addProperty("y",y);row.addProperty("z",z);row.addProperty("distance",Float.floatToRawIntBits(mover.moveDist));row.addProperty("flying_distance",Float.floatToRawIntBits(mover.flyDist));row.addProperty("next",Float.floatToRawIntBits(nextStep.getFloat(mover)));row.addProperty("event",world.movementEvent);movementRows.add(row);
+            }
+        }
+        world.movementState=null;
+        var result=new JsonObject(); result.add("frequencies", frequencies); result.add("strengths", strengths); result.add("distances",distances); result.add("selections", selections); result.add("timing",timing); result.add("filter",filter); result.add("rays",rays); result.add("block_registry",blockRegistry); result.add("sensor_signals",sensorSignals);result.add("sensor_filter",sensorFilter);result.add("sensor_ticks",sensorTicks);result.add("sensor_arrivals",sensorArrivals);result.add("sensor_dispatch",sensorDispatch);result.add("sensor_step",sensorStep);result.add("movement",movementRows);
         Files.writeString(Path.of(args[0]), result.toString());
         var registryLookup=net.minecraft.data.registries.VanillaRegistries.createWorldLookup();
         var sensorNbt=new net.minecraft.nbt.CompoundTag();

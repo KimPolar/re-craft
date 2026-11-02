@@ -439,6 +439,8 @@ pub struct LoadedSession {
     vanilla_block_ids: Option<Arc<BTreeSet<String>>>,
     vibration_event_tags: Option<Arc<native_resources::game_event_tags::GameEventTags>>,
     vibration_block_tags: Option<Arc<native_resources::game_event_tags::VibrationBlockTags>>,
+    movement_climbable: Option<Arc<BTreeSet<String>>>,
+    movement_events: crate::movement_events::MovementEvents,
     dropped_items: crate::items::ItemEntities,
     experience_orbs: crate::orbs::Orbs,
     pickup_sounds: VecDeque<crate::PickupSound>,
@@ -4761,6 +4763,10 @@ impl LoadedSession {
         self.vibration_block_tags = Some(blocks);
     }
 
+    pub fn set_movement_climbable_tag(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.movement_climbable = Some(tag);
+    }
+
     pub fn set_falling_fire_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         self.falling_fire_tag = Some(tag);
         self.sand_deferred_revision = None;
@@ -5278,6 +5284,8 @@ impl LoadedSession {
             vanilla_block_ids: None,
             vibration_event_tags: None,
             vibration_block_tags: None,
+            movement_climbable: None,
+            movement_events: crate::movement_events::MovementEvents::default(),
             dropped_items: crate::items::ItemEntities::default(),
             experience_orbs: crate::orbs::Orbs::default(),
             pickup_sounds: VecDeque::new(),
@@ -6737,18 +6745,142 @@ impl LoadedSession {
         })
     }
 
+    /// Accumulate Entity.move distance before applying block-contact effects.
+    fn emit_player_movement_event(
+        &mut self,
+        actual: DVec3,
+        flying: bool,
+        in_water: bool,
+        support: Option<IVec3>,
+        legacy: IVec3,
+    ) {
+        if !self.movement_events.valid || flying || (self.motion.on_ground && self.sneak) {
+            return;
+        }
+        let modern = support.unwrap_or_else(|| {
+            (self.motion.position - DVec3::Y * f64::from(1.0e-5_f32))
+                .floor()
+                .as_ivec3()
+        });
+        let contact = |position| {
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
+                return None;
+            }
+            let climbable = self.movement_climbable.as_ref()?;
+            Some((
+                crate::movement_events::Contact {
+                    air: matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    climbable: state.name == "minecraft:powder_snow"
+                        || climbable.contains(&state.name),
+                },
+                id,
+            ))
+        };
+        let modern_contact = contact(modern);
+        let legacy_contact = if modern == legacy {
+            modern_contact
+        } else {
+            contact(legacy)
+        };
+        let event = self.movement_events.advance(crate::movement_events::Input {
+            movement: actual,
+            enabled: true,
+            modern: modern_contact.as_ref().map(|(contact, _)| *contact),
+            legacy: legacy_contact.as_ref().map(|(contact, _)| *contact),
+            same_block: modern == legacy,
+            on_ground: self.motion.on_ground,
+            crouching: self.player.pose == PlayerPose::Crouching,
+            on_rails: false,
+            swimming: self.swimming,
+            in_water,
+        });
+        if let Some(event) = event {
+            let (name, affected) = match event {
+                crate::movement_events::Event::Step => (
+                    "minecraft:step",
+                    modern_contact
+                        .and_then(|(_, id)| self.world.state(id))
+                        .map(|state| state.name.clone()),
+                ),
+                crate::movement_events::Event::Swim => ("minecraft:swim", None),
+            };
+            self.dispatch_vibration(
+                name,
+                self.origin.as_dvec3() + self.motion.position,
+                self.player_uuid,
+                true,
+                self.game_mode == GameMode::Spectator,
+                self.sneak,
+                affected.as_deref(),
+            );
+        }
+    }
+
     /// Dispatch an item splash to resident listeners using active pack tags.
     fn dispatch_item_splash(&mut self, event: crate::ItemWaterEntry) {
+        self.dispatch_vibration(
+            "minecraft:splash",
+            event.position,
+            event.source_uuid,
+            false,
+            false,
+            false,
+            None,
+        );
+    }
+
+    /// Deliver a game event with its source and optional affected block.
+    fn dispatch_vibration(
+        &mut self,
+        event_name: &str,
+        event_position: DVec3,
+        source_uuid: Option<[i32; 4]>,
+        server_player: bool,
+        spectator: bool,
+        stepping_carefully: bool,
+        affected_block: Option<&str>,
+    ) {
         let (Some(events), Some(blocks)) = (
             self.vibration_event_tags.clone(),
             self.vibration_block_tags.clone(),
         ) else {
             return;
         };
-        if !events.vibrates("minecraft:splash") || !event.position.is_finite() {
+        if !event_position.is_finite() {
             return;
         }
-        let event_block = event.position.floor();
+        let affected_dampens = match affected_block {
+            Some(name) => match blocks.dampens(name) {
+                Some(value) => value,
+                None => return,
+            },
+            None => false,
+        };
+        let source = crate::vibration::VibrationSource {
+            spectator,
+            stepping_carefully,
+            dampens_vibrations: false,
+            server_player,
+        };
+        if crate::vibration::filter(&events, event_name, Some(source), affected_dampens, true)
+            != crate::vibration::FilterResult::Accept
+        {
+            return;
+        }
+        let event_block = event_position.floor();
         if event_block.min_element() < f64::from(i32::MIN)
             || event_block.max_element() > f64::from(i32::MAX)
         {
@@ -6813,10 +6945,12 @@ impl LoadedSession {
             } else {
                 None
             };
-            if sensor.can_receive("minecraft:splash", false, input) != Some(true) {
+            if sensor.can_receive(event_name, event_block == position.as_dvec3(), input)
+                != Some(true)
+            {
                 continue;
             }
-            let blocked = crate::vibration::occluded(event.position, listener, |absolute| {
+            let blocked = crate::vibration::occluded(event_position, listener, |absolute| {
                 let relative = subtract(absolute, self.origin)?;
                 let Cell::State(id) = cell(
                     &self.world,
@@ -6832,14 +6966,14 @@ impl LoadedSession {
             if blocked != Some(false) {
                 continue;
             }
-            let Some(distance) = crate::vibration::travel_distance(event.position, listener) else {
+            let Some(distance) = crate::vibration::travel_distance(event_position, listener) else {
                 continue;
             };
             let vibration = crate::vibration::Vibration {
-                event: "minecraft:splash".into(),
+                event: event_name.into(),
                 distance,
-                position: event.position,
-                source: event.source_uuid,
+                position: event_position,
+                source: source_uuid,
                 projectile_owner: None,
             };
             let Some(saved) = self.sculk_listeners.get_mut(&key) else {
@@ -8482,6 +8616,7 @@ impl LoadedSession {
             on_ground: false,
             jump_delay: 0,
         };
+        self.movement_events = crate::movement_events::MovementEvents::default();
         self.location_effects = crate::location_enchantments::LocationTracker::default();
         self.location_last_position = None;
         self.location_failure_revision = None;
@@ -17225,28 +17360,33 @@ impl LoadedSession {
         } else {
             self.fall_distance -= f64::from(actual.y.min(0.0) as f32);
         }
-        if self.motion.on_ground {
-            let support = collision_support.get().unwrap_or_else(|| {
+        let support = if self.motion.on_ground {
+            collision_support.get().unwrap_or_else(|| {
                 crate::movement::supporting_block(
                     self.motion.position,
                     actual,
                     self.ground_without_support,
                     block_shape,
                 )
-            });
+            })
+        } else {
+            None
+        };
+        let legacy = crate::movement::legacy_on_block(self.motion.position, support, |pos| {
+            match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
+                Cell::State(id) => self.world.state(id).is_some_and(|state| {
+                    let name = state.name.as_str();
+                    name.ends_with("_fence")
+                        || name.ends_with("_wall")
+                        || name.ends_with("_fence_gate")
+                }),
+                Cell::Missing => false,
+            }
+        });
+        self.emit_player_movement_event(actual, flying, in_water, support, legacy);
+        if self.motion.on_ground {
             self.ground_without_support = support.is_none();
             self.ground_support = support.and_then(|relative| add(self.origin, relative));
-            let legacy = crate::movement::legacy_on_block(self.motion.position, support, |pos| {
-                match cell(&self.world, self.origin, self.bounds, pos, self.states[0]) {
-                    Cell::State(id) => self.world.state(id).is_some_and(|state| {
-                        let name = state.name.as_str();
-                        name.ends_with("_fence")
-                            || name.ends_with("_wall")
-                            || name.ends_with("_fence_gate")
-                    }),
-                    Cell::Missing => false,
-                }
-            });
             let landing_state = match cell(
                 &self.world,
                 self.origin,
@@ -31882,6 +32022,82 @@ pub(crate) mod tests {
                 .iter()
                 .any(|sound| sound.info.event == "minecraft:block.sculk_sensor.clicking")
         );
+    }
+
+    #[test]
+    fn walking_emits_sensor_vibrations_but_grounded_sneaking_does_not() {
+        for sneak in [false, true] {
+            let (mut session, pos) =
+                splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+            let (_, blocks) = splash_test_tags();
+            let events = native_resources::game_event_tags::GameEventTags::new(
+                BTreeSet::from(["minecraft:step".into(), "minecraft:swim".into()]),
+                BTreeSet::from(["minecraft:step".into(), "minecraft:swim".into()]),
+            );
+            session.set_vibration_tags(Arc::new(events), blocks);
+            session.set_movement_climbable_tag(Arc::new(BTreeSet::new()));
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:stone".into(),
+                "minecraft:sculk_sensor".into(),
+            ])));
+            session.set_random_tick_speed(0);
+            session.motion.position = DVec3::new(6.5, 1.0, 6.5);
+            session.player.position = session.motion.position.as_vec3();
+            session.motion.on_ground = true;
+            session.player.on_ground = true;
+            session.movement = (1.0, 0.0, false);
+            session.sneak = sneak;
+            let mut heard = false;
+            for _ in 0..36 {
+                session.update(TICK);
+                let listener = &session.sculk_listeners[&pos.to_array()];
+                heard |= listener.vibration.pending().is_some()
+                    || listener.vibration.current().is_some()
+                    || listener.last_frequency == 1;
+            }
+            assert_eq!(
+                heard, !sneak,
+                "sneak={sneak}, movement={:?}, position={:?}, on_ground={}",
+                session.movement_events, session.motion.position, session.motion.on_ground
+            );
+            assert!(session.movement_events.valid, "sneak={sneak}");
+        }
+    }
+
+    #[test]
+    fn swimming_movement_reaches_registered_sensor_as_swim() {
+        let (mut session, pos) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let (_, blocks) = splash_test_tags();
+        session.set_vibration_tags(
+            Arc::new(native_resources::game_event_tags::GameEventTags::new(
+                BTreeSet::from(["minecraft:swim".into()]),
+                BTreeSet::new(),
+            )),
+            blocks,
+        );
+        session.set_movement_climbable_tag(Arc::new(BTreeSet::new()));
+        session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+        ])));
+        session.motion.position = DVec3::new(6.5, 1.0, 6.5);
+        session.motion.on_ground = true;
+        session.swimming = true;
+        let support = IVec3::new(6, 0, 6);
+        session.emit_player_movement_event(
+            DVec3::new(2.0, 0.0, 0.0),
+            false,
+            true,
+            Some(support),
+            support,
+        );
+        let (_, candidate) = session.sculk_listeners[&pos.to_array()]
+            .vibration
+            .pending()
+            .unwrap();
+        assert_eq!(candidate.event, "minecraft:swim");
     }
 
     #[test]

@@ -1237,6 +1237,11 @@ fn prepare_existing_world(
         match resources.vanilla_block_ids() {
             Ok(registry) => {
                 session.set_vanilla_block_ids(Arc::new(registry.clone()));
+                match native_resources::respawn_tags::load_climbable_tag(&mut resources, &registry)
+                {
+                    Ok(tag) => session.set_movement_climbable_tag(Arc::new(tag)),
+                    Err(error) => eprintln!("Movement climbable tag is unavailable: {error:#}"),
+                }
                 let vibration_events = native_resources::game_event_tags::GameEventTags::load(
                     &mut resources,
                     &native_session::vibration::vanilla_game_events(),

@@ -401,6 +401,7 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"
+                | "net/minecraft/world/level/block/TallSeagrassBlock"
                 | "net/minecraft/world/level/block/TallFlowerBlock" => {
                     Some(StateSchema::DoublePlant)
                 }

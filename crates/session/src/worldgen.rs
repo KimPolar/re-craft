@@ -33,7 +33,7 @@ mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_chest::GeneratedLootChest;
-pub use ore::{OreVeinRegion, PlacedOreVein, PreparedOreDecoration, ScheduledOreVein};
+pub use ore::{OreRegion, PlacedOreFeature, PreparedOreDecoration, ScheduledOreFeature};
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {

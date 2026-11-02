@@ -164,6 +164,49 @@ fn load_feature(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result
     serde_json::from_slice(&bytes).with_context(|| format!("invalid feature {path}"))
 }
 
+/// The two ore feature types share target rules but use different world writes.
+pub enum ConfiguredOre<S> {
+    Vein(OreVein<S>),
+    Scattered(ScatteredOre<S>),
+}
+impl<S: Clone + Eq> ConfiguredOre<S> {
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        id: &ResourceId,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+    ) -> Result<Self> {
+        Self::decode(&load_feature(provider, id)?, resolve)
+            .with_context(|| format!("in feature {}:{}", id.namespace, id.path))
+    }
+    pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let kind = id(value, "type")?;
+        match (kind.namespace.as_str(), kind.path.as_str()) {
+            ("minecraft", "ore") => Ok(Self::Vein(OreVein::decode(value, resolve)?)),
+            ("minecraft", "scattered_ore") => {
+                Ok(Self::Scattered(ScatteredOre::decode(value, resolve)?))
+            }
+            _ => bail!("unsupported ore feature {}:{}", kind.namespace, kind.path),
+        }
+    }
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        match self {
+            Self::Vein(v) => v.required_tags(),
+            Self::Scattered(v) => v.required_tags(),
+        }
+    }
+    pub fn place(
+        &self,
+        world: &mut impl OreVeinWorld<State = S>,
+        random: &mut DecorationRandom,
+        origin: [i32; 3],
+    ) -> Result<bool> {
+        match self {
+            Self::Vein(v) => v.place(world, random, origin),
+            Self::Scattered(v) => v.place(world, random, origin),
+        }
+    }
+}
+
 fn parse_config<S: Clone + Eq>(
     value: &Value,
     expected: &str,

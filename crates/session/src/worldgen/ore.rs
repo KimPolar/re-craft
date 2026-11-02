@@ -1,4 +1,4 @@
-//! Apply ordinary ore features to intermediate generated chunk sections.
+//! Apply ore features to intermediate generated chunk sections.
 //!
 //! The surrounding decoration scheduler must still supply Java's feature order,
 //! random seed, writable region and complete CARVERS-stage neighborhood.
@@ -12,7 +12,7 @@ use native_core::random::DecorationRandom;
 use native_resources::{
     feature_order::{FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
-    ore_feature::{OreBlockTags, OreVein, OreVeinWorld, OreWorld},
+    ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
 };
@@ -23,7 +23,7 @@ use super::{CarvedTerrainWorld, DecorationPlan};
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
-pub struct OreVeinRegion<'a> {
+pub struct OreRegion<'a> {
     target: &'a mut CarvedTerrainWorld,
     world: World,
     tags: &'a OreBlockTags,
@@ -36,15 +36,15 @@ pub struct OreVeinRegion<'a> {
 }
 
 /// A placed feature bound to the exact configured ore it references.
-pub struct PlacedOreVein {
+pub struct PlacedOreFeature {
     placement: PlacedFeature,
-    ore: OreVein<BlockState>,
+    ore: ConfiguredOre<BlockState>,
 }
 
 /// A placed ore resolved from one exact entry of the decoration schedule.
-pub struct ScheduledOreVein<'a> {
+pub struct ScheduledOreFeature<'a> {
     key: FeatureKey,
-    placed: PlacedOreVein,
+    placed: PlacedOreFeature,
     schedule: &'a FeatureSchedule,
 }
 
@@ -52,7 +52,7 @@ pub struct ScheduledOreVein<'a> {
 /// features are rejected before any generated terrain is changed.
 pub struct PreparedOreDecoration<'p, 's> {
     plan: &'p DecorationPlan<'s>,
-    ores: BTreeMap<FeatureKey, ScheduledOreVein<'s>>,
+    ores: BTreeMap<FeatureKey, ScheduledOreFeature<'s>>,
     tags: OreBlockTags,
     motion: HeightmapTags,
 }
@@ -83,10 +83,10 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
             );
             if !ores.contains_key(selected.feature) {
                 let ore =
-                    ScheduledOreVein::load(provider, plan.schedule, selected.feature, resolve)
+                    ScheduledOreFeature::load(provider, plan.schedule, selected.feature, resolve)
                         .with_context(|| {
-                            format!("unsupported planned feature {:?}", selected.feature)
-                        })?;
+                        format!("unsupported planned feature {:?}", selected.feature)
+                    })?;
                 required.extend(ore.required_tags());
                 ores.insert(selected.feature.clone(), ore);
             }
@@ -143,7 +143,7 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
                 });
             }
         }
-        let mut region = terrain.ore_vein_region(&self.tags, &self.motion, writable)?;
+        let mut region = terrain.ore_region(&self.tags, &self.motion, writable)?;
         let mut results = Vec::with_capacity(self.plan.features.len());
         for (index, selected) in self.plan.features.iter().enumerate() {
             let ore = self
@@ -158,7 +158,7 @@ impl<'p, 's> PreparedOreDecoration<'p, 's> {
     }
 }
 
-impl<'a> ScheduledOreVein<'a> {
+impl<'a> ScheduledOreFeature<'a> {
     /// Read both named and inline placed features from the same active packs
     /// and block registry that were used to prepare the schedule.
     pub fn load(
@@ -172,7 +172,7 @@ impl<'a> ScheduledOreVein<'a> {
             "feature is absent from the schedule"
         );
         let placed = match key {
-            FeatureKey::Registered(id) => PlacedOreVein::load(provider, id, resolve)?,
+            FeatureKey::Registered(id) => PlacedOreFeature::load(provider, id, resolve)?,
             FeatureKey::Inline { biome, .. } => {
                 let definition = schedule
                     .biome(biome)
@@ -180,7 +180,7 @@ impl<'a> ScheduledOreVein<'a> {
                     .inline
                     .get(key)
                     .context("inline feature definition is missing")?;
-                PlacedOreVein::from_placement(
+                PlacedOreFeature::from_placement(
                     provider,
                     PlacedFeature::decode(definition)?,
                     resolve,
@@ -217,7 +217,7 @@ impl<'a> ScheduledOreVein<'a> {
     }
 }
 
-impl PlacedOreVein {
+impl PlacedOreFeature {
     pub fn load(
         provider: &mut impl ResourceProvider,
         id: &ResourceId,
@@ -233,9 +233,9 @@ impl PlacedOreVein {
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Self> {
         let ore = if let Some(id) = placement.feature.as_str() {
-            OreVein::load(provider, &ResourceId::parse(id)?, resolve)?
+            ConfiguredOre::load(provider, &ResourceId::parse(id)?, resolve)?
         } else {
-            OreVein::decode(&placement.feature, resolve)?
+            ConfiguredOre::decode(&placement.feature, resolve)?
         };
         Ok(Self { placement, ore })
     }
@@ -251,12 +251,12 @@ impl CarvedTerrainWorld {
     /// The tags must belong to the same registry and active data packs for the
     /// lifetime of the terrain. Other generation writes must update any primed
     /// heightmaps before this interface can be combined with those features.
-    pub fn ore_vein_region<'a>(
+    pub fn ore_region<'a>(
         &'a mut self,
         tags: &'a OreBlockTags,
         motion: &'a HeightmapTags,
         writable: BTreeSet<ChunkPos>,
-    ) -> Result<OreVeinRegion<'a>> {
+    ) -> Result<OreRegion<'a>> {
         ensure!(
             writable.iter().all(|p| self.world.chunks.contains_key(p)),
             "writable generation chunk is missing"
@@ -264,7 +264,7 @@ impl CarvedTerrainWorld {
         let world = (*self.world).clone();
         let heights = self.ore_ocean_floor_heights.clone();
         let surface_heights = self.feature_world_surface_heights.clone();
-        Ok(OreVeinRegion {
+        Ok(OreRegion {
             target: self,
             world,
             tags,
@@ -278,7 +278,7 @@ impl CarvedTerrainWorld {
     }
 }
 
-impl OreVeinRegion<'_> {
+impl OreRegion<'_> {
     /// A failed attempt must be discarded; on failure the caller's RNG is unchanged.
     /// If the region contains earlier successful placements, the caller must
     /// also restore its RNG to the beginning of the discarded region.
@@ -305,7 +305,7 @@ impl OreVeinRegion<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn place_placed(
         &mut self,
-        placed: &PlacedOreVein,
+        placed: &PlacedOreFeature,
         random: &mut DecorationRandom,
         origin: [i32; 3],
         generator_min_y: i32,
@@ -336,7 +336,7 @@ impl OreVeinRegion<'_> {
         &mut self,
         plan: &DecorationPlan<'_>,
         index: usize,
-        ore: &ScheduledOreVein<'_>,
+        ore: &ScheduledOreFeature<'_>,
         biome_allows: &mut impl FnMut(&FeatureKey, &ResourceId) -> Result<bool>,
     ) -> Result<bool> {
         ensure!(!self.failed, "generation attempt previously failed");
@@ -379,7 +379,7 @@ impl OreVeinRegion<'_> {
         Ok(result)
     }
 
-    /// Resolve biome membership from the active schedule for ordinary ores.
+    /// Resolve biome membership from the active schedule for supported ores.
     /// Distinct placed features with uniform/trapezoid height providers are
     /// never equal in Java because each decoded provider has object identity.
     /// Ambiguous data-pack feature equality and unknown biomes are errors.
@@ -387,7 +387,7 @@ impl OreVeinRegion<'_> {
         &mut self,
         plan: &DecorationPlan<'_>,
         index: usize,
-        ore: &ScheduledOreVein<'_>,
+        ore: &ScheduledOreFeature<'_>,
     ) -> Result<bool> {
         let selected = plan
             .features
@@ -502,10 +502,53 @@ impl OreVeinRegion<'_> {
         self.prime_heightmaps(pos)?;
         Ok(self.surface_heights[&pos][(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
+
+    fn set_scattered_block(&mut self, p: [i32; 3], state: &BlockState, flags: i32) -> Result<bool> {
+        ensure!(flags == 2, "unsupported worldgen block flags");
+        if !self.writable.contains(&chunk(p)) {
+            return Ok(false);
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(p)),
+            "generation block chunk is missing"
+        );
+        // These states have no POI or block entity, and ancient debris does not
+        // request postprocessing. Unknown data-pack replacements are rejected.
+        ensure!(
+            state.name == "minecraft:ancient_debris" && state.properties.is_empty(),
+            "unsupported scattered ore replacement effects"
+        );
+        if self.is_outside(p[1]) {
+            return Ok(true);
+        }
+        let old = self.read(p)?;
+        ensure!(
+            matches!(
+                old.name.as_str(),
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:void_air"
+                    | "minecraft:netherrack"
+                    | "minecraft:basalt"
+                    | "minecraft:blackstone"
+                    | "minecraft:ancient_debris"
+                    | "minecraft:stone"
+                    | "minecraft:deepslate"
+                    | "minecraft:water"
+                    | "minecraft:lava"
+            ),
+            "unsupported scattered ore source effects"
+        );
+        // At TERRAIN, ProtoChunk updates final heightmaps, not the cached
+        // world-generation maps used by this partial feature pipeline.
+        // Final heightmaps are not exposed or saved by this pipeline yet.
+        self.set_section_block(p, state)?;
+        Ok(true)
+    }
 }
 
 struct PlannedOreEnvironment<'a, 'b, F> {
-    region: &'a mut OreVeinRegion<'b>,
+    region: &'a mut OreRegion<'b>,
     plan: &'a DecorationPlan<'a>,
     key: &'a FeatureKey,
     biome_allows: &'a mut F,
@@ -542,9 +585,19 @@ fn chunk(p: [i32; 3]) -> ChunkPos {
     }
 }
 
-impl OreWorld for OreVeinRegion<'_> {
+impl OreWorld for OreRegion<'_> {
     type State = BlockState;
     fn block(&mut self, p: [i32; 3]) -> Result<BlockState> {
+        if self.is_outside(p[1]) {
+            ensure!(
+                self.world.chunks.contains_key(&chunk(p)),
+                "generation block chunk is missing"
+            );
+            return Ok(BlockState {
+                name: "minecraft:void_air".into(),
+                properties: BTreeMap::new(),
+            });
+        }
         self.read(p)
     }
     fn block_is(&mut self, state: &BlockState, id: &ResourceId) -> Result<bool> {
@@ -556,11 +609,15 @@ impl OreWorld for OreVeinRegion<'_> {
     fn is_air(&mut self, state: &BlockState) -> Result<bool> {
         Ok(is_air(state))
     }
-    fn set_block(&mut self, _: [i32; 3], _: &BlockState, _: i32) -> Result<bool> {
-        bail!("WorldGenLevel.setBlock effects are not implemented by the ore vein region")
+    fn set_block(&mut self, p: [i32; 3], state: &BlockState, flags: i32) -> Result<bool> {
+        let result = self.set_scattered_block(p, state, flags);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 }
-impl OreVeinWorld for OreVeinRegion<'_> {
+impl OreVeinWorld for OreRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
         self.prime_heightmaps(pos)?;
@@ -619,6 +676,9 @@ impl OreVeinWorld for OreVeinRegion<'_> {
 }
 
 #[cfg(test)]
+mod scattered_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use native_resources::packs::ResourceProvider;
@@ -660,6 +720,14 @@ mod tests {
             "minecraft:stone",
             "minecraft:diamond_ore",
             "minecraft:water",
+            "minecraft:ancient_debris",
+            "minecraft:cave_air",
+            "minecraft:void_air",
+            "minecraft:netherrack",
+            "minecraft:basalt",
+            "minecraft:blackstone",
+            "minecraft:deepslate",
+            "minecraft:lava",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -722,7 +790,7 @@ mod tests {
         let (mut terrain, tags, motion, feature) = fixture();
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(123);
         assert!(region.place(&feature, &mut random, [15, 4, 7]).unwrap());
         region.finish().unwrap();
@@ -745,7 +813,7 @@ mod tests {
     fn primes_whole_heightmap_and_keeps_direct_section_writes_out_of_it() {
         let (mut terrain, tags, motion, _) = fixture();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         region
             .set_section_block([1, 12, 1], &state("stone"))
@@ -754,7 +822,7 @@ mod tests {
         assert_eq!(region.section_neighbor([1, -1, 1]).unwrap(), state("air"));
         region.finish().unwrap();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut next = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut next = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert_eq!(next.ocean_floor_height(1, 1).unwrap(), 8);
     }
 
@@ -762,7 +830,7 @@ mod tests {
     fn neighboring_chunk_maps_are_primed_before_direct_feature_writes() {
         let (mut terrain, tags, motion, _) = fixture();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert!(region.heights.is_empty() && region.surface_heights.is_empty());
         // Neither neighbor column was queried before these direct writes.
         region.set_section_block([16, 7, 5], &state("air")).unwrap();
@@ -775,7 +843,7 @@ mod tests {
         }
         region.finish().unwrap();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut next = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut next = terrain.ore_region(&tags, &motion, writable).unwrap();
         for x in [16, 17] {
             assert_eq!(next.ocean_floor_height(x, 5).unwrap(), 8);
             assert_eq!(next.world_surface_height(x, 5).unwrap(), 8);
@@ -791,9 +859,61 @@ mod tests {
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         section.blocks.as_mut().unwrap()[12 * 256] = water;
         let writable = terrain.snapshot().chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 13);
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
+    }
+
+    #[test]
+    fn scattered_set_block_preserves_worldgen_maps_and_respects_write_bounds() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
+        assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
+        assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        // The fixture's motion tag intentionally excludes ancient debris.
+        assert!(
+            region
+                .set_block([0, 7, 0], &state("ancient_debris"), 2)
+                .unwrap()
+        );
+        assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
+        assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        assert!(
+            region
+                .set_block([0, 12, 0], &state("ancient_debris"), 2)
+                .unwrap()
+        );
+        assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
+        assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        assert!(
+            !region
+                .set_block([16, 7, 0], &state("ancient_debris"), 2)
+                .unwrap()
+        );
+        assert_eq!(region.block([0, -1, 0]).unwrap(), state("void_air"));
+        assert!(
+            region
+                .set_block([0, -1, 0], &state("ancient_debris"), 2)
+                .unwrap()
+        );
+        region.finish().unwrap();
+    }
+
+    #[test]
+    fn scattered_set_block_rejects_unknown_effects_without_publishing() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert!(
+            region
+                .set_block([0, 7, 0], &state("diamond_ore"), 2)
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]
@@ -804,7 +924,7 @@ mod tests {
             .remove(&ChunkPos { x: 0, z: -1 });
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(123);
         let mut expected = random.clone();
         assert!(region.place(&feature, &mut random, [15, 4, 7]).is_err());
@@ -832,12 +952,12 @@ mod tests {
         }
     }
 
-    fn inline_placed_ore() -> PlacedOreVein {
+    fn inline_placed_ore() -> PlacedOreFeature {
         let placement = PlacedFeature::decode(&json!({"feature": {
             "type":"minecraft:ore", "size":9, "discard_chance_on_air_exposure":0.0,
             "targets":[{"target":{"predicate_type":"minecraft:block_match", "block":"minecraft:stone"}, "state":"minecraft:diamond_ore"}]
         }, "placement":[{"type":"minecraft:count", "count":4},{"type":"minecraft:biome"}]})).unwrap();
-        PlacedOreVein::from_placement(&mut Data, placement, &mut |v| {
+        PlacedOreFeature::from_placement(&mut Data, placement, &mut |v| {
             Ok(state(
                 v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
             ))
@@ -850,7 +970,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(7);
         let mut env = PlacementTestEnv {
             allow: false,
@@ -899,7 +1019,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         let mut random = DecorationRandom::new(7);
         let mut expected = random.clone();
         let mut env = PlacementTestEnv {
@@ -1030,14 +1150,14 @@ mod tests {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         assert_eq!(plan.features.len(), 2);
-        let named = ScheduledOreVein::load(
+        let named = ScheduledOreFeature::load(
             &mut data,
             &schedule,
             plan.features[0].feature,
             &mut resolve_test,
         )
         .unwrap();
-        let inline = ScheduledOreVein::load(
+        let inline = ScheduledOreFeature::load(
             &mut data,
             &schedule,
             plan.features[1].feature,
@@ -1047,7 +1167,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let previous = terrain.snapshot();
         let writable = previous.chunks.keys().copied().collect();
-        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         let mut calls = 0;
         let mut allows = |_: &FeatureKey, biome: &ResourceId| {
             calls += 1;
@@ -1074,7 +1194,7 @@ mod tests {
     fn scheduled_biome_failure_discards_prior_writes_and_unsupported_heightmaps_fail() {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
-        let ore = ScheduledOreVein::load(
+        let ore = ScheduledOreFeature::load(
             &mut data,
             &schedule,
             plan.features[0].feature,
@@ -1084,7 +1204,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         let mut calls = 0;
         assert!(
@@ -1102,7 +1222,7 @@ mod tests {
 
         let (mut data, schedule, neighborhood) = scheduled_fixture(Some("MOTION_BLOCKING"));
         let plan = fixture_plan(&schedule, &neighborhood);
-        let ore = ScheduledOreVein::load(
+        let ore = ScheduledOreFeature::load(
             &mut data,
             &schedule,
             plan.features[0].feature,
@@ -1110,7 +1230,7 @@ mod tests {
         )
         .unwrap();
         let mut region = terrain
-            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         assert!(
             region
@@ -1126,7 +1246,7 @@ mod tests {
         for kind in ["OCEAN_FLOOR_WG", "WORLD_SURFACE_WG"] {
             let (mut data, schedule, neighborhood) = scheduled_fixture(Some(kind));
             let plan = fixture_plan(&schedule, &neighborhood);
-            let ore = ScheduledOreVein::load(
+            let ore = ScheduledOreFeature::load(
                 &mut data,
                 &schedule,
                 plan.features[0].feature,
@@ -1136,7 +1256,7 @@ mod tests {
             let (mut terrain, tags, motion, _) = fixture();
             let before = terrain.snapshot();
             let mut region = terrain
-                .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+                .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
                 .unwrap();
             assert!(
                 region
@@ -1164,7 +1284,7 @@ mod tests {
         )
         .unwrap();
         let key = FeatureKey::Registered(ResourceId::parse("test:ore").unwrap());
-        let ore = ScheduledOreVein::load(&mut data, &schedule, &key, &mut resolve_test).unwrap();
+        let ore = ScheduledOreFeature::load(&mut data, &schedule, &key, &mut resolve_test).unwrap();
         assert!(ore.biome_allows(&plains).unwrap());
         assert!(
             !ore.biome_allows(&desert).unwrap(),
@@ -1183,7 +1303,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         assert!(region.place_planned_auto(&plan, index, &ore).unwrap());
         region.finish().unwrap();
@@ -1196,11 +1316,11 @@ mod tests {
         )
         .unwrap();
         let other_ore =
-            ScheduledOreVein::load(&mut other_data, &other_schedule, &key, &mut resolve_test)
+            ScheduledOreFeature::load(&mut other_data, &other_schedule, &key, &mut resolve_test)
                 .unwrap();
         let before = terrain.snapshot();
         let mut region = terrain
-            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
         assert!(region.place_planned_auto(&plan, index, &other_ore).is_err());
         region.finish().unwrap();
@@ -1219,7 +1339,7 @@ mod tests {
         )
         .unwrap();
         let ambiguous_ore =
-            ScheduledOreVein::load(&mut ambiguous, &ambiguous_schedule, &key, &mut resolve_test)
+            ScheduledOreFeature::load(&mut ambiguous, &ambiguous_schedule, &key, &mut resolve_test)
                 .unwrap();
         assert!(ambiguous_ore.biome_allows(&plains).unwrap());
         assert!(ambiguous_ore.biome_allows(&desert).is_err());
@@ -1251,10 +1371,15 @@ mod tests {
         }
     }
     fn batch_registry() -> BTreeSet<String> {
-        ["minecraft:air", "minecraft:stone", "minecraft:diamond_ore"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:diamond_ore",
+            "minecraft:ancient_debris",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     #[test]
@@ -1309,6 +1434,49 @@ mod tests {
     }
 
     #[test]
+    fn prepared_batch_runs_vein_then_scattered_ore() {
+        struct MixedData;
+        impl ResourceProvider for MixedData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let scattered = json!({"feature":{"type":"minecraft:scattered_ore","size":64,"discard_chance_on_air_exposure":0.0,"targets":[{"target":{"predicate_type":"minecraft:block_match","block":"minecraft:stone"},"state":"minecraft:ancient_debris"}]},"placement":[{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":4},"max_inclusive":{"absolute":4}}},{"type":"minecraft:biome"}]});
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[["test:ore",scattered]]}),
+                    )?));
+                }
+                ScheduledData { heightmap: None }.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let schedule =
+            FeatureSchedule::load(&mut MixedData, std::slice::from_ref(&plains), &registry)
+                .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let batch = PreparedOreDecoration::load(
+            &mut MixedData,
+            &plan,
+            &batch_registry(),
+            &mut resolve_test,
+        )
+        .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let results = batch.execute(&mut terrain, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[1]);
+        let world = terrain.snapshot();
+        assert!((-8..8).any(|x| (-8..8).any(|z| {
+            (0..8).any(|y| world.block(x, y, z).unwrap().name == "minecraft:ancient_debris")
+        })));
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn generated_chunk_veins_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -1329,8 +1497,10 @@ mod tests {
             "ore_coal_upper",
             "ore_iron_middle",
             "ore_dirt",
+            "ore_ancient_debris_large",
+            "ore_debris_small",
         ] {
-            PlacedOreVein::load(
+            PlacedOreFeature::load(
                 &mut installed,
                 &ResourceId::parse(&format!("minecraft:{name}")).unwrap(),
                 &mut |v| super::super::resolve_generated_terrain_state(v, &registry),
@@ -1535,7 +1705,7 @@ mod tests {
                     let mut terrain = oracle_terrain();
                     let previous = terrain.snapshot();
                     let writable = previous.chunks.keys().copied().collect();
-                    let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+                    let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
                     let mut random = DecorationRandom::new(0);
                     let deco = random.set_decoration_seed(seed, -32, 48);
                     random.set_feature_seed(deco, 7, 3);
@@ -1579,7 +1749,7 @@ mod tests {
             {"type":"minecraft:count","count":4},{"type":"minecraft:in_square"},
             {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-5},"max_inclusive":{"absolute":5}}}
         ]})).unwrap();
-        let placed = PlacedOreVein::from_placement(&mut data, placement, &mut |v| {
+        let placed = PlacedOreFeature::from_placement(&mut data, placement, &mut |v| {
             Ok(state(
                 v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
             ))
@@ -1590,7 +1760,7 @@ mod tests {
             let mut terrain = oracle_terrain();
             let previous = terrain.snapshot();
             let writable = previous.chunks.keys().copied().collect();
-            let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+            let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
             let mut random = DecorationRandom::new(0);
             let deco = random.set_decoration_seed(seed, -32, 48);
             random.set_feature_seed(deco, 7, 3);
@@ -1621,7 +1791,7 @@ mod tests {
         }
         let key = FeatureKey::Registered(ResourceId::parse("example:ore").unwrap());
         let (_, java_schedule, _) = scheduled_fixture(None);
-        let scheduled = ScheduledOreVein {
+        let scheduled = ScheduledOreFeature {
             key: key.clone(),
             placed,
             schedule: &java_schedule,
@@ -1664,7 +1834,7 @@ mod tests {
                 generator_height: 32,
             };
             let mut region = terrain
-                .ore_vein_region(&tags, &motion, previous.chunks.keys().copied().collect())
+                .ore_region(&tags, &motion, previous.chunks.keys().copied().collect())
                 .unwrap();
             region
                 .place_planned(&plan, 0, &scheduled, &mut |_, _| {

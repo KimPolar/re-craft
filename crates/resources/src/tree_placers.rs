@@ -1,7 +1,194 @@
 //! Building blocks for 26.3 tree generation. These do not apply a complete
 //! tree: the caller owns collision checks, providers, writes and decoration.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
+use serde_json::Value;
+use std::sync::OnceLock;
+
+use crate::{ore_feature::OreWorld, packs::ResourceId};
+
+/// The vanilla feature-size codec bounds both scan radii and tree heights.
+pub struct TreeFeatureSize {
+    layers: TreeSizeLayers,
+    min_clipped_height: Option<i32>,
+}
+
+enum TreeSizeLayers {
+    Two {
+        limit: i32,
+        lower: i32,
+        upper: i32,
+    },
+    Three {
+        limit: i32,
+        upper_limit: i32,
+        lower: i32,
+        middle: i32,
+        upper: i32,
+    },
+}
+
+impl TreeFeatureSize {
+    pub fn decode(value: &Value) -> Result<Self> {
+        let integer = |name: &str, default: i32, max: i32| -> Result<i32> {
+            let number = match value.get(name) {
+                Some(v) => v.as_i64().with_context(|| format!("invalid {name}"))?,
+                None => i64::from(default),
+            };
+            ensure!((0..=i64::from(max)).contains(&number), "invalid {name}");
+            Ok(number as i32)
+        };
+        let min_clipped_height = value
+            .get("min_clipped_height")
+            .map(|_| integer("min_clipped_height", 0, 80))
+            .transpose()?;
+        let kind = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing feature size type")?,
+        )?;
+        let layers = match (kind.namespace.as_str(), kind.path.as_str()) {
+            ("minecraft", "two_layers_feature_size") => TreeSizeLayers::Two {
+                limit: integer("limit", 1, 81)?,
+                lower: integer("lower_size", 0, 16)?,
+                upper: integer("upper_size", 1, 16)?,
+            },
+            ("minecraft", "three_layers_feature_size") => TreeSizeLayers::Three {
+                limit: integer("limit", 1, 80)?,
+                upper_limit: integer("upper_limit", 1, 80)?,
+                lower: integer("lower_size", 0, 16)?,
+                middle: integer("middle_size", 1, 16)?,
+                upper: integer("upper_size", 1, 16)?,
+            },
+            _ => bail!("unsupported tree feature size"),
+        };
+        Ok(Self {
+            layers,
+            min_clipped_height,
+        })
+    }
+
+    pub fn radius_at(&self, height: i32, y: i32) -> i32 {
+        match self.layers {
+            TreeSizeLayers::Two {
+                limit,
+                lower,
+                upper,
+            } => {
+                if y < limit {
+                    lower
+                } else {
+                    upper
+                }
+            }
+            TreeSizeLayers::Three {
+                limit,
+                upper_limit,
+                lower,
+                middle,
+                upper,
+            } => {
+                if y < limit {
+                    lower
+                } else if y >= height - upper_limit {
+                    upper
+                } else {
+                    middle
+                }
+            }
+        }
+    }
+}
+
+/// Tree placers may have different free-space rules; vines are checked only
+/// after the placer reports that a position is free.
+pub trait TreeClearanceWorld {
+    fn is_free(&mut self, pos: [i32; 3]) -> Result<bool>;
+    fn is_vine(&mut self, pos: [i32; 3]) -> Result<bool>;
+}
+
+/// Clearance for vanilla trunk placers backed by the world's active tags.
+pub struct VanillaTreeClearance<'a, W>(pub &'a mut W);
+
+impl<W: OreWorld> TreeClearanceWorld for VanillaTreeClearance<'_, W> {
+    fn is_free(&mut self, pos: [i32; 3]) -> Result<bool> {
+        static REPLACEABLE: OnceLock<ResourceId> = OnceLock::new();
+        static LOGS: OnceLock<ResourceId> = OnceLock::new();
+        let state = self.0.block(pos)?;
+        Ok(self.0.is_air(&state)?
+            || self.0.in_tag(
+                &state,
+                REPLACEABLE
+                    .get_or_init(|| ResourceId::parse("minecraft:replaceable_by_trees").unwrap()),
+            )?
+            || self.0.in_tag(
+                &state,
+                LOGS.get_or_init(|| ResourceId::parse("minecraft:logs").unwrap()),
+            )?)
+    }
+
+    fn is_vine(&mut self, pos: [i32; 3]) -> Result<bool> {
+        static VINE: OnceLock<ResourceId> = OnceLock::new();
+        let state = self.0.block(pos)?;
+        self.0.block_is(
+            &state,
+            VINE.get_or_init(|| ResourceId::parse("minecraft:vine").unwrap()),
+        )
+    }
+}
+
+pub fn max_free_tree_height(
+    world: &mut impl TreeClearanceWorld,
+    origin: [i32; 3],
+    height: i32,
+    size: &TreeFeatureSize,
+    ignore_vines: bool,
+) -> Result<i32> {
+    ensure!((0..=80).contains(&height), "invalid tree height");
+    for y in 0..=height + 1 {
+        let radius = size.radius_at(height, y);
+        for x in -radius..=radius {
+            for z in -radius..=radius {
+                let pos = [
+                    origin[0].wrapping_add(x),
+                    origin[1].wrapping_add(y),
+                    origin[2].wrapping_add(z),
+                ];
+                if !world.is_free(pos)? || (!ignore_vines && world.is_vine(pos)?) {
+                    return Ok(y - 2);
+                }
+            }
+        }
+    }
+    Ok(height)
+}
+
+/// Return the height used by the tree placer, or None when the tree cannot fit.
+/// `max_y` is the world's inclusive upper block coordinate, as in Java 26.3.
+pub fn permitted_tree_height(
+    world: &mut impl TreeClearanceWorld,
+    root: [i32; 3],
+    trunk: [i32; 3],
+    min_y: i32,
+    max_y: i32,
+    height: i32,
+    size: &TreeFeatureSize,
+    ignore_vines: bool,
+) -> Result<Option<i32>> {
+    ensure!((0..=80).contains(&height), "invalid tree height");
+    if root[1].min(trunk[1]) < min_y.wrapping_add(1)
+        || root[1].max(trunk[1]).wrapping_add(height).wrapping_add(1) > max_y.wrapping_add(1)
+    {
+        return Ok(None);
+    }
+    let free = max_free_tree_height(world, trunk, height, size, ignore_vines)?;
+    if free < height && size.min_clipped_height.is_none_or(|min| free < min) {
+        Ok(None)
+    } else {
+        Ok(Some(free))
+    }
+}
 
 /// The common height calculation used by vanilla trunk placers.
 pub struct TrunkHeight {

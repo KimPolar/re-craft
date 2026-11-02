@@ -167,6 +167,9 @@ fn generated_block_defaults_match_java() {
         .arg(&cp)
         .arg(&source));
     let mut cases = vec![
+        serde_json::json!("minecraft:glow_lichen"),
+        serde_json::json!({"id":"minecraft:glow_lichen","properties":{"down":"true","north":"true","waterlogged":"true"}}),
+        serde_json::json!({"id":"minecraft:glow_lichen","properties":{"up":"invalid","east":"true"}}),
         serde_json::json!("minecraft:stone"),
         serde_json::json!("minecraft:diamond_ore"),
         serde_json::json!("minecraft:deepslate_diamond_ore"),

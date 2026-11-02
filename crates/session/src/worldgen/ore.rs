@@ -18,6 +18,7 @@ use native_resources::{
     heightmap_tags::HeightmapTags,
     lake_feature::{LakeFeature, LakeWorld},
     monster_room::{RoomBlock, RoomMob, place_monster_room},
+    multiface_growth::{BlockSet as MultifaceBlockSet, Face as MultifaceFace, MultifaceGrowth},
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
@@ -98,6 +99,7 @@ enum ConfiguredDecoration {
     Freeze,
     MonsterRoom,
     Geode(GeodeFeature<BlockState>),
+    Multiface(MultifaceGrowth),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -122,6 +124,7 @@ impl ConfiguredDecoration {
             Self::Tree(v) => v.required_blocks(),
             Self::FallenTree(v) => v.required_blocks(),
             Self::Geode(v) => v.required_blocks(),
+            Self::Multiface(v) => v.required_blocks(),
             Self::Freeze => ["minecraft:ice", "minecraft:snow"]
                 .into_iter()
                 .map(|v| ResourceId::parse(v).unwrap())
@@ -222,6 +225,9 @@ impl ConfiguredDecoration {
             ("minecraft", "freeze_top_layer") => Ok(Self::Freeze),
             ("minecraft", "monster_room") => Ok(Self::MonsterRoom),
             ("minecraft", "geode") => Ok(Self::Geode(GeodeFeature::decode(value, resolve)?)),
+            ("minecraft", "multiface_growth") => {
+                Ok(Self::Multiface(MultifaceGrowth::decode(value)?))
+            }
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -296,6 +302,7 @@ impl ConfiguredDecoration {
             }
             Self::FallenTree(v) => v.required_tags(),
             Self::Geode(v) => v.required_tags(),
+            Self::Multiface(v) => v.required_tags(),
             Self::Freeze => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
@@ -351,6 +358,7 @@ impl ConfiguredDecoration {
             Self::Freeze => freeze_top_layer(world, pos),
             Self::MonsterRoom => place_monster_room(world, random, pos),
             Self::Geode(v) => v.place(world, random, world.target.seed, pos),
+            Self::Multiface(v) => v.place(world, random, pos),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -2408,6 +2416,189 @@ fn geode_safe_state(state: &BlockState) -> Result<()> {
     Ok(())
 }
 
+fn multiface_name(face: MultifaceFace) -> &'static str {
+    match face {
+        MultifaceFace::Down => "down",
+        MultifaceFace::Up => "up",
+        MultifaceFace::North => "north",
+        MultifaceFace::South => "south",
+        MultifaceFace::West => "west",
+        MultifaceFace::East => "east",
+    }
+}
+fn valid_lichen(state: &BlockState) -> bool {
+    state.name == "minecraft:glow_lichen"
+        && state.properties.len() == 7
+        && [
+            "down",
+            "up",
+            "north",
+            "south",
+            "west",
+            "east",
+            "waterlogged",
+        ]
+        .into_iter()
+        .all(|name| {
+            matches!(
+                state.properties.get(name).map(String::as_str),
+                Some("true" | "false")
+            )
+        })
+}
+fn multiface_support(state: &BlockState) -> Result<bool> {
+    if is_air(state)
+        || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
+        || valid_lichen(state)
+    {
+        return Ok(false);
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:stone"
+            | "minecraft:andesite"
+            | "minecraft:diorite"
+            | "minecraft:granite"
+            | "minecraft:dripstone_block"
+            | "minecraft:calcite"
+            | "minecraft:tuff"
+            | "minecraft:deepslate"
+            | "minecraft:sulfur"
+            | "minecraft:cinnabar"
+            | "minecraft:bedrock"
+            | "minecraft:amethyst_block"
+            | "minecraft:budding_amethyst"
+            | "minecraft:smooth_basalt"
+    ) {
+        return Ok(true);
+    }
+    bail!("unsupported multiface support shape for {}", state.name)
+}
+impl native_resources::multiface_growth::MultifaceWorld for DecorationRegion<'_> {
+    type State = BlockState;
+    fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        OreWorld::block(self, pos)
+    }
+    fn air_or_water(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(is_air(state) || state.name == "minecraft:water")
+    }
+    fn is_growth(&mut self, state: &BlockState, block: &ResourceId) -> Result<bool> {
+        Ok(state
+            .name
+            .split_once(':')
+            .is_some_and(|(namespace, path)| namespace == block.namespace && path == block.path))
+    }
+    fn in_block_set(&mut self, state: &BlockState, set: &MultifaceBlockSet) -> Result<bool> {
+        match set {
+            MultifaceBlockSet::Tag(id) => self.tags.contains(id, &state.name),
+            MultifaceBlockSet::Blocks(ids) => {
+                Ok(state.name.split_once(':').is_some_and(|(namespace, path)| {
+                    ids.iter()
+                        .any(|id| namespace == id.namespace && path == id.path)
+                }))
+            }
+        }
+    }
+    fn state_for_placement(
+        &mut self,
+        block: &ResourceId,
+        existing: &BlockState,
+        pos: [i32; 3],
+        face: MultifaceFace,
+    ) -> Result<Option<BlockState>> {
+        ensure!(
+            block.namespace == "minecraft" && block.path == "glow_lichen",
+            "unsupported multiface block"
+        );
+        if existing.name == "minecraft:glow_lichen" {
+            ensure!(valid_lichen(existing), "invalid glow lichen state");
+            if existing.properties[multiface_name(face)] == "true" {
+                return Ok(None);
+            }
+        }
+        let support = OreWorld::block(self, face.offset(pos))?;
+        if !multiface_support(&support)? {
+            return Ok(None);
+        }
+        let mut result = if existing.name == "minecraft:glow_lichen" {
+            existing.clone()
+        } else {
+            let fluid = native_world::fluid::FluidState::from_block(existing)
+                .map_err(anyhow::Error::msg)?;
+            let waterlogged =
+                fluid.is_some_and(|v| v.kind == native_world::fluid::FluidKind::Water && v.source);
+            let mut properties = [
+                "down",
+                "up",
+                "north",
+                "south",
+                "west",
+                "east",
+                "waterlogged",
+            ]
+            .into_iter()
+            .map(|s| (s.to_owned(), "false".to_owned()))
+            .collect::<BTreeMap<_, _>>();
+            properties.insert("waterlogged".into(), waterlogged.to_string());
+            BlockState {
+                name: "minecraft:glow_lichen".into(),
+                properties,
+            }
+        };
+        result
+            .properties
+            .insert(multiface_name(face).into(), "true".into());
+        Ok(Some(result))
+    }
+    fn has_face(&mut self, state: &BlockState, face: MultifaceFace) -> Result<bool> {
+        ensure!(valid_lichen(state), "invalid glow lichen state");
+        Ok(state.properties[multiface_name(face)] == "true")
+    }
+    fn can_replace_for_spread(&mut self, state: &BlockState, block: &ResourceId) -> Result<bool> {
+        ensure!(
+            block.namespace == "minecraft" && block.path == "glow_lichen",
+            "unsupported multiface block"
+        );
+        if is_air(state) {
+            return Ok(true);
+        }
+        if state.name == "minecraft:glow_lichen" {
+            ensure!(valid_lichen(state), "invalid glow lichen state");
+            return Ok(true);
+        }
+        if state.name != "minecraft:water" {
+            return Ok(false);
+        }
+        Ok(native_world::fluid::FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|v| v.source))
+    }
+    fn set_growth(&mut self, pos: [i32; 3], state: &BlockState, _initial: bool) -> Result<bool> {
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(false);
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "multiface chunk missing"
+        );
+        ensure!(valid_lichen(state), "invalid glow lichen write");
+        if self.is_outside(pos[1]) {
+            return Ok(true);
+        }
+        let old = self.read(pos)?;
+        ensure!(
+            is_air(&old) || old.name == "minecraft:water" || valid_lichen(&old),
+            "unsupported multiface replacement effect"
+        );
+        self.set_section_block(pos, state)?;
+        self.update_final_heightmaps(pos, state)?;
+        Ok(true)
+    }
+    fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()> {
+        DiskWorld::mark_postprocessing(self, pos)
+    }
+}
+
 impl GeodeEnvironment for DecorationRegion<'_> {
     fn set_geode_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
         if !self.writable.contains(&chunk(pos)) {
@@ -3345,6 +3536,56 @@ mod tests {
         assert!(
             region
                 .place_placed(&placed, &mut random, [0, 4, 0], 0, 16, &mut env)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), original.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn unknown_multiface_support_rolls_back_random_and_terrain() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let air = world.intern_state(state("air"));
+        let unknown = world.intern_state(state("diamond_block"));
+        let center = ChunkPos { x: 0, z: 0 };
+        let chunk = Arc::make_mut(world.chunks.get_mut(&center).unwrap());
+        let blocks = Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+            .blocks
+            .as_mut()
+            .unwrap();
+        blocks.fill(air);
+        for [x, y, z] in [
+            [8, 7, 8],
+            [8, 9, 8],
+            [8, 8, 7],
+            [8, 8, 9],
+            [7, 8, 8],
+            [9, 8, 8],
+        ] {
+            blocks[(x + z * 16 + y * 256) as usize] = unknown;
+        }
+        let value = json!({"type":"minecraft:multiface_growth","block":"minecraft:glow_lichen","can_place_on_floor":true,"can_place_on_ceiling":true,"can_place_on_wall":true,"can_be_placed_on":["minecraft:diamond_block"]});
+        let placed = PlacedDecorationFeature {
+            placement: PlacedFeature::decode(&json!({"feature":"minecraft:test","placement":[]}))
+                .unwrap(),
+            feature: ConfiguredDecoration::Multiface(MultifaceGrowth::decode(&value).unwrap()),
+        };
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut random = DecorationRandom::new(7);
+        let mut original = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
                 .is_err()
         );
         assert_eq!(random.next_long(), original.next_long());
@@ -5097,6 +5338,212 @@ mod tests {
         assert!(
             wrote_crystal && saw_tick,
             "oracle must cover crystal and fluid effects"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_glow_lichen_matches_java_in_generated_chunks() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("MultifaceOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/MultifaceOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let output = c.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let oracle = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MultifaceOracle")
+            .arg("chunk"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:glow_lichen","placement":[]}))
+                .unwrap();
+        let placed = PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |v| {
+            super::super::resolve_generated_terrain_state(v, &generated)
+        })
+        .unwrap();
+        let tags = OreBlockTags::load(&mut resources, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut saw_write = false;
+        let mut saw_spread = false;
+        for mode in 0..6 {
+            for seed in [0, 1, -1, 123456789] {
+                let (mut terrain, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut terrain.world);
+                let air = world.intern_state(state("air"));
+                let stone = world.intern_state(state("stone"));
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let source_water = world.intern_state(water.clone());
+                water.properties.insert("level".into(), "5".into());
+                let flowing_water = world.intern_state(water);
+                let mut lichen = super::super::resolve_generated_terrain_state(
+                    &json!("minecraft:glow_lichen"),
+                    &generated,
+                )
+                .unwrap();
+                lichen.properties.insert("east".into(), "true".into());
+                let lichen = world.intern_state(lichen);
+                let chunk = Arc::make_mut(world.chunks.get_mut(&center).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                let blocks = section.blocks.as_mut().unwrap();
+                for y in 0..16i32 {
+                    for z in 0..16i32 {
+                        for x in 0..16i32 {
+                            let (dx, dy, dz) = (x - 8, y - 8, z - 8);
+                            blocks[(x + z * 16 + y * 256) as usize] = if mode == 0 {
+                                air
+                            } else if mode == 1 && dy >= 1 {
+                                stone
+                            } else if mode >= 2
+                                && (dx >= 2
+                                    || dy >= 2
+                                    || dz >= 2
+                                    || dx <= -2
+                                    || dy <= -2
+                                    || dz <= -2)
+                            {
+                                stone
+                            } else if mode == 3 {
+                                source_water
+                            } else if mode == 4 {
+                                flowing_water
+                            } else if mode == 5 && (dx, dy, dz) == (1, 0, 0) {
+                                lichen
+                            } else {
+                                air
+                            };
+                        }
+                    }
+                }
+                let before = terrain.snapshot();
+                let mut region = terrain
+                    .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                    .unwrap();
+                let mut random = DecorationRandom::new(seed);
+                let mut env = PlacementTestEnv {
+                    allow: true,
+                    fail_after: None,
+                    calls: 0,
+                };
+                let ok = region
+                    .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                    .unwrap();
+                region.finish().unwrap();
+                let prefix = format!("C {mode} 0 {seed} ");
+                let line = oracle
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&prefix))
+                    .unwrap();
+                let (java_ok, rest) = line.split_once(" W ").unwrap();
+                let (writes, rest) = rest.split_once(" M ").unwrap();
+                let (marks, next) = rest.split_once(" R ").unwrap();
+                assert_eq!(ok, java_ok.parse::<bool>().unwrap());
+                assert_eq!(random.next_long(), next.parse::<i64>().unwrap());
+                let mut expected = BTreeMap::new();
+                if !writes.is_empty() {
+                    for item in writes.split(';') {
+                        let a = item.split(',').collect::<Vec<_>>();
+                        let p = [
+                            a[0].parse::<i32>().unwrap(),
+                            a[1].parse::<i32>().unwrap(),
+                            a[2].parse::<i32>().unwrap(),
+                        ];
+                        let (mask, wet) = a[3].split_once(':').unwrap();
+                        let mask = mask.parse::<u8>().unwrap();
+                        let mut block = super::super::resolve_generated_terrain_state(
+                            &json!("minecraft:glow_lichen"),
+                            &generated,
+                        )
+                        .unwrap();
+                        for (i, name) in ["down", "up", "north", "south", "west", "east"]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            block
+                                .properties
+                                .insert(name.into(), (mask & (1 << i) != 0).to_string());
+                        }
+                        block.properties.insert("waterlogged".into(), wet.into());
+                        expected.insert(p, block);
+                        saw_write = true;
+                        saw_spread |= a[4] == "false";
+                    }
+                }
+                let after = terrain.snapshot();
+                for y in 0..16 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [x, y, z];
+                            assert_eq!(
+                                after.block(x, y, z),
+                                expected.get(&p).or_else(|| before.block(x, y, z)),
+                                "mode {mode} seed {seed} {p:?}"
+                            );
+                        }
+                    }
+                }
+                let expected_marks: Vec<i16> = if marks.is_empty() {
+                    vec![]
+                } else {
+                    marks
+                        .split(';')
+                        .map(|v| {
+                            let a = v
+                                .split(',')
+                                .map(|x| x.parse::<i32>().unwrap())
+                                .collect::<Vec<_>>();
+                            (a[0] | a[1] << 4 | a[2] << 8) as i16
+                        })
+                        .collect()
+                };
+                let actual_marks = terrain
+                    .feature_postprocessing(center)
+                    .map(|p| p.sections()[0].clone())
+                    .unwrap_or_default();
+                assert_eq!(actual_marks, expected_marks, "mode {mode} seed {seed}");
+            }
+        }
+        assert!(
+            saw_write && saw_spread,
+            "oracle must cover placement and spread"
         );
     }
 

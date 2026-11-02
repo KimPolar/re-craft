@@ -33,6 +33,7 @@ enum StateSchema {
     Sapling,
     Leaves,
     AmethystCluster,
+    Multiface,
 }
 
 impl StateSchema {
@@ -52,6 +53,20 @@ impl StateSchema {
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
+            Self::Multiface => {
+                return [
+                    "down",
+                    "up",
+                    "north",
+                    "south",
+                    "west",
+                    "east",
+                    "waterlogged",
+                ]
+                .into_iter()
+                .map(|name| (name.into(), "false".into()))
+                .collect();
+            }
             Self::Snowy => ("snowy", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
@@ -65,6 +80,14 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Multiface
+                if matches!(
+                    name,
+                    "down" | "up" | "north" | "south" | "west" | "east" | "waterlogged"
+                ) && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
             Self::AmethystCluster
                 if name == "facing"
                     && matches!(value, "down" | "up" | "north" | "south" | "west" | "east") =>
@@ -248,6 +271,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
                 }
+                "net/minecraft/world/level/block/GlowLichenBlock" => Some(StateSchema::Multiface),
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"
                 | "net/minecraft/world/level/block/TallFlowerBlock" => {

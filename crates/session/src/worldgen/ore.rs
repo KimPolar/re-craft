@@ -3927,6 +3927,9 @@ impl DiskWorld for DecorationRegion<'_> {
         if tree_generated_leaf(state)? || tree_generated_log(state) || tree_mushroom_block(state)? {
             return Ok(true);
         }
+        if tree_cave_vines(state)? || generated_dripleaf(state)? {
+            return Ok(false);
+        }
         if let Some(solid) = disk_safe_solid(&state.name) {
             return Ok(solid);
         }
@@ -7172,6 +7175,7 @@ mod tests {
         let predicate =
             BlockPredicate::decode(&json!({"type":"minecraft:solid","offset":[1,-2,3]})).unwrap();
         let mut count = 0;
+        let mut families = BTreeMap::<String, usize>::new();
         for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
             let parts: Vec<_> = line.split_whitespace().collect();
             assert_eq!(parts.len(), 3, "{line}");
@@ -7195,8 +7199,22 @@ mod tests {
                 "{line}"
             );
             count += 1;
+            *families.entry(parts[0].to_owned()).or_default() += 1;
         }
         assert!(count >= 300, "missing Java state comparisons: {count}");
+        for (name, expected) in [
+            ("cave_vines", 52),
+            ("cave_vines_plant", 2),
+            ("big_dripleaf", 32),
+            ("big_dripleaf_stem", 8),
+            ("small_dripleaf", 16),
+        ] {
+            assert_eq!(
+                families.get(name),
+                Some(&expected),
+                "missing Java states for {name}"
+            );
+        }
     }
 
     #[test]

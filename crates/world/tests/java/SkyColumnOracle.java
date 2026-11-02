@@ -44,6 +44,11 @@ public class SkyColumnOracle implements BlockGetter {
             case "glass" -> Blocks.GLASS.defaultBlockState();
             case "torch" -> Blocks.TORCH.defaultBlockState();
             case "mushroom" -> Blocks.BROWN_MUSHROOM.defaultBlockState();
+            case "red_cap" -> Blocks.RED_MUSHROOM_BLOCK.defaultBlockState();
+            case "red_cap_none" -> Blocks.RED_MUSHROOM_BLOCK.defaultBlockState().setValue(HugeMushroomBlock.DOWN,false).setValue(HugeMushroomBlock.UP,false).setValue(HugeMushroomBlock.NORTH,false).setValue(HugeMushroomBlock.SOUTH,false).setValue(HugeMushroomBlock.WEST,false).setValue(HugeMushroomBlock.EAST,false);
+            case "brown_cap" -> Blocks.BROWN_MUSHROOM_BLOCK.defaultBlockState().setValue(HugeMushroomBlock.UP,false).setValue(HugeMushroomBlock.NORTH,false);
+            case "mushroom_stem" -> Blocks.MUSHROOM_STEM.defaultBlockState().setValue(HugeMushroomBlock.DOWN,false);
+            case "moss_carpet" -> Blocks.MOSS_CARPET.defaultBlockState();
             case "slab_bottom" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM);
             case "slab_top" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.TOP);
             case "slab_double" -> Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.DOUBLE);

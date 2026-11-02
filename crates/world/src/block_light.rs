@@ -153,6 +153,37 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         (value <= maximum && value.to_string() == *raw).then_some(())
     };
     let pair = match state.name.as_str() {
+        "minecraft:red_mushroom_block"
+        | "minecraft:brown_mushroom_block"
+        | "minecraft:mushroom_stem"
+            if state.properties.len() == 6
+                && ["up", "down", "north", "south", "east", "west"]
+                    .iter()
+                    .all(|face| boolean(face).is_some()) =>
+        {
+            (15, 0)
+        }
+        "minecraft:moss_carpet"
+        | "minecraft:white_carpet"
+        | "minecraft:orange_carpet"
+        | "minecraft:magenta_carpet"
+        | "minecraft:light_blue_carpet"
+        | "minecraft:yellow_carpet"
+        | "minecraft:lime_carpet"
+        | "minecraft:pink_carpet"
+        | "minecraft:gray_carpet"
+        | "minecraft:light_gray_carpet"
+        | "minecraft:cyan_carpet"
+        | "minecraft:purple_carpet"
+        | "minecraft:blue_carpet"
+        | "minecraft:brown_carpet"
+        | "minecraft:green_carpet"
+        | "minecraft:red_carpet"
+        | "minecraft:black_carpet"
+            if state.properties.is_empty() =>
+        {
+            (0, 0)
+        }
         "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
             if state.properties.is_empty() =>
         {
@@ -1675,6 +1706,18 @@ mod tests {
     }
 
     #[test]
+    fn mushroom_light_requires_all_six_valid_faces() {
+        let mut block = state("red_mushroom_block", None);
+        assert!(light_properties(&block).is_none());
+        for face in ["up", "down", "north", "south", "east", "west"] {
+            block.properties.insert(face.into(), "false".into());
+        }
+        assert_eq!(properties(&block), Some((15, 0)));
+        block.properties.insert("west".into(), "invalid".into());
+        assert!(light_properties(&block).is_none());
+    }
+
+    #[test]
     fn ordinary_light_checks_only_skip_known_equivalent_states() {
         let blocks: Vec<_> = ["stone", "dirt", "sand", "gravel"]
             .into_iter()
@@ -2054,6 +2097,26 @@ mod tests {
             .arg(&cp)
             .arg(&source));
         let names = [
+            "red_mushroom_block",
+            "brown_mushroom_block",
+            "mushroom_stem",
+            "moss_carpet",
+            "white_carpet",
+            "orange_carpet",
+            "magenta_carpet",
+            "light_blue_carpet",
+            "yellow_carpet",
+            "lime_carpet",
+            "pink_carpet",
+            "gray_carpet",
+            "light_gray_carpet",
+            "cyan_carpet",
+            "purple_carpet",
+            "blue_carpet",
+            "brown_carpet",
+            "green_carpet",
+            "red_carpet",
+            "black_carpet",
             "glow_lichen",
             "amethyst_block",
             "budding_amethyst",

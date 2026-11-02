@@ -635,6 +635,63 @@ mod tests {
                     ],
                 ),
             ),
+            (
+                "red_cap",
+                state(
+                    "red_mushroom_block",
+                    &[
+                        ("down", "true"),
+                        ("up", "true"),
+                        ("north", "true"),
+                        ("south", "true"),
+                        ("west", "true"),
+                        ("east", "true"),
+                    ],
+                ),
+            ),
+            (
+                "red_cap_none",
+                state(
+                    "red_mushroom_block",
+                    &[
+                        ("down", "false"),
+                        ("up", "false"),
+                        ("north", "false"),
+                        ("south", "false"),
+                        ("west", "false"),
+                        ("east", "false"),
+                    ],
+                ),
+            ),
+            (
+                "brown_cap",
+                state(
+                    "brown_mushroom_block",
+                    &[
+                        ("down", "true"),
+                        ("up", "false"),
+                        ("north", "false"),
+                        ("south", "true"),
+                        ("west", "true"),
+                        ("east", "true"),
+                    ],
+                ),
+            ),
+            (
+                "mushroom_stem",
+                state(
+                    "mushroom_stem",
+                    &[
+                        ("down", "false"),
+                        ("up", "true"),
+                        ("north", "true"),
+                        ("south", "true"),
+                        ("west", "true"),
+                        ("east", "true"),
+                    ],
+                ),
+            ),
+            ("moss_carpet", state("moss_carpet", &[])),
         ];
         let mut actions = vec![
             (0, 6),

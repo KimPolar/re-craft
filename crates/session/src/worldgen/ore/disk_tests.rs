@@ -83,6 +83,7 @@ fn terrain() -> CarvedTerrainWorld {
         carver_postprocessing: BTreeMap::new(),
         feature_postprocessing: BTreeMap::new(),
         generated_bee_nests: Arc::new(BTreeMap::new()),
+        generated_monster_entities: Arc::new(BTreeMap::new()),
     }
 }
 const SOLID: &[&str] = &[

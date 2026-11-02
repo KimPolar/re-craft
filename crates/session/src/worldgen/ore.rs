@@ -16,6 +16,7 @@ use native_resources::{
     freeze_feature::freeze_top_layer,
     heightmap_tags::HeightmapTags,
     lake_feature::{LakeFeature, LakeWorld},
+    monster_room::{RoomBlock, RoomMob, place_monster_room},
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
     packs::{ResourceId, ResourceProvider},
     placed_feature::{PlacedFeature, PlacementEnvironment},
@@ -58,6 +59,8 @@ pub struct DecorationRegion<'a> {
     freeze_context: Option<FreezeContext<'a>>,
     tree_decorations: Vec<[i32; 3]>,
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
+    monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
+    pending_monster_spawners: usize,
     failed: bool,
 }
 
@@ -92,6 +95,7 @@ enum ConfiguredDecoration {
     Tree(TreeFeature<BlockState>),
     FallenTree(FallenTreeFeature<BlockState>),
     Freeze,
+    MonsterRoom,
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -119,6 +123,16 @@ impl ConfiguredDecoration {
                 .into_iter()
                 .map(|v| ResourceId::parse(v).unwrap())
                 .collect(),
+            Self::MonsterRoom => [
+                "minecraft:cave_air",
+                "minecraft:cobblestone",
+                "minecraft:mossy_cobblestone",
+                "minecraft:chest",
+                "minecraft:spawner",
+            ]
+            .into_iter()
+            .map(|v| ResourceId::parse(v).unwrap())
+            .collect(),
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_blocks)
@@ -202,6 +216,7 @@ impl ConfiguredDecoration {
                 provider, value, resolve,
             )?)),
             ("minecraft", "freeze_top_layer") => Ok(Self::Freeze),
+            ("minecraft", "monster_room") => Ok(Self::MonsterRoom),
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -276,6 +291,9 @@ impl ConfiguredDecoration {
             }
             Self::FallenTree(v) => v.required_tags(),
             Self::Freeze => BTreeSet::new(),
+            Self::MonsterRoom => {
+                BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
+            }
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_tags)
@@ -325,6 +343,7 @@ impl ConfiguredDecoration {
             Self::Lake(v) => v.place(world, random, pos),
             Self::FallenTree(v) => v.place(world, random, pos),
             Self::Freeze => freeze_top_layer(world, pos),
+            Self::MonsterRoom => place_monster_room(world, random, pos),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -843,6 +862,7 @@ impl CarvedTerrainWorld {
         let final_heights = self.final_heightmaps.clone();
         let feature_marks = self.feature_postprocessing.clone();
         let bee_nests = self.generated_bee_nests.clone();
+        let monster_entities = self.generated_monster_entities.clone();
         Ok(DecorationRegion {
             target: self,
             world,
@@ -864,6 +884,8 @@ impl CarvedTerrainWorld {
             freeze_context: None,
             tree_decorations: Vec::new(),
             bee_nests,
+            monster_entities,
+            pending_monster_spawners: 0,
             failed: false,
         })
     }
@@ -1039,12 +1061,17 @@ impl DecorationRegion<'_> {
     /// Publish this intermediate state; it is not a finished or saveable chunk.
     pub fn finish(self) -> Result<()> {
         ensure!(!self.failed, "cannot publish a failed generation attempt");
+        ensure!(
+            self.pending_monster_spawners == 0,
+            "unfinished generated spawner data"
+        );
         self.target.world = Arc::new(self.world);
         self.target.ore_ocean_floor_heights = self.heights;
         self.target.feature_world_surface_heights = self.surface_heights;
         self.target.final_heightmaps = self.final_heights;
         self.target.feature_postprocessing = self.feature_marks;
         self.target.generated_bee_nests = self.bee_nests;
+        self.target.generated_monster_entities = self.monster_entities;
         Ok(())
     }
 
@@ -1718,6 +1745,285 @@ impl FallenFeatureWorld for DecorationRegion<'_> {
             "unsupported fallen tree decoration effects"
         );
         self.set_fallen_block(pos, &state)
+    }
+}
+
+// Only state families independently checked against 26.3 are accepted here.
+fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
+    let name = state.name.as_str();
+    if is_air(state) {
+        return Ok((false, false));
+    }
+    if matches!(name, "minecraft:water" | "minecraft:lava") {
+        native_world::fluid::FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .context("invalid monster-room fluid")?;
+        return Ok((false, false));
+    }
+    if name == "minecraft:chest" {
+        ensure!(
+            state.properties.len() == 3
+                && matches!(
+                    state.properties.get("facing").map(String::as_str),
+                    Some("north" | "south" | "east" | "west")
+                )
+                && matches!(
+                    state.properties.get("type").map(String::as_str),
+                    Some("single" | "left" | "right")
+                )
+                && matches!(
+                    state.properties.get("waterlogged").map(String::as_str),
+                    Some("true" | "false")
+                ),
+            "invalid monster-room chest state"
+        );
+        return Ok((true, false));
+    }
+    if name == "minecraft:spawner" {
+        ensure!(state.properties.is_empty(), "invalid spawner state");
+        return Ok((true, false));
+    }
+    if matches!(
+        name,
+        "minecraft:stone"
+            | "minecraft:deepslate"
+            | "minecraft:tuff"
+            | "minecraft:granite"
+            | "minecraft:diorite"
+            | "minecraft:andesite"
+            | "minecraft:calcite"
+            | "minecraft:dirt"
+            | "minecraft:coarse_dirt"
+            | "minecraft:clay"
+            | "minecraft:gravel"
+            | "minecraft:sand"
+            | "minecraft:red_sand"
+            | "minecraft:sandstone"
+            | "minecraft:bedrock"
+            | "minecraft:cobblestone"
+            | "minecraft:mossy_cobblestone"
+            | "minecraft:cobbled_deepslate"
+            | "minecraft:coal_ore"
+            | "minecraft:deepslate_coal_ore"
+            | "minecraft:iron_ore"
+            | "minecraft:deepslate_iron_ore"
+            | "minecraft:copper_ore"
+            | "minecraft:deepslate_copper_ore"
+            | "minecraft:gold_ore"
+            | "minecraft:deepslate_gold_ore"
+            | "minecraft:redstone_ore"
+            | "minecraft:deepslate_redstone_ore"
+            | "minecraft:emerald_ore"
+            | "minecraft:deepslate_emerald_ore"
+            | "minecraft:lapis_ore"
+            | "minecraft:deepslate_lapis_ore"
+            | "minecraft:diamond_ore"
+            | "minecraft:deepslate_diamond_ore"
+            | "minecraft:netherrack"
+            | "minecraft:basalt"
+            | "minecraft:blackstone"
+            | "minecraft:ancient_debris"
+    ) {
+        // These state families retain their flags across axis and lit values.
+        ensure!(
+            state.properties.is_empty()
+                || matches!(
+                    name,
+                    "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
+                ) && state.properties.len() == 1
+                    && matches!(
+                        state.properties.get("lit").map(String::as_str),
+                        Some("true" | "false")
+                    )
+                || matches!(name, "minecraft:deepslate" | "minecraft:basalt")
+                    && state.properties.len() == 1
+                    && matches!(
+                        state.properties.get("axis").map(String::as_str),
+                        Some("x" | "y" | "z")
+                    ),
+            "unsupported monster-room block state"
+        );
+        return Ok((true, true));
+    }
+    bail!("unsupported monster-room block {}", name)
+}
+impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
+    type State = BlockState;
+    fn min_y(&self) -> i32 {
+        self.target.min_y
+    }
+    fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        OreWorld::block(self, pos)
+    }
+    fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(monster_block_flags(state)?.0)
+    }
+    fn is_solid_render(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(monster_block_flags(state)?.1)
+    }
+    fn is_air(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(is_air(state))
+    }
+    fn is_chest(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(state.name == "minecraft:chest")
+    }
+    fn is_spawner(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(state.name == "minecraft:spawner")
+    }
+    fn may_replace(&mut self, state: &BlockState) -> Result<bool> {
+        static CANNOT: OnceLock<ResourceId> = OnceLock::new();
+        Ok(!self.tags.contains(
+            CANNOT.get_or_init(|| ResourceId::parse("minecraft:features_cannot_replace").unwrap()),
+            &state.name,
+        )?)
+    }
+    fn set_block(&mut self, pos: [i32; 3], kind: RoomBlock) -> Result<()> {
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "monster-room chunk is missing"
+        );
+        if self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        let old = self.read(pos)?;
+        monster_block_flags(&old)?;
+        if matches!(old.name.as_str(), "minecraft:chest" | "minecraft:spawner") {
+            ensure!(
+                self.monster_entities.contains_key(&pos),
+                "existing monster-room block entity is unavailable"
+            );
+            ensure!(
+                !(old.name == "minecraft:spawner" && matches!(kind, RoomBlock::Spawner)),
+                "rewriting an existing generated spawner is not supported"
+            );
+        }
+        let state = match kind {
+            RoomBlock::CaveAir => BlockState {
+                name: "minecraft:cave_air".into(),
+                properties: BTreeMap::new(),
+            },
+            RoomBlock::Cobblestone => BlockState {
+                name: "minecraft:cobblestone".into(),
+                properties: BTreeMap::new(),
+            },
+            RoomBlock::MossyCobblestone => BlockState {
+                name: "minecraft:mossy_cobblestone".into(),
+                properties: BTreeMap::new(),
+            },
+            RoomBlock::Spawner => BlockState {
+                name: "minecraft:spawner".into(),
+                properties: BTreeMap::new(),
+            },
+            RoomBlock::Chest(facing) => {
+                let facing = match facing {
+                    native_resources::structure_start::HorizontalDirection::North => "north",
+                    native_resources::structure_start::HorizontalDirection::East => "east",
+                    native_resources::structure_start::HorizontalDirection::South => "south",
+                    native_resources::structure_start::HorizontalDirection::West => "west",
+                };
+                BlockState {
+                    name: "minecraft:chest".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), facing.into()),
+                        ("type".into(), "single".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                }
+            }
+        };
+        if matches!(self.monster_entities.get(&pos), Some(None)) {
+            self.pending_monster_spawners = self
+                .pending_monster_spawners
+                .checked_sub(1)
+                .context("invalid pending spawner count")?;
+        }
+        if self.monster_entities.contains_key(&pos) {
+            Arc::make_mut(&mut self.monster_entities).remove(&pos);
+        }
+        self.set_section_block(pos, &state)?;
+        self.update_final_heightmaps(pos, &state)?;
+        match kind {
+            RoomBlock::Chest(facing) => {
+                let chest = super::GeneratedLootChest::new(
+                    pos,
+                    facing,
+                    "minecraft:chests/simple_dungeon",
+                    0,
+                )?;
+                Arc::make_mut(&mut self.monster_entities)
+                    .insert(pos, Some(super::GeneratedMonsterRoomEntity::Chest(chest)));
+            }
+            RoomBlock::Spawner => {
+                Arc::make_mut(&mut self.monster_entities).insert(pos, None);
+                self.pending_monster_spawners += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn chest_entity_exists(&mut self, pos: [i32; 3]) -> Result<bool> {
+        if OreWorld::block(self, pos)?.name != "minecraft:chest" {
+            return Ok(false);
+        }
+        match self.monster_entities.get(&pos) {
+            Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => Ok(true),
+            _ => bail!("chest block entity is unavailable"),
+        }
+    }
+    fn set_chest_loot(&mut self, pos: [i32; 3], seed: i64) -> Result<()> {
+        let Some(Some(super::GeneratedMonsterRoomEntity::Chest(chest))) =
+            self.monster_entities.get(&pos)
+        else {
+            bail!("generated chest is unavailable")
+        };
+        let updated = super::GeneratedLootChest::new(
+            pos,
+            chest.facing,
+            "minecraft:chests/simple_dungeon",
+            seed,
+        )?;
+        Arc::make_mut(&mut self.monster_entities)
+            .insert(pos, Some(super::GeneratedMonsterRoomEntity::Chest(updated)));
+        Ok(())
+    }
+    fn spawner_entity_exists(&mut self, pos: [i32; 3]) -> Result<bool> {
+        if OreWorld::block(self, pos)?.name != "minecraft:spawner" {
+            return Ok(false);
+        }
+        match self.monster_entities.get(&pos) {
+            Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_))) => Ok(true),
+            _ => bail!("spawner block entity is unavailable"),
+        }
+    }
+    fn set_spawner_mob(
+        &mut self,
+        pos: [i32; 3],
+        mob: RoomMob,
+        _: &mut DecorationRandom,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                self.monster_entities.get(&pos),
+                Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_)))
+            ),
+            "generated spawner is unavailable"
+        );
+        if matches!(self.monster_entities.get(&pos), Some(None)) {
+            self.pending_monster_spawners = self
+                .pending_monster_spawners
+                .checked_sub(1)
+                .context("invalid pending spawner count")?;
+        }
+        Arc::make_mut(&mut self.monster_entities).insert(
+            pos,
+            Some(super::GeneratedMonsterRoomEntity::Spawner(
+                super::GeneratedMonsterSpawner { position: pos, mob },
+            )),
+        );
+        Ok(())
     }
 }
 
@@ -2660,6 +2966,12 @@ impl OreVeinWorld for DecorationRegion<'_> {
                 "generated bee nest replacement is not supported"
             );
         }
+        if self.monster_entities.contains_key(&p) {
+            ensure!(
+                self.read(p)? == *state,
+                "generated monster-room entity replacement is not supported"
+            );
+        }
         // Preserve both original maps before the first direct write in this
         // chunk; untouched neighbors need no heightmap scan.
         self.prime_heightmaps(chunk(p))?;
@@ -2811,6 +3123,7 @@ mod tests {
             carver_postprocessing: BTreeMap::new(),
             feature_postprocessing: BTreeMap::new(),
             generated_bee_nests: Arc::new(BTreeMap::new()),
+            generated_monster_entities: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
     }
@@ -4082,6 +4395,332 @@ mod tests {
         ]);
         (schedule, neighborhood, registry)
     }
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn monster_room_block_flags_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p)
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("MonsterRoomBlockOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/MonsterRoomBlockOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MonsterRoomBlockOracle"));
+        let mut count = 0;
+        for line in output.lines().filter_map(|v| v.strip_prefix("C ")) {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(parts.len(), 6);
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for entry in parts[1].split(',') {
+                    let (key, value) = entry.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            let expected = (
+                parts[2].parse::<bool>().unwrap(),
+                parts[3].parse::<bool>().unwrap(),
+            );
+            assert_eq!(monster_block_flags(&block).unwrap(), expected, "{line}");
+            assert_eq!(
+                parts[4].parse::<bool>().unwrap(),
+                matches!(parts[0], "chest" | "spawner"),
+                "{line}"
+            );
+            assert!(
+                !parts[5].parse::<bool>().unwrap(),
+                "unexpected postprocessing: {line}"
+            );
+            count += 1;
+        }
+        assert!(count >= 70, "missing block states");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_monster_room_matches_java_and_preserves_entities() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p)
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("MonsterRoomOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/MonsterRoomOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let o = c.output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            String::from_utf8(o.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MonsterRoomOracle")
+            .arg("chunk"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:monster_room","placement":[]}))
+                .unwrap();
+        let placed = PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |v| {
+            super::super::resolve_generated_terrain_state(v, &generated)
+        })
+        .unwrap();
+        let tags = OreBlockTags::load(&mut resources, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut saw_chest = false;
+        let mut saw_spawner = false;
+        for seed in [0, 1, -1, 987654321] {
+            for mode in 0..4 {
+                let mut preview = DecorationRandom::new(seed);
+                let rx = preview.next_int_bound(2).unwrap() + 2;
+                let rz = preview.next_int_bound(2).unwrap() + 2;
+                let (mut terrain, _, _, _) = fixture();
+                let world = Arc::make_mut(&mut terrain.world);
+                let stone = world.intern_state(state("stone"));
+                let air = world.intern_state(state("air"));
+                let bedrock = world.intern_state(state("bedrock"));
+                let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                let blocks = section.blocks.as_mut().unwrap();
+                blocks.fill(stone);
+                let index = |x: i32, y: i32, z: i32| -> usize { (x + z * 16 + y * 256) as usize };
+                blocks[index(8 - rx - 1, 8, 8)] = air;
+                blocks[index(8 - rx - 1, 9, 8)] = air;
+                if mode == 1 {
+                    blocks[index(8 - rx - 1, 7, 8 - rz - 1)] = air;
+                }
+                if mode == 2 {
+                    for x in [8 - rx - 1, 8 + rx + 1] {
+                        for z in 8 - rz..=8 + rz {
+                            blocks[index(x, 8, z)] = air;
+                            blocks[index(x, 9, z)] = air;
+                        }
+                    }
+                }
+                if mode == 3 {
+                    blocks[index(8 - rx - 1, 7, 9)] = bedrock;
+                    blocks[index(9, 8, 9)] = bedrock;
+                }
+                let before = terrain.snapshot();
+                let writable = before.chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                let mut random = DecorationRandom::new(seed);
+                let mut env = PlacementTestEnv {
+                    allow: true,
+                    fail_after: None,
+                    calls: 0,
+                };
+                let ok = region
+                    .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                    .unwrap();
+                region.finish().unwrap();
+                let actual = terrain.snapshot();
+                let prefix = format!("C {seed} {mode} ");
+                let line = output
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&prefix))
+                    .unwrap();
+                let (java_ok, rest) = line.split_once(" W ").unwrap();
+                let (writes, rest) = rest.split_once(" T ").unwrap();
+                let (java_chests, rest) = rest.split_once(" M ").unwrap();
+                let (java_mob, java_random) = rest.split_once(" R ").unwrap();
+                assert_eq!(ok, java_ok.parse::<bool>().unwrap());
+                assert_eq!(random.next_long(), java_random.parse::<i64>().unwrap());
+                let mut expected = BTreeMap::new();
+                if !writes.is_empty() {
+                    for item in writes.split(';') {
+                        let parts = item.split(',').collect::<Vec<_>>();
+                        let pos = [
+                            parts[0].parse::<i32>().unwrap(),
+                            parts[1].parse::<i32>().unwrap(),
+                            parts[2].parse::<i32>().unwrap(),
+                        ];
+                        let replacement = match parts[3] {
+                            "air" => state("cave_air"),
+                            "cobble" => state("cobblestone"),
+                            "mossy" => state("mossy_cobblestone"),
+                            "spawner" => state("spawner"),
+                            value if value.starts_with("chest:") => {
+                                let mut s = state("chest");
+                                s.properties = BTreeMap::from([
+                                    ("facing".into(), value[6..].into()),
+                                    ("type".into(), "single".into()),
+                                    ("waterlogged".into(), "false".into()),
+                                ]);
+                                s
+                            }
+                            _ => panic!("unknown Java write"),
+                        };
+                        expected.insert(pos, replacement);
+                    }
+                }
+                for x in 0..16 {
+                    for y in 0..16 {
+                        for z in 0..16 {
+                            let p = [x, y, z];
+                            assert_eq!(
+                                actual.block(x, y, z),
+                                expected.get(&p).or_else(|| before.block(x, y, z)),
+                                "seed {seed} mode {mode} block {p:?}"
+                            );
+                        }
+                    }
+                }
+                let mut chest_data = Vec::new();
+                let mut mob = "-";
+                for entity in terrain.generated_monster_entities() {
+                    match entity {
+                        super::super::GeneratedMonsterRoomEntity::Chest(chest) => {
+                            saw_chest = true;
+                            let [x, y, z] = chest.position;
+                            chest_data.push(format!("{x},{y},{z},{}", chest.loot_seed));
+                            assert!(
+                                matches!(chest.block_entity().get("LootTable"),Some(native_persistence::nbt::Tag::String(value)) if value.matches("minecraft:chests/simple_dungeon"))
+                            );
+                        }
+                        super::super::GeneratedMonsterRoomEntity::Spawner(spawner) => {
+                            saw_spawner = true;
+                            mob = match spawner.mob {
+                                RoomMob::Skeleton => "minecraft:skeleton",
+                                RoomMob::Zombie => "minecraft:zombie",
+                                RoomMob::Spider => "minecraft:spider",
+                            };
+                        }
+                    }
+                }
+                chest_data.sort();
+                assert_eq!(chest_data.join(";"), java_chests);
+                assert_eq!(mob, java_mob);
+            }
+        }
+        assert!(
+            saw_chest && saw_spawner,
+            "oracle seeds must exercise block entities"
+        );
+        // Unsupported data encountered after wall writes must discard the draft.
+        let mut probe = DecorationRandom::new(0);
+        let rx = probe.next_int_bound(2).unwrap() + 2;
+        let rz = probe.next_int_bound(2).unwrap() + 2;
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let stone = world.intern_state(state("stone"));
+        let air = world.intern_state(state("air"));
+        let unknown = world.intern_state(state("beacon"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        let blocks = section.blocks.as_mut().unwrap();
+        blocks.fill(stone);
+        let index = |x: i32, y: i32, z: i32| -> usize { (x + z * 16 + y * 256) as usize };
+        blocks[index(8 - rx - 1, 8, 8)] = air;
+        blocks[index(8 - rx - 1, 9, 8)] = air;
+        blocks[index(8 - rx - 1, 6, 8 - rz - 1)] = unknown;
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(0);
+        let mut unchanged = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), unchanged.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
+    #[test]
+    fn unfinished_generated_spawner_cannot_be_published() {
+        let (mut terrain, tags, _, _) = fixture();
+        let mut registry = batch_registry();
+        registry.insert("minecraft:spawner".into());
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        native_resources::monster_room::MonsterRoomWorld::set_block(
+            &mut region,
+            [0, 8, 0],
+            RoomBlock::Spawner,
+        )
+        .unwrap();
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
     #[test]
     fn planned_oak_tree_is_written_to_generated_chunk() {
         let (schedule, neighborhood, registry) = prepare_tree_fixture();

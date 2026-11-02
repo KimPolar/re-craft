@@ -30,14 +30,23 @@ use serde_json::Value;
 mod carving;
 mod generated_beehive;
 mod generated_chest;
+mod generated_spawner;
 mod ore;
 pub mod postprocessing;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
+pub use generated_spawner::GeneratedMonsterSpawner;
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
+
+/// Block entities created by a monster-room feature in intermediate terrain.
+#[derive(Clone, Debug)]
+pub enum GeneratedMonsterRoomEntity {
+    Chest(GeneratedLootChest),
+    Spawner(GeneratedMonsterSpawner),
+}
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
@@ -87,6 +96,7 @@ pub struct CarvedTerrainWorld {
     feature_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     generated_bee_nests: Arc<BTreeMap<[i32; 3], GeneratedBeeNest>>,
+    generated_monster_entities: Arc<BTreeMap<[i32; 3], Option<GeneratedMonsterRoomEntity>>>,
 }
 
 impl CarvedTerrainWorld {
@@ -127,6 +137,7 @@ impl CarvedTerrainWorld {
                 .collect(),
             feature_postprocessing: BTreeMap::new(),
             generated_bee_nests: Arc::new(BTreeMap::new()),
+            generated_monster_entities: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -177,6 +188,13 @@ impl CarvedTerrainWorld {
     /// Other block-entity data may still be unavailable.
     pub fn generated_bee_nests(&self) -> impl Iterator<Item = &GeneratedBeeNest> {
         self.generated_bee_nests.values()
+    }
+
+    /// Known monster-room entities; these chunks are not yet ready to save.
+    pub fn generated_monster_entities(&self) -> impl Iterator<Item = &GeneratedMonsterRoomEntity> {
+        self.generated_monster_entities
+            .values()
+            .filter_map(Option::as_ref)
     }
 
     /// Z, X, Y order, with Y measured from this collection's minimum height.

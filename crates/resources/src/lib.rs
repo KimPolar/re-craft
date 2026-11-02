@@ -36,6 +36,7 @@ pub mod lake_feature;
 pub mod loot;
 pub mod mining_tags;
 pub mod models;
+pub mod monster_room;
 pub mod noise;
 pub mod noise_router;
 pub mod noise_stage;

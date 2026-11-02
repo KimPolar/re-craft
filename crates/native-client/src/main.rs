@@ -31,6 +31,7 @@ mod fov_ui;
 mod frame_pacer;
 mod game_ui;
 mod generated_item;
+mod generation_worker;
 mod ground_items;
 mod gui_gpu;
 mod held_items;

@@ -2957,14 +2957,7 @@ mod tests {
             .enable_decoration(&mut data, &BTreeSet::new(), registry, &lighting)
             .unwrap();
         batch.enable_light_initialization(generated).unwrap();
-        for z in -1..=1 {
-            for x in -1..=1 {
-                batch
-                    .request_light_initialization(ChunkPos { x, z })
-                    .unwrap();
-            }
-        }
-        let mut classify = |v: &Value| -> Result<CarverBlockState> {
+        let classify = |v: &Value| -> Result<CarverBlockState> {
             let name = v
                 .as_str()
                 .or_else(|| v.get("id").and_then(Value::as_str))
@@ -2974,7 +2967,7 @@ mod tests {
                 has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
             })
         };
-        let mut resolve = |v: &Value| -> Result<BlockState> {
+        let resolve = |v: &Value| -> Result<BlockState> {
             Ok(BlockState {
                 name: v
                     .as_str()
@@ -2984,12 +2977,6 @@ mod tests {
                 properties: BTreeMap::new(),
             })
         };
-        while batch
-            .step(&mut data, &mut classify, &mut resolve)
-            .unwrap()
-            .is_some()
-        {}
-        batch.seal_for_light_propagation().unwrap();
         let center = ChunkPos { x: 0, z: 0 };
         let targets = BTreeSet::from([center]);
         let mut renderer = IncrementalPreview::default();
@@ -3008,12 +2995,39 @@ mod tests {
             )
             .is_err()
         );
-        batch.request_light(center).unwrap();
-        while batch
-            .step(&mut data, &mut classify, &mut resolve)
-            .unwrap()
-            .is_some()
-        {}
+        let caller_thread = std::thread::current().id();
+        let generation = crate::generation_worker::GenerationWorker::start(
+            move || {
+                assert_ne!(std::thread::current().id(), caller_thread);
+                Ok((batch, data, classify, resolve))
+            },
+            targets.clone(),
+            7,
+            0,
+            IVec3::ZERO,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let generated = loop {
+            if let Some(result) = generation.try_result().unwrap() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "world generation worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let crate::generation_worker::GenerationResult::Ready(generated) = generated else {
+            panic!("expected generated terrain")
+        };
+        assert_eq!(
+            generation.progress().phase,
+            crate::generation_worker::GenerationPhase::Ready
+        );
+        assert!(generation.progress().completed_steps > 0);
+        let mut batch = generated.batch;
+        let job = generated.mesh;
         let (world, scene) = renderer
             .prepare_generated(&mut batch, &targets, &mut resources, IVec3::ZERO, 2048, 0)
             .unwrap();
@@ -3036,14 +3050,6 @@ mod tests {
             &repeated_scene.chunks[&center]
         ));
         assert_eq!(renderer.last_rebuilt, 0);
-        let job = crate::mesh_worker::MeshJob::for_generated(
-            &mut batch,
-            targets.clone(),
-            7,
-            0,
-            IVec3::ZERO,
-        )
-        .unwrap();
         assert!(Arc::ptr_eq(&world, &job.world));
         let worker = crate::mesh_worker::MeshWorker::start(resources).unwrap();
         worker.submit(job);

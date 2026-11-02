@@ -47,6 +47,54 @@ impl VisibleLightSnapshot {
     ) -> Option<VisibleLightColumn> {
         self.columns.insert(pos, column)
     }
+
+    /// Capture a newly created engine after the listed nonempty section status
+    /// updates have been drained. No lighting may have been enabled, queued,
+    /// propagated, removed or restored before this snapshot. The caller must
+    /// provide every nonempty status registered in this engine revision.
+    pub fn fresh_after_section_updates(
+        has_block: bool,
+        has_sky: bool,
+        nonempty_sections: impl IntoIterator<Item = (ChunkPos, i32)>,
+        covered_columns: impl IntoIterator<Item = ChunkPos>,
+    ) -> Option<Self> {
+        let mut result = Self::new(has_block, has_sky);
+        for pos in covered_columns {
+            if !(-2_097_152..=2_097_151).contains(&pos.x)
+                || !(-2_097_152..=2_097_151).contains(&pos.z)
+            {
+                return None;
+            }
+            result.columns.entry(pos).or_default();
+        }
+        let zero = Arc::new([0; LIGHT_BYTES]);
+        for (pos, y) in nonempty_sections {
+            if !(-2_097_151..=2_097_150).contains(&pos.x)
+                || !(-2_097_151..=2_097_150).contains(&pos.z)
+                || !(-524_287..=524_286).contains(&y)
+            {
+                return None;
+            }
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(column) = result.columns.get_mut(&ChunkPos {
+                        x: pos.x + dx,
+                        z: pos.z + dz,
+                    }) {
+                        for sy in y - 1..=y + 1 {
+                            if has_block {
+                                column.block.entry(sy).or_insert_with(|| Arc::clone(&zero));
+                            }
+                            if has_sky {
+                                column.sky.entry(sy).or_insert_with(|| Arc::clone(&zero));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(result)
+    }
     fn position(pos: [i32; 3]) -> Option<(ChunkPos, i32, usize, usize, usize)> {
         // BlockPos.asLong has signed 26-bit X/Z and signed 12-bit Y.
         if !(-33_554_432..=33_554_431).contains(&pos[0])
@@ -141,5 +189,39 @@ mod tests {
         assert_eq!(light.raw_brightness([-1, 2, 0], 16), None);
         assert_eq!(light.raw_brightness([0, 2, 0], 0), None);
         assert_eq!(light.sky_light([-1, 2048, 0]), None);
+    }
+
+    #[test]
+    fn fresh_engine_registers_neighbor_sections_and_shares_empty_layers() {
+        let center = ChunkPos { x: 0, z: 0 };
+        let neighbor = ChunkPos { x: -1, z: 1 };
+        let fresh =
+            VisibleLightSnapshot::fresh_after_section_updates(true, true, [], [center]).unwrap();
+        assert_eq!(fresh.raw_brightness([0, 0, 0], 0), Some(15));
+        let light = VisibleLightSnapshot::fresh_after_section_updates(
+            true,
+            true,
+            [(center, 0)],
+            [center, neighbor],
+        )
+        .unwrap();
+        assert_eq!(light.sky_light([0, -64, 0]), Some(0));
+        assert_eq!(light.sky_light([0, 31, 0]), Some(0));
+        assert_eq!(light.sky_light([0, 32, 0]), Some(15));
+        assert_eq!(light.block_light([-1, 5, 16]), Some(0));
+        assert_eq!(light.sky_light([16, 5, 16]), None);
+        assert!(Arc::ptr_eq(
+            &light.columns[&center].block[&0],
+            &light.columns[&neighbor].sky[&1]
+        ));
+        assert!(
+            VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [(ChunkPos { x: i32::MAX, z: 0 }, 0)],
+                [center]
+            )
+            .is_none()
+        );
     }
 }

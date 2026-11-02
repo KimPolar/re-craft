@@ -8098,6 +8098,24 @@ mod tests {
                             .is_err()
                     );
                     assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                    for (registered, expected) in [(false, false), (true, true)] {
+                        let center = ChunkPos { x: 0, z: 0 };
+                        let statuses = registered.then_some((center, 0));
+                        let snapshot = VisibleLightSnapshot::fresh_after_section_updates(
+                            true,
+                            true,
+                            statuses,
+                            [center],
+                        )
+                        .unwrap();
+                        let (mut terrain, _, _, _) = fixture();
+                        assert_eq!(
+                            prepared
+                                .execute_with_visible_light(&mut terrain, false, &snapshot)
+                                .unwrap(),
+                            [expected]
+                        );
+                    }
                     for (sky_enabled, level, expected) in
                         [(true, 0, false), (false, 0, true), (false, 13, false)]
                     {

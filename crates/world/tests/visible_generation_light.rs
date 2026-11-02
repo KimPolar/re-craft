@@ -56,6 +56,7 @@ fn visible_generation_light_matches_java_engine_storage() {
         .arg("VisibleGenerationLightOracle"));
     let mut columns: BTreeMap<ChunkPos, Column> = BTreeMap::new();
     let mut snapshot = None;
+    let mut fresh = None;
     let mut channels = (false, false);
     let mut stage = 0;
     let mut cases = 0;
@@ -66,6 +67,7 @@ fn visible_generation_light_matches_java_engine_storage() {
         match a.first().copied() {
             Some("H") => {
                 stage += 1;
+                let mode: u8 = a[1].parse().unwrap();
                 channels = (a[2].parse().unwrap(), a[3].parse().unwrap());
                 snapshot = None;
                 columns.clear();
@@ -74,6 +76,29 @@ fn visible_generation_light_matches_java_engine_storage() {
                         columns.insert(ChunkPos { x, z }, Column::default());
                     }
                 }
+                let mut statuses = Vec::new();
+                if mode > 0 {
+                    statuses.push((ChunkPos { x: 0, z: 0 }, 0));
+                }
+                if mode == 4 {
+                    statuses.extend([(ChunkPos { x: -1, z: 1 }, -1), (ChunkPos { x: 1, z: 0 }, 1)]);
+                }
+                if mode == 5 {
+                    statuses.extend([(ChunkPos { x: 0, z: 0 }, 2), (ChunkPos { x: 1, z: -1 }, -2)]);
+                }
+                fresh = if matches!(mode, 0 | 1 | 4 | 5) {
+                    Some(
+                        VisibleLightSnapshot::fresh_after_section_updates(
+                            channels.0,
+                            channels.1,
+                            statuses,
+                            columns.keys().copied(),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
             }
             Some("L") => {
                 let pos = ChunkPos {
@@ -115,6 +140,10 @@ fn visible_generation_light_matches_java_engine_storage() {
                 let s = a[5].parse::<u8>().unwrap();
                 assert_eq!(light.block_light(p), Some(b), "stage {stage} {p:?}");
                 assert_eq!(light.sky_light(p), Some(s), "stage {stage} {p:?}");
+                if let Some(fresh) = &fresh {
+                    assert_eq!(fresh.block_light(p), Some(b), "fresh stage {stage} {p:?}");
+                    assert_eq!(fresh.sky_light(p), Some(s), "fresh stage {stage} {p:?}");
+                }
                 assert_eq!(
                     light.raw_brightness(p, 0),
                     Some(a[6].parse().unwrap()),
@@ -132,7 +161,7 @@ fn visible_generation_light_matches_java_engine_storage() {
             _ => {}
         }
     }
-    assert_eq!(stage, 16);
-    assert_eq!(cases, 16 * 7 * 4 * 10);
+    assert_eq!(stage, 24);
+    assert_eq!(cases, 24 * 7 * 4 * 10);
     assert!(nonzero_blocks && nontrivial_sky);
 }

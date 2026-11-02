@@ -28,12 +28,14 @@ public class VisibleGenerationLightOracle implements LightChunkGetter, LightChun
   var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
   var storageField=LightEngine.class.getDeclaredField("storage");storageField.setAccessible(true);
   var dataMethod=LayerLightSectionStorage.class.getDeclaredMethod("getDataLayer",long.class,boolean.class);dataMethod.setAccessible(true);
-  for(int mode=0;mode<4;mode++)for(boolean block:new boolean[]{false,true})for(boolean sky:new boolean[]{false,true}) {
+  for(int mode=0;mode<6;mode++)for(boolean block:new boolean[]{false,true})for(boolean sky:new boolean[]{false,true}) {
    var w=new VisibleGenerationLightOracle();var e=new LevelLightEngine(w,block,sky);
    if(mode==3){
     for(var layer:LightLayer.values()){var data=new DataLayer();for(int z=0;z<16;z++)for(int x=0;x<16;x++)for(int y=0;y<16;y++)data.set(x,y,z,(x+y*3+z*7+(layer==LightLayer.SKY?4:0))&15);e.queueSectionData(layer,SectionPos.of(0,0,0),data);}
    }
    if(mode>0){e.updateSectionStatus(SectionPos.of(0,0,0),false);drain(e);}
+   if(mode==4){e.updateSectionStatus(SectionPos.of(-1,-1,1),false);e.updateSectionStatus(SectionPos.of(1,1,0),false);drain(e);}
+   if(mode==5){e.updateSectionStatus(SectionPos.of(0,2,0),false);e.updateSectionStatus(SectionPos.of(1,-2,-1),false);drain(e);}
    if(mode==2){e.setLightEnabled(new ChunkPos(0,0),true);e.propagateLightSources(new ChunkPos(0,0));drain(e);}
    out.printf("H %d %s %s%n",mode,block,sky);
    for(var layer:LightLayer.values())for(int cz=-1;cz<=1;cz++)for(int cx=-1;cx<=1;cx++)for(int sy=-4;sy<=4;sy++){

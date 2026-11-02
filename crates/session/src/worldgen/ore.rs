@@ -34,6 +34,7 @@ use native_resources::{
     tree_leaf_update::{LeafUpdateWorld, finish_generated_tree},
     underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
     vegetation_patch::{VegetationPatch, VegetationPatchWorld},
+    vines_feature::{VinesFeature, VinesWorld},
 };
 use native_world::loaded::{
     BlockState, BlockStateId, ChunkPos, SavedBlockTick, SavedFluidTick, World,
@@ -107,6 +108,7 @@ enum ConfiguredDecoration {
     MonsterRoom,
     Geode(GeodeFeature<BlockState>),
     Multiface(MultifaceGrowth),
+    Vines(VinesFeature<BlockState>),
     HugeMushroom(HugeMushroomFeature<BlockState>),
     VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
     RootSystem(RootSystemFeature<BlockState>, Box<PlacedDecorationFeature>),
@@ -136,6 +138,7 @@ impl ConfiguredDecoration {
             Self::FallenTree(v) => v.required_blocks(),
             Self::Geode(v) => v.required_blocks(),
             Self::Multiface(v) => v.required_blocks(),
+            Self::Vines(_) => BTreeSet::from([ResourceId::parse("minecraft:vine").unwrap()]),
             Self::HugeMushroom(v) => v.required_blocks(),
             Self::VegetationPatch(v, nested) => {
                 let mut blocks = v.required_blocks();
@@ -285,6 +288,7 @@ impl ConfiguredDecoration {
             ("minecraft", "multiface_growth") => {
                 Ok(Self::Multiface(MultifaceGrowth::decode(value)?))
             }
+            ("minecraft", "vines") => Ok(Self::Vines(VinesFeature::decode(value, resolve)?)),
             ("minecraft", "huge_brown_mushroom" | "huge_red_mushroom") => Ok(Self::HugeMushroom(
                 HugeMushroomFeature::decode(provider, value, resolve)?,
             )),
@@ -417,7 +421,7 @@ impl ConfiguredDecoration {
                 tags.extend(nested.required_tags());
                 tags
             }
-            Self::Freeze => BTreeSet::new(),
+            Self::Freeze | Self::Vines(_) => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
             }
@@ -481,6 +485,7 @@ impl ConfiguredDecoration {
             Self::MonsterRoom => place_monster_room(world, random, pos),
             Self::Geode(v) => v.place(world, random, world.target.seed, pos),
             Self::Multiface(v) => v.place(world, random, pos),
+            Self::Vines(v) => v.place(world, pos),
             Self::HugeMushroom(v) => v.place(world, random, pos),
             Self::VegetationPatch(v, nested) => {
                 v.place(world, random, pos, |world, random, origin| {
@@ -3090,6 +3095,13 @@ fn multiface_support(state: &BlockState) -> Result<bool> {
     {
         return Ok(false);
     }
+    if state.name == "minecraft:vine" {
+        ensure!(valid_vine(state), "invalid vine state");
+        return Ok(false);
+    }
+    if tree_generated_log(state) || tree_generated_leaf(state)? {
+        return Ok(true);
+    }
     if matches!(
         state.name.as_str(),
         "minecraft:stone"
@@ -3106,11 +3118,74 @@ fn multiface_support(state: &BlockState) -> Result<bool> {
             | "minecraft:amethyst_block"
             | "minecraft:budding_amethyst"
             | "minecraft:smooth_basalt"
+            | "minecraft:glass"
     ) {
         return Ok(true);
     }
     bail!("unsupported multiface support shape for {}", state.name)
 }
+
+fn valid_vine(state: &BlockState) -> bool {
+    state.name == "minecraft:vine"
+        && state.properties.len() == 5
+        && ["up", "north", "south", "west", "east"]
+            .into_iter()
+            .all(|name| {
+                matches!(
+                    state.properties.get(name).map(String::as_str),
+                    Some("true" | "false")
+                )
+            })
+}
+
+impl VinesWorld for DecorationRegion<'_> {
+    type State = BlockState;
+    fn vines_empty(&mut self, pos: [i32; 3]) -> Result<bool> {
+        Ok(is_air(&OreWorld::block(self, pos)?))
+    }
+    fn vines_can_attach(&mut self, neighbor: [i32; 3], _: MultifaceFace) -> Result<bool> {
+        let state = OreWorld::block(self, neighbor)?;
+        // This helper accepts only blocks whose support and collision shapes
+        // are known to be full or empty in all six directions.
+        multiface_support(&state)
+    }
+    fn vine_with_face(
+        &mut self,
+        state: &BlockState,
+        direction: MultifaceFace,
+    ) -> Result<BlockState> {
+        ensure!(valid_vine(state), "invalid default vine state");
+        ensure!(direction != MultifaceFace::Down, "invalid vine attachment");
+        let mut state = state.clone();
+        state
+            .properties
+            .insert(multiface_name(direction).into(), "true".into());
+        Ok(state)
+    }
+    fn set_vines(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "vines chunk is missing"
+            );
+            if self.is_outside(pos[1]) {
+                return Ok(true);
+            }
+            ensure!(is_air(&self.read(pos)?), "unsupported vines source effects");
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
 impl native_resources::multiface_growth::MultifaceWorld for DecorationRegion<'_> {
     type State = BlockState;
     fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
@@ -6688,6 +6763,64 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    fn vines_feature_writes_first_supported_face_to_chunk() {
+        let value = json!({"feature":{"type":"minecraft:vines"},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut Data,
+            PlacedFeature::decode(&value).unwrap(),
+            &mut |value| {
+                let mut block = resolve_test(value)?;
+                if block.name == "minecraft:vine" {
+                    block.properties = ["up", "north", "south", "west", "east"]
+                        .into_iter()
+                        .map(|s| (s.into(), "false".into()))
+                        .collect();
+                }
+                Ok(block)
+            },
+        )
+        .unwrap();
+        let mut registry = batch_registry();
+        registry.insert("minecraft:vine".into());
+        let tags = OreBlockTags::load(&mut Data, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let air = state("air");
+        region.set_section_block([8, 7, 8], &air).unwrap();
+        region.update_final_heightmaps([8, 7, 8], &air).unwrap();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(
+                    &placed,
+                    &mut DecorationRandom::new(42),
+                    [8, 7, 8],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        let vine = after.block(8, 7, 8).unwrap();
+        assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+        assert_eq!(vine.name, "minecraft:vine");
+        assert_eq!(vine.properties["north"], "true");
+        for direction in ["up", "south", "west", "east"] {
+            assert_eq!(vine.properties[direction], "false");
+        }
     }
 
     #[test]

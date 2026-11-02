@@ -12,9 +12,11 @@ use native_core::random::DecorationRandom;
 use native_resources::{
     heightmap_tags::HeightmapTags,
     ore_feature::{OreBlockTags, OreVein, OreVeinWorld, OreWorld},
-    packs::ResourceId,
+    packs::{ResourceId, ResourceProvider},
+    placed_feature::{PlacedFeature, PlacementEnvironment},
 };
 use native_world::loaded::{BlockState, BlockStateId, ChunkPos, World};
+use serde_json::Value;
 
 use super::CarvedTerrainWorld;
 
@@ -29,6 +31,40 @@ pub struct OreVeinRegion<'a> {
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
+}
+
+/// A placed feature bound to the exact configured ore it references.
+pub struct PlacedOreVein {
+    placement: PlacedFeature,
+    ore: OreVein<BlockState>,
+}
+
+impl PlacedOreVein {
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        id: &ResourceId,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        let placement = PlacedFeature::load(provider, id)?;
+        Self::from_placement(provider, placement, resolve)
+    }
+
+    pub fn from_placement(
+        provider: &mut impl ResourceProvider,
+        placement: PlacedFeature,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        let ore = if let Some(id) = placement.feature.as_str() {
+            OreVein::load(provider, &ResourceId::parse(id)?, resolve)?
+        } else {
+            OreVein::decode(&placement.feature, resolve)?
+        };
+        Ok(Self { placement, ore })
+    }
+
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        self.ore.required_tags()
+    }
 }
 
 impl CarvedTerrainWorld {
@@ -76,6 +112,37 @@ impl OreVeinRegion<'_> {
         let mut next = random.clone();
         self.failed = true;
         let result = feature.place(self, &mut next, origin)?;
+        *random = next;
+        self.failed = false;
+        Ok(result)
+    }
+
+    /// Run placement modifiers and their ore feature in Java's depth-first
+    /// order on one RNG. The environment must use the active biome settings,
+    /// top-level placed feature, current heightmaps and level minimum Y.
+    /// `generator_min_y` and `generator_height` are the placement context's
+    /// generator bounds, which can differ from the level bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_placed(
+        &mut self,
+        placed: &PlacedOreVein,
+        random: &mut DecorationRandom,
+        origin: [i32; 3],
+        generator_min_y: i32,
+        generator_height: i32,
+        environment: &mut impl PlacementEnvironment,
+    ) -> Result<bool> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let mut next = random.clone();
+        self.failed = true;
+        let mut positions =
+            placed
+                .placement
+                .positions(origin, generator_min_y, generator_height)?;
+        let mut result = false;
+        while let Some(position) = positions.next(&mut next, environment)? {
+            result |= placed.ore.place(self, &mut next, position)?;
+        }
         *random = next;
         self.failed = false;
         Ok(result)
@@ -383,6 +450,118 @@ mod tests {
         assert!(Arc::ptr_eq(&previous, &terrain.snapshot()));
     }
 
+    struct PlacementTestEnv {
+        allow: bool,
+        fail_after: Option<usize>,
+        calls: usize,
+    }
+    impl PlacementEnvironment for PlacementTestEnv {
+        fn min_y(&self) -> i32 {
+            0
+        }
+        fn heightmap(&mut self, _: &str, _: i32, _: i32) -> Result<i32> {
+            bail!("missing heightmap")
+        }
+        fn biome_allows(&mut self, _: [i32; 3]) -> Result<bool> {
+            self.calls += 1;
+            ensure!(self.fail_after != Some(self.calls), "missing biome data");
+            Ok(self.allow)
+        }
+    }
+
+    fn inline_placed_ore() -> PlacedOreVein {
+        let placement = PlacedFeature::decode(&json!({"feature": {
+            "type":"minecraft:ore", "size":9, "discard_chance_on_air_exposure":0.0,
+            "targets":[{"target":{"predicate_type":"minecraft:block_match", "block":"minecraft:stone"}, "state":"minecraft:diamond_ore"}]
+        }, "placement":[{"type":"minecraft:count", "count":4},{"type":"minecraft:biome"}]})).unwrap();
+        PlacedOreVein::from_placement(&mut Data, placement, &mut |v| {
+            Ok(state(
+                v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
+            ))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn placed_vein_filters_biomes_and_executes_all_successful_positions() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(7);
+        let mut env = PlacementTestEnv {
+            allow: false,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            !region
+                .place_placed(
+                    &inline_placed_ore(),
+                    &mut random,
+                    [7, 4, 7],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        assert_eq!(env.calls, 4);
+        env.allow = true;
+        assert!(
+            region
+                .place_placed(
+                    &inline_placed_ore(),
+                    &mut random,
+                    [7, 4, 7],
+                    0,
+                    16,
+                    &mut env
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            env.calls, 8,
+            "success must not stop later feature placements"
+        );
+        region.finish().unwrap();
+        let after = terrain.snapshot();
+        assert!((0..16).any(|x| (0..16).any(|z| {
+            (0..8).any(|y| after.block(x, y, z).unwrap() != before.block(x, y, z).unwrap())
+        })));
+    }
+
+    #[test]
+    fn placement_failure_discards_earlier_writes_and_random_changes() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(7);
+        let mut expected = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: Some(2),
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(
+                    &inline_placed_ore(),
+                    &mut random,
+                    [7, 4, 7],
+                    0,
+                    16,
+                    &mut env
+                )
+                .is_err()
+        );
+        assert_eq!(env.calls, 2);
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn generated_chunk_veins_match_java() {
@@ -397,6 +576,21 @@ mod tests {
         let manifest: Value =
             serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
         assert_eq!(manifest["id"], "26.3");
+        let mut installed = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = installed.vanilla_generated_block_registry().unwrap();
+        for name in [
+            "ore_diamond",
+            "ore_coal_upper",
+            "ore_iron_middle",
+            "ore_dirt",
+        ] {
+            PlacedOreVein::load(
+                &mut installed,
+                &ResourceId::parse(&format!("minecraft:{name}")).unwrap(),
+                &mut |v| super::super::resolve_generated_terrain_state(v, &registry),
+            )
+            .unwrap();
+        }
         let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
         for lib in manifest["libraries"].as_array().unwrap() {
             if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
@@ -432,7 +626,9 @@ mod tests {
             .arg("OreVeinOracle"));
         let mut expected =
             BTreeMap::<(i32, String, i64), (BTreeMap<[i32; 3], String>, bool, i64)>::new();
+        let mut integrated = BTreeMap::<i64, (BTreeMap<[i32; 3], String>, i64)>::new();
         let mut key = None;
+        let mut integrated_key = None;
         let mut writes = BTreeMap::new();
         for line in output.lines() {
             let words: Vec<_> = line.split_whitespace().collect();
@@ -445,7 +641,11 @@ mod tests {
                     ));
                     writes.clear();
                 }
-                ["W", x, y, z, name] if key.is_some() => {
+                ["I", seed] => {
+                    integrated_key = Some(seed.parse().unwrap());
+                    writes.clear();
+                }
+                ["W", x, y, z, name] if key.is_some() || integrated_key.is_some() => {
                     writes.insert(
                         [x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap()],
                         (*name).to_owned(),
@@ -459,6 +659,12 @@ mod tests {
                             result.parse().unwrap(),
                             next.parse().unwrap(),
                         ),
+                    );
+                }
+                ["T", next] if integrated_key.is_some() => {
+                    integrated.insert(
+                        integrated_key.take().unwrap(),
+                        (std::mem::take(&mut writes), next.parse().unwrap()),
                     );
                 }
                 _ => {}
@@ -486,6 +692,61 @@ mod tests {
             .collect();
         let mut data = OracleData;
         let motion = HeightmapTags::load(&mut data, &registry).unwrap();
+        fn oracle_terrain() -> CarvedTerrainWorld {
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            world.chunks.clear();
+            let ids = [
+                world.intern_state(state("air")),
+                world.intern_state(state("stone")),
+                world.intern_state(state("deepslate")),
+            ];
+            for cz in 1..=4i32 {
+                for cx in -3..=0i32 {
+                    let pos = ChunkPos { x: cx, z: cz };
+                    let mut sections = BTreeMap::new();
+                    for sy in -1..=0i32 {
+                        let mut blocks = Box::new([BlockStateId(0); BLOCK_COUNT]);
+                        for y in 0..16i32 {
+                            for z in 0..16i32 {
+                                for x in 0..16i32 {
+                                    let (wx, wy, wz) = (cx * 16 + x, sy * 16 + y, cz * 16 + z);
+                                    let v = wx * 31 + wy * 17 + wz * 13;
+                                    blocks[(x + z * 16 + y * 256) as usize] = ids[if v & 7 == 0 {
+                                        0
+                                    } else if wy < 0 {
+                                        2
+                                    } else {
+                                        1
+                                    }];
+                                }
+                            }
+                        }
+                        sections.insert(
+                            sy as i8,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        );
+                    }
+                    world.chunks.insert(
+                        pos,
+                        Arc::new(Chunk {
+                            position: pos,
+                            status: Some("minecraft:carvers".into()),
+                            block_light_correct: false,
+                            sections,
+                        }),
+                    );
+                }
+            }
+            terrain.min_y = -16;
+            terrain.height = 32;
+            terrain
+        }
         let mut checked = 0;
         for size in [3, 17, 64] {
             for chance in [0.0f32, 0.5, 1.0] {
@@ -496,60 +757,7 @@ mod tests {
                 let tags =
                     OreBlockTags::load(&mut data, &registry, &feature.required_tags()).unwrap();
                 for seed in [1i64, 2, 5, 7] {
-                    let (mut terrain, _, _, _) = fixture();
-                    let world = Arc::make_mut(&mut terrain.world);
-                    world.chunks.clear();
-                    let ids = [
-                        world.intern_state(state("air")),
-                        world.intern_state(state("stone")),
-                        world.intern_state(state("deepslate")),
-                    ];
-                    for cz in 1..=3i32 {
-                        for cx in -3..=0i32 {
-                            let pos = ChunkPos { x: cx, z: cz };
-                            let mut sections = BTreeMap::new();
-                            for sy in -1..=0i32 {
-                                let mut blocks = Box::new([BlockStateId(0); BLOCK_COUNT]);
-                                for y in 0..16i32 {
-                                    for z in 0..16i32 {
-                                        for x in 0..16i32 {
-                                            let (wx, wy, wz) =
-                                                (cx * 16 + x, sy * 16 + y, cz * 16 + z);
-                                            let v = wx * 31 + wy * 17 + wz * 13;
-                                            blocks[(x + z * 16 + y * 256) as usize] =
-                                                ids[if v & 7 == 0 {
-                                                    0
-                                                } else if wy < 0 {
-                                                    2
-                                                } else {
-                                                    1
-                                                }];
-                                        }
-                                    }
-                                }
-                                sections.insert(
-                                    sy as i8,
-                                    Arc::new(Section {
-                                        blocks: Some(blocks),
-                                        biomes: None,
-                                        block_light: None,
-                                        sky_light: None,
-                                    }),
-                                );
-                            }
-                            world.chunks.insert(
-                                pos,
-                                Arc::new(Chunk {
-                                    position: pos,
-                                    status: Some("minecraft:carvers".into()),
-                                    block_light_correct: false,
-                                    sections,
-                                }),
-                            );
-                        }
-                    }
-                    terrain.min_y = -16;
-                    terrain.height = 32;
+                    let mut terrain = oracle_terrain();
                     let previous = terrain.snapshot();
                     let writable = previous.chunks.keys().copied().collect();
                     let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
@@ -566,7 +774,7 @@ mod tests {
                     region.finish().unwrap();
                     let world = terrain.snapshot();
                     let mut actual = BTreeMap::new();
-                    for z in 16..64 {
+                    for z in 16..80 {
                         for x in -48..16 {
                             for y in -16..16 {
                                 let after = world.block(x, y, z).unwrap();
@@ -586,5 +794,54 @@ mod tests {
             }
         }
         assert_eq!(checked, 36);
+
+        let ore = json!({"type":"minecraft:ore","size":9,"discard_chance_on_air_exposure":0.5,"targets":[
+            {"state":"minecraft:diamond_ore","target":{"predicate_type":"minecraft:all_of","rules":[{"predicate_type":"minecraft:tag_match","tag":"minecraft:base_stone_overworld"},{"predicate_type":"minecraft:height_match","min_inclusive":-2,"max_inclusive":2},{"predicate_type":"minecraft:not","rule":{"predicate_type":"minecraft:random_block_match","block":"minecraft:stone","probability":0.25}}]}},
+            {"state":"minecraft:gold_ore","target":{"predicate_type":"minecraft:any_of","rules":[{"predicate_type":"minecraft:block_match","block":"minecraft:deepslate"},{"predicate_type":"minecraft:random_block_match","block":"minecraft:stone","probability":0.5}]}}
+        ]});
+        let placement = PlacedFeature::decode(&json!({"feature":ore,"placement":[
+            {"type":"minecraft:count","count":4},{"type":"minecraft:in_square"},
+            {"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-5},"max_inclusive":{"absolute":5}}}
+        ]})).unwrap();
+        let placed = PlacedOreVein::from_placement(&mut data, placement, &mut |v| {
+            Ok(state(
+                v.as_str().unwrap().strip_prefix("minecraft:").unwrap(),
+            ))
+        })
+        .unwrap();
+        let tags = OreBlockTags::load(&mut data, &registry, &placed.required_tags()).unwrap();
+        for seed in 0..8i64 {
+            let mut terrain = oracle_terrain();
+            let previous = terrain.snapshot();
+            let writable = previous.chunks.keys().copied().collect();
+            let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+            let mut random = DecorationRandom::new(0);
+            let deco = random.set_decoration_seed(seed, -32, 48);
+            random.set_feature_seed(deco, 7, 3);
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            region
+                .place_placed(&placed, &mut random, [-32, 0, 48], -16, 32, &mut env)
+                .unwrap();
+            region.finish().unwrap();
+            let world = terrain.snapshot();
+            let mut actual = BTreeMap::new();
+            for z in 16..80 {
+                for x in -48..16 {
+                    for y in -16..16 {
+                        let after = world.block(x, y, z).unwrap();
+                        if previous.block(x, y, z).unwrap() != after {
+                            actual.insert([x, y, z], after.name.clone());
+                        }
+                    }
+                }
+            }
+            let (writes, next) = &integrated[&seed];
+            assert_eq!(&actual, writes, "integrated blocks {seed}");
+            assert_eq!(random.next_long(), *next, "integrated random stream {seed}");
+        }
     }
 }

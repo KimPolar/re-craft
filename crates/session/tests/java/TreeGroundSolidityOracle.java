@@ -27,6 +27,14 @@ public class TreeGroundSolidityOracle {
           out.println();
         }
       }
+      if(name.endsWith("_ore")) {
+        var lit=(BooleanProperty)state.getBlock().getStateDefinition().getProperty("lit");
+        for(var variant:state.getBlock().getStateDefinition().getPossibleStates()) {
+          out.printf("R %s %s %s",name,lit==null ? "-" : variant.getValue(lit),variant.isSolidRender());
+          for(var direction:Direction.values())out.printf(" %s",variant.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
+          out.println();
+        }
+      }
     }
   }
 }

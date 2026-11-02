@@ -24,7 +24,7 @@ public class UnderwaterMagmaOracle {
   }
   public static void main(String[]args)throws Exception {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
-    String[] names={"air","cave_air","void_air","water","lava","stone","deepslate","netherrack","basalt","blackstone","ancient_debris","dirt","grass_block","mud","clay","sand","sandstone","gravel","snow_block","podzol","coarse_dirt","mycelium","tuff","calcite","granite","diorite","andesite","bedrock","red_sand","moss_block","magma_block"};
+    String[] names={"air","cave_air","void_air","water","lava","stone","deepslate","netherrack","basalt","blackstone","ancient_debris","dirt","grass_block","mud","clay","sand","sandstone","gravel","snow_block","podzol","coarse_dirt","mycelium","tuff","calcite","granite","diorite","andesite","bedrock","red_sand","moss_block","magma_block","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore"};
     for(String name:names){var b=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));for(var s:b.getStateDefinition().getPossibleStates())for(var d:Direction.values())out.printf("O minecraft:%s %s%n",name,Block.isShapeFullBlock(s.getFaceOcclusionShape(d)));}
     var magma=Blocks.MAGMA_BLOCK.defaultBlockState();out.println("E "+magma.hasBlockEntity()+" "+PoiTypes.hasPoi(magma)+" "+magma.getPostProcessPos(null,BlockPos.ZERO));
     int number=0;

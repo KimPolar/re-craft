@@ -208,7 +208,7 @@ fn magma_generation_matches_java() {
             _ => {}
         }
     }
-    assert!(occlusions >= 31 * 6);
+    assert!(occlusions >= (31 + 18) * 6);
     assert_eq!(cases.len(), 5 * 4 * 3 * 3 * 2 * 2 * 3);
     for (index, c) in cases.iter().enumerate() {
         let feature=UnderwaterMagma::decode(&json!({"type":"minecraft:underwater_magma","floor_search_range":c.range,"placement_radius_around_floor":c.radius,"placement_probability_per_valid_position":c.probability}),&mut resolve).unwrap();

@@ -4754,6 +4754,24 @@ mod tests {
             "leaf_litter",
             "cave_vines",
             "cave_vines_plant",
+            "coal_ore",
+            "deepslate_coal_ore",
+            "iron_ore",
+            "deepslate_iron_ore",
+            "copper_ore",
+            "deepslate_copper_ore",
+            "gold_ore",
+            "deepslate_gold_ore",
+            "redstone_ore",
+            "deepslate_redstone_ore",
+            "emerald_ore",
+            "deepslate_emerald_ore",
+            "lapis_ore",
+            "deepslate_lapis_ore",
+            "diamond_ore",
+            "deepslate_diamond_ore",
+            "nether_gold_ore",
+            "nether_quartz_ore",
         ];
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -4883,6 +4901,31 @@ mod tests {
         invalid.properties.insert("berries".into(), "true".into());
         invalid.properties.insert("age".into(), "26".into());
         assert!(tree_sturdy_up(&invalid).is_err());
+        let ores: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("R "))
+            .collect();
+        assert_eq!(ores.len(), 20);
+        for line in ores {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 9, "{line}");
+            let mut block = state(fields[0]);
+            if fields[1] != "-" {
+                block.properties.insert("lit".into(), fields[1].into());
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                fields[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for face in &fields[3..] {
+                assert_eq!(
+                    tree_sturdy_up(&block).unwrap(),
+                    face.parse::<bool>().unwrap(),
+                    "{line}"
+                );
+            }
+        }
     }
     fn fixture() -> (
         CarvedTerrainWorld,

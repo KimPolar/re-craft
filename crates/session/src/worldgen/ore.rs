@@ -894,9 +894,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
     }
 
-    /// Use the tracked fresh light-engine revision. Direct ore section writes
-    /// may update registered chunks only when each write preserves air status
-    /// and all supported light properties. Other edits discard the attempt.
+    /// Use the tracked fresh light-engine revision. Direct ore writes may
+    /// preserve it when light behavior and air status do not change. Ordinary
+    /// writes must also skip Java's light check; other edits are discarded.
     pub fn execute_with_tracked_light(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -4442,7 +4442,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     unchanged_registered = true;
                 } else {
                     ensure!(
-                        self.direct_ore_write
+                        (self.direct_ore_write
+                            || native_world::block_light::skips_light_check_for_edit(&old, state)
+                                == Some(true))
                             && super::generated_state_is_air(guard.registry, &old)
                                 .zip(super::generated_state_is_air(guard.registry, state))
                                 .is_some_and(|(a, b)| a == b)
@@ -5878,6 +5880,88 @@ mod tests {
             drop(region);
             assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             assert!(tracker.snapshot(&terrain, [east], &registry).is_ok());
+        }
+
+        struct SandDisk;
+        impl ResourceProvider for SandDisk {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let disk = json!({"feature":{"type":"minecraft:disk",
+                        "target":{"type":"minecraft:matching_blocks","blocks":"minecraft:stone"},
+                        "state_provider":{"id":"minecraft:sand"},"radius":1,"half_height":1},
+                        "placement":[{"type":"minecraft:offset","x":16,"y":4,"z":8}]});
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[disk]]}))?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(&mut SandDisk, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, biomes) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &biomes);
+        let mut blocks = batch_registry();
+        blocks.extend(["minecraft:sand".into(), "minecraft:torch".into()]);
+        let prepared =
+            PreparedDecoration::load(&mut SandDisk, &plan, &blocks, &mut resolve_test).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(17, 10, 8, torch).unwrap();
+        terrain.completed_decoration.insert(east);
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        tracker.initialize_chunk(&terrain, east, &registry).unwrap();
+        let sources = tracker.sky_sources(&terrain, east).unwrap();
+        prepared
+            .execute_with_tracked_light(&mut terrain, false, &mut tracker, &registry)
+            .unwrap();
+        assert_eq!(
+            terrain.snapshot().block(17, 4, 8).unwrap().name,
+            "minecraft:sand"
+        );
+        assert_eq!(&*sources, &*tracker.sky_sources(&terrain, east).unwrap());
+        let expected_path = temp.path().join("normal.json");
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&expected_path)
+            .arg("normal")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<Vec<u8>>> =
+            serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
+        let before_light = tracker.snapshot(&terrain, [center], &registry).unwrap();
+        let mut engine = StagedGenerationLightEngine::new(tracker);
+        let active = engine
+            .activate(&terrain, east, [center], &registry)
+            .unwrap();
+        for (stage, actual) in [&before_light, &active].into_iter().enumerate() {
+            for y in -16..32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let pos = [x, y, z];
+                        let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                        assert_eq!(
+                            actual.block_light(pos),
+                            Some(expected[stage][0][index]),
+                            "normal block {stage} {pos:?}"
+                        );
+                        assert_eq!(
+                            actual.sky_light(pos),
+                            Some(expected[stage][1][index]),
+                            "normal sky {stage} {pos:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

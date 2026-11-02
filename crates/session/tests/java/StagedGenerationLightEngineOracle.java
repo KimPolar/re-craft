@@ -71,7 +71,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
         boolean ore=args.length>1 && args[1].equals("ore");
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore);
+        boolean normal=args.length>1 && args[1].equals("normal");
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
         int radius=w.mixed?2:1;
@@ -91,6 +92,18 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(normal){
+            // Mirror ProtoChunk.setBlockState's section and light checks.
+            boolean wasEmpty=eastSection.section.hasOnlyAir();
+            var old=eastSection.section.setBlockState(1,4,8,Blocks.SAND.defaultBlockState());
+            w.edits.put(new BlockPos(17,4,8),Blocks.SAND.defaultBlockState());
+            boolean isEmpty=eastSection.section.hasOnlyAir();
+            if(wasEmpty!=isEmpty) engine.updateSectionStatus(SectionPos.of(1,0,0),isEmpty);
+            if(LightEngine.hasDifferentLightProperties(old,Blocks.SAND.defaultBlockState())) throw new AssertionError("unexpected light check");
+            drain(engine); stages.add(capture(engine));
+            engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(ore){
             // OreFeature writes the section directly after INITIALIZE_LIGHT.
             eastSection.section.setBlockState(1,4,8,Blocks.DIAMOND_ORE.defaultBlockState(),false);

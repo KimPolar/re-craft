@@ -36,7 +36,7 @@ use native_world::loaded::{
 };
 use serde_json::Value;
 
-use super::{CarvedTerrainWorld, DecorationPlan};
+use super::{CarvedTerrainWorld, DecorationPlan, FreshGenerationLightTracker};
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
@@ -550,7 +550,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None, None)
+        self.execute_inner(terrain, structures_enabled, None, None, None)
     }
 
     /// Supply the level light engine's block-light values for FEATURES-stage
@@ -561,7 +561,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures_enabled: bool,
         block_light: &dyn Fn([i32; 3]) -> Result<u8>,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, Some(block_light), None)
+        self.execute_inner(terrain, structures_enabled, Some(block_light), None, None)
     }
 
     /// Supply Java's raw brightness with zero sky subtraction for mushrooms.
@@ -572,7 +572,13 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures_enabled: bool,
         raw_brightness: &dyn Fn(&World, [i32; 3]) -> Result<u8>,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None, Some(raw_brightness))
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            None,
+            Some(raw_brightness),
+            None,
+        )
     }
 
     /// Supply both light queries when the selected features need them.
@@ -588,6 +594,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(block_light),
             Some(raw_brightness),
+            None,
         )
     }
 
@@ -612,12 +619,56 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
     }
 
+    /// Use the tracked fresh light-engine revision. If decoration touches a
+    /// registered chunk, discard the attempt instead of assuming light remains
+    /// unchanged while that chunk's engine can receive updates.
+    pub fn execute_with_tracked_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        tracker: &FreshGenerationLightTracker,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<bool>> {
+        let center = ChunkPos {
+            x: self.plan.origin[0].div_euclid(16),
+            z: self.plan.origin[2].div_euclid(16),
+        };
+        let mut covered = BTreeSet::new();
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                covered.insert(ChunkPos {
+                    x: center.x.checked_add(dx).context("light X overflow")?,
+                    z: center.z.checked_add(dz).context("light Z overflow")?,
+                });
+            }
+        }
+        let light = tracker.snapshot(terrain, covered, registry)?;
+        let block = |p| {
+            light
+                .block_light(p)
+                .context("block-light column not captured")
+        };
+        let raw = |_: &World, p| {
+            light
+                .raw_brightness(p, 0)
+                .context("raw-brightness column not captured")
+        };
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            Some(&block),
+            Some(&raw),
+            Some(tracker),
+        )
+    }
+
     fn execute_inner(
         &self,
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
         block_light: Option<&dyn Fn([i32; 3]) -> Result<u8>>,
         raw_brightness: Option<&dyn Fn(&World, [i32; 3]) -> Result<u8>>,
+        fresh_tracker: Option<&FreshGenerationLightTracker>,
     ) -> Result<Vec<bool>> {
         ensure!(
             !structures_enabled,
@@ -672,6 +723,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .get(selected.feature)
                 .context("prepared ore is missing")?;
             results.push(region.place_planned_auto(self.plan, index, ore)?);
+        }
+        if let Some(tracker) = fresh_tracker {
+            tracker.validate_world(&region.world)?;
         }
         region.finish()?;
         terrain.completed_decoration.insert(center);
@@ -3580,6 +3634,7 @@ mod tests {
             min_y: 0,
             height: 16,
             completed_decoration: BTreeSet::new(),
+            has_published_light: false,
             ore_ocean_floor_heights: BTreeMap::new(),
             feature_world_surface_heights: BTreeMap::new(),
             final_heightmaps: BTreeMap::new(),
@@ -3777,6 +3832,122 @@ mod tests {
                 .fresh_generation_light([center], [center], &registry, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn tracked_fresh_light_drives_decoration_and_rejects_registered_writes() {
+        struct MushroomAt(i32);
+        impl ResourceProvider for MushroomAt {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[[{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:brown_mushroom"}},"placement":[{"type":"minecraft:offset","x":self.0,"y":8,"z":8}]}]]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let vanilla = resources.vanilla_generated_block_registry().unwrap();
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        for x in [8, 16] {
+            let schedule = FeatureSchedule::load(
+                &mut MushroomAt(x),
+                std::slice::from_ref(&plains),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let (_, _, neighborhood) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let mut registry = batch_registry();
+            registry.insert("minecraft:brown_mushroom".into());
+            let prepared =
+                PreparedDecoration::load(&mut MushroomAt(x), &plan, &registry, &mut resolve_test)
+                    .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let registered = ChunkPos { x: 1, z: 0 };
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            assert!(
+                tracker
+                    .register_chunk(&terrain, registered, &vanilla)
+                    .is_err()
+            );
+            terrain.completed_decoration.insert(registered);
+            tracker
+                .register_chunk(&terrain, registered, &vanilla)
+                .unwrap();
+            assert!(
+                tracker
+                    .register_chunk(&terrain, registered, &vanilla)
+                    .is_err()
+            );
+            assert_eq!(
+                tracker
+                    .snapshot(&terrain, [center], &vanilla)
+                    .unwrap()
+                    .sky_light([8, 8, 8]),
+                Some(0)
+            );
+            let before = terrain.snapshot();
+            let result =
+                prepared.execute_with_tracked_light(&mut terrain, false, &tracker, &vanilla);
+            if x == 8 {
+                assert_eq!(result.unwrap(), [true]);
+                assert_eq!(
+                    terrain.snapshot().block(8, 8, 8).unwrap().name,
+                    "minecraft:brown_mushroom"
+                );
+                assert_eq!(
+                    tracker
+                        .snapshot(&terrain, [center], &vanilla)
+                        .unwrap()
+                        .sky_light([8, 8, 8]),
+                    Some(0)
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(!terrain.completed_decoration.contains(&center));
+            }
+            let world = Arc::make_mut(&mut terrain.world);
+            let air = world.intern_state(state("air"));
+            world.set_block_id(16, 0, 0, air).unwrap();
+            assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_light_tracker_stays_invalid_after_published_light_is_cleared() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        for z in -2..=2 {
+            for x in -2..=2 {
+                terrain.completed_decoration.insert(ChunkPos { x, z });
+            }
+        }
+        let tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
+        terrain
+            .initialize_generated_lighting(center, false)
+            .unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.set_section_block([0, 0, 0], &state("air")).unwrap();
+        region.finish().unwrap();
+        assert!(!terrain.snapshot().chunks[&center].block_light_correct);
+        assert!(tracker.validate_terrain(&terrain).is_err());
+        assert!(FreshGenerationLightTracker::new(&terrain, false).is_err());
     }
 
     #[test]

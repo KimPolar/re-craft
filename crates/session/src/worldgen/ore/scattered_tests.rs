@@ -101,6 +101,7 @@ fn terrain(seed: i64) -> CarvedTerrainWorld {
         min_y: -16,
         height: 32,
         completed_decoration: BTreeSet::new(),
+        has_published_light: false,
         ore_ocean_floor_heights: BTreeMap::new(),
         feature_world_surface_heights: BTreeMap::new(),
         final_heightmaps: BTreeMap::new(),

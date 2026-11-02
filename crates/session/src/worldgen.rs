@@ -1,6 +1,6 @@
-//! Intermediate noise, biome, surface and carver generation for fresh terrain.
-//! Structures, features, lighting, persistence and playable world integration
-//! are not implemented by this module.
+//! Intermediate terrain, selected features and lighting for fresh worlds.
+//! Full structure and feature coverage, persistence and playable world
+//! integration are not yet implemented.
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -82,6 +82,9 @@ pub struct CarvedTerrainWorld {
     // Completed only when every selected feature has been processed with
     // structures disabled; lighting and later generation are still pending.
     completed_decoration: std::collections::BTreeSet<native_world::loaded::ChunkPos>,
+    // Once light has been published, clearing chunk arrays cannot recreate the
+    // fresh engine's earlier allocation and propagation history.
+    has_published_light: bool,
     // Direct feature section writes do not update Java's primed heightmap.
     ore_ocean_floor_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     feature_world_surface_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
@@ -97,6 +100,112 @@ pub struct CarvedTerrainWorld {
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     generated_bee_nests: Arc<BTreeMap<[i32; 3], GeneratedBeeNest>>,
     generated_monster_entities: Arc<BTreeMap<[i32; 3], Option<GeneratedMonsterRoomEntity>>>,
+}
+
+/// Registration history for a newly created generation light engine. The
+/// scheduler must route every INITIALIZE_LIGHT registration through this
+/// tracker and stop using it once other light-engine work has been scheduled.
+pub struct FreshGenerationLightTracker {
+    dimension: String,
+    seed: i64,
+    min_y: i32,
+    height: i32,
+    has_skylight: bool,
+    registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
+}
+
+impl FreshGenerationLightTracker {
+    /// Start only when the associated Java-equivalent engine is freshly empty.
+    pub fn new(terrain: &CarvedTerrainWorld, has_skylight: bool) -> Result<Self> {
+        ensure!(!terrain.has_published_light, "light was already published");
+        ensure!(
+            terrain
+                .world
+                .chunks
+                .values()
+                .all(|c| !c.block_light_correct),
+            "fresh engine cannot contain propagated chunks"
+        );
+        Ok(Self {
+            dimension: terrain.world.dimension.clone(),
+            seed: terrain.seed,
+            min_y: terrain.min_y,
+            height: terrain.height,
+            has_skylight,
+            registered: BTreeMap::new(),
+        })
+    }
+
+    fn validate_terrain(&self, terrain: &CarvedTerrainWorld) -> Result<()> {
+        ensure!(!terrain.has_published_light, "light was already published");
+        ensure!(
+            self.dimension == terrain.world.dimension
+                && self.seed == terrain.seed
+                && self.min_y == terrain.min_y
+                && self.height == terrain.height,
+            "light tracker belongs to different terrain"
+        );
+        self.validate_world(&terrain.world)
+    }
+
+    fn validate_world(&self, world: &native_world::loaded::World) -> Result<()> {
+        ensure!(
+            world
+                .chunks
+                .values()
+                .all(|chunk| !chunk.block_light_correct),
+            "fresh light engine has propagated chunks"
+        );
+        for (pos, original) in &self.registered {
+            ensure!(
+                world
+                    .chunks
+                    .get(pos)
+                    .is_some_and(|chunk| Arc::ptr_eq(chunk, original)),
+                "registered light chunk has changed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Register the completed chunk in the same order as the light engine.
+    pub fn register_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        self.validate_terrain(terrain)?;
+        ensure!(
+            !self.registered.contains_key(&pos),
+            "light chunk is already registered"
+        );
+        terrain.fresh_generation_light([pos], [], registry, self.has_skylight)?;
+        let chunk = terrain
+            .world
+            .chunks
+            .get(&pos)
+            .context("light chunk is missing")?;
+        self.registered.insert(pos, Arc::clone(chunk));
+        Ok(())
+    }
+
+    /// Capture one immutable engine revision. Any later registered-chunk edit
+    /// invalidates this tracker before another snapshot or registration.
+    pub fn snapshot(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        covered_columns: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        self.validate_terrain(terrain)?;
+        terrain.fresh_generation_light(
+            self.registered.keys().copied(),
+            covered_columns,
+            registry,
+            self.has_skylight,
+        )
+    }
 }
 
 impl CarvedTerrainWorld {
@@ -119,6 +228,7 @@ impl CarvedTerrainWorld {
             min_y,
             height,
             completed_decoration: std::collections::BTreeSet::new(),
+            has_published_light: false,
             ore_ocean_floor_heights: BTreeMap::new(),
             feature_world_surface_heights: BTreeMap::new(),
             final_heightmaps: BTreeMap::new(),
@@ -195,6 +305,7 @@ impl CarvedTerrainWorld {
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
         has_skylight: bool,
     ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        ensure!(!self.has_published_light, "light was already published");
         let registered: Vec<_> = registered_chunks.into_iter().collect();
         ensure!(
             registered
@@ -318,6 +429,7 @@ impl CarvedTerrainWorld {
         Arc::make_mut(&mut self.world)
             .chunks
             .insert(center, Arc::new(chunk));
+        self.has_published_light = true;
         Ok(())
     }
 

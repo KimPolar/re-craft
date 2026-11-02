@@ -1527,6 +1527,45 @@ mod tests {
         assert_eq!(locked.step, f64::from(locked.clip.rate) / 48000.0 * 1.25);
     }
     #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn bubble_column_ambient_sounds_resolve_as_block_sounds() {
+        let root = native_resources::default_minecraft_dir().unwrap();
+        let mut catalog = Catalog::load(Resources {
+            root,
+            packs: Vec::new(),
+        })
+        .unwrap();
+        let position = glam::DVec3::new(-8.0, 10.0, 17.0);
+        let neutral = Arc::new(AtomicU32::new(0));
+        let ambient = Arc::new(AtomicU32::new(0));
+        for name in [
+            "block.bubble_column.whirlpool_ambient",
+            "block.bubble_column.upwards_ambient",
+        ] {
+            let event = native_session::ConsumeSound {
+                position,
+                info: native_session::ConsumeSoundInfo {
+                    event: name.into(),
+                    volume: 0.3,
+                    pitch: 0.95,
+                    category: native_session::ConsumeSoundCategory::Block,
+                },
+            };
+            let voice = catalog
+                .consume(event, &mut LegacyRandom::new(3), 48000, &neutral, &ambient)
+                .unwrap()
+                .unwrap();
+            assert!(
+                voice.clip.samples.iter().any(|sample| *sample != 0),
+                "{name}"
+            );
+            assert_eq!(voice.spatial.unwrap().position, position);
+            assert!(!voice.player_sound);
+            assert!(voice.category_gain.is_none());
+        }
+    }
+
+    #[test]
     fn mixer_resamples_and_finishes_multiple_voices() {
         let clip = Arc::new(Clip {
             samples: vec![0, 16384, 0],

@@ -179,6 +179,13 @@ pub struct GameUi {
     bubble_sprite_result:
         std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     bubble_load_failed: bool,
+    ambient_bubbles: crate::ambient_bubbles::AmbientBubbles,
+    bubble_up_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    bubble_up_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
+    current_down_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    current_down_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     surface_packet_random: crate::surface_particles::SurfacePacketRandom,
     splash_particles: crate::surface_particles::SplashSystem,
     splash_sprites: Option<crate::particle_sprites::ParticleSprites>,
@@ -238,6 +245,8 @@ impl GameUi {
         let skin = Arc::clone(&assets.player_skin);
         let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (bubble_sender, bubble_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (bubble_up_sender, bubble_up_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (current_down_sender, current_down_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (splash_sender, splash_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (soul_sender, soul_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (plant_sender, plant_sprite_result) = std::sync::mpsc::sync_channel(1);
@@ -270,6 +279,16 @@ impl GameUi {
                             .load_bubble_sprites()
                             .map_err(|error| format!("{error:#}")),
                     );
+                    let _ = bubble_up_sender.send(
+                        loader
+                            .load_bubble_column_up_sprites()
+                            .map_err(|error| format!("{error:#}")),
+                    );
+                    let _ = current_down_sender.send(
+                        loader
+                            .load_current_down_sprites()
+                            .map_err(|error| format!("{error:#}")),
+                    );
                     let _ = splash_sender.send(
                         loader
                             .load_splash_sprites()
@@ -285,6 +304,10 @@ impl GameUi {
                     let _ = smoke_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
                     let _ = bubble_sender
+                        .send(Err("particle resource loader is unavailable".to_owned()));
+                    let _ = bubble_up_sender
+                        .send(Err("particle resource loader is unavailable".to_owned()));
+                    let _ = current_down_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
                     let _ = splash_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
@@ -318,6 +341,11 @@ impl GameUi {
             bubble_sprites: None,
             bubble_sprite_result,
             bubble_load_failed: false,
+            ambient_bubbles: crate::ambient_bubbles::AmbientBubbles::default(),
+            bubble_up_sprites: None,
+            bubble_up_sprite_result,
+            current_down_sprites: None,
+            current_down_sprite_result,
             surface_packet_random: crate::surface_particles::SurfacePacketRandom::default(),
             splash_particles: crate::surface_particles::SplashSystem::default(),
             splash_sprites: None,
@@ -442,6 +470,33 @@ impl GameUi {
             }
         }
         self.bubble_particles.enqueue(bubbles);
+    }
+
+    pub fn update_ambient_bubbles(
+        &mut self,
+        snapshot: &native_session::WorldSnapshot,
+    ) -> Vec<native_session::ConsumeSound> {
+        if self.bubble_up_sprites.is_none() {
+            if let Ok(result) = self.bubble_up_sprite_result.try_recv() {
+                match result {
+                    Ok(sprites) => self.bubble_up_sprites = Some(sprites),
+                    Err(error) => eprintln!("Cannot load bubble-column sprites: {error}"),
+                }
+            }
+        }
+        if self.current_down_sprites.is_none() {
+            if let Ok(result) = self.current_down_sprite_result.try_recv() {
+                match result {
+                    Ok(sprites) => self.current_down_sprites = Some(sprites),
+                    Err(error) => eprintln!("Cannot load current-down sprites: {error}"),
+                }
+            }
+        }
+        self.ambient_bubbles.update(
+            snapshot,
+            self.bubble_up_sprites.as_ref().map_or(0, |s| s.len()),
+            self.current_down_sprites.as_ref().map_or(0, |s| s.len()),
+        )
     }
 
     pub fn update_splash_particles(&mut self, snapshot: &native_session::WorldSnapshot) {
@@ -2287,6 +2342,44 @@ impl GameUi {
                     light,
                 });
             }
+        }
+        if self.ambient_bubbles.particles().next().is_some() {
+            if let Some(sprites) = &mut self.bubble_up_sprites {
+                sprites.advance(snapshot.tick);
+            }
+            if let Some(sprites) = &mut self.current_down_sprites {
+                sprites.advance(snapshot.tick);
+            }
+        }
+        for particle in self.ambient_bubbles.particles() {
+            let sprites = match particle.kind {
+                crate::ambient_bubbles::Kind::Up => &self.bubble_up_sprites,
+                crate::ambient_bubbles::Kind::Down => &self.current_down_sprites,
+            };
+            let Some((texture, uv)) = sprites
+                .as_ref()
+                .and_then(|sprites| sprites.get(particle.sprite))
+            else {
+                continue;
+            };
+            let light = match &snapshot.world {
+                native_session::SessionWorld::Demo(_) => u32::MAX,
+                native_session::SessionWorld::Loaded(world) => {
+                    let cell = particle.position.floor().as_ivec3();
+                    u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                        + 16 * u32::from(world.light(cell.x, cell.y, cell.z, true).unwrap_or(15))
+                }
+            };
+            particle_draws.push(crate::consume_particle_render::RenderParticle {
+                previous: particle.previous,
+                position: particle.position,
+                size: particle.size,
+                uv,
+                color: [1.0; 3],
+                opaque: true,
+                texture: Arc::clone(texture),
+                light,
+            });
         }
         if let Some(sprites) = &mut self.splash_sprites {
             if self.splash_particles.particles().next().is_some() {

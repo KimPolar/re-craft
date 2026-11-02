@@ -727,7 +727,9 @@ impl Viewer {
                 ui.update_splash_particles(&snapshot);
                 ui.update_soul_particles(&snapshot, soul_particles);
                 ui.update_consume_particles(&snapshot, particles);
-                ui.update_evaporation_smoke(&snapshot, smoke, fizz)
+                let mut sounds = ui.update_evaporation_smoke(&snapshot, smoke, fizz);
+                sounds.extend(ui.update_ambient_bubbles(&snapshot));
+                sounds
             } else {
                 Vec::new()
             };

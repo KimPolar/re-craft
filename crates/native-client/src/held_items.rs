@@ -426,6 +426,16 @@ impl Loader {
     ) -> Result<crate::particle_sprites::ParticleSprites> {
         crate::particle_sprites::ParticleSprites::load(&mut self.stack, "bubble")
     }
+    pub(crate) fn load_bubble_column_up_sprites(
+        &mut self,
+    ) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "bubble_column_up")
+    }
+    pub(crate) fn load_current_down_sprites(
+        &mut self,
+    ) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "current_down")
+    }
     pub(crate) fn load_splash_sprites(
         &mut self,
     ) -> Result<crate::particle_sprites::ParticleSprites> {
@@ -1408,6 +1418,56 @@ mod tests {
                 .0,
             [7, 11, 13, 255]
         );
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn ambient_bubble_sprites_follow_both_particle_definitions() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut vanilla = open_loader(&game, &[]);
+        assert_eq!(vanilla.load_bubble_column_up_sprites().unwrap().len(), 1);
+        assert_eq!(vanilla.load_current_down_sprites().unwrap().len(), 1);
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("particles")).unwrap();
+        std::fs::create_dir_all(base.join("textures/particle")).unwrap();
+        for (definition, texture, color) in [
+            ("bubble_column_up", "custom_up", [7, 11, 13, 255]),
+            ("current_down", "custom_down", [17, 19, 23, 255]),
+        ] {
+            std::fs::write(
+                base.join(format!("particles/{definition}.json")),
+                format!(r#"{{"textures":["minecraft:{texture}"]}}"#),
+            )
+            .unwrap();
+            RgbaImage::from_pixel(4, 4, image::Rgba(color))
+                .save(base.join(format!("textures/particle/{texture}.png")))
+                .unwrap();
+        }
+        let mut selected = open_loader(&game, &[pack.path().to_path_buf()]);
+        for (sprites, color) in [
+            (
+                selected.load_bubble_column_up_sprites().unwrap(),
+                [7, 11, 13, 255],
+            ),
+            (
+                selected.load_current_down_sprites().unwrap(),
+                [17, 19, 23, 255],
+            ),
+        ] {
+            let (image, uv) = sprites.get(0).unwrap();
+            assert_eq!(
+                image
+                    .get_pixel(
+                        (uv[0] * image.width() as f32) as u32,
+                        (uv[1] * image.height() as f32) as u32
+                    )
+                    .0,
+                color
+            );
+        }
     }
 
     #[test]

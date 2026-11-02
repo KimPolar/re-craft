@@ -98,7 +98,7 @@ impl Bubble {
     }
 }
 
-fn water_at(world: &SessionWorld, position: DVec3) -> bool {
+pub(crate) fn water_at(world: &SessionWorld, position: DVec3) -> bool {
     let cell = position.floor().as_ivec3();
     match world {
         SessionWorld::Demo(_) => false,

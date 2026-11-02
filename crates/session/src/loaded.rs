@@ -6283,8 +6283,10 @@ impl LoadedSession {
             return;
         };
         self.push_chest_sound(position, other, false);
+        self.chest_vibration(position, false);
         self.set_trapped_chest_open(position, false);
         if let Some(other) = other {
+            self.chest_vibration(other, false);
             self.set_trapped_chest_open(other, false);
         }
         let mut changed_chunks = BTreeSet::new();
@@ -6578,7 +6580,9 @@ impl LoadedSession {
             self.chest_contents.insert(key(left_position), left);
             self.push_chest_sound(right_position, Some(left_position), true);
             if self.game_mode != GameMode::Spectator {
+                self.chest_vibration(right_position, true);
                 self.set_trapped_chest_open(right_position, true);
+                self.chest_vibration(left_position, true);
                 self.set_trapped_chest_open(left_position, true);
             }
         } else {
@@ -6596,6 +6600,7 @@ impl LoadedSession {
             self.chest_contents.insert(key(position), chest);
             self.push_chest_sound(position, None, true);
             if self.game_mode != GameMode::Spectator {
+                self.chest_vibration(position, true);
                 self.set_trapped_chest_open(position, true);
             }
         }
@@ -6660,6 +6665,37 @@ impl LoadedSession {
 
     pub fn take_chest_sounds(&mut self) -> Vec<ChestSoundEvent> {
         self.chest_sounds.drain(..).collect()
+    }
+
+    /// Each half has its own opener counter and emits at its block center.
+    fn chest_vibration(&mut self, position: IVec3, opening: bool) {
+        if self.game_mode == GameMode::Spectator || self.sculk_listeners.is_empty() {
+            return;
+        }
+        let event = if opening {
+            "minecraft:container_open"
+        } else {
+            "minecraft:container_close"
+        };
+        if !self
+            .world
+            .block(position.x, position.y, position.z)
+            .is_some_and(|block| {
+                matches!(
+                    block.name.as_str(),
+                    "minecraft:chest" | "minecraft:trapped_chest"
+                )
+            })
+        {
+            return;
+        }
+        self.dispatch_vibration(
+            event,
+            position.as_dvec3() + DVec3::splat(0.5),
+            self.player_uuid,
+            Some(self.player_vibration_source()),
+            None,
+        );
     }
 
     fn notify_chest_locked(
@@ -32993,6 +33029,194 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    fn chest_vibration_fixture(
+        double: bool,
+        trapped: bool,
+        ignore_sneak: bool,
+    ) -> (LoadedSession, IVec3, IVec3) {
+        use native_persistence::nbt::{self, Tag};
+        use native_world::loaded::SavedBlockEntities;
+        let (mut session, sensor) =
+            splash_test_session(false, crate::sculk_sensor::Phase::Inactive, 0, false);
+        let chest = session.origin + IVec3::new(8, 2, 6);
+        let right = chest + IVec3::X;
+        let name = if trapped {
+            "minecraft:trapped_chest"
+        } else {
+            "minecraft:chest"
+        };
+        for (position, kind) in [
+            (chest, if double { "left" } else { "single" }),
+            (right, "right"),
+        ]
+        .into_iter()
+        .take(if double { 2 } else { 1 })
+        {
+            let id = session.intern_block(state(
+                name,
+                &[
+                    ("facing", "north"),
+                    ("type", kind),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(position - session.origin, id));
+        }
+        let chunk = ChunkPos {
+            x: chest.x.div_euclid(16),
+            z: chest.z.div_euclid(16),
+        };
+        let SavedBlockEntities::Encoded(bytes) =
+            session.world.saved_block_entities.get(&chunk).unwrap()
+        else {
+            unreachable!()
+        };
+        let mut document = nbt::read(bytes).unwrap();
+        let Tag::List { values, .. } = &mut document.value else {
+            unreachable!()
+        };
+        for position in [chest, right].into_iter().take(if double { 2 } else { 1 }) {
+            values.push(Tag::Compound(vec![
+                ("id".into(), Tag::String(name.into())),
+                ("x".into(), Tag::Int(position.x)),
+                ("y".into(), Tag::Int(position.y)),
+                ("z".into(), Tag::Int(position.z)),
+            ]));
+        }
+        Arc::make_mut(&mut session.world)
+            .saved_block_entities
+            .insert(
+                chunk,
+                SavedBlockEntities::Encoded(nbt::write(&document).unwrap().into()),
+            );
+        let events = BTreeSet::from([
+            "minecraft:container_open".into(),
+            "minecraft:container_close".into(),
+        ]);
+        let ignored = if ignore_sneak {
+            events.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let ids = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:sculk_sensor".into(),
+            "minecraft:chest".into(),
+            "minecraft:trapped_chest".into(),
+        ]);
+        let blocks = native_resources::game_event_tags::VibrationBlockTags::load(
+            &mut BlockEventPacks {
+                dampens: false,
+                occludes: false,
+            },
+            &ids,
+        )
+        .unwrap();
+        session.set_vibration_tags(
+            Arc::new(native_resources::game_event_tags::GameEventTags::new(
+                events, ignored,
+            )),
+            Arc::new(blocks),
+        );
+        session.player_uuid = Some([1, 2, 3, 4]);
+        session.set_random_tick_speed(0);
+        (session, sensor, chest)
+    }
+
+    #[test]
+    fn chest_open_and_close_deliver_player_vibrations_to_sensors() {
+        for double in [false, true] {
+            for trapped in [false, true] {
+                for (spectator, sneak, ignore_sneak) in [
+                    (false, false, false),
+                    (false, true, false),
+                    (false, true, true),
+                    (true, false, false),
+                ] {
+                    let (mut session, sensor, chest) =
+                        chest_vibration_fixture(double, trapped, ignore_sneak);
+                    session.sneak = sneak;
+                    if spectator {
+                        session.set_game_mode(GameMode::Spectator);
+                    }
+                    assert!(session.try_open_saved_chest(chest - session.origin));
+                    let check = |session: &LoadedSession, expected: &str| {
+                        let pending = session.sculk_listeners[&sensor.to_array()]
+                            .vibration
+                            .pending()
+                            .map(|(_, event)| event);
+                        assert_eq!(pending.is_some(), !spectator && !(sneak && ignore_sneak));
+                        if let Some(event) = pending {
+                            assert_eq!(event.event, expected);
+                            assert_eq!(event.source, session.player_uuid);
+                            // For a double chest this left half is closer, even though the right half is visited first.
+                            assert_eq!(event.position, chest.as_dvec3() + DVec3::splat(0.5));
+                        }
+                    };
+                    check(&session, "minecraft:container_open");
+                    session
+                        .sculk_listeners
+                        .get_mut(&sensor.to_array())
+                        .unwrap()
+                        .vibration = Default::default();
+                    assert!(Arc::make_mut(&mut session.inventory).toggle());
+                    session.collect_closed_chest();
+                    check(&session, "minecraft:container_close");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_chest_vibrations_with_java(rows: &[serde_json::Value]) {
+        assert_eq!(rows.len(), 2);
+        let (mut session, sensor, chest) = chest_vibration_fixture(false, false, false);
+        for row in rows {
+            if row["opening"].as_bool().unwrap() {
+                assert!(session.try_open_saved_chest(chest - session.origin));
+            } else {
+                session
+                    .sculk_listeners
+                    .get_mut(&sensor.to_array())
+                    .unwrap()
+                    .vibration = Default::default();
+                assert!(Arc::make_mut(&mut session.inventory).toggle());
+                session.collect_closed_chest();
+            }
+            let event = &session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending()
+                .unwrap()
+                .1;
+            assert_eq!(
+                event.event,
+                format!("minecraft:{}", row["event"].as_str().unwrap())
+            );
+            assert_eq!(
+                event.source == session.player_uuid,
+                row["source"].as_bool().unwrap()
+            );
+            assert_eq!(
+                event.position == chest.as_dvec3() + DVec3::splat(0.5),
+                row["center"].as_bool().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_chest_does_not_emit_an_open_vibration() {
+        let (mut session, sensor, chest) = chest_vibration_fixture(false, false, false);
+        assert!(session.set(chest - session.origin + IVec3::Y, session.states[3]));
+        assert!(!session.try_open_saved_chest(chest - session.origin));
+        assert!(
+            session.sculk_listeners[&sensor.to_array()]
+                .vibration
+                .pending()
+                .is_none()
+        );
     }
 
     #[test]

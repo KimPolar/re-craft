@@ -31,8 +31,15 @@ pub struct OreRegion<'a> {
     writable: BTreeSet<ChunkPos>,
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    final_heights: BTreeMap<ChunkPos, Arc<FinalHeightmaps>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
+}
+
+/// Final 26.3 terrain heightmaps in surface, ocean, motion and no-leaves order.
+#[derive(Clone)]
+pub(super) struct FinalHeightmaps {
+    values: Box<[[i32; 256]; 4]>,
 }
 
 /// A placed feature bound to the exact configured ore it references.
@@ -249,8 +256,8 @@ impl CarvedTerrainWorld {
     /// Writable chunks must match the Java WorldGenRegion for this step.
     /// All reads, including neighbors and heightmaps, require loaded chunks.
     /// The tags must belong to the same registry and active data packs for the
-    /// lifetime of the terrain. Other generation writes must update any primed
-    /// heightmaps before this interface can be combined with those features.
+    /// lifetime of the terrain. Other generation writes must apply the Java
+    /// heightmap rules before this interface can be combined with them.
     pub fn ore_region<'a>(
         &'a mut self,
         tags: &'a OreBlockTags,
@@ -264,6 +271,7 @@ impl CarvedTerrainWorld {
         let world = (*self.world).clone();
         let heights = self.ore_ocean_floor_heights.clone();
         let surface_heights = self.feature_world_surface_heights.clone();
+        let final_heights = self.final_heightmaps.clone();
         Ok(OreRegion {
             target: self,
             world,
@@ -272,6 +280,7 @@ impl CarvedTerrainWorld {
             writable,
             heights,
             surface_heights,
+            final_heights,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -414,6 +423,7 @@ impl OreRegion<'_> {
         self.target.world = Arc::new(self.world);
         self.target.ore_ocean_floor_heights = self.heights;
         self.target.feature_world_surface_heights = self.surface_heights;
+        self.target.final_heightmaps = self.final_heights;
         Ok(())
     }
 
@@ -433,7 +443,8 @@ impl OreRegion<'_> {
     fn prime_heightmaps(&mut self, pos: ChunkPos) -> Result<()> {
         let need_ocean = !self.heights.contains_key(&pos);
         let need_surface = !self.surface_heights.contains_key(&pos);
-        if !need_ocean && !need_surface {
+        let need_final = !self.final_heights.contains_key(&pos);
+        if !need_ocean && !need_surface && !need_final {
             return Ok(());
         }
         let base_x = pos.x.checked_mul(16).context("chunk X overflow")?;
@@ -448,10 +459,15 @@ impl OreRegion<'_> {
         );
         let mut ocean = Box::new([self.target.min_y; 256]);
         let mut surface = Box::new([self.target.min_y; 256]);
+        let mut final_maps = FinalHeightmaps {
+            values: Box::new([[self.target.min_y; 256]; 4]),
+        };
+        let mut final_cache = BTreeMap::<BlockStateId, [bool; 4]>::new();
         for z in 0..16 {
             for x in 0..16 {
                 let mut missing_ocean = need_ocean;
                 let mut missing_surface = need_surface;
+                let mut missing_final = [need_final; 4];
                 for y in (self.target.min_y..self.target.min_y + self.target.height).rev() {
                     let id = self
                         .world
@@ -482,7 +498,22 @@ impl OreRegion<'_> {
                             missing_ocean = false;
                         }
                     }
-                    if !missing_ocean && !missing_surface {
+                    if missing_final.iter().any(|v| *v) {
+                        let flags = if let Some(flags) = final_cache.get(&id) {
+                            *flags
+                        } else {
+                            let flags = self.final_predicates(state)?;
+                            final_cache.insert(id, flags);
+                            flags
+                        };
+                        for kind in 0..4 {
+                            if missing_final[kind] && flags[kind] {
+                                final_maps.values[kind][index] = y + 1;
+                                missing_final[kind] = false;
+                            }
+                        }
+                    }
+                    if !missing_ocean && !missing_surface && !missing_final.iter().any(|v| *v) {
                         break;
                     }
                 }
@@ -493,6 +524,73 @@ impl OreRegion<'_> {
         }
         if need_surface {
             self.surface_heights.insert(pos, Arc::from(surface));
+        }
+        if need_final {
+            self.final_heights.insert(pos, Arc::new(final_maps));
+        }
+        Ok(())
+    }
+
+    fn final_predicates(&self, state: &BlockState) -> Result<[bool; 4]> {
+        let motion = self.motion.for_block(&state.name)?;
+        let fluid = native_world::fluid::FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .is_some();
+        Ok([
+            !is_air(state),
+            motion.blocks_motion,
+            motion.blocks_motion || fluid,
+            motion.blocks_motion_no_leaves || fluid,
+        ])
+    }
+
+    fn final_height(&mut self, kind: usize, x: i32, z: i32) -> Result<i32> {
+        let pos = chunk([x, 0, z]);
+        self.prime_heightmaps(pos)?;
+        Ok(self.final_heights[&pos].values[kind]
+            [(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
+    }
+
+    // Only WorldGenLevel.setBlock updates the final maps. Direct section
+    // writes can leave them stale, and Java then updates that stale value.
+    fn update_final_heightmaps(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
+        let pos = chunk(p);
+        let index = (p[0].rem_euclid(16) + p[2].rem_euclid(16) * 16) as usize;
+        let old = self
+            .final_heights
+            .get(&pos)
+            .context("final heightmaps missing")?;
+        let flags = self.final_predicates(state)?;
+        let mut values = [0; 4];
+        for kind in 0..4 {
+            let previous = old.values[kind][index];
+            values[kind] = previous;
+            if p[1] <= previous - 2 {
+                continue;
+            }
+            if flags[kind] && p[1] >= previous {
+                values[kind] = p[1] + 1;
+            } else if !flags[kind] && p[1] == previous - 1 {
+                values[kind] = self.target.min_y;
+                for y in (self.target.min_y..p[1]).rev() {
+                    let below = self
+                        .world
+                        .block(p[0], y, p[2])
+                        .context("heightmap scan block missing")?;
+                    if self.final_predicates(below)?[kind] {
+                        values[kind] = y + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        let maps = Arc::make_mut(
+            self.final_heights
+                .get_mut(&pos)
+                .context("final heightmaps missing")?,
+        );
+        for kind in 0..4 {
+            maps.values[kind][index] = values[kind];
         }
         Ok(())
     }
@@ -540,9 +638,9 @@ impl OreRegion<'_> {
             "unsupported scattered ore source effects"
         );
         // At TERRAIN, ProtoChunk updates final heightmaps, not the cached
-        // world-generation maps used by this partial feature pipeline.
-        // Final heightmaps are not exposed or saved by this pipeline yet.
+        // world-generation maps. Saving remains outside this partial pipeline.
         self.set_section_block(p, state)?;
+        self.update_final_heightmaps(p, state)?;
         Ok(true)
     }
 }
@@ -563,6 +661,10 @@ impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
         match kind {
             "OCEAN_FLOOR_WG" => self.region.ocean_floor_height(x, z),
             "WORLD_SURFACE_WG" => self.region.world_surface_height(x, z),
+            "WORLD_SURFACE" => self.region.final_height(0, x, z),
+            "OCEAN_FLOOR" => self.region.final_height(1, x, z),
+            "MOTION_BLOCKING" => self.region.final_height(2, x, z),
+            "MOTION_BLOCKING_NO_LEAVES" => self.region.final_height(3, x, z),
             _ => bail!("unsupported generation heightmap {kind}"),
         }
     }
@@ -777,6 +879,7 @@ mod tests {
             completed_decoration: BTreeSet::new(),
             ore_ocean_floor_heights: BTreeMap::new(),
             feature_world_surface_heights: BTreeMap::new(),
+            final_heightmaps: BTreeMap::new(),
             postprocessing: BTreeMap::new(),
             noise_postprocessing: BTreeMap::new(),
             surface_postprocessing: BTreeMap::new(),
@@ -862,6 +965,10 @@ mod tests {
         let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 13);
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        assert_eq!(region.final_height(1, 0, 0).unwrap(), 8);
+        assert_eq!(region.final_height(2, 0, 0).unwrap(), 13);
+        assert_eq!(region.final_height(3, 0, 0).unwrap(), 13);
     }
 
     #[test]
@@ -871,6 +978,9 @@ mod tests {
         let mut region = terrain.ore_region(&tags, &motion, writable).unwrap();
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        for kind in 0..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 8);
+        }
         // The fixture's motion tag intentionally excludes ancient debris.
         assert!(
             region
@@ -879,6 +989,10 @@ mod tests {
         );
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 8);
+        for kind in 1..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
+        }
         assert!(
             region
                 .set_block([0, 12, 0], &state("ancient_debris"), 2)
@@ -886,6 +1000,10 @@ mod tests {
         );
         assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
         assert_eq!(region.world_surface_height(0, 0).unwrap(), 8);
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        for kind in 1..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
+        }
         assert!(
             !region
                 .set_block([16, 7, 0], &state("ancient_debris"), 2)
@@ -898,6 +1016,11 @@ mod tests {
                 .unwrap()
         );
         region.finish().unwrap();
+        let mut next = terrain
+            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert_eq!(next.final_height(0, 0, 0).unwrap(), 13);
+        assert_eq!(next.final_height(1, 0, 0).unwrap(), 7);
     }
 
     #[test]
@@ -914,6 +1037,34 @@ mod tests {
         );
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn final_heightmaps_keep_stale_direct_section_writes() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let mut region = terrain
+            .ore_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        region
+            .set_section_block([0, 12, 0], &state("stone"))
+            .unwrap();
+        for kind in 0..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 8);
+        }
+        region
+            .set_block([0, 7, 0], &state("ancient_debris"), 2)
+            .unwrap();
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 8);
+        for kind in 1..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
+        }
+        region
+            .set_block([0, 12, 0], &state("ancient_debris"), 2)
+            .unwrap();
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        for kind in 1..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
+        }
     }
 
     #[test]
@@ -1191,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_biome_failure_discards_prior_writes_and_unsupported_heightmaps_fail() {
+    fn scheduled_biome_failure_discards_prior_writes() {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         let ore = ScheduledOreFeature::load(
@@ -1219,31 +1370,18 @@ mod tests {
         assert_eq!(calls, 2);
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
-
-        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("MOTION_BLOCKING"));
-        let plan = fixture_plan(&schedule, &neighborhood);
-        let ore = ScheduledOreFeature::load(
-            &mut data,
-            &schedule,
-            plan.features[0].feature,
-            &mut resolve_test,
-        )
-        .unwrap();
-        let mut region = terrain
-            .ore_region(&tags, &motion, before.chunks.keys().copied().collect())
-            .unwrap();
-        assert!(
-            region
-                .place_planned(&plan, 0, &ore, &mut |_, _| Ok(true))
-                .is_err()
-        );
-        assert!(region.finish().is_err());
-        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]
     fn scheduled_ore_uses_generation_heightmaps() {
-        for kind in ["OCEAN_FLOOR_WG", "WORLD_SURFACE_WG"] {
+        for kind in [
+            "OCEAN_FLOOR_WG",
+            "WORLD_SURFACE_WG",
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+        ] {
             let (mut data, schedule, neighborhood) = scheduled_fixture(Some(kind));
             let plan = fixture_plan(&schedule, &neighborhood);
             let ore = ScheduledOreFeature::load(
@@ -1358,10 +1496,7 @@ mod tests {
                 let second = if self.unsupported {
                     json!({"feature":{"type":"minecraft:tree"},"placement":[]})
                 } else {
-                    ScheduledData {
-                        heightmap: Some("MOTION_BLOCKING"),
-                    }
-                    .definition()
+                    json!({"feature":{"type":"minecraft:scattered_ore","size":64,"discard_chance_on_air_exposure":0.0,"targets":[{"target":{"predicate_type":"minecraft:block_match","block":"minecraft:stone"},"state":"minecraft:diamond_ore"}]},"placement":[{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":4},"max_inclusive":{"absolute":4}}},{"type":"minecraft:biome"}]})
                 };
                 return Ok(Some(serde_json::to_vec(
                     &json!({"features":[["test:ore",second]]}),

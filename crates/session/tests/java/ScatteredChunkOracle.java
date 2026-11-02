@@ -3,6 +3,7 @@ import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.core.*;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.ai.village.poi.PoiTypes;
 import net.minecraft.world.level.*;
@@ -19,6 +20,9 @@ public class ScatteredChunkOracle {
   static java.io.PrintStream out;
   static final int CX=-1,CZ=2;
   static long key(int x,int z){return ((long)x<<32)^(z&0xffffffffL);}
+  static void maps(ProtoChunk chunk,int step,int x,int z) {
+    out.printf("D %d %d %d %d %d%n",step,chunk.getHeight(Heightmap.Types.WORLD_SURFACE,x,z)+1,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR,x,z)+1,chunk.getHeight(Heightmap.Types.MOTION_BLOCKING,x,z)+1,chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,x,z)+1);
+  }
   static BlockState initial(int x,int y,int z) {
     int n=x*31+y*17+z*13;
     if((n&7)==0)return Blocks.AIR.defaultBlockState();
@@ -30,16 +34,23 @@ public class ScatteredChunkOracle {
       for(var s:b.getStateDefinition().getPossibleStates()) if(s.hasBlockEntity()||PoiTypes.hasPoi(s))throw new AssertionError("unsupported state effects "+s);
     if(Blocks.ANCIENT_DEBRIS.defaultBlockState().getPostProcessPos(null,BlockPos.ZERO)!=null)throw new AssertionError("debris postprocessing");
     out.println("E safe");
+    var fluids=new TreeSet<String>();
+    for(var b:BuiltInRegistries.BLOCK) for(var s:b.getStateDefinition().getPossibleStates()) {
+      var waterlogged=s.getProperties().stream().filter(p->p.getName().equals("waterlogged")).findFirst();
+      String wet=waterlogged.isPresent()?s.getValue(waterlogged.get()).toString():"none";
+      fluids.add("F "+BuiltInRegistries.BLOCK.getKey(b)+" "+wet+" "+!s.getFluidState().isEmpty());
+    }
+    fluids.forEach(out::println);
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
-    for(var b:List.of(Blocks.NETHERRACK,Blocks.BASALT,Blocks.BLACKSTONE))bind.invoke(b.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_NETHER,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP));
+    for(var b:List.of(Blocks.NETHERRACK,Blocks.BASALT,Blocks.BLACKSTONE))bind.invoke(b.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_NETHER,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES));
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);var unsafe=(sun.misc.Unsafe)f.get(null);
     var biome=Holder.direct((Biome)unsafe.allocateInstance(Biome.class));
     var ids=new IdMapper<Holder<Biome>>();ids.add(biome);
     var palette=new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState(),null,Strategy.createForBiomes(ids),biome,null);
     var height=LevelHeightAccessor.create(-16,32);
     var target=List.of(new BlockReplacement(new TagMatchTest(BlockTags.BASE_STONE_NETHER),Blocks.ANCIENT_DEBRIS.defaultBlockState()));
-    for(int mode=0;mode<2;mode++) {
-      bind.invoke(Blocks.ANCIENT_DEBRIS.builtInRegistryHolder(),mode==0?List.of(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP):List.of());
+    for(int mode=0;mode<3;mode++) {
+      bind.invoke(Blocks.ANCIENT_DEBRIS.builtInRegistryHolder(),mode==0?List.of(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES):mode==2?List.of(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP):List.of());
       for(int size:new int[]{3,12})for(float discard:new float[]{0.0f,1.0f})for(long seed=0;seed<4;seed++) {
         var chunks=new HashMap<Long,ProtoChunk>();
         for(int cz=CZ-1;cz<=CZ+1;cz++)for(int cx=CX-1;cx<=CX+1;cx++) {
@@ -47,7 +58,7 @@ public class ScatteredChunkOracle {
           for(int y=-16;y<16;y++)for(int z=0;z<16;z++)for(int x=0;x<16;x++) {
             var s=initial(cx*16+x,y,cz*16+z);if(!s.isAir())chunk.getSection((y+16)>>4).setBlockState(x,y&15,z,s,false);
           }
-          Heightmap.primeHeightmaps(chunk,EnumSet.of(Heightmap.Types.OCEAN_FLOOR_WG,Heightmap.Types.WORLD_SURFACE_WG));
+          Heightmap.primeHeightmaps(chunk,EnumSet.of(Heightmap.Types.OCEAN_FLOOR_WG,Heightmap.Types.WORLD_SURFACE_WG,Heightmap.Types.WORLD_SURFACE,Heightmap.Types.OCEAN_FLOOR,Heightmap.Types.MOTION_BLOCKING,Heightmap.Types.MOTION_BLOCKING_NO_LEAVES));
           chunks.put(key(cx,cz),chunk);
         }
         var changed=new TreeSet<Long>();
@@ -69,8 +80,12 @@ public class ScatteredChunkOracle {
         out.println("R "+result+" "+random.nextLong());
         for(long column:changed) {
           int x=(int)(column>>32),z=(int)column;var chunk=chunks.get(key(x>>4,z>>4));
-          out.printf("H %d %d %d %d%n",x,z,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR_WG,x,z)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG,x,z)+1);
+          out.printf("H %d %d %d %d %d %d %d %d%n",x,z,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR_WG,x,z)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG,x,z)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE,x,z)+1,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR,x,z)+1,chunk.getHeight(Heightmap.Types.MOTION_BLOCKING,x,z)+1,chunk.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,x,z)+1);
         }
+        var probe=chunks.get(key(CX,CZ));int px=-11,pz=37;
+        probe.getSection(1).setBlockState(px&15,15,pz&15,Blocks.NETHERRACK.defaultBlockState(),false);maps(probe,0,px,pz);
+        probe.setBlockState(new BlockPos(px,14,pz),Blocks.ANCIENT_DEBRIS.defaultBlockState(),2);maps(probe,1,px,pz);
+        probe.setBlockState(new BlockPos(px,15,pz),Blocks.ANCIENT_DEBRIS.defaultBlockState(),2);maps(probe,2,px,pz);
       }
     }
   }

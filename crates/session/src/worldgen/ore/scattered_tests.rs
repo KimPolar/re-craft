@@ -24,7 +24,9 @@ impl ResourceProvider for Data {
                     "minecraft:basalt",
                     "minecraft:blackstone",
                 ];
-                if self.mode == 0 {
+                if self.mode == 0
+                    || (self.mode == 2 && path.ends_with("blocks_motion_in_heightmap.json"))
+                {
                     names.push("minecraft:ancient_debris");
                 }
                 Some(json!({"values":names}))
@@ -101,6 +103,7 @@ fn terrain(seed: i64) -> CarvedTerrainWorld {
         completed_decoration: BTreeSet::new(),
         ore_ocean_floor_heights: BTreeMap::new(),
         feature_world_surface_heights: BTreeMap::new(),
+        final_heightmaps: BTreeMap::new(),
         postprocessing: BTreeMap::new(),
         noise_postprocessing: BTreeMap::new(),
         surface_postprocessing: BTreeMap::new(),
@@ -128,7 +131,9 @@ struct Case {
     writes: BTreeSet<[i32; 3]>,
     result: bool,
     next: i64,
-    heights: BTreeMap<(i32, i32), (i32, i32)>,
+    heights: BTreeMap<(i32, i32), [i32; 6]>,
+    direct: [[i32; 4]; 3],
+    direct_count: usize,
 }
 fn run(cmd: &mut Command) -> String {
     let output = cmd.output().unwrap();
@@ -179,10 +184,28 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
         .arg("ScatteredChunkOracle"));
     let mut cases = Vec::<Case>::new();
     let mut verified_effects = false;
+    let mut fluid_cases = 0;
     for line in output.lines() {
         let words: Vec<_> = line.split_whitespace().collect();
         match words.as_slice() {
             ["E", "safe"] => verified_effects = true,
+            ["F", name, wet, expected] => {
+                let mut state = BlockState {
+                    name: (*name).into(),
+                    properties: BTreeMap::new(),
+                };
+                if *wet != "none" {
+                    state.properties.insert("waterlogged".into(), (*wet).into());
+                }
+                assert_eq!(
+                    native_world::fluid::FluidState::from_block(&state)
+                        .unwrap()
+                        .is_some(),
+                    expected.parse::<bool>().unwrap(),
+                    "fluid state for {name} waterlogged={wet}"
+                );
+                fluid_cases += 1;
+            }
             ["C", mode, size, discard, seed] => cases.push(Case {
                 mode: mode.parse().unwrap(),
                 size: size.parse().unwrap(),
@@ -202,17 +225,42 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
                 c.result = result.parse().unwrap();
                 c.next = next.parse().unwrap()
             }
-            ["H", x, z, ocean, surface] => {
+            [
+                "H",
+                x,
+                z,
+                ocean,
+                surface,
+                final_surface,
+                final_ocean,
+                motion,
+                no_leaves,
+            ] => {
                 cases.last_mut().unwrap().heights.insert(
                     (x.parse().unwrap(), z.parse().unwrap()),
-                    (ocean.parse().unwrap(), surface.parse().unwrap()),
+                    [
+                        ocean,
+                        surface,
+                        final_surface,
+                        final_ocean,
+                        motion,
+                        no_leaves,
+                    ]
+                    .map(|v| v.parse().unwrap()),
                 );
+            }
+            ["D", step, a, b, c, d] => {
+                let case = cases.last_mut().unwrap();
+                let step = step.parse::<usize>().unwrap();
+                case.direct[step] = [a, b, c, d].map(|v| v.parse().unwrap());
+                case.direct_count += 1;
             }
             _ => {}
         }
     }
     assert!(verified_effects);
-    assert_eq!(cases.len(), 32);
+    assert!(fluid_cases > 1000);
+    assert_eq!(cases.len(), 48);
     let registry: BTreeSet<String> = [
         "air",
         "cave_air",
@@ -255,17 +303,26 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
             .unwrap();
         assert_eq!(result, case.result);
         assert_eq!(random.next_long(), case.next);
-        for (&(x, z), &(ocean, surface)) in &case.heights {
+        for (&(x, z), heights) in &case.heights {
             assert_eq!(
                 region.ocean_floor_height(x, z).unwrap(),
-                ocean,
+                heights[0],
                 "ocean at {x},{z}"
             );
             assert_eq!(
                 region.world_surface_height(x, z).unwrap(),
-                surface,
+                heights[1],
                 "surface at {x},{z}"
             );
+            for kind in 0..4 {
+                assert_eq!(
+                    region.final_height(kind, x, z).unwrap(),
+                    heights[kind + 2],
+                    "final map {kind} at {x},{z}, mode {}, seed {}",
+                    case.mode,
+                    case.seed
+                );
+            }
         }
         if case.mode == 1 {
             changed_top += case.writes.iter().filter(|p| p[1] == 15).count();
@@ -291,6 +348,37 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
             "mode {} size {} discard {} seed {}",
             case.mode, case.size, case.discard, case.seed
         );
+        assert_eq!(case.direct_count, 3);
+        let mut region = terrain
+            .ore_region(&tags, &motion, after.chunks.keys().copied().collect())
+            .unwrap();
+        for step in 0..3 {
+            match step {
+                0 => region
+                    .set_section_block([-11, 15, 37], &block("netherrack"))
+                    .unwrap(),
+                1 => {
+                    region
+                        .set_block([-11, 14, 37], &block("ancient_debris"), 2)
+                        .unwrap();
+                }
+                2 => {
+                    region
+                        .set_block([-11, 15, 37], &block("ancient_debris"), 2)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            for kind in 0..4 {
+                assert_eq!(
+                    region.final_height(kind, -11, 37).unwrap(),
+                    case.direct[step][kind],
+                    "direct write step {step}, map {kind}, mode {}, seed {}",
+                    case.mode,
+                    case.seed
+                );
+            }
+        }
     }
     assert!(changed_top > 0, "no top-layer replacement was exercised");
 }

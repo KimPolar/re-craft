@@ -59,6 +59,7 @@ pub struct DecorationRegion<'a> {
     tree_logs: Vec<[i32; 3]>,
     tree_leaves: Vec<[i32; 3]>,
     freeze_context: Option<FreezeContext<'a>>,
+    raw_brightness: Option<&'a dyn Fn(&World, [i32; 3]) -> Result<u8>>,
     tree_decorations: Vec<[i32; 3]>,
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
@@ -328,6 +329,9 @@ impl ConfiguredDecoration {
                         Ok(SimplePlantKind::DryVegetation) => {
                             Some("minecraft:supports_dry_vegetation")
                         }
+                        Ok(SimplePlantKind::Mushroom) => {
+                            Some("minecraft:overrides_mushroom_light_requirement")
+                        }
                         _ => None,
                     };
                     if let Some(tag) = tag {
@@ -546,7 +550,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None)
+        self.execute_inner(terrain, structures_enabled, None, None)
     }
 
     /// Supply the level light engine's block-light values for FEATURES-stage
@@ -557,7 +561,34 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures_enabled: bool,
         block_light: &dyn Fn([i32; 3]) -> Result<u8>,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, Some(block_light))
+        self.execute_inner(terrain, structures_enabled, Some(block_light), None)
+    }
+
+    /// Supply Java's raw brightness with zero sky subtraction for mushrooms.
+    /// The sampler must reflect all earlier writes in this generation attempt.
+    pub fn execute_with_raw_brightness(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        raw_brightness: &dyn Fn(&World, [i32; 3]) -> Result<u8>,
+    ) -> Result<Vec<bool>> {
+        self.execute_inner(terrain, structures_enabled, None, Some(raw_brightness))
+    }
+
+    /// Supply both light queries when the selected features need them.
+    pub fn execute_with_lighting(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        block_light: &dyn Fn([i32; 3]) -> Result<u8>,
+        raw_brightness: &dyn Fn(&World, [i32; 3]) -> Result<u8>,
+    ) -> Result<Vec<bool>> {
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            Some(block_light),
+            Some(raw_brightness),
+        )
     }
 
     fn execute_inner(
@@ -565,6 +596,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
         block_light: Option<&dyn Fn([i32; 3]) -> Result<u8>>,
+        raw_brightness: Option<&dyn Fn(&World, [i32; 3]) -> Result<u8>>,
     ) -> Result<Vec<bool>> {
         ensure!(
             !structures_enabled,
@@ -604,6 +636,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
         region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
         region.lake_water_fluids = self.lake_water_fluids.as_ref();
+        region.raw_brightness = raw_brightness;
         region.freeze_context = self.freeze.as_ref().map(|v| FreezeContext {
             biomes: self.plan.biomes,
             climates: &v.climates,
@@ -897,6 +930,7 @@ impl CarvedTerrainWorld {
             tree_logs: Vec::new(),
             tree_leaves: Vec::new(),
             freeze_context: None,
+            raw_brightness: None,
             tree_decorations: Vec::new(),
             bee_nests,
             monster_entities,
@@ -2672,6 +2706,9 @@ impl GeodeEnvironment for DecorationRegion<'_> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn mushroom_survives(&mut self, pos: [i32; 3]) -> Result<bool> {
+        self.mushroom_survival(pos)
+    }
     fn inside_build_height(&mut self, y: i32) -> Result<bool> {
         Ok(!self.is_outside(y))
     }
@@ -2811,6 +2848,7 @@ enum SimplePlantKind {
     DryVegetation,
     Double,
     Unconditional,
+    Mushroom,
 }
 
 // All states of these vanilla blocks have been checked for their Java
@@ -2873,12 +2911,55 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
             ensure!(state.properties.is_empty(), "invalid simple block state");
             SimplePlantKind::Unconditional
         }
+        "minecraft:brown_mushroom" | "minecraft:red_mushroom" => {
+            ensure!(state.properties.is_empty(), "invalid mushroom state");
+            SimplePlantKind::Mushroom
+        }
         _ => bail!("unsupported simple-block survival for {name}"),
     };
     Ok(kind)
 }
 
 impl DecorationRegion<'_> {
+    fn mushroom_survival(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+        static OVERRIDE: OnceLock<ResourceId> = OnceLock::new();
+        let tag = OVERRIDE.get_or_init(|| {
+            ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap()
+        });
+        if self.tags.contains(tag, &below.name)? {
+            return Ok(true);
+        }
+        let brightness =
+            self.raw_brightness
+                .context("mushroom raw brightness unavailable")?(&self.world, pos)?;
+        ensure!(brightness <= 15, "invalid mushroom raw brightness");
+        if brightness >= 13 {
+            return Ok(false);
+        }
+        if matches!(
+            below.name.as_str(),
+            "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+        ) {
+            ensure!(
+                below.properties.len() == 1
+                    && matches!(
+                        below.properties.get("snowy").map(String::as_str),
+                        Some("true" | "false")
+                    ),
+                "invalid snowy mushroom support"
+            );
+            return Ok(true);
+        }
+        if matches!(
+            below.name.as_str(),
+            "minecraft:crimson_nylium" | "minecraft:warped_nylium"
+        ) {
+            ensure!(below.properties.is_empty(), "invalid nylium state");
+            return Ok(true);
+        }
+        Ok(monster_block_flags(&below)?.1)
+    }
     fn write_simple_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<bool> {
         if !self.writable.contains(&chunk(p)) {
             return Ok(false);
@@ -2897,6 +2978,13 @@ impl DecorationRegion<'_> {
         );
         self.set_section_block(p, state)?;
         self.update_final_heightmaps(p, state)?;
+        // WorldGenRegion.setBlock records the mushroom's postprocess position.
+        if matches!(
+            state.name.as_str(),
+            "minecraft:brown_mushroom" | "minecraft:red_mushroom"
+        ) {
+            DiskWorld::mark_postprocessing(self, p)?;
+        }
         Ok(true)
     }
 }
@@ -2908,6 +2996,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
             let survives = match kind {
                 SimplePlantKind::Unconditional => true,
+                SimplePlantKind::Mushroom => self.mushroom_survival(pos)?,
                 SimplePlantKind::Double
                     if state.properties.get("half").map(String::as_str) == Some("upper") =>
                 {
@@ -5666,6 +5755,206 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_mushroom_features_match_java_brightness_and_support() {
+        use std::{cell::Cell, path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("MushroomGenerationOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/MushroomGenerationOracle.java"),
+        )
+        .unwrap();
+        let run = |c: &mut Command| {
+            let output = c.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let oracle = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MushroomGenerationOracle"));
+        let effects = oracle
+            .lines()
+            .filter(|line| line.starts_with("E "))
+            .collect::<Vec<_>>();
+        assert_eq!(effects.len(), 2);
+        assert!(
+            effects
+                .iter()
+                .all(|line| line.ends_with("false false BlockPos{x=0, y=0, z=0}")),
+            "{effects:?}"
+        );
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut features = BTreeMap::new();
+        for name in ["brown_mushroom", "red_mushroom"] {
+            let placement = PlacedFeature::decode(
+                &json!({"feature":format!("minecraft:{name}"),"placement":[]}),
+            )
+            .unwrap();
+            let placed =
+                PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |v| {
+                    super::super::resolve_generated_terrain_state(v, &generated)
+                })
+                .unwrap();
+            features.insert(format!("minecraft:{name}"), placed);
+        }
+        struct TagOverride<'a> {
+            resources: &'a mut native_resources::packs::ResourceStack,
+            base: &'a str,
+            enabled: bool,
+        }
+        impl ResourceProvider for TagOverride<'_> {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.resources.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.enabled {vec![self.base]} else {vec![]}}),
+                    )?));
+                }
+                self.resources.read_data(path)
+            }
+        }
+        let required =
+            BTreeSet::from([
+                ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap(),
+            ]);
+        let mut tag_cache = BTreeMap::new();
+        let mut count = 0;
+        for line in oracle.lines().filter(|v| v.starts_with("C ")) {
+            let a = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(a.len(), 10);
+            let mushroom = a[1];
+            let base = a[2];
+            let overridden = a[3].parse::<bool>().unwrap();
+            let light = a[4].parse::<u8>().unwrap();
+            let expected = a[5].parse::<bool>().unwrap();
+            let expected_calls = a[6].parse::<u32>().unwrap();
+            let key = (base.to_owned(), overridden);
+            if !tag_cache.contains_key(&key) {
+                let tags = OreBlockTags::load(
+                    &mut TagOverride {
+                        resources: &mut resources,
+                        base,
+                        enabled: overridden,
+                    },
+                    &registry,
+                    &required,
+                )
+                .unwrap();
+                tag_cache.insert(key.clone(), tags);
+            }
+            let tags = &tag_cache[&key];
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let mut support = state(base.strip_prefix("minecraft:").unwrap());
+            if matches!(
+                base,
+                "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+            ) {
+                support.properties.insert("snowy".into(), "false".into());
+            }
+            if base == "minecraft:water" {
+                support.properties.insert("level".into(), "0".into());
+            }
+            if base == "minecraft:deepslate" {
+                support.properties.insert("axis".into(), "y".into());
+            }
+            if base == "minecraft:chest" {
+                support.properties = BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            let id = world.intern_state(support);
+            let center = ChunkPos { x: 0, z: 0 };
+            let chunk = Arc::make_mut(world.chunks.get_mut(&center).unwrap());
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap()[8 + 8 * 16 + 7 * 256] = id;
+            let calls = Cell::new(0u32);
+            let sampler = |_: &World, _: [i32; 3]| {
+                calls.set(calls.get() + 1);
+                Ok(light)
+            };
+            let mut region = terrain
+                .decoration_region(tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            region.raw_brightness = Some(&sampler);
+            let mut random = DecorationRandom::new(33);
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            let placed = region
+                .place_placed(&features[mushroom], &mut random, [8, 8, 8], 0, 16, &mut env)
+                .unwrap();
+            assert_eq!(placed, expected, "{line}");
+            assert_eq!(calls.get(), expected_calls, "{line}");
+            assert_eq!(random.next_long(), a[8].parse::<i64>().unwrap());
+            assert_eq!(
+                region.read([8, 8, 8]).unwrap().name,
+                if expected { mushroom } else { "minecraft:air" }
+            );
+            assert_eq!(a[7], if expected { mushroom } else { "-" });
+            if !overridden && light == 0 {
+                assert_eq!(
+                    expected,
+                    a[9].parse::<bool>().unwrap(),
+                    "solid render {base}"
+                );
+            }
+            region.finish().unwrap();
+            let marks = terrain
+                .feature_postprocessing(center)
+                .map(|v| v.sections()[0].clone())
+                .unwrap_or_default();
+            assert_eq!(
+                marks,
+                if expected { vec![0x888] } else { vec![] },
+                "postprocessing {line}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, 192);
+    }
+
+    #[test]
     fn unfinished_generated_spawner_cannot_be_published() {
         let (mut terrain, tags, _, _) = fixture();
         let mut registry = batch_registry();
@@ -7445,6 +7734,171 @@ mod tests {
     }
 
     #[test]
+    fn mushroom_generation_requires_current_brightness_unless_tag_overrides_it() {
+        struct MushroomData {
+            override_light: bool,
+            predicate: bool,
+        }
+        impl ResourceProvider for MushroomData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    let mut modifiers = vec![json!({"type":"minecraft:offset","x":8,"y":8,"z":8})];
+                    if self.predicate {
+                        modifiers.push(json!({"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:would_survive","state":"minecraft:brown_mushroom"}}));
+                    }
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"features":[[{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:brown_mushroom"}},"placement":modifiers}]]}),
+                    )?));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.override_light{vec!["minecraft:stone"]}else{vec![]}}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        for predicate in [false, true] {
+            for overrides in [false, true] {
+                let schedule = FeatureSchedule::load(
+                    &mut MushroomData {
+                        override_light: overrides,
+                        predicate,
+                    },
+                    std::slice::from_ref(&plains),
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                let (_, _, neighborhood) = scheduled_fixture(None);
+                let plan = fixture_plan(&schedule, &neighborhood);
+                let mut registry = batch_registry();
+                registry.insert("minecraft:brown_mushroom".into());
+                let prepared = PreparedDecoration::load(
+                    &mut MushroomData {
+                        override_light: overrides,
+                        predicate,
+                    },
+                    &plan,
+                    &registry,
+                    &mut resolve_test,
+                )
+                .unwrap();
+                let (mut without, _, _, _) = fixture();
+                let before = without.snapshot();
+                if overrides {
+                    assert_eq!(prepared.execute(&mut without, false).unwrap(), [true]);
+                } else {
+                    assert!(prepared.execute(&mut without, false).is_err());
+                    assert!(Arc::ptr_eq(&before, &without.snapshot()));
+                }
+                for brightness in [0, 12, 13, 15] {
+                    let (mut terrain, _, _, _) = fixture();
+                    let calls = std::cell::Cell::new(0);
+                    let light = |_: &World, _: [i32; 3]| {
+                        calls.set(calls.get() + 1);
+                        Ok(brightness)
+                    };
+                    let result = prepared
+                        .execute_with_raw_brightness(&mut terrain, false, &light)
+                        .unwrap();
+                    let expected = overrides || brightness < 13;
+                    assert_eq!(result, [expected]);
+                    assert_eq!(
+                        terrain.snapshot().block(8, 8, 8).unwrap().name,
+                        if expected {
+                            "minecraft:brown_mushroom"
+                        } else {
+                            "minecraft:air"
+                        }
+                    );
+                    assert_eq!(
+                        calls.get(),
+                        if overrides {
+                            0
+                        } else if predicate && expected {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                }
+                if !overrides {
+                    let (mut terrain, _, _, _) = fixture();
+                    let before = terrain.snapshot();
+                    assert!(
+                        prepared
+                            .execute_with_raw_brightness(&mut terrain, false, &|_, _| Ok(16))
+                            .is_err()
+                    );
+                    assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mushroom_brightness_sampler_observes_prior_unpublished_writes() {
+        struct StagedData;
+        impl ResourceProvider for StagedData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[
+                        {"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:pumpkin"}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]},
+                        {"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:red_mushroom"}},"placement":[{"type":"minecraft:offset","x":9,"y":8,"z":8}]}
+                    ]]}))?));
+                }
+                if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut StagedData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend(["minecraft:pumpkin".into(), "minecraft:red_mushroom".into()]);
+        let prepared =
+            PreparedDecoration::load(&mut StagedData, &plan, &registry, &mut resolve_test).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let raw = |world: &World, _: [i32; 3]| -> Result<u8> {
+            Ok(
+                if world
+                    .block(8, 8, 8)
+                    .is_some_and(|s| s.name == "minecraft:pumpkin")
+                {
+                    12
+                } else {
+                    15
+                },
+            )
+        };
+        assert_eq!(
+            prepared
+                .execute_with_raw_brightness(&mut terrain, false, &raw)
+                .unwrap(),
+            [true, true]
+        );
+        assert_eq!(
+            terrain.snapshot().block(9, 8, 8).unwrap().name,
+            "minecraft:red_mushroom"
+        );
+    }
+
+    #[test]
     fn prepared_lava_lake_commits_blocks_ticks_and_postprocessing() {
         struct LakeData;
         impl ResourceProvider for LakeData {
@@ -7634,6 +8088,8 @@ mod tests {
             "patch_sugar_cane",
             "patch_firefly_bush_near_water",
             "flower_plains",
+            "brown_mushroom_normal",
+            "red_mushroom_normal",
             "patch_cactus_desert",
             "lake_lava_surface",
             "lake_lava_underground",

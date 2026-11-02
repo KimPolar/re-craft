@@ -29,6 +29,10 @@ pub trait DiskWorld: OreWorld {
     fn inside_build_height(&mut self, _y: i32) -> Result<bool> {
         bail!("world build height unavailable")
     }
+    /// The world must provide current raw generation brightness and support.
+    fn mushroom_survives(&mut self, _pos: [i32; 3]) -> Result<bool> {
+        bail!("mushroom survival context unavailable")
+    }
     fn would_survive(&mut self, state: &Value, pos: [i32; 3]) -> Result<bool> {
         let raw = state
             .as_str()
@@ -39,6 +43,9 @@ pub trait DiskWorld: OreWorld {
             id.namespace == "minecraft",
             "unsupported would_survive block"
         );
+        if matches!(id.path.as_str(), "brown_mushroom" | "red_mushroom") {
+            return self.mushroom_survives(pos);
+        }
         if let Some(tag) = vegetation_support(&id) {
             let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
             return self.in_tag(&below, &ResourceId::parse(tag)?);
@@ -270,6 +277,15 @@ impl Predicate {
                 );
                 tags.insert(
                     ResourceId::parse("minecraft:supports_sugar_cane_adjacently")
+                        .expect("constant tag"),
+                );
+            }
+            Self::WouldSurvive(_, id, _)
+                if id.namespace == "minecraft"
+                    && matches!(id.path.as_str(), "brown_mushroom" | "red_mushroom") =>
+            {
+                tags.insert(
+                    ResourceId::parse("minecraft:overrides_mushroom_light_requirement")
                         .expect("constant tag"),
                 );
             }

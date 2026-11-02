@@ -10,6 +10,13 @@ use native_resources::fluid_tags::BubbleColumnTags;
 use native_world::{fluid::FluidState, loaded::BlockState};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntityContact {
+    pub position: IVec3,
+    pub drag_down: bool,
+    pub surface: bool,
+}
+
 /// Player bubble-column velocity after one inside-block callback.
 pub fn player_velocity(mut velocity: DVec3, drag_down: bool, surface: bool, flying: bool) -> DVec3 {
     if flying {

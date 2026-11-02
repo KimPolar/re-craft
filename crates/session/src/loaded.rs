@@ -6562,24 +6562,12 @@ impl LoadedSession {
         self.motion.velocity =
             crate::bubble_column::player_velocity(self.motion.velocity, drag_down, surface, false);
         if surface {
-            for _ in 0..2 {
-                for kind in [
-                    BubbleSurfaceParticleKind::Splash,
-                    BubbleSurfaceParticleKind::Bubble,
-                ] {
-                    let x = f64::from(position.x) + self.level_random.next_double();
-                    let z = f64::from(position.z) + self.level_random.next_double();
-                    if self.bubble_surface_particles.len() == 4096 {
-                        self.bubble_surface_particles.pop_front();
-                    }
-                    self.bubble_surface_particles
-                        .push_back(BubbleSurfaceParticle {
-                            tick: self.tick.saturating_add(1),
-                            position: DVec3::new(x, f64::from(position.y) + 1.0, z),
-                            kind,
-                        });
-                }
-            }
+            queue_bubble_surface_particles(
+                &mut self.bubble_surface_particles,
+                &mut self.level_random,
+                self.tick,
+                position,
+            );
         } else {
             self.fall_distance = 0.0;
         }
@@ -15163,7 +15151,7 @@ impl LoadedSession {
                 climates: self.biome_climates.as_deref(),
                 sea_level: self.generator_sea_level,
             };
-            self.dropped_items.tick_with_fluid_and_proof(
+            self.dropped_items.tick_with_fluid_bubbles_and_proof(
                 origin,
                 self.motion.position,
                 self.player.pose,
@@ -15215,6 +15203,22 @@ impl LoadedSession {
                 },
                 |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
                 |pos| rain.at(pos),
+                |item_bounds, actual, requested| {
+                    fluid_view.bubble_contacts(item_bounds, actual, requested)
+                },
+                |contact| {
+                    self.unresolved_bubble_tick = true;
+                    if let Some(Some(relative)) = contact {
+                        if let Some(position) = add(origin, relative) {
+                            queue_bubble_surface_particles(
+                                &mut self.bubble_surface_particles,
+                                &mut self.level_random,
+                                self.tick,
+                                position,
+                            );
+                        }
+                    }
+                },
             );
             self.tick_experience_orbs(false);
             self.tick += 1;
@@ -16985,7 +16989,7 @@ impl LoadedSession {
             climates: self.biome_climates.as_deref(),
             sea_level: self.generator_sea_level,
         };
-        self.dropped_items.tick_with_fluid_and_proof(
+        self.dropped_items.tick_with_fluid_bubbles_and_proof(
             origin,
             self.motion.position,
             self.player.pose,
@@ -17041,6 +17045,22 @@ impl LoadedSession {
             },
             |item_bounds, actual| item_path_proof.safe(item_bounds, actual),
             |pos| rain.at(pos),
+            |item_bounds, actual, requested| {
+                fluid_view.bubble_contacts(item_bounds, actual, requested)
+            },
+            |contact| {
+                self.unresolved_bubble_tick = true;
+                if let Some(Some(relative)) = contact {
+                    if let Some(position) = add(origin, relative) {
+                        queue_bubble_surface_particles(
+                            &mut self.bubble_surface_particles,
+                            &mut self.level_random,
+                            self.tick,
+                            position,
+                        );
+                    }
+                }
+            },
         );
         update_recipe_unlocks(&mut self.inventory, &before_pickup, self.recipes.as_deref());
         self.tick_experience_orbs(self.death.is_none());
@@ -17336,6 +17356,31 @@ fn subtract(a: IVec3, b: IVec3) -> Option<IVec3> {
         a.y.checked_sub(b.y)?,
         a.z.checked_sub(b.z)?,
     ))
+}
+
+fn queue_bubble_surface_particles(
+    queue: &mut VecDeque<BubbleSurfaceParticle>,
+    random: &mut native_core::random::LegacyRandom,
+    tick: u64,
+    position: IVec3,
+) {
+    for _ in 0..2 {
+        for kind in [
+            BubbleSurfaceParticleKind::Splash,
+            BubbleSurfaceParticleKind::Bubble,
+        ] {
+            let x = f64::from(position.x) + random.next_double();
+            let z = f64::from(position.z) + random.next_double();
+            if queue.len() == 4096 {
+                queue.pop_front();
+            }
+            queue.push_back(BubbleSurfaceParticle {
+                tick: tick.saturating_add(1),
+                position: DVec3::new(x, f64::from(position.y) + 1.0, z),
+                kind,
+            });
+        }
+    }
 }
 
 fn draft_falling_sand(
@@ -19148,6 +19193,114 @@ struct FluidView<'a> {
 }
 
 impl FluidView<'_> {
+    fn bubble_contacts(
+        &self,
+        bounds: BoundingBox,
+        actual: DVec3,
+        requested: DVec3,
+    ) -> Option<Vec<crate::bubble_column::EntityContact>> {
+        // Most items never approach a column. Avoid the traversal's hash set
+        // and sorting when the whole swept bounding region is known clear.
+        let inset = DVec3::splat(f64::from(1.0e-5_f32));
+        if bounds.min.is_finite()
+            && bounds.max.is_finite()
+            && (bounds.min + inset).cmple(bounds.max - inset).all()
+            && actual.is_finite()
+            && requested.is_finite()
+        {
+            let area = bounds.expanded_towards(actual);
+            if area.min.min_element() >= f64::from(i32::MIN)
+                && area.max.max_element() <= f64::from(i32::MAX)
+            {
+                let low = area.min.floor().as_ivec3();
+                let high = area.max.floor().as_ivec3();
+                let count = (i64::from(high.x) - i64::from(low.x) + 1)
+                    .checked_mul(i64::from(high.y) - i64::from(low.y) + 1)
+                    .and_then(|n| n.checked_mul(i64::from(high.z) - i64::from(low.z) + 1));
+                if count.is_some_and(|n| (1..=4096).contains(&n)) {
+                    let mut needs_traversal = false;
+                    'scan: for x in low.x..=high.x {
+                        for y in low.y..=high.y {
+                            for z in low.z..=high.z {
+                                let Cell::State(id) = cell(
+                                    self.world,
+                                    self.origin,
+                                    self.bounds,
+                                    IVec3::new(x, y, z),
+                                    self.air,
+                                ) else {
+                                    needs_traversal = true;
+                                    break 'scan;
+                                };
+                                if self
+                                    .world
+                                    .state(id)
+                                    .is_none_or(|state| state.name == "minecraft:bubble_column")
+                                {
+                                    needs_traversal = true;
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                    if !needs_traversal {
+                        return Some(Vec::new());
+                    }
+                }
+            }
+        }
+        self.bubble_contacts_traverse(bounds, actual, requested)
+    }
+
+    fn bubble_contacts_traverse(
+        &self,
+        bounds: BoundingBox,
+        actual: DVec3,
+        requested: DVec3,
+    ) -> Option<Vec<crate::bubble_column::EntityContact>> {
+        let hits = crate::fire_contact::swept(bounds, actual, requested, |pos| {
+            let Cell::State(id) = cell(self.world, self.origin, self.bounds, pos, self.air) else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            if state.name == "minecraft:bubble_column" {
+                Some(Some(crate::fire_contact::InsideBlock::Bubble(
+                    bubble_column_drag(state)?,
+                )))
+            } else {
+                Some(None)
+            }
+        })?;
+        let mut result = Vec::new();
+        for hit in hits {
+            let crate::fire_contact::InsideBlock::Bubble(drag_down) = hit.kind else {
+                continue;
+            };
+            if !crate::fire_contact::bubble_active(
+                bounds,
+                actual,
+                requested,
+                hit.axis_step,
+                hit.position,
+            ) {
+                continue;
+            }
+            let above = add(hit.position, IVec3::Y)?;
+            let Cell::State(id) = cell(self.world, self.origin, self.bounds, above, self.air)
+            else {
+                return None;
+            };
+            let shape = self.shapes.get(id.0 as usize)?.as_deref()?;
+            let fluid = self.fluids.get(id.0 as usize)?;
+            result.push(crate::bubble_column::EntityContact {
+                position: hit.position,
+                drag_down,
+                surface: shape.is_empty() && fluid.is_none(),
+            });
+        }
+        Some(result)
+    }
+
     fn at(&self, pos: IVec3) -> fluid::Cell {
         match cell(self.world, self.origin, self.bounds, pos, self.air) {
             Cell::Missing => fluid::Cell::Missing,
@@ -30126,6 +30279,187 @@ pub(crate) mod tests {
                 "{row}"
             );
         }
+    }
+
+    #[test]
+    fn item_bubble_fast_scan_matches_full_traversal() {
+        let mut session = session();
+        let bubble = session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+        assert!(session.set(IVec3::new(8, 1, 8), bubble));
+        let view = FluidView {
+            world: &session.world,
+            shapes: &session.shapes,
+            fluids: &session.fluids,
+            origin: session.origin,
+            bounds: session.bounds,
+            air: session.states[0],
+        };
+        for x in [0.0, 1.5, 7.2, 7.9, 8.5, 9.2, 15.9] {
+            for z in [0.0, 7.9, 8.5, 9.2, 15.9] {
+                for movement in [
+                    DVec3::ZERO,
+                    DVec3::new(0.8, 0.0, 0.0),
+                    DVec3::new(-1.2, 0.0, 0.8),
+                    DVec3::new(0.0, 1.1, 0.0),
+                ] {
+                    let bounds = BoundingBox {
+                        min: DVec3::new(x - 0.125, 1.0, z - 0.125),
+                        max: DVec3::new(x + 0.125, 1.25, z + 0.125),
+                    };
+                    assert_eq!(
+                        view.bubble_contacts(bounds, movement, movement),
+                        view.bubble_contacts_traverse(bounds, movement, movement),
+                        "{bounds:?} {movement:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn item_bubble_traversal_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemBubbleTraversalOracle.java");
+        let output = temp.path().join("item-traversal.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ItemBubbleTraversalOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ItemBubbleTraversalOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 56);
+        for row in rows {
+            let mut session = session();
+            let bubble = session.intern_block(state(
+                "minecraft:bubble_column",
+                &[(
+                    "drag",
+                    if row["drag"].as_bool().unwrap() {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )],
+            ));
+            assert!(session.set(IVec3::new(8, 10, 8), bubble));
+            if !row["surface"].as_bool().unwrap() {
+                let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+                assert!(session.set(IVec3::new(8, 11, 8), water));
+            }
+            let input = row["input"].as_array().unwrap();
+            let number = |i: usize| input[i].as_f64().unwrap();
+            let from = DVec3::new(number(0), number(1), number(2));
+            let requested = DVec3::new(number(3), number(4), number(5));
+            let movement = (from + requested) - from;
+            let bounds = BoundingBox {
+                min: from + DVec3::new(-0.125, 0.0, -0.125),
+                max: from + DVec3::new(0.125, 0.25, 0.125),
+            };
+            let view = FluidView {
+                world: &session.world,
+                shapes: &session.shapes,
+                fluids: &session.fluids,
+                origin: session.origin,
+                bounds: session.bounds,
+                air: session.states[0],
+            };
+            let contacts = view.bubble_contacts(bounds, movement, movement).unwrap();
+            let mut velocity = DVec3::new(0.2, -0.2, -0.3);
+            let mut fall = 5.0;
+            for contact in contacts {
+                velocity = crate::bubble_column::player_velocity(
+                    velocity,
+                    contact.drag_down,
+                    contact.surface,
+                    false,
+                );
+                if !contact.surface {
+                    fall = 0.0;
+                }
+            }
+            assert_eq!(velocity.y, row["velocity"].as_f64().unwrap(), "{row}");
+            assert_eq!(fall, row["fall"].as_f64().unwrap(), "{row}");
+        }
+    }
+
+    #[test]
+    fn dropped_item_in_surface_bubble_emits_ordered_particles() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        let bubble = session.intern_block(state("minecraft:bubble_column", &[("drag", "false")]));
+        assert!(session.set(IVec3::new(8, 1, 8), bubble));
+        session.motion.position = DVec3::new(2.5, 5.0, 2.5);
+        session.player.position = session.motion.position.as_vec3();
+        let stack = ItemStack::new(
+            "minecraft:stone".into(),
+            1,
+            64,
+            native_persistence::nbt::Tag::Compound(vec![]),
+        )
+        .unwrap();
+        session.dropped_items.spawn_from_entity(
+            session.origin.as_dvec3() + DVec3::new(8.5, 1.05, 8.5),
+            stack,
+        );
+        session.update(TICK);
+        let events = session.take_bubble_surface_particles();
+        assert_eq!(events.len(), 4);
+        assert!(session.unresolved_bubble_tick);
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                BubbleSurfaceParticleKind::Splash,
+                BubbleSurfaceParticleKind::Bubble,
+                BubbleSurfaceParticleKind::Splash,
+                BubbleSurfaceParticleKind::Bubble,
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.position.y == 2.0 && event.tick == 1)
+        );
     }
 
     #[test]

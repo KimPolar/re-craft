@@ -344,6 +344,7 @@ struct ItemEntity {
     id: u32,
     section_sequence: u64,
     random: LegacyRandom,
+    last_bubble_movement: Option<(DVec3, DVec3, DVec3)>,
     _damage_state: ItemDamageState,
 }
 
@@ -1443,6 +1444,7 @@ impl ItemEntities {
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             random: entity_random,
+            last_bubble_movement: None,
             _damage_state: ItemDamageState {
                 health: i32::from(saved.health),
                 fire_ticks: i32::from(saved.fire_ticks),
@@ -1490,6 +1492,7 @@ impl ItemEntities {
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             random: entity_random,
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1586,6 +1589,7 @@ impl ItemEntities {
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
+                    last_bubble_movement: None,
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -1640,6 +1644,7 @@ impl ItemEntities {
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             random: entity_random,
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -1712,6 +1717,7 @@ impl ItemEntities {
             id: self.next_id,
             section_sequence: self.next_section_sequence,
             random: entity_random,
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         self.next_id = self.next_id.wrapping_add(1);
@@ -2058,6 +2064,7 @@ impl ItemEntities {
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
+                    last_bubble_movement: None,
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -2190,6 +2197,7 @@ impl ItemEntities {
                     id: self.next_id,
                     section_sequence: self.next_section_sequence,
                     random: entity_random,
+                    last_bubble_movement: None,
                     _damage_state: ItemDamageState::default(),
                 });
                 self.next_id = self.next_id.wrapping_add(1);
@@ -2226,11 +2234,14 @@ impl ItemEntities {
             |_, _, _| None,
             |_, _| false,
             |_| Some(false),
+            |_, _, _| Some(Vec::new()),
+            |_| {},
         );
     }
 
     /// The proof callback must certify that the complete movement area has no
     /// blocks or fluids with untracked base-entity effects.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick_with_fluid_and_proof<'a>(
         &mut self,
@@ -2265,6 +2276,54 @@ impl ItemEntities {
             path,
             safe,
             rain_at,
+            |_, _, _| Some(Vec::new()),
+            |_| {},
+        );
+    }
+
+    /// Simulate bubble contacts in the same movement step as other item effects.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tick_with_fluid_bubbles_and_proof<'a>(
+        &mut self,
+        origin: IVec3,
+        player: DVec3,
+        pose: PlayerPose,
+        mode: GameMode,
+        inventory: &mut Arc<PlayerInventory>,
+        shape: impl FnMut(IVec3) -> &'a [Aabb],
+        friction: impl FnMut(IVec3) -> f32,
+        bounce: impl FnMut(IVec3) -> f32,
+        keep_support_height: impl FnMut(IVec3) -> bool,
+        fluid: impl FnMut(BoundingBox) -> native_world::fluid::FluidContacts,
+        fast_lava: bool,
+        path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
+        safe: impl FnMut(BoundingBox, DVec3) -> bool,
+        rain_at: impl FnMut(IVec3) -> Option<bool>,
+        bubble: impl FnMut(
+            BoundingBox,
+            DVec3,
+            DVec3,
+        ) -> Option<Vec<crate::bubble_column::EntityContact>>,
+        on_bubble: impl FnMut(Option<Option<IVec3>>),
+    ) {
+        self.tick_with_threshold(
+            origin,
+            player,
+            pose,
+            mode,
+            inventory,
+            shape,
+            friction,
+            bounce,
+            keep_support_height,
+            512,
+            fluid,
+            fast_lava,
+            path,
+            safe,
+            rain_at,
+            bubble,
+            on_bubble,
         );
     }
 
@@ -2286,6 +2345,12 @@ impl ItemEntities {
         mut path: impl FnMut(BoundingBox, DVec3, DVec3) -> Option<Vec<native_world::fluid::FluidKind>>,
         mut safe: impl FnMut(BoundingBox, DVec3) -> bool,
         mut rain_at: impl FnMut(IVec3) -> Option<bool>,
+        mut bubble: impl FnMut(
+            BoundingBox,
+            DVec3,
+            DVec3,
+        ) -> Option<Vec<crate::bubble_column::EntityContact>>,
+        mut on_bubble: impl FnMut(Option<Option<IVec3>>),
     ) {
         let player_box = movement::player_bounds(player, pose.height());
         let pickup = BoundingBox {
@@ -2370,6 +2435,7 @@ impl ItemEntities {
                     .is_multiple_of(4);
             let requested = entity.velocity;
             let mut actual = DVec3::ZERO;
+            let mut item_drag = None;
             if moves {
                 actual =
                     movement::resolve_box(bounds, requested, entity.on_ground, 0.0, &mut shape);
@@ -2430,11 +2496,39 @@ impl ItemEntities {
                 } else {
                     drag
                 };
-                entity.velocity *= DVec3::new(
+                item_drag = Some(DVec3::new(
                     f64::from(ground_drag),
                     f64::from(drag),
                     f64::from(ground_drag),
-                );
+                ));
+            }
+            if moves {
+                entity.last_bubble_movement =
+                    Some((entity.item.previous_position, actual, requested));
+            }
+            if let Some((from, movement, original)) = entity.last_bubble_movement {
+                match bubble(item_bounds(from - origin.as_dvec3()), movement, original) {
+                    Some(contacts) => {
+                        for contact in contacts {
+                            entity.velocity = crate::bubble_column::player_velocity(
+                                entity.velocity,
+                                contact.drag_down,
+                                contact.surface,
+                                false,
+                            );
+                            if !contact.surface {
+                                if let Some(created) = &mut entity.created {
+                                    created.fall_distance = 0.0;
+                                }
+                            }
+                            on_bubble(Some(contact.surface.then_some(contact.position)));
+                        }
+                    }
+                    None => on_bubble(None),
+                }
+            }
+            if let Some(drag) = item_drag {
+                entity.velocity *= drag;
                 if entity.on_ground && entity.velocity.y < 0.0 {
                     entity.velocity.y *= -0.5;
                 }
@@ -3447,6 +3541,189 @@ mod tests {
     }
 
     #[test]
+    fn bubble_contact_precedes_item_drag_and_replays_last_movement_when_idle() {
+        let mut items = ItemEntities::default();
+        let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        items.spawn_from_entity(DVec3::new(8.5, 10.0, 8.5), stack);
+        items.entities[0].velocity = DVec3::ZERO;
+        items.entities[0].no_gravity = true;
+        let mut inventory = Arc::new(PlayerInventory::default());
+        let mut seen = Vec::new();
+        items.tick_with_fluid_bubbles_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| false,
+            |_| Some(false),
+            |_, _, _| {
+                Some(vec![crate::bubble_column::EntityContact {
+                    position: IVec3::new(8, 10, 8),
+                    drag_down: false,
+                    surface: true,
+                }])
+            },
+            |event| seen.push(event),
+        );
+        assert_eq!(items.entities[0].velocity.y, 0.1 * f64::from(0.98_f32));
+        assert_eq!(seen, vec![Some(Some(IVec3::new(8, 10, 8)))]);
+        items.entities[0].on_ground = true;
+        items.entities[0].velocity = DVec3::ZERO;
+        items.entities[0].item.age = 0;
+        items.entities[0].id = 0;
+        items.tick_with_fluid_bubbles_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            &mut inventory,
+            |_| &[],
+            |_| 0.6,
+            |_| 0.0,
+            |_| false,
+            |_| native_world::fluid::FluidContacts::default(),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| false,
+            |_| Some(false),
+            |_, _, _| {
+                Some(vec![crate::bubble_column::EntityContact {
+                    position: IVec3::new(8, 10, 8),
+                    drag_down: true,
+                    surface: false,
+                }])
+            },
+            |event| seen.push(event),
+        );
+        assert_eq!(items.entities[0].velocity.y, -0.03);
+        assert_eq!(seen.last(), Some(&Some(None)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn item_bubble_motion_matches_java_tick() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("ItemBubbleMotionOracle.java");
+        let output = temp.path().join("item.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ItemBubbleMotionOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("ItemBubbleMotionOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 28);
+        for row in rows {
+            let mut items = ItemEntities::default();
+            let stack =
+                ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+            items.spawn_from_entity(DVec3::new(8.5, 10.0, 8.5), stack);
+            items.entities[0].velocity = DVec3::new(0.2, row["initial"].as_f64().unwrap(), -0.3);
+            items.entities[0].created.as_mut().unwrap().fall_distance = 5.0;
+            let mut inventory = Arc::new(PlayerInventory::default());
+            let mut seen = Vec::new();
+            items.tick_with_fluid_bubbles_and_proof(
+                IVec3::ZERO,
+                DVec3::splat(100.0),
+                PlayerPose::Standing,
+                GameMode::Spectator,
+                &mut inventory,
+                |_| &[],
+                |_| 0.6,
+                |_| 0.0,
+                |_| false,
+                |_| {
+                    let mut fluid = native_world::fluid::FluidContacts::default();
+                    fluid.water.depth = 1.0;
+                    fluid
+                },
+                false,
+                |_, _, _| Some(vec![native_world::fluid::FluidKind::Water]),
+                |_, _| false,
+                |_| Some(false),
+                |_, _, _| {
+                    Some(vec![crate::bubble_column::EntityContact {
+                        position: IVec3::new(8, 10, 8),
+                        drag_down: row["drag"].as_bool().unwrap(),
+                        surface: row["surface"].as_bool().unwrap(),
+                    }])
+                },
+                |event| seen.push(event),
+            );
+            let item = &items.entities[0];
+            let expected = |name: &str| row[name].as_f64().unwrap();
+            assert!(
+                (item.item.position - DVec3::new(expected("x"), expected("y"), expected("z")))
+                    .abs()
+                    .max_element()
+                    < 1.0e-12,
+                "{row}"
+            );
+            assert!(
+                (item.velocity - DVec3::new(expected("vx"), expected("vy"), expected("vz")))
+                    .abs()
+                    .max_element()
+                    < 1.0e-12,
+                "{row}: {:?}",
+                item.velocity
+            );
+            assert_eq!(
+                item.created.as_ref().unwrap().fall_distance,
+                expected("fall"),
+                "{row}"
+            );
+            assert_eq!(seen.len(), row["calls"].as_u64().unwrap() as usize, "{row}");
+        }
+    }
+
+    #[test]
     fn created_item_fall_distance_uses_java_float_displacement_and_ground_reset() {
         let mut items = ItemEntities::default();
         let stack = ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])).unwrap();
@@ -3999,6 +4276,7 @@ mod tests {
             id: 0,
             section_sequence: 0,
             random: LegacyRandom::new(0),
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         };
         let mut stone = make("minecraft:stone");
@@ -4963,6 +5241,7 @@ mod tests {
                             id: index as u32,
                             section_sequence: 0,
                             random: LegacyRandom::new(0),
+                            last_bubble_movement: None,
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -4992,6 +5271,8 @@ mod tests {
                                 |_, _, _| None,
                                 |_, _| false,
                                 |_| Some(false),
+                                |_, _, _| Some(Vec::new()),
+                                |_| {},
                             );
                         }
                         timings[i].push(start.elapsed().as_secs_f64() * 1000.0);
@@ -5049,6 +5330,7 @@ mod tests {
                 id: index as u32,
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
             cells.entry(item_cell(position)).or_default().push(index);
@@ -5122,6 +5404,7 @@ mod tests {
                 id: index as u32,
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5208,6 +5491,7 @@ mod tests {
                 id: count,
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5266,6 +5550,7 @@ mod tests {
                 id: 0,
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5327,6 +5612,7 @@ mod tests {
                 id: index as u32,
                 section_sequence: index as u64,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
         }
@@ -5376,6 +5662,7 @@ mod tests {
             id: 0,
             section_sequence: 4,
             random: LegacyRandom::new(0),
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         items.next_section_sequence = 5;
@@ -5416,6 +5703,7 @@ mod tests {
             id: 0,
             section_sequence: 0,
             random: LegacyRandom::new(0),
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -5477,6 +5765,7 @@ mod tests {
             id: 0,
             section_sequence: 0,
             random: LegacyRandom::new(0),
+            last_bubble_movement: None,
             _damage_state: ItemDamageState::default(),
         });
         let mut inventory = Arc::new(PlayerInventory::default());
@@ -6918,6 +7207,7 @@ public class ItemMotionOracle {
                         id: 0,
                         section_sequence: 0,
                         random: LegacyRandom::new(0),
+                        last_bubble_movement: None,
                         _damage_state: ItemDamageState::default(),
                     });
                 }
@@ -6985,6 +7275,7 @@ public class ItemMotionOracle {
                             id: i as u32,
                             section_sequence: 0,
                             random: LegacyRandom::new(0),
+                            last_bubble_movement: None,
                             _damage_state: ItemDamageState::default(),
                         });
                     }
@@ -7134,6 +7425,7 @@ public class ItemMotionOracle {
                 id: index as u32,
                 section_sequence: 0,
                 random: LegacyRandom::new(0),
+                last_bubble_movement: None,
                 _damage_state: ItemDamageState::default(),
             });
             let mut inventory = Arc::new(PlayerInventory::default());

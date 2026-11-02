@@ -118,6 +118,52 @@ fn feature(kind: i32, direction: &str, tip: bool) -> Value {
     };
     json!({"type":"minecraft:block_column","layers":layers,"direction":direction,"allowed_placement":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"},"prioritize_tip":tip})
 }
+
+#[test]
+fn named_column_providers_follow_selected_resource_stack() {
+    struct Packs(bool);
+    impl ResourceProvider for Packs {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok((path == "data/example/worldgen/block_state_provider/column.json")
+                .then(|| serde_json::to_vec(&json!({"type":"minecraft:weighted","entries":[
+                    {"data":{"id":if self.0 {"minecraft:stone"} else {"minecraft:sugar_cane"}},"weight":2},
+                    {"data":{"id":"minecraft:stone"},"weight":1}
+                ]})).unwrap()))
+        }
+    }
+    let mut named = feature(1, "up", false);
+    named["layers"][0]["provider"] = json!("example:column");
+    for override_pack in [false, true] {
+        let mut resources = Packs(override_pack);
+        let column =
+            BlockColumnFeature::decode_with_resources(&mut resources, &named, &mut resolve)
+                .unwrap();
+        let bytes = resources
+            .read_data("data/example/worldgen/block_state_provider/column.json")
+            .unwrap()
+            .unwrap();
+        let mut inline = named.clone();
+        inline["layers"][0]["provider"] = serde_json::from_slice(&bytes).unwrap();
+        let expected = BlockColumnFeature::decode(&inline, &mut resolve).unwrap();
+        for seed in [0, 1, -1, 42] {
+            let (mut a, mut b) = (world(), world());
+            let (mut ra, mut rb) = (DecorationRandom::new(seed), DecorationRandom::new(seed));
+            assert_eq!(
+                column.place(&mut a, &mut ra, [0, 0, 0]).unwrap(),
+                expected.place(&mut b, &mut rb, [0, 0, 0]).unwrap()
+            );
+            assert_eq!(a.writes, b.writes);
+            assert_eq!(ra.next_long(), rb.next_long());
+        }
+    }
+    named["layers"][0]["provider"] = json!("example:missing");
+    assert!(
+        BlockColumnFeature::decode_with_resources(&mut Packs(false), &named, &mut resolve).is_err()
+    );
+}
 fn run(cmd: &mut Command) -> String {
     let out = cmd.output().unwrap();
     assert!(

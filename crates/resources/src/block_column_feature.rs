@@ -1,7 +1,7 @@
 //! Layered block columns with Java's height sampling and truncation order.
 use crate::{
     disk_feature::{BlockPredicate, DiskWorld, Provider},
-    packs::ResourceId,
+    packs::{ResourceId, ResourceProvider},
     placed_feature::IntProvider,
 };
 use anyhow::{Context, Result, ensure};
@@ -35,6 +35,27 @@ impl<S: Clone + Eq> BlockColumnFeature<S> {
                 .any(|layer| layer.provider.needs_survival(name))
     }
     pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        Self::decode_with_loader(value, resolve, |value, resolve| {
+            Provider::decode(value, resolve, 0)
+        })
+    }
+
+    /// Resolve state-provider holder references through the active data packs.
+    pub fn decode_with_resources(
+        resources: &mut impl ResourceProvider,
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<S>,
+    ) -> Result<Self> {
+        Self::decode_with_loader(value, resolve, |value, resolve| {
+            Provider::load(resources, value, resolve)
+        })
+    }
+
+    fn decode_with_loader<R: FnMut(&Value) -> Result<S>>(
+        value: &Value,
+        resolve: &mut R,
+        mut load: impl FnMut(&Value, &mut R) -> Result<Provider<S>>,
+    ) -> Result<Self> {
         let id = ResourceId::parse(
             value
                 .get("type")
@@ -68,12 +89,11 @@ impl<S: Clone + Eq> BlockColumnFeature<S> {
             let height =
                 IntProvider::parse(layer.get("height").context("missing column height")?, 0)?;
             ensure!(height.bounds().0 >= 0, "negative column height");
-            let provider = Provider::decode(
+            let provider = load(
                 layer
                     .get("provider")
                     .context("missing column state provider")?,
                 resolve,
-                0,
             )?;
             layers.push(Layer { height, provider });
         }

@@ -235,9 +235,9 @@ impl ConfiguredDecoration {
             ("minecraft", "underwater_magma") => {
                 Ok(Self::Magma(UnderwaterMagma::decode(value, resolve)?))
             }
-            ("minecraft", "block_column") => {
-                Ok(Self::Column(BlockColumnFeature::decode(value, resolve)?))
-            }
+            ("minecraft", "block_column") => Ok(Self::Column(
+                BlockColumnFeature::decode_with_resources(provider, value, resolve)?,
+            )),
             ("minecraft", "lake") => Ok(Self::Lake(LakeFeature::decode(value, resolve)?)),
             ("minecraft", "tree") => Ok(Self::Tree(TreeFeature::decode(provider, value, resolve)?)),
             ("minecraft", "fallen_tree") => Ok(Self::FallenTree(FallenTreeFeature::decode(

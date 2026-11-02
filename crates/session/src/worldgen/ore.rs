@@ -4,7 +4,7 @@
 //! random seed, writable region and complete CARVERS-stage neighborhood.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -20,6 +20,8 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
     spring_feature::{SpringFeature, SpringWorld},
+    tree_feature::{TreeFeature, TreeWorld, TreeWrite},
+    tree_leaf_update::{LeafUpdateWorld, finish_generated_tree},
     underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
 };
 use native_world::loaded::{
@@ -47,6 +49,8 @@ pub struct DecorationRegion<'a> {
     cactus_lava_fluids: Option<&'a BTreeSet<String>>,
     lake_water_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
+    tree_logs: Vec<[i32; 3]>,
+    tree_leaves: Vec<[i32; 3]>,
     failed: bool,
 }
 
@@ -70,6 +74,7 @@ enum ConfiguredDecoration {
     Magma(UnderwaterMagma<BlockState>),
     Column(BlockColumnFeature<BlockState>),
     Lake(LakeFeature<BlockState>),
+    Tree(TreeFeature<BlockState>),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -91,6 +96,7 @@ impl ConfiguredDecoration {
             Self::Spring(v) => v.required_blocks(),
             Self::Column(v) => v.required_blocks(),
             Self::Lake(v) => v.required_blocks(),
+            Self::Tree(v) => v.required_blocks(),
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_blocks)
@@ -159,6 +165,7 @@ impl ConfiguredDecoration {
                 Ok(Self::Column(BlockColumnFeature::decode(value, resolve)?))
             }
             ("minecraft", "lake") => Ok(Self::Lake(LakeFeature::decode(value, resolve)?)),
+            ("minecraft", "tree") => Ok(Self::Tree(TreeFeature::decode(provider, value, resolve)?)),
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -223,6 +230,12 @@ impl ConfiguredDecoration {
             Self::Magma(_) => BTreeSet::new(),
             Self::Column(v) => v.required_tags(),
             Self::Lake(v) => v.required_tags(),
+            Self::Tree(v) => {
+                let mut tags = v.required_tags();
+                tags.insert(ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap());
+                tags.insert(ResourceId::parse("minecraft:snow").unwrap());
+                tags
+            }
             Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_tags)
@@ -270,6 +283,19 @@ impl ConfiguredDecoration {
             Self::Magma(v) => v.place(world, random, pos),
             Self::Column(v) => v.place(world, random, pos),
             Self::Lake(v) => v.place(world, random, pos),
+            Self::Tree(v) => {
+                world.tree_logs.clear();
+                world.tree_leaves.clear();
+                let placed = v.place_components(world, random, pos)?;
+                let mut logs = std::mem::take(&mut world.tree_logs);
+                let mut leaves = std::mem::take(&mut world.tree_leaves);
+                let result = finish_generated_tree(world, placed, &logs, &leaves, &[], &[]);
+                logs.clear();
+                leaves.clear();
+                world.tree_logs = logs;
+                world.tree_leaves = leaves;
+                result
+            }
             Self::Selector(values) => {
                 let index = random
                     .next_int_bound(i32::try_from(values.len())?)
@@ -718,6 +744,8 @@ impl CarvedTerrainWorld {
             cactus_lava_fluids: None,
             lake_water_fluids: None,
             motion_cache: BTreeMap::new(),
+            tree_logs: Vec::new(),
+            tree_leaves: Vec::new(),
             failed: false,
         })
     }
@@ -1226,6 +1254,223 @@ impl OreWorld for DecorationRegion<'_> {
             self.failed = true;
         }
         result
+    }
+}
+
+fn tree_oak_leaf(state: &BlockState) -> Result<bool> {
+    if state.name != "minecraft:oak_leaves" {
+        return Ok(false);
+    }
+    ensure!(state.properties.len() == 3, "unsupported oak leaf state");
+    ensure!(
+        state
+            .properties
+            .get("distance")
+            .and_then(|v| v.parse::<u8>().ok())
+            .is_some_and(|v| (1..=7).contains(&v)),
+        "invalid oak leaf distance"
+    );
+    for property in ["persistent", "waterlogged"] {
+        ensure!(
+            matches!(
+                state.properties.get(property).map(String::as_str),
+                Some("true" | "false")
+            ),
+            "invalid oak leaf property"
+        );
+    }
+    Ok(true)
+}
+
+fn tree_decay_tag() -> &'static ResourceId {
+    static TAG: OnceLock<ResourceId> = OnceLock::new();
+    TAG.get_or_init(|| ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap())
+}
+
+fn tree_oak_log(state: &BlockState) -> bool {
+    state.name == "minecraft:oak_log"
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("axis").map(String::as_str),
+            Some("x" | "y" | "z")
+        )
+}
+
+fn tree_grass_block(state: &BlockState) -> bool {
+    state.name == "minecraft:grass_block"
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("snowy").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
+impl DecorationRegion<'_> {
+    /// Known-shape writes used by the supported oak tree states. Unknown
+    /// block-entity, POI or postprocessing effects abort the transaction.
+    fn set_tree_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
+        ensure!(flags == 19 || flags == 2, "unsupported tree write flags");
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "tree write chunk is missing"
+        );
+        let allowed = tree_oak_leaf(state)?
+            || tree_oak_log(state)
+            || (flags == 2 && tree_grass_block(state))
+            || (state.name == "minecraft:dirt" && state.properties.is_empty());
+        ensure!(allowed, "unsupported tree replacement effects");
+        if self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        let old = self.read(pos)?;
+        ensure!(
+            disk_safe_solid(&old.name).is_some()
+                || tree_oak_leaf(&old)?
+                || tree_oak_log(&old)
+                || simple_plant_kind(&old).is_ok(),
+            "unsupported tree source effects"
+        );
+        self.set_section_block(pos, state)?;
+        self.update_final_heightmaps(pos, state)?;
+        Ok(())
+    }
+}
+
+impl TreeWorld for DecorationRegion<'_> {
+    fn tree_min_y(&self) -> i32 {
+        self.target.min_y
+    }
+    fn tree_max_y(&self) -> i32 {
+        self.target.min_y + self.target.height - 1
+    }
+    fn persistent_foliage(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let state = OreWorld::block(self, pos)?;
+        match state.properties.get("persistent").map(String::as_str) {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            _ => bail!("invalid persistent property"),
+        }
+    }
+    fn foliage_state(&mut self, pos: [i32; 3], mut state: BlockState) -> Result<BlockState> {
+        ensure!(tree_oak_leaf(&state)?, "unsupported tree foliage state");
+        let old = OreWorld::block(self, pos)?;
+        let water = native_world::fluid::FluidState::from_block(&old)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|f| f.kind == native_world::fluid::FluidKind::Water && f.source);
+        state
+            .properties
+            .insert("waterlogged".into(), water.to_string());
+        Ok(state)
+    }
+    fn write_tree(&mut self, pos: [i32; 3], state: &BlockState, kind: TreeWrite) -> Result<()> {
+        match kind {
+            TreeWrite::Trunk => self.tree_logs.push(pos),
+            TreeWrite::Foliage => self.tree_leaves.push(pos),
+        }
+        self.set_tree_block(pos, state, 19)
+    }
+}
+
+impl LeafUpdateWorld for DecorationRegion<'_> {
+    fn optional_leaf_distance(&mut self, pos: [i32; 3]) -> Result<Option<u8>> {
+        let state = OreWorld::block(self, pos)?;
+        if self.tags.contains(tree_decay_tag(), &state.name)? {
+            return Ok(Some(0));
+        }
+        match state.properties.get("distance") {
+            None => Ok(None),
+            Some(value) => Ok(Some(
+                value
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|v| (1..=7).contains(v))
+                    .context("unsupported leaf distance")?,
+            )),
+        }
+    }
+    fn set_leaf_distance(&mut self, pos: [i32; 3], distance: u8) -> Result<()> {
+        let mut state = OreWorld::block(self, pos)?;
+        ensure!(tree_oak_leaf(&state)?, "unsupported distance-bearing block");
+        state
+            .properties
+            .insert("distance".into(), distance.to_string());
+        self.set_tree_block(pos, &state, 19)
+    }
+}
+
+impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_> {
+    type State = BlockState;
+    fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        OreWorld::block(self, pos)
+    }
+    fn update_shape(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        direction: [i32; 3],
+        _: [i32; 3],
+        neighbor: &BlockState,
+    ) -> Result<BlockState> {
+        if tree_oak_leaf(state)? {
+            if state
+                .properties
+                .get("waterlogged")
+                .is_some_and(|v| v == "true")
+            {
+                SpringWorld::schedule_spring_tick(
+                    self,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            let neighbor_distance = if self.tags.contains(tree_decay_tag(), &neighbor.name)? {
+                0
+            } else {
+                match neighbor.properties.get("distance") {
+                    Some(value) => value
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|v| (1..=7).contains(v))
+                        .context("unsupported neighbor leaf distance")?,
+                    None => 7,
+                }
+            };
+            let own = state.properties["distance"].parse::<u8>()?;
+            if neighbor_distance + 1 != 1 || own != 1 {
+                SimpleBlockWorld::schedule_simple_tick(self, pos)?;
+            }
+        } else if tree_grass_block(state) {
+            if direction == [0, 1, 0] {
+                let snowy = self
+                    .tags
+                    .contains(&ResourceId::parse("minecraft:snow")?, &neighbor.name)?;
+                let mut updated = state.clone();
+                updated.properties.insert("snowy".into(), snowy.to_string());
+                return Ok(updated);
+            }
+        } else {
+            ensure!(
+                tree_oak_log(state)
+                    || (state.properties.is_empty()
+                        && matches!(
+                            state.name.as_str(),
+                            "minecraft:air"
+                                | "minecraft:cave_air"
+                                | "minecraft:void_air"
+                                | "minecraft:stone"
+                                | "minecraft:dirt"
+                        )),
+                "unsupported tree edge shape update for {}",
+                state.name
+            );
+        }
+        Ok(state.clone())
+    }
+    fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
+        self.set_tree_block(pos, state, flags)
     }
 }
 
@@ -3213,6 +3458,460 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    struct TreeData;
+    impl ResourceProvider for TreeData {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            let value = match path {
+                "data/minecraft/worldgen/biome/plains.json" => json!({"features":[[{"feature":{
+                    "type":"minecraft:tree",
+                    "trunk_provider":{"id":"minecraft:oak_log","properties":{"axis":"y"}},
+                    "trunk_placer":{"type":"minecraft:straight_trunk_placer","base_height":4,"height_rand_a":2,"height_rand_b":0},
+                    "foliage_provider":{"id":"minecraft:oak_leaves","properties":{"distance":"7","persistent":"false","waterlogged":"false"}},
+                    "foliage_placer":{"type":"minecraft:blob_foliage_placer","height":3,"radius":2,"offset":0},
+                    "below_trunk_provider":{"id":"minecraft:dirt"},"minimum_size":{"type":"minecraft:two_layers_feature_size"},"decorators":[],"ignore_vines":true
+                },"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}]]}),
+                "data/minecraft/tags/block/replaceable_by_trees.json" => {
+                    json!({"values":["minecraft:oak_leaves"]})
+                }
+                "data/minecraft/tags/block/snow.json" => json!({"values":[]}),
+                "data/minecraft/tags/block/logs.json"
+                | "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" => {
+                    json!({"values":["minecraft:oak_log"]})
+                }
+                "data/minecraft/tags/block/blocks_motion_in_heightmap.json" => {
+                    json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:dirt","minecraft:grass_block","minecraft:oak_log","minecraft:oak_leaves"]})
+                }
+                "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                    json!({"values":["minecraft:stone","minecraft:diamond_ore","minecraft:dirt","minecraft:grass_block","minecraft:oak_log"]})
+                }
+                _ => return Data.read_data(path),
+            };
+            Ok(Some(serde_json::to_vec(&value)?))
+        }
+    }
+    fn resolve_tree_test(v: &Value) -> Result<BlockState> {
+        let mut block = resolve_test(v)?;
+        if let Some(values) = v.get("properties").and_then(Value::as_object) {
+            for (key, value) in values {
+                block.properties.insert(
+                    key.clone(),
+                    value
+                        .as_str()
+                        .context("invalid test state property")?
+                        .into(),
+                );
+            }
+        }
+        Ok(block)
+    }
+    fn prepare_tree_fixture() -> (
+        FeatureSchedule,
+        super::super::BiomeNeighborhood,
+        BTreeSet<String>,
+    ) {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut TreeData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:dirt".into(),
+            "minecraft:grass_block".into(),
+            "minecraft:oak_log".into(),
+            "minecraft:oak_leaves".into(),
+        ]);
+        (schedule, neighborhood, registry)
+    }
+    #[test]
+    fn planned_oak_tree_is_written_to_generated_chunk() {
+        let (schedule, neighborhood, registry) = prepare_tree_fixture();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut TreeData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+        let world = terrain.snapshot();
+        assert_eq!(world.block(8, 7, 8).unwrap().name, "minecraft:dirt");
+        let mut logs = 0;
+        let mut leaves = 0;
+        for x in 4..=12 {
+            for y in 8..16 {
+                for z in 4..=12 {
+                    let block = world.block(x, y, z).unwrap();
+                    if block.name == "minecraft:oak_log" {
+                        logs += 1;
+                    }
+                    if block.name == "minecraft:oak_leaves" {
+                        leaves += 1;
+                        assert!(block.properties["distance"].parse::<u8>().unwrap() < 7);
+                    }
+                }
+            }
+        }
+        assert!((4..=6).contains(&logs));
+        assert!(leaves > 10);
+        assert!(
+            !world
+                .saved_block_ticks
+                .values()
+                .flatten()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn repeated_oak_placements_reset_and_reuse_position_buffers() {
+        let (schedule, neighborhood, registry) = prepare_tree_fixture();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut TreeData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let feature = &prepared.features.values().next().unwrap().placed;
+        let (mut terrain, _, _, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain
+            .decoration_region(&prepared.tags, &prepared.motion, writable)
+            .unwrap();
+        let mut random = DecorationRandom::new(0);
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(feature, &mut random, [-4, 0, -4], 0, 16, &mut env)
+                .unwrap()
+        );
+        let log_capacity = region.tree_logs.capacity();
+        let leaf_capacity = region.tree_leaves.capacity();
+        assert!(region.tree_logs.is_empty() && region.tree_leaves.is_empty());
+        assert!(log_capacity > 0 && leaf_capacity > 0);
+        assert!(
+            region
+                .place_placed(feature, &mut random, [4, 0, 4], 0, 16, &mut env)
+                .unwrap()
+        );
+        assert!(region.tree_logs.is_empty() && region.tree_leaves.is_empty());
+        assert!(
+            region.tree_logs.capacity() >= log_capacity
+                && region.tree_leaves.capacity() >= leaf_capacity
+        );
+        region.finish().unwrap();
+        let world = terrain.snapshot();
+        assert_eq!(world.block(4, 8, 4).unwrap().name, "minecraft:oak_log");
+        assert_eq!(world.block(12, 8, 12).unwrap().name, "minecraft:oak_log");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_oak_chunk_and_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeChunkOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeChunkOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stderr),
+                String::from_utf8_lossy(&result.stdout)
+            );
+            String::from_utf8(result.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actual = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeChunkOracle"));
+        let actual = actual
+            .lines()
+            .find(|line| line.starts_with("RESULT "))
+            .unwrap();
+        let (schedule, neighborhood, registry) = prepare_tree_fixture();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut TreeData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let success = prepared.execute(&mut terrain, false).unwrap();
+        let world = terrain.snapshot();
+        let mut blocks = Vec::new();
+        for x in 0..16 {
+            for y in 7..16 {
+                for z in 0..16 {
+                    let block = world.block(x, y, z).unwrap();
+                    if !matches!(
+                        block.name.as_str(),
+                        "minecraft:dirt" | "minecraft:oak_log" | "minecraft:oak_leaves"
+                    ) {
+                        continue;
+                    }
+                    let extra = match block.name.as_str() {
+                        "minecraft:oak_log" => format!(",axis={}", block.properties["axis"]),
+                        "minecraft:oak_leaves" => format!(
+                            ",distance={},persistent={},waterlogged={}",
+                            block.properties["distance"],
+                            block.properties["persistent"],
+                            block.properties["waterlogged"]
+                        ),
+                        _ => String::new(),
+                    };
+                    blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                }
+            }
+        }
+        let ticks = world
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .into_iter()
+            .flatten()
+            .map(|tick| {
+                format!(
+                    "{},{},{},{}",
+                    tick.position[0], tick.position[1], tick.position[2], tick.block
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            format!(
+                "RESULT {} B {} T {}",
+                success[0],
+                blocks.join(";"),
+                ticks.join(";")
+            )
+        );
+
+        // Load the named oak and its below-trunk provider from the verified
+        // installation, then apply the same feature seed to an equal chunk.
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let block_registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:oak","placement":[]})).unwrap();
+        let placed =
+            PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |value| {
+                super::super::resolve_generated_terrain_state(value, &generated)
+            })
+            .unwrap();
+        let tags =
+            OreBlockTags::load(&mut resources, &block_registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &block_registry).unwrap();
+        let (mut installed, _, _, _) = fixture();
+        let writable = installed.snapshot().chunks.keys().copied().collect();
+        let mut region = installed
+            .decoration_region(&tags, &motion, writable)
+            .unwrap();
+        let mut random = plan.feature_random(&plan.features[0]);
+        let mut environment = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut environment)
+                .unwrap()
+        );
+        region.finish().unwrap();
+        let installed = installed.snapshot();
+        for x in 0..16 {
+            for y in 0..16 {
+                for z in 0..16 {
+                    assert_eq!(
+                        installed.block(x, y, z),
+                        world.block(x, y, z),
+                        "installed oak at {x},{y},{z}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            installed.saved_block_ticks.get(&ChunkPos { x: 0, z: 0 }),
+            world.saved_block_ticks.get(&ChunkPos { x: 0, z: 0 })
+        );
+
+        let grass_output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeChunkOracle")
+            .arg("grass"));
+        let grass_actual = grass_output
+            .lines()
+            .find(|line| line.starts_with("RESULT "))
+            .unwrap();
+        let (mut grassy, _, _, _) = fixture();
+        let mutable = Arc::make_mut(&mut grassy.world);
+        let mut grass = state("grass_block");
+        grass.properties.insert("snowy".into(), "true".into());
+        let id = mutable.intern_state(grass);
+        let chunk = Arc::make_mut(mutable.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+        assert_eq!(prepared.execute(&mut grassy, false).unwrap(), [true]);
+        let grassy = grassy.snapshot();
+        let mut grass_blocks = Vec::new();
+        for x in 0..16 {
+            for y in 7..16 {
+                for z in 0..16 {
+                    let block = grassy.block(x, y, z).unwrap();
+                    let extra = match block.name.as_str() {
+                        "minecraft:dirt" => String::new(),
+                        "minecraft:grass_block" => format!(",snowy={}", block.properties["snowy"]),
+                        "minecraft:oak_log" => format!(",axis={}", block.properties["axis"]),
+                        "minecraft:oak_leaves" => format!(
+                            ",distance={},persistent={},waterlogged={}",
+                            block.properties["distance"],
+                            block.properties["persistent"],
+                            block.properties["waterlogged"]
+                        ),
+                        _ => continue,
+                    };
+                    grass_blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                }
+            }
+        }
+        let grass_ticks = grassy
+            .saved_block_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .into_iter()
+            .flatten()
+            .map(|tick| {
+                format!(
+                    "{},{},{},{}",
+                    tick.position[0], tick.position[1], tick.position[2], tick.block
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            grass_actual,
+            format!(
+                "RESULT true B {} T {}",
+                grass_blocks.join(";"),
+                grass_ticks.join(";")
+            )
+        );
+
+        struct SnowData(bool);
+        impl ResourceProvider for SnowData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/snow.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.0 {vec!["minecraft:stone"]}else{vec![]}}),
+                    )?));
+                }
+                TreeData.read_data(path)
+            }
+        }
+        let mut grass_shapes = Vec::new();
+        for snowy_tag in [false, true] {
+            for initial in [false, true] {
+                for (name, direction) in [("up", [0, 1, 0]), ("east", [1, 0, 0])] {
+                    let required = BTreeSet::from([ResourceId::parse("minecraft:snow").unwrap()]);
+                    let tags =
+                        OreBlockTags::load(&mut SnowData(snowy_tag), &registry, &required).unwrap();
+                    let motion = HeightmapTags::load(&mut SnowData(snowy_tag), &registry).unwrap();
+                    let (mut terrain, _, _, _) = fixture();
+                    let world = Arc::make_mut(&mut terrain.world);
+                    let mut grass = state("grass_block");
+                    grass.properties.insert("snowy".into(), initial.to_string());
+                    let id = world.intern_state(grass.clone());
+                    let chunk =
+                        Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                    let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                    section.blocks.as_mut().unwrap()[1 + 16 + 8 * 256] = id;
+                    let writable = terrain.snapshot().chunks.keys().copied().collect();
+                    let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                    let changed = native_resources::tree_leaf_update::ShapeEdgeWorld::update_shape(
+                        &mut region,
+                        [1, 8, 1],
+                        &grass,
+                        direction,
+                        [1, 9, 1],
+                        &state("stone"),
+                    )
+                    .unwrap();
+                    if changed != grass {
+                        native_resources::tree_leaf_update::ShapeEdgeWorld::set_block(
+                            &mut region,
+                            [1, 8, 1],
+                            &changed,
+                            2,
+                        )
+                        .unwrap();
+                    }
+                    region.finish().unwrap();
+                    let value =
+                        terrain.snapshot().block(1, 8, 1).unwrap().properties["snowy"].clone();
+                    grass_shapes.push(format!("GRASS {snowy_tag} {initial} {name} {value}"));
+                }
+            }
+        }
+        let java_grass: Vec<_> = grass_output
+            .lines()
+            .filter(|line| line.starts_with("GRASS "))
+            .collect();
+        assert_eq!(java_grass, grass_shapes);
+    }
+    #[test]
+    fn unsupported_tree_edge_discards_generated_writes_and_ticks() {
+        let (schedule, neighborhood, mut registry) = prepare_tree_fixture();
+        registry.insert("minecraft:sand".into());
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut TreeData, &plan, &registry, &mut resolve_tree_test)
+                .unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(state("sand"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+        let before = terrain.snapshot();
+        assert!(prepared.execute(&mut terrain, false).is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]

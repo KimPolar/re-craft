@@ -3740,6 +3740,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_generation_light_reads_initialized_chunk_sections() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        assert!(
+            terrain
+                .fresh_generation_light([center], [center], &registry, true)
+                .is_err()
+        );
+        terrain.completed_decoration.insert(center);
+        let light = terrain
+            .fresh_generation_light([center], [center], &registry, true)
+            .unwrap();
+        assert_eq!(light.sky_light([0, 0, 0]), Some(0));
+        assert_eq!(light.sky_light([0, 32, 0]), Some(15));
+        assert_eq!(light.block_light([0, 0, 0]), Some(0));
+        let no_registered = terrain
+            .fresh_generation_light([], [center], &registry, true)
+            .unwrap();
+        assert_eq!(no_registered.sky_light([0, 0, 0]), Some(15));
+        Arc::make_mut(
+            Arc::make_mut(&mut terrain.world)
+                .chunks
+                .get_mut(&center)
+                .unwrap(),
+        )
+        .block_light_correct = true;
+        assert!(
+            terrain
+                .fresh_generation_light([center], [center], &registry, true)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn spring_writes_and_fluid_ticks_commit_or_rollback_together() {
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

@@ -1,6 +1,6 @@
 use native_world::{
     generation_light::{VisibleLayers, VisibleLightColumn, VisibleLightSnapshot},
-    loaded::{ChunkPos, LIGHT_BYTES},
+    loaded::{BLOCK_COUNT, BlockState, Chunk, ChunkPos, LIGHT_BYTES, Section, World},
 };
 use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 #[derive(Default)]
@@ -17,6 +17,84 @@ fn run(c: &mut Command) -> String {
         String::from_utf8_lossy(&o.stdout)
     );
     String::from_utf8(o.stdout).unwrap()
+}
+fn initialized_chunk_fixture() -> World {
+    let mut world = World::new("minecraft:overworld");
+    let make = |name: &str| BlockState {
+        name: format!("minecraft:{name}"),
+        properties: Default::default(),
+    };
+    let air = world.intern_state(make("air"));
+    for x in [-1, 0] {
+        let position = ChunkPos { x, z: 0 };
+        let mut sections = BTreeMap::new();
+        for sy in -1..=2 {
+            sections.insert(
+                sy,
+                Arc::new(Section {
+                    blocks: Some(Box::new([air; BLOCK_COUNT])),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                }),
+            );
+        }
+        world.chunks.insert(
+            position,
+            Arc::new(Chunk {
+                position,
+                status: Some("minecraft:features".into()),
+                block_light_correct: false,
+                sections,
+            }),
+        );
+    }
+    for (x, y, z, name) in [
+        (0, -16, 0, "cave_air"),
+        (0, 0, 0, "void_air"),
+        (0, 16, 0, "stone"),
+        (0, 32, 0, "water"),
+        (-16, -16, 0, "torch"),
+    ] {
+        let id = world.intern_state(make(name));
+        world.set_block_id(x, y, z, id).unwrap();
+    }
+    world
+}
+
+#[test]
+fn chunk_capture_rejects_missing_and_unknown_section_data() {
+    let center = ChunkPos { x: 0, z: 0 };
+    let capture = |world: &World| {
+        VisibleLightSnapshot::fresh_after_chunk_initialization(
+            world,
+            -1..3,
+            [center],
+            [center],
+            true,
+            true,
+            |state| match state.name.as_str() {
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => Some(true),
+                "minecraft:stone" | "minecraft:water" => Some(false),
+                _ => None,
+            },
+        )
+    };
+    let mut world = initialized_chunk_fixture();
+    let light = capture(&world).unwrap();
+    assert_eq!(light.sky_light([0, 48, 0]), Some(0));
+    assert_eq!(light.sky_light([0, 64, 0]), Some(15));
+    Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+        .sections
+        .remove(&2);
+    assert!(capture(&world).is_none());
+    let mut world = initialized_chunk_fixture();
+    let unknown = world.intern_state(BlockState {
+        name: "example:unknown".into(),
+        properties: Default::default(),
+    });
+    world.set_block_id(0, -16, 0, unknown).unwrap();
+    assert!(capture(&world).is_none());
 }
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
@@ -96,6 +174,24 @@ fn visible_generation_light_matches_java_engine_storage() {
                         )
                         .unwrap(),
                     )
+                } else if mode == 6 {
+                    Some(
+                        VisibleLightSnapshot::fresh_after_chunk_initialization(
+                            &initialized_chunk_fixture(),
+                            -1..3,
+                            [ChunkPos { x: 0, z: 0 }, ChunkPos { x: -1, z: 0 }],
+                            columns.keys().copied(),
+                            channels.0,
+                            channels.1,
+                            |s| {
+                                Some(matches!(
+                                    s.name.as_str(),
+                                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                                ))
+                            },
+                        )
+                        .unwrap(),
+                    )
                 } else {
                     None
                 };
@@ -161,7 +257,7 @@ fn visible_generation_light_matches_java_engine_storage() {
             _ => {}
         }
     }
-    assert_eq!(stage, 24);
-    assert_eq!(cases, 24 * 7 * 4 * 10);
+    assert_eq!(stage, 28);
+    assert_eq!(cases, 28 * 7 * 4 * 10);
     assert!(nonzero_blocks && nontrivial_sky);
 }

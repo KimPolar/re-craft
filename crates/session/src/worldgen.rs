@@ -184,6 +184,61 @@ impl CarvedTerrainWorld {
         Arc::clone(&self.world)
     }
 
+    /// Capture the visible state of a fresh, unpropagated light engine after
+    /// INITIALIZE_LIGHT has registered these feature-complete chunks. The
+    /// caller must provide the complete engine registration set and guarantee
+    /// the registered section occupancy has not changed since registration.
+    pub fn fresh_generation_light(
+        &self,
+        registered_chunks: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        covered_columns: impl IntoIterator<Item = native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        has_skylight: bool,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        let registered: Vec<_> = registered_chunks.into_iter().collect();
+        ensure!(
+            registered
+                .iter()
+                .all(|pos| self.completed_decoration.contains(pos)),
+            "light initialization requires completed features"
+        );
+        ensure!(
+            self.world
+                .chunks
+                .values()
+                .all(|chunk| !chunk.block_light_correct),
+            "fresh light engine cannot contain propagated chunks"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        native_world::generation_light::VisibleLightSnapshot::fresh_after_chunk_initialization(
+            &self.world,
+            self.min_y.div_euclid(16)..max_y.div_euclid(16),
+            registered,
+            covered_columns,
+            true,
+            has_skylight,
+            |state| {
+                if !registry.contains(&state.name) {
+                    return None;
+                }
+                let air = matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                );
+                if air && !state.properties.is_empty() {
+                    return None;
+                }
+                Some(air)
+            },
+        )
+        .context("registered light sections are missing or unsupported")
+    }
+
     /// Calculate a draft block-light snapshot after every feature center that
     /// can write into the three-by-three input area has completed. The caller
     /// must discard the result if any of those blocks are subsequently edited.

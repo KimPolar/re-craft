@@ -4,8 +4,12 @@
 //! reads the light engine's published data, which can differ from a fresh
 //! calculation of the generated terrain. Missing *allocated* sections and
 //! columns not included in a snapshot must not be conflated.
-use crate::loaded::{ChunkPos, LIGHT_BYTES};
-use std::{collections::BTreeMap, sync::Arc};
+use crate::loaded::{BlockState, ChunkPos, LIGHT_BYTES, World};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
 
 /// Nibble-packed visible layers indexed by absolute section Y.
 pub type VisibleLayers = BTreeMap<i32, Arc<[u8; LIGHT_BYTES]>>;
@@ -94,6 +98,58 @@ impl VisibleLightSnapshot {
             }
         }
         Some(result)
+    }
+
+    /// Read the nonempty sections registered by INITIALIZE_LIGHT from the
+    /// specified immutable chunk revision. The caller must supply all chunks
+    /// initialized in the fresh engine, and ensure they have not changed since
+    /// their section status was registered. No light may have propagated or
+    /// been restored, enabled, removed, or queued in that engine.
+    pub fn fresh_after_chunk_initialization(
+        world: &World,
+        section_range: Range<i32>,
+        registered_chunks: impl IntoIterator<Item = ChunkPos>,
+        covered_columns: impl IntoIterator<Item = ChunkPos>,
+        has_block: bool,
+        has_sky: bool,
+        mut is_air: impl FnMut(&BlockState) -> Option<bool>,
+    ) -> Option<Self> {
+        if section_range.start >= section_range.end {
+            return None;
+        }
+        let mut known = HashMap::new();
+        let mut statuses = Vec::new();
+        for pos in registered_chunks {
+            let chunk = world.chunks.get(&pos)?;
+            if chunk.position != pos {
+                return None;
+            }
+            for sy in section_range.clone() {
+                let blocks = chunk
+                    .sections
+                    .get(&i8::try_from(sy).ok()?)?
+                    .blocks
+                    .as_ref()?;
+                let mut nonempty = false;
+                for id in blocks.iter() {
+                    let air = if let Some(&air) = known.get(&id.0) {
+                        air
+                    } else {
+                        let air = is_air(world.state(*id)?)?;
+                        known.insert(id.0, air);
+                        air
+                    };
+                    if !air {
+                        nonempty = true;
+                        break;
+                    }
+                }
+                if nonempty {
+                    statuses.push((pos, sy));
+                }
+            }
+        }
+        Self::fresh_after_section_updates(has_block, has_sky, statuses, covered_columns)
     }
     fn position(pos: [i32; 3]) -> Option<(ChunkPos, i32, usize, usize, usize)> {
         // BlockPos.asLong has signed 26-bit X/Z and signed 12-bit Y.

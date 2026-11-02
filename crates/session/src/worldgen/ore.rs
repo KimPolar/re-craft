@@ -18,6 +18,7 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
     spring_feature::{SpringFeature, SpringWorld},
+    underwater_magma::{MagmaWorld, UnderwaterMagma, vanilla_full_occlusion},
 };
 use native_world::loaded::{
     BlockState, BlockStateId, ChunkPos, SavedBlockTick, SavedFluidTick, World,
@@ -61,6 +62,7 @@ enum ConfiguredDecoration {
     Disk(DiskFeature<BlockState>),
     Simple(SimpleBlockFeature<BlockState>),
     Spring(SpringFeature<BlockState>),
+    Magma(UnderwaterMagma<BlockState>),
 }
 impl ConfiguredDecoration {
     fn decode(
@@ -84,6 +86,9 @@ impl ConfiguredDecoration {
             ("minecraft", "spring_feature") => {
                 Ok(Self::Spring(SpringFeature::decode(value, resolve)?))
             }
+            ("minecraft", "underwater_magma") => {
+                Ok(Self::Magma(UnderwaterMagma::decode(value, resolve)?))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -96,6 +101,7 @@ impl ConfiguredDecoration {
             Self::Ore(v) => v.required_tags(),
             Self::Disk(v) => v.required_tags(),
             Self::Spring(v) => v.required_tags(),
+            Self::Magma(_) => BTreeSet::new(),
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
@@ -127,6 +133,7 @@ impl ConfiguredDecoration {
             Self::Disk(v) => v.place(world, random, pos),
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
+            Self::Magma(v) => v.place(world, random, pos),
         }
     }
 }
@@ -882,6 +889,7 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
         | "minecraft:bedrock"
         | "minecraft:red_sand"
         | "minecraft:moss_block" => Some(true),
+        "minecraft:magma_block" => Some(true),
         _ => None,
     }
 }
@@ -1250,6 +1258,42 @@ impl SpringWorld for DecorationRegion<'_> {
                     });
             }
             Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
+impl MagmaWorld for DecorationRegion<'_> {
+    fn face_is_full(&mut self, state: &BlockState, _direction: [i32; 3]) -> Result<bool> {
+        vanilla_full_occlusion(&state.name)
+            .with_context(|| format!("unsupported magma neighbor occlusion for {}", state.name))
+    }
+    fn set_magma(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "generation block chunk is missing"
+            );
+            ensure!(
+                state.name == "minecraft:magma_block" && state.properties.is_empty(),
+                "invalid magma block state"
+            );
+            if !self.is_outside(pos[1]) {
+                ensure!(
+                    disk_safe_solid(&self.read(pos)?.name).is_some(),
+                    "unsupported magma source effects"
+                );
+                self.set_section_block(pos, state)?;
+                self.update_final_heightmaps(pos, state)?;
+            }
+            self.mark_postprocessing([pos[0], pos[1].wrapping_add(1), pos[2]])?;
+            Ok(true)
         })();
         if result.is_err() {
             self.failed = true;
@@ -2314,8 +2358,78 @@ mod tests {
     }
 
     #[test]
+    fn prepared_batch_places_underwater_magma_and_rolls_back_unknown_faces() {
+        struct MagmaData;
+        impl ResourceProvider for MagmaData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{"feature":{
+                        "type":"minecraft:underwater_magma","floor_search_range":3,"placement_radius_around_floor":0,"placement_probability_per_valid_position":1.0
+                    },"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}]]}))?));
+                }
+                if matches!(
+                    path,
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                        | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                ) {
+                    return Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:magma_block"]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut MagmaData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend(["minecraft:water".into(), "minecraft:magma_block".into()]);
+        let prepared =
+            PreparedDecoration::load(&mut MagmaData, &plan, &registry, &mut resolve_test).unwrap();
+        for unknown in [false, true] {
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut water = state("water");
+            water.properties.insert("level".into(), "0".into());
+            setup.set_section_block([8, 8, 8], &water).unwrap();
+            if unknown {
+                setup
+                    .set_section_block([9, 7, 8], &state("diamond_ore"))
+                    .unwrap();
+            }
+            setup.finish().unwrap();
+            let before = terrain.snapshot();
+            if unknown {
+                assert!(prepared.execute(&mut terrain, false).is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(terrain.feature_postprocessing(center).is_none());
+            } else {
+                assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+                assert_eq!(
+                    terrain.snapshot().block(8, 7, 8).unwrap().name,
+                    "minecraft:magma_block"
+                );
+                assert_eq!(
+                    terrain.feature_postprocessing(center).unwrap().sections()[0],
+                    [0x888]
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn installed_spring_definitions_load_with_the_block_registry() {
+    fn installed_spring_and_magma_definitions_load_with_the_block_registry() {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -2326,6 +2440,7 @@ mod tests {
             "spring_lava",
             "spring_lava_frozen",
             "spring_delta",
+            "underwater_magma",
         ] {
             let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
             PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {

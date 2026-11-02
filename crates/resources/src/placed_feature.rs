@@ -39,6 +39,25 @@ fn kind(value: &Value) -> Result<String> {
     );
     Ok(id.path)
 }
+fn heightmap_name(entry: &Value) -> Result<String> {
+    let name = entry
+        .get("heightmap")
+        .and_then(Value::as_str)
+        .context("missing heightmap")?;
+    ensure!(
+        [
+            "WORLD_SURFACE_WG",
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR_WG",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES"
+        ]
+        .contains(&name),
+        "unsupported heightmap"
+    );
+    Ok(name.to_owned())
+}
 impl IntProvider {
     pub(crate) fn parse(value: &Value, depth: u8) -> Result<Self> {
         ensure!(depth < 32, "integer provider nesting is too deep");
@@ -289,6 +308,7 @@ enum Modifier {
     Height(HeightProvider),
     Rarity(i32),
     Heightmap(String),
+    SurfaceRelativeThreshold(String, i32, i32),
     Biome,
     BlockPredicate(BlockPredicate),
     Offset(IntProvider, IntProvider, IntProvider),
@@ -414,25 +434,20 @@ impl PlacedFeature {
                     ensure!(chance > 0, "invalid rarity");
                     Modifier::Rarity(chance)
                 }
-                "heightmap" => {
-                    let name = entry
-                        .get("heightmap")
-                        .and_then(Value::as_str)
-                        .context("missing heightmap")?;
-                    ensure!(
-                        [
-                            "WORLD_SURFACE_WG",
-                            "WORLD_SURFACE",
-                            "OCEAN_FLOOR_WG",
-                            "OCEAN_FLOOR",
-                            "MOTION_BLOCKING",
-                            "MOTION_BLOCKING_NO_LEAVES"
-                        ]
-                        .contains(&name),
-                        "unsupported heightmap"
-                    );
-                    Modifier::Heightmap(name.to_owned())
-                }
+                "heightmap" => Modifier::Heightmap(heightmap_name(entry)?),
+                "surface_relative_threshold_filter" => Modifier::SurfaceRelativeThreshold(
+                    heightmap_name(entry)?,
+                    entry
+                        .get("min_inclusive")
+                        .map(|_| integer(entry, "min_inclusive"))
+                        .transpose()?
+                        .unwrap_or(i32::MIN),
+                    entry
+                        .get("max_inclusive")
+                        .map(|_| integer(entry, "max_inclusive"))
+                        .transpose()?
+                        .unwrap_or(i32::MAX),
+                ),
                 "biome" => Modifier::Biome,
                 "block_predicate_filter" => Modifier::BlockPredicate(BlockPredicate::decode(
                     entry
@@ -609,6 +624,13 @@ impl PlacementPositions<'_> {
                             Modifier::Heightmap(kind) => {
                                 let y = env.heightmap(kind, position[0], position[2])?;
                                 (y > env.min_y()).then_some([position[0], y, position[2]])
+                            }
+                            Modifier::SurfaceRelativeThreshold(kind, min, max) => {
+                                let height =
+                                    i64::from(env.heightmap(kind, position[0], position[2])?);
+                                (height + i64::from(*min) <= i64::from(position[1])
+                                    && i64::from(position[1]) <= height + i64::from(*max))
+                                .then_some(position)
                             }
                             Modifier::Biome => env.biome_allows(position)?.then_some(position),
                             Modifier::BlockPredicate(predicate) => env

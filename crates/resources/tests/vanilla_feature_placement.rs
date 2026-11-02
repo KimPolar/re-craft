@@ -134,6 +134,9 @@ fn modifiers_and_feature_randomness_match_java() {
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-56},"inner":8}}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-57},"inner":8}}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":20},{"type":"minecraft:height_range","height":{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-64},"max_inclusive":{"absolute":-40}}}]}),
+        json!({"feature":"minecraft:ore_dirt","origin":[5,69,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"OCEAN_FLOOR_WG","min_inclusive":-10,"max_inclusive":-1}]}),
+        json!({"feature":"minecraft:ore_dirt","origin":[0,-2147483648,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG"}]}),
+        json!({"feature":"minecraft:ore_dirt","origin":[0,2147483647,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG","min_inclusive":2147483647}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[]}),
     ];
     let mut resources = ResourceStack::open(&game).unwrap();
@@ -143,6 +146,7 @@ fn modifiers_and_feature_randomness_match_java() {
         "ore_coal_upper",
         "spring_water",
         "spring_lava",
+        "underwater_magma",
     ] {
         let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
         PlacedFeature::load(&mut resources, &id).unwrap();

@@ -70,15 +70,18 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var w=new StagedGenerationLightEngineOracle();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
-        boolean partial=args.length>1 && args[1].equals("partial");
+        boolean ore=args.length>1 && args[1].equals("ore");
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
         int radius=w.mixed?2:1;
+        FakeChunk eastSection=null;
         for(int z=-radius;z<=radius;z++) for(int x=-radius;x<=radius;x++){
             var chunk=w.new TestChunk(x,z); w.chunks.put(new ChunkPos(x,z),chunk);
             var fake=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
             var container=new PalettedContainer<>(Blocks.AIR.defaultBlockState(),Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
             fake.section=new LevelChunkSection(container,null);
+            if(x==1 && z==0) eastSection=fake;
             for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(x==1 && z==0) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
@@ -88,6 +91,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(ore){
+            // OreFeature writes the section directly after INITIALIZE_LIGHT.
+            eastSection.section.setBlockState(1,4,8,Blocks.DIAMOND_ORE.defaultBlockState(),false);
+            w.edits.put(new BlockPos(17,4,8),Blocks.DIAMOND_ORE.defaultBlockState());
+            drain(engine); stages.add(capture(engine));
+            engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(w.mixed){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
             var first=new JsonArray(); first.add(capture(engine,0)); first.add(capture(engine,-1)); first.add(capture(engine,0,-1)); stages.add(first);

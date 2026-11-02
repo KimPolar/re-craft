@@ -421,7 +421,7 @@ impl GenerationSchedule {
         prepared: &super::PreparedDecoration<'_, '_>,
         structures_enabled: bool,
         fresh_light: Option<(
-            &super::FreshGenerationLightTracker,
+            &mut super::FreshGenerationLightTracker,
             &native_resources::block_registry::GeneratedBlockRegistry,
         )>,
     ) -> Result<Vec<bool>> {

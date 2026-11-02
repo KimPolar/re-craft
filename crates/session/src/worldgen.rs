@@ -367,8 +367,8 @@ impl FreshGenerationLightTracker {
         Ok(())
     }
 
-    /// Return source heights only while the registered generation data remains
-    /// unchanged. The array uses X + 16 * Z within the chunk.
+    /// Return source heights while registered generation data matches this
+    /// tracked revision. The array uses X + 16 * Z within the chunk.
     pub fn sky_sources(
         &self,
         terrain: &CarvedTerrainWorld,
@@ -489,8 +489,8 @@ impl FreshGenerationLightTracker {
         .context("active generated sky-light inputs are incomplete or unsupported")
     }
 
-    /// Capture one immutable engine revision. Any later registered-chunk edit
-    /// invalidates this tracker before another snapshot or registration.
+    /// Capture one immutable engine revision. Registered-chunk edits outside
+    /// the explicitly tracked generation path invalidate this tracker.
     pub fn snapshot(
         &self,
         terrain: &CarvedTerrainWorld,

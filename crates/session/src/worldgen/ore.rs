@@ -72,7 +72,24 @@ pub struct DecorationRegion<'a> {
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
     pending_monster_spawners: usize,
+    light_guard: Option<DecorationLightGuard<'a>>,
+    direct_ore_write: bool,
     failed: bool,
+}
+
+struct DecorationLightGuard<'a> {
+    registered: BTreeSet<ChunkPos>,
+    registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    changed_blocks: BTreeSet<String>,
+    changed_chunks: BTreeSet<ChunkPos>,
+}
+
+enum DecorationLightTracking<'a> {
+    Fresh(
+        &'a mut FreshGenerationLightTracker,
+        &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ),
+    Frozen(&'a FreshGenerationLightTracker),
 }
 
 struct FreezeContext<'a> {
@@ -552,7 +569,12 @@ impl ConfiguredDecoration {
         generator_height: i32,
     ) -> Result<bool> {
         match self {
-            Self::Ore(v) => v.place(world, random, pos),
+            Self::Ore(v) => {
+                world.direct_ore_write = matches!(v, ConfiguredOre::Vein(_));
+                let result = v.place(world, random, pos);
+                world.direct_ore_write = false;
+                result
+            }
             Self::Disk(v) => v.place(world, random, pos),
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
@@ -872,14 +894,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         self.execute_with_lighting(terrain, structures_enabled, &block, &raw)
     }
 
-    /// Use the tracked fresh light-engine revision. If decoration touches a
-    /// registered chunk, discard the attempt instead of assuming light remains
-    /// unchanged while that chunk's engine can receive updates.
+    /// Use the tracked fresh light-engine revision. Direct ore section writes
+    /// may update registered chunks only when each write preserves air status
+    /// and all supported light properties. Other edits discard the attempt.
     pub fn execute_with_tracked_light(
         &self,
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
-        tracker: &FreshGenerationLightTracker,
+        tracker: &mut FreshGenerationLightTracker,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<Vec<bool>> {
         let center = ChunkPos {
@@ -911,7 +933,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(&block),
             Some(&raw),
-            Some(tracker),
+            Some(DecorationLightTracking::Fresh(tracker, registry)),
         )
     }
 
@@ -950,7 +972,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(&block),
             Some(&raw),
-            Some(&engine.fresh),
+            Some(DecorationLightTracking::Frozen(&engine.fresh)),
         )
     }
 
@@ -960,7 +982,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures_enabled: bool,
         block_light: Option<&dyn Fn([i32; 3]) -> Result<u8>>,
         raw_brightness: Option<&dyn Fn(&World, [i32; 3]) -> Result<u8>>,
-        fresh_tracker: Option<&FreshGenerationLightTracker>,
+        mut light_tracking: Option<DecorationLightTracking<'_>>,
     ) -> Result<Vec<bool>> {
         ensure!(
             !structures_enabled,
@@ -997,6 +1019,19 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
         }
         let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
+        if let Some(DecorationLightTracking::Fresh(tracker, registry)) = &light_tracking {
+            region.light_guard = Some(DecorationLightGuard {
+                registered: region
+                    .writable
+                    .iter()
+                    .filter(|pos| tracker.registered.contains_key(pos))
+                    .copied()
+                    .collect(),
+                registry,
+                changed_blocks: BTreeSet::new(),
+                changed_chunks: BTreeSet::new(),
+            });
+        }
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
         region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
         region.lake_water_fluids = self.lake_water_fluids.as_ref();
@@ -1017,10 +1052,28 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .context("prepared ore is missing")?;
             results.push(region.place_planned_auto(self.plan, index, ore)?);
         }
-        if let Some(tracker) = fresh_tracker {
+        if let Some(DecorationLightTracking::Frozen(tracker)) = &light_tracking {
             tracker.validate_world(&region.world)?;
         }
+        let changes = region.light_guard.as_mut().map(|guard| {
+            (
+                std::mem::take(&mut guard.changed_blocks),
+                std::mem::take(&mut guard.changed_chunks),
+            )
+        });
         region.finish()?;
+        if let Some(DecorationLightTracking::Fresh(tracker, _)) = &mut light_tracking {
+            let (checked_blocks, changed_chunks) =
+                changes.expect("fresh tracker has a light guard");
+            for pos in changed_chunks {
+                *tracker
+                    .registered
+                    .get_mut(&pos)
+                    .expect("guarded chunk is registered") =
+                    Arc::clone(&terrain.world.chunks[&pos]);
+            }
+            tracker.checked_blocks.extend(checked_blocks);
+        }
         terrain.completed_decoration.insert(center);
         Ok(results)
     }
@@ -1304,6 +1357,8 @@ impl CarvedTerrainWorld {
             bee_nests,
             monster_entities,
             pending_monster_spawners: 0,
+            light_guard: None,
+            direct_ore_write: false,
             failed: false,
         })
     }
@@ -1347,7 +1402,10 @@ impl DecorationRegion<'_> {
         ensure!(!self.failed, "generation attempt previously failed");
         let mut next = random.clone();
         self.failed = true;
-        let result = feature.place(self, &mut next, origin)?;
+        self.direct_ore_write = true;
+        let result = feature.place(self, &mut next, origin);
+        self.direct_ore_write = false;
+        let result = result?;
         *random = next;
         self.failed = false;
         Ok(result)
@@ -4376,6 +4434,37 @@ impl OreVeinWorld for DecorationRegion<'_> {
     }
     fn set_section_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
         ensure!(!self.is_outside(p[1]), "ore write outside build height");
+        let mut unchanged_registered = false;
+        if let Some(guard) = &self.light_guard {
+            if guard.registered.contains(&chunk(p)) {
+                let old = self.read(p)?;
+                if old == *state {
+                    unchanged_registered = true;
+                } else {
+                    ensure!(
+                        self.direct_ore_write
+                            && super::generated_state_is_air(guard.registry, &old)
+                                .zip(super::generated_state_is_air(guard.registry, state))
+                                .is_some_and(|(a, b)| a == b)
+                            && native_world::block_light::same_light_behavior(&old, state)
+                                == Some(true),
+                        "registered light chunk has changed at {p:?}: {} -> {}",
+                        old.name,
+                        state.name,
+                    );
+                    self.light_guard
+                        .as_mut()
+                        .unwrap()
+                        .changed_blocks
+                        .insert(state.name.clone());
+                    self.light_guard
+                        .as_mut()
+                        .unwrap()
+                        .changed_chunks
+                        .insert(chunk(p));
+                }
+            }
+        }
         if self.bee_nests.contains_key(&p) {
             ensure!(
                 self.read(p)? == *state,
@@ -4391,6 +4480,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
         // Preserve both original maps before the first direct write in this
         // chunk; untouched neighbors need no heightmap scan.
         self.prime_heightmaps(chunk(p))?;
+        if unchanged_registered {
+            return Ok(());
+        }
         let id = self.world.intern_state(state.clone());
         let section_y = i8::try_from(p[1].div_euclid(16))?;
         let chunk = Arc::make_mut(
@@ -5353,13 +5445,22 @@ mod tests {
             let before = terrain.snapshot();
             assert!(
                 steps
-                    .run_features(&mut terrain, &prepared, true, Some((&tracker, &vanilla)))
+                    .run_features(
+                        &mut terrain,
+                        &prepared,
+                        true,
+                        Some((&mut tracker, &vanilla))
+                    )
                     .is_err()
             );
             assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
-            let result =
-                steps.run_features(&mut terrain, &prepared, false, Some((&tracker, &vanilla)));
+            let result = steps.run_features(
+                &mut terrain,
+                &prepared,
+                false,
+                Some((&mut tracker, &vanilla)),
+            );
             if x == 8 {
                 assert_eq!(result.unwrap(), [true]);
                 assert_eq!(steps.completed(center), Some(GenerationStage::Features));
@@ -5427,9 +5528,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
+                    format!("{:#}", result.unwrap_err())
                         .contains("registered light chunk has changed")
                 );
                 assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
@@ -5633,6 +5732,153 @@ mod tests {
         assert_eq!(dark[&0][index / 2] & 15, 0);
         assert_eq!(lit[&0][index / 2] & 15, 15);
         assert_eq!(dark[&5][index / 2] & 15, 15);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tracked_light_accepts_equivalent_ore_and_rejects_other_writes() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let compilation = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        let expected_path = temp.path().join("ore.json");
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&expected_path)
+            .arg("ore")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Vec<Vec<Vec<u8>>> =
+            serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut blocks = batch_registry();
+        blocks.insert("minecraft:torch".into());
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &blocks, &mut resolve_test).unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let east = ChunkPos { x: 1, z: 0 };
+        let center = ChunkPos { x: 0, z: 0 };
+        let world = Arc::make_mut(&mut terrain.world);
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(17, 10, 8, torch).unwrap();
+        terrain.completed_decoration.insert(east);
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        tracker.initialize_chunk(&terrain, east, &registry).unwrap();
+        let before = terrain.snapshot();
+        let sky = tracker.sky_sources(&terrain, east).unwrap();
+        prepared
+            .execute_with_tracked_light(&mut terrain, false, &mut tracker, &registry)
+            .unwrap();
+        let after = terrain.snapshot();
+        assert!((16..32).any(|x| (0..16).any(|z| (0..8).any(|y| {
+            before.block(x, y, z) != after.block(x, y, z)
+                && after.block(x, y, z).unwrap().name == "minecraft:diamond_ore"
+        }))));
+        assert_eq!(&*sky, &*tracker.sky_sources(&terrain, east).unwrap());
+        assert!(tracker.snapshot(&terrain, [east], &registry).is_ok());
+        assert!(tracker.checked_blocks.contains("minecraft:diamond_ore"));
+        let before_light = tracker.snapshot(&terrain, [center], &registry).unwrap();
+        let mut engine = StagedGenerationLightEngine::new(tracker);
+        let active = engine
+            .activate(&terrain, east, [center], &registry)
+            .unwrap();
+        for (stage, actual) in [&before_light, &active].into_iter().enumerate() {
+            for y in -16..32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let pos = [x, y, z];
+                        let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                        assert_eq!(
+                            actual.block_light(pos),
+                            Some(expected[stage][0][index]),
+                            "block {stage} {pos:?}"
+                        );
+                        assert_eq!(
+                            actual.sky_light(pos),
+                            Some(expected[stage][1][index]),
+                            "sky {stage} {pos:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let tracker = &engine.fresh;
+
+        for (direct, replacement) in [(false, "diamond_ore"), (true, "air"), (true, "torch")] {
+            let before = terrain.snapshot();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([east]))
+                .unwrap();
+            region.light_guard = Some(DecorationLightGuard {
+                registered: BTreeSet::from([east]),
+                registry: &registry,
+                changed_blocks: BTreeSet::new(),
+                changed_chunks: BTreeSet::new(),
+            });
+            region.direct_ore_write = true;
+            let initial = region.read([16, 0, 0]).unwrap();
+            let valid = if initial.name == "minecraft:stone" {
+                state("diamond_ore")
+            } else {
+                state("stone")
+            };
+            region.set_section_block([16, 0, 0], &valid).unwrap();
+            region.direct_ore_write = direct;
+            let old = region.read([16, 0, 0]).unwrap();
+            let replacement = if old.name == format!("minecraft:{replacement}") {
+                state("stone")
+            } else {
+                state(replacement)
+            };
+            assert!(region.set_section_block([16, 0, 0], &replacement).is_err());
+            drop(region);
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert!(tracker.snapshot(&terrain, [east], &registry).is_ok());
+        }
     }
 
     #[test]

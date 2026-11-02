@@ -474,7 +474,7 @@ impl FreshTerrainBatch {
                             .all(|chunk| !chunk.block_light_correct),
                     "feature batch light engine is not fresh"
                 );
-                if let Some(tracker) = &self.light_tracker {
+                if let Some(tracker) = &mut self.light_tracker {
                     let registry = self
                         .light_registry
                         .as_ref()

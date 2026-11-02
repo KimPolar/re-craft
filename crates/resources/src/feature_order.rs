@@ -294,6 +294,15 @@ pub struct FeatureTags {
 }
 
 impl FeatureTags {
+    /// Resolve a placed-feature tag from the active pack stack and registry.
+    pub fn resolve_tag(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        registry: &BTreeSet<ResourceId>,
+        id: &ResourceId,
+    ) -> Result<Option<Vec<ResourceId>>> {
+        self.resolve(provider, registry, id, &mut BTreeSet::new())
+    }
     fn resolve(
         &mut self,
         provider: &mut impl ResourceProvider,

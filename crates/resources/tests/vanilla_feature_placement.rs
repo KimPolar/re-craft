@@ -137,6 +137,7 @@ fn modifiers_and_feature_randomness_match_java() {
         json!({"feature":"minecraft:ore_dirt","origin":[5,69,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"OCEAN_FLOOR_WG","min_inclusive":-10,"max_inclusive":-1}]}),
         json!({"feature":"minecraft:ore_dirt","origin":[0,-2147483648,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG"}]}),
         json!({"feature":"minecraft:ore_dirt","origin":[0,2147483647,0],"placement":[{"type":"minecraft:surface_relative_threshold_filter","heightmap":"WORLD_SURFACE_WG","min_inclusive":2147483647}]}),
+        json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:count","count":{"type":"minecraft:clamped","min_inclusive":0,"max_inclusive":2,"source":{"type":"minecraft:uniform","min_inclusive":-3,"max_inclusive":4}}},{"type":"minecraft:in_square"}]}),
         json!({"feature":"minecraft:ore_dirt","placement":[]}),
     ];
     let mut resources = ResourceStack::open(&game).unwrap();
@@ -147,6 +148,7 @@ fn modifiers_and_feature_randomness_match_java() {
         "spring_water",
         "spring_lava",
         "underwater_magma",
+        "forest_flowers",
     ] {
         let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
         PlacedFeature::load(&mut resources, &id).unwrap();

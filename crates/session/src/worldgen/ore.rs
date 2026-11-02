@@ -12,7 +12,7 @@ use native_core::random::DecorationRandom;
 use native_resources::{
     block_column_feature::{BlockColumnFeature, ColumnWorld},
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
-    feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule},
+    feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule, FeatureTags},
     heightmap_tags::HeightmapTags,
     lake_feature::{LakeFeature, LakeWorld},
     ore_feature::{ConfiguredOre, OreBlockTags, OreVein, OreVeinWorld, OreWorld},
@@ -70,11 +70,70 @@ enum ConfiguredDecoration {
     Magma(UnderwaterMagma<BlockState>),
     Column(BlockColumnFeature<BlockState>),
     Lake(LakeFeature<BlockState>),
+    Selector(Vec<PlacedDecorationFeature>),
+    WeightedSelector(
+        Vec<(f32, PlacedDecorationFeature)>,
+        Box<PlacedDecorationFeature>,
+    ),
+}
+#[derive(Default)]
+struct FeatureLoadState {
+    active: BTreeSet<String>,
+    nodes: usize,
+    tags: FeatureTags,
+    registry: Option<BTreeSet<ResourceId>>,
 }
 impl ConfiguredDecoration {
+    fn required_blocks(&self) -> BTreeSet<ResourceId> {
+        match self {
+            Self::Disk(v) => v.required_blocks(),
+            Self::Simple(v) => v.required_blocks(),
+            Self::Spring(v) => v.required_blocks(),
+            Self::Column(v) => v.required_blocks(),
+            Self::Lake(v) => v.required_blocks(),
+            Self::Selector(values) => values
+                .iter()
+                .flat_map(PlacedDecorationFeature::required_blocks)
+                .collect(),
+            Self::WeightedSelector(values, default) => {
+                let mut blocks = default.required_blocks();
+                for (_, feature) in values {
+                    blocks.extend(feature.required_blocks());
+                }
+                blocks
+            }
+            _ => BTreeSet::new(),
+        }
+    }
+    fn needs_survival(&self, name: &str) -> bool {
+        match self {
+            Self::Disk(v) => v.needs_survival(name),
+            Self::Simple(v) => v.needs_survival(name),
+            Self::Column(v) => v.needs_survival(name),
+            Self::Lake(v) => v.needs_survival(name),
+            Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
+            Self::WeightedSelector(values, default) => {
+                default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
+            }
+            _ => false,
+        }
+    }
+    fn needs_lake(&self) -> bool {
+        match self {
+            Self::Lake(_) => true,
+            Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_lake),
+            Self::WeightedSelector(values, default) => {
+                default.needs_lake() || values.iter().any(|(_, v)| v.needs_lake())
+            }
+            _ => false,
+        }
+    }
     fn decode(
+        provider: &mut impl ResourceProvider,
         value: &Value,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        state: &mut FeatureLoadState,
+        depth: usize,
     ) -> Result<Self> {
         let id = ResourceId::parse(
             value
@@ -100,6 +159,55 @@ impl ConfiguredDecoration {
                 Ok(Self::Column(BlockColumnFeature::decode(value, resolve)?))
             }
             ("minecraft", "lake") => Ok(Self::Lake(LakeFeature::decode(value, resolve)?)),
+            ("minecraft", "simple_random_selector") => {
+                let features = value.get("features").context("missing selector features")?;
+                let entries = PlacedDecorationFeature::load_holder_set(
+                    provider,
+                    features,
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                ensure!(!entries.is_empty(), "empty selector feature set");
+                Ok(Self::Selector(entries))
+            }
+            ("minecraft", "random_selector") => {
+                let entries = value
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .context("missing weighted selector features")?;
+                ensure!(entries.len() <= 4096, "too many weighted selector entries");
+                let mut features = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let chance = entry
+                        .get("chance")
+                        .and_then(Value::as_f64)
+                        .context("invalid selector chance")?
+                        as f32;
+                    ensure!(
+                        chance.is_finite() && (0.0..=1.0).contains(&chance),
+                        "invalid selector chance"
+                    );
+                    let selected = PlacedDecorationFeature::load_nested(
+                        provider,
+                        entry
+                            .get("feature")
+                            .context("missing weighted selector feature")?,
+                        resolve,
+                        state,
+                        depth + 1,
+                    )?;
+                    features.push((chance, selected));
+                }
+                let default = PlacedDecorationFeature::load_nested(
+                    provider,
+                    value.get("default").context("missing selector default")?,
+                    resolve,
+                    state,
+                    depth + 1,
+                )?;
+                Ok(Self::WeightedSelector(features, Box::new(default)))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -115,6 +223,17 @@ impl ConfiguredDecoration {
             Self::Magma(_) => BTreeSet::new(),
             Self::Column(v) => v.required_tags(),
             Self::Lake(v) => v.required_tags(),
+            Self::Selector(values) => values
+                .iter()
+                .flat_map(PlacedDecorationFeature::required_tags)
+                .collect(),
+            Self::WeightedSelector(values, default) => {
+                let mut tags = default.required_tags();
+                for (_, feature) in values {
+                    tags.extend(feature.required_tags());
+                }
+                tags
+            }
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
@@ -140,6 +259,8 @@ impl ConfiguredDecoration {
         world: &mut DecorationRegion<'_>,
         random: &mut DecorationRandom,
         pos: [i32; 3],
+        generator_min_y: i32,
+        generator_height: i32,
     ) -> Result<bool> {
         match self {
             Self::Ore(v) => v.place(world, random, pos),
@@ -149,6 +270,32 @@ impl ConfiguredDecoration {
             Self::Magma(v) => v.place(world, random, pos),
             Self::Column(v) => v.place(world, random, pos),
             Self::Lake(v) => v.place(world, random, pos),
+            Self::Selector(values) => {
+                let index = random
+                    .next_int_bound(i32::try_from(values.len())?)
+                    .context("empty selector feature set")? as usize;
+                world.place_nested(
+                    &values[index],
+                    random,
+                    pos,
+                    generator_min_y,
+                    generator_height,
+                )
+            }
+            Self::WeightedSelector(values, default) => {
+                for (chance, feature) in values {
+                    if random.next_float() < *chance {
+                        return world.place_nested(
+                            feature,
+                            random,
+                            pos,
+                            generator_min_y,
+                            generator_height,
+                        );
+                    }
+                }
+                world.place_nested(default, random, pos, generator_min_y, generator_height)
+            }
         }
     }
 }
@@ -209,33 +356,10 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     resolve,
                 )
                 .with_context(|| format!("unsupported planned feature {:?}", selected.feature))?;
-                let mut blocks = feature.placed.placement.required_blocks();
-                needs_sugar_cane |= feature.placed.placement.needs_sugar_cane_survival();
-                needs_cactus |= feature.placed.placement.needs_survival("cactus");
-                if let ConfiguredDecoration::Disk(disk) = &feature.placed.feature {
-                    blocks.extend(disk.required_blocks());
-                    needs_sugar_cane |= disk.needs_sugar_cane_survival();
-                    needs_cactus |= disk.needs_survival("cactus");
-                }
-                if let ConfiguredDecoration::Simple(simple) = &feature.placed.feature {
-                    blocks.extend(simple.required_blocks());
-                    needs_sugar_cane |= simple.needs_sugar_cane_survival();
-                    needs_cactus |= simple.needs_survival("cactus");
-                }
-                if let ConfiguredDecoration::Spring(spring) = &feature.placed.feature {
-                    blocks.extend(spring.required_blocks());
-                }
-                if let ConfiguredDecoration::Column(column) = &feature.placed.feature {
-                    blocks.extend(column.required_blocks());
-                    needs_sugar_cane |= column.needs_sugar_cane_survival();
-                    needs_cactus |= column.needs_survival("cactus");
-                }
-                if let ConfiguredDecoration::Lake(lake) = &feature.placed.feature {
-                    blocks.extend(lake.required_blocks());
-                    needs_sugar_cane |= lake.needs_survival("sugar_cane");
-                    needs_cactus |= lake.needs_survival("cactus");
-                    needs_lake = true;
-                }
+                let blocks = feature.placed.required_blocks();
+                needs_sugar_cane |= feature.placed.needs_survival("sugar_cane");
+                needs_cactus |= feature.placed.needs_survival("cactus");
+                needs_lake |= feature.placed.needs_lake();
                 for id in blocks {
                     ensure!(
                         block_registry.contains(&format!("{}:{}", id.namespace, id.path)),
@@ -411,25 +535,149 @@ impl PlacedDecorationFeature {
         placement: PlacedFeature,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Self> {
+        Self::from_placement_inner(
+            provider,
+            placement,
+            resolve,
+            &mut FeatureLoadState::default(),
+            0,
+        )
+    }
+    fn from_placement_inner(
+        provider: &mut impl ResourceProvider,
+        placement: PlacedFeature,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        state: &mut FeatureLoadState,
+        depth: usize,
+    ) -> Result<Self> {
+        ensure!(
+            depth < 64 && state.nodes < 4096,
+            "feature nesting or size limit exceeded"
+        );
+        state.nodes += 1;
         let feature = if let Some(id) = placement.feature.as_str() {
             let id = ResourceId::parse(id)?;
             let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
-            let data = provider
-                .read_data(&path)?
-                .with_context(|| format!("missing feature {path}"))?;
-            let value =
-                serde_json::from_slice(&data).with_context(|| format!("invalid feature {path}"))?;
-            ConfiguredDecoration::decode(&value, resolve)?
+            ensure!(
+                state.active.insert(path.clone()),
+                "cyclic configured feature reference"
+            );
+            let result = (|| {
+                let data = provider
+                    .read_data(&path)?
+                    .with_context(|| format!("missing feature {path}"))?;
+                let value = serde_json::from_slice(&data)
+                    .with_context(|| format!("invalid feature {path}"))?;
+                ConfiguredDecoration::decode(provider, &value, resolve, state, depth + 1)
+            })();
+            state.active.remove(&path);
+            result?
         } else {
-            ConfiguredDecoration::decode(&placement.feature, resolve)?
+            ConfiguredDecoration::decode(provider, &placement.feature, resolve, state, depth + 1)?
         };
         Ok(Self { placement, feature })
+    }
+
+    fn load_nested(
+        provider: &mut impl ResourceProvider,
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        state: &mut FeatureLoadState,
+        depth: usize,
+    ) -> Result<Self> {
+        if let Some(name) = value.as_str() {
+            ensure!(!name.starts_with('#'), "tag is not a single placed feature");
+            let id = ResourceId::parse(name)?;
+            let path = format!(
+                "data/{}/worldgen/placed_feature/{}.json",
+                id.namespace, id.path
+            );
+            ensure!(
+                state.active.insert(path.clone()),
+                "cyclic placed feature reference"
+            );
+            let result = (|| {
+                let placement = PlacedFeature::load(provider, &id)?;
+                Self::from_placement_inner(provider, placement, resolve, state, depth + 1)
+            })();
+            state.active.remove(&path);
+            result
+        } else {
+            Self::from_placement_inner(
+                provider,
+                PlacedFeature::decode(value)?,
+                resolve,
+                state,
+                depth + 1,
+            )
+        }
+    }
+    fn load_holder_set(
+        provider: &mut impl ResourceProvider,
+        value: &Value,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        state: &mut FeatureLoadState,
+        depth: usize,
+    ) -> Result<Vec<Self>> {
+        if let Some(tag) = value.as_str().and_then(|s| s.strip_prefix('#')) {
+            let id = ResourceId::parse(tag)?;
+            if state.registry.is_none() {
+                state.registry = Some(
+                    provider
+                        .list_data("worldgen/placed_feature")?
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            let members = state
+                .tags
+                .resolve_tag(provider, state.registry.as_ref().unwrap(), &id)?
+                .context("selector placed-feature tag missing")?;
+            return members
+                .iter()
+                .map(|id| {
+                    Self::load_nested(
+                        provider,
+                        &Value::String(format!("{}:{}", id.namespace, id.path)),
+                        resolve,
+                        state,
+                        depth + 1,
+                    )
+                })
+                .collect();
+        }
+        if let Some(values) = value.as_array() {
+            ensure!(values.len() <= 4096, "too many selector features");
+            values
+                .iter()
+                .map(|entry| Self::load_nested(provider, entry, resolve, state, depth + 1))
+                .collect()
+        } else {
+            Ok(vec![Self::load_nested(
+                provider,
+                value,
+                resolve,
+                state,
+                depth + 1,
+            )?])
+        }
     }
 
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
         let mut tags = self.feature.required_tags();
         tags.extend(self.placement.required_tags());
         tags
+    }
+    fn required_blocks(&self) -> BTreeSet<ResourceId> {
+        let mut blocks = self.placement.required_blocks();
+        blocks.extend(self.feature.required_blocks());
+        blocks
+    }
+    fn needs_survival(&self, name: &str) -> bool {
+        self.placement.needs_survival(name) || self.feature.needs_survival(name)
+    }
+    fn needs_lake(&self) -> bool {
+        self.feature.needs_lake()
     }
 }
 
@@ -476,6 +724,31 @@ impl CarvedTerrainWorld {
 }
 
 impl DecorationRegion<'_> {
+    fn place_nested(
+        &mut self,
+        placed: &PlacedDecorationFeature,
+        random: &mut DecorationRandom,
+        origin: [i32; 3],
+        generator_min_y: i32,
+        generator_height: i32,
+    ) -> Result<bool> {
+        let mut positions =
+            placed
+                .placement
+                .positions(origin, generator_min_y, generator_height)?;
+        let mut result = false;
+        loop {
+            let next = {
+                let mut env = NestedDecorationEnvironment { region: self };
+                positions.next(random, &mut env)?
+            };
+            let Some(pos) = next else { break };
+            result |= placed
+                .feature
+                .place(self, random, pos, generator_min_y, generator_height)?;
+        }
+        Ok(result)
+    }
     /// A failed attempt must be discarded; on failure the caller's RNG is unchanged.
     /// If the region contains earlier successful placements, the caller must
     /// also restore its RNG to the beginning of the discarded region.
@@ -518,7 +791,13 @@ impl DecorationRegion<'_> {
                 .positions(origin, generator_min_y, generator_height)?;
         let mut result = false;
         while let Some(position) = positions.next(&mut next, environment)? {
-            result |= placed.feature.place(self, &mut next, position)?;
+            result |= placed.feature.place(
+                self,
+                &mut next,
+                position,
+                generator_min_y,
+                generator_height,
+            )?;
         }
         *random = next;
         self.failed = false;
@@ -570,7 +849,13 @@ impl DecorationRegion<'_> {
                 positions.next(&mut random, &mut env)?
             };
             let Some(position) = next else { break };
-            result |= ore.placed.feature.place(self, &mut random, position)?;
+            result |= ore.placed.feature.place(
+                self,
+                &mut random,
+                position,
+                plan.generator_min_y,
+                plan.generator_height,
+            )?;
         }
         self.failed = false;
         Ok(result)
@@ -839,6 +1124,35 @@ struct PlannedDecorationEnvironment<'a, 'b, F> {
     plan: &'a DecorationPlan<'a>,
     key: &'a FeatureKey,
     biome_allows: &'a mut F,
+}
+
+struct NestedDecorationEnvironment<'a, 'b> {
+    region: &'a mut DecorationRegion<'b>,
+}
+impl PlacementEnvironment for NestedDecorationEnvironment<'_, '_> {
+    fn min_y(&self) -> i32 {
+        self.region.target.min_y
+    }
+    fn inside_build_height(&self, y: i32) -> Result<bool> {
+        Ok(!self.region.is_outside(y))
+    }
+    fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32> {
+        match kind {
+            "OCEAN_FLOOR_WG" => self.region.ocean_floor_height(x, z),
+            "WORLD_SURFACE_WG" => self.region.world_surface_height(x, z),
+            "WORLD_SURFACE" => self.region.final_height(0, x, z),
+            "OCEAN_FLOOR" => self.region.final_height(1, x, z),
+            "MOTION_BLOCKING" => self.region.final_height(2, x, z),
+            "MOTION_BLOCKING_NO_LEAVES" => self.region.final_height(3, x, z),
+            _ => bail!("unsupported generation heightmap {kind}"),
+        }
+    }
+    fn biome_allows(&mut self, _: [i32; 3]) -> Result<bool> {
+        bail!("nested placed feature has no top-level biome feature")
+    }
+    fn block_predicate(&mut self, predicate: &BlockPredicate, pos: [i32; 3]) -> Result<bool> {
+        predicate.test(self.region, pos)
+    }
 }
 impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
     for PlannedDecorationEnvironment<'_, '_, F>
@@ -2194,6 +2508,357 @@ mod tests {
     }
 
     #[test]
+    fn nested_selector_resolves_tags_and_rejects_cycles() {
+        struct GraphData {
+            cycle: bool,
+        }
+        impl ResourceProvider for GraphData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/placed_feature", "unexpected folder");
+                Ok(["test:a", "test:b"]
+                    .into_iter()
+                    .map(|v| ResourceId::parse(v).unwrap())
+                    .collect())
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/test/worldgen/placed_feature/root.json" => {
+                        json!({"feature":"test:root","placement":[]})
+                    }
+                    "data/test/worldgen/feature/root.json" => {
+                        json!({"type":"minecraft:simple_random_selector","features":if self.cycle {json!([{"feature":"test:root","placement":[]}])} else {json!("#test:flowers")}})
+                    }
+                    "data/test/tags/worldgen/placed_feature/flowers.json" => {
+                        json!({"values":["test:a","test:b"]})
+                    }
+                    "data/test/worldgen/placed_feature/a.json" => {
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[]})
+                    }
+                    "data/test/worldgen/placed_feature/b.json" => {
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:pumpkin"}},"placement":[]})
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+        }
+        let key = ResourceId::parse("test:root").unwrap();
+        let feature =
+            PlacedDecorationFeature::load(&mut GraphData { cycle: false }, &key, &mut resolve_test)
+                .unwrap();
+        assert!(matches!(feature.feature,ConfiguredDecoration::Selector(ref v) if v.len()==2));
+        let error =
+            PlacedDecorationFeature::load(&mut GraphData { cycle: true }, &key, &mut resolve_test)
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(error.contains("cyclic"), "{error}");
+
+        let nested = json!({"feature":{"type":"minecraft:simple_random_selector","features":[{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:biome"}]}]},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut Data,
+            PlacedFeature::decode(&nested).unwrap(),
+            &mut resolve_test,
+        )
+        .unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let mut random = DecorationRandom::new(0);
+        let mut expected = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
+    fn nested_selectors_match_java_placement_and_randomness() {
+        use std::{path::PathBuf, process::Command};
+        fn run(command: &mut Command) -> String {
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "selector oracle failed: {}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .rev()
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            String::from_utf8(out.stdout).unwrap()
+        }
+        fn leaf(name: &str, count: i32, filter: bool) -> Value {
+            let mut placement = vec![
+                json!({"type":"minecraft:count","count":count}),
+                json!({"type":"minecraft:offset","x":{"type":"minecraft:uniform","min_inclusive":-2,"max_inclusive":2},"y":0,"z":{"type":"minecraft:uniform","min_inclusive":-2,"max_inclusive":2}}),
+            ];
+            if filter {
+                placement.push(json!({"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"}}));
+            }
+            json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":format!("minecraft:{name}")}},"placement":placement})
+        }
+        fn definition(kind: i32) -> Value {
+            let a = leaf("melon", 3, true);
+            let b = leaf("pumpkin", 2, false);
+            let inner = json!({"feature":{"type":"minecraft:random_selector","features":[{"chance":0.25,"feature":a},{"chance":0.6,"feature":b}],"default":a},"placement":[{"type":"minecraft:count","count":2}]});
+            let feature = if kind == 0 {
+                json!({"type":"minecraft:simple_random_selector","features":[a,b,inner]})
+            } else {
+                json!({"type":"minecraft:random_selector","features":[{"chance":0.4,"feature":inner},{"chance":0.3,"feature":b}],"default":a})
+            };
+            json!({"feature":feature,"placement":[{"type":"minecraft:count","count":2}]})
+        }
+        struct SelectorData;
+        impl ResourceProvider for SelectorData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if matches!(
+                    path,
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                        | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                ) {
+                    return Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:melon","minecraft:pumpkin"]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        #[derive(Default)]
+        struct Case {
+            kind: i32,
+            profile: i32,
+            limited: bool,
+            seed: i64,
+            result: bool,
+            next: i64,
+            blocks: BTreeMap<(i32, i32), String>,
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SelectorOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/SelectorOracle.java"),
+        )
+        .unwrap();
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SelectorOracle"));
+        assert!(output.lines().any(|line| line == "N rejected"));
+        let mut cases = Vec::<Case>::new();
+        for line in output.lines() {
+            let p: Vec<_> = line.split_whitespace().collect();
+            match p.as_slice() {
+                ["C", kind, profile, limited, seed, result, next] => cases.push(Case {
+                    kind: kind.parse().unwrap(),
+                    profile: profile.parse().unwrap(),
+                    limited: *limited == "1",
+                    seed: seed.parse().unwrap(),
+                    result: result.parse().unwrap(),
+                    next: next.parse().unwrap(),
+                    blocks: BTreeMap::new(),
+                }),
+                ["B", x, z, name] => {
+                    cases
+                        .last_mut()
+                        .unwrap()
+                        .blocks
+                        .insert((x.parse().unwrap(), z.parse().unwrap()), (*name).into());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cases.len(), 2 * 2 * 2 * 16);
+        let mut registry = batch_registry();
+        registry.extend(["minecraft:melon".into(), "minecraft:pumpkin".into()]);
+        let tags = OreBlockTags::load(&mut SelectorData, &registry, &BTreeSet::new()).unwrap();
+        let motion = HeightmapTags::load(&mut SelectorData, &registry).unwrap();
+        for (index, case) in cases.iter().enumerate() {
+            let placed = PlacedDecorationFeature::from_placement(
+                &mut SelectorData,
+                PlacedFeature::decode(&definition(case.kind)).unwrap(),
+                &mut resolve_test,
+            )
+            .unwrap();
+            let (mut terrain, setup_tags, setup_motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            if case.profile == 1 {
+                let mut setup = terrain
+                    .decoration_region(&setup_tags, &setup_motion, BTreeSet::from([center]))
+                    .unwrap();
+                for x in 6i32..=10 {
+                    for z in 6i32..=10 {
+                        if (x * 7 + z * 3).rem_euclid(5) == 0 {
+                            setup.set_section_block([x, 8, z], &state("stone")).unwrap();
+                        }
+                    }
+                }
+                setup.finish().unwrap();
+            }
+            let before = terrain.snapshot();
+            let writable = if case.limited {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([center])
+            };
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+            let mut random = DecorationRandom::new(case.seed);
+            let mut env = PlacementTestEnv {
+                allow: true,
+                fail_after: None,
+                calls: 0,
+            };
+            assert_eq!(
+                region
+                    .place_placed(&placed, &mut random, [8, 8, 8], 0, 16, &mut env)
+                    .unwrap(),
+                case.result,
+                "result {index}"
+            );
+            assert_eq!(random.next_long(), case.next, "random {index}");
+            region.finish().unwrap();
+            let after = terrain.snapshot();
+            let mut actual = BTreeMap::new();
+            for x in 6..=10 {
+                for z in 6..=10 {
+                    let a = after.block(x, 8, z).unwrap();
+                    if a != before.block(x, 8, z).unwrap() {
+                        actual.insert((x, z), a.name.clone());
+                    }
+                }
+            }
+            assert_eq!(actual, case.blocks, "blocks {index}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_forest_flower_selector_places_vegetation() {
+        struct ForestData;
+        impl ResourceProvider for ForestData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/supports_vegetation.json" {
+                    return Ok(Some(br#"{"values":["minecraft:stone"]}"#.to_vec()));
+                }
+                Data.read_data(path)
+            }
+        }
+        struct Env;
+        impl PlacementEnvironment for Env {
+            fn min_y(&self) -> i32 {
+                0
+            }
+            fn heightmap(&mut self, _: &str, _: i32, _: i32) -> Result<i32> {
+                Ok(8)
+            }
+            fn biome_allows(&mut self, _: [i32; 3]) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let states = resources.vanilla_generated_block_registry().unwrap();
+        let placed = PlacedDecorationFeature::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:forest_flowers").unwrap(),
+            &mut |v| super::super::resolve_generated_terrain_state(v, &states),
+        )
+        .unwrap();
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:lilac".into(),
+            "minecraft:rose_bush".into(),
+            "minecraft:peony".into(),
+            "minecraft:lily_of_the_valley".into(),
+        ]);
+        let tags = OreBlockTags::load(&mut ForestData, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut ForestData, &registry).unwrap();
+        let mut success = false;
+        for seed in 0..256 {
+            let (mut terrain, _, _, _) = fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+            let mut random = DecorationRandom::new(seed);
+            if !region
+                .place_placed(&placed, &mut random, [0, 0, 0], 0, 16, &mut Env)
+                .unwrap()
+            {
+                continue;
+            }
+            region.finish().unwrap();
+            let snapshot = terrain.snapshot();
+            success = (-7..23).any(|x| {
+                (-7..23).any(|z| {
+                    (0..16).any(|y| {
+                        snapshot.block(x, y, z).is_some_and(|s| {
+                            matches!(
+                                s.name.as_str(),
+                                "minecraft:lilac"
+                                    | "minecraft:rose_bush"
+                                    | "minecraft:peony"
+                                    | "minecraft:lily_of_the_valley"
+                            )
+                        })
+                    })
+                })
+            });
+            if success {
+                break;
+            }
+        }
+        assert!(success, "installed forest selector never placed a flower");
+    }
+
+    #[test]
     fn scheduled_ores_use_plan_biomes_and_reject_mismatched_entries() {
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
@@ -2962,6 +3627,7 @@ mod tests {
             "patch_cactus_desert",
             "lake_lava_surface",
             "lake_lava_underground",
+            "forest_flowers",
         ] {
             let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
             PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {

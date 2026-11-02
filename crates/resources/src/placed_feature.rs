@@ -17,6 +17,7 @@ pub(crate) enum IntProvider {
     Biased(i32, i32),
     Trapezoid(i32, i32, i32),
     Weighted(Vec<(i32, IntProvider)>, i32),
+    Clamped(Box<IntProvider>, i32, i32),
 }
 
 fn integer(value: &Value, key: &str) -> Result<i32> {
@@ -124,6 +125,14 @@ impl IntProvider {
                 ensure!(total > 0, "weighted distribution has no positive weight");
                 Self::Weighted(items, total)
             }
+            "clamped" => Self::Clamped(
+                Box::new(Self::parse(
+                    value.get("source").context("missing clamped source")?,
+                    depth + 1,
+                )?),
+                integer(value, "min_inclusive")?,
+                integer(value, "max_inclusive")?,
+            ),
             name => bail!("unsupported integer provider {name}"),
         })
     }
@@ -135,6 +144,10 @@ impl IntProvider {
                 .iter()
                 .map(|(_, p)| p.bounds())
                 .fold((i32::MAX, i32::MIN), |(a, b), (c, d)| (a.min(c), b.max(d))),
+            Self::Clamped(source, min, max) => {
+                let (a, b) = source.bounds();
+                ((*min).max(a), (*max).min(b))
+            }
         }
     }
     pub(crate) fn sample(&self, random: &mut DecorationRandom) -> i32 {
@@ -169,6 +182,7 @@ impl IntProvider {
                 }
                 unreachable!("validated weight sum")
             }
+            Self::Clamped(source, min, max) => source.sample(random).max(*min).min(*max),
         }
     }
 }

@@ -451,6 +451,7 @@ pub struct LoadedSession {
     block_drops: bool,
     entity_drops: bool,
     game_mode: GameMode,
+    game_mode_changed_during_session: bool,
     game_master_permission: bool,
     world_seed: Option<i64>,
     registered_clocks: Option<Arc<BTreeSet<native_persistence::world::DimensionId>>>,
@@ -3280,6 +3281,10 @@ impl LoadedSession {
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
+        anyhow::ensure!(
+            !self.game_mode_changed_during_session,
+            "game mode transitions and abilities are not yet coordinated for saving"
+        );
         // Sensor step events, listener state, and redstone side effects are
         // not yet captured together, even though their collision is known.
         anyhow::ensure!(
@@ -4649,11 +4654,7 @@ impl LoadedSession {
     pub fn set_game_mode(&mut self, mode: GameMode) {
         self.mining.release();
         self.game_mode = mode;
-        if mode == GameMode::Spectator {
-            self.flight.flying = true;
-        } else if mode != GameMode::Creative {
-            self.flight.flying = false;
-        }
+        self.flight.flying = mode.flight_after_change(self.flight.flying);
         Arc::make_mut(&mut self.snapshot).game_mode = mode;
     }
 
@@ -5454,6 +5455,7 @@ impl LoadedSession {
             block_drops: true,
             entity_drops: true,
             game_mode: GameMode::default(),
+            game_mode_changed_during_session: false,
             game_master_permission: false,
             world_seed: None,
             registered_clocks: None,
@@ -16333,6 +16335,23 @@ impl LoadedSession {
             let before_inventory = Arc::clone(&self.inventory);
             match command {
                 PlayerCommand::Respawn => {}
+                PlayerCommand::SetGameMode(mode) => {
+                    if !self.game_master_permission {
+                        crate::push_system_message(
+                            &mut self.system_messages,
+                            crate::SystemMessageKind::TimePermissionDenied,
+                            self.tick.saturating_add(1),
+                        );
+                    } else if self.game_mode != mode {
+                        self.game_mode_changed_during_session = true;
+                        self.set_game_mode(mode);
+                        crate::push_system_message(
+                            &mut self.system_messages,
+                            crate::SystemMessageKind::GameModeChanged(mode),
+                            self.tick.saturating_add(1),
+                        );
+                    }
+                }
                 PlayerCommand::QueryWorldSeed => {
                     let kind = self.world_seed.map_or(
                         crate::SystemMessageKind::CommandUnavailable,
@@ -20646,6 +20665,53 @@ fn move_axis(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn gamemode_command_respects_permission_flight_and_save_guard() {
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Creative));
+        session.update(TICK);
+        assert_eq!(session.game_mode, GameMode::Survival);
+        assert_eq!(
+            session.system_messages.last().unwrap().kind,
+            crate::SystemMessageKind::TimePermissionDenied
+        );
+        assert!(!session.game_mode_changed_during_session);
+
+        session.set_game_master_permission(true);
+        for (mode, flying) in [
+            (GameMode::Spectator, true),
+            (GameMode::Creative, true),
+            (GameMode::Adventure, false),
+            (GameMode::Survival, false),
+        ] {
+            session.submit_command(PlayerCommand::SetGameMode(mode));
+            session.update(TICK);
+            assert_eq!(session.game_mode, mode);
+            assert_eq!(session.snapshot().game_mode, mode);
+            assert_eq!(session.flight.flying, flying);
+            assert_eq!(
+                session.system_messages.last().unwrap().kind,
+                crate::SystemMessageKind::GameModeChanged(mode)
+            );
+        }
+        let count = session.system_messages.len();
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Survival));
+        session.update(TICK);
+        assert_eq!(session.system_messages.len(), count);
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![]),
+        };
+        assert!(
+            session
+                .draft_player_state_inner(&original)
+                .unwrap_err()
+                .to_string()
+                .contains("game mode transitions")
+        );
+    }
 
     #[test]
     fn weather_command_requires_permission_and_preserves_shared_data_source() {

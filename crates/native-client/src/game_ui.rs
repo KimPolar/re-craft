@@ -831,6 +831,11 @@ impl GameUi {
                 self.last_draw = None;
                 return action;
             }
+            if let Some(mode) = native_session::gamemode_command::parse(text) {
+                self.pending_chat_command = Some(native_session::PlayerCommand::SetGameMode(mode));
+                self.last_draw = None;
+                return action;
+            }
             if let Some(command) = native_session::time_command::parse(text) {
                 self.pending_chat_command =
                     Some(native_session::PlayerCommand::WorldTime(Arc::new(command)));
@@ -3981,6 +3986,15 @@ mod inventory_tests {
             ui.chat_key(KeyCode::Enter, false, false, 0);
             assert!(
                 matches!(ui.take_chat_command(), Some(PlayerCommand::Weather(actual)) if actual == expected)
+            );
+        }
+        for input in ["gamemode creative", "gamemode spectator @s"] {
+            let expected = native_session::gamemode_command::parse(&format!("/{input}")).unwrap();
+            ui.open_chat(true);
+            ui.chat_text(input);
+            ui.chat_key(KeyCode::Enter, false, false, 0);
+            assert!(
+                matches!(ui.take_chat_command(), Some(PlayerCommand::SetGameMode(actual)) if actual == expected)
             );
         }
     }

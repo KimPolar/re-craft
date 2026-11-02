@@ -33,6 +33,7 @@ pub mod experience;
 pub mod fall;
 pub mod falling_block;
 pub mod farmland;
+pub mod gamemode_command;
 mod interaction;
 pub mod inventory;
 pub mod items;
@@ -289,6 +290,13 @@ pub enum GameMode {
 }
 
 impl GameMode {
+    pub(crate) fn flight_after_change(self, flying: bool) -> bool {
+        match self {
+            Self::Spectator => true,
+            Self::Creative => flying,
+            Self::Survival | Self::Adventure => false,
+        }
+    }
     /// Java's legacy game-type codec maps an unknown integer to survival.
     pub fn from_legacy_id(id: i32) -> Self {
         match id {
@@ -310,6 +318,7 @@ impl GameMode {
 
 #[derive(Clone, Debug)]
 pub enum PlayerCommand {
+    SetGameMode(GameMode),
     Weather(weather_command::WeatherCommand),
     WorldTime(Arc<time_command::TimeCommand>),
     /// Read the verified seed of this local world.
@@ -506,6 +515,7 @@ pub struct DeathInfo {
 /// A client-visible system message produced by a local game event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SystemMessageKind {
+    GameModeChanged(GameMode),
     MissingRespawnBlock,
     DebugFocusPause(bool),
     ScreenshotSaved(Arc<std::path::PathBuf>),
@@ -1501,7 +1511,9 @@ impl LocalSession {
                         self.tick.saturating_add(1),
                     );
                 }
-                PlayerCommand::WorldTime(_) | PlayerCommand::Weather(_) => {
+                PlayerCommand::WorldTime(_)
+                | PlayerCommand::Weather(_)
+                | PlayerCommand::SetGameMode(_) => {
                     push_system_message(
                         &mut Arc::make_mut(&mut self.snapshot).system_messages,
                         SystemMessageKind::CommandUnavailable,

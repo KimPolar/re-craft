@@ -372,6 +372,24 @@ fn prepare_lines(
                 | SystemMessageKind::TimeMarker { missing: true, .. }
         );
         let (text, debug_prefix, links, action) = match &message.kind {
+            SystemMessageKind::GameModeChanged(mode) => {
+                let (key, fallback) = match mode {
+                    native_session::GameMode::Survival => ("gameMode.survival", "Survival Mode"),
+                    native_session::GameMode::Creative => ("gameMode.creative", "Creative Mode"),
+                    native_session::GameMode::Adventure => ("gameMode.adventure", "Adventure Mode"),
+                    native_session::GameMode::Spectator => ("gameMode.spectator", "Spectator Mode"),
+                };
+                (
+                    format_translation(
+                        assets
+                            .translate("commands.gamemode.success.self", "Set own game mode to %s"),
+                        &[assets.translate(key, fallback)],
+                    ),
+                    None,
+                    Vec::new(),
+                    None,
+                )
+            }
             SystemMessageKind::MissingRespawnBlock => (
                 assets
                     .translate(

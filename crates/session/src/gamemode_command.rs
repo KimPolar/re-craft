@@ -1,0 +1,115 @@
+//! Local-player subset of the Java `/gamemode` command.
+
+use crate::GameMode;
+
+fn mode(name: &str) -> Option<GameMode> {
+    match name {
+        "survival" => Some(GameMode::Survival),
+        "creative" => Some(GameMode::Creative),
+        "adventure" => Some(GameMode::Adventure),
+        "spectator" => Some(GameMode::Spectator),
+        _ => None,
+    }
+}
+
+/// Commands may address the executing player implicitly or with `@s`.
+pub fn parse(input: &str) -> Option<GameMode> {
+    match input.split(' ').collect::<Vec<_>>().as_slice() {
+        ["/gamemode", name] | ["/gamemode", name, "@s"] => mode(name),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_local_player_modes_and_rejects_unsupported_targets() {
+        for (name, expected) in [
+            ("survival", GameMode::Survival),
+            ("creative", GameMode::Creative),
+            ("adventure", GameMode::Adventure),
+            ("spectator", GameMode::Spectator),
+        ] {
+            assert_eq!(parse(&format!("/gamemode {name}")), Some(expected));
+            assert_eq!(parse(&format!("/gamemode {name} @s")), Some(expected));
+        }
+        for input in [
+            "/gamemode",
+            "/gamemode Creative",
+            "/gamemode 1",
+            "/gamemode creative @a",
+            "/gamemode creative @s extra",
+            "/gamemode  creative",
+            "/gamemode creative ",
+        ] {
+            assert_eq!(parse(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn argument_and_flight_transition_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("GameModeOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(&source, include_str!("../tests/java/GameModeOracle.java")).unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("GameModeOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let data: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for row in data["arguments"].as_array().unwrap() {
+            let value = row["input"].as_str().unwrap();
+            assert_eq!(
+                mode(value).is_some(),
+                row["valid"].as_bool().unwrap(),
+                "{value}"
+            );
+        }
+        for row in data["abilities"].as_array().unwrap() {
+            let target = mode(row["mode"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                target.flight_after_change(row["initial"].as_bool().unwrap()),
+                row["flying"].as_bool().unwrap(),
+                "{row}"
+            );
+        }
+    }
+}

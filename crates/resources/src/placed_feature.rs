@@ -294,6 +294,18 @@ impl PlacedFeature {
             )
         })
     }
+
+    /// These modifiers contain an independently decoded Java object whose
+    /// equality is identity-based. Distinct placed objects cannot compare equal.
+    pub fn has_independent_modifier(&self) -> bool {
+        self.has_independent_height_provider()
+            || self.modifiers.iter().any(|modifier| {
+                matches!(
+                    modifier,
+                    Modifier::BlockPredicate(predicate) if predicate.has_independent_identity()
+                )
+            })
+    }
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
         let path = format!(
             "data/{}/worldgen/placed_feature/{}.json",

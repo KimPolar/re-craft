@@ -101,6 +101,7 @@ pub struct ScheduledDecorationFeature<'a> {
     key: FeatureKey,
     placed: PlacedDecorationFeature,
     schedule: &'a FeatureSchedule,
+    independent_modifier: bool,
 }
 
 /// A fully resolved chunk decoration attempt. Unsupported selected
@@ -256,10 +257,12 @@ impl<'a> ScheduledDecorationFeature<'a> {
                 )?
             }
         };
+        let independent_modifier = placed.placement.has_independent_modifier();
         Ok(Self {
             key: key.clone(),
             placed,
             schedule,
+            independent_modifier,
         })
     }
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
@@ -267,8 +270,8 @@ impl<'a> ScheduledDecorationFeature<'a> {
     }
 
     /// Java `BiomeGenerationSettings.hasFeature` tests value equality. Exact
-    /// schedule identity is always equal; independently decoded uniform and
-    /// trapezoid heights prove that any other feature object is unequal.
+    /// schedule identity is always equal; independently decoded height or
+    /// block predicate objects can prove other placed features unequal.
     pub fn biome_allows(&self, biome: &ResourceId) -> Result<bool> {
         let settings = self
             .schedule
@@ -277,9 +280,7 @@ impl<'a> ScheduledDecorationFeature<'a> {
         if self.schedule.biome_contains_identity(biome, &self.key)? {
             return Ok(true);
         }
-        if self.placed.placement.has_independent_height_provider()
-            || settings.steps.iter().all(Vec::is_empty)
-        {
+        if self.independent_modifier || settings.steps.iter().all(Vec::is_empty) {
             return Ok(false);
         }
         bail!("cannot determine Java feature equality for this biome")
@@ -462,8 +463,8 @@ impl DecorationRegion<'_> {
     }
 
     /// Resolve biome membership from the active schedule for supported features.
-    /// Distinct placed features with uniform/trapezoid height providers are
-    /// never equal in Java because each decoded provider has object identity.
+    /// Certain independently decoded height providers and block predicates
+    /// make distinct placed features unequal in Java.
     /// Ambiguous data-pack feature equality and unknown biomes are errors.
     pub fn place_planned_auto(
         &mut self,
@@ -1422,6 +1423,10 @@ mod tests {
             ];
             if self.heightmap == Some("no_height") {
                 // Exercise the equality case where a distinct feature can match.
+            } else if self.heightmap == Some("filter") {
+                placement.push(json!({"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_blocks","blocks":"minecraft:stone"}}));
+            } else if self.heightmap == Some("true_filter") {
+                placement.push(json!({"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:true"}}));
             } else if let Some(kind) = self.heightmap {
                 placement.push(json!({"type":"minecraft:heightmap","heightmap":kind}));
             } else {
@@ -1707,6 +1712,129 @@ mod tests {
         assert!(ambiguous_ore.biome_allows(&plains).unwrap());
         assert!(ambiguous_ore.biome_allows(&desert).is_err());
         assert!(!ambiguous_ore.biome_allows(&forest).unwrap());
+
+        let mut filtered = ScheduledData {
+            heightmap: Some("filter"),
+        };
+        let filtered_schedule = FeatureSchedule::load(
+            &mut filtered,
+            &[plains.clone(), desert.clone(), forest.clone()],
+            &registry,
+        )
+        .unwrap();
+        let feature = ScheduledDecorationFeature::load(
+            &mut filtered,
+            &filtered_schedule,
+            &key,
+            &mut resolve_test,
+        )
+        .unwrap();
+        assert!(feature.biome_allows(&plains).unwrap());
+        assert!(!feature.biome_allows(&desert).unwrap());
+        assert!(!feature.biome_allows(&forest).unwrap());
+
+        let mut singleton = ScheduledData {
+            heightmap: Some("true_filter"),
+        };
+        let singleton_schedule = FeatureSchedule::load(
+            &mut singleton,
+            &[plains.clone(), desert.clone(), forest.clone()],
+            &registry,
+        )
+        .unwrap();
+        let feature = ScheduledDecorationFeature::load(
+            &mut singleton,
+            &singleton_schedule,
+            &key,
+            &mut resolve_test,
+        )
+        .unwrap();
+        assert!(feature.biome_allows(&plains).unwrap());
+        assert!(feature.biome_allows(&desert).is_err());
+        assert!(!feature.biome_allows(&forest).unwrap());
+    }
+
+    #[test]
+    fn planned_feature_crosses_biome_boundary_without_ambiguous_failure() {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let desert = ResourceId::parse("minecraft:desert").unwrap();
+        let registry = [ResourceId::parse("test:ore").unwrap()]
+            .into_iter()
+            .collect();
+        let mut data = ScheduledData {
+            heightmap: Some("filter"),
+        };
+        let schedule =
+            FeatureSchedule::load(&mut data, &[plains.clone(), desert.clone()], &registry).unwrap();
+        let key = FeatureKey::Registered(ResourceId::parse("test:ore").unwrap());
+        let feature =
+            ScheduledDecorationFeature::load(&mut data, &schedule, &key, &mut resolve_test)
+                .unwrap();
+        let mut neighborhood = super::super::BiomeNeighborhood::new(0, 0, 16).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let biome = if x == 1 && z == 1 { &plains } else { &desert };
+                neighborhood
+                    .insert(Arc::new(
+                        super::super::QuartBiomeChunk::from_values(
+                            [x, z],
+                            0,
+                            0,
+                            16,
+                            vec![biome.clone(); 64],
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let index = plan
+            .features
+            .iter()
+            .position(|item| *item.feature == key)
+            .unwrap();
+        let (mut automatic, tags, motion, _) = fixture();
+        let (mut expected, _, _, _) = fixture();
+        let writable = automatic
+            .snapshot()
+            .chunks
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut auto_region = automatic
+            .decoration_region(&tags, &motion, writable.clone())
+            .unwrap();
+        let actual = auto_region
+            .place_planned_auto(&plan, index, &feature)
+            .unwrap();
+        auto_region.finish().unwrap();
+        let mut expected_region = expected
+            .decoration_region(&tags, &motion, writable)
+            .unwrap();
+        let mut saw_desert = false;
+        let reference = expected_region
+            .place_planned(&plan, index, &feature, &mut |_, biome| {
+                saw_desert |= *biome == desert;
+                Ok(*biome == plains)
+            })
+            .unwrap();
+        expected_region.finish().unwrap();
+        assert!(saw_desert);
+        assert_eq!(actual, reference);
+        let actual = automatic.snapshot();
+        let expected = expected.snapshot();
+        for z in -16..32 {
+            for x in -16..32 {
+                for y in 0..16 {
+                    assert_eq!(
+                        actual.block(x, y, z),
+                        expected.block(x, y, z),
+                        "block at {x},{y},{z}"
+                    );
+                }
+            }
+        }
     }
 
     struct BatchData {
@@ -2248,6 +2376,7 @@ mod tests {
         let (_, java_schedule, _) = scheduled_fixture(None);
         let scheduled = ScheduledDecorationFeature {
             key: key.clone(),
+            independent_modifier: placed.placement.has_independent_modifier(),
             placed,
             schedule: &java_schedule,
         };

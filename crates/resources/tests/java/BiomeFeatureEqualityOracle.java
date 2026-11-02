@@ -6,7 +6,12 @@ import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.core.Holder;
 import net.minecraft.core.HolderSet;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.data.registries.VanillaRegistries;
+import net.minecraft.resources.RegistryOps;
 import net.minecraft.world.level.biome.BiomeGenerationSettings;
+import net.minecraft.world.level.levelgen.blockpredicates.BlockPredicate;
+import net.minecraft.world.level.levelgen.placement.BlockPredicateFilter;
 import net.minecraft.world.level.levelgen.heightproviders.HeightProvider;
 import net.minecraft.world.level.levelgen.placement.HeightRangePlacement;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
@@ -26,11 +31,27 @@ public class BiomeFeatureEqualityOracle {
     var s = settings(a);
     out.println(label+" "+s.hasFeature(a)+" "+s.hasFeature(b));
   }
+  static void comparePredicate(java.io.PrintStream out, RegistryOps<com.google.gson.JsonElement> ops, String label, String json) throws Exception {
+    var a=BlockPredicate.CODEC.parse(ops,JsonParser.parseString(json)).getOrThrow();
+    var b=BlockPredicate.CODEC.parse(ops,JsonParser.parseString(json)).getOrThrow();
+    var first=new PlacedFeature(null,List.of(new BlockPredicateFilter(a)));
+    var second=new PlacedFeature(null,List.of(new BlockPredicateFilter(b)));
+    var s=settings(first);out.println(label+" "+s.hasFeature(first)+" "+s.hasFeature(second));
+  }
   public static void main(String[] args) throws Exception {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     compare(out,"uniform","{\"type\":\"minecraft:uniform\",\"min_inclusive\":{\"absolute\":0},\"max_inclusive\":{\"absolute\":8}}");
     compare(out,"trapezoid","{\"type\":\"minecraft:trapezoid\",\"min_inclusive\":{\"absolute\":0},\"max_inclusive\":{\"absolute\":8}}");
     var a=new PlacedFeature(null,List.of()); var b=new PlacedFeature(null,List.of());
     var s=settings(a); out.println("none "+s.hasFeature(a)+" "+s.hasFeature(b));
+    var ops=RegistryOps.create(JsonOps.INSTANCE,VanillaRegistries.createWorldLookup());
+    comparePredicate(out,ops,"blocks","{\"type\":\"minecraft:matching_blocks\",\"blocks\":\"minecraft:stone\"}");
+    comparePredicate(out,ops,"fluids","{\"type\":\"minecraft:matching_fluids\",\"fluids\":\"minecraft:water\"}");
+    comparePredicate(out,ops,"tag","{\"type\":\"minecraft:matching_block_tag\",\"tag\":\"minecraft:base_stone_overworld\"}");
+    comparePredicate(out,ops,"solid","{\"type\":\"minecraft:solid\"}");
+    comparePredicate(out,ops,"not","{\"type\":\"minecraft:not\",\"predicate\":{\"type\":\"minecraft:true\"}}");
+    comparePredicate(out,ops,"any","{\"type\":\"minecraft:any_of\",\"predicates\":[{\"type\":\"minecraft:true\"}]}");
+    comparePredicate(out,ops,"all","{\"type\":\"minecraft:all_of\",\"predicates\":[{\"type\":\"minecraft:true\"}]}");
+    comparePredicate(out,ops,"true","{\"type\":\"minecraft:true\"}");
   }
 }

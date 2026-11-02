@@ -51,6 +51,12 @@ impl BlockPredicate {
         self.0.blocks(&mut blocks);
         blocks
     }
+
+    /// Java decodes these predicate classes as distinct objects and they do
+    /// not implement value equality. `true` is a shared singleton instead.
+    pub fn has_independent_identity(&self) -> bool {
+        !matches!(self.0, Predicate::True)
+    }
 }
 
 fn offset(value: &Value) -> Result<[i32; 3]> {

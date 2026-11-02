@@ -2,7 +2,7 @@ use native_resources::{
     packs::{ResourceProvider, ResourceStack},
     placed_feature::PlacedFeature,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
 fn run(command: &mut Command) -> String {
@@ -69,6 +69,50 @@ fn height_provider_identity_controls_java_biome_membership() {
         ]
     );
 
+    let predicates = [
+        (
+            "blocks",
+            json!({"type":"minecraft:matching_blocks","blocks":"minecraft:stone"}),
+            true,
+        ),
+        (
+            "fluids",
+            json!({"type":"minecraft:matching_fluids","fluids":"minecraft:water"}),
+            true,
+        ),
+        (
+            "tag",
+            json!({"type":"minecraft:matching_block_tag","tag":"minecraft:base_stone_overworld"}),
+            true,
+        ),
+        ("solid", json!({"type":"minecraft:solid"}), true),
+        (
+            "not",
+            json!({"type":"minecraft:not","predicate":{"type":"minecraft:true"}}),
+            true,
+        ),
+        (
+            "any",
+            json!({"type":"minecraft:any_of","predicates":[{"type":"minecraft:true"}]}),
+            true,
+        ),
+        (
+            "all",
+            json!({"type":"minecraft:all_of","predicates":[{"type":"minecraft:true"}]}),
+            true,
+        ),
+        ("true", json!({"type":"minecraft:true"}), false),
+    ];
+    for (label, predicate, independent) in predicates {
+        let expected = format!("{label} true {}", !independent);
+        assert!(
+            output.lines().any(|line| line == expected),
+            "Java comparison missing: {expected}"
+        );
+        let placed = PlacedFeature::decode(&json!({"feature":"minecraft:ore_dirt","placement":[{"type":"minecraft:block_predicate_filter","predicate":predicate}]})).unwrap();
+        assert_eq!(placed.has_independent_modifier(), independent, "{label}");
+    }
+
     let mut resources = ResourceStack::open(&game).unwrap();
     let ids = resources.list_data("worldgen/placed_feature").unwrap();
     let mut count = 0;
@@ -86,4 +130,19 @@ fn height_provider_identity_controls_java_biome_membership() {
         count += 1;
     }
     assert_eq!(count, 40);
+    for name in [
+        "disk_clay",
+        "disk_grass",
+        "disk_gravel",
+        "disk_sand",
+        "ice_patch",
+    ] {
+        let id = native_resources::packs::ResourceId::parse(&format!("minecraft:{name}")).unwrap();
+        assert!(
+            PlacedFeature::load(&mut resources, &id)
+                .unwrap()
+                .has_independent_modifier(),
+            "{name}"
+        );
+    }
 }

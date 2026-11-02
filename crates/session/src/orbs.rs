@@ -16,6 +16,14 @@ use crate::{GameMode, PlayerPose, experience::Experience, inventory::PlayerInven
 
 const VALUES: [i32; 11] = [1, 3, 7, 17, 37, 73, 149, 307, 617, 1237, 2477];
 
+fn advance_fall_distance(fall: &mut f64, displacement: f64, on_ground: bool, in_water: bool) {
+    if on_ground {
+        *fall = 0.0;
+    } else if !in_water && displacement < 0.0 {
+        *fall -= f64::from(displacement as f32);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExperienceOrb {
     /// Absolute coordinates keep orbs stable when the loaded window shifts.
@@ -47,6 +55,7 @@ struct Orb {
     count: i32,
     random: LegacyRandom,
     source: Option<Arc<native_persistence::nbt::Tag>>,
+    saved_fall_distance: Option<f64>,
     created: Option<CreatedOrb>,
     save_unresolved: bool,
     damage: OrbDamageState,
@@ -359,6 +368,7 @@ impl Orbs {
         self.next_entity_id = self.next_entity_id.wrapping_add(1);
         let section_sequence = self.next_section_sequence;
         self.next_section_sequence = self.next_section_sequence.wrapping_add(1);
+        let saved_fall_distance = crate::saved_orb::saved_fall_distance(&saved.source).ok();
         self.entities.push(Orb {
             id,
             section_sequence,
@@ -376,6 +386,7 @@ impl Orbs {
             count: saved.count,
             random: LegacyRandom::new(self.entity_seeder.next_long()),
             source: Some(saved.source),
+            saved_fall_distance,
             created: None,
             save_unresolved: false,
             damage: OrbDamageState {
@@ -747,6 +758,7 @@ impl Orbs {
                 count: 1,
                 random: LegacyRandom::new(self.entity_seeder.next_long()),
                 source: None,
+                saved_fall_distance: None,
                 created: Some(CreatedOrb::new(position, yaw)),
                 save_unresolved: false,
                 damage: OrbDamageState::default(),
@@ -927,6 +939,14 @@ impl Orbs {
             let bounds = orb_bounds(relative);
             entity.visual.previous_position = entity.visual.position;
             let (contacts, lava_at_position) = fluid(bounds, relative);
+            if let Some(fall) = &mut entity.saved_fall_distance {
+                if contacts.water.depth > 0.0 {
+                    *fall = 0.0;
+                }
+                if contacts.lava.depth > 0.0 {
+                    *fall *= 0.5;
+                }
+            }
             if let Some(created) = &mut entity.created {
                 if contacts.water.depth > 0.0 {
                     created.fall_distance = 0.0;
@@ -1050,12 +1070,30 @@ impl Orbs {
             }
             let hit_y = requested.y != actual.y;
             entity.on_ground = hit_y && requested.y < 0.0;
+            // Java emits HIT_GROUND when a positive fall reaches the floor.
+            // That game event is not yet included in coordinated saves.
+            if entity.on_ground
+                && entity.saved_fall_distance.is_some_and(|fall| {
+                    let displacement = if contacts.water.depth <= 0.0 && actual.y < 0.0 {
+                        f64::from(actual.y as f32)
+                    } else {
+                        0.0
+                    };
+                    fall - displacement > 0.0
+                })
+            {
+                entity.saved_fall_distance = None;
+            }
+            if let Some(fall) = &mut entity.saved_fall_distance {
+                advance_fall_distance(fall, actual.y, entity.on_ground, contacts.water.depth > 0.0);
+            }
             if let Some(created) = &mut entity.created {
-                if entity.on_ground {
-                    created.fall_distance = 0.0;
-                } else if contacts.water.depth <= 0.0 && actual.y < 0.0 {
-                    created.fall_distance -= f64::from(actual.y as f32);
-                }
+                advance_fall_distance(
+                    &mut created.fall_distance,
+                    actual.y,
+                    entity.on_ground,
+                    contacts.water.depth > 0.0,
+                );
             }
             if hit_y {
                 entity.velocity.y = 0.0;
@@ -1070,6 +1108,9 @@ impl Orbs {
                             false,
                         );
                         if !contact.surface {
+                            if let Some(fall) = &mut entity.saved_fall_distance {
+                                *fall = 0.0;
+                            }
                             if let Some(created) = &mut entity.created {
                                 created.fall_distance = 0.0;
                             }
@@ -1166,6 +1207,17 @@ impl Orbs {
                     entity.visual.position,
                     supported,
                 );
+            }
+            if entity.source.is_some() && entity.saved_fall_distance.is_some() {
+                let supported = contacts.water.depth <= 0.0
+                    && contacts.lava.depth <= 0.0
+                    && !lava_at_position
+                    && entity.damage.fire_ticks == 0
+                    && !entity.save_unresolved
+                    && safe(bounds, actual);
+                if !supported {
+                    entity.saved_fall_distance = None;
+                }
             }
             let relative_position = entity.visual.position - origin.as_dvec3();
             let support = if entity.on_ground {
@@ -1367,7 +1419,13 @@ fn draft_orb(orb: &Orb) -> anyhow::Result<crate::saved_orb::OrbDraft> {
         name: "".into(),
         value: (**source).clone(),
     };
-    crate::saved_orb::draft(&original, orb_state(orb))
+    let mut draft = crate::saved_orb::draft(&original, orb_state(orb))?;
+    draft.set_fall_distance(
+        &original,
+        orb.saved_fall_distance
+            .context("experience-orb fall distance is not verified")?,
+    )?;
+    Ok(draft)
 }
 
 fn orb_state(orb: &Orb) -> crate::saved_orb::OrbSaveState {
@@ -1891,10 +1949,211 @@ mod tests {
             count,
             random: LegacyRandom::new(0),
             source: None,
+            saved_fall_distance: Some(0.0),
             created: None,
             save_unresolved: false,
             damage: OrbDamageState::default(),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn orb_fall_distance_matches_java_entity_check() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("OrbFallDistanceOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/OrbFallDistanceOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("OrbFallDistanceOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 40);
+        for row in rows {
+            let mut fall = row["initial"].as_f64().unwrap();
+            advance_fall_distance(
+                &mut fall,
+                row["movement"].as_f64().unwrap(),
+                false,
+                row["water"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                fall.to_bits(),
+                row["fall_bits"].as_i64().unwrap() as u64,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_orb_tracks_fall_distance_only_on_verified_paths() {
+        use native_persistence::nbt::{Tag, TagType};
+        let uuid = [1, 2, 3, 4];
+        let original = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:experience_orb".into())),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: [2.5, 10.0, 2.5].into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            (
+                "Motion".into(),
+                Tag::List {
+                    element_type: TagType::Double,
+                    values: [0.0, -0.2, 0.0].into_iter().map(Tag::Double).collect(),
+                },
+            ),
+            ("Value".into(), Tag::Short(7)),
+            ("fall_distance".into(), Tag::Double(5.0)),
+            ("future".into(), Tag::Int(17)),
+        ]);
+        for safe in [true, false] {
+            let mut orbs = Orbs::default();
+            orbs.spawn_saved(crate::saved_orb::read(&original).unwrap().unwrap());
+            let mut expected = 5.0;
+            for _ in 0..3 {
+                let before = orbs.entities[0].visual.position;
+                orbs.tick_with_fluid_and_proof(
+                    IVec3::ZERO,
+                    DVec3::splat(100.0),
+                    PlayerPose::Standing,
+                    GameMode::Spectator,
+                    true,
+                    &mut Arc::new(PlayerInventory::default()),
+                    &mut LegacyRandom::new(0),
+                    &mut Experience::default(),
+                    &mut 0,
+                    |_| &[],
+                    |_| 0.6,
+                    |_| false,
+                    |_, _| (Default::default(), false),
+                    false,
+                    |_, _, _| Some(Vec::new()),
+                    |_, _| safe,
+                    |_| Some(false),
+                );
+                let actual = orbs.entities[0].visual.position - before;
+                expected -= f64::from(actual.y as f32);
+            }
+            let result = orbs.draft_saved(uuid);
+            if safe {
+                let draft = result.unwrap().unwrap();
+                assert_eq!(
+                    draft.document().value.get("fall_distance"),
+                    Some(&Tag::Double(expected))
+                );
+                assert_eq!(draft.document().value.get("future"), Some(&Tag::Int(17)));
+                assert_eq!(original.get("fall_distance"), Some(&Tag::Double(5.0)));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        for invalid in [
+            Tag::Float(1.0),
+            Tag::Double(f64::NAN),
+            Tag::String("unknown".into()),
+        ] {
+            let mut source = original.clone();
+            if let Tag::Compound(fields) = &mut source {
+                fields
+                    .iter_mut()
+                    .find(|(key, _)| key.matches("fall_distance"))
+                    .unwrap()
+                    .1 = invalid;
+            }
+            let mut orbs = Orbs::default();
+            match crate::saved_orb::read(&source) {
+                Ok(Some(saved)) => {
+                    orbs.spawn_saved(saved);
+                    assert!(orbs.draft_saved(uuid).is_err());
+                }
+                Err(_) => {} // Non-finite values are rejected at load time.
+                Ok(None) => panic!("expected an experience orb"),
+            }
+        }
+        let mut landing = Orbs::default();
+        landing.spawn_saved(crate::saved_orb::read(&original).unwrap().unwrap());
+        landing.tick_with_fluid_and_proof(
+            IVec3::ZERO,
+            DVec3::splat(100.0),
+            PlayerPose::Standing,
+            GameMode::Spectator,
+            true,
+            &mut Arc::new(PlayerInventory::default()),
+            &mut LegacyRandom::new(0),
+            &mut Experience::default(),
+            &mut 0,
+            |pos| {
+                if pos.y == 9 {
+                    native_world::collision::unknown_barrier()
+                } else {
+                    &[]
+                }
+            },
+            |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
+        );
+        assert!(landing.entities[0].on_ground);
+        assert!(
+            landing.draft_saved(uuid).is_err(),
+            "HIT_GROUND is not preserved yet"
+        );
+        let mut duplicate = original.clone();
+        if let Tag::Compound(fields) = &mut duplicate {
+            fields.push(("fall_distance".into(), Tag::Double(1.0)));
+        }
+        let mut orbs = Orbs::default();
+        orbs.spawn_saved(crate::saved_orb::read(&duplicate).unwrap().unwrap());
+        assert!(orbs.draft_saved(uuid).is_err());
     }
 
     #[test]
@@ -2175,7 +2434,7 @@ mod tests {
             orb.source = Some(saved.source);
             orbs.entities.push(orb);
         }
-        orbs.tick(
+        orbs.tick_with_fluid_and_proof(
             IVec3::ZERO,
             DVec3::splat(100.0),
             PlayerPose::Standing,
@@ -2187,6 +2446,12 @@ mod tests {
             &mut 0,
             |_| &[],
             |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
         );
         let owners = BTreeMap::from([(a, left), (b, right)]);
         assert_eq!(
@@ -2238,7 +2503,7 @@ mod tests {
         let mut xp = Experience::default();
         let mut score = 0;
         for _ in 0..10 {
-            orbs.tick(
+            orbs.tick_with_fluid_and_proof(
                 IVec3::ZERO,
                 DVec3::new(15.8, 5.0, 0.5),
                 PlayerPose::Standing,
@@ -2250,6 +2515,12 @@ mod tests {
                 &mut score,
                 |_| &[],
                 |_| 0.6,
+                |_| false,
+                |_, _| (Default::default(), false),
+                false,
+                |_, _, _| Some(Vec::new()),
+                |_, _| true,
+                |_| Some(false),
             );
         }
         assert_eq!(xp.total, 35);
@@ -2679,7 +2950,7 @@ mod tests {
         ]);
         let mut orbs = Orbs::default();
         orbs.spawn_saved(crate::saved_orb::read(&source).unwrap().unwrap());
-        orbs.tick(
+        orbs.tick_with_fluid_and_proof(
             IVec3::ZERO,
             DVec3::splat(100.0),
             PlayerPose::Standing,
@@ -2691,6 +2962,12 @@ mod tests {
             &mut 0,
             |_| &[],
             |_| 0.6,
+            |_| false,
+            |_, _| (Default::default(), false),
+            false,
+            |_, _, _| Some(Vec::new()),
+            |_, _| true,
+            |_| Some(false),
         );
         assert!(orbs.entities.is_empty());
         assert_eq!(

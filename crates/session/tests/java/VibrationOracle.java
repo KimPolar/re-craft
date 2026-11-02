@@ -155,6 +155,13 @@ public class VibrationOracle {
             if (calibrated!=0) state=state.setValue(CalibratedSculkSensorBlock.FACING,Direction.NORTH);
             for (var direction:Direction.values()) {
                 var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("power",power);row.addProperty("wet",wet);row.addProperty("direction",direction.getName());
+                if(direction==Direction.DOWN) {
+                    var shape=state.getShape(world,BlockPos.ZERO).bounds(); var collision=state.getCollisionShape(world,BlockPos.ZERO).bounds();
+                    var outline=new JsonArray();var boxes=new JsonArray();
+                    for(double v:new double[]{shape.minX,shape.minY,shape.minZ,shape.maxX,shape.maxY,shape.maxZ})outline.add(v);
+                    for(double v:new double[]{collision.minX,collision.minY,collision.minZ,collision.maxX,collision.maxY,collision.maxZ})boxes.add(v);
+                    row.add("outline",outline);row.add("collision",boxes);row.addProperty("outline_count",state.getShape(world,BlockPos.ZERO).toAabbs().size());row.addProperty("collision_count",state.getCollisionShape(world,BlockPos.ZERO).toAabbs().size());
+                }
                 row.addProperty("weak",state.getSignal(world,BlockPos.ZERO,direction));row.addProperty("direct",state.getDirectSignal(world,BlockPos.ZERO,direction));sensorSignals.add(row);
             }
             world.sensorState=state;world.delay=0;world.notifications=0;world.sounds=0;world.events=0;

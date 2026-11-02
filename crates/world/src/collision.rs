@@ -207,6 +207,39 @@ mod face_tests {
     }
 
     #[test]
+    fn sculk_sensor_shapes_validate_all_properties() {
+        for name in [
+            "minecraft:sculk_sensor",
+            "minecraft:calibrated_sculk_sensor",
+        ] {
+            for phase in ["inactive", "active", "cooldown"] {
+                for power in 0..=15 {
+                    for wet in ["true", "false"] {
+                        for facing in ["north", "south", "east", "west"] {
+                            let mut state = BlockState {
+                                name: name.into(),
+                                properties: [
+                                    ("sculk_sensor_phase".into(), phase.into()),
+                                    ("power".into(), power.to_string()),
+                                    ("waterlogged".into(), wet.into()),
+                                ]
+                                .into(),
+                            };
+                            if name.contains("calibrated") {
+                                state.properties.insert("facing".into(), facing.into());
+                            }
+                            assert_eq!(block_shape(&state), Some(BOTTOM_SLAB.to_vec()));
+                            assert_eq!(block_outline(&state), Some(BOTTOM_SLAB.to_vec()));
+                            state.properties.insert("power".into(), "016".into());
+                            assert_eq!(block_shape(&state), None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn snow_shapes_reject_invalid_layer_properties() {
         for value in ["0", "9", "01", "-1", "x"] {
             let state = BlockState {
@@ -258,6 +291,31 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if matches!(id, "sculk_sensor" | "calibrated_sculk_sensor") {
+        let calibrated = id == "calibrated_sculk_sensor";
+        let power = state.properties.get("power")?;
+        let power_value = power.parse::<u8>().ok()?;
+        let valid = state.properties.len() == if calibrated { 4 } else { 3 }
+            && power_value <= 15
+            && power_value.to_string() == *power
+            && matches!(
+                state
+                    .properties
+                    .get("sculk_sensor_phase")
+                    .map(String::as_str),
+                Some("inactive" | "active" | "cooldown")
+            )
+            && matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            )
+            && (!calibrated
+                || matches!(
+                    state.properties.get("facing").map(String::as_str),
+                    Some("north" | "south" | "west" | "east")
+                ));
+        return valid.then(|| BOTTOM_SLAB.to_vec());
+    }
     if id == "frosted_ice" {
         return (state.properties.len() == 1
             && matches!(

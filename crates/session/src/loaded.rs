@@ -3268,6 +3268,16 @@ impl LoadedSession {
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
+        // Sensor step events, listener state, and redstone side effects are
+        // not yet captured together, even though their collision is known.
+        anyhow::ensure!(
+            self.tick == 0
+                || !self.world.states().any(|(_, state)| matches!(
+                    state.name.as_str(),
+                    "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor"
+                )),
+            "sculk sensor events are not yet fully tracked for saving"
+        );
         anyhow::ensure!(
             !self.unresolved_ice_tick,
             "frosted ice tick effects are not yet fully tracked for saving"
@@ -32642,6 +32652,39 @@ pub(crate) mod tests {
             let landed = session.motion.position.y;
             session.update(TICK);
             assert_eq!(session.motion.position.y > landed + 1e-6, bounces, "{name}");
+        }
+    }
+
+    #[test]
+    fn player_lands_on_sculk_sensor_and_unhandled_events_block_player_save() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        for name in [
+            "minecraft:sculk_sensor",
+            "minecraft:calibrated_sculk_sensor",
+        ] {
+            let mut session = session();
+            let sensor = crate::sculk_sensor::Sensor {
+                phase: crate::sculk_sensor::Phase::Inactive,
+                power: 0,
+                waterlogged: false,
+                facing: (name == "minecraft:calibrated_sculk_sensor").then_some(IVec3::NEG_Z),
+            };
+            let id = session.intern_block(sensor.to_block().unwrap());
+            assert!(session.set(IVec3::new(4, 1, 4), id));
+            session.motion.position = DVec3::new(4.5, 2.0, 4.5);
+            session.motion.velocity = DVec3::new(0.0, -0.6, 0.0);
+            session.motion.on_ground = false;
+            session.player.position = session.motion.position.as_vec3();
+            session.player.on_ground = false;
+            session.update(TICK);
+            assert!(session.motion.on_ground, "{name}");
+            assert_eq!(session.motion.position.y, 1.5, "{name}");
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            };
+            let error = session.draft_player_state_inner(&original).unwrap_err();
+            assert!(error.to_string().contains("sculk sensor events"), "{error}");
         }
     }
 

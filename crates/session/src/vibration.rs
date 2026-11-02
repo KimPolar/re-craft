@@ -702,6 +702,38 @@ mod tests {
                 ),
                 "{row}"
             );
+            if direction == IVec3::NEG_Y {
+                let block = parse_sensor(row).to_block().unwrap();
+                for (kind, boxes) in [
+                    (
+                        "outline",
+                        native_world::collision::block_outline(&block).unwrap(),
+                    ),
+                    (
+                        "collision",
+                        native_world::collision::block_shape(&block).unwrap(),
+                    ),
+                ] {
+                    assert_eq!(
+                        boxes.len() as u64,
+                        row[format!("{kind}_count")].as_u64().unwrap(),
+                        "{row}"
+                    );
+                    assert_eq!(boxes.len(), 1, "{row}");
+                    let bounds = [
+                        boxes[0].min.x,
+                        boxes[0].min.y,
+                        boxes[0].min.z,
+                        boxes[0].max.x,
+                        boxes[0].max.y,
+                        boxes[0].max.z,
+                    ];
+                    for (actual, expected) in bounds.into_iter().zip(row[kind].as_array().unwrap())
+                    {
+                        assert_eq!(f64::from(actual), expected.as_f64().unwrap(), "{row}");
+                    }
+                }
+            }
         }
         let sensor_filter = data["sensor_filter"].as_array().unwrap();
         assert_eq!(sensor_filter.len(), 61 * 3 * 2 * 17);

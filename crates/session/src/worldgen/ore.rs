@@ -14,6 +14,7 @@ use native_resources::{
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
     feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule, FeatureTags},
     freeze_feature::freeze_top_layer,
+    geode_feature::{Direction as GeodeDirection, GeodeEnvironment, GeodeFeature},
     heightmap_tags::HeightmapTags,
     lake_feature::{LakeFeature, LakeWorld},
     monster_room::{RoomBlock, RoomMob, place_monster_room},
@@ -96,6 +97,7 @@ enum ConfiguredDecoration {
     FallenTree(FallenTreeFeature<BlockState>),
     Freeze,
     MonsterRoom,
+    Geode(GeodeFeature<BlockState>),
     Selector(Vec<PlacedDecorationFeature>),
     WeightedSelector(
         Vec<(f32, PlacedDecorationFeature)>,
@@ -119,6 +121,7 @@ impl ConfiguredDecoration {
             Self::Lake(v) => v.required_blocks(),
             Self::Tree(v) => v.required_blocks(),
             Self::FallenTree(v) => v.required_blocks(),
+            Self::Geode(v) => v.required_blocks(),
             Self::Freeze => ["minecraft:ice", "minecraft:snow"]
                 .into_iter()
                 .map(|v| ResourceId::parse(v).unwrap())
@@ -153,6 +156,7 @@ impl ConfiguredDecoration {
             Self::Simple(v) => v.needs_survival(name),
             Self::Column(v) => v.needs_survival(name),
             Self::Lake(v) => v.needs_survival(name),
+            Self::Geode(v) => v.needs_survival(name),
             Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
@@ -217,6 +221,7 @@ impl ConfiguredDecoration {
             )?)),
             ("minecraft", "freeze_top_layer") => Ok(Self::Freeze),
             ("minecraft", "monster_room") => Ok(Self::MonsterRoom),
+            ("minecraft", "geode") => Ok(Self::Geode(GeodeFeature::decode(value, resolve)?)),
             ("minecraft", "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -290,6 +295,7 @@ impl ConfiguredDecoration {
                 tags
             }
             Self::FallenTree(v) => v.required_tags(),
+            Self::Geode(v) => v.required_tags(),
             Self::Freeze => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
@@ -344,6 +350,7 @@ impl ConfiguredDecoration {
             Self::FallenTree(v) => v.place(world, random, pos),
             Self::Freeze => freeze_top_layer(world, pos),
             Self::MonsterRoom => place_monster_room(world, random, pos),
+            Self::Geode(v) => v.place(world, random, world.target.seed, pos),
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -2359,6 +2366,120 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
     }
 }
 
+// These vanilla blocks have no block entity, POI, or setBlock postprocessing.
+// Reject unknown data-pack effects until their semantics can be preserved.
+fn geode_safe_state(state: &BlockState) -> Result<()> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:amethyst_block"
+            | "minecraft:budding_amethyst"
+            | "minecraft:calcite"
+            | "minecraft:smooth_basalt"
+    ) {
+        ensure!(state.properties.is_empty(), "invalid geode layer state");
+        return Ok(());
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:small_amethyst_bud"
+            | "minecraft:medium_amethyst_bud"
+            | "minecraft:large_amethyst_bud"
+            | "minecraft:amethyst_cluster"
+    ) {
+        ensure!(
+            state.properties.len() == 2
+                && matches!(
+                    state.properties.get("facing").map(String::as_str),
+                    Some("down" | "up" | "north" | "south" | "west" | "east")
+                )
+                && matches!(
+                    state.properties.get("waterlogged").map(String::as_str),
+                    Some("true" | "false")
+                ),
+            "invalid geode crystal state"
+        );
+        return Ok(());
+    }
+    ensure!(
+        !matches!(state.name.as_str(), "minecraft:chest" | "minecraft:spawner"),
+        "unsupported geode block entity"
+    );
+    monster_block_flags(state)?;
+    Ok(())
+}
+
+impl GeodeEnvironment for DecorationRegion<'_> {
+    fn set_geode_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        if !self.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "geode chunk is missing"
+        );
+        geode_safe_state(state)?;
+        if self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        geode_safe_state(&self.read(pos)?)?;
+        self.set_section_block(pos, state)?;
+        self.update_final_heightmaps(pos, state)
+    }
+    fn schedule_geode_fluid(&mut self, pos: [i32; 3]) -> Result<()> {
+        use native_world::fluid::{FluidKind, FluidState};
+        let state = OreWorld::block(self, pos)?;
+        geode_safe_state(&state)?;
+        if let Some(fluid) = FluidState::from_block(&state).map_err(anyhow::Error::msg)? {
+            let name = match (fluid.kind, fluid.source) {
+                (FluidKind::Water, true) => "minecraft:water",
+                (FluidKind::Water, false) => "minecraft:flowing_water",
+                (FluidKind::Lava, true) => "minecraft:lava",
+                (FluidKind::Lava, false) => "minecraft:flowing_lava",
+            };
+            SpringWorld::schedule_spring_tick(self, pos, &ResourceId::parse(name)?)?;
+        }
+        Ok(())
+    }
+    fn geode_placement_state(
+        &mut self,
+        state: &BlockState,
+        direction: GeodeDirection,
+        existing: &BlockState,
+    ) -> Result<BlockState> {
+        geode_safe_state(state)?;
+        let mut result = state.clone();
+        if let Some(value) = result.properties.get_mut("facing") {
+            *value = match direction {
+                GeodeDirection::Down => "down",
+                GeodeDirection::Up => "up",
+                GeodeDirection::North => "north",
+                GeodeDirection::South => "south",
+                GeodeDirection::West => "west",
+                GeodeDirection::East => "east",
+            }
+            .into();
+        }
+        if let Some(value) = result.properties.get_mut("waterlogged") {
+            let source = native_world::fluid::FluidState::from_block(existing)
+                .map_err(anyhow::Error::msg)?
+                .is_some_and(|f| f.source);
+            *value = source.to_string();
+        }
+        Ok(result)
+    }
+    fn geode_can_grow(&mut self, state: &BlockState) -> Result<bool> {
+        if is_air(state) {
+            return Ok(true);
+        }
+        if state.name != "minecraft:water" {
+            return Ok(false);
+        }
+        Ok(native_world::fluid::FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|fluid| fluid.amount == 8))
+    }
+}
+
 impl DiskWorld for DecorationRegion<'_> {
     fn inside_build_height(&mut self, y: i32) -> Result<bool> {
         Ok(!self.is_outside(y))
@@ -3176,6 +3297,92 @@ mod tests {
         );
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn unsupported_geode_write_rolls_back_terrain_and_random() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let stone = world.intern_state(state("stone"));
+        for chunk in world.chunks.values_mut() {
+            let chunk = Arc::make_mut(chunk);
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+                .blocks
+                .as_mut()
+                .unwrap()
+                .fill(stone);
+        }
+        let value = json!({
+            "type":"minecraft:geode",
+            "blocks":{
+                "filling_provider":{"id":"minecraft:diamond_block"},
+                "inner_layer_provider":{"id":"minecraft:amethyst_block"},
+                "alternate_inner_layer_provider":{"id":"minecraft:budding_amethyst"},
+                "middle_layer_provider":{"id":"minecraft:calcite"},
+                "outer_layer_provider":{"id":"minecraft:smooth_basalt"},
+                "inner_placements":["minecraft:amethyst_block"],
+                "cannot_replace":[], "invalid_blocks":[]
+            },
+            "layers":{}, "crack":{"generate_crack_chance":0.0},
+            "invalid_blocks_threshold":1, "min_gen_offset":-3, "max_gen_offset":3
+        });
+        let feature = GeodeFeature::decode(&value, &mut resolve_test).unwrap();
+        let placed = PlacedDecorationFeature {
+            placement: PlacedFeature::decode(&json!({"feature":"minecraft:test","placement":[]}))
+                .unwrap(),
+            feature: ConfiguredDecoration::Geode(feature),
+        };
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(123);
+        let mut original = random.clone();
+        let mut env = PlacementTestEnv {
+            allow: true,
+            fail_after: None,
+            calls: 0,
+        };
+        assert!(
+            region
+                .place_placed(&placed, &mut random, [0, 4, 0], 0, 16, &mut env)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), original.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn geode_fluid_ticks_distinguish_source_and_flowing_water_and_lava() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+            .unwrap();
+        for (x, name, level, expected) in [
+            (0, "water", "0", "minecraft:water"),
+            (1, "water", "8", "minecraft:flowing_water"),
+            (2, "lava", "0", "minecraft:lava"),
+            (3, "lava", "3", "minecraft:flowing_lava"),
+        ] {
+            let mut block = state(name);
+            block.properties.insert("level".into(), level.into());
+            region.set_section_block([x, 4, 0], &block).unwrap();
+            region.schedule_geode_fluid([x, 4, 0]).unwrap();
+            region.schedule_geode_fluid([x, 4, 0]).unwrap();
+            assert_eq!(
+                region.world.saved_fluid_ticks[&chunk].last().unwrap().fluid,
+                expected
+            );
+            if name == "water" {
+                assert_eq!(
+                    region.geode_can_grow(&block).unwrap(),
+                    level == "0" || level == "8"
+                );
+            }
+        }
+        assert_eq!(region.world.saved_fluid_ticks[&chunk].len(), 4);
+        region.finish().unwrap();
     }
 
     #[test]
@@ -4698,6 +4905,199 @@ mod tests {
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
         assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_geode_matches_java_in_generated_chunks() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GeodeOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/GeodeOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let oracle = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GeodeOracle"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let placement =
+            PlacedFeature::decode(&json!({"feature":"minecraft:amethyst_geode","placement":[]}))
+                .unwrap();
+        let placed = PlacedDecorationFeature::from_placement(&mut resources, placement, &mut |v| {
+            super::super::resolve_generated_terrain_state(v, &generated)
+        })
+        .unwrap();
+        let tags = OreBlockTags::load(&mut resources, &registry, &placed.required_tags()).unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let mut wrote_crystal = false;
+        let mut saw_tick = false;
+        for seed in [0, 1, -1, 987654321] {
+            for mode in 0..3 {
+                let (mut terrain, _, _, _) = fixture();
+                terrain.seed = seed + 123;
+                terrain.height = 48;
+                let world = Arc::make_mut(&mut terrain.world);
+                let stone = world.intern_state(state("stone"));
+                let bedrock = world.intern_state(state("bedrock"));
+                let air = world.intern_state(state("air"));
+                let mut water_state = state("water");
+                water_state.properties.insert("level".into(), "0".into());
+                let water = world.intern_state(water_state);
+                for (pos, chunk) in &mut world.chunks {
+                    let chunk = Arc::make_mut(chunk);
+                    chunk.sections.clear();
+                    for sy in 0..3 {
+                        let mut blocks = Box::new([stone; BLOCK_COUNT]);
+                        for y in 0..16 {
+                            for z in 0..16 {
+                                for x in 0..16 {
+                                    let (ax, ay, az) =
+                                        (pos.x * 16 + x, sy * 16 + y, pos.z * 16 + z);
+                                    blocks[(x + z * 16 + y * 256) as usize] = if mode == 2 {
+                                        air
+                                    } else if mode == 1 && (ax + ay + az).rem_euclid(17) == 0 {
+                                        bedrock
+                                    } else if mode == 1 && (ax * 3 + ay + az).rem_euclid(23) == 0 {
+                                        water
+                                    } else {
+                                        stone
+                                    };
+                                }
+                            }
+                        }
+                        chunk.sections.insert(
+                            sy as i8,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        );
+                    }
+                }
+                let before = terrain.snapshot();
+                let writable = before.chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                let mut random = DecorationRandom::new(seed);
+                let mut env = PlacementTestEnv {
+                    allow: true,
+                    fail_after: None,
+                    calls: 0,
+                };
+                let ok = region
+                    .place_placed(&placed, &mut random, [0, 20, 0], 0, 48, &mut env)
+                    .unwrap();
+                region.finish().unwrap();
+                let after = terrain.snapshot();
+                let prefix = format!("C {seed} {mode} ");
+                let line = oracle
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&prefix))
+                    .unwrap();
+                let (java_ok, rest) = line.split_once(" W ").unwrap();
+                let (writes, rest) = rest.split_once(" T ").unwrap();
+                let (ticks, next) = rest.split_once(" R ").unwrap();
+                assert_eq!(ok, java_ok.parse::<bool>().unwrap());
+                assert_eq!(random.next_long(), next.parse::<i64>().unwrap());
+                let mut expected = BTreeMap::new();
+                if !writes.is_empty() {
+                    for item in writes.split(';') {
+                        let parts = item.split(',').collect::<Vec<_>>();
+                        let pos = [
+                            parts[0].parse::<i32>().unwrap(),
+                            parts[1].parse::<i32>().unwrap(),
+                            parts[2].parse::<i32>().unwrap(),
+                        ];
+                        let mut kind = parts[3].split(':');
+                        let name = kind.next().unwrap();
+                        let mut block = state(name);
+                        if let Some(facing) = kind.next() {
+                            block.properties.insert("facing".into(), facing.into());
+                            block
+                                .properties
+                                .insert("waterlogged".into(), kind.next().unwrap().into());
+                            wrote_crystal = true;
+                        }
+                        expected.insert(pos, block);
+                    }
+                }
+                for z in -16..=16 {
+                    for y in 4..=36 {
+                        for x in -16..=16 {
+                            let p = [x, y, z];
+                            assert_eq!(
+                                after.block(x, y, z),
+                                expected.get(&p).or_else(|| before.block(x, y, z)),
+                                "seed {seed} mode {mode} {p:?}"
+                            );
+                        }
+                    }
+                }
+                let expected_ticks: BTreeSet<_> = if ticks.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    ticks
+                        .split(';')
+                        .map(|v| {
+                            let a = v
+                                .split(',')
+                                .map(|v| v.parse::<i32>().unwrap())
+                                .collect::<Vec<_>>();
+                            [a[0], a[1], a[2]]
+                        })
+                        .collect()
+                };
+                let actual_ticks: BTreeSet<_> = after
+                    .saved_fluid_ticks
+                    .values()
+                    .flatten()
+                    .map(|v| v.position)
+                    .collect();
+                saw_tick |= !actual_ticks.is_empty();
+                assert_eq!(actual_ticks, expected_ticks, "seed {seed} mode {mode}");
+            }
+        }
+        assert!(
+            wrote_crystal && saw_tick,
+            "oracle must cover crystal and fluid effects"
+        );
     }
 
     #[test]

@@ -91,7 +91,7 @@ impl GeodeWorld for World {
         }))
     }
     fn is_air_or_invalid(&mut self, s: &State) -> Result<bool> {
-        Ok(s.name == "air" || s.name == "bedrock")
+        Ok(s.name == "air" || s.name == "bedrock" || s.name == "water")
     }
     fn may_replace(&mut self, s: &State) -> Result<bool> {
         Ok(s.name != "bedrock")

@@ -32,6 +32,7 @@ enum StateSchema {
     Age15,
     Sapling,
     Leaves,
+    AmethystCluster,
 }
 
 impl StateSchema {
@@ -42,6 +43,12 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
                     ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::AmethystCluster => {
+                return BTreeMap::from([
+                    ("facing".into(), "up".into()),
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
@@ -58,6 +65,15 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::AmethystCluster
+                if name == "facing"
+                    && matches!(value, "down" | "up" | "north" | "south" | "west" | "east") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::AmethystCluster if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
             Self::Snowy if name == "snowy" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
@@ -229,6 +245,9 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/GrassBlock"
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
+                "net/minecraft/world/level/block/AmethystClusterBlock" => {
+                    Some(StateSchema::AmethystCluster)
+                }
                 "net/minecraft/world/level/block/RotatedPillarBlock" => Some(StateSchema::Axis),
                 "net/minecraft/world/level/block/DoublePlantBlock"
                 | "net/minecraft/world/level/block/TallFlowerBlock" => {

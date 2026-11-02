@@ -498,7 +498,7 @@ impl FreshGenerationLightTracker {
 /// the tracker is moved here. Requested columns need their 3x3 neighborhood;
 /// uninitialized chunks must retain their default sky-source heightmaps.
 /// Once propagation starts, reads use the blocks seen at activation. Further
-/// activation is rejected if any captured chunk has changed in the meantime.
+/// activation is rejected if its 3x3 input neighborhood changed in the meantime.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,
@@ -540,15 +540,23 @@ impl StagedGenerationLightEngine {
         );
         ensure!(!self.active.contains(&pos), "light chunk is already active");
         if let Some(frozen) = &self.frozen_world {
-            ensure!(
-                frozen.chunks.len() == terrain.world.chunks.len()
-                    && frozen.chunks.iter().all(|(pos, before)| terrain
-                        .world
-                        .chunks
-                        .get(pos)
-                        .is_some_and(|now| Arc::ptr_eq(before, now))),
-                "light inputs changed before activation"
-            );
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let neighbor = native_world::loaded::ChunkPos {
+                        x: pos.x.checked_add(dx).context("light X overflow")?,
+                        z: pos.z.checked_add(dz).context("light Z overflow")?,
+                    };
+                    let same = match (
+                        frozen.chunks.get(&neighbor),
+                        terrain.world.chunks.get(&neighbor),
+                    ) {
+                        (Some(before), Some(now)) => Arc::ptr_eq(before, now),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    ensure!(same, "light inputs changed before activation");
+                }
+            }
         }
         let mut active = self.active.clone();
         active.insert(pos);

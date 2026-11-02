@@ -3768,10 +3768,85 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let partial_expected: Vec<Vec<Vec<u8>>> =
+            serde_json::from_slice(&std::fs::read(&expected_path).unwrap()).unwrap();
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&expected_path)
+            .arg("mixed")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mixed_expected: Vec<Vec<Vec<Vec<u8>>>> =
             serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
 
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut mixed_terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let west = ChunkPos { x: -1, z: 0 };
+        let world = Arc::make_mut(&mut mixed_terrain.world);
+        let template = world.chunks[&center].as_ref().clone();
+        for z in -2..=2 {
+            for x in -2..=2 {
+                let pos = ChunkPos { x, z };
+                world.chunks.entry(pos).or_insert_with(|| {
+                    let mut chunk = template.clone();
+                    chunk.position = pos;
+                    Arc::new(chunk)
+                });
+            }
+        }
+        let torch = world.intern_state(state("torch"));
+        world.set_block_id(0, 10, 8, torch).unwrap();
+        world.set_block_id(17, 10, 8, torch).unwrap();
+        mixed_terrain.completed_decoration.extend([center, east]);
+        let mut mixed_tracker = FreshGenerationLightTracker::new(&mixed_terrain, true).unwrap();
+        mixed_tracker
+            .initialize_chunk(&mixed_terrain, center, &registry)
+            .unwrap();
+        mixed_tracker
+            .initialize_chunk(&mixed_terrain, east, &registry)
+            .unwrap();
+        let mut mixed_engine = StagedGenerationLightEngine::new(mixed_tracker);
+        let mixed_first = mixed_engine
+            .activate(&mixed_terrain, center, [center, west], &registry)
+            .unwrap();
+        let world = Arc::make_mut(&mut mixed_terrain.world);
+        let stone = world.intern_state(state("stone"));
+        world.set_block_id(-1, 10, 8, stone).unwrap();
+        let mixed_second = mixed_engine
+            .activate(&mixed_terrain, east, [center, west], &registry)
+            .unwrap();
+        for (stage, actual) in [&mixed_first, &mixed_second].into_iter().enumerate() {
+            for (column, base) in [0, -16].into_iter().enumerate() {
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [base + x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                actual.block_light(p),
+                                Some(mixed_expected[stage][column][0][index]),
+                                "mixed block stage {stage} at {p:?}"
+                            );
+                            assert_eq!(
+                                actual.sky_light(p),
+                                Some(mixed_expected[stage][column][1][index]),
+                                "mixed sky stage {stage} at {p:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(mixed_second.block_light([-1, 10, 8]), Some(13));
         let (mut terrain, _, _, _) = fixture();
         let world = Arc::make_mut(&mut terrain.world);
         let torch = world.intern_state(state("torch"));
@@ -4355,7 +4430,7 @@ mod tests {
             let (mut terrain, _, _, _) = fixture();
             let center = ChunkPos { x: 0, z: 0 };
             let east = ChunkPos { x: 1, z: 0 };
-            let west = ChunkPos { x: -2, z: 0 };
+            let west = ChunkPos { x: -1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
             let template = world.chunks[&center].as_ref().clone();
             for z in -3..=3 {

@@ -266,6 +266,39 @@ impl CarvedTerrainWorld {
         Ok(())
     }
 
+    /// Initialize using the cached dimension settings selected from the same
+    /// world preset and active data packs as the generated terrain.
+    pub fn initialize_lighting_for_dimension(
+        &mut self,
+        center: native_world::loaded::ChunkPos,
+        settings: &native_resources::dimension_lighting::GeneratedDimensionLighting,
+    ) -> Result<()> {
+        let dimension = ResourceId::parse(&self.world.dimension)?;
+        ensure!(
+            dimension == settings.dimension,
+            "lighting dimension differs from terrain"
+        );
+        ensure!(
+            self.min_y == settings.min_y && self.height == settings.height,
+            "lighting height differs from terrain"
+        );
+        let name = settings
+            .dimension_type
+            .as_ref()
+            .map(|id| format!("{}:{}", id.namespace, id.path));
+        if let Some(existing) = &self.world.dimension_type {
+            ensure!(
+                Some(existing) == name.as_ref(),
+                "lighting dimension type differs from terrain"
+            );
+        }
+        self.initialize_generated_lighting(center, settings.has_skylight)?;
+        if self.world.dimension_type != name {
+            Arc::make_mut(&mut self.world).dimension_type = name;
+        }
+        Ok(())
+    }
+
     fn generated_light_bounds(
         &self,
         center: native_world::loaded::ChunkPos,

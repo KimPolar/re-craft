@@ -3694,6 +3694,52 @@ mod tests {
     }
 
     #[test]
+    fn generated_lighting_uses_selected_dimension_and_rejects_mismatch() {
+        use native_resources::dimension_lighting::GeneratedDimensionLighting;
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        for z in -2..=2 {
+            for x in -2..=2 {
+                terrain.completed_decoration.insert(ChunkPos { x, z });
+            }
+        }
+        let mut settings = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            dimension_type: Some(ResourceId::parse("example:custom_sky").unwrap()),
+            min_y: 0,
+            height: 32,
+            has_skylight: true,
+        };
+        let before = terrain.snapshot();
+        assert!(
+            terrain
+                .initialize_lighting_for_dimension(center, &settings)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        settings.height = 16;
+        terrain
+            .initialize_lighting_for_dimension(center, &settings)
+            .unwrap();
+        let lit = terrain.snapshot();
+        assert_eq!(lit.dimension_type.as_deref(), Some("example:custom_sky"));
+        assert_eq!(lit.light(0, 10, 0, true), Some(15));
+        settings.dimension_type = Some(ResourceId::parse("example:other").unwrap());
+        assert!(
+            terrain
+                .initialize_lighting_for_dimension(center, &settings)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&lit, &terrain.snapshot()));
+        settings.dimension = ResourceId::parse("example:wrong_dimension").unwrap();
+        assert!(
+            terrain
+                .initialize_lighting_for_dimension(center, &settings)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn spring_writes_and_fluid_ticks_commit_or_rollback_together() {
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

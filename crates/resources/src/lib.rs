@@ -21,6 +21,7 @@ pub mod carver;
 pub mod chest_loot;
 pub mod datapacks;
 pub mod density;
+pub mod dimension_lighting;
 pub mod disk_feature;
 pub mod enchantments;
 pub mod entity_collision;

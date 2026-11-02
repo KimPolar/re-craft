@@ -123,6 +123,7 @@ fn vegetation_support(id: &ResourceId) -> Option<&'static str> {
         return None;
     }
     match id.path.as_str() {
+        "azalea" | "flowering_azalea" => Some("minecraft:supports_azalea"),
         "oak_sapling" | "spruce_sapling" | "birch_sapling" | "jungle_sapling"
         | "acacia_sapling" | "dark_oak_sapling" | "cherry_sapling" | "pale_oak_sapling"
         | "short_grass" | "fern" | "bush" | "dandelion" | "poppy" | "blue_orchid" | "allium"

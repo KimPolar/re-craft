@@ -490,6 +490,7 @@ impl ConfiguredDecoration {
                 tags.insert(ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap());
                 tags.insert(ResourceId::parse("minecraft:snow").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
+                tags.insert(ResourceId::parse("minecraft:supports_azalea").unwrap());
                 tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
                 tags.insert(
                     ResourceId::parse("minecraft:enables_bubble_column_drag_down").unwrap(),
@@ -544,6 +545,7 @@ impl ConfiguredDecoration {
                         Ok(SimplePlantKind::DryVegetation) => {
                             Some("minecraft:supports_dry_vegetation")
                         }
+                        Ok(SimplePlantKind::Azalea) => Some("minecraft:supports_azalea"),
                         Ok(SimplePlantKind::Mushroom) => {
                             Some("minecraft:overrides_mushroom_light_requirement")
                         }
@@ -1986,6 +1988,11 @@ fn tree_vegetation_tag(dry: bool) -> &'static ResourceId {
     }
 }
 
+fn tree_azalea_tag() -> &'static ResourceId {
+    static AZALEA: OnceLock<ResourceId> = OnceLock::new();
+    AZALEA.get_or_init(|| ResourceId::parse("minecraft:supports_azalea").unwrap())
+}
+
 fn tree_oak_log(state: &BlockState) -> bool {
     state.name == "minecraft:oak_log"
         && state.properties.len() == 1
@@ -2109,6 +2116,8 @@ fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
             | "minecraft:lily_of_the_valley"
             | "minecraft:firefly_bush"
             | "minecraft:closed_eyeblossom"
+            | "minecraft:azalea"
+            | "minecraft:flowering_azalea"
             | "minecraft:sweet_berry_bush"
             | "minecraft:short_dry_grass"
             | "minecraft:tall_dry_grass"
@@ -3218,10 +3227,12 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                     below.name == state.name
                         && below.properties.get("half").map(String::as_str) == Some("lower")
                 } else {
-                    self.tags.contains(
-                        tree_vegetation_tag(matches!(kind, SimplePlantKind::DryVegetation)),
-                        &below.name,
-                    )?
+                    let tag = if matches!(kind, SimplePlantKind::Azalea) {
+                        tree_azalea_tag()
+                    } else {
+                        tree_vegetation_tag(matches!(kind, SimplePlantKind::DryVegetation))
+                    };
+                    self.tags.contains(tag, &below.name)?
                 };
             if !survives {
                 return Ok(BlockState {
@@ -3887,6 +3898,7 @@ impl DiskWorld for DecorationRegion<'_> {
 enum SimplePlantKind {
     Vegetation,
     DryVegetation,
+    Azalea,
     Double,
     Unconditional,
     Mushroom,
@@ -3903,6 +3915,10 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
         "minecraft:leaf_litter" => {
             tree_leaf_litter(state)?;
             SimplePlantKind::LeafLitter
+        }
+        "minecraft:azalea" | "minecraft:flowering_azalea" => {
+            ensure!(state.properties.is_empty(), "invalid azalea state");
+            SimplePlantKind::Azalea
         }
         "minecraft:seagrass" => {
             ensure!(state.properties.is_empty(), "invalid seagrass state");
@@ -4105,6 +4121,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                     let below = self.block(below)?;
                     let tag = match kind {
                         SimplePlantKind::DryVegetation => "minecraft:supports_dry_vegetation",
+                        SimplePlantKind::Azalea => "minecraft:supports_azalea",
                         _ => "minecraft:supports_vegetation",
                     };
                     self.tags.contains(&ResourceId::parse(tag)?, &below.name)?
@@ -4614,6 +4631,9 @@ mod tests {
                     Some(br#"{"values":["minecraft:stone"]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/supports_vegetation.json" => {
+                    Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore"]}"#.to_vec())
+                }
+                "data/minecraft/tags/block/supports_azalea.json" => {
                     Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore"]}"#.to_vec())
                 }
                 "data/minecraft/tags/block/air.json" => Some(
@@ -7786,6 +7806,199 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn azalea_generation_matches_java_tags_and_edges() {
+        use native_resources::tree_leaf_update::ShapeEdgeWorld;
+        use std::{path::PathBuf, process::Command};
+        struct AzaleaData(u8);
+        impl ResourceProvider for AzaleaData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/supports_azalea.json" {
+                    let mut values = Vec::new();
+                    if self.0 & 1 != 0 {
+                        values.push("minecraft:stone");
+                    }
+                    if self.0 & 2 != 0 {
+                        values.push("minecraft:dirt");
+                    }
+                    return Ok(Some(serde_json::to_vec(&json!({"values":values}))?));
+                }
+                if path == "data/minecraft/tags/block/supports_vegetation.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.0 & 4 != 0 { vec!["minecraft:stone"] } else { vec![] }}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("AzaleaFeatureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/AzaleaFeatureOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("AzaleaFeatureOracle"));
+        let mut registry = batch_registry();
+        registry.extend(
+            [
+                "minecraft:azalea",
+                "minecraft:flowering_azalea",
+                "minecraft:dirt",
+                "minecraft:sand",
+                "minecraft:water",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let required = BTreeSet::from([
+            ResourceId::parse("minecraft:supports_azalea").unwrap(),
+            ResourceId::parse("minecraft:supports_vegetation").unwrap(),
+        ]);
+        let motion = HeightmapTags::load(&mut AzaleaData(0), &registry).unwrap();
+        let mut cases = 0;
+        let mut edges = 0;
+        for mode in 0..8u8 {
+            let tags = OreBlockTags::load(&mut AzaleaData(mode), &registry, &required).unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            for line in output
+                .lines()
+                .filter(|line| line.starts_with(&format!("A {mode} ")))
+            {
+                let p: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(p.len(), 12, "{line}");
+                let kind: usize = p[2].parse().unwrap();
+                let base: usize = p[3].parse().unwrap();
+                let here: usize = p[4].parse().unwrap();
+                let mut support = state(["stone", "dirt", "sand", "air"][base]);
+                let mut current =
+                    state(["air", "stone", "water", "azalea", "flowering_azalea"][here]);
+                if current.name == "minecraft:water" {
+                    current.properties.insert("level".into(), "0".into());
+                }
+                if support.name == "minecraft:water" {
+                    support.properties.insert("level".into(), "0".into());
+                }
+                region.set_section_block([8, 7, 8], &support).unwrap();
+                region.set_section_block([8, 8, 8], &current).unwrap();
+                let target = state(["azalea", "flowering_azalea"][kind]);
+                let pred = BlockPredicate::decode(
+                    &json!({"type":"minecraft:would_survive","state":{"id":target.name}}),
+                )
+                .unwrap();
+                assert_eq!(
+                    pred.test(&mut region, [8, 8, 8]).unwrap(),
+                    p[6] == "true",
+                    "{line}"
+                );
+                assert_eq!(
+                    DiskWorld::is_solid(&mut region, &target).unwrap(),
+                    p[11] == "true",
+                    "{line}"
+                );
+                let feature = SimpleBlockFeature::decode(
+                    &json!({"type":"minecraft:simple_block","to_place":{"id":target.name}}),
+                    &mut resolve_tree_test,
+                )
+                .unwrap();
+                let mut random = DecorationRandom::new(42);
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[7] == "true",
+                    "{line}"
+                );
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[8] == "true",
+                    "{line}"
+                );
+                assert_eq!(region.read([8, 8, 8]).unwrap().name, p[9], "{line}");
+                assert_eq!(random.next_long(), p[10].parse::<i64>().unwrap(), "{line}");
+                assert_eq!(p[5], p[6], "{line}");
+                for edge in output
+                    .lines()
+                    .filter(|edge| edge.starts_with(&format!("U {mode} {kind} {base} {here} ")))
+                {
+                    let u: Vec<_> = edge.split_whitespace().collect();
+                    let direction = match u[5] {
+                        "down" => [0, -1, 0],
+                        "up" => [0, 1, 0],
+                        "north" => [0, 0, -1],
+                        "south" => [0, 0, 1],
+                        "west" => [-1, 0, 0],
+                        "east" => [1, 0, 0],
+                        _ => panic!("{edge}"),
+                    };
+                    let result = region
+                        .update_shape([8, 8, 8], &target, direction, [0, 0, 0], &state("stone"))
+                        .unwrap();
+                    assert_eq!(result.name, u[6], "{edge}");
+                    edges += 1;
+                }
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 8 * 2 * 4 * 5);
+        assert_eq!(edges, cases * 6);
+        let feature=PlacedDecorationFeature::from_placement(&mut AzaleaData(0),PlacedFeature::decode(&json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:azalea"}},"placement":[]})).unwrap(),&mut resolve_tree_test).unwrap();
+        assert!(
+            feature
+                .required_tags()
+                .contains(&ResourceId::parse("minecraft:supports_azalea").unwrap())
+        );
+        let predicate = BlockPredicate::decode(&json!({
+            "type":"minecraft:would_survive", "state":{"id":"minecraft:flowering_azalea"}
+        }))
+        .unwrap();
+        assert!(
+            predicate
+                .required_tags()
+                .contains(&ResourceId::parse("minecraft:supports_azalea").unwrap())
+        );
     }
 
     #[test]

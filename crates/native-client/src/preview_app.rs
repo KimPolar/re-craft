@@ -888,11 +888,17 @@ impl Viewer {
                 biome_blend: self.video.biome_blend,
                 origin: snapshot.origin,
                 world: Arc::clone(world),
+                targets: None,
             });
             play.requested_revision = snapshot.world_revision;
             play.requested_blend = self.video.biome_blend;
         }
         while let Some(result) = play.mesher.try_result()? {
+            // This session requests all loaded chunks; a selected generated
+            // result must not replace its complete scene.
+            if result.targets.is_some() {
+                continue;
+            }
             if obsolete_mesh(
                 result.revision,
                 result.biome_blend,
@@ -2614,6 +2620,7 @@ mod tests {
                     biome_blend: 0,
                     origin: glam::IVec3::ZERO,
                     world: Arc::new(self.world.clone()),
+                    targets: None,
                 });
             }
             fn window_event(
@@ -3127,6 +3134,7 @@ mod tests {
                             biome_blend: 0,
                             origin: glam::IVec3::ZERO,
                             world: Arc::new(self.world.clone()),
+                            targets: None,
                         });
                     }
                 }

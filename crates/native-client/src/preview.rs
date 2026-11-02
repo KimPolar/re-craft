@@ -1089,7 +1089,7 @@ impl IncrementalPreview {
         Ok((world, scene))
     }
 
-    fn prepare_selected(
+    pub(crate) fn prepare_selected(
         &mut self,
         world: &World,
         source: &mut impl ResourceProvider,
@@ -2998,6 +2998,16 @@ mod tests {
                 .prepare_generated(&mut batch, &targets, &mut resources, IVec3::ZERO, 2048, 0)
                 .is_err()
         );
+        assert!(
+            crate::mesh_worker::MeshJob::for_generated(
+                &mut batch,
+                targets.clone(),
+                1,
+                0,
+                IVec3::ZERO
+            )
+            .is_err()
+        );
         batch.request_light(center).unwrap();
         while batch
             .step(&mut data, &mut classify, &mut resolve)
@@ -3026,6 +3036,38 @@ mod tests {
             &repeated_scene.chunks[&center]
         ));
         assert_eq!(renderer.last_rebuilt, 0);
+        let job = crate::mesh_worker::MeshJob::for_generated(
+            &mut batch,
+            targets.clone(),
+            7,
+            0,
+            IVec3::ZERO,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&world, &job.world));
+        let worker = crate::mesh_worker::MeshWorker::start(resources).unwrap();
+        worker.submit(job);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            if let Some(result) = worker.try_result().unwrap() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "generated mesh worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(result.revision, 7);
+        assert_eq!(result.targets.as_deref(), Some(&targets));
+        let worker_scene = result.scene.unwrap();
+        assert_eq!(worker_scene.chunks.len(), 1);
+        assert!(worker_scene.chunks.contains_key(&center));
+        assert!(
+            worker_scene
+                .opaque_vertices()
+                .any(|v| (v.position[1] - 16.0).abs() < 0.0001 && v.light / 16 == 15)
+        );
     }
 
     #[test]

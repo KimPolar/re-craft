@@ -653,6 +653,7 @@ pub struct LoadedSession {
     sensor_deferred_revision: Option<u64>,
     sensor_pending: BTreeSet<(i32, i32, i32, bool)>,
     sculk_listeners: BTreeMap<[i32; 3], crate::saved_sculk::SavedSculkSensor>,
+    removed_sculk_listeners: BTreeMap<[i32; 3], crate::saved_sculk::SavedSculkSensor>,
     active_sculk_listeners: BTreeSet<[i32; 3]>,
     registered_sculk_chunks: BTreeSet<ChunkPos>,
     unresolved_ice_tick: bool,
@@ -4459,8 +4460,13 @@ impl LoadedSession {
         let mut sensors = self
             .sculk_listeners
             .range(start..=end)
-            .map(|(_, sensor)| sensor)
-            .filter(|sensor| sensor.position.z.div_euclid(16) == position.z)
+            .map(|(key, sensor)| (key, sensor, false))
+            .chain(
+                self.removed_sculk_listeners
+                    .range(start..=end)
+                    .map(|(key, sensor)| (key, sensor, true)),
+            )
+            .filter(|(_, sensor, _)| sensor.position.z.div_euclid(16) == position.z)
             .peekable();
         if sensors.peek().is_none() {
             return Ok(());
@@ -4475,7 +4481,12 @@ impl LoadedSession {
         static EVENTS: OnceLock<BTreeSet<String>> = OnceLock::new();
         let registry = EVENTS.get_or_init(crate::vibration::vanilla_game_events);
         let mut changes = Vec::new();
-        for sensor in sensors {
+        let mut seen = BTreeSet::new();
+        for (key, sensor, removed) in sensors {
+            ensure!(
+                *key == sensor.position.to_array() && seen.insert(*key),
+                "duplicate or misplaced sensor listener"
+            );
             ensure!(
                 self.registered_sculk_chunks.contains(&position),
                 "sensor chunk was not registered"
@@ -4512,11 +4523,21 @@ impl LoadedSession {
                 .and_then(|section| section.blocks.as_ref())
                 .and_then(|blocks| self.world.state(blocks[index]))
                 .context("sensor block is unavailable")?;
-            ensure!(
-                crate::sculk_sensor::Sensor::from_block(block)
-                    .is_some_and(|state| state.facing.is_some() == sensor.calibrated),
-                "sensor block and block entity differ"
-            );
+            if removed {
+                ensure!(
+                    !matches!(
+                        block.name.as_str(),
+                        "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor"
+                    ),
+                    "removed sensor block was recreated without a block entity"
+                );
+            } else {
+                ensure!(
+                    crate::sculk_sensor::Sensor::from_block(block)
+                        .is_some_and(|state| state.facing.is_some() == sensor.calibrated),
+                    "sensor block and block entity differ"
+                );
+            }
             let initial = if let Some(edit) = self.block_edits.get(&position).and_then(|edits| {
                 edits.get(&(sensor.position.x, sensor.position.y, sensor.position.z))
             }) {
@@ -4553,7 +4574,12 @@ impl LoadedSession {
                 "source sensor state changed since loading"
             );
             let change = sensor.draft(sensor.source(), registry)?;
-            if change.expected != change.replacement {
+            if removed {
+                changes.push(BlockEntityMutation {
+                    expected: Some(change.expected),
+                    replacement: None,
+                });
+            } else if change.expected != change.replacement {
                 changes.push(BlockEntityMutation {
                     expected: Some(change.expected),
                     replacement: Some(change.replacement),
@@ -5606,6 +5632,7 @@ impl LoadedSession {
             sensor_deferred_revision: None,
             sensor_pending: BTreeSet::new(),
             sculk_listeners: BTreeMap::new(),
+            removed_sculk_listeners: BTreeMap::new(),
             active_sculk_listeners: BTreeSet::new(),
             registered_sculk_chunks: BTreeSet::new(),
             unresolved_ice_tick: false,
@@ -6838,6 +6865,9 @@ impl LoadedSession {
         self.registered_sculk_chunks.insert(chunk);
         for saved in sensors {
             let p = saved.position;
+            if self.removed_sculk_listeners.contains_key(&p.to_array()) {
+                continue;
+            }
             let valid = self
                 .world
                 .block(p.x, p.y, p.z)
@@ -7261,7 +7291,10 @@ impl LoadedSession {
             };
             let Some(sensor) = crate::sculk_sensor::Sensor::from_block(block) else {
                 self.active_sculk_listeners.remove(&key);
-                self.sculk_listeners.remove(&key);
+                if let Some(saved) = self.sculk_listeners.remove(&key) {
+                    self.removed_sculk_listeners.entry(key).or_insert(saved);
+                    self.mark_tick_chunk_dirty(position.x, position.z);
+                }
                 continue;
             };
             let ready = self.sculk_adjacent_chunks_loaded(position);
@@ -13102,6 +13135,18 @@ impl LoadedSession {
             original_state,
             replacement_state,
         } = checked;
+        if original_state.as_ref().is_some_and(|state| {
+            matches!(
+                state.name.as_str(),
+                "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor"
+            ) && state.name != replacement_state.name
+        }) {
+            let key = pos.to_array();
+            if let Some(sensor) = self.sculk_listeners.remove(&key) {
+                self.removed_sculk_listeners.entry(key).or_insert(sensor);
+            }
+            self.active_sculk_listeners.remove(&key);
+        }
         let chunk = self.world.chunks.get(&chunk_pos).expect("checked chunk");
         let poi_position = BlockPosition {
             x: pos.x,
@@ -32676,6 +32721,54 @@ pub(crate) mod tests {
         assert_eq!(
             parked_draft.document().value.get("block_entities"),
             draft.document().value.get("block_entities")
+        );
+        let restored = session.parked_chunks.remove(&chunk).unwrap();
+        Arc::make_mut(&mut session.world)
+            .chunks
+            .insert(chunk, restored);
+        let air = session.states[0];
+        assert!(session.set(sensor_pos - session.origin, air));
+        assert!(!session.sculk_listeners.contains_key(&sensor_pos.to_array()));
+        assert!(
+            !session
+                .active_sculk_listeners
+                .contains(&sensor_pos.to_array())
+        );
+        assert!(
+            session
+                .removed_sculk_listeners
+                .contains_key(&sensor_pos.to_array())
+        );
+        let mut removed_draft = session.draft_changed_chunk(chunk, &source).unwrap();
+        session
+            .stage_sculk_listeners(chunk, &source, &mut removed_draft)
+            .unwrap();
+        let Tag::List { values, .. } = removed_draft
+            .document()
+            .value
+            .get("block_entities")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(values.is_empty());
+        let mut stale_removal = session.draft_changed_chunk(chunk, &stale).unwrap();
+        let before = nbt::write(stale_removal.document()).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &stale, &mut stale_removal)
+                .is_err()
+        );
+        assert_eq!(nbt::write(stale_removal.document()).unwrap(), before);
+        session.registered_sculk_chunks.remove(&chunk);
+        session.register_saved_sculk_chunk(chunk);
+        assert!(!session.sculk_listeners.contains_key(&sensor_pos.to_array()));
+        assert!(session.set(sensor_pos - session.origin, active_id));
+        let mut recreated = session.draft_changed_chunk(chunk, &source).unwrap();
+        assert!(
+            session
+                .stage_sculk_listeners(chunk, &source, &mut recreated)
+                .is_err()
         );
     }
 

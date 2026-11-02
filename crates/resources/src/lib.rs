@@ -34,6 +34,7 @@ pub mod models;
 pub mod noise;
 pub mod noise_router;
 pub mod noise_stage;
+pub mod ore_feature;
 pub mod packs;
 pub mod placed_feature;
 pub mod recipes;

@@ -56,6 +56,7 @@ pub mod surface_biomes;
 pub mod surface_pass;
 pub mod surface_rules;
 pub mod transforms;
+pub mod tree_beehive;
 pub mod tree_feature;
 pub mod tree_leaf_update;
 pub mod tree_placers;

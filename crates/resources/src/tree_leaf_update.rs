@@ -539,6 +539,17 @@ impl PositionSet {
     }
 }
 
+/// TreeDecorator.Context copies Java HashSets and stably sorts them by Y.
+pub(crate) fn decorator_positions(positions: &[[i32; 3]]) -> Result<Vec<[i32; 3]>> {
+    let mut set = PositionSet::default();
+    for &pos in positions {
+        set.insert(pos)?;
+    }
+    let mut sorted: Vec<_> = set.values().collect();
+    sorted.sort_by_key(|pos| pos[1]);
+    Ok(sorted)
+}
+
 /// Update reachable leaves and return the occupied world positions used by
 /// `StructureTemplate.updateShapeAtEdge`. The caller must still run that edge
 /// update and must discard the enclosing transaction on errors.

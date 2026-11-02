@@ -234,6 +234,8 @@ impl ConfiguredDecoration {
                 let mut tags = v.required_tags();
                 tags.insert(ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap());
                 tags.insert(ResourceId::parse("minecraft:snow").unwrap());
+                tags.insert(ResourceId::parse("minecraft:supports_vegetation").unwrap());
+                tags.insert(ResourceId::parse("minecraft:supports_dry_vegetation").unwrap());
                 tags
             }
             Self::Selector(values) => values
@@ -1287,6 +1289,16 @@ fn tree_decay_tag() -> &'static ResourceId {
     TAG.get_or_init(|| ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap())
 }
 
+fn tree_vegetation_tag(dry: bool) -> &'static ResourceId {
+    static NORMAL: OnceLock<ResourceId> = OnceLock::new();
+    static DRY: OnceLock<ResourceId> = OnceLock::new();
+    if dry {
+        DRY.get_or_init(|| ResourceId::parse("minecraft:supports_dry_vegetation").unwrap())
+    } else {
+        NORMAL.get_or_init(|| ResourceId::parse("minecraft:supports_vegetation").unwrap())
+    }
+}
+
 fn tree_oak_log(state: &BlockState) -> bool {
     state.name == "minecraft:oak_log"
         && state.properties.len() == 1
@@ -1305,6 +1317,27 @@ fn tree_grass_block(state: &BlockState) -> bool {
         )
 }
 
+fn tree_edge_plant(state: &BlockState) -> Result<Option<SimplePlantKind>> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:short_grass"
+            | "minecraft:fern"
+            | "minecraft:bush"
+            | "minecraft:dandelion"
+            | "minecraft:poppy"
+            | "minecraft:short_dry_grass"
+            | "minecraft:tall_dry_grass"
+            | "minecraft:dead_bush"
+            | "minecraft:tall_grass"
+            | "minecraft:large_fern"
+            | "minecraft:sunflower"
+    ) {
+        Ok(Some(simple_plant_kind(state)?))
+    } else {
+        Ok(None)
+    }
+}
+
 impl DecorationRegion<'_> {
     /// Known-shape writes used by the supported oak tree states. Unknown
     /// block-entity, POI or postprocessing effects abort the transaction.
@@ -1320,6 +1353,7 @@ impl DecorationRegion<'_> {
         let allowed = tree_oak_leaf(state)?
             || tree_oak_log(state)
             || (flags == 2 && tree_grass_block(state))
+            || (flags == 2 && state.name == "minecraft:air" && state.properties.is_empty())
             || (state.name == "minecraft:dirt" && state.properties.is_empty());
         ensure!(allowed, "unsupported tree replacement effects");
         if self.is_outside(pos[1]) {
@@ -1450,6 +1484,41 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
                 let mut updated = state.clone();
                 updated.properties.insert("snowy".into(), snowy.to_string());
                 return Ok(updated);
+            }
+        } else if let Some(kind) = tree_edge_plant(state)? {
+            if matches!(kind, SimplePlantKind::Double) {
+                let half = state.properties["half"].as_str();
+                let pair_direction = (half == "lower" && direction == [0, 1, 0])
+                    || (half == "upper" && direction == [0, -1, 0]);
+                if pair_direction && neighbor.name == state.name {
+                    simple_plant_kind(neighbor)?;
+                }
+                if pair_direction
+                    && (neighbor.name != state.name
+                        || neighbor.properties.get("half").map(String::as_str) == Some(half))
+                {
+                    return Ok(BlockState {
+                        name: "minecraft:air".into(),
+                        properties: BTreeMap::new(),
+                    });
+                }
+            }
+            let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            let survives =
+                if matches!(kind, SimplePlantKind::Double) && state.properties["half"] == "upper" {
+                    below.name == state.name
+                        && below.properties.get("half").map(String::as_str) == Some("lower")
+                } else {
+                    self.tags.contains(
+                        tree_vegetation_tag(matches!(kind, SimplePlantKind::DryVegetation)),
+                        &below.name,
+                    )?
+                };
+            if !survives {
+                return Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: BTreeMap::new(),
+                });
             }
         } else {
             ensure!(
@@ -3479,6 +3548,9 @@ mod tests {
                     json!({"values":["minecraft:oak_leaves"]})
                 }
                 "data/minecraft/tags/block/snow.json" => json!({"values":[]}),
+                "data/minecraft/tags/block/supports_dry_vegetation.json" => {
+                    json!({"values":["minecraft:stone"]})
+                }
                 "data/minecraft/tags/block/logs.json"
                 | "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" => {
                     json!({"values":["minecraft:oak_log"]})
@@ -3612,6 +3684,210 @@ mod tests {
         let world = terrain.snapshot();
         assert_eq!(world.block(4, 8, 4).unwrap().name, "minecraft:oak_log");
         assert_eq!(world.block(12, 8, 12).unwrap().name, "minecraft:oak_log");
+    }
+
+    #[test]
+    fn tree_edges_remove_only_vegetation_without_active_support() {
+        struct Support(bool);
+        impl ResourceProvider for Support {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/supports_vegetation.json" && !self.0 {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                TreeData.read_data(path)
+            }
+        }
+        let (schedule, neighborhood, registry) = prepare_tree_fixture();
+        let plan = fixture_plan(&schedule, &neighborhood);
+        for supported in [false, true] {
+            let prepared = PreparedDecoration::load(
+                &mut Support(supported),
+                &plan,
+                &registry,
+                &mut resolve_tree_test,
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let id = world.intern_state(state("short_grass"));
+            let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+            assert_eq!(
+                terrain.snapshot().block(8, 8, 9).unwrap().name,
+                if supported {
+                    "minecraft:short_grass"
+                } else {
+                    "minecraft:air"
+                }
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn tree_edge_vegetation_survival_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("TreeVegetationOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/TreeVegetationOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let actual = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("TreeVegetationOracle"));
+        struct PlantData(bool);
+        impl ResourceProvider for PlantData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if matches!(
+                    path,
+                    "data/minecraft/tags/block/supports_vegetation.json"
+                        | "data/minecraft/tags/block/supports_dry_vegetation.json"
+                ) {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.0 {vec!["minecraft:stone"]}else{vec![]}}),
+                    )?));
+                }
+                TreeData.read_data(path)
+            }
+        }
+        let names = [
+            "short_grass",
+            "fern",
+            "bush",
+            "dandelion",
+            "poppy",
+            "short_dry_grass",
+            "tall_dry_grass",
+            "dead_bush",
+            "tall_grass",
+            "large_fern",
+            "sunflower",
+        ];
+        let (_, _, mut registry) = prepare_tree_fixture();
+        for name in names {
+            registry.insert(format!("minecraft:{name}"));
+        }
+        let mut expected = Vec::new();
+        for name in names {
+            let doubled = matches!(name, "tall_grass" | "large_fern" | "sunflower");
+            for support in [false, true] {
+                let required = BTreeSet::from([
+                    ResourceId::parse("minecraft:supports_vegetation").unwrap(),
+                    ResourceId::parse("minecraft:supports_dry_vegetation").unwrap(),
+                ]);
+                let tags =
+                    OreBlockTags::load(&mut PlantData(support), &registry, &required).unwrap();
+                let motion = HeightmapTags::load(&mut PlantData(support), &registry).unwrap();
+                let (mut terrain, _, _, _) = fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                for half in 0..if doubled { 2 } else { 1 } {
+                    for below_pair in 0..if doubled && half == 1 { 2 } else { 1 } {
+                        let mut plant = state(name);
+                        if doubled {
+                            plant.properties.insert(
+                                "half".into(),
+                                if half == 0 { "lower" } else { "upper" }.into(),
+                            );
+                        }
+                        let mut below = if below_pair == 1 {
+                            state(name)
+                        } else {
+                            state("stone")
+                        };
+                        if below_pair == 1 {
+                            below.properties.insert("half".into(), "lower".into());
+                        }
+                        let id = region.world.intern_state(below);
+                        let chunk = Arc::make_mut(
+                            region
+                                .world
+                                .chunks
+                                .get_mut(&ChunkPos { x: 0, z: 0 })
+                                .unwrap(),
+                        );
+                        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                        section.blocks.as_mut().unwrap()[8 + 8 * 16 + 7 * 256] = id;
+                        for (direction_name, direction) in
+                            [("down", [0, -1, 0]), ("up", [0, 1, 0]), ("east", [1, 0, 0])]
+                        {
+                            for neighbor_kind in 0..if doubled { 3 } else { 1 } {
+                                let mut neighbor = if neighbor_kind == 0 {
+                                    state("air")
+                                } else {
+                                    state(name)
+                                };
+                                if neighbor_kind != 0 {
+                                    let other = if neighbor_kind == 1 { 1 - half } else { half };
+                                    neighbor.properties.insert(
+                                        "half".into(),
+                                        if other == 0 { "lower" } else { "upper" }.into(),
+                                    );
+                                }
+                                let updated=native_resources::tree_leaf_update::ShapeEdgeWorld::update_shape(&mut region,[8,8,8],&plant,direction,[8+direction[0],8+direction[1],8+direction[2]],&neighbor).unwrap();
+                                let extra = updated
+                                    .properties
+                                    .get("half")
+                                    .map(|v| format!(",{v}"))
+                                    .unwrap_or_default();
+                                expected.push(format!("C {name} {support} {half} {below_pair} {direction_name} {neighbor_kind} {}{extra}",updated.name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let actual: Vec<_> = actual
+            .lines()
+            .filter(|line| line.starts_with("C "))
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(*actual, expected, "case {i}");
+        }
     }
 
     #[test]
@@ -3894,6 +4170,95 @@ mod tests {
             .filter(|line| line.starts_with("GRASS "))
             .collect();
         assert_eq!(java_grass, grass_shapes);
+
+        struct TreeSupport(bool);
+        impl ResourceProvider for TreeSupport {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/supports_vegetation.json" && !self.0 {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
+                TreeData.read_data(path)
+            }
+        }
+        for supported in [false, true] {
+            let mode = if supported {
+                "vegetation-supported"
+            } else {
+                "vegetation"
+            };
+            let java_output = run(Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("TreeChunkOracle")
+                .arg(mode));
+            let actual = java_output
+                .lines()
+                .find(|line| line.starts_with("RESULT "))
+                .unwrap();
+            let prepared = PreparedDecoration::load(
+                &mut TreeSupport(supported),
+                &plan,
+                &registry,
+                &mut resolve_tree_test,
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let id = world.intern_state(state("short_grass"));
+            let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks.as_mut().unwrap()[8 + 9 * 16 + 8 * 256] = id;
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+            let world = terrain.snapshot();
+            assert_eq!(
+                world.block(8, 8, 9).unwrap().name,
+                if supported {
+                    "minecraft:short_grass"
+                } else {
+                    "minecraft:air"
+                }
+            );
+            let mut blocks = Vec::new();
+            for x in 0..16 {
+                for y in 7..16 {
+                    for z in 0..16 {
+                        let block = world.block(x, y, z).unwrap();
+                        let extra = match block.name.as_str() {
+                            "minecraft:dirt" | "minecraft:short_grass" => String::new(),
+                            "minecraft:oak_log" => format!(",axis={}", block.properties["axis"]),
+                            "minecraft:oak_leaves" => format!(
+                                ",distance={},persistent={},waterlogged={}",
+                                block.properties["distance"],
+                                block.properties["persistent"],
+                                block.properties["waterlogged"]
+                            ),
+                            _ => continue,
+                        };
+                        blocks.push(format!("{x},{y},{z},{}{extra}", block.name));
+                    }
+                }
+            }
+            let ticks = world
+                .saved_block_ticks
+                .get(&ChunkPos { x: 0, z: 0 })
+                .into_iter()
+                .flatten()
+                .map(|tick| {
+                    format!(
+                        "{},{},{},{}",
+                        tick.position[0], tick.position[1], tick.position[2], tick.block
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                format!("RESULT true B {} T {}", blocks.join(";"), ticks.join(";")),
+                "{mode}"
+            );
+        }
     }
     #[test]
     fn unsupported_tree_edge_discards_generated_writes_and_ticks() {

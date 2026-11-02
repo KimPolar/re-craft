@@ -32,7 +32,11 @@ public class TreeChunkOracle {
     bind.invoke(Blocks.OAK_LOG.builtInRegistryHolder(),List.of(BlockTags.LOGS,BlockTags.PREVENTS_NEARBY_LEAF_DECAY));
     bind.invoke(Blocks.OAK_LEAVES.builtInRegistryHolder(),List.of(BlockTags.REPLACEABLE_BY_TREES));
     var blocks=new HashMap<BlockPos,BlockState>();var ticks=new LinkedHashSet<String>();
-    if(args.length>0)blocks.put(new BlockPos(8,8,9),Blocks.GRASS_BLOCK.defaultBlockState().setValue(BlockStateProperties.SNOWY,true));
+    if(args.length>0 && args[0].equals("grass"))blocks.put(new BlockPos(8,8,9),Blocks.GRASS_BLOCK.defaultBlockState().setValue(BlockStateProperties.SNOWY,true));
+    if(args.length>0 && args[0].startsWith("vegetation")){
+      blocks.put(new BlockPos(8,8,9),Blocks.SHORT_GRASS.defaultBlockState());
+      if(args[0].equals("vegetation-supported"))bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_VEGETATION));
+    }
     var worldRandom=new WorldgenRandom(new XoroshiroRandomSource(123));
     var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(proxy,m,v)->{
       if(m.getName().equals("getMinY"))return 0;if(m.getName().equals("getMaxY"))return 15;
@@ -51,7 +55,7 @@ public class TreeChunkOracle {
     boolean success=tree.place(world,null,random,new BlockPos(8,8,8));
     var result=new ArrayList<String>();
     for(int x=0;x<16;x++)for(int y=7;y<16;y++)for(int z=0;z<16;z++){
-      var p=new BlockPos(x,y,z);var s=blocks.get(p);if(s==null)continue;
+      var p=new BlockPos(x,y,z);var s=blocks.get(p);if(s==null || s.is(Blocks.AIR))continue;
       var name=BuiltInRegistries.BLOCK.getKey(s.getBlock()).toString();
       var extra=s.is(Blocks.OAK_LOG)?",axis="+s.getValue(BlockStateProperties.AXIS):s.is(Blocks.OAK_LEAVES)?",distance="+s.getValue(BlockStateProperties.DISTANCE)+",persistent="+s.getValue(BlockStateProperties.PERSISTENT)+",waterlogged="+s.getValue(BlockStateProperties.WATERLOGGED):s.is(Blocks.GRASS_BLOCK)?",snowy="+s.getValue(BlockStateProperties.SNOWY):"";
       result.add(pos(p)+","+name+extra);

@@ -320,6 +320,9 @@ pub struct PlacedFeature {
     modifiers: Vec<Modifier>,
 }
 impl PlacedFeature {
+    pub fn needs_sugar_cane_survival(&self) -> bool {
+        self.modifiers.iter().any(|modifier|matches!(modifier,Modifier::BlockPredicate(p) if p.needs_sugar_cane_survival()))
+    }
     pub fn required_tags(&self) -> std::collections::BTreeSet<ResourceId> {
         self.modifiers
             .iter()

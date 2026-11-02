@@ -29,6 +29,7 @@ enum StateSchema {
     Axis,
     DoublePlant,
     BerryBush,
+    Age15,
 }
 
 impl StateSchema {
@@ -40,6 +41,7 @@ impl StateSchema {
             Self::Axis => ("axis", "y"),
             Self::DoublePlant => ("half", "lower"),
             Self::BerryBush => ("age", "0"),
+            Self::Age15 => ("age", "0"),
         };
         BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
     }
@@ -60,6 +62,9 @@ impl StateSchema {
             }
             Self::BerryBush if name == "age" => java_decimal(value)
                 .filter(|n| (0..=3).contains(n))
+                .map(|n| n.to_string()),
+            Self::Age15 if name == "age" => java_decimal(value)
+                .filter(|n| (0..=15).contains(n))
                 .map(|n| n.to_string()),
             _ => None,
         }
@@ -210,6 +215,8 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/SweetBerryBushBlock" => {
                     Some(StateSchema::BerryBush)
                 }
+                "net/minecraft/world/level/block/SugarCaneBlock"
+                | "net/minecraft/world/level/block/CactusBlock" => Some(StateSchema::Age15),
                 _ if stateless_class(
                     &class,
                     &mut read_class,

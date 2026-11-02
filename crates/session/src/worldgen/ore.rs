@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
+    block_column_feature::{BlockColumnFeature, ColumnWorld},
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld},
     feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule},
     heightmap_tags::HeightmapTags,
@@ -41,6 +42,7 @@ pub struct DecorationRegion<'a> {
     feature_marks: BTreeMap<ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     block_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     fluid_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
+    sugar_cane_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -63,6 +65,7 @@ enum ConfiguredDecoration {
     Simple(SimpleBlockFeature<BlockState>),
     Spring(SpringFeature<BlockState>),
     Magma(UnderwaterMagma<BlockState>),
+    Column(BlockColumnFeature<BlockState>),
 }
 impl ConfiguredDecoration {
     fn decode(
@@ -89,6 +92,9 @@ impl ConfiguredDecoration {
             ("minecraft", "underwater_magma") => {
                 Ok(Self::Magma(UnderwaterMagma::decode(value, resolve)?))
             }
+            ("minecraft", "block_column") => {
+                Ok(Self::Column(BlockColumnFeature::decode(value, resolve)?))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -102,6 +108,7 @@ impl ConfiguredDecoration {
             Self::Disk(v) => v.required_tags(),
             Self::Spring(v) => v.required_tags(),
             Self::Magma(_) => BTreeSet::new(),
+            Self::Column(v) => v.required_tags(),
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
                 for state in v.possible_states() {
@@ -134,6 +141,7 @@ impl ConfiguredDecoration {
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
             Self::Magma(v) => v.place(world, random, pos),
+            Self::Column(v) => v.place(world, random, pos),
         }
     }
 }
@@ -154,6 +162,7 @@ pub struct PreparedDecoration<'p, 's> {
     features: BTreeMap<FeatureKey, ScheduledDecorationFeature<'s>>,
     tags: OreBlockTags,
     motion: HeightmapTags,
+    sugar_cane_fluids: Option<BTreeSet<String>>,
 }
 
 impl<'p, 's> PreparedDecoration<'p, 's> {
@@ -167,6 +176,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
     ) -> Result<Self> {
         let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
+        let mut needs_sugar_cane = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
             let index = usize::try_from(selected.index).context("invalid feature index")?;
@@ -189,14 +199,21 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 )
                 .with_context(|| format!("unsupported planned feature {:?}", selected.feature))?;
                 let mut blocks = feature.placed.placement.required_blocks();
+                needs_sugar_cane |= feature.placed.placement.needs_sugar_cane_survival();
                 if let ConfiguredDecoration::Disk(disk) = &feature.placed.feature {
                     blocks.extend(disk.required_blocks());
+                    needs_sugar_cane |= disk.needs_sugar_cane_survival();
                 }
                 if let ConfiguredDecoration::Simple(simple) = &feature.placed.feature {
                     blocks.extend(simple.required_blocks());
+                    needs_sugar_cane |= simple.needs_sugar_cane_survival();
                 }
                 if let ConfiguredDecoration::Spring(spring) = &feature.placed.feature {
                     blocks.extend(spring.required_blocks());
+                }
+                if let ConfiguredDecoration::Column(column) = &feature.placed.feature {
+                    blocks.extend(column.required_blocks());
+                    needs_sugar_cane |= column.needs_sugar_cane_survival();
                 }
                 for id in blocks {
                     ensure!(
@@ -212,11 +229,15 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         }
         let tags = OreBlockTags::load(provider, block_registry, &required)?;
         let motion = HeightmapTags::load(provider, block_registry)?;
+        let sugar_cane_fluids = needs_sugar_cane
+            .then(|| native_resources::fluid_tags::load_sugar_cane_adjacent(provider))
+            .transpose()?;
         Ok(Self {
             plan,
             features,
             tags,
             motion,
+            sugar_cane_fluids,
         })
     }
 
@@ -263,6 +284,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
         }
         let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
+        region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
         let mut results = Vec::with_capacity(self.plan.features.len());
         for (index, selected) in self.plan.features.iter().enumerate() {
             let ore = self
@@ -413,6 +435,7 @@ impl CarvedTerrainWorld {
             feature_marks,
             block_tick_keys: BTreeMap::new(),
             fluid_tick_keys: BTreeMap::new(),
+            sugar_cane_fluids: None,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -895,6 +918,26 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn fluid_in_tag(&mut self, state: &BlockState, tag: &ResourceId) -> Result<bool> {
+        ensure!(
+            tag.namespace == "minecraft" && tag.path == "supports_sugar_cane_adjacently",
+            "unsupported survival fluid tag"
+        );
+        let fluids = self
+            .sugar_cane_fluids
+            .context("sugar cane fluid tags were not prepared")?;
+        let fluid =
+            match native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)? {
+                None => "minecraft:empty",
+                Some(value) => match (value.kind, value.source) {
+                    (native_world::fluid::FluidKind::Water, true) => "minecraft:water",
+                    (native_world::fluid::FluidKind::Water, false) => "minecraft:flowing_water",
+                    (native_world::fluid::FluidKind::Lava, true) => "minecraft:lava",
+                    (native_world::fluid::FluidKind::Lava, false) => "minecraft:flowing_lava",
+                },
+            };
+        Ok(fluids.contains(fluid))
+    }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
         disk_safe_solid(&state.name).context("unsupported disk solid predicate block")
     }
@@ -1293,6 +1336,47 @@ impl MagmaWorld for DecorationRegion<'_> {
                 self.update_final_heightmaps(pos, state)?;
             }
             self.mark_postprocessing([pos[0], pos[1].wrapping_add(1), pos[2]])?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+}
+
+impl ColumnWorld for DecorationRegion<'_> {
+    fn set_column_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        let result = (|| {
+            if !self.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.world.chunks.contains_key(&chunk(pos)),
+                "generation block chunk is missing"
+            );
+            let age = state
+                .properties
+                .get("age")
+                .and_then(|v| v.parse::<u8>().ok());
+            ensure!(
+                state.name == "minecraft:sugar_cane"
+                    && state.properties.len() == 1
+                    && age.is_some_and(|v| v <= 15),
+                "unsupported column replacement effects"
+            );
+            if self.is_outside(pos[1]) {
+                return Ok(true);
+            }
+            let old = self.read(pos)?;
+            ensure!(
+                disk_safe_solid(&old.name).is_some()
+                    || old.name == "minecraft:sugar_cane"
+                    || simple_plant_kind(&old).is_ok(),
+                "unsupported column source effects"
+            );
+            self.set_section_block(pos, state)?;
+            self.update_final_heightmaps(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -2428,6 +2512,87 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sugar_cane_column_uses_active_block_and_fluid_tags() {
+        struct CaneData;
+        impl ResourceProvider for CaneData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{"feature":{
+                        "type":"minecraft:block_column","direction":"up","prioritize_tip":false,"allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},
+                        "layers":[{"height":3,"provider":{"id":"minecraft:sugar_cane","properties":{"age":"0"}}}]
+                    },"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:would_survive","state":"minecraft:sugar_cane"}}]}]]}))?));
+                }
+                let data = match path {
+                    "data/minecraft/tags/block/supports_sugar_cane.json" => {
+                        Some(br#"{"values":["minecraft:stone"]}"#.as_slice())
+                    }
+                    "data/minecraft/tags/block/supports_sugar_cane_adjacently.json" => {
+                        Some(br#"{"values":["minecraft:frosted_ice"]}"#.as_slice())
+                    }
+                    "data/minecraft/tags/fluid/supports_sugar_cane_adjacently.json" => Some(
+                        br#"{"values":["minecraft:water","minecraft:flowing_water"]}"#.as_slice(),
+                    ),
+                    _ => None,
+                };
+                match data {
+                    Some(value) => Ok(Some(value.to_vec())),
+                    None => Data.read_data(path),
+                }
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut CaneData,
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:frosted_ice".into(),
+            "minecraft:sugar_cane".into(),
+        ]);
+        let prepared = PreparedDecoration::load(&mut CaneData, &plan, &registry, &mut |v| {
+            let mut result = resolve_test(v)?;
+            if result.name == "minecraft:sugar_cane" {
+                result.properties.insert("age".into(), "0".into());
+            }
+            Ok(result)
+        })
+        .unwrap();
+        for (neighbor, expected) in [("water", true), ("frosted_ice", true), ("stone", false)] {
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut block = state(neighbor);
+            if neighbor == "water" {
+                block.properties.insert("level".into(), "0".into());
+            }
+            setup.set_section_block([9, 7, 8], &block).unwrap();
+            setup.finish().unwrap();
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [expected]);
+            for y in 8..11 {
+                assert_eq!(
+                    terrain.snapshot().block(8, y, 8).unwrap().name,
+                    if expected {
+                        "minecraft:sugar_cane"
+                    } else {
+                        "minecraft:air"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn installed_spring_and_magma_definitions_load_with_the_block_registry() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -2441,6 +2606,7 @@ mod tests {
             "spring_lava_frozen",
             "spring_delta",
             "underwater_magma",
+            "patch_sugar_cane",
         ] {
             let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
             PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {

@@ -120,6 +120,11 @@ pub fn load_water(provider: &mut impl ResourceProvider) -> Result<BTreeSet<Strin
     load_fluid_tag(provider, "minecraft:water")
 }
 
+/// Active fluids that allow a sugar cane block to survive alongside them.
+pub fn load_sugar_cane_adjacent(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {
+    load_fluid_tag(provider, "minecraft:supports_sugar_cane_adjacently")
+}
+
 fn load_fluid_tag(provider: &mut impl ResourceProvider, name: &str) -> Result<BTreeSet<String>> {
     fn resolve(
         provider: &mut impl ResourceProvider,

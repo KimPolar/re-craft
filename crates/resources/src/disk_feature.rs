@@ -17,6 +17,40 @@ pub trait DiskWorld: OreWorld {
     fn fluid_is(&mut self, state: &Self::State, id: &ResourceId) -> Result<bool>;
     fn set_disk_block(&mut self, pos: [i32; 3], state: &Self::State) -> Result<bool>;
     fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()>;
+    fn fluid_in_tag(&mut self, _state: &Self::State, _tag: &ResourceId) -> Result<bool> {
+        bail!("unsupported survival fluid tag")
+    }
+    fn would_survive(&mut self, state: &Value, pos: [i32; 3]) -> Result<bool> {
+        let raw = state
+            .as_str()
+            .or_else(|| state.get("id").and_then(Value::as_str))
+            .context("missing survival block")?;
+        let id = ResourceId::parse(raw)?;
+        ensure!(
+            id.namespace == "minecraft" && id.path == "sugar_cane",
+            "unsupported would_survive block"
+        );
+        let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
+        let base = self.block(below)?;
+        if self.block_is(&base, &id)? {
+            return Ok(true);
+        }
+        if !self.in_tag(&base, &ResourceId::parse("minecraft:supports_sugar_cane")?)? {
+            return Ok(false);
+        }
+        let adjacent = ResourceId::parse("minecraft:supports_sugar_cane_adjacently")?;
+        for [dx, dz] in [[0, -1], [1, 0], [0, 1], [-1, 0]] {
+            let neighbor = self.block([
+                below[0].wrapping_add(dx),
+                below[1],
+                below[2].wrapping_add(dz),
+            ])?;
+            if self.fluid_in_tag(&neighbor, &adjacent)? || self.in_tag(&neighbor, &adjacent)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +60,7 @@ pub(crate) enum Predicate {
     Tag([i32; 3], ResourceId),
     Fluids([i32; 3], Vec<ResourceId>),
     Solid([i32; 3]),
+    WouldSurvive([i32; 3], ResourceId, Value),
     Not(Box<Predicate>),
     Any(Vec<Predicate>),
     All(Vec<Predicate>),
@@ -56,6 +91,9 @@ impl BlockPredicate {
     /// not implement value equality. `true` is a shared singleton instead.
     pub fn has_independent_identity(&self) -> bool {
         !matches!(self.0, Predicate::True)
+    }
+    pub fn needs_sugar_cane_survival(&self) -> bool {
+        self.0.needs_sugar_cane_survival()
     }
 }
 
@@ -125,6 +163,14 @@ impl Predicate {
                 ids(value.get("fluids").context("missing predicate fluids")?)?,
             ),
             "solid" => Self::Solid(offset(value)?),
+            "would_survive" => {
+                let state = value.get("state").context("missing survival state")?;
+                let raw = state
+                    .as_str()
+                    .or_else(|| state.get("id").and_then(Value::as_str))
+                    .context("missing survival block id")?;
+                Self::WouldSurvive(offset(value)?, ResourceId::parse(raw)?, state.clone())
+            }
             "not" => Self::Not(Box::new(Self::decode(
                 value.get("predicate").context("missing nested predicate")?,
                 depth + 1,
@@ -154,6 +200,17 @@ impl Predicate {
             Self::Tag(_, id) => {
                 tags.insert(id.clone());
             }
+            Self::WouldSurvive(_, id, _)
+                if id.namespace == "minecraft" && id.path == "sugar_cane" =>
+            {
+                tags.insert(
+                    ResourceId::parse("minecraft:supports_sugar_cane").expect("constant tag"),
+                );
+                tags.insert(
+                    ResourceId::parse("minecraft:supports_sugar_cane_adjacently")
+                        .expect("constant tag"),
+                );
+            }
             Self::Not(value) => value.tags(tags),
             Self::Any(values) | Self::All(values) => {
                 for value in values {
@@ -167,6 +224,9 @@ impl Predicate {
     fn blocks(&self, blocks: &mut BTreeSet<ResourceId>) {
         match self {
             Self::Blocks(_, ids) => blocks.extend(ids.iter().cloned()),
+            Self::WouldSurvive(_, id, _) => {
+                blocks.insert(id.clone());
+            }
             Self::Not(value) => value.blocks(blocks),
             Self::Any(values) | Self::All(values) => {
                 for value in values {
@@ -211,6 +271,7 @@ impl Predicate {
                 let state = world.block(at(offset))?;
                 world.is_solid(&state)?
             }
+            Self::WouldSurvive(offset, _, state) => world.would_survive(state, at(offset))?,
             Self::Not(child) => !child.test(world, pos)?,
             Self::Any(children) => {
                 let mut found = false;
@@ -234,6 +295,16 @@ impl Predicate {
             }
         })
     }
+    fn needs_sugar_cane_survival(&self) -> bool {
+        match self {
+            Self::WouldSurvive(_, id, _) => id.namespace == "minecraft" && id.path == "sugar_cane",
+            Self::Not(v) => v.needs_sugar_cane_survival(),
+            Self::All(values) | Self::Any(values) => {
+                values.iter().any(Self::needs_sugar_cane_survival)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +320,19 @@ pub(crate) enum Provider<S> {
     },
 }
 impl<S: Clone> Provider<S> {
+    pub(crate) fn needs_sugar_cane_survival(&self) -> bool {
+        match self {
+            Self::Rules { fallback, rules } => {
+                fallback
+                    .as_ref()
+                    .is_some_and(|v| v.needs_sugar_cane_survival())
+                    || rules.iter().any(|(p, v)| {
+                        p.needs_sugar_cane_survival() || v.needs_sugar_cane_survival()
+                    })
+            }
+            _ => false,
+        }
+    }
     pub(crate) fn decode(
         value: &Value,
         resolve: &mut impl FnMut(&Value) -> Result<S>,
@@ -416,6 +500,9 @@ pub struct DiskFeature<S> {
     half_height: i32,
 }
 impl<S: Clone + Eq> DiskFeature<S> {
+    pub fn needs_sugar_cane_survival(&self) -> bool {
+        self.target.needs_sugar_cane_survival() || self.provider.needs_sugar_cane_survival()
+    }
     pub fn load(
         provider: &mut impl ResourceProvider,
         id: &ResourceId,

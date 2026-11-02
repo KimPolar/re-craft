@@ -22,6 +22,9 @@ pub struct SimpleBlockFeature<S> {
     schedule_tick: bool,
 }
 impl<S: Clone + Eq> SimpleBlockFeature<S> {
+    pub fn needs_sugar_cane_survival(&self) -> bool {
+        self.provider.needs_sugar_cane_survival()
+    }
     pub fn load(
         provider: &mut impl ResourceProvider,
         id: &ResourceId,

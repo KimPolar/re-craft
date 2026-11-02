@@ -197,6 +197,12 @@ fn generated_block_defaults_match_java() {
             cases.push(serde_json::json!({"id":id, "properties":{"level":level.to_string()}}));
         }
     }
+    for id in ["minecraft:sugar_cane", "minecraft:cactus"] {
+        cases.push(serde_json::json!(id));
+        for age in -1..=16 {
+            cases.push(serde_json::json!({"id":id,"properties":{"age":age.to_string()}}));
+        }
+    }
     for snowy in ["true", "false", "yes", "TRUE"] {
         cases.push(serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":snowy,"extra":"ignored"}}));
     }

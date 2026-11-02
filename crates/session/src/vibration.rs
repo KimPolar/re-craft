@@ -754,6 +754,7 @@ mod tests {
         }
         let ticks = data["sensor_ticks"].as_array().unwrap();
         assert_eq!(ticks.len(), 2 * 3 * 16 * 2);
+        crate::loaded::tests::compare_saved_sensors_with_java(ticks);
         for row in ticks {
             let before = parse_sensor(row);
             let change = before.scheduled_tick();

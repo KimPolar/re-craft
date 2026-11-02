@@ -644,6 +644,10 @@ pub struct LoadedSession {
     ice_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32)>,
     ice_deferred_state: Option<(u64, usize, bool)>,
     ice_pending: BTreeSet<(i32, i32, i32)>,
+    sensor_ticks: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32, bool)>,
+    sensor_deferred: BTreeMap<(i128, i32, i64, u64), (i32, i32, i32, bool)>,
+    sensor_deferred_revision: Option<u64>,
+    sensor_pending: BTreeSet<(i32, i32, i32, bool)>,
     unresolved_ice_tick: bool,
     applying_ice_tick: bool,
     bubble_ticks: BTreeMap<(i128, i32, i64, u64), BubbleTickKey>,
@@ -5446,6 +5450,10 @@ impl LoadedSession {
             ice_deferred: BTreeMap::new(),
             ice_deferred_state: None,
             ice_pending: BTreeSet::new(),
+            sensor_ticks: BTreeMap::new(),
+            sensor_deferred: BTreeMap::new(),
+            sensor_deferred_revision: None,
+            sensor_pending: BTreeSet::new(),
             unresolved_ice_tick: false,
             applying_ice_tick: false,
             bubble_ticks: BTreeMap::new(),
@@ -5501,6 +5509,7 @@ impl LoadedSession {
             session.enqueue_saved_buttons(&ticks);
             session.enqueue_saved_lamps(&ticks);
             session.enqueue_saved_ice(&ticks);
+            session.enqueue_saved_sensors(&ticks);
             session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
         }
@@ -8441,6 +8450,7 @@ impl LoadedSession {
                     self.enqueue_saved_buttons(&sand_ticks);
                     self.enqueue_saved_lamps(&sand_ticks);
                     self.enqueue_saved_ice(&sand_ticks);
+                    self.enqueue_saved_sensors(&sand_ticks);
                     self.enqueue_saved_bubble(&sand_ticks);
                     self.enqueue_saved_soil(&sand_ticks);
                 }
@@ -8648,6 +8658,7 @@ impl LoadedSession {
                                     self.enqueue_saved_buttons(&saved_sand_ticks);
                                     self.enqueue_saved_lamps(&saved_sand_ticks);
                                     self.enqueue_saved_ice(&saved_sand_ticks);
+                                    self.enqueue_saved_sensors(&saved_sand_ticks);
                                     self.enqueue_saved_bubble(&saved_sand_ticks);
                                     self.enqueue_saved_soil(&saved_sand_ticks);
                                 }
@@ -12909,6 +12920,55 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_sensors(&mut self, ticks: &[SavedBlockTick]) {
+        for (index, tick) in ticks.iter().enumerate() {
+            let calibrated = match tick.block.as_str() {
+                "minecraft:sculk_sensor" | "sculk_sensor" => false,
+                "minecraft:calibrated_sculk_sensor" | "calibrated_sculk_sensor" => true,
+                _ => continue,
+            };
+            let [x, y, z] = tick.position;
+            let key = (x, y, z, calibrated);
+            self.sensor_pending.insert(key);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.sensor_ticks.insert(
+                (
+                    i128::from(self.tick) + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_sensor(&mut self, absolute: IVec3, calibrated: bool, delay: u8) {
+        let key = (absolute.x, absolute.y, absolute.z, calibrated);
+        if !self.sensor_pending.insert(key) {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.0, key.2);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.sensor_ticks.insert(
+            (
+                i128::from(self.tick) + i128::from(delay),
+                0,
+                i64::try_from(sequence).unwrap_or(i64::MAX),
+                sequence,
+            ),
+            key,
+        );
+    }
+
     fn schedule_ice(&mut self, relative: IVec3, delay: i32) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -13174,17 +13234,17 @@ impl LoadedSession {
     }
 
     fn advance_block_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, true, true, true, true, true);
+        self.advance_scheduled_block_ticks(true, true, true, true, true, true, true);
     }
 
     #[cfg(test)]
     fn advance_sand_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(true, false, false, false, false, false);
+        self.advance_scheduled_block_ticks(true, false, false, false, false, false, false);
     }
 
     #[cfg(test)]
     fn advance_soil_ticks(&mut self) {
-        self.advance_scheduled_block_ticks(false, false, true, false, false, false);
+        self.advance_scheduled_block_ticks(false, false, true, false, false, false, false);
     }
 
     fn advance_scheduled_block_ticks(
@@ -13195,6 +13255,7 @@ impl LoadedSession {
         process_lamps: bool,
         process_ice: bool,
         process_bubble: bool,
+        process_sensor: bool,
     ) {
         let revision = self.revision;
         let ice_state = (
@@ -13220,12 +13281,16 @@ impl LoadedSession {
         if process_lamps && self.lamp_deferred_revision != Some(revision) {
             self.lamp_ticks.append(&mut self.lamp_deferred);
         }
+        if process_sensor && self.sensor_deferred_revision != Some(revision) {
+            self.sensor_ticks.append(&mut self.sensor_deferred);
+        }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
         let mut deferred_lamps = Vec::new();
         let mut deferred_ice = Vec::new();
         let mut deferred_bubble = Vec::new();
+        let mut deferred_sensors = Vec::new();
         let mut executed = 0;
         while executed < 65_536 {
             let sand_order = process_sand
@@ -13246,6 +13311,9 @@ impl LoadedSession {
             let bubble_order = process_bubble
                 .then(|| self.bubble_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let sensor_order = process_sensor
+                .then(|| self.sensor_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
             let Some((order, kind)) = [
                 (sand_order, 0),
                 (button_order, 1),
@@ -13253,6 +13321,7 @@ impl LoadedSession {
                 (lamp_order, 3),
                 (ice_order, 4),
                 (bubble_order, 5),
+                (sensor_order, 6),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -13547,6 +13616,98 @@ impl LoadedSession {
                     continue;
                 }
                 executed += 1;
+            } else if kind == 6 {
+                let (order, key) = self
+                    .sensor_ticks
+                    .pop_first()
+                    .expect("selected sensor tick remains queued");
+                let absolute = IVec3::new(key.0, key.1, key.2);
+                let Some(relative) = subtract(absolute, self.origin) else {
+                    deferred_sensors.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    deferred_sensors.push((order, key));
+                    continue;
+                };
+                let Some(current) = self.world.state(id) else {
+                    deferred_sensors.push((order, key));
+                    continue;
+                };
+                let expected = if key.3 {
+                    "minecraft:calibrated_sculk_sensor"
+                } else {
+                    "minecraft:sculk_sensor"
+                };
+                if current.name != expected {
+                    self.sensor_pending.remove(&key);
+                    self.mark_tick_chunk_dirty(key.0, key.2);
+                    executed += 1;
+                    continue;
+                }
+                let Some(sensor) = crate::sculk_sensor::Sensor::from_block(current) else {
+                    deferred_sensors.push((order, key));
+                    continue;
+                };
+                let transition = sensor.scheduled_tick();
+                if let Some(change) = transition {
+                    let next =
+                        self.intern_block(change.state.to_block().expect("validated sensor state"));
+                    if self.check_block_set(relative, next, false, false).is_none()
+                        || !self.set_with_notify(relative, next, false)
+                    {
+                        deferred_sensors.push((order, key));
+                        continue;
+                    }
+                    self.sensor_pending.remove(&key);
+                    if let Some(delay) = change.tick_after {
+                        self.schedule_sensor(absolute, key.3, delay);
+                    }
+                    if change.notify_neighbors {
+                        for center in [Some(relative), add(relative, IVec3::NEG_Y)]
+                            .into_iter()
+                            .flatten()
+                        {
+                            for direction in [
+                                IVec3::NEG_Y,
+                                IVec3::Y,
+                                IVec3::NEG_Z,
+                                IVec3::Z,
+                                IVec3::NEG_X,
+                                IVec3::X,
+                            ] {
+                                if let Some(neighbor) = add(center, direction) {
+                                    self.update_lamp(neighbor);
+                                }
+                            }
+                        }
+                    }
+                    if change.play_stop {
+                        let pitch = self.level_random.next_float() * 0.2_f32 + 0.8_f32;
+                        if self.consume_sounds.len() == 4096 {
+                            self.consume_sounds.pop_front();
+                        }
+                        self.consume_sounds.push_back(crate::ConsumeSound {
+                            position: absolute.as_dvec3() + DVec3::splat(0.5),
+                            info: crate::ConsumeSoundInfo {
+                                event: "minecraft:block.sculk_sensor.clicking_stop".into(),
+                                volume: 1.0,
+                                pitch,
+                                category: crate::ConsumeSoundCategory::Block,
+                            },
+                        });
+                    }
+                } else {
+                    self.sensor_pending.remove(&key);
+                }
+                self.mark_tick_chunk_dirty(key.0, key.2);
+                executed += 1;
             } else if kind == 5 {
                 let (order, key) = self
                     .bubble_ticks
@@ -13733,6 +13894,10 @@ impl LoadedSession {
         if process_bubble {
             self.bubble_deferred.extend(deferred_bubble);
             self.bubble_deferred_revision = Some(revision);
+        }
+        if process_sensor {
+            self.sensor_deferred.extend(deferred_sensors);
+            self.sensor_deferred_revision = Some(revision);
         }
     }
 
@@ -20175,6 +20340,75 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn compare_saved_sensors_with_java(rows: &[serde_json::Value]) {
+        for row in rows {
+            let mut session = session();
+            let calibrated = row["calibrated"].as_bool().unwrap();
+            let phase = match row["phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            let sensor = crate::sculk_sensor::Sensor {
+                phase,
+                power: row["power"].as_u64().unwrap() as u8,
+                waterlogged: row["wet"].as_bool().unwrap(),
+                facing: calibrated.then_some(IVec3::NEG_Z),
+            };
+            let relative = IVec3::new(4, 2, 4);
+            let absolute = session.origin + relative;
+            let id = session.intern_block(sensor.to_block().unwrap());
+            assert!(session.set(relative, id));
+            session.level_random = native_core::random::LegacyRandom::new(42);
+            session.schedule_sensor(absolute, calibrated, 0);
+            session.advance_block_ticks();
+            let actual = crate::sculk_sensor::Sensor::from_block(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap(),
+            )
+            .unwrap();
+            let expected_phase = match row["after_phase"].as_str().unwrap() {
+                "inactive" => crate::sculk_sensor::Phase::Inactive,
+                "active" => crate::sculk_sensor::Phase::Active,
+                "cooldown" => crate::sculk_sensor::Phase::Cooldown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                (actual.phase, u64::from(actual.power)),
+                (expected_phase, row["after_power"].as_u64().unwrap()),
+                "{row}"
+            );
+            let delay = session
+                .sensor_ticks
+                .first_key_value()
+                .map_or(0, |(order, _)| order.0);
+            assert_eq!(delay, i128::from(row["delay"].as_i64().unwrap()), "{row}");
+            let sounds = session.take_consume_sounds();
+            assert_eq!(
+                sounds.len() as u64,
+                row["sounds"].as_u64().unwrap(),
+                "{row}"
+            );
+            if let Some(sound) = sounds.first() {
+                assert_eq!(sound.info.event, row["sound"].as_str().unwrap(), "{row}");
+                assert_eq!(
+                    sound.info.pitch.to_bits(),
+                    row["pitch_bits"].as_i64().unwrap() as u32,
+                    "{row}"
+                );
+            }
+            assert_eq!(
+                i64::from(session.level_random.next_int()),
+                row["next_random"].as_i64().unwrap(),
+                "{row}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -32686,6 +32920,183 @@ pub(crate) mod tests {
             let error = session.draft_player_state_inner(&original).unwrap_err();
             assert!(error.to_string().contains("sculk sensor events"), "{error}");
         }
+    }
+
+    #[test]
+    fn saved_sensor_ticks_transition_and_update_neighboring_lamps() {
+        for calibrated in [false, true] {
+            for wet in [false, true] {
+                let mut session = session();
+                let position = IVec3::new(4, 2, 4);
+                let absolute = session.origin + position;
+                let sensor = crate::sculk_sensor::Sensor {
+                    phase: crate::sculk_sensor::Phase::Active,
+                    power: 8,
+                    waterlogged: wet,
+                    facing: calibrated.then_some(IVec3::NEG_Z),
+                };
+                let id = session.intern_block(sensor.to_block().unwrap());
+                assert!(session.set(position, id));
+                let lamp =
+                    session.intern_block(state("minecraft:redstone_lamp", &[("lit", "true")]));
+                assert!(session.set(position + IVec3::X, lamp));
+                let name = if calibrated {
+                    "minecraft:calibrated_sculk_sensor"
+                } else {
+                    "minecraft:sculk_sensor"
+                };
+                session.enqueue_saved_sensors(&[SavedBlockTick {
+                    block: name.into(),
+                    position: absolute.to_array(),
+                    delay: 0,
+                    priority: 0,
+                }]);
+                session.advance_block_ticks();
+                let current = crate::sculk_sensor::Sensor::from_block(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    (current.phase, current.power),
+                    (crate::sculk_sensor::Phase::Cooldown, 0)
+                );
+                assert_eq!(session.sensor_ticks.first_key_value().unwrap().0.0, 10);
+                assert_eq!(session.lamp_ticks.first_key_value().unwrap().0.0, 4);
+                session.tick = 4;
+                session.advance_block_ticks();
+                let lamp_pos = absolute + IVec3::X;
+                assert_eq!(
+                    redstone_lamp_lit(
+                        session
+                            .world
+                            .block(lamp_pos.x, lamp_pos.y, lamp_pos.z)
+                            .unwrap()
+                    ),
+                    Some(false)
+                );
+                session.tick = 10;
+                session.advance_block_ticks();
+                let current = crate::sculk_sensor::Sensor::from_block(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(current.phase, crate::sculk_sensor::Phase::Inactive);
+                let sounds = session.take_consume_sounds();
+                assert_eq!(sounds.len(), usize::from(!wet));
+                if !wet {
+                    assert_eq!(
+                        sounds[0].info.event,
+                        "minecraft:block.sculk_sensor.clicking_stop"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_sensor_ticks_ignore_stale_blocks_and_defer_invalid_states() {
+        let mut session = session();
+        let pos = session.origin + IVec3::new(4, 2, 4);
+        let tick = SavedBlockTick {
+            block: "minecraft:sculk_sensor".into(),
+            position: pos.to_array(),
+            delay: 0,
+            priority: 0,
+        };
+        session.enqueue_saved_sensors(std::slice::from_ref(&tick));
+        session.advance_block_ticks();
+        assert!(session.sensor_ticks.is_empty() && session.sensor_pending.is_empty());
+        let invalid = session.intern_block(state("minecraft:sculk_sensor", &[("power", "wrong")]));
+        assert!(session.set(IVec3::new(4, 2, 4), invalid));
+        session.enqueue_saved_sensors(&[tick]);
+        session.advance_block_ticks();
+        assert_eq!(session.sensor_deferred.len(), 1);
+        let valid = crate::sculk_sensor::Sensor {
+            phase: crate::sculk_sensor::Phase::Active,
+            power: 3,
+            waterlogged: false,
+            facing: None,
+        };
+        let id = session.intern_block(valid.to_block().unwrap());
+        assert!(session.set(IVec3::new(4, 2, 4), id));
+        session.advance_block_ticks();
+        assert!(session.sensor_deferred.is_empty());
+        let state = crate::sculk_sensor::Sensor::from_block(
+            session.world.block(pos.x, pos.y, pos.z).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.phase, crate::sculk_sensor::Phase::Cooldown);
+    }
+
+    #[test]
+    fn loaded_sensor_schedule_is_independent_of_frame_intervals() {
+        let make = || {
+            let (mut world, origin, player) = fixture();
+            let position = IVec3::new(4, 2, 4);
+            let sensor = crate::sculk_sensor::Sensor {
+                phase: crate::sculk_sensor::Phase::Active,
+                power: 7,
+                waterlogged: false,
+                facing: None,
+            };
+            let id = world.intern_state(sensor.to_block().unwrap());
+            let chunk_pos = ChunkPos {
+                x: origin.x.div_euclid(16),
+                z: origin.z.div_euclid(16),
+            };
+            let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            section.blocks.as_mut().unwrap()[4 + 4 * 16 + 2 * 256] = id;
+            world.saved_block_ticks.insert(
+                chunk_pos,
+                vec![SavedBlockTick {
+                    block: "minecraft:sculk_sensor".into(),
+                    position: (origin + position).to_array(),
+                    delay: 2,
+                    priority: 0,
+                }],
+            );
+            let mut session = LoadedSession::new(
+                world,
+                origin,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session.set_random_tick_speed(0);
+            session.level_random = native_core::random::LegacyRandom::new(42);
+            session
+        };
+        let mut slow = make();
+        let mut fast = make();
+        for _ in 0..15 {
+            slow.update(TICK);
+            fast.update(Duration::from_millis(25));
+            fast.update(Duration::from_millis(25));
+            let abs = slow.origin + IVec3::new(4, 2, 4);
+            assert_eq!(
+                slow.world.block(abs.x, abs.y, abs.z),
+                fast.world.block(abs.x, abs.y, abs.z)
+            );
+            assert_eq!(slow.sensor_ticks, fast.sensor_ticks);
+            assert_eq!(slow.take_consume_sounds(), fast.take_consume_sounds());
+        }
+        let pos = slow.origin + IVec3::new(4, 2, 4);
+        assert_eq!(
+            crate::sculk_sensor::Sensor::from_block(slow.world.block(pos.x, pos.y, pos.z).unwrap())
+                .unwrap()
+                .phase,
+            crate::sculk_sensor::Phase::Inactive
+        );
     }
 
     #[test]

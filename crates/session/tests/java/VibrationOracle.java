@@ -26,7 +26,7 @@ import net.minecraft.world.phys.Vec3;
 
 public class VibrationOracle {
     static class World extends ServerLevel {
-        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection;
+        long now; Set<BlockPos> occluders; int signal, delay, notifications, sounds, events; BlockState sensorState; RandomSource sensorRandom; BlockPos signalPosition; Direction signalDirection; float soundPitch; String soundId;
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public long getGameTime() { return now; }
         @Override public boolean shouldTickBlocksAt(long pos) { return false; }
@@ -37,7 +37,7 @@ public class VibrationOracle {
         @Override public void updateNeighborsAt(BlockPos pos, Block block) { notifications++; }
         @Override public void updateNeighborsAt(BlockPos pos, Block block, Orientation orientation) { notifications++; }
         @Override public RandomSource getRandom() { return sensorRandom; }
-        @Override public void playSound(Entity entity, BlockPos pos, SoundEvent event, SoundSource source, float volume, float pitch) { sounds++; }
+        @Override public void playSound(Entity entity, BlockPos pos, SoundEvent event, SoundSource source, float volume, float pitch) { sounds++;soundPitch=pitch;soundId=event.location().toString(); }
         @Override public void playSound(Entity entity, double x,double y,double z,SoundEvent event,SoundSource source,float volume,float pitch) { sounds++; }
         @Override public void gameEvent(Entity entity, Holder<GameEvent> event, BlockPos pos) { events++; }
         @Override public <T extends ParticleOptions> int sendParticles(T type, double x, double y, double z, int count, double dx, double dy, double dz, double speed) { return 0; }
@@ -164,11 +164,11 @@ public class VibrationOracle {
                 }
                 row.addProperty("weak",state.getSignal(world,BlockPos.ZERO,direction));row.addProperty("direct",state.getDirectSignal(world,BlockPos.ZERO,direction));sensorSignals.add(row);
             }
-            world.sensorState=state;world.delay=0;world.notifications=0;world.sounds=0;world.events=0;
+            world.sensorState=state;world.delay=0;world.notifications=0;world.sounds=0;world.events=0;world.soundId="";world.soundPitch=0;world.sensorRandom=RandomSource.create(42);
             state.tick(world,BlockPos.ZERO,world.sensorRandom);
             var row=new JsonObject();row.addProperty("calibrated",calibrated!=0);row.addProperty("phase",phase.getSerializedName());row.addProperty("power",power);row.addProperty("wet",wet);
             row.addProperty("after_phase",world.sensorState.getValue(SculkSensorBlock.PHASE).getSerializedName());row.addProperty("after_power",world.sensorState.getValue(SculkSensorBlock.POWER));
-            row.addProperty("delay",world.delay);row.addProperty("notifications",world.notifications);row.addProperty("sounds",world.sounds);sensorTicks.add(row);
+            row.addProperty("delay",world.delay);row.addProperty("notifications",world.notifications);row.addProperty("sounds",world.sounds);row.addProperty("sound",world.soundId);row.addProperty("pitch_bits",Float.floatToRawIntBits(world.soundPitch));row.addProperty("next_random",world.sensorRandom.nextInt());sensorTicks.add(row);
         }
         for (int calibrated=0;calibrated<2;calibrated++) for (var phase:SculkSensorPhase.values()) {
             var state=(calibrated==0 ? Blocks.SCULK_SENSOR : Blocks.CALIBRATED_SCULK_SENSOR).defaultBlockState().setValue(SculkSensorBlock.PHASE,phase);

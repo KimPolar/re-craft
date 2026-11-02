@@ -55,6 +55,13 @@ pub fn source(state: &BlockState, direction: IVec3) -> Option<(u8, u8, bool)> {
     if !DIRECTIONS.contains(&direction) {
         return None;
     }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:sculk_sensor" | "minecraft:calibrated_sculk_sensor"
+    ) {
+        let (weak, direct) = crate::sculk_sensor::Sensor::from_block(state)?.signal(direction)?;
+        return Some((weak, direct, false));
+    }
     if state.name == "minecraft:chest" {
         native_world::collision::block_shape(state)?;
         return Some((0, 0, false));

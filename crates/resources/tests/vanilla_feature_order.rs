@@ -116,7 +116,7 @@ fn feature_order_matches_java_for_biomes_and_cycles() {
     }
     let schedule = FeatureSchedule::load(&mut provider, &possible_biomes, &registry).unwrap();
     let scheduled: Vec<Vec<i32>> = schedule
-        .steps
+        .steps()
         .iter()
         .map(|step| step.iter().map(|key| keys[key]).collect())
         .collect();

@@ -33,8 +33,19 @@ pub struct BiomeFeatures {
 
 /// Global feature order and the biome holder lists that contributed to it.
 pub struct FeatureSchedule {
-    pub steps: Vec<Vec<FeatureKey>>,
-    pub biomes: BTreeMap<ResourceId, BiomeFeatures>,
+    steps: Vec<Vec<FeatureKey>>,
+    biomes: BTreeMap<ResourceId, BiomeFeatures>,
+    possible_biomes: Vec<ResourceId>,
+    indices: BTreeMap<ResourceId, Vec<Vec<usize>>>,
+}
+
+/// A selected feature retains its global index even when earlier features are
+/// absent from the chunk's neighboring biomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedFeature<'a> {
+    pub step: i32,
+    pub index: i32,
+    pub feature: &'a FeatureKey,
 }
 
 impl FeatureSchedule {
@@ -55,7 +66,90 @@ impl FeatureSchedule {
             biomes.insert(id.clone(), biome);
         }
         let steps = order_features(&lists)?;
-        Ok(Self { steps, biomes })
+        ensure!(
+            i32::try_from(steps.len()).is_ok(),
+            "too many decoration steps"
+        );
+        let mut lookup = Vec::with_capacity(steps.len());
+        for step in &steps {
+            ensure!(
+                i32::try_from(step.len()).is_ok(),
+                "too many features in a decoration step"
+            );
+            lookup.push(
+                step.iter()
+                    .enumerate()
+                    .map(|(i, key)| (key, i))
+                    .collect::<BTreeMap<_, _>>(),
+            );
+        }
+        let mut indices = BTreeMap::new();
+        for (id, biome) in &biomes {
+            let mut features = Vec::with_capacity(biome.steps.len());
+            for (step, keys) in biome.steps.iter().enumerate() {
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    values.push(
+                        *lookup[step]
+                            .get(key)
+                            .context("feature missing from global schedule")?,
+                    );
+                }
+                features.push(values);
+            }
+            indices.insert(id.clone(), features);
+        }
+        Ok(Self {
+            steps,
+            biomes,
+            possible_biomes: possible_biomes.to_vec(),
+            indices,
+        })
+    }
+
+    pub fn steps(&self) -> &[Vec<FeatureKey>] {
+        &self.steps
+    }
+    pub fn biome(&self, id: &ResourceId) -> Option<&BiomeFeatures> {
+        self.biomes.get(id)
+    }
+    pub fn possible_biomes(&self) -> &[ResourceId] {
+        &self.possible_biomes
+    }
+
+    /// Union features from present possible biomes, in global step/index order.
+    /// Other biomes are ignored exactly as Java's `retainAll(possibleBiomes)`.
+    pub fn select<'a, 'b>(
+        &'a self,
+        present: impl IntoIterator<Item = &'b ResourceId>,
+    ) -> Vec<SelectedFeature<'a>> {
+        let mut selected: Vec<Vec<bool>> = self
+            .steps
+            .iter()
+            .map(|step| vec![false; step.len()])
+            .collect();
+        for biome in present {
+            if let Some(steps) = self.indices.get(biome) {
+                for (step, indices) in steps.iter().enumerate() {
+                    for &index in indices {
+                        selected[step][index] = true;
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        for (step, flags) in selected.iter().enumerate() {
+            for (index, &flag) in flags.iter().enumerate() {
+                if flag {
+                    result.push(SelectedFeature {
+                        step: step as i32,
+                        index: index as i32,
+                        feature: &self.steps[step][index],
+                    });
+                }
+            }
+        }
+        result
     }
 }
 
@@ -425,5 +519,51 @@ mod tests {
             order_features::<char>(&[vec![vec![], vec![]]]).unwrap(),
             vec![Vec::<char>::new(), Vec::new()]
         );
+    }
+
+    #[test]
+    fn selection_uses_global_indices_and_ignores_absent_biomes() {
+        let mut data = Data::default();
+        insert(
+            &mut data,
+            "data/test/worldgen/biome/a.json",
+            &[json!({"features":[["test:a","test:b"],["test:c"]]})],
+        );
+        insert(
+            &mut data,
+            "data/test/worldgen/biome/b.json",
+            &[json!({"features":[["test:d","test:b"],["test:e"]]})],
+        );
+        let registry = ["test:a", "test:b", "test:c", "test:d", "test:e"]
+            .into_iter()
+            .map(id)
+            .collect();
+        let a = id("test:a");
+        let b = id("test:b");
+        let missing = id("test:missing");
+        let schedule =
+            FeatureSchedule::load(&mut data, &[a.clone(), b.clone()], &registry).unwrap();
+        let actual = schedule.select([&b, &missing, &b]);
+        let expected: Vec<_> = schedule
+            .steps()
+            .iter()
+            .enumerate()
+            .flat_map(|(step, list)| {
+                list.iter().enumerate().filter_map(move |(index, feature)| {
+                    let wanted = ["test:b", "test:d", "test:e"]
+                        .iter()
+                        .any(|name| *feature == FeatureKey::Registered(id(name)));
+                    wanted.then_some((step as i32, index as i32, feature))
+                })
+            })
+            .collect();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|v| (v.step, v.index, v.feature))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(schedule.select([&missing]).is_empty());
     }
 }

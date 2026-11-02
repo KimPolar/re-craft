@@ -118,6 +118,7 @@ enum ConfiguredDecoration {
         Vec<(f32, PlacedDecorationFeature)>,
         Box<PlacedDecorationFeature>,
     ),
+    WeightedListSelector(Vec<(i32, PlacedDecorationFeature)>, i32),
 }
 #[derive(Default)]
 struct FeatureLoadState {
@@ -180,6 +181,10 @@ impl ConfiguredDecoration {
                 }
                 blocks
             }
+            Self::WeightedListSelector(values, _) => values
+                .iter()
+                .flat_map(|(_, v)| v.required_blocks())
+                .collect(),
             _ => BTreeSet::new(),
         }
     }
@@ -201,6 +206,9 @@ impl ConfiguredDecoration {
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
             }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.needs_survival(name))
+            }
             _ => false,
         }
     }
@@ -216,6 +224,9 @@ impl ConfiguredDecoration {
             Self::WeightedSelector(values, default) => {
                 default.needs_water_fluids() || values.iter().any(|(_, v)| v.needs_water_fluids())
             }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.needs_water_fluids())
+            }
             _ => false,
         }
     }
@@ -229,6 +240,7 @@ impl ConfiguredDecoration {
             Self::WeightedSelector(values, default) => {
                 default.needs_freeze() || values.iter().any(|(_, v)| v.needs_freeze())
             }
+            Self::WeightedListSelector(values, _) => values.iter().any(|(_, v)| v.needs_freeze()),
             _ => false,
         }
     }
@@ -243,6 +255,9 @@ impl ConfiguredDecoration {
             Self::WeightedSelector(values, default) => {
                 default.feature.needs_root_system()
                     || values.iter().any(|(_, v)| v.feature.needs_root_system())
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.feature.needs_root_system())
             }
             _ => false,
         }
@@ -384,6 +399,35 @@ impl ConfiguredDecoration {
                 )?;
                 Ok(Self::WeightedSelector(features, Box::new(default)))
             }
+            ("minecraft", "weighted_random_selector") => {
+                let entries = value
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .context("missing weighted list features")?;
+                ensure!(entries.len() <= 4096, "too many weighted list features");
+                let mut features = Vec::with_capacity(entries.len());
+                let mut total = 0i32;
+                for entry in entries {
+                    let weight = entry
+                        .get("weight")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .context("invalid selector weight")?;
+                    ensure!(weight >= 0, "invalid selector weight");
+                    total = total
+                        .checked_add(weight)
+                        .context("selector weight total overflow")?;
+                    let nested = PlacedDecorationFeature::load_nested(
+                        provider,
+                        entry.get("data").context("missing weighted list feature")?,
+                        resolve,
+                        state,
+                        depth + 1,
+                    )?;
+                    features.push((weight, nested));
+                }
+                Ok(Self::WeightedListSelector(features, total))
+            }
             _ => bail!(
                 "unsupported decoration feature {}:{}",
                 id.namespace,
@@ -440,6 +484,9 @@ impl ConfiguredDecoration {
                     tags.extend(feature.required_tags());
                 }
                 tags
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().flat_map(|(_, v)| v.required_tags()).collect()
             }
             Self::Simple(v) => {
                 let mut tags = v.required_tags();
@@ -548,6 +595,27 @@ impl ConfiguredDecoration {
                     }
                 }
                 world.place_nested(default, random, pos, generator_min_y, generator_height)
+            }
+            Self::WeightedListSelector(values, total) => {
+                if *total == 0 {
+                    return Ok(false);
+                }
+                let mut choice = random
+                    .next_int_bound(*total)
+                    .context("invalid selector total")?;
+                for (weight, feature) in values {
+                    choice -= weight;
+                    if choice < 0 {
+                        return world.place_nested(
+                            feature,
+                            random,
+                            pos,
+                            generator_min_y,
+                            generator_height,
+                        );
+                    }
+                }
+                bail!("weighted selector total does not match entries")
             }
         }
     }
@@ -6092,6 +6160,37 @@ mod tests {
     }
 
     #[test]
+    fn weighted_selector_validates_weights_and_keeps_zero_weight_dependencies() {
+        let vine = json!({"feature":{"type":"minecraft:vines"},"placement":[]});
+        let make = |features: Value| json!({"feature":{"type":"minecraft:weighted_random_selector","features":features},"placement":[]});
+        let placed = PlacedDecorationFeature::from_placement(
+            &mut Data,
+            PlacedFeature::decode(&make(json!([{"weight":0,"data":vine}]))).unwrap(),
+            &mut resolve_test,
+        )
+        .unwrap();
+        assert!(
+            placed
+                .required_blocks()
+                .contains(&ResourceId::parse("minecraft:vine").unwrap())
+        );
+        for features in [
+            json!([{"weight":-1,"data":vine}]),
+            json!([{"weight":2147483647i64,"data":vine},{"weight":1,"data":vine}]),
+            json!([{"data":vine}]),
+        ] {
+            assert!(
+                PlacedDecorationFeature::from_placement(
+                    &mut Data,
+                    PlacedFeature::decode(&make(features)).unwrap(),
+                    &mut resolve_test
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and a Java 25 JDK"]
     fn nested_selectors_match_java_placement_and_randomness() {
         use std::{path::PathBuf, process::Command};
@@ -6131,8 +6230,20 @@ mod tests {
                 json!({"type":"minecraft:simple_random_selector","features":[a,b,inner]})
             } else if kind == 1 {
                 json!({"type":"minecraft:random_selector","features":[{"chance":0.4,"feature":inner},{"chance":0.3,"feature":b}],"default":a})
-            } else {
+            } else if kind == 2 {
                 json!({"type":"minecraft:random_boolean_selector","feature_true":inner,"feature_false":b})
+            } else {
+                let entries = match kind {
+                    3 => json!([{"weight":80,"data":a},{"weight":20,"data":b}]),
+                    4 => {
+                        json!([{"weight":1,"data":a},{"weight":0,"data":inner},{"weight":62,"data":b}])
+                    }
+                    5 => json!([{"weight":0,"data":a},{"weight":0,"data":b}]),
+                    6 => json!([]),
+                    7 => json!([{"weight":1,"data":inner}]),
+                    _ => unreachable!(),
+                };
+                json!({"type":"minecraft:weighted_random_selector","features":entries})
             };
             json!({"feature":feature,"placement":[{"type":"minecraft:count","count":2}]})
         }
@@ -6219,7 +6330,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(cases.len(), 3 * 2 * 2 * 16);
+        assert_eq!(cases.len(), 8 * 2 * 2 * 16);
         let mut registry = batch_registry();
         registry.extend(["minecraft:melon".into(), "minecraft:pumpkin".into()]);
         let tags = OreBlockTags::load(&mut SelectorData, &registry, &BTreeSet::new()).unwrap();

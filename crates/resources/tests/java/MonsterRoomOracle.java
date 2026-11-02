@@ -24,7 +24,8 @@ public class MonsterRoomOracle {
   var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);bind.invoke(Blocks.BEDROCK.builtInRegistryHolder(),List.of(BlockTags.FEATURES_CANNOT_REPLACE));
   out.printf("K %s %s %s %s%n",Blocks.CHEST.defaultBlockState().isSolid(),Blocks.CHEST.defaultBlockState().isSolidRender(),Blocks.SPAWNER.defaultBlockState().isSolid(),Blocks.SPAWNER.defaultBlockState().isSolidRender());
   var next=BaseSpawner.class.getDeclaredField("nextSpawnData");next.setAccessible(true);
-  boolean chunk=args.length>0 && args[0].equals("chunk");final int bx=chunk?8:0,by=chunk?8:20,bz=chunk?8:0;
+  boolean grass=args.length>0 && args[0].equals("chunk_grass");
+  boolean chunk=grass || args.length>0 && args[0].equals("chunk");final int bx=chunk?8:0,by=chunk?8:20,bz=chunk?8:0;
   for(long seed:new long[]{0,1,-1,987654321})for(int mode=0;mode<8;mode++){
    final int scenario=mode;var probe=new WorldgenRandom(new XoroshiroRandomSource(seed));int rx=probe.nextInt(2)+2,rz=probe.nextInt(2)+2;
    var blocks=new HashMap<BlockPos,BlockState>();var entities=new HashMap<BlockPos,BlockEntity>();var writes=new ArrayList<String>();
@@ -33,7 +34,7 @@ public class MonsterRoomOracle {
     if(kind==1 && x==-rx-1 && y==-1 && z==-rz-1)return Blocks.AIR.defaultBlockState();
     if(kind==2 && Math.abs(x)==rx+1 && Math.abs(z)<=rz && (y==0||y==1))return Blocks.AIR.defaultBlockState();
     if(kind==3 && ((x==-rx-1 && y==-1 && z==1)||(x==1&&y==0&&z==1)))return Blocks.BEDROCK.defaultBlockState();
-    return Blocks.STONE.defaultBlockState();
+    return grass?Blocks.GRASS_BLOCK.defaultBlockState():Blocks.STONE.defaultBlockState();
    };
    var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(proxy,m,v)->{
     if(m.getName().equals("getMinY"))return 0;

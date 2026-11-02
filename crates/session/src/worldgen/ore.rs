@@ -2605,6 +2605,20 @@ fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     }
     if matches!(
         name,
+        "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+    ) {
+        ensure!(
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("snowy").map(String::as_str),
+                    Some("true" | "false")
+                ),
+            "invalid snowy monster-room block state"
+        );
+        return Ok((true, true));
+    }
+    if matches!(
+        name,
         "minecraft:stone"
             | "minecraft:deepslate"
             | "minecraft:tuff"
@@ -8160,6 +8174,11 @@ mod tests {
             .arg(&cp)
             .arg("MonsterRoomOracle")
             .arg("chunk"));
+        let grassy_output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("MonsterRoomOracle")
+            .arg("chunk_grass"));
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let generated = resources.vanilla_generated_block_registry().unwrap();
         let registry = resources.vanilla_block_ids().unwrap();
@@ -8174,7 +8193,12 @@ mod tests {
         let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
         let mut saw_chest = false;
         let mut saw_spawner = false;
-        for seed in [0, 1, -1, 987654321] {
+        for (grassy, seed) in [false, true].into_iter().flat_map(|grassy| {
+            [0, 1, -1, 987654321]
+                .into_iter()
+                .map(move |seed| (grassy, seed))
+        }) {
+            let output = if grassy { &grassy_output } else { &output };
             for mode in 0..4 {
                 let mut preview = DecorationRandom::new(seed);
                 let rx = preview.next_int_bound(2).unwrap() + 2;
@@ -8182,12 +8206,16 @@ mod tests {
                 let (mut terrain, _, _, _) = fixture();
                 let world = Arc::make_mut(&mut terrain.world);
                 let stone = world.intern_state(state("stone"));
+                let grass = world.intern_state(BlockState {
+                    name: "minecraft:grass_block".into(),
+                    properties: BTreeMap::from([("snowy".into(), "false".into())]),
+                });
                 let air = world.intern_state(state("air"));
                 let bedrock = world.intern_state(state("bedrock"));
                 let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
                 let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
                 let blocks = section.blocks.as_mut().unwrap();
-                blocks.fill(stone);
+                blocks.fill(if grassy { grass } else { stone });
                 let index = |x: i32, y: i32, z: i32| -> usize { (x + z * 16 + y * 256) as usize };
                 blocks[index(8 - rx - 1, 8, 8)] = air;
                 blocks[index(8 - rx - 1, 9, 8)] = air;

@@ -18,7 +18,7 @@ public class MonsterRoomBlockOracle {
    if(m.getName().equals("getMinY"))return 0;if(m.getName().equals("getHeight"))return 16;
    throw new UnsupportedOperationException(m.toString());
   });
-  var names=List.of("air","cave_air","void_air","water","lava","chest","spawner","stone","deepslate","tuff","granite","diorite","andesite","calcite","dirt","coarse_dirt","clay","gravel","sand","red_sand","sandstone","bedrock","cobblestone","mossy_cobblestone","cobbled_deepslate","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","netherrack","basalt","blackstone","ancient_debris");
+  var names=List.of("air","cave_air","void_air","water","lava","chest","spawner","stone","deepslate","tuff","granite","diorite","andesite","calcite","dirt","grass_block","podzol","mycelium","coarse_dirt","clay","gravel","sand","red_sand","sandstone","bedrock","cobblestone","mossy_cobblestone","cobbled_deepslate","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","netherrack","basalt","blackstone","ancient_debris");
   for(var name:names){
    var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
    for(var state:block.getStateDefinition().getPossibleStates()){

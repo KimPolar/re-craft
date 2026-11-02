@@ -3753,6 +3753,21 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let expected: Vec<Vec<Vec<u8>>> =
+            serde_json::from_slice(&std::fs::read(&expected_path).unwrap()).unwrap();
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&expected_path)
+            .arg("partial")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let partial_expected: Vec<Vec<Vec<u8>>> =
             serde_json::from_slice(&std::fs::read(expected_path).unwrap()).unwrap();
 
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
@@ -3860,6 +3875,40 @@ mod tests {
                         "no-sky block at {p:?}"
                     );
                     assert_eq!(dark.sky_light(p), Some(0));
+                }
+            }
+        }
+        let mut partial_tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        partial_tracker
+            .initialize_chunk(&terrain, east, &registry)
+            .unwrap();
+        let mut partial_engine = StagedGenerationLightEngine::new(partial_tracker);
+        let partial_before = partial_engine
+            .activate(&terrain, east, [center], &registry)
+            .unwrap();
+        let world = Arc::make_mut(&mut terrain.world);
+        let stone = world.intern_state(state("stone"));
+        world.set_block_id(15, 10, 8, stone).unwrap();
+        let partial_after = partial_engine
+            .snapshot(&terrain, [center], &registry)
+            .unwrap();
+        for (stage, actual) in [&partial_before, &partial_after].into_iter().enumerate() {
+            for y in -16..32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let p = [x, y, z];
+                        let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                        assert_eq!(
+                            actual.block_light(p),
+                            Some(partial_expected[stage][0][index]),
+                            "partial block stage {stage} at {p:?}"
+                        );
+                        assert_eq!(
+                            actual.sky_light(p),
+                            Some(partial_expected[stage][1][index]),
+                            "partial sky stage {stage} at {p:?}"
+                        );
+                    }
                 }
             }
         }
@@ -4287,7 +4336,8 @@ mod tests {
         }
         // A neighboring initialized chunk may already emit while the target
         // is still at FEATURES. Compare the same placement before and after
-        // the source is activated, and reject recomputation after later edits.
+        // the source is activated, and preserve the published light after
+        // edits to a chunk whose sources have not been initialized.
         for active in [false, true] {
             let schedule = FeatureSchedule::load(
                 &mut MushroomAt(15),
@@ -4305,6 +4355,7 @@ mod tests {
             let (mut terrain, _, _, _) = fixture();
             let center = ChunkPos { x: 0, z: 0 };
             let east = ChunkPos { x: 1, z: 0 };
+            let west = ChunkPos { x: -2, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
             let template = world.chunks[&center].as_ref().clone();
             for z in -3..=3 {
@@ -4320,8 +4371,10 @@ mod tests {
             let torch = world.intern_state(state("torch"));
             world.set_block_id(16, 8, 8, torch).unwrap();
             terrain.completed_decoration.insert(east);
+            terrain.completed_decoration.insert(west);
             let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
             tracker.initialize_chunk(&terrain, east, &vanilla).unwrap();
+            tracker.initialize_chunk(&terrain, west, &vanilla).unwrap();
             let mut engine = super::super::StagedGenerationLightEngine::new(tracker);
             if active {
                 engine.activate(&terrain, east, [center], &vanilla).unwrap();
@@ -4339,10 +4392,29 @@ mod tests {
             assert_eq!(result, [!active]);
             assert_eq!(steps.completed(center), Some(GenerationStage::Features));
             if active {
+                let old = engine.snapshot(&terrain, [center], &vanilla).unwrap();
+                assert_eq!(old.block_light([15, 8, 8]), Some(13));
                 let world = Arc::make_mut(&mut terrain.world);
                 let stone = world.intern_state(state("stone"));
-                world.set_block_id(14, 8, 8, stone).unwrap();
-                assert!(engine.snapshot(&terrain, [center], &vanilla).is_err());
+                world.set_block_id(15, 8, 8, stone).unwrap();
+                let preserved = engine.snapshot(&terrain, [center], &vanilla).unwrap();
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [x, y, z];
+                            assert_eq!(preserved.block_light(p), old.block_light(p), "block {p:?}");
+                            assert_eq!(preserved.sky_light(p), old.sky_light(p), "sky {p:?}");
+                        }
+                    }
+                }
+                assert!(engine.activate(&terrain, west, [center], &vanilla).is_err());
+                assert_eq!(
+                    engine
+                        .snapshot(&terrain, [center], &vanilla)
+                        .unwrap()
+                        .block_light([15, 8, 8]),
+                    Some(13)
+                );
             }
         }
         let (mut invalid, _, _, _) = fixture();

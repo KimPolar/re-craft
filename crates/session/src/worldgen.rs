@@ -351,6 +351,17 @@ impl FreshGenerationLightTracker {
         active: &BTreeSet<native_world::loaded::ChunkPos>,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<native_world::generation_light::VisibleLayers> {
+        self.calculate_block_light_in_world(terrain, &terrain.world, center, active, registry)
+    }
+
+    fn calculate_block_light_in_world(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        light_world: &native_world::loaded::World,
+        center: native_world::loaded::ChunkPos,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
         ensure!(
             active.iter().all(|pos| self.registered.contains_key(pos)),
             "active light chunk was not registered"
@@ -372,7 +383,7 @@ impl FreshGenerationLightTracker {
         let bounds = native_world::block_light::LightBounds::new(self.min_y, max_y)
             .context("unsupported light height")?;
         native_world::generation_block_light::generated_block_light_from_active_chunks(
-            &terrain.world,
+            light_world,
             bounds,
             center,
             active,
@@ -387,6 +398,17 @@ impl FreshGenerationLightTracker {
     pub fn calculate_sky_light_for_active_chunks(
         &self,
         terrain: &CarvedTerrainWorld,
+        center: native_world::loaded::ChunkPos,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_world::generation_light::VisibleLayers> {
+        self.calculate_sky_light_in_world(terrain, &terrain.world, center, active, registry)
+    }
+
+    fn calculate_sky_light_in_world(
+        &self,
+        terrain: &CarvedTerrainWorld,
+        light_world: &native_world::loaded::World,
         center: native_world::loaded::ChunkPos,
         active: &BTreeSet<native_world::loaded::ChunkPos>,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
@@ -416,7 +438,7 @@ impl FreshGenerationLightTracker {
         let registered = self.registered.keys().copied().collect();
         let initialized = self.sky_sources.keys().copied().collect();
         native_world::generation_sky_light::generated_sky_light_with_initialization_history(
-            &terrain.world,
+            light_world,
             bounds,
             center,
             active,
@@ -471,11 +493,12 @@ impl FreshGenerationLightTracker {
 
 /// A frozen batch of initialized generation chunks with monotonically
 /// activated light sources. This is separate from the live world: it cannot
-/// accept section updates, block changes, restored light or new registrations.
+/// accept section updates, registered-chunk edits, restored light or new registrations.
 /// Every initialized chunk that affects the batch must be registered before
 /// the tracker is moved here. Requested columns need their 3x3 neighborhood;
 /// uninitialized chunks must retain their default sky-source heightmaps.
-/// Once propagation starts, changed neighboring blocks invalidate later reads.
+/// Once propagation starts, reads use the blocks seen at activation. Further
+/// activation is rejected if any captured chunk has changed in the meantime.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,
@@ -516,6 +539,17 @@ impl StagedGenerationLightEngine {
             "light chunk is not initialized"
         );
         ensure!(!self.active.contains(&pos), "light chunk is already active");
+        if let Some(frozen) = &self.frozen_world {
+            ensure!(
+                frozen.chunks.len() == terrain.world.chunks.len()
+                    && frozen.chunks.iter().all(|(pos, before)| terrain
+                        .world
+                        .chunks
+                        .get(pos)
+                        .is_some_and(|now| Arc::ptr_eq(before, now))),
+                "light inputs changed before activation"
+            );
+        }
         let mut active = self.active.clone();
         active.insert(pos);
         let snapshot = self.snapshot_for(terrain, covered, registry, &active)?;
@@ -554,37 +588,24 @@ impl StagedGenerationLightEngine {
             if !affected {
                 continue;
             }
-            // Recomputing old propagation against changed, uninitialized
-            // neighboring blocks would fabricate updates Java never ran.
-            if let Some(frozen) = &self.frozen_world {
-                for dz in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        let neighbor = ChunkPos {
-                            x: pos.x.checked_add(dx).context("light X overflow")?,
-                            z: pos.z.checked_add(dz).context("light Z overflow")?,
-                        };
-                        let before = frozen
-                            .chunks
-                            .get(&neighbor)
-                            .context("light input was not captured")?;
-                        let current = terrain
-                            .world
-                            .chunks
-                            .get(&neighbor)
-                            .context("light input is missing")?;
-                        ensure!(
-                            Arc::ptr_eq(before, current),
-                            "light input changed after activation"
-                        );
-                    }
-                }
-            }
-            let block = self
-                .fresh
-                .calculate_block_light_for_active_chunks(terrain, pos, active, registry)?;
+            // Unregistered proto-chunk writes do not enqueue light updates.
+            // Replay against the immutable blocks used for the activation.
+            let light_world = self.frozen_world.as_deref().unwrap_or(&terrain.world);
+            let block = self.fresh.calculate_block_light_in_world(
+                terrain,
+                light_world,
+                pos,
+                active,
+                registry,
+            )?;
             let sky = if self.fresh.has_skylight {
-                self.fresh
-                    .calculate_sky_light_for_active_chunks(terrain, pos, active, registry)?
+                self.fresh.calculate_sky_light_in_world(
+                    terrain,
+                    light_world,
+                    pos,
+                    active,
+                    registry,
+                )?
             } else {
                 VisibleLayers::new()
             };

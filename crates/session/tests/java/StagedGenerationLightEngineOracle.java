@@ -15,12 +15,14 @@ import net.minecraft.world.level.material.FluidState;
 
 public class StagedGenerationLightEngineOracle implements LightChunkGetter, BlockGetter {
     final Map<ChunkPos, TestChunk> chunks = new HashMap<>();
+    final Map<BlockPos, BlockState> edits = new HashMap<>();
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
     public LightChunk getChunkForLighting(int x,int z){ return chunks.get(new ChunkPos(x,z)); }
     public BlockEntity getBlockEntity(BlockPos p){ return null; }
     public BlockState getBlockState(BlockPos p){
+        if(edits.containsKey(p)) return edits.get(p);
         if(p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=1 && Math.abs(Math.floorDiv(p.getZ(),16))<=1) return Blocks.STONE.defaultBlockState();
         return Blocks.AIR.defaultBlockState();
@@ -61,6 +63,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var w=new StagedGenerationLightEngineOracle();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
+        boolean partial=args.length>1 && args[1].equals("partial");
         for(int z=-1;z<=1;z++) for(int x=-1;x<=1;x++){
             var chunk=w.new TestChunk(x,z); w.chunks.put(new ChunkPos(x,z),chunk);
             var fake=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
@@ -68,10 +71,21 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             fake.section=new LevelChunkSection(container,null);
             for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(x==1 && z==0) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
-            chunk.sources.fillFrom(fake);
-            engine.updateSectionStatus(SectionPos.of(x,0,z),false);
+            if(!partial || (x==1 && z==0)){
+                chunk.sources.fillFrom(fake);
+                engine.updateSectionStatus(SectionPos.of(x,0,z),false);
+            }
         }
-        drain(engine); var stages=new JsonArray(); stages.add(capture(engine));
+        drain(engine); var stages=new JsonArray();
+        if(partial){
+            engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
+            // Before INITIALIZE_LIGHT, ProtoChunk.setBlockState neither calls
+            // updateSectionStatus nor checkBlock on the light engine.
+            w.edits.put(new BlockPos(15,10,8),Blocks.STONE.defaultBlockState());
+            drain(engine); stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
+        stages.add(capture(engine));
         for(int x:new int[]{0,1}){ engine.propagateLightSources(new ChunkPos(x,0)); drain(engine); stages.add(capture(engine)); }
         Files.writeString(Path.of(args[0]),stages.toString());
     }

@@ -36,9 +36,9 @@ pub trait DiskWorld: OreWorld {
             id.namespace == "minecraft",
             "unsupported would_survive block"
         );
-        if is_tree_sapling(&id) {
+        if let Some(tag) = vegetation_support(&id) {
             let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
-            return self.in_tag(&below, &ResourceId::parse("minecraft:supports_vegetation")?);
+            return self.in_tag(&below, &ResourceId::parse(tag)?);
         }
         if id.path == "cactus" {
             let lava = ResourceId::parse("minecraft:lava")?;
@@ -82,19 +82,22 @@ pub trait DiskWorld: OreWorld {
     }
 }
 
-fn is_tree_sapling(id: &ResourceId) -> bool {
-    id.namespace == "minecraft"
-        && matches!(
-            id.path.as_str(),
-            "oak_sapling"
-                | "spruce_sapling"
-                | "birch_sapling"
-                | "jungle_sapling"
-                | "acacia_sapling"
-                | "dark_oak_sapling"
-                | "cherry_sapling"
-                | "pale_oak_sapling"
-        )
+fn vegetation_support(id: &ResourceId) -> Option<&'static str> {
+    if id.namespace != "minecraft" {
+        return None;
+    }
+    match id.path.as_str() {
+        "oak_sapling" | "spruce_sapling" | "birch_sapling" | "jungle_sapling"
+        | "acacia_sapling" | "dark_oak_sapling" | "cherry_sapling" | "pale_oak_sapling"
+        | "short_grass" | "fern" | "bush" | "dandelion" | "poppy" | "blue_orchid" | "allium"
+        | "azure_bluet" | "red_tulip" | "orange_tulip" | "white_tulip" | "pink_tulip"
+        | "oxeye_daisy" | "cornflower" | "lily_of_the_valley" | "firefly_bush"
+        | "closed_eyeblossom" | "sweet_berry_bush" => Some("minecraft:supports_vegetation"),
+        "short_dry_grass" | "tall_dry_grass" | "dead_bush" => {
+            Some("minecraft:supports_dry_vegetation")
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -270,9 +273,9 @@ impl Predicate {
             Self::WouldSurvive(_, id, _) if id.namespace == "minecraft" && id.path == "cactus" => {
                 tags.insert(ResourceId::parse("minecraft:supports_cactus").expect("constant tag"));
             }
-            Self::WouldSurvive(_, id, _) if is_tree_sapling(id) => {
+            Self::WouldSurvive(_, id, _) if vegetation_support(id).is_some() => {
                 tags.insert(
-                    ResourceId::parse("minecraft:supports_vegetation").expect("constant tag"),
+                    ResourceId::parse(vegetation_support(id).unwrap()).expect("constant tag"),
                 );
             }
             Self::Not(value) => value.tags(tags),

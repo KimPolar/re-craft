@@ -34,7 +34,7 @@ public class BlockColumnOracle {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
     bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_SUGAR_CANE,BlockTags.SUPPORTS_VEGETATION));
-    bind.invoke(Blocks.SAND.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_CACTUS));
+    bind.invoke(Blocks.SAND.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_CACTUS,BlockTags.SUPPORTS_DRY_VEGETATION));
     bind.invoke(Blocks.FROSTED_ICE.builtInRegistryHolder(),List.of(BlockTags.SUPPORTS_SUGAR_CANE_ADJACENTLY));
     bind.invoke(Fluids.WATER.builtInRegistryHolder(),List.of(FluidTags.SUPPORTS_SUGAR_CANE_ADJACENTLY));
     bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),List.of(FluidTags.SUPPORTS_SUGAR_CANE_ADJACENTLY));
@@ -46,6 +46,13 @@ public class BlockColumnOracle {
       for(int base=0;base<4;base++) {var state=switch(base){case 0->Blocks.STONE.defaultBlockState();case 1->Blocks.DIRT.defaultBlockState();case 2->Blocks.AIR.defaultBlockState();default->Blocks.WATER.defaultBlockState();};
         var level=(LevelReader)Proxy.newProxyInstance(LevelReader.class.getClassLoader(),new Class[]{LevelReader.class},(o,m,a)->{if(m.getName().equals("getBlockState"))return state;throw new UnsupportedOperationException(m.getName());});
         out.printf("P minecraft:%s %d %s%n",name,base,b.defaultBlockState().canSurvive(level,BlockPos.ZERO));
+      }
+    }
+    for(String name:List.of("short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush")) {
+      var b=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
+      for(int base=0;base<5;base++) {var state=switch(base){case 0->Blocks.STONE.defaultBlockState();case 1->Blocks.DIRT.defaultBlockState();case 2->Blocks.AIR.defaultBlockState();case 3->Blocks.WATER.defaultBlockState();default->Blocks.SAND.defaultBlockState();};
+        var level=(LevelReader)Proxy.newProxyInstance(LevelReader.class.getClassLoader(),new Class[]{LevelReader.class},(o,m,a)->{if(m.getName().equals("getBlockState"))return state;throw new UnsupportedOperationException(m.getName());});
+        out.printf("V minecraft:%s %d %s%n",name,base,b.defaultBlockState().canSurvive(level,BlockPos.ZERO));
       }
     }
     out.println("E "+sugar.hasBlockEntity()+" "+net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(sugar)+" "+sugar.getPostProcessPos(null,BlockPos.ZERO));

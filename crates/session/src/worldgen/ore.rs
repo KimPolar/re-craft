@@ -7273,6 +7273,60 @@ mod tests {
     }
 
     #[test]
+    fn firefly_survival_filter_and_feature_use_active_vegetation_tag() {
+        struct VegetationData(bool);
+        impl ResourceProvider for VegetationData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{
+                        "feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:firefly_bush"}},
+                        "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:would_survive","state":"minecraft:firefly_bush"}}]
+                    }]]}))?));
+                }
+                if path == "data/minecraft/tags/block/supports_vegetation.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.0 {vec!["minecraft:stone"]}else{vec![]}}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut VegetationData(true),
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.insert("minecraft:firefly_bush".into());
+        for supports in [false, true] {
+            let prepared = PreparedDecoration::load(
+                &mut VegetationData(supports),
+                &plan,
+                &registry,
+                &mut resolve_test,
+            )
+            .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [supports]);
+            assert_eq!(
+                terrain.snapshot().block(8, 8, 8).unwrap().name,
+                if supports {
+                    "minecraft:firefly_bush"
+                } else {
+                    "minecraft:air"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn prepared_lava_lake_commits_blocks_ticks_and_postprocessing() {
         struct LakeData;
         impl ResourceProvider for LakeData {

@@ -46,6 +46,7 @@ impl OreWorld for World {
             "supports_sugar_cane_adjacently" => s == "minecraft:frosted_ice",
             "supports_cactus" => s == "minecraft:sand",
             "supports_vegetation" => s == "minecraft:stone",
+            "supports_dry_vegetation" => s == "minecraft:sand",
             _ => false,
         })
     }
@@ -203,9 +204,45 @@ fn block_columns_and_sugar_cane_survival_match_java() {
     let mut cactus_cases = 0;
     let mut solidity_cases = 0;
     let mut sapling_cases = 0;
+    let mut vegetation_cases = 0;
     for line in output.lines() {
         let p: Vec<_> = line.split_whitespace().collect();
         match p.as_slice() {
+            ["V", name, base, result] => {
+                let predicate =
+                    BlockPredicate::decode(&json!({"type":"minecraft:would_survive","state":name}))
+                        .unwrap();
+                let tag = if matches!(
+                    *name,
+                    "minecraft:short_dry_grass"
+                        | "minecraft:tall_dry_grass"
+                        | "minecraft:dead_bush"
+                ) {
+                    "minecraft:supports_dry_vegetation"
+                } else {
+                    "minecraft:supports_vegetation"
+                };
+                assert!(predicate.required_tags().contains(&id(tag)));
+                let mut w = world();
+                let base: usize = base.parse().unwrap();
+                w.blocks.insert(
+                    [0, -1, 0],
+                    [
+                        "minecraft:stone",
+                        "minecraft:dirt",
+                        "minecraft:air",
+                        "minecraft:water",
+                        "minecraft:sand",
+                    ][base]
+                        .into(),
+                );
+                assert_eq!(
+                    predicate.test(&mut w, [0, 0, 0]).unwrap(),
+                    result.parse::<bool>().unwrap(),
+                    "{name} {base}"
+                );
+                vegetation_cases += 1;
+            }
             ["P", name, base, result] => {
                 let predicate =
                     BlockPredicate::decode(&json!({"type":"minecraft:would_survive","state":name}))
@@ -361,6 +398,7 @@ fn block_columns_and_sugar_cane_survival_match_java() {
     }
     assert_eq!(survival, 100);
     assert_eq!(sapling_cases, 8 * 4);
+    assert_eq!(vegetation_cases, 21 * 5);
     assert_eq!(cactus_cases, 3 * 7 * 5 * 5);
     assert_eq!(solidity_cases, 8);
     assert_eq!(cases.len(), 6 * 2 * 6 * 2 * 4 * 3);

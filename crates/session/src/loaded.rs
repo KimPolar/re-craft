@@ -13533,12 +13533,12 @@ impl LoadedSession {
                 }
                 executed += 1;
             } else if kind == 5 {
-                self.unresolved_bubble_tick = true;
                 let (order, key) = self
                     .bubble_ticks
                     .pop_first()
                     .expect("selected bubble tick remains queued");
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    self.unresolved_bubble_tick = true;
                     deferred_bubble.push((order, key));
                     continue;
                 };
@@ -13549,10 +13549,12 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.unresolved_bubble_tick = true;
                     deferred_bubble.push((order, key));
                     continue;
                 };
                 let Some(current) = self.world.state(id) else {
+                    self.unresolved_bubble_tick = true;
                     deferred_bubble.push((order, key));
                     continue;
                 };
@@ -13566,6 +13568,9 @@ impl LoadedSession {
                     executed += 1;
                     continue;
                 }
+                // A stale tick has no callback. Matching ticks may change blocks,
+                // fluids, and other effects that are not fully saved yet.
+                self.unresolved_bubble_tick = true;
                 let Some(tags) = self.bubble_column_tags.as_ref() else {
                     deferred_bubble.push((order, key));
                     continue;
@@ -31243,6 +31248,7 @@ pub(crate) mod tests {
         let mut deferred = setup(true);
         deferred.advance_block_ticks();
         assert_eq!(deferred.bubble_deferred.len(), 1);
+        assert!(deferred.unresolved_bubble_tick);
         assert!(deferred.fluid_ticks.is_empty());
         assert_eq!(
             deferred
@@ -56392,6 +56398,108 @@ pub(crate) mod tests {
         session.bubble_deferred.remove(&(99, 0, 42, 99));
         session.unresolved_bubble_tick = true;
         assert!(session.draft_block_ticks(home).is_err());
+    }
+
+    #[test]
+    fn stale_bubble_ticks_are_removed_from_the_chunk_draft_without_blocking_save() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let relative = IVec3::new(8, 5, 8);
+        let position = (session.origin + relative).to_array();
+        assert_ne!(
+            session
+                .world
+                .block(position[0], position[1], position[2])
+                .unwrap()
+                .name,
+            "minecraft:water"
+        );
+        assert_ne!(
+            session
+                .world
+                .block(position[0], position[1], position[2])
+                .unwrap()
+                .name,
+            "minecraft:bubble_column"
+        );
+        let ticks = vec![
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 0,
+                priority: 0,
+            },
+            SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position,
+                delay: 30,
+                priority: 1,
+            },
+            SavedBlockTick {
+                block: "minecraft:bubble_column".into(),
+                position,
+                delay: 0,
+                priority: -1,
+            },
+            SavedBlockTick {
+                block: "minecraft:water".into(),
+                position,
+                delay: 20,
+                priority: 0,
+            },
+        ];
+        let mut source = native_persistence::edit::draft_chunk_blocks(
+            &fixture_chunk_document(home),
+            native_persistence::world::ChunkPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[],
+        )
+        .unwrap();
+        source.replace_block_ticks(&ticks).unwrap();
+        let source = source.document().clone();
+        Arc::make_mut(&mut session.world)
+            .saved_block_ticks
+            .insert(home, ticks.clone());
+        session.enqueue_saved_sand(&ticks);
+        session.enqueue_saved_bubble(&ticks);
+        session.advance_block_ticks();
+
+        assert!(!session.unresolved_bubble_tick);
+        assert_eq!(
+            session.draft_block_ticks(home).unwrap(),
+            vec![ticks[1].clone(), ticks[3].clone()]
+        );
+        let draft = session
+            .draft_dirty_chunk_with_heightmaps_and_simulated_ticks(
+                home,
+                &source,
+                &test_heightmap_tags(),
+                |_| anyhow::bail!("tick-only draft must not rebuild heightmaps"),
+            )
+            .unwrap();
+        assert!(draft.matches_source(&source).unwrap());
+        let expected = {
+            let mut expected = native_persistence::edit::draft_chunk_blocks(
+                &source,
+                native_persistence::world::ChunkPos {
+                    x: home.x,
+                    z: home.z,
+                },
+                &[],
+            )
+            .unwrap();
+            expected
+                .replace_block_ticks(&[ticks[1].clone(), ticks[3].clone()])
+                .unwrap();
+            expected.document().value.get("block_ticks").cloned()
+        };
+        assert_eq!(draft.document().value.get("block_ticks").cloned(), expected);
+        session.unresolved_bubble_tick = true;
+        session.tick = 20;
+        session.advance_block_ticks();
+        assert!(session.unresolved_bubble_tick);
     }
 
     #[test]

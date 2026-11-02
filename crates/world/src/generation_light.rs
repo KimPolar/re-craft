@@ -14,6 +14,51 @@ use std::{
 /// Nibble-packed visible layers indexed by absolute section Y.
 pub type VisibleLayers = BTreeMap<i32, Arc<[u8; LIGHT_BYTES]>>;
 
+/// Determine which sections are nonempty in this immutable world snapshot.
+pub fn initialized_nonempty_sections(
+    world: &World,
+    section_range: Range<i32>,
+    registered_chunks: impl IntoIterator<Item = ChunkPos>,
+    mut is_air: impl FnMut(&BlockState) -> Option<bool>,
+) -> Option<Vec<(ChunkPos, i32)>> {
+    if section_range.start >= section_range.end {
+        return None;
+    }
+    let mut known = HashMap::new();
+    let mut statuses = Vec::new();
+    for pos in registered_chunks {
+        let chunk = world.chunks.get(&pos)?;
+        if chunk.position != pos {
+            return None;
+        }
+        for sy in section_range.clone() {
+            let blocks = chunk
+                .sections
+                .get(&i8::try_from(sy).ok()?)?
+                .blocks
+                .as_ref()?;
+            let mut nonempty = false;
+            for id in blocks.iter() {
+                let air = if let Some(&air) = known.get(&id.0) {
+                    air
+                } else {
+                    let air = is_air(world.state(*id)?)?;
+                    known.insert(id.0, air);
+                    air
+                };
+                if !air {
+                    nonempty = true;
+                    break;
+                }
+            }
+            if nonempty {
+                statuses.push((pos, sy));
+            }
+        }
+    }
+    Some(statuses)
+}
+
 #[derive(Clone, Default)]
 pub struct VisibleLightColumn {
     block: VisibleLayers,
@@ -112,43 +157,10 @@ impl VisibleLightSnapshot {
         covered_columns: impl IntoIterator<Item = ChunkPos>,
         has_block: bool,
         has_sky: bool,
-        mut is_air: impl FnMut(&BlockState) -> Option<bool>,
+        is_air: impl FnMut(&BlockState) -> Option<bool>,
     ) -> Option<Self> {
-        if section_range.start >= section_range.end {
-            return None;
-        }
-        let mut known = HashMap::new();
-        let mut statuses = Vec::new();
-        for pos in registered_chunks {
-            let chunk = world.chunks.get(&pos)?;
-            if chunk.position != pos {
-                return None;
-            }
-            for sy in section_range.clone() {
-                let blocks = chunk
-                    .sections
-                    .get(&i8::try_from(sy).ok()?)?
-                    .blocks
-                    .as_ref()?;
-                let mut nonempty = false;
-                for id in blocks.iter() {
-                    let air = if let Some(&air) = known.get(&id.0) {
-                        air
-                    } else {
-                        let air = is_air(world.state(*id)?)?;
-                        known.insert(id.0, air);
-                        air
-                    };
-                    if !air {
-                        nonempty = true;
-                        break;
-                    }
-                }
-                if nonempty {
-                    statuses.push((pos, sy));
-                }
-            }
-        }
+        let statuses =
+            initialized_nonempty_sections(world, section_range, registered_chunks, is_air)?;
         Self::fresh_after_section_updates(has_block, has_sky, statuses, covered_columns)
     }
     fn position(pos: [i32; 3]) -> Option<(ChunkPos, i32, usize, usize, usize)> {

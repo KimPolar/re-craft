@@ -2,7 +2,7 @@
 //! Full structure and feature coverage, persistence and playable world
 //! integration are not yet implemented.
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -112,6 +112,26 @@ pub struct FreshGenerationLightTracker {
     height: i32,
     has_skylight: bool,
     registered: BTreeMap<native_world::loaded::ChunkPos, Arc<native_world::loaded::Chunk>>,
+    allocated: BTreeMap<native_world::loaded::ChunkPos, BTreeSet<i32>>,
+    checked_blocks: BTreeSet<String>,
+    zero_layer: Arc<[u8; native_world::loaded::LIGHT_BYTES]>,
+}
+
+fn generated_state_is_air(
+    registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    state: &native_world::loaded::BlockState,
+) -> Option<bool> {
+    if !registry.contains(&state.name) {
+        return None;
+    }
+    let air = matches!(
+        state.name.as_str(),
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+    );
+    if air && !state.properties.is_empty() {
+        return None;
+    }
+    Some(air)
 }
 
 impl FreshGenerationLightTracker {
@@ -133,6 +153,9 @@ impl FreshGenerationLightTracker {
             height: terrain.height,
             has_skylight,
             registered: BTreeMap::new(),
+            allocated: BTreeMap::new(),
+            checked_blocks: BTreeSet::new(),
+            zero_layer: Arc::new([0; native_world::loaded::LIGHT_BYTES]),
         })
     }
 
@@ -144,6 +167,12 @@ impl FreshGenerationLightTracker {
                 && self.min_y == terrain.min_y
                 && self.height == terrain.height,
             "light tracker belongs to different terrain"
+        );
+        ensure!(
+            self.registered
+                .keys()
+                .all(|pos| terrain.completed_decoration.contains(pos)),
+            "registered light chunk has not completed features"
         );
         self.validate_world(&terrain.world)
     }
@@ -180,12 +209,56 @@ impl FreshGenerationLightTracker {
             !self.registered.contains_key(&pos),
             "light chunk is already registered"
         );
-        terrain.fresh_generation_light([pos], [], registry, self.has_skylight)?;
+        ensure!(
+            terrain.completed_decoration.contains(&pos),
+            "light initialization requires completed features"
+        );
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("light height overflow")?;
+        native_world::block_light::LightBounds::new(self.min_y, max_y)
+            .context("unsupported light height")?;
+        let mut checked = BTreeSet::new();
+        let statuses = native_world::generation_light::initialized_nonempty_sections(
+            &terrain.world,
+            self.min_y.div_euclid(16)..max_y.div_euclid(16),
+            [pos],
+            |state| {
+                let air = generated_state_is_air(registry, state)?;
+                checked.insert(state.name.clone());
+                Some(air)
+            },
+        )
+        .context("registered light sections are missing or unsupported")?;
+        // Validate packed section coordinates before modifying the tracker.
+        native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+            true,
+            self.has_skylight,
+            statuses.iter().copied(),
+            [],
+        )
+        .context("registered light section is out of range")?;
         let chunk = terrain
             .world
             .chunks
             .get(&pos)
             .context("light chunk is missing")?;
+        for (position, y) in statuses {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let neighbor = native_world::loaded::ChunkPos {
+                        x: position.x + dx,
+                        z: position.z + dz,
+                    };
+                    self.allocated
+                        .entry(neighbor)
+                        .or_default()
+                        .extend(y - 1..=y + 1);
+                }
+            }
+        }
+        self.checked_blocks.extend(checked);
         self.registered.insert(pos, Arc::clone(chunk));
         Ok(())
     }
@@ -199,12 +272,36 @@ impl FreshGenerationLightTracker {
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
         self.validate_terrain(terrain)?;
-        terrain.fresh_generation_light(
-            self.registered.keys().copied(),
-            covered_columns,
-            registry,
-            self.has_skylight,
-        )
+        ensure!(
+            self.checked_blocks
+                .iter()
+                .all(|name| registry.contains(name)),
+            "registered block is absent from the registry"
+        );
+        let mut snapshot =
+            native_world::generation_light::VisibleLightSnapshot::new(true, self.has_skylight);
+        for pos in covered_columns {
+            ensure!(
+                (-2_097_152..=2_097_151).contains(&pos.x)
+                    && (-2_097_152..=2_097_151).contains(&pos.z),
+                "light column is out of range"
+            );
+            let mut block = native_world::generation_light::VisibleLayers::new();
+            let mut sky = native_world::generation_light::VisibleLayers::new();
+            if let Some(sections) = self.allocated.get(&pos) {
+                for &sy in sections {
+                    block.insert(sy, Arc::clone(&self.zero_layer));
+                    if self.has_skylight {
+                        sky.insert(sy, Arc::clone(&self.zero_layer));
+                    }
+                }
+            }
+            snapshot.insert_complete_column(
+                pos,
+                native_world::generation_light::VisibleLightColumn::new(block, sky),
+            );
+        }
+        Ok(snapshot)
     }
 }
 
@@ -333,19 +430,7 @@ impl CarvedTerrainWorld {
             covered_columns,
             true,
             has_skylight,
-            |state| {
-                if !registry.contains(&state.name) {
-                    return None;
-                }
-                let air = matches!(
-                    state.name.as_str(),
-                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-                );
-                if air && !state.properties.is_empty() {
-                    return None;
-                }
-                Some(air)
-            },
+            |state| generated_state_is_air(registry, state),
         )
         .context("registered light sections are missing or unsupported")
     }

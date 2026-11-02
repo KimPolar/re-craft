@@ -3892,6 +3892,35 @@ mod tests {
                     .register_chunk(&terrain, registered, &vanilla)
                     .is_err()
             );
+            let second = ChunkPos { x: 0, z: 1 };
+            terrain.completed_decoration.insert(second);
+            tracker.register_chunk(&terrain, second, &vanilla).unwrap();
+            let mut covered = Vec::new();
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    covered.push(ChunkPos { x, z });
+                }
+            }
+            let cached = tracker
+                .snapshot(&terrain, covered.iter().copied(), &vanilla)
+                .unwrap();
+            let direct = terrain
+                .fresh_generation_light(
+                    [registered, second],
+                    covered.iter().copied(),
+                    &vanilla,
+                    true,
+                )
+                .unwrap();
+            for z in [-17, -1, 0, 15, 16, 32] {
+                for x in [-17, -1, 0, 15, 16, 32] {
+                    for y in [-32, 0, 8, 15, 16, 31, 32, 64] {
+                        let p = [x, y, z];
+                        assert_eq!(cached.block_light(p), direct.block_light(p), "{p:?}");
+                        assert_eq!(cached.sky_light(p), direct.sky_light(p), "{p:?}");
+                    }
+                }
+            }
             assert_eq!(
                 tracker
                     .snapshot(&terrain, [center], &vanilla)
@@ -3899,6 +3928,9 @@ mod tests {
                     .sky_light([8, 8, 8]),
                 Some(0)
             );
+            terrain.completed_decoration.remove(&second);
+            assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
+            terrain.completed_decoration.insert(second);
             let before = terrain.snapshot();
             let result =
                 prepared.execute_with_tracked_light(&mut terrain, false, &tracker, &vanilla);
@@ -3924,6 +3956,21 @@ mod tests {
             let air = world.intern_state(state("air"));
             world.set_block_id(16, 0, 0, air).unwrap();
             assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
+        }
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        terrain.completed_decoration.insert(center);
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
+        tracker.register_chunk(&terrain, center, &vanilla).unwrap();
+        let cached = tracker.snapshot(&terrain, [center], &vanilla).unwrap();
+        let direct = terrain
+            .fresh_generation_light([center], [center], &vanilla, false)
+            .unwrap();
+        for y in [-32, 0, 8, 16, 32, 64] {
+            assert_eq!(
+                cached.raw_brightness([0, y, 0], 0),
+                direct.raw_brightness([0, y, 0], 0)
+            );
         }
     }
 

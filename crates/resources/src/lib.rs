@@ -29,6 +29,7 @@ pub mod fluid_environment;
 pub mod fluid_tags;
 pub mod freeze_feature;
 pub mod game_event_tags;
+pub mod geode_feature;
 pub mod geometry;
 pub mod heightmap_tags;
 pub mod item_registry;

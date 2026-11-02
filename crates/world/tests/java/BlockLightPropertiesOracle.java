@@ -9,6 +9,9 @@ import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.CaveVines;
 import net.minecraft.world.level.block.GrowingPlantHeadBlock;
 import net.minecraft.world.level.block.state.properties.ChestType;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.world.level.block.state.properties.Tilt;
 import net.minecraft.core.Direction;
 
 public class BlockLightPropertiesOracle {
@@ -24,9 +27,11 @@ public class BlockLightPropertiesOracle {
             if (entry.has("lit")) state = state.setValue(RedStoneOreBlock.LIT, entry.get("lit").getAsBoolean());
             if (entry.has("berries")) state = state.setValue(CaveVines.BERRIES, entry.get("berries").getAsBoolean());
             if (entry.has("age")) state = state.setValue(GrowingPlantHeadBlock.AGE, entry.get("age").getAsInt());
-            if (entry.has("facing")) state = state.setValue(ChestBlock.FACING, Direction.byName(entry.get("facing").getAsString()))
-                .setValue(ChestBlock.TYPE, ChestType.valueOf(entry.get("type").getAsString().toUpperCase(java.util.Locale.ROOT)))
-                .setValue(ChestBlock.WATERLOGGED, entry.get("waterlogged").getAsBoolean());
+            if (entry.has("facing")) state = state.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.byName(entry.get("facing").getAsString()))
+                .setValue(BlockStateProperties.WATERLOGGED, entry.get("waterlogged").getAsBoolean());
+            if (entry.has("type")) state = state.setValue(ChestBlock.TYPE, ChestType.valueOf(entry.get("type").getAsString().toUpperCase(java.util.Locale.ROOT)));
+            if (entry.has("half")) state = state.setValue(BlockStateProperties.DOUBLE_BLOCK_HALF, DoubleBlockHalf.valueOf(entry.get("half").getAsString().toUpperCase(java.util.Locale.ROOT)));
+            if (entry.has("tilt")) state = state.setValue(BlockStateProperties.TILT, Tilt.valueOf(entry.get("tilt").getAsString().toUpperCase(java.util.Locale.ROOT)));
             var row = new JsonArray();
             row.add(state.getLightDampening());
             row.add(state.getLightEmission());

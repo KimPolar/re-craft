@@ -209,6 +209,28 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (0, if boolean("berries")? { 14 } else { 0 })
         }
+        "minecraft:small_dripleaf" | "minecraft:big_dripleaf" | "minecraft:big_dripleaf_stem"
+            if facing() =>
+        {
+            let waterlogged = boolean("waterlogged")?;
+            match state.name.as_str() {
+                "minecraft:small_dripleaf"
+                    if state.properties.len() == 3
+                        && matches!(
+                            state.properties.get("half").map(String::as_str),
+                            Some("lower" | "upper")
+                        ) => {}
+                "minecraft:big_dripleaf"
+                    if state.properties.len() == 3
+                        && matches!(
+                            state.properties.get("tilt").map(String::as_str),
+                            Some("none" | "unstable" | "partial" | "full")
+                        ) => {}
+                "minecraft:big_dripleaf_stem" if state.properties.len() == 2 => {}
+                _ => return None,
+            }
+            (u8::from(waterlogged), 0)
+        }
         "minecraft:redstone_block" if state.properties.is_empty() => (15, 0),
         "minecraft:chest" | "minecraft:trapped_chest"
             if state.properties.len() == 3 && facing() =>
@@ -2632,6 +2654,32 @@ mod tests {
                 }
             }
         }
+        for name in ["small_dripleaf", "big_dripleaf", "big_dripleaf_stem"] {
+            for facing in ["north", "south", "west", "east"] {
+                for waterlogged in ["false", "true"] {
+                    let variants: &[&str] = match name {
+                        "small_dripleaf" => &["lower", "upper"],
+                        "big_dripleaf" => &["none", "unstable", "partial", "full"],
+                        _ => &[""],
+                    };
+                    for variant in variants {
+                        let mut properties = BTreeMap::from([
+                            ("facing".into(), facing.into()),
+                            ("waterlogged".into(), waterlogged.into()),
+                        ]);
+                        if name == "small_dripleaf" {
+                            properties.insert("half".into(), (*variant).into());
+                        } else if name == "big_dripleaf" {
+                            properties.insert("tilt".into(), (*variant).into());
+                        }
+                        states.push(BlockState {
+                            name: format!("minecraft:{name}"),
+                            properties,
+                        });
+                    }
+                }
+            }
+        }
         let cases: Vec<_> = states
             .iter()
             .map(|s| {
@@ -2647,8 +2695,16 @@ mod tests {
                 }
                 if let Some(facing) = s.properties.get("facing") {
                     row["facing"] = serde_json::json!(facing);
-                    row["type"] = serde_json::json!(s.properties["type"]);
+                    if let Some(kind) = s.properties.get("type") {
+                        row["type"] = serde_json::json!(kind);
+                    }
                     row["waterlogged"] = serde_json::json!(s.properties["waterlogged"] == "true");
+                }
+                if let Some(half) = s.properties.get("half") {
+                    row["half"] = serde_json::json!(half);
+                }
+                if let Some(tilt) = s.properties.get("tilt") {
+                    row["tilt"] = serde_json::json!(tilt);
                 }
                 row
             })

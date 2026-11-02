@@ -30,6 +30,7 @@ pub struct OreVeinRegion<'a> {
     motion: &'a HeightmapTags,
     writable: BTreeSet<ChunkPos>,
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -262,6 +263,7 @@ impl CarvedTerrainWorld {
         );
         let world = (*self.world).clone();
         let heights = self.ore_ocean_floor_heights.clone();
+        let surface_heights = self.feature_world_surface_heights.clone();
         Ok(OreVeinRegion {
             target: self,
             world,
@@ -269,6 +271,7 @@ impl CarvedTerrainWorld {
             motion,
             writable,
             heights,
+            surface_heights,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -410,6 +413,7 @@ impl OreVeinRegion<'_> {
         ensure!(!self.failed, "cannot publish a failed generation attempt");
         self.target.world = Arc::new(self.world);
         self.target.ore_ocean_floor_heights = self.heights;
+        self.target.feature_world_surface_heights = self.surface_heights;
         Ok(())
     }
 
@@ -426,7 +430,12 @@ impl OreVeinRegion<'_> {
 
     // Java primes the entire heightmap on first access. Direct ore section
     // writes do not update it, including for data-pack replacement states.
-    fn prime_heightmap(&mut self, pos: ChunkPos) -> Result<()> {
+    fn prime_heightmaps(&mut self, pos: ChunkPos) -> Result<()> {
+        let need_ocean = !self.heights.contains_key(&pos);
+        let need_surface = !self.surface_heights.contains_key(&pos);
+        if !need_ocean && !need_surface {
+            return Ok(());
+        }
         let base_x = pos.x.checked_mul(16).context("chunk X overflow")?;
         let base_z = pos.z.checked_mul(16).context("chunk Z overflow")?;
         ensure!(
@@ -437,35 +446,61 @@ impl OreVeinRegion<'_> {
             self.world.chunks.contains_key(&pos),
             "generation heightmap chunk is missing"
         );
-        let mut values = Box::new([self.target.min_y; 256]);
+        let mut ocean = Box::new([self.target.min_y; 256]);
+        let mut surface = Box::new([self.target.min_y; 256]);
         for z in 0..16 {
             for x in 0..16 {
+                let mut missing_ocean = need_ocean;
+                let mut missing_surface = need_surface;
                 for y in (self.target.min_y..self.target.min_y + self.target.height).rev() {
                     let id = self
                         .world
                         .block_id(base_x + x, y, base_z + z)
                         .context("generation heightmap block is missing")?;
-                    let matches = if let Some(value) = self.motion_cache.get(&id) {
-                        *value
-                    } else {
-                        let state = self
-                            .world
-                            .state(id)
-                            .context("generation block state is missing")?;
-                        let value =
-                            !is_air(state) && self.motion.for_block(&state.name)?.blocks_motion;
-                        self.motion_cache.insert(id, value);
-                        value
-                    };
-                    if matches {
-                        values[(x + z * 16) as usize] = y + 1;
+                    let state = self
+                        .world
+                        .state(id)
+                        .context("generation block state is missing")?;
+                    if is_air(state) {
+                        continue;
+                    }
+                    let index = (x + z * 16) as usize;
+                    if missing_surface {
+                        surface[index] = y + 1;
+                        missing_surface = false;
+                    }
+                    if missing_ocean {
+                        let matches = if let Some(value) = self.motion_cache.get(&id) {
+                            *value
+                        } else {
+                            let value = self.motion.for_block(&state.name)?.blocks_motion;
+                            self.motion_cache.insert(id, value);
+                            value
+                        };
+                        if matches {
+                            ocean[index] = y + 1;
+                            missing_ocean = false;
+                        }
+                    }
+                    if !missing_ocean && !missing_surface {
                         break;
                     }
                 }
             }
         }
-        self.heights.insert(pos, Arc::from(values));
+        if need_ocean {
+            self.heights.insert(pos, Arc::from(ocean));
+        }
+        if need_surface {
+            self.surface_heights.insert(pos, Arc::from(surface));
+        }
         Ok(())
+    }
+
+    fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        let pos = chunk([x, 0, z]);
+        self.prime_heightmaps(pos)?;
+        Ok(self.surface_heights[&pos][(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
 }
 
@@ -482,11 +517,11 @@ impl<F: FnMut(&FeatureKey, &ResourceId) -> Result<bool>> PlacementEnvironment
         self.region.target.min_y
     }
     fn heightmap(&mut self, kind: &str, x: i32, z: i32) -> Result<i32> {
-        ensure!(
-            kind == "OCEAN_FLOOR_WG",
-            "unsupported generation heightmap {kind}"
-        );
-        self.region.ocean_floor_height(x, z)
+        match kind {
+            "OCEAN_FLOOR_WG" => self.region.ocean_floor_height(x, z),
+            "WORLD_SURFACE_WG" => self.region.world_surface_height(x, z),
+            _ => bail!("unsupported generation heightmap {kind}"),
+        }
     }
     fn biome_allows(&mut self, pos: [i32; 3]) -> Result<bool> {
         let biome = self.plan.biomes.biome_at_block(pos[0], pos[1], pos[2])?;
@@ -528,9 +563,7 @@ impl OreWorld for OreVeinRegion<'_> {
 impl OreVeinWorld for OreVeinRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
-        if !self.heights.contains_key(&pos) {
-            self.prime_heightmap(pos)?;
-        }
+        self.prime_heightmaps(pos)?;
         Ok(self.heights[&pos][(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
     fn outside_build_height(&self, y: i32) -> bool {
@@ -556,6 +589,9 @@ impl OreVeinWorld for OreVeinRegion<'_> {
     }
     fn set_section_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
         ensure!(!self.is_outside(p[1]), "ore write outside build height");
+        // Preserve both original maps before the first direct write in this
+        // chunk; untouched neighbors need no heightmap scan.
+        self.prime_heightmaps(chunk(p))?;
         let id = self.world.intern_state(state.clone());
         let section_y = i8::try_from(p[1].div_euclid(16))?;
         let chunk = Arc::make_mut(
@@ -619,10 +655,15 @@ mod tests {
         HeightmapTags,
         OreVein<BlockState>,
     ) {
-        let registry = ["minecraft:air", "minecraft:stone", "minecraft:diamond_ore"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let registry = [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:diamond_ore",
+            "minecraft:water",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         let mut data = Data;
         let feature = OreVein::decode(&json!({"type":"minecraft:ore", "size": 33, "discard_chance_on_air_exposure": 0.0, "targets": [{"target":{"predicate_type":"minecraft:tag_match", "tag":"minecraft:base_stone_overworld"}, "state":"minecraft:diamond_ore"}]}), &mut |v: &Value| Ok(state(v.as_str().unwrap().strip_prefix("minecraft:").unwrap()))).unwrap();
         let tags = OreBlockTags::load(&mut data, &registry, &feature.required_tags()).unwrap();
@@ -667,6 +708,7 @@ mod tests {
             height: 16,
             completed_decoration: BTreeSet::new(),
             ore_ocean_floor_heights: BTreeMap::new(),
+            feature_world_surface_heights: BTreeMap::new(),
             postprocessing: BTreeMap::new(),
             noise_postprocessing: BTreeMap::new(),
             surface_postprocessing: BTreeMap::new(),
@@ -714,6 +756,44 @@ mod tests {
         let writable = terrain.snapshot().chunks.keys().copied().collect();
         let mut next = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
         assert_eq!(next.ocean_floor_height(1, 1).unwrap(), 8);
+    }
+
+    #[test]
+    fn neighboring_chunk_maps_are_primed_before_direct_feature_writes() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        assert!(region.heights.is_empty() && region.surface_heights.is_empty());
+        // Neither neighbor column was queried before these direct writes.
+        region.set_section_block([16, 7, 5], &state("air")).unwrap();
+        region
+            .set_section_block([17, 12, 5], &state("stone"))
+            .unwrap();
+        for x in [16, 17] {
+            assert_eq!(region.ocean_floor_height(x, 5).unwrap(), 8);
+            assert_eq!(region.world_surface_height(x, 5).unwrap(), 8);
+        }
+        region.finish().unwrap();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut next = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        for x in [16, 17] {
+            assert_eq!(next.ocean_floor_height(x, 5).unwrap(), 8);
+            assert_eq!(next.world_surface_height(x, 5).unwrap(), 8);
+        }
+    }
+
+    #[test]
+    fn surface_and_ocean_floor_differ_above_water() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let water = world.intern_state(state("water"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[12 * 256] = water;
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.ore_vein_region(&tags, &motion, writable).unwrap();
+        assert_eq!(region.world_surface_height(0, 0).unwrap(), 13);
+        assert_eq!(region.ocean_floor_height(0, 0).unwrap(), 8);
     }
 
     #[test]
@@ -1020,7 +1100,7 @@ mod tests {
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
 
-        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("WORLD_SURFACE_WG"));
+        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("MOTION_BLOCKING"));
         let plan = fixture_plan(&schedule, &neighborhood);
         let ore = ScheduledOreVein::load(
             &mut data,
@@ -1042,27 +1122,29 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_ore_uses_live_ocean_floor_heightmap() {
-        let (mut data, schedule, neighborhood) = scheduled_fixture(Some("OCEAN_FLOOR_WG"));
-        let plan = fixture_plan(&schedule, &neighborhood);
-        let ore = ScheduledOreVein::load(
-            &mut data,
-            &schedule,
-            plan.features[0].feature,
-            &mut resolve_test,
-        )
-        .unwrap();
-        let (mut terrain, tags, motion, _) = fixture();
-        let before = terrain.snapshot();
-        let mut region = terrain
-            .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+    fn scheduled_ore_uses_generation_heightmaps() {
+        for kind in ["OCEAN_FLOOR_WG", "WORLD_SURFACE_WG"] {
+            let (mut data, schedule, neighborhood) = scheduled_fixture(Some(kind));
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let ore = ScheduledOreVein::load(
+                &mut data,
+                &schedule,
+                plan.features[0].feature,
+                &mut resolve_test,
+            )
             .unwrap();
-        assert!(
-            region
-                .place_planned(&plan, 0, &ore, &mut |_, _| Ok(true))
-                .unwrap()
-        );
-        region.finish().unwrap();
+            let (mut terrain, tags, motion, _) = fixture();
+            let before = terrain.snapshot();
+            let mut region = terrain
+                .ore_vein_region(&tags, &motion, before.chunks.keys().copied().collect())
+                .unwrap();
+            assert!(
+                region
+                    .place_planned(&plan, 0, &ore, &mut |_, _| Ok(true))
+                    .unwrap()
+            );
+            region.finish().unwrap();
+        }
     }
 
     #[test]
@@ -1157,7 +1239,7 @@ mod tests {
                     json!({"feature":{"type":"minecraft:tree"},"placement":[]})
                 } else {
                     ScheduledData {
-                        heightmap: Some("WORLD_SURFACE_WG"),
+                        heightmap: Some("MOTION_BLOCKING"),
                     }
                     .definition()
                 };
@@ -1297,6 +1379,7 @@ mod tests {
         let mut integrated_key = None;
         let mut batch_key = None;
         let mut write_radius = None;
+        let mut preserved_heightmaps = None;
         let mut writes = BTreeMap::new();
         for line in output.lines() {
             let words: Vec<_> = line.split_whitespace().collect();
@@ -1319,6 +1402,16 @@ mod tests {
                 }
                 ["Z", radius] => {
                     write_radius = Some(radius.parse::<i32>().unwrap());
+                }
+                ["H", a, b, c, d, e, f] => {
+                    preserved_heightmaps = Some([
+                        a.parse::<i32>().unwrap(),
+                        b.parse().unwrap(),
+                        c.parse().unwrap(),
+                        d.parse().unwrap(),
+                        e.parse().unwrap(),
+                        f.parse().unwrap(),
+                    ]);
                 }
                 ["W", x, y, z, name]
                     if key.is_some() || integrated_key.is_some() || batch_key.is_some() =>
@@ -1351,6 +1444,7 @@ mod tests {
             }
         }
         assert_eq!(write_radius, Some(1));
+        assert_eq!(preserved_heightmaps, Some([8, 8, 8, 8, 8, 13]));
         struct OracleData;
         impl ResourceProvider for OracleData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {

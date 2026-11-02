@@ -5,6 +5,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.core.*;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.*;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.*;
@@ -56,7 +57,7 @@ public class OreVeinOracle {
     out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);unsafe=(sun.misc.Unsafe)f.get(null);
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
-    bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD));bind.invoke(Blocks.DEEPSLATE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD));
+    bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD,BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP));bind.invoke(Blocks.DEEPSLATE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD));
     var first=new AllOfRuleTest(List.of(new TagMatchTest(BlockTags.BASE_STONE_OVERWORLD),new HeightMatchTest(-2,2),new NotRuleTest(new RandomBlockMatchTest(Blocks.STONE,0.25f))));
     var second=new AnyOfRuleTest(List.of(new BlockMatchTest(Blocks.DEEPSLATE),new RandomBlockMatchTest(Blocks.STONE,0.5f)));
     var targets=List.of(new BlockReplacement(first,Blocks.DIAMOND_ORE.defaultBlockState()),new BlockReplacement(second,Blocks.GOLD_ORE.defaultBlockState()));
@@ -73,6 +74,20 @@ public class OreVeinOracle {
       out.println("I "+seed);place(modifiers,0,context,random,new BlockPos(-32,0,48),world(true,false),new OreFeature(targets,9,0.5f));out.println("T "+random.nextLong());
     }
     if(args.length>0 && args[0].equals("--batch")) out.println("Z "+ChunkPyramid.GENERATION_PYRAMID.getStepTo(ChunkStatus.FEATURES).blockStateWriteRadius());
+    if(args.length>0 && args[0].equals("--batch")) {
+      var biome=Holder.direct((Biome)unsafe.allocateInstance(Biome.class));
+      var ids=new IdMapper<Holder<Biome>>();ids.add(biome);
+      var palette=new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),Blocks.AIR.defaultBlockState(),null,Strategy.createForBiomes(ids),biome,null);
+      var chunk=new ProtoChunk(new ChunkPos(1,0),UpgradeData.EMPTY,LevelHeightAccessor.create(0,16),palette,null);
+      chunk.setPersistedStatus(ChunkStatus.TERRAIN);
+      var section=chunk.getSection(0);
+      for(int y=0;y<8;y++)for(int z=0;z<16;z++)for(int x=0;x<16;x++)section.setBlockState(x,y,z,Blocks.STONE.defaultBlockState(),false);
+      section.setBlockState(2,12,5,Blocks.WATER.defaultBlockState(),false);
+      Heightmap.primeHeightmaps(chunk,EnumSet.of(Heightmap.Types.OCEAN_FLOOR_WG,Heightmap.Types.WORLD_SURFACE_WG));
+      section.setBlockState(0,7,5,Blocks.AIR.defaultBlockState(),false);
+      section.setBlockState(1,12,5,Blocks.STONE.defaultBlockState(),false);
+      out.printf("H %d %d %d %d %d %d%n",chunk.getHeight(Heightmap.Types.OCEAN_FLOOR_WG,0,5)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG,0,5)+1,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR_WG,1,5)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG,1,5)+1,chunk.getHeight(Heightmap.Types.OCEAN_FLOOR_WG,2,5)+1,chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG,2,5)+1);
+    }
     if(args.length>0 && args[0].equals("--batch")) for(long seed=0;seed<8;seed++){
       blocks=new HashMap<>();var random=new WorldgenRandom(new XoroshiroRandomSource(0));long deco=random.setDecorationSeed(seed,-32,48);
       out.println("B "+seed);

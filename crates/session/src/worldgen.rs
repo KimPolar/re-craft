@@ -71,6 +71,7 @@ pub struct CarvedTerrainWorld {
     completed_decoration: std::collections::BTreeSet<native_world::loaded::ChunkPos>,
     // Direct feature section writes do not update Java's primed heightmap.
     ore_ocean_floor_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
+    feature_world_surface_heights: BTreeMap<native_world::loaded::ChunkPos, Arc<[i32; 256]>>,
     postprocessing: BTreeMap<native_world::loaded::ChunkPos, Arc<[bool]>>,
     noise_postprocessing:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
@@ -101,6 +102,7 @@ impl CarvedTerrainWorld {
             height,
             completed_decoration: std::collections::BTreeSet::new(),
             ore_ocean_floor_heights: BTreeMap::new(),
+            feature_world_surface_heights: BTreeMap::new(),
             postprocessing: BTreeMap::from([(position, postprocessing)]),
             noise_postprocessing: noise_postprocessing
                 .into_iter()

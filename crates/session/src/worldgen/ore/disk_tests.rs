@@ -61,7 +61,7 @@ fn terrain() -> CarvedTerrainWorld {
                 pos,
                 Arc::new(Chunk {
                     position: pos,
-                    status: Some("minecraft:carvers".into()),
+                    status: Some("minecraft:terrain".into()),
                     block_light_correct: false,
                     sections,
                 }),

@@ -33,6 +33,7 @@ mod generated_chest;
 mod generated_spawner;
 mod ore;
 pub mod postprocessing;
+pub mod schedule;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
@@ -57,7 +58,7 @@ pub struct QuartBiomeChunk {
     values: Vec<ResourceId>,
 }
 
-/// A CARVERS-stage result ready for the remaining generation stages. The
+/// A terrain-stage result ready for the remaining generation stages. The
 /// embedded chunk is deliberately not marked FULL or safe for world saving.
 pub struct MaterializedTerrain {
     world: native_world::loaded::World,
@@ -72,7 +73,7 @@ pub struct MaterializedTerrain {
 }
 
 /// A collection of intermediate generated chunks sharing one world registry.
-/// Individual feature attempts may have modified these CARVERS-stage chunks;
+/// Individual feature attempts may have modified these terrain-stage chunks;
 /// they are not ready for play or saving.
 pub struct CarvedTerrainWorld {
     world: Arc<native_world::loaded::World>,
@@ -718,7 +719,7 @@ impl MaterializedTerrain {
     }
 }
 
-/// Resolve a generated CARVERS-stage chunk against the active block-state
+/// Resolve a generated terrain-stage chunk against the active block-state
 /// registry. The resolver must return the complete state, including defaults,
 /// and reject identifiers or properties absent from that registry.
 pub fn materialize_carved_terrain(
@@ -831,7 +832,7 @@ pub fn materialize_carved_terrain(
         position,
         Arc::new(Chunk {
             position,
-            status: Some("minecraft:carvers".into()),
+            status: Some("minecraft:terrain".into()),
             block_light_correct: false,
             sections,
         }),
@@ -1959,7 +1960,7 @@ mod tests {
         let world = generated.world();
         assert_eq!(world.biome_zoom_seed(), Some(obfuscate_seed(123)));
         let chunk = &world.chunks[&native_world::loaded::ChunkPos { x: -2, z: 3 }];
-        assert_eq!(chunk.status.as_deref(), Some("minecraft:carvers"));
+        assert_eq!(chunk.status.as_deref(), Some("minecraft:terrain"));
         assert!(!chunk.block_light_correct);
         for section in chunk.sections.values() {
             assert!(section.block_light.is_none() && section.sky_light.is_none());

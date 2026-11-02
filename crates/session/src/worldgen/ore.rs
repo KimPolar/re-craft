@@ -1,7 +1,7 @@
 //! Apply supported decoration features to intermediate generated chunks.
 //!
 //! The surrounding decoration scheduler must still supply Java's feature order,
-//! random seed, writable region and complete CARVERS-stage neighborhood.
+//! random seed, writable region and complete terrain-stage neighborhood.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
@@ -442,6 +442,12 @@ struct PreparedFreeze {
 }
 
 impl<'p, 's> PreparedDecoration<'p, 's> {
+    pub(crate) fn center_chunk(&self) -> ChunkPos {
+        ChunkPos {
+            x: self.plan.origin[0].div_euclid(16),
+            z: self.plan.origin[2].div_euclid(16),
+        }
+    }
     /// The provider, complete block registry and resolver must describe the
     /// same immutable data-pack stack as the plan and generated terrain.
     pub fn load(
@@ -3613,7 +3619,7 @@ mod tests {
                     position,
                     Arc::new(Chunk {
                         position,
-                        status: Some("minecraft:carvers".into()),
+                        status: Some("minecraft:terrain".into()),
                         block_light_correct: false,
                         sections: BTreeMap::from([(
                             0,
@@ -3702,7 +3708,7 @@ mod tests {
         assert!(lit.chunks[&center].block_light_correct);
         assert_eq!(
             lit.chunks[&center].status.as_deref(),
-            Some("minecraft:carvers")
+            Some("minecraft:terrain")
         );
         assert_eq!(lit.light(0, 10, 8, false), Some(13));
         assert_eq!(lit.light(0, 10, 8, true), Some(15));
@@ -3931,15 +3937,36 @@ mod tests {
             terrain.completed_decoration.remove(&second);
             assert!(tracker.snapshot(&terrain, [center], &vanilla).is_err());
             terrain.completed_decoration.insert(second);
+            let mut steps = super::super::schedule::GenerationSchedule::new();
+            use super::super::schedule::GenerationStage;
+            steps.request(center, GenerationStage::Features).unwrap();
+            while !steps.ready(center, GenerationStage::Features) {
+                let (pos, stage) = steps.next_ready().unwrap();
+                steps.complete(pos, stage).unwrap();
+            }
             let before = terrain.snapshot();
+            assert!(
+                steps
+                    .run_features(&mut terrain, &prepared, true, Some((&tracker, &vanilla)))
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
             let result =
-                prepared.execute_with_tracked_light(&mut terrain, false, &tracker, &vanilla);
+                steps.run_features(&mut terrain, &prepared, false, Some((&tracker, &vanilla)));
             if x == 8 {
                 assert_eq!(result.unwrap(), [true]);
+                assert_eq!(steps.completed(center), Some(GenerationStage::Features));
                 assert_eq!(
                     terrain.snapshot().block(8, 8, 8).unwrap().name,
                     "minecraft:brown_mushroom"
                 );
+                steps
+                    .request(center, GenerationStage::InitializeLight)
+                    .unwrap();
+                assert!(steps.ready(center, GenerationStage::InitializeLight));
+                tracker.register_chunk(&terrain, center, &vanilla).unwrap();
+                assert_eq!(steps.completed(center), Some(GenerationStage::Features));
                 assert_eq!(
                     tracker
                         .snapshot(&terrain, [center], &vanilla)
@@ -3949,6 +3976,7 @@ mod tests {
                 );
             } else {
                 assert!(result.is_err());
+                assert_eq!(steps.completed(center), Some(GenerationStage::Terrain));
                 assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
                 assert!(!terrain.completed_decoration.contains(&center));
             }
@@ -9216,7 +9244,7 @@ mod tests {
                         pos,
                         Arc::new(Chunk {
                             position: pos,
-                            status: Some("minecraft:carvers".into()),
+                            status: Some("minecraft:terrain".into()),
                             block_light_correct: false,
                             sections,
                         }),

@@ -88,7 +88,7 @@ fn terrain(seed: i64) -> CarvedTerrainWorld {
                 position,
                 Arc::new(Chunk {
                     position,
-                    status: Some("minecraft:carvers".into()),
+                    status: Some("minecraft:terrain".into()),
                     block_light_correct: false,
                     sections,
                 }),

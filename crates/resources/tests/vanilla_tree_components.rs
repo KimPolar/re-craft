@@ -70,6 +70,13 @@ impl DiskWorld for World {
     }
 }
 impl TreeWorld for World {
+    fn trunk_axis(
+        &mut self,
+        state: State,
+        _: native_resources::tree_fancy_trunk::LogAxis,
+    ) -> Result<State> {
+        Ok(state)
+    }
     fn tree_min_y(&self) -> i32 {
         0
     }
@@ -169,6 +176,18 @@ fn installed_oak_bees_definition_is_supported() {
         tree.required_blocks()
             .contains(&ResourceId::parse("minecraft:bee_nest").unwrap())
     );
+    let fancy: Value = serde_json::from_slice(
+        &resources
+            .read_data("data/minecraft/worldgen/feature/fancy_oak_bees_005.json")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let tree = TreeFeature::decode(&mut resources, &fancy, &mut resolve).unwrap();
+    assert!(
+        tree.required_blocks()
+            .contains(&ResourceId::parse("minecraft:bee_nest").unwrap())
+    );
 }
 
 fn run(c: &mut Command) -> String {
@@ -245,52 +264,67 @@ fn straight_blob_tree_components_match_java() {
         for mode in 0..6 {
             for ignore in [false, true] {
                 for fancy in [false, true] {
-                    let mut config = definition(ignore);
-                    if fancy {
-                        config["foliage_placer"]["type"] = json!("minecraft:fancy_foliage_placer");
+                    for branching in [false, true] {
+                        let mut config = definition(ignore);
+                        if fancy {
+                            config["foliage_placer"]["type"] =
+                                json!("minecraft:fancy_foliage_placer");
+                        }
+                        if branching {
+                            config["trunk_placer"]["type"] = json!("minecraft:fancy_trunk_placer");
+                        }
+                        let tree = TreeFeature::decode(&mut Data, &config, &mut resolve).unwrap();
+                        let mut world = World {
+                            blocks: BTreeMap::from([([3, 2, -4], state("minecraft:stone"))]),
+                            writes: Vec::new(),
+                        };
+                        match mode {
+                            1 => {
+                                world.blocks.insert([3, 5, -4], state("minecraft:stone"));
+                            }
+                            2 => {
+                                let mut s = state("minecraft:oak_leaves");
+                                s.persistent = true;
+                                world.blocks.insert([4, 6, -4], s);
+                            }
+                            3 => {
+                                world.blocks.insert([2, 6, -4], state("minecraft:water"));
+                            }
+                            4 => {
+                                world.blocks.insert([3, 5, -4], state("minecraft:vine"));
+                            }
+                            5 => {
+                                world.blocks.insert([3, 5, -4], state("minecraft:oak_log"));
+                            }
+                            _ => {}
+                        }
+                        let mut random = DecorationRandom::new(seed);
+                        let ok = tree
+                            .place_components(&mut world, &mut random, [3, 3, -4])
+                            .unwrap();
+                        expected.push(format!(
+                            "{} {seed} {mode} {ignore} {ok} {} R {}",
+                            match (branching, fancy) {
+                                (false, false) => "C",
+                                (false, true) => "F",
+                                (true, false) => "B",
+                                (true, true) => "G",
+                            },
+                            world.writes.join(";"),
+                            random.next_long()
+                        ));
                     }
-                    let tree = TreeFeature::decode(&mut Data, &config, &mut resolve).unwrap();
-                    let mut world = World {
-                        blocks: BTreeMap::from([([3, 2, -4], state("minecraft:stone"))]),
-                        writes: Vec::new(),
-                    };
-                    match mode {
-                        1 => {
-                            world.blocks.insert([3, 5, -4], state("minecraft:stone"));
-                        }
-                        2 => {
-                            let mut s = state("minecraft:oak_leaves");
-                            s.persistent = true;
-                            world.blocks.insert([4, 6, -4], s);
-                        }
-                        3 => {
-                            world.blocks.insert([2, 6, -4], state("minecraft:water"));
-                        }
-                        4 => {
-                            world.blocks.insert([3, 5, -4], state("minecraft:vine"));
-                        }
-                        5 => {
-                            world.blocks.insert([3, 5, -4], state("minecraft:oak_log"));
-                        }
-                        _ => {}
-                    }
-                    let mut random = DecorationRandom::new(seed);
-                    let ok = tree
-                        .place_components(&mut world, &mut random, [3, 3, -4])
-                        .unwrap();
-                    expected.push(format!(
-                        "{} {seed} {mode} {ignore} {ok} {} R {}",
-                        if fancy { "F" } else { "C" },
-                        world.writes.join(";"),
-                        random.next_long()
-                    ));
                 }
             }
         }
     }
     let actual: Vec<_> = actual
         .lines()
-        .filter(|line| line.starts_with("C ") || line.starts_with("F "))
+        .filter(|line| {
+            ["C ", "F ", "B ", "G "]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
         .collect();
     assert_eq!(actual.len(), expected.len());
     for (i, (actual, expected)) in actual.iter().zip(&expected).enumerate() {

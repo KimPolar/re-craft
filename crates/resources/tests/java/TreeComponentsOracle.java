@@ -24,6 +24,7 @@ import net.minecraft.world.level.levelgen.feature.foliageplacers.FancyFoliagePla
 import net.minecraft.world.level.levelgen.feature.foliageplacers.FoliagePlacer;
 import net.minecraft.world.level.levelgen.feature.stateproviders.BlockStateProvider;
 import net.minecraft.world.level.levelgen.feature.trunkplacers.StraightTrunkPlacer;
+import net.minecraft.world.level.levelgen.feature.trunkplacers.FancyTrunkPlacer;
 
 public class TreeComponentsOracle {
   @SuppressWarnings("unchecked") public static void main(String[] args)throws Exception {
@@ -32,7 +33,7 @@ public class TreeComponentsOracle {
     bind.invoke(Blocks.OAK_LOG.builtInRegistryHolder(),List.of(BlockTags.LOGS));
     for(var b:List.of(Blocks.OAK_LEAVES,Blocks.VINE,Blocks.WATER))bind.invoke(b.builtInRegistryHolder(),List.of(BlockTags.REPLACEABLE_BY_TREES));
     var method=TreeFeature.class.getDeclaredMethod("doPlace",WorldGenLevel.class,RandomSource.class,BlockPos.class,BiConsumer.class,BiConsumer.class,FoliagePlacer.FoliageSetter.class);method.setAccessible(true);
-    for(long seed:new long[]{0,1,-1,987654321})for(int mode=0;mode<6;mode++)for(boolean ignore:new boolean[]{false,true})for(boolean fancy:new boolean[]{false,true}) {
+    for(long seed:new long[]{0,1,-1,987654321})for(int mode=0;mode<6;mode++)for(boolean ignore:new boolean[]{false,true})for(boolean fancy:new boolean[]{false,true})for(boolean branching:new boolean[]{false,true}) {
       var blocks=new HashMap<BlockPos,BlockState>();var writes=new ArrayList<String>();
       blocks.put(new BlockPos(3,2,-4),Blocks.STONE.defaultBlockState());
       if(mode==1)blocks.put(new BlockPos(3,5,-4),Blocks.STONE.defaultBlockState());
@@ -48,10 +49,10 @@ public class TreeComponentsOracle {
       });
       BiConsumer<BlockPos,BlockState> trunk=(p,s)->{p=p.immutable();blocks.put(p,s);writes.add("T"+p.getX()+","+p.getY()+","+p.getZ()+","+BuiltInRegistries.BLOCK.getKey(s.getBlock()));};
       var foliage=new FoliagePlacer.FoliageSetter(){public void set(BlockPos p,BlockState s){p=p.immutable();blocks.put(p,s);writes.add("L"+p.getX()+","+p.getY()+","+p.getZ()+","+BuiltInRegistries.BLOCK.getKey(s.getBlock())+","+s.getValue(BlockStateProperties.WATERLOGGED));}public boolean isSet(BlockPos p){return false;}};
-      var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),fancy?new FancyFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3):new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),List.of(),ignore,BlockStateProvider.holderOf(Blocks.DIRT));
+      var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),branching?new FancyTrunkPlacer(4,2,0):new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),fancy?new FancyFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3):new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),List.of(),ignore,BlockStateProvider.holderOf(Blocks.DIRT));
       var random=new WorldgenRandom(new XoroshiroRandomSource(seed));
       boolean ok=(boolean)method.invoke(tree,world,random,new BlockPos(3,3,-4),trunk,trunk,foliage);
-      out.printf("%s %d %d %s %s %s R %d%n",fancy?"F":"C",seed,mode,ignore,ok,String.join(";",writes),random.nextLong());
+      out.printf("%s %d %d %s %s %s R %d%n",branching?(fancy?"G":"B"):(fancy?"F":"C"),seed,mode,ignore,ok,String.join(";",writes),random.nextLong());
     }
   }
 }

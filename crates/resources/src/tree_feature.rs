@@ -11,6 +11,7 @@ use crate::{
     packs::{ResourceId, ResourceProvider},
     placed_feature::IntProvider,
     tree_beehive::{BeehiveDecorator, BeehiveWorld},
+    tree_fancy_trunk::{FancyTrunkWorld, LogAxis, place_fancy_trunk},
     tree_placers::{
         TreeFeatureSize, TrunkHeight, VanillaTreeClearance, permitted_tree_height,
         place_blob_foliage, place_fancy_foliage, place_straight_trunk,
@@ -29,6 +30,8 @@ pub trait TreeWorld: DiskWorld {
     fn tree_max_y(&self) -> i32;
     fn persistent_foliage(&mut self, pos: [i32; 3]) -> Result<bool>;
     fn foliage_state(&mut self, pos: [i32; 3], state: Self::State) -> Result<Self::State>;
+    /// Java's trySetValue changes the axis only when the state has that property.
+    fn trunk_axis(&mut self, state: Self::State, axis: LogAxis) -> Result<Self::State>;
     fn write_tree(&mut self, pos: [i32; 3], state: &Self::State, kind: TreeWrite) -> Result<()>;
 }
 
@@ -37,6 +40,7 @@ pub struct TreeFeature<S> {
     foliage: Provider<S>,
     below: Provider<S>,
     trunk_height: TrunkHeight,
+    fancy_trunk: bool,
     foliage_height: i32,
     fancy_foliage: bool,
     radius: IntProvider,
@@ -47,7 +51,7 @@ pub struct TreeFeature<S> {
 }
 
 impl<S: Clone + Eq> TreeFeature<S> {
-    /// Decode a straight-trunk tree with blob or fancy foliage, without roots.
+    /// Decode straight or fancy trunks with blob or fancy foliage, without roots.
     /// Reject unsupported configurations before a world can be modified.
     pub fn decode(
         provider: &mut impl ResourceProvider,
@@ -113,10 +117,11 @@ impl<S: Clone + Eq> TreeFeature<S> {
             decorators.push(BeehiveDecorator::new(probability)?);
         }
         let trunk_placer = field(value, "trunk_placer")?;
-        ensure!(
-            name(trunk_placer)? == ResourceId::parse("minecraft:straight_trunk_placer")?,
-            "unsupported tree trunk placer"
-        );
+        let fancy_trunk = match name(trunk_placer)? {
+            id if id == ResourceId::parse("minecraft:straight_trunk_placer")? => false,
+            id if id == ResourceId::parse("minecraft:fancy_trunk_placer")? => true,
+            _ => anyhow::bail!("unsupported tree trunk placer"),
+        };
         let foliage_placer = field(value, "foliage_placer")?;
         let fancy_foliage = match name(foliage_placer)? {
             id if id == ResourceId::parse("minecraft:blob_foliage_placer")? => false,
@@ -147,6 +152,7 @@ impl<S: Clone + Eq> TreeFeature<S> {
                 integer(trunk_placer, "height_rand_a")?,
                 integer(trunk_placer, "height_rand_b")?,
             )?,
+            fancy_trunk,
             foliage_height,
             fancy_foliage,
             radius,
@@ -214,52 +220,109 @@ impl<S: Clone + Eq> TreeFeature<S> {
         else {
             return Ok(false);
         };
-        let attachment = place_straight_trunk(random, origin, height, |pos, soil, random| {
-            if soil {
-                if let Some(state) = self.below.state(world, random, pos)? {
-                    world.write_tree(pos, &state, TreeWrite::Trunk)?;
-                }
-            } else if valid_tree_pos(world, pos)? {
-                let state = self
-                    .trunk
-                    .state(world, random, pos)?
-                    .context("tree trunk provider returned no state")?;
-                world.write_tree(pos, &state, TreeWrite::Trunk)?;
-            }
-            Ok(())
-        })?;
-        let offset = self.offset.sample(random);
-        let mut place = |pos, random: &mut DecorationRandom| {
-            if !world.persistent_foliage(pos)? && valid_tree_pos(world, pos)? {
-                let state = self
-                    .foliage
-                    .state(world, random, pos)?
-                    .context("tree foliage provider returned no state")?;
-                let state = world.foliage_state(pos, state)?;
-                world.write_tree(pos, &state, TreeWrite::Foliage)?;
-            }
-            Ok(())
-        };
-        if self.fancy_foliage {
-            place_fancy_foliage(
+        let attachments = if self.fancy_trunk {
+            place_fancy_trunk(
+                &mut FancyTreeAdapter { tree: self, world },
                 random,
-                attachment,
-                self.foliage_height,
-                radius,
-                offset,
-                &mut place,
-            )?;
+                origin,
+                height,
+            )?
         } else {
-            place_blob_foliage(
+            vec![place_straight_trunk(
                 random,
-                attachment,
-                self.foliage_height,
-                radius,
-                offset,
-                &mut place,
-            )?;
+                origin,
+                height,
+                |pos, soil, random| {
+                    if soil {
+                        if let Some(state) = self.below.state(world, random, pos)? {
+                            world.write_tree(pos, &state, TreeWrite::Trunk)?;
+                        }
+                    } else if valid_tree_pos(world, pos)? {
+                        let state = self
+                            .trunk
+                            .state(world, random, pos)?
+                            .context("tree trunk provider returned no state")?;
+                        world.write_tree(pos, &state, TreeWrite::Trunk)?;
+                    }
+                    Ok(())
+                },
+            )?]
+        };
+        for attachment in attachments {
+            let offset = self.offset.sample(random);
+            let mut place = |pos, random: &mut DecorationRandom| {
+                if !world.persistent_foliage(pos)? && valid_tree_pos(world, pos)? {
+                    let state = self
+                        .foliage
+                        .state(world, random, pos)?
+                        .context("tree foliage provider returned no state")?;
+                    let state = world.foliage_state(pos, state)?;
+                    world.write_tree(pos, &state, TreeWrite::Foliage)?;
+                }
+                Ok(())
+            };
+            if self.fancy_foliage {
+                place_fancy_foliage(
+                    random,
+                    attachment,
+                    self.foliage_height,
+                    radius,
+                    offset,
+                    &mut place,
+                )?;
+            } else {
+                place_blob_foliage(
+                    random,
+                    attachment,
+                    self.foliage_height,
+                    radius,
+                    offset,
+                    &mut place,
+                )?;
+            }
         }
         Ok(true)
+    }
+}
+
+struct FancyTreeAdapter<'a, S, W> {
+    tree: &'a TreeFeature<S>,
+    world: &'a mut W,
+}
+impl<S: Clone + Eq, W: TreeWorld<State = S>> FancyTrunkWorld for FancyTreeAdapter<'_, S, W> {
+    fn is_free(&mut self, pos: [i32; 3]) -> Result<bool> {
+        if valid_tree_pos(self.world, pos)? {
+            return Ok(true);
+        }
+        let state = self.world.block(pos)?;
+        static LOGS: OnceLock<ResourceId> = OnceLock::new();
+        self.world.in_tag(
+            &state,
+            LOGS.get_or_init(|| ResourceId::parse("minecraft:logs").unwrap()),
+        )
+    }
+    fn place_soil(&mut self, pos: [i32; 3], random: &mut DecorationRandom) -> Result<()> {
+        if let Some(state) = self.tree.below.state(self.world, random, pos)? {
+            self.world.write_tree(pos, &state, TreeWrite::Trunk)?;
+        }
+        Ok(())
+    }
+    fn place_log(
+        &mut self,
+        pos: [i32; 3],
+        axis: LogAxis,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        if valid_tree_pos(self.world, pos)? {
+            let state = self
+                .tree
+                .trunk
+                .state(self.world, random, pos)?
+                .context("tree trunk provider returned no state")?;
+            let state = self.world.trunk_axis(state, axis)?;
+            self.world.write_tree(pos, &state, TreeWrite::Trunk)?;
+        }
+        Ok(())
     }
 }
 

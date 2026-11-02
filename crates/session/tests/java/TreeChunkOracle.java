@@ -25,6 +25,7 @@ import net.minecraft.world.level.levelgen.feature.foliageplacers.BlobFoliagePlac
 import net.minecraft.world.level.levelgen.feature.foliageplacers.FancyFoliagePlacer;
 import net.minecraft.world.level.levelgen.feature.stateproviders.BlockStateProvider;
 import net.minecraft.world.level.levelgen.feature.trunkplacers.StraightTrunkPlacer;
+import net.minecraft.world.level.levelgen.feature.trunkplacers.FancyTrunkPlacer;
 import net.minecraft.world.level.levelgen.feature.treedecorators.BeehiveDecorator;
 
 public class TreeChunkOracle {
@@ -36,7 +37,8 @@ public class TreeChunkOracle {
     bind.invoke(Blocks.OAK_LEAVES.builtInRegistryHolder(),List.of(BlockTags.REPLACEABLE_BY_TREES));
     var blocks=new HashMap<BlockPos,BlockState>();var ticks=new LinkedHashSet<String>();var nests=new HashMap<BlockPos,BeehiveBlockEntity>();
     boolean bees=args.length>0 && args[0].equals("bees");
-    boolean fancy=args.length>0 && args[0].equals("fancy");
+    boolean branching=args.length>0 && args[0].equals("branching");
+    boolean fancy=branching || args.length>0 && args[0].equals("fancy");
     if(args.length>0 && args[0].equals("grass"))blocks.put(new BlockPos(8,8,9),Blocks.GRASS_BLOCK.defaultBlockState().setValue(BlockStateProperties.SNOWY,true));
     if(args.length>0 && args[0].startsWith("vegetation")){
       blocks.put(new BlockPos(8,8,9),Blocks.SHORT_GRASS.defaultBlockState());
@@ -60,7 +62,7 @@ public class TreeChunkOracle {
       if(m.getName().equals("scheduleTick")){if(v[1] instanceof Block block)ticks.add(pos((BlockPos)v[0])+","+BuiltInRegistries.BLOCK.getKey(block));else throw new AssertionError("unexpected fluid tick");return null;}
       throw new UnsupportedOperationException(m.toString());
     });
-    var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),fancy?new FancyFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3):new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),bees?List.of(new BeehiveDecorator(1f)):List.of(),true,BlockStateProvider.holderOf(Blocks.DIRT));
+    var tree=new TreeFeature(BlockStateProvider.holderOf(Blocks.OAK_LOG),branching?new FancyTrunkPlacer(4,2,0):new StraightTrunkPlacer(4,2,0),BlockStateProvider.holderOf(Blocks.OAK_LEAVES),fancy?new FancyFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3):new BlobFoliagePlacer(ConstantInt.of(2),ConstantInt.of(0),3),Optional.empty(),new TwoLayersFeatureSize(1,0,1),bees?List.of(new BeehiveDecorator(1f)):List.of(),true,BlockStateProvider.holderOf(Blocks.DIRT));
     var random=new WorldgenRandom(new XoroshiroRandomSource(0));long decoration=random.setDecorationSeed(0,0,0);random.setFeatureSeed(decoration,0,0);
     boolean success=tree.place(world,null,random,new BlockPos(8,8,8));
     var result=new ArrayList<String>();

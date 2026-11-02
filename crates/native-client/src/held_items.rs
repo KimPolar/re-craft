@@ -426,6 +426,11 @@ impl Loader {
     ) -> Result<crate::particle_sprites::ParticleSprites> {
         crate::particle_sprites::ParticleSprites::load(&mut self.stack, "bubble")
     }
+    pub(crate) fn load_splash_sprites(
+        &mut self,
+    ) -> Result<crate::particle_sprites::ParticleSprites> {
+        crate::particle_sprites::ParticleSprites::load(&mut self.stack, "splash")
+    }
     pub(crate) fn load_soul_sprites(&mut self) -> Result<crate::particle_sprites::ParticleSprites> {
         crate::particle_sprites::ParticleSprites::load(&mut self.stack, "soul")
     }
@@ -1394,6 +1399,44 @@ mod tests {
         let (second, second_uv) = sprites.get(1).unwrap();
         assert!(Arc::ptr_eq(image, second));
         assert_eq!(uv, second_uv);
+        assert_eq!(
+            image
+                .get_pixel(
+                    (uv[0] * image.width() as f32) as u32,
+                    (uv[1] * image.height() as f32) as u32
+                )
+                .0,
+            [7, 11, 13, 255]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires locally installed Minecraft 26.3 assets"]
+    fn splash_sprites_follow_particle_definition_and_pack() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        assert_eq!(
+            open_loader(&game, &[]).load_splash_sprites().unwrap().len(),
+            4
+        );
+        let pack = tempfile::tempdir().unwrap();
+        let base = pack.path().join("assets/minecraft");
+        std::fs::create_dir_all(base.join("particles")).unwrap();
+        std::fs::create_dir_all(base.join("textures/particle")).unwrap();
+        std::fs::write(
+            base.join("particles/splash.json"),
+            br#"{"textures":["minecraft:test_splash"]}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(4, 4, image::Rgba([7, 11, 13, 255]))
+            .save(base.join("textures/particle/test_splash.png"))
+            .unwrap();
+        let sprites = open_loader(&game, &[pack.path().to_path_buf()])
+            .load_splash_sprites()
+            .unwrap();
+        assert_eq!(sprites.len(), 1);
+        let (image, uv) = sprites.get(0).unwrap();
         assert_eq!(
             image
                 .get_pixel(

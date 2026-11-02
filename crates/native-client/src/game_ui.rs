@@ -179,6 +179,12 @@ pub struct GameUi {
     bubble_sprite_result:
         std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
     bubble_load_failed: bool,
+    surface_packet_random: crate::surface_particles::SurfacePacketRandom,
+    splash_particles: crate::surface_particles::SplashSystem,
+    splash_sprites: Option<crate::particle_sprites::ParticleSprites>,
+    splash_sprite_result:
+        std::sync::mpsc::Receiver<Result<crate::particle_sprites::ParticleSprites, String>>,
+    splash_load_failed: bool,
     soul_particles: crate::soul_particles::SoulSystem,
     soul_sprites: Option<crate::particle_sprites::ParticleSprites>,
     soul_sprite_result:
@@ -232,6 +238,7 @@ impl GameUi {
         let skin = Arc::clone(&assets.player_skin);
         let (smoke_sender, smoke_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (bubble_sender, bubble_sprite_result) = std::sync::mpsc::sync_channel(1);
+        let (splash_sender, splash_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (soul_sender, soul_sprite_result) = std::sync::mpsc::sync_channel(1);
         let (plant_sender, plant_sprite_result) = std::sync::mpsc::sync_channel(1);
         let smoke_loader = Arc::clone(&assets.item_models);
@@ -263,6 +270,11 @@ impl GameUi {
                             .load_bubble_sprites()
                             .map_err(|error| format!("{error:#}")),
                     );
+                    let _ = splash_sender.send(
+                        loader
+                            .load_splash_sprites()
+                            .map_err(|error| format!("{error:#}")),
+                    );
                     let _ = soul_sender.send(
                         loader
                             .load_soul_sprites()
@@ -273,6 +285,8 @@ impl GameUi {
                     let _ = smoke_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
                     let _ = bubble_sender
+                        .send(Err("particle resource loader is unavailable".to_owned()));
+                    let _ = splash_sender
                         .send(Err("particle resource loader is unavailable".to_owned()));
                     let _ =
                         soul_sender.send(Err("particle resource loader is unavailable".to_owned()));
@@ -304,6 +318,11 @@ impl GameUi {
             bubble_sprites: None,
             bubble_sprite_result,
             bubble_load_failed: false,
+            surface_packet_random: crate::surface_particles::SurfacePacketRandom::default(),
+            splash_particles: crate::surface_particles::SplashSystem::default(),
+            splash_sprites: None,
+            splash_sprite_result,
+            splash_load_failed: false,
             soul_particles: crate::soul_particles::SoulSystem::default(),
             soul_sprites: None,
             soul_sprite_result,
@@ -405,6 +424,43 @@ impl GameUi {
                 .update(snapshot.tick, &snapshot.world, sprites.len());
         } else if self.bubble_load_failed {
             self.bubble_particles
+                .update(snapshot.tick, &snapshot.world, 0);
+        }
+    }
+
+    pub fn queue_bubble_surface_particles(
+        &mut self,
+        packets: Vec<native_session::loaded::BubbleSurfaceParticle>,
+    ) {
+        use native_session::loaded::BubbleSurfaceParticleKind;
+        let mut bubbles = Vec::new();
+        for packet in packets {
+            let spawn = self.surface_packet_random.decode(packet);
+            match packet.kind {
+                BubbleSurfaceParticleKind::Splash => self.splash_particles.enqueue(spawn),
+                BubbleSurfaceParticleKind::Bubble => bubbles.push(spawn),
+            }
+        }
+        self.bubble_particles.enqueue(bubbles);
+    }
+
+    pub fn update_splash_particles(&mut self, snapshot: &native_session::WorldSnapshot) {
+        if self.splash_sprites.is_none() && !self.splash_load_failed {
+            match self.splash_sprite_result.try_recv() {
+                Ok(Ok(sprites)) => self.splash_sprites = Some(sprites),
+                Ok(Err(error)) => {
+                    eprintln!("Cannot load splash sprites: {error}");
+                    self.splash_load_failed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.splash_load_failed = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(sprites) = &self.splash_sprites {
+            self.splash_particles
+                .update(snapshot.tick, &snapshot.world, sprites.len());
+        } else if self.splash_load_failed {
+            self.splash_particles
                 .update(snapshot.tick, &snapshot.world, 0);
         }
     }
@@ -2207,6 +2263,36 @@ impl GameUi {
                 sprites.advance(snapshot.tick);
             }
             for particle in self.bubble_particles.particles() {
+                let Some((texture, uv)) = sprites.get(particle.sprite) else {
+                    continue;
+                };
+                let light = match &snapshot.world {
+                    native_session::SessionWorld::Demo(_) => u32::MAX,
+                    native_session::SessionWorld::Loaded(world) => {
+                        let cell = particle.position.floor().as_ivec3();
+                        u32::from(world.light(cell.x, cell.y, cell.z, false).unwrap_or(0))
+                            + 16 * u32::from(
+                                world.light(cell.x, cell.y, cell.z, true).unwrap_or(15),
+                            )
+                    }
+                };
+                particle_draws.push(crate::consume_particle_render::RenderParticle {
+                    previous: particle.previous,
+                    position: particle.position,
+                    size: particle.size,
+                    uv,
+                    color: [1.0; 3],
+                    opaque: true,
+                    texture: Arc::clone(texture),
+                    light,
+                });
+            }
+        }
+        if let Some(sprites) = &mut self.splash_sprites {
+            if self.splash_particles.particles().next().is_some() {
+                sprites.advance(snapshot.tick);
+            }
+            for particle in self.splash_particles.particles() {
                 let Some((texture, uv)) = sprites.get(particle.sprite) else {
                     continue;
                 };

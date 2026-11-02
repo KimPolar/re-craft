@@ -119,6 +119,9 @@ const FLUIDS: [&str; 5] = [
 pub fn load_water(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {
     load_fluid_tag(provider, "minecraft:water")
 }
+pub fn load_lava(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {
+    load_fluid_tag(provider, "minecraft:lava")
+}
 
 /// Active fluids that allow a sugar cane block to survive alongside them.
 pub fn load_sugar_cane_adjacent(provider: &mut impl ResourceProvider) -> Result<BTreeSet<String>> {

@@ -20,6 +20,9 @@ pub trait DiskWorld: OreWorld {
     fn fluid_in_tag(&mut self, _state: &Self::State, _tag: &ResourceId) -> Result<bool> {
         bail!("unsupported survival fluid tag")
     }
+    fn is_liquid(&mut self, _state: &Self::State) -> Result<bool> {
+        bail!("unsupported block liquid property")
+    }
     fn would_survive(&mut self, state: &Value, pos: [i32; 3]) -> Result<bool> {
         let raw = state
             .as_str()
@@ -27,9 +30,28 @@ pub trait DiskWorld: OreWorld {
             .context("missing survival block")?;
         let id = ResourceId::parse(raw)?;
         ensure!(
-            id.namespace == "minecraft" && id.path == "sugar_cane",
+            id.namespace == "minecraft",
             "unsupported would_survive block"
         );
+        if id.path == "cactus" {
+            let lava = ResourceId::parse("minecraft:lava")?;
+            for [dx, dz] in [[0, -1], [1, 0], [0, 1], [-1, 0]] {
+                let neighbor =
+                    self.block([pos[0].wrapping_add(dx), pos[1], pos[2].wrapping_add(dz)])?;
+                if self.is_solid(&neighbor)? || self.fluid_in_tag(&neighbor, &lava)? {
+                    return Ok(false);
+                }
+            }
+            let below = self.block([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            if !self.block_is(&below, &id)?
+                && !self.in_tag(&below, &ResourceId::parse("minecraft:supports_cactus")?)?
+            {
+                return Ok(false);
+            }
+            let above = self.block([pos[0], pos[1].wrapping_add(1), pos[2]])?;
+            return Ok(!self.is_liquid(&above)?);
+        }
+        ensure!(id.path == "sugar_cane", "unsupported would_survive block");
         let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
         let base = self.block(below)?;
         if self.block_is(&base, &id)? {
@@ -93,7 +115,10 @@ impl BlockPredicate {
         !matches!(self.0, Predicate::True)
     }
     pub fn needs_sugar_cane_survival(&self) -> bool {
-        self.0.needs_sugar_cane_survival()
+        self.0.needs_survival("sugar_cane")
+    }
+    pub fn needs_survival(&self, name: &str) -> bool {
+        self.0.needs_survival(name)
     }
 }
 
@@ -211,6 +236,9 @@ impl Predicate {
                         .expect("constant tag"),
                 );
             }
+            Self::WouldSurvive(_, id, _) if id.namespace == "minecraft" && id.path == "cactus" => {
+                tags.insert(ResourceId::parse("minecraft:supports_cactus").expect("constant tag"));
+            }
             Self::Not(value) => value.tags(tags),
             Self::Any(values) | Self::All(values) => {
                 for value in values {
@@ -295,13 +323,11 @@ impl Predicate {
             }
         })
     }
-    fn needs_sugar_cane_survival(&self) -> bool {
+    fn needs_survival(&self, name: &str) -> bool {
         match self {
-            Self::WouldSurvive(_, id, _) => id.namespace == "minecraft" && id.path == "sugar_cane",
-            Self::Not(v) => v.needs_sugar_cane_survival(),
-            Self::All(values) | Self::Any(values) => {
-                values.iter().any(Self::needs_sugar_cane_survival)
-            }
+            Self::WouldSurvive(_, id, _) => id.namespace == "minecraft" && id.path == name,
+            Self::Not(v) => v.needs_survival(name),
+            Self::All(values) | Self::Any(values) => values.iter().any(|v| v.needs_survival(name)),
             _ => false,
         }
     }
@@ -320,15 +346,13 @@ pub(crate) enum Provider<S> {
     },
 }
 impl<S: Clone> Provider<S> {
-    pub(crate) fn needs_sugar_cane_survival(&self) -> bool {
+    pub(crate) fn needs_survival(&self, name: &str) -> bool {
         match self {
             Self::Rules { fallback, rules } => {
-                fallback
-                    .as_ref()
-                    .is_some_and(|v| v.needs_sugar_cane_survival())
-                    || rules.iter().any(|(p, v)| {
-                        p.needs_sugar_cane_survival() || v.needs_sugar_cane_survival()
-                    })
+                fallback.as_ref().is_some_and(|v| v.needs_survival(name))
+                    || rules
+                        .iter()
+                        .any(|(p, v)| p.needs_survival(name) || v.needs_survival(name))
             }
             _ => false,
         }
@@ -501,7 +525,10 @@ pub struct DiskFeature<S> {
 }
 impl<S: Clone + Eq> DiskFeature<S> {
     pub fn needs_sugar_cane_survival(&self) -> bool {
-        self.target.needs_sugar_cane_survival() || self.provider.needs_sugar_cane_survival()
+        self.needs_survival("sugar_cane")
+    }
+    pub fn needs_survival(&self, name: &str) -> bool {
+        self.target.needs_survival(name) || self.provider.needs_survival(name)
     }
     pub fn load(
         provider: &mut impl ResourceProvider,

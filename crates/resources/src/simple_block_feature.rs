@@ -23,7 +23,10 @@ pub struct SimpleBlockFeature<S> {
 }
 impl<S: Clone + Eq> SimpleBlockFeature<S> {
     pub fn needs_sugar_cane_survival(&self) -> bool {
-        self.provider.needs_sugar_cane_survival()
+        self.needs_survival("sugar_cane")
+    }
+    pub fn needs_survival(&self, name: &str) -> bool {
+        self.provider.needs_survival(name)
     }
     pub fn load(
         provider: &mut impl ResourceProvider,

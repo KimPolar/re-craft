@@ -43,6 +43,7 @@ pub struct DecorationRegion<'a> {
     block_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     fluid_tick_keys: BTreeMap<ChunkPos, BTreeSet<([i32; 3], String)>>,
     sugar_cane_fluids: Option<&'a BTreeSet<String>>,
+    cactus_lava_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
     failed: bool,
 }
@@ -163,6 +164,7 @@ pub struct PreparedDecoration<'p, 's> {
     tags: OreBlockTags,
     motion: HeightmapTags,
     sugar_cane_fluids: Option<BTreeSet<String>>,
+    cactus_lava_fluids: Option<BTreeSet<String>>,
 }
 
 impl<'p, 's> PreparedDecoration<'p, 's> {
@@ -177,6 +179,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
         let mut needs_sugar_cane = false;
+        let mut needs_cactus = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
             let index = usize::try_from(selected.index).context("invalid feature index")?;
@@ -200,13 +203,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .with_context(|| format!("unsupported planned feature {:?}", selected.feature))?;
                 let mut blocks = feature.placed.placement.required_blocks();
                 needs_sugar_cane |= feature.placed.placement.needs_sugar_cane_survival();
+                needs_cactus |= feature.placed.placement.needs_survival("cactus");
                 if let ConfiguredDecoration::Disk(disk) = &feature.placed.feature {
                     blocks.extend(disk.required_blocks());
                     needs_sugar_cane |= disk.needs_sugar_cane_survival();
+                    needs_cactus |= disk.needs_survival("cactus");
                 }
                 if let ConfiguredDecoration::Simple(simple) = &feature.placed.feature {
                     blocks.extend(simple.required_blocks());
                     needs_sugar_cane |= simple.needs_sugar_cane_survival();
+                    needs_cactus |= simple.needs_survival("cactus");
                 }
                 if let ConfiguredDecoration::Spring(spring) = &feature.placed.feature {
                     blocks.extend(spring.required_blocks());
@@ -214,6 +220,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 if let ConfiguredDecoration::Column(column) = &feature.placed.feature {
                     blocks.extend(column.required_blocks());
                     needs_sugar_cane |= column.needs_sugar_cane_survival();
+                    needs_cactus |= column.needs_survival("cactus");
                 }
                 for id in blocks {
                     ensure!(
@@ -232,12 +239,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let sugar_cane_fluids = needs_sugar_cane
             .then(|| native_resources::fluid_tags::load_sugar_cane_adjacent(provider))
             .transpose()?;
+        let cactus_lava_fluids = needs_cactus
+            .then(|| native_resources::fluid_tags::load_lava(provider))
+            .transpose()?;
         Ok(Self {
             plan,
             features,
             tags,
             motion,
             sugar_cane_fluids,
+            cactus_lava_fluids,
         })
     }
 
@@ -285,6 +296,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         }
         let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
+        region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
         let mut results = Vec::with_capacity(self.plan.features.len());
         for (index, selected) in self.plan.features.iter().enumerate() {
             let ore = self
@@ -436,6 +448,7 @@ impl CarvedTerrainWorld {
             block_tick_keys: BTreeMap::new(),
             fluid_tick_keys: BTreeMap::new(),
             sugar_cane_fluids: None,
+            cactus_lava_fluids: None,
             motion_cache: BTreeMap::new(),
             failed: false,
         })
@@ -912,20 +925,23 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
         | "minecraft:bedrock"
         | "minecraft:red_sand"
         | "minecraft:moss_block" => Some(true),
-        "minecraft:magma_block" => Some(true),
+        "minecraft:magma_block" | "minecraft:cactus" => Some(true),
+        "minecraft:sugar_cane" | "minecraft:cactus_flower" => Some(false),
         _ => None,
     }
 }
 
 impl DiskWorld for DecorationRegion<'_> {
     fn fluid_in_tag(&mut self, state: &BlockState, tag: &ResourceId) -> Result<bool> {
-        ensure!(
-            tag.namespace == "minecraft" && tag.path == "supports_sugar_cane_adjacently",
-            "unsupported survival fluid tag"
-        );
-        let fluids = self
-            .sugar_cane_fluids
-            .context("sugar cane fluid tags were not prepared")?;
+        let fluids = match (tag.namespace.as_str(), tag.path.as_str()) {
+            ("minecraft", "supports_sugar_cane_adjacently") => self
+                .sugar_cane_fluids
+                .context("sugar cane fluid tags were not prepared")?,
+            ("minecraft", "lava") => self
+                .cactus_lava_fluids
+                .context("lava fluid tags were not prepared")?,
+            _ => bail!("unsupported survival fluid tag"),
+        };
         let fluid =
             match native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)? {
                 None => "minecraft:empty",
@@ -940,6 +956,16 @@ impl DiskWorld for DecorationRegion<'_> {
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
         disk_safe_solid(&state.name).context("unsupported disk solid predicate block")
+    }
+    fn is_liquid(&mut self, state: &BlockState) -> Result<bool> {
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            return Ok(true);
+        }
+        ensure!(
+            disk_safe_solid(&state.name).is_some() || simple_plant_kind(state).is_ok(),
+            "unsupported block liquid property"
+        );
+        Ok(false)
     }
 
     fn fluid_is(&mut self, state: &BlockState, id: &ResourceId) -> Result<bool> {
@@ -1359,12 +1385,14 @@ impl ColumnWorld for DecorationRegion<'_> {
                 .properties
                 .get("age")
                 .and_then(|v| v.parse::<u8>().ok());
-            ensure!(
-                state.name == "minecraft:sugar_cane"
-                    && state.properties.len() == 1
-                    && age.is_some_and(|v| v <= 15),
-                "unsupported column replacement effects"
-            );
+            let valid = match state.name.as_str() {
+                "minecraft:sugar_cane" | "minecraft:cactus" => {
+                    state.properties.len() == 1 && age.is_some_and(|v| v <= 15)
+                }
+                "minecraft:cactus_flower" => state.properties.is_empty(),
+                _ => false,
+            };
+            ensure!(valid, "unsupported column replacement effects");
             if self.is_outside(pos[1]) {
                 return Ok(true);
             }
@@ -2593,6 +2621,102 @@ mod tests {
     }
 
     #[test]
+    fn prepared_cactus_column_respects_block_and_fluid_tags() {
+        struct CactusData {
+            water_is_lava: bool,
+        }
+        impl ResourceProvider for CactusData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({"features":[[{"feature":{
+                    "type":"minecraft:block_column","direction":"up","prioritize_tip":false,"allowed_placement":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"},
+                    "layers":[{"height":2,"provider":{"id":"minecraft:cactus","properties":{"age":"0"}}},{"height":1,"provider":{"id":"minecraft:cactus_flower"}}]
+                },"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8},{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:would_survive","state":"minecraft:cactus"}}]}]]}))?));
+                }
+                if path == "data/minecraft/tags/block/supports_cactus.json" {
+                    return Ok(Some(br#"{"values":["minecraft:stone"]}"#.to_vec()));
+                }
+                if path == "data/minecraft/tags/fluid/lava.json" {
+                    return Ok(Some(if self.water_is_lava {
+                        br#"{"values":["minecraft:water"]}"#.to_vec()
+                    } else {
+                        br#"{"values":["minecraft:lava","minecraft:flowing_lava"]}"#.to_vec()
+                    }));
+                }
+                Data.read_data(path)
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let schedule = FeatureSchedule::load(
+            &mut CactusData {
+                water_is_lava: false,
+            },
+            std::slice::from_ref(&plains),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:lava".into(),
+            "minecraft:cactus".into(),
+            "minecraft:cactus_flower".into(),
+        ]);
+        for (block, location, water_is_lava, expected) in [
+            ("air", [9, 8, 8], false, true),
+            ("stone", [9, 8, 8], false, false),
+            ("lava", [9, 8, 8], false, false),
+            ("water", [8, 9, 8], false, false),
+            ("water", [9, 8, 8], true, false),
+            ("water", [9, 8, 8], false, true),
+        ] {
+            let prepared = PreparedDecoration::load(
+                &mut CactusData { water_is_lava },
+                &plan,
+                &registry,
+                &mut |v| {
+                    let mut s = resolve_test(v)?;
+                    if s.name == "minecraft:cactus" {
+                        s.properties.insert("age".into(), "0".into());
+                    }
+                    Ok(s)
+                },
+            )
+            .unwrap();
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut state = state(block);
+            if matches!(block, "water" | "lava") {
+                state.properties.insert("level".into(), "0".into());
+            }
+            setup.set_section_block(location, &state).unwrap();
+            setup.finish().unwrap();
+            assert_eq!(
+                prepared.execute(&mut terrain, false).unwrap(),
+                [expected],
+                "{block} {location:?} {water_is_lava}"
+            );
+            if expected {
+                let world = terrain.snapshot();
+                assert_eq!(world.block(8, 8, 8).unwrap().name, "minecraft:cactus");
+                assert_eq!(world.block(8, 9, 8).unwrap().name, "minecraft:cactus");
+                assert_eq!(
+                    world.block(8, 10, 8).unwrap().name,
+                    "minecraft:cactus_flower"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn installed_spring_and_magma_definitions_load_with_the_block_registry() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -2607,6 +2731,7 @@ mod tests {
             "spring_delta",
             "underwater_magma",
             "patch_sugar_cane",
+            "patch_cactus_desert",
         ] {
             let id = ResourceId::parse(&format!("minecraft:{name}")).unwrap();
             PlacedDecorationFeature::load(&mut resources, &id, &mut |value| {

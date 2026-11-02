@@ -25,11 +25,14 @@ pub struct BlockColumnFeature<S> {
 }
 impl<S: Clone + Eq> BlockColumnFeature<S> {
     pub fn needs_sugar_cane_survival(&self) -> bool {
-        self.allowed.needs_sugar_cane_survival()
+        self.needs_survival("sugar_cane")
+    }
+    pub fn needs_survival(&self, name: &str) -> bool {
+        self.allowed.needs_survival(name)
             || self
                 .layers
                 .iter()
-                .any(|layer| layer.provider.needs_sugar_cane_survival())
+                .any(|layer| layer.provider.needs_survival(name))
     }
     pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
         let id = ResourceId::parse(

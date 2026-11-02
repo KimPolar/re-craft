@@ -44,6 +44,7 @@ impl OreWorld for World {
         Ok(match tag.path.as_str() {
             "supports_sugar_cane" => s == "minecraft:stone",
             "supports_sugar_cane_adjacently" => s == "minecraft:frosted_ice",
+            "supports_cactus" => s == "minecraft:sand",
             _ => false,
         })
     }
@@ -55,15 +56,24 @@ impl OreWorld for World {
     }
 }
 impl DiskWorld for World {
-    fn is_solid(&mut self, _: &String) -> Result<bool> {
-        unreachable!()
+    fn is_solid(&mut self, s: &String) -> Result<bool> {
+        Ok(matches!(
+            s.as_str(),
+            "minecraft:stone" | "minecraft:dirt" | "minecraft:sand" | "minecraft:cactus"
+        ))
+    }
+    fn is_liquid(&mut self, s: &String) -> Result<bool> {
+        Ok(matches!(s.as_str(), "minecraft:water" | "minecraft:lava"))
     }
     fn fluid_is(&mut self, _: &String, _: &ResourceId) -> Result<bool> {
         unreachable!()
     }
     fn fluid_in_tag(&mut self, s: &String, tag: &ResourceId) -> Result<bool> {
-        assert_eq!(tag.path, "supports_sugar_cane_adjacently");
-        Ok(s == "minecraft:water" || s == "test:flowing_water")
+        Ok(match tag.path.as_str() {
+            "supports_sugar_cane_adjacently" => s == "minecraft:water" || s == "test:flowing_water",
+            "lava" => s == "minecraft:lava",
+            _ => false,
+        })
     }
     fn set_disk_block(&mut self, _: [i32; 3], _: &String) -> Result<bool> {
         unreachable!()
@@ -97,8 +107,11 @@ fn feature(kind: i32, direction: &str, tip: bool) -> Value {
         1 => {
             json!([{"height":{"type":"minecraft:biased_to_bottom","min_inclusive":2,"max_inclusive":4},"provider":sugar}])
         }
-        _ => {
+        2 => {
             json!([{"height":{"type":"minecraft:uniform","min_inclusive":1,"max_inclusive":3},"provider":sugar},{"height":{"type":"minecraft:uniform","min_inclusive":0,"max_inclusive":2},"provider":stone},{"height":1,"provider":{"type":"minecraft:weighted","entries":[{"data":{"id":"minecraft:sugar_cane"},"weight":3},{"data":{"id":"minecraft:stone"},"weight":1}]}}])
+        }
+        _ => {
+            json!([{"height":{"type":"minecraft:biased_to_bottom","min_inclusive":1,"max_inclusive":3},"provider":{"id":"minecraft:cactus"}},{"height":{"type":"minecraft:weighted_list","distribution":[{"data":0,"weight":3},{"data":1,"weight":1}]},"provider":{"id":"minecraft:cactus_flower"}}])
         }
     };
     json!({"type":"minecraft:block_column","layers":layers,"direction":direction,"allowed_placement":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"},"prioritize_tip":tip})
@@ -174,11 +187,83 @@ fn block_columns_and_sugar_cane_survival_match_java() {
     assert!(pred.needs_sugar_cane_survival());
     assert_eq!(pred.required_tags().len(), 2);
     assert!(pred.required_blocks().contains(&id("minecraft:sugar_cane")));
+    let cactus = BlockPredicate::decode(
+        &json!({"type":"minecraft:would_survive","state":"minecraft:cactus"}),
+    )
+    .unwrap();
+    assert!(cactus.needs_survival("cactus"));
+    assert!(
+        cactus
+            .required_tags()
+            .contains(&id("minecraft:supports_cactus"))
+    );
     let mut cases = Vec::<Case>::new();
     let mut survival = 0;
+    let mut cactus_cases = 0;
+    let mut solidity_cases = 0;
     for line in output.lines() {
         let p: Vec<_> = line.split_whitespace().collect();
         match p.as_slice() {
+            ["J", name, solid, liquid, entity, poi, post] => {
+                let mut w = world();
+                let s = (*name).to_owned();
+                assert_eq!(
+                    w.is_solid(&s).unwrap(),
+                    solid.parse::<bool>().unwrap(),
+                    "solid {name}"
+                );
+                assert_eq!(
+                    w.is_liquid(&s).unwrap(),
+                    liquid.parse::<bool>().unwrap(),
+                    "liquid {name}"
+                );
+                assert_eq!((*entity, *poi, *post), ("false", "false", "null"));
+                solidity_cases += 1;
+            }
+            ["K", base, neighbor, side, above, result] => {
+                let base: usize = base.parse().unwrap();
+                let neighbor: usize = neighbor.parse().unwrap();
+                let side: usize = side.parse().unwrap();
+                let above: usize = above.parse().unwrap();
+                let mut w = world();
+                w.blocks.insert(
+                    [0, -1, 0],
+                    ["minecraft:sand", "minecraft:cactus", "minecraft:dirt"][base].into(),
+                );
+                w.blocks.insert(
+                    [0, 1, 0],
+                    [
+                        "minecraft:air",
+                        "minecraft:water",
+                        "minecraft:lava",
+                        "minecraft:stone",
+                        "minecraft:cactus_flower",
+                    ][above]
+                        .into(),
+                );
+                if side < 4 {
+                    let [dx, dz] = [[0, -1], [1, 0], [0, 1], [-1, 0]][side];
+                    w.blocks.insert(
+                        [dx, 0, dz],
+                        [
+                            "minecraft:air",
+                            "minecraft:stone",
+                            "minecraft:cactus",
+                            "minecraft:water",
+                            "minecraft:lava",
+                            "minecraft:sugar_cane",
+                            "minecraft:cactus_flower",
+                        ][neighbor]
+                            .into(),
+                    );
+                }
+                assert_eq!(
+                    cactus.test(&mut w, [0, 0, 0]).unwrap(),
+                    result.parse::<bool>().unwrap(),
+                    "cactus {base} {neighbor} {side} {above}"
+                );
+                cactus_cases += 1;
+            }
             ["S", base, neighbor, side, result] => {
                 let base: usize = base.parse().unwrap();
                 let neighbor: usize = neighbor.parse().unwrap();
@@ -245,7 +330,9 @@ fn block_columns_and_sugar_cane_survival_match_java() {
         }
     }
     assert_eq!(survival, 100);
-    assert_eq!(cases.len(), 6 * 2 * 6 * 2 * 3 * 3);
+    assert_eq!(cactus_cases, 3 * 7 * 5 * 5);
+    assert_eq!(solidity_cases, 8);
+    assert_eq!(cases.len(), 6 * 2 * 6 * 2 * 4 * 3);
     for (index, c) in cases.iter().enumerate() {
         let d = match c.direction.as_str() {
             "up" => [0, 1, 0],
@@ -280,4 +367,16 @@ fn block_columns_and_sugar_cane_survival_match_java() {
         .unwrap();
     let definition: Value = serde_json::from_slice(&bytes).unwrap();
     BlockColumnFeature::decode(&definition, &mut resolve).unwrap();
+    for name in ["patch_cactus", "patch_cactus_desert"] {
+        assert!(
+            PlacedFeature::load(&mut resources, &id(&format!("minecraft:{name}")))
+                .unwrap()
+                .needs_survival("cactus")
+        );
+    }
+    let bytes = resources
+        .read_data("data/minecraft/worldgen/feature/cactus.json")
+        .unwrap()
+        .unwrap();
+    BlockColumnFeature::decode(&serde_json::from_slice(&bytes).unwrap(), &mut resolve).unwrap();
 }

@@ -3770,11 +3770,16 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
-        if tree_generated_leaf(state)? {
+        if tree_generated_leaf(state)? || tree_generated_log(state) || tree_mushroom_block(state)? {
             return Ok(true);
         }
-        disk_safe_solid(&state.name)
-            .with_context(|| format!("unsupported disk solid predicate block {}", state.name))
+        if let Some(solid) = disk_safe_solid(&state.name) {
+            return Ok(solid);
+        }
+        if let Ok(kind) = simple_plant_kind(state) {
+            return Ok(matches!(kind, SimplePlantKind::Unconditional));
+        }
+        bail!("unsupported disk solid predicate block {}", state.name)
     }
     fn is_liquid(&mut self, state: &BlockState) -> Result<bool> {
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
@@ -6229,6 +6234,93 @@ mod tests {
         let snapshot = terrain.snapshot();
         assert_eq!(snapshot.block(8, 8, 8).unwrap().properties["east"], "false");
         assert_eq!(snapshot.block(9, 8, 8).unwrap().properties["west"], "false");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generation_solid_predicate_matches_java_states() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GenerationSolidPredicateOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GenerationSolidPredicateOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GenerationSolidPredicateOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let predicate =
+            BlockPredicate::decode(&json!({"type":"minecraft:solid","offset":[1,-2,3]})).unwrap();
+        let mut count = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "{line}");
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for property in parts[1].split(',') {
+                    let (key, value) = property.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            let expected = parts[2].parse::<bool>().unwrap();
+            assert_eq!(
+                DiskWorld::is_solid(&mut region, &block).unwrap(),
+                expected,
+                "{line}"
+            );
+            region.set_section_block([9, 6, 11], &block).unwrap();
+            assert_eq!(
+                predicate.test(&mut region, [8, 8, 8]).unwrap(),
+                expected,
+                "{line}"
+            );
+            count += 1;
+        }
+        assert!(count >= 300, "missing Java state comparisons: {count}");
     }
 
     #[test]

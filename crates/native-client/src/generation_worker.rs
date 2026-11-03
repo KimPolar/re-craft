@@ -293,6 +293,16 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and a full generation batch"]
     fn installed_overworld_generates_a_lit_mesh_job() -> Result<()> {
+        installed_overworld_generation(false)
+    }
+
+    #[test]
+    #[ignore = "known incomplete: registered tree leaves need incremental light updates"]
+    fn installed_overworld_expands_to_adjacent_lit_mesh() -> Result<()> {
+        installed_overworld_generation(true)
+    }
+
+    fn installed_overworld_generation(expand: bool) -> Result<()> {
         use crate::fresh_generation::{FreshGenerationSettings, prepare};
 
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -356,6 +366,54 @@ mod tests {
         assert_eq!(scene.chunks.len(), 1);
         assert!(scene.chunks.contains_key(&ChunkPos { x: 0, z: 0 }));
         assert!(scene.opaque_len() > 0, "generated terrain mesh is empty");
+        if !expand {
+            return Ok(());
+        }
+
+        // Continue the same generated batch toward the immediately adjacent
+        // chunk. Reopen the same vanilla pack stack for the test driver.
+        let mut batch = generated.batch;
+        let (_, mut provider, mut classify, mut resolve) = prepare(FreshGenerationSettings {
+            minecraft_dir: mesh_game,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            structures_enabled: false,
+            data_packs: None,
+        })?
+        .into_worker_inputs();
+        let east = ChunkPos { x: 1, z: 0 };
+        let edge: Vec<_> = (-1..=1).map(|z| ChunkPos { x: 2, z }).collect();
+        for &pos in &edge {
+            batch.request_features(pos)?;
+        }
+        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
+        for &pos in &edge {
+            batch.request_light_initialization(pos)?;
+        }
+        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
+        batch.request_light(east)?;
+        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
+        let expanded_targets = BTreeSet::from([ChunkPos { x: 0, z: 0 }, east]);
+        let job = MeshJob::for_generated(&mut batch, expanded_targets.clone(), 8, 0, IVec3::ZERO)?;
+        mesher.submit(job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mesh = loop {
+            if let Some(result) = mesher.try_result()? {
+                break result;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "expanded mesh timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(mesh.revision, 8);
+        assert_eq!(mesh.targets.as_deref(), Some(&expanded_targets));
+        let scene = mesh.scene?;
+        assert_eq!(scene.chunks.len(), 2);
+        assert!(scene.chunks.contains_key(&east));
+        assert!(scene.opaque_len() > 0);
         Ok(())
     }
 }

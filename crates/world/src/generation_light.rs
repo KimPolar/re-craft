@@ -118,6 +118,38 @@ impl VisibleLightSnapshot {
         self.has_sky
     }
 
+    // Unlike visible reads, propagation must distinguish absent storage from
+    // an allocated zero layer. The outer Option denotes a covered column.
+    pub(crate) fn stored_sky(&self, pos: [i32; 3]) -> Option<Option<u8>> {
+        let (column, section, x, y, z) = Self::position(pos)?;
+        if !self.has_sky {
+            return None;
+        }
+        Some(
+            self.columns
+                .get(&column)?
+                .sky
+                .get(&section)
+                .map(|layer| Self::nibble(layer, x, y, z)),
+        )
+    }
+
+    pub(crate) fn set_stored_sky(&mut self, pos: [i32; 3], value: u8) -> Option<()> {
+        if value > 15 || !self.has_sky {
+            return None;
+        }
+        let (column, section, x, y, z) = Self::position(pos)?;
+        let layer = Arc::make_mut(self.columns.get_mut(&column)?.sky.get_mut(&section)?);
+        let index = x + z * 16 + y * 256;
+        let byte = &mut layer[index / 2];
+        if index % 2 == 0 {
+            *byte = (*byte & 0xf0) | value;
+        } else {
+            *byte = (*byte & 0x0f) | (value << 4);
+        }
+        Some(())
+    }
+
     /// Expand one covered section into packed arrays for a consumer that
     /// cannot read sparse engine storage. Missing sky layers inherit the
     /// bottom slice of the next higher layer, or full sky above all layers.
@@ -290,6 +322,27 @@ mod tests {
     use super::*;
     fn layer(n: u8) -> Arc<[u8; LIGHT_BYTES]> {
         Arc::new([n | (n << 4); LIGHT_BYTES])
+    }
+    #[test]
+    fn stored_sky_edits_preserve_previous_snapshots_and_absent_layers() {
+        let pos = ChunkPos { x: -1, z: 0 };
+        let mut before = VisibleLightSnapshot::new(false, true);
+        before.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(BTreeMap::new(), BTreeMap::from([(0, layer(7))])),
+        );
+        let mut after = before.clone();
+        assert_eq!(before.stored_sky([-1, 2, 0]), Some(Some(7)));
+        assert_eq!(before.stored_sky([-1, 16, 0]), Some(None));
+        assert_eq!(before.stored_sky([0, 2, 0]), None);
+        assert_eq!(after.set_stored_sky([-1, 2, 0], 3), Some(()));
+        assert_eq!(after.set_stored_sky([-2, 2, 0], 12), Some(()));
+        assert_eq!(after.set_stored_sky([-1, 16, 0], 2), None);
+        assert_eq!(after.set_stored_sky([-1, 2, 0], 16), None);
+        assert_eq!(before.sky_light([-1, 2, 0]), Some(7));
+        assert_eq!(before.sky_light([-2, 2, 0]), Some(7));
+        assert_eq!(after.sky_light([-1, 2, 0]), Some(3));
+        assert_eq!(after.sky_light([-2, 2, 0]), Some(12));
     }
     #[test]
     fn absent_layers_use_engine_defaults_but_unknown_columns_do_not() {

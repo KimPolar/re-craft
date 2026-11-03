@@ -1,6 +1,6 @@
 //! Initial sky-light values for generated blocks and a complete one-chunk halo.
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -66,6 +66,161 @@ pub fn generated_sky_light_with_initialization_history(
         Some(fresh_storage),
         Some((registered, initialized)),
     )
+}
+
+/// Apply a single drained `checkBlock` in a registered, inactive chunk.
+///
+/// `before` must be the complete published storage over the affected area;
+/// section allocation and active chunks must be unchanged, and `world` must
+/// contain the updated block states. This does not update section allocation,
+/// source heights, block light, or active chunks' direct sky sources. Missing
+/// inputs and sparse vertical gaps are rejected without changing `before`.
+pub fn check_inactive_sky_block(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    position: [i32; 3],
+) -> Option<VisibleLightSnapshot> {
+    #[derive(Clone, Copy)]
+    struct Entry {
+        pos: [i32; 3],
+        level: u8,
+        directions: u8,
+    }
+    const ALL: u8 = 0b11_1111;
+    // Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
+    const ORDER: [usize; 6] = [3, 2, 5, 4, 1, 0];
+    let chunk = ChunkPos {
+        x: position[0].div_euclid(16),
+        z: position[2].div_euclid(16),
+    };
+    if active.contains(&chunk)
+        || !bounds.build_range().contains(&position[1])
+        || !before.has_sky_channel()
+    {
+        return None;
+    }
+    let mut draft = before.clone();
+    let Some(old) = draft.stored_sky(position)? else {
+        return Some(draft);
+    };
+    let mut decreases = VecDeque::new();
+    let mut increases = VecDeque::new();
+    if old > 0 {
+        draft.set_stored_sky(position, 0)?;
+    }
+    decreases.push_back(Entry {
+        pos: position,
+        level: old.max(1),
+        directions: ALL,
+    });
+    let mut properties = HashMap::<u32, LightProperties>::new();
+    let get_properties = |p: [i32; 3], cache: &mut HashMap<u32, LightProperties>| {
+        if !bounds.build_range().contains(&p[1]) {
+            return Some(transparent_light_properties());
+        }
+        let id = world.block_id(p[0], p[1], p[2])?;
+        if let Some(value) = cache.get(&id.0) {
+            return Some(value.clone());
+        }
+        let value = light_properties(world.state(id)?)?;
+        cache.insert(id.0, value.clone());
+        Some(value)
+    };
+    let neighbor = |p: [i32; 3], direction: usize| {
+        let (dx, dy, dz) = DIRECTIONS[direction];
+        Some([
+            p[0].checked_add(dx)?,
+            p[1].checked_add(dy)?,
+            p[2].checked_add(dz)?,
+        ])
+    };
+    let check_gap = |snapshot: &VisibleLightSnapshot, p: [i32; 3]| -> Option<()> {
+        if p[1].rem_euclid(16) == 0
+            && (matches!(p[0].rem_euclid(16), 0 | 15) || matches!(p[2].rem_euclid(16), 0 | 15))
+        {
+            let below = p[1].checked_sub(1)?;
+            if bounds.light_range().contains(&below)
+                && snapshot.stored_sky([p[0], below, p[2]])?.is_none()
+            {
+                return None;
+            }
+        }
+        Some(())
+    };
+    while let Some(entry) = decreases.pop_front() {
+        check_gap(&draft, entry.pos)?;
+        for direction in ORDER {
+            if entry.directions & (1 << direction) == 0 {
+                continue;
+            }
+            let next = neighbor(entry.pos, direction)?;
+            if !bounds.light_range().contains(&next[1]) {
+                continue;
+            }
+            let Some(level) = draft.stored_sky(next)? else {
+                continue;
+            };
+            if level == 0 {
+                continue;
+            }
+            let opposite = direction ^ 1;
+            if level <= entry.level.saturating_sub(1) {
+                draft.set_stored_sky(next, 0)?;
+                decreases.push_back(Entry {
+                    pos: next,
+                    level,
+                    directions: ALL & !(1 << opposite),
+                });
+            } else {
+                increases.push_back(Entry {
+                    pos: next,
+                    level,
+                    directions: 1 << opposite,
+                });
+            }
+        }
+    }
+    while let Some(entry) = increases.pop_front() {
+        if draft.stored_sky(entry.pos)? != Some(entry.level) {
+            continue;
+        }
+        check_gap(&draft, entry.pos)?;
+        let from = get_properties(entry.pos, &mut properties)?;
+        for direction in ORDER {
+            if entry.directions & (1 << direction) == 0 {
+                continue;
+            }
+            let next = neighbor(entry.pos, direction)?;
+            if !bounds.light_range().contains(&next[1]) {
+                continue;
+            }
+            let Some(old) = draft.stored_sky(next)? else {
+                continue;
+            };
+            if entry.level.saturating_sub(1) <= old {
+                continue;
+            }
+            let to = get_properties(next, &mut properties)?;
+            let level = entry.level.saturating_sub(to.opacity.max(1));
+            if level <= old
+                || ((from.has_faces || to.has_faces)
+                    && faces_occlude(&from.faces[direction], &to.faces[direction ^ 1]))
+            {
+                continue;
+            }
+            draft.set_stored_sky(next, level)?;
+            if level > 1 {
+                increases.push_back(Entry {
+                    pos: next,
+                    level,
+                    directions: ALL & !(1 << (direction ^ 1)),
+                });
+            }
+        }
+    }
+    Some(draft)
 }
 
 fn calculate_generated_sky_light(

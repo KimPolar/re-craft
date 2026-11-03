@@ -3665,6 +3665,52 @@ impl native_resources::tree_leaf_update::ShapeEdgeWorld for DecorationRegion<'_>
     }
 }
 
+// Ore states are used here only for solid and fluid predicates, not as proof
+// that replacing them preserves all other world-generation side effects.
+fn generated_ore_state(state: &BlockState) -> Result<bool> {
+    let name = state.name.as_str();
+    let redstone = matches!(
+        name,
+        "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
+    );
+    if !redstone
+        && !matches!(
+            name,
+            "minecraft:coal_ore"
+                | "minecraft:deepslate_coal_ore"
+                | "minecraft:iron_ore"
+                | "minecraft:deepslate_iron_ore"
+                | "minecraft:copper_ore"
+                | "minecraft:deepslate_copper_ore"
+                | "minecraft:gold_ore"
+                | "minecraft:deepslate_gold_ore"
+                | "minecraft:emerald_ore"
+                | "minecraft:deepslate_emerald_ore"
+                | "minecraft:lapis_ore"
+                | "minecraft:deepslate_lapis_ore"
+                | "minecraft:diamond_ore"
+                | "minecraft:deepslate_diamond_ore"
+                | "minecraft:nether_gold_ore"
+                | "minecraft:nether_quartz_ore"
+        )
+    {
+        return Ok(false);
+    }
+    ensure!(
+        if redstone {
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("lit").map(String::as_str),
+                    Some("true" | "false")
+                )
+        } else {
+            state.properties.is_empty()
+        },
+        "invalid generated ore state"
+    );
+    Ok(true)
+}
+
 // These complete vanilla block-state families were checked for solidness,
 // block entities, POIs and postprocessing effects against Java 26.3.
 fn disk_safe_solid(name: &str) -> Option<bool> {
@@ -4244,7 +4290,11 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
-        if tree_generated_leaf(state)? || tree_generated_log(state) || tree_mushroom_block(state)? {
+        if tree_generated_leaf(state)?
+            || tree_generated_log(state)
+            || tree_mushroom_block(state)?
+            || generated_ore_state(state)?
+        {
             return Ok(true);
         }
         if tree_cave_vines(state)? || generated_dripleaf(state)? || tree_glow_lichen(state)? {
@@ -4263,7 +4313,9 @@ impl DiskWorld for DecorationRegion<'_> {
             return Ok(true);
         }
         ensure!(
-            disk_safe_solid(&state.name).is_some() || simple_plant_kind(state).is_ok(),
+            disk_safe_solid(&state.name).is_some()
+                || generated_ore_state(state)?
+                || simple_plant_kind(state).is_ok(),
             "unsupported block liquid property"
         );
         Ok(false)
@@ -9446,6 +9498,12 @@ mod tests {
             ("big_dripleaf_stem", 8),
             ("small_dripleaf", 16),
             ("glow_lichen", 128),
+            ("coal_ore", 1),
+            ("deepslate_coal_ore", 1),
+            ("redstone_ore", 2),
+            ("deepslate_redstone_ore", 2),
+            ("nether_gold_ore", 1),
+            ("nether_quartz_ore", 1),
         ] {
             assert_eq!(
                 families.get(name),
@@ -9453,6 +9511,32 @@ mod tests {
                 "missing Java states for {name}"
             );
         }
+        let mut ore_states = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("O ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "{line}");
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for property in parts[1].split(',') {
+                    let (key, value) = property.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            assert_eq!(
+                DiskWorld::is_liquid(&mut region, &block).unwrap(),
+                !parts[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            ore_states += 1;
+        }
+        assert_eq!(ore_states, 20);
+        let mut invalid = state("coal_ore");
+        invalid
+            .properties
+            .insert("unexpected".into(), "true".into());
+        assert!(DiskWorld::is_solid(&mut region, &invalid).is_err());
+        assert!(DiskWorld::is_liquid(&mut region, &invalid).is_err());
+        assert!(DiskWorld::is_solid(&mut region, &state("redstone_ore")).is_err());
         let directions = [
             [0, -1, 0],
             [0, 1, 0],

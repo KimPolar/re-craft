@@ -511,7 +511,7 @@ impl FreshTerrainBatch {
                             .all(|chunk| !chunk.block_light_correct),
                     "feature batch light engine is not fresh"
                 );
-                if let Some(engine) = &self.light_engine {
+                if let Some(engine) = &mut self.light_engine {
                     let registry = self
                         .light_registry
                         .as_ref()

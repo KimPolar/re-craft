@@ -88,7 +88,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var w=new StagedGenerationLightEngineOracle();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
-        boolean ore=args.length>1 && args[1].equals("ore");
+        boolean oreActive=args.length>1 && args[1].equals("ore_active");
+        boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
         boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
@@ -170,11 +171,15 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(ore){
+            if(oreActive){
+                if(LightEngine.hasDifferentLightProperties(Blocks.DEEPSLATE.defaultBlockState(),Blocks.TUFF.defaultBlockState()))throw new AssertionError("deepslate and tuff light properties differ");
+                engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
+            }
             // OreFeature writes the section directly after INITIALIZE_LIGHT.
             eastSection.section.setBlockState(1,4,8,Blocks.DIAMOND_ORE.defaultBlockState(),false);
             w.edits.put(new BlockPos(17,4,8),Blocks.DIAMOND_ORE.defaultBlockState());
             drain(engine); stages.add(capture(engine));
-            engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
+            if(!oreActive){ engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine)); }
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(w.mixed){

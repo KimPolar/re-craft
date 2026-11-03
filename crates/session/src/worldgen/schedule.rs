@@ -498,7 +498,7 @@ impl GenerationSchedule {
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures_enabled: bool,
-        engine: &super::StagedGenerationLightEngine,
+        engine: &mut super::StagedGenerationLightEngine,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<Vec<bool>> {
         let center = prepared.center_chunk();

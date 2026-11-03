@@ -631,9 +631,25 @@ impl StagedGenerationLightEngine {
     }
 
     fn validate_active_world(&self, world: &native_world::loaded::World) -> Result<()> {
-        if let Some(frozen) = &self.frozen_world {
+        Self::validate_active_world_parts(
+            self.frozen_world.as_ref(),
+            &self.active,
+            self.fresh.min_y,
+            self.fresh.height,
+            world,
+        )
+    }
+
+    fn validate_active_world_parts(
+        frozen: Option<&Arc<native_world::loaded::World>>,
+        active: &BTreeSet<native_world::loaded::ChunkPos>,
+        min_y: i32,
+        height: i32,
+        world: &native_world::loaded::World,
+    ) -> Result<()> {
+        if let Some(frozen) = frozen {
             if !std::ptr::eq(frozen.as_ref(), world) {
-                for active in &self.active {
+                for active in active {
                     for dz in -1i32..=1 {
                         for dx in -1i32..=1 {
                             let neighbor = native_world::loaded::ChunkPos {
@@ -642,7 +658,12 @@ impl StagedGenerationLightEngine {
                             };
                             let unchanged =
                                 match (frozen.chunks.get(&neighbor), world.chunks.get(&neighbor)) {
-                                    (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                                    (Some(before), Some(after)) => {
+                                        Arc::ptr_eq(before, after)
+                                            || unchanged_chunk_light_behavior(
+                                                frozen, world, before, after, min_y, height,
+                                            )?
+                                    }
                                     (None, None) => true,
                                     _ => false,
                                 };

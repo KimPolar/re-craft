@@ -36,6 +36,11 @@ pub struct PreparedFreshGeneration {
 }
 
 impl PreparedFreshGeneration {
+    /// Compute the generation origin before moving these inputs to a worker.
+    pub fn spawn_origin(&mut self) -> Result<native_world::loaded::ChunkPos> {
+        self.batch.spawn_origin(&mut self.resources)
+    }
+
     pub fn into_worker_inputs(self) -> (FreshTerrainBatch, ResourceStack, Classifier, Resolver) {
         (self.batch, self.resources, self.classify, self.resolve)
     }
@@ -130,7 +135,7 @@ mod tests {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
-        let prepared = prepare(FreshGenerationSettings {
+        let mut prepared = prepare(FreshGenerationSettings {
             minecraft_dir: game,
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
@@ -143,6 +148,8 @@ mod tests {
             (prepared.lighting.min_y, prepared.lighting.height),
             (-64, 384)
         );
+        let origin = prepared.spawn_origin()?;
+        assert!((origin.x.abs() <= 160) && (origin.z.abs() <= 160));
         let (mut batch, mut resources, mut classify, mut resolve) = prepared.into_worker_inputs();
         assert!(classify(&json!("minecraft:air"))?.is_air);
         assert!(classify(&json!("minecraft:water"))?.has_fluid);

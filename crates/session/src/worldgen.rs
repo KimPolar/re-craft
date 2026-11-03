@@ -1689,6 +1689,7 @@ impl BiomeNeighborhood {
 /// settings. It must be used with the same data-pack stack throughout its life.
 pub struct TerrainGenerator {
     noise: NoiseStageGenerator,
+    spawn_target: Option<Value>,
     structure_context: bool,
     source: BiomeSource,
     possible_biomes: std::collections::BTreeSet<ResourceId>,
@@ -1868,6 +1869,7 @@ impl TerrainGenerator {
         let possible_biomes_ordered = source.possible_biomes_in_order();
         Ok(Self {
             noise,
+            spawn_target: parsed.get("spawn_target").cloned(),
             structure_context,
             source,
             possible_biomes,
@@ -1883,6 +1885,21 @@ impl TerrainGenerator {
     }
     pub fn height(&self) -> i32 {
         self.height
+    }
+    /// Compute the initial origin with the same immutable data-pack stack
+    /// used to build this generator, before requesting generated chunks.
+    pub fn spawn_origin(&self, provider: &mut impl ResourceProvider) -> Result<[i32; 2]> {
+        let target = self
+            .spawn_target
+            .as_ref()
+            .context("noise settings have no spawn_target")?;
+        let compiled = native_resources::spawn_origin::NoiseSpawnTargets::compile(
+            provider,
+            target,
+            self.seed,
+            self.noise.router().random,
+        )?;
+        Ok(compiled.origin_chunk(&mut DensityEvaluator::default()))
     }
     pub fn biome_neighborhood(&self) -> Result<BiomeNeighborhood> {
         BiomeNeighborhood::new(self.seed, self.min_y(), self.height())
@@ -2790,6 +2807,22 @@ mod tests {
             "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,
                 "erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
         }})
+    }
+    #[test]
+    fn generator_spawn_origin_uses_settings_and_validates_missing_targets() {
+        let mut data = Data;
+        let mut config = definition();
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        assert!(generator.spawn_origin(&mut data).is_err());
+        config["settings"]["spawn_target"] = json!([]);
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        assert_eq!(generator.spawn_origin(&mut data).unwrap(), [0, 0]);
+        config["settings"]["spawn_target"] = json!([{"minecraft:missing": [0, 1]}]);
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        assert!(generator.spawn_origin(&mut data).is_err());
     }
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

@@ -55,6 +55,12 @@ struct DecorationConfig {
 }
 
 impl FreshTerrainBatch {
+    /// The provider must use the same unchanged data-pack stack as the generator.
+    pub fn spawn_origin(&self, provider: &mut impl ResourceProvider) -> Result<ChunkPos> {
+        let [x, z] = self.generator.spawn_origin(provider)?;
+        Ok(ChunkPos { x, z })
+    }
+
     /// The supplied generator must have been constructed without structure
     /// adjustment and for a new world with structures explicitly disabled.
     pub fn new_without_structures(

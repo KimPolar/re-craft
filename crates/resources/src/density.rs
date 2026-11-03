@@ -133,6 +133,26 @@ impl DensityEvaluator {
         })
     }
 
+    /// Sample a dynamically sized set at one position with shared graph caches.
+    /// Reuse the output buffer when sampling many positions.
+    pub fn sample_slice(
+        &mut self,
+        functions: &[Arc<DensityFunction>],
+        x: i32,
+        y: i32,
+        z: i32,
+        output: &mut Vec<f32>,
+    ) {
+        self.memo.clear();
+        self.memo.volume = None;
+        output.clear();
+        output.extend(
+            functions
+                .iter()
+                .map(|function| function.evaluate_cached(x, y, z, false, &mut self.memo)),
+        );
+    }
+
     /// Java's 4-block-spaced, Y=0 surface volume in Z/X order.
     /// Uses the same stepped-volume path as biome sampling.
     pub fn sample_quart_surface(

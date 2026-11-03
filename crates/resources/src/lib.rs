@@ -53,6 +53,7 @@ pub mod respawn_tags;
 pub mod root_system_feature;
 pub mod simple_block_feature;
 pub mod sounds;
+pub mod spawn_origin;
 pub mod spring_feature;
 pub mod sprites;
 pub mod structure_biomes;

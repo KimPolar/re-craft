@@ -2057,6 +2057,14 @@ fn tree_cave_vines(state: &BlockState) -> Result<bool> {
     Ok(true)
 }
 
+fn tree_glow_lichen(state: &BlockState) -> Result<bool> {
+    if state.name != "minecraft:glow_lichen" {
+        return Ok(false);
+    }
+    ensure!(valid_lichen(state), "invalid glow lichen state");
+    Ok(true)
+}
+
 // All vanilla dripleaf states have no block entity, POI, or placement
 // postprocessing. Block-column features write their supplied states directly.
 fn generated_dripleaf(state: &BlockState) -> Result<bool> {
@@ -2104,6 +2112,7 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if tree_generated_leaf(state)?
         || tree_leaf_litter(state)?
         || tree_cave_vines(state)?
+        || tree_glow_lichen(state)?
         || state.name == "minecraft:vine"
     {
         return Ok(false);
@@ -2122,6 +2131,7 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if tree_generated_leaf(state)?
         || tree_leaf_litter(state)?
         || tree_cave_vines(state)?
+        || tree_glow_lichen(state)?
         || state.name == "minecraft:vine"
     {
         return Ok(false);
@@ -3474,6 +3484,8 @@ fn multiface_support(state: &BlockState) -> Result<bool> {
     if is_air(state)
         || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
         || valid_lichen(state)
+        || tree_cave_vines(state)?
+        || generated_dripleaf(state)?
     {
         return Ok(false);
     }
@@ -3931,7 +3943,7 @@ impl DiskWorld for DecorationRegion<'_> {
         if tree_generated_leaf(state)? || tree_generated_log(state) || tree_mushroom_block(state)? {
             return Ok(true);
         }
-        if tree_cave_vines(state)? || generated_dripleaf(state)? {
+        if tree_cave_vines(state)? || generated_dripleaf(state)? || tree_glow_lichen(state)? {
             return Ok(false);
         }
         if let Some(solid) = disk_safe_solid(&state.name) {
@@ -7212,6 +7224,7 @@ mod tests {
             ("big_dripleaf", 32),
             ("big_dripleaf_stem", 8),
             ("small_dripleaf", 16),
+            ("glow_lichen", 128),
         ] {
             assert_eq!(
                 families.get(name),
@@ -7219,6 +7232,54 @@ mod tests {
                 "missing Java states for {name}"
             );
         }
+        let directions = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        let mut lichen_states = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("G ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 8, "{line}");
+            let mut block = state("glow_lichen");
+            for property in parts[0].split(',') {
+                let (name, value) = property.split_once('=').unwrap();
+                block.properties.insert(name.into(), value.into());
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                parts[1].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for (direction, expected) in directions.into_iter().zip(&parts[2..]) {
+                let expected = expected.parse::<bool>().unwrap();
+                assert_eq!(tree_sturdy_up(&block).unwrap(), expected, "{line}");
+                assert_eq!(
+                    DiskWorld::face_sturdy(&mut region, &block, [8, 8, 8], direction).unwrap(),
+                    expected,
+                    "{line}"
+                );
+                assert_eq!(
+                    VegetationPatchWorld::patch_face_sturdy(
+                        &mut region,
+                        &block,
+                        [8, 8, 8],
+                        direction
+                    )
+                    .unwrap(),
+                    expected,
+                    "{line}"
+                );
+            }
+            lichen_states += 1;
+        }
+        assert_eq!(lichen_states, 128);
+        let invalid = state("glow_lichen");
+        assert!(tree_sturdy_up(&invalid).is_err());
+        assert!(DiskWorld::is_solid(&mut region, &invalid).is_err());
     }
 
     #[test]
@@ -7430,6 +7491,7 @@ mod tests {
         let origin = [8, 8, 8];
         let lichen = ResourceId::parse("minecraft:glow_lichen").unwrap();
         let mut checked = 0;
+        let mut families = BTreeMap::<String, usize>::new();
         for line in output.lines().filter_map(|line| line.strip_prefix("S ")) {
             let p: Vec<_> = line.split_whitespace().collect();
             assert_eq!(p.len(), 4, "{line}");
@@ -7467,8 +7529,23 @@ mod tests {
                 "{line}"
             );
             checked += 1;
+            *families.entry(p[0].to_owned()).or_default() += 1;
         }
         assert!(checked > 2_000, "missing Java state comparisons: {checked}");
+        for (name, states) in [
+            ("cave_vines", 52),
+            ("cave_vines_plant", 2),
+            ("big_dripleaf", 32),
+            ("big_dripleaf_stem", 8),
+            ("small_dripleaf", 16),
+            ("glow_lichen", 128),
+        ] {
+            assert_eq!(
+                families.get(name),
+                Some(&(states * 6)),
+                "missing Java faces for {name}"
+            );
+        }
         let vine = VinesFeature::decode(&json!({"type":"minecraft:vines"}), &mut |_| {
             let mut value = state("vine");
             value.properties = ["up", "north", "south", "west", "east"]

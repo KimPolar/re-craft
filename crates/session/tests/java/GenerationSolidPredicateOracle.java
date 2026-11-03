@@ -6,12 +6,13 @@ import net.minecraft.core.*;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.levelgen.blockpredicates.SolidPredicate;
 
 public class GenerationSolidPredicateOracle {
   public static void main(String[] args) {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
-    var names=List.of("leaf_litter","seagrass","tall_seagrass","short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac","melon","pumpkin","brown_mushroom","red_mushroom","red_mushroom_block","brown_mushroom_block","mushroom_stem","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf");
+    var names=List.of("leaf_litter","seagrass","tall_seagrass","short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac","melon","pumpkin","brown_mushroom","red_mushroom","red_mushroom_block","brown_mushroom_block","mushroom_stem","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf","glow_lichen");
     var pos=new BlockPos(8,8,8); var target=pos.offset(1,-2,3);
     for(var name:names){
       var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
@@ -25,6 +26,11 @@ public class GenerationSolidPredicateOracle {
         boolean solid=new SolidPredicate(new Vec3i(1,-2,3)).test(world,pos);
         if(solid!=state.isSolid())throw new AssertionError("predicate differs from state");
         out.printf("S %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),solid);
+        if(name.equals("glow_lichen")){
+          out.printf("G %s %s",String.join(",",pairs),state.isSolidRender());
+          for(var direction:Direction.values())out.printf(" %s",state.isFaceSturdy(EmptyBlockGetter.INSTANCE,pos,direction));
+          out.println();
+        }
       }
     }
   }

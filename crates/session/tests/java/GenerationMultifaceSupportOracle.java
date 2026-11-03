@@ -15,7 +15,7 @@ import net.minecraft.world.level.levelgen.feature.VinesFeature;
 public class GenerationMultifaceSupportOracle {
   public static void main(String[] args) {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
-    var names=List.of("moss_block","dirt","coarse_dirt","rooted_dirt","clay","gravel","sand","red_sand","sandstone","red_sandstone","ice","packed_ice","blue_ice","snow_block","magma_block","netherrack","blackstone","grass_block","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","red_mushroom_block","brown_mushroom_block","mushroom_stem","leaf_litter");
+    var names=List.of("moss_block","dirt","coarse_dirt","rooted_dirt","clay","gravel","sand","red_sand","sandstone","red_sandstone","ice","packed_ice","blue_ice","snow_block","magma_block","netherrack","blackstone","grass_block","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","red_mushroom_block","brown_mushroom_block","mushroom_stem","leaf_litter","cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf","glow_lichen");
     var pos=new BlockPos(8,8,8);
     for(var name:names){
       var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));

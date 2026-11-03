@@ -84,6 +84,7 @@ struct DecorationLightGuard<'a> {
     changed_blocks: BTreeSet<String>,
     changed_chunks: BTreeSet<ChunkPos>,
     tree_light_updates: BTreeSet<[i32; 3]>,
+    tree_light_order: Vec<[i32; 3]>,
     non_air_counts: BTreeMap<(ChunkPos, i8), usize>,
 }
 
@@ -93,10 +94,8 @@ enum DecorationLightTracking<'a> {
         &'a native_resources::block_registry::GeneratedBlockRegistry,
     ),
     Staged(
-        &'a mut FreshGenerationLightTracker,
+        &'a mut StagedGenerationLightEngine,
         &'a native_resources::block_registry::GeneratedBlockRegistry,
-        &'a mut Option<Arc<World>>,
-        &'a BTreeSet<ChunkPos>,
     ),
 }
 
@@ -990,12 +989,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(&block),
             Some(&raw),
-            Some(DecorationLightTracking::Staged(
-                &mut engine.fresh,
-                registry,
-                &mut engine.frozen_world,
-                &engine.active,
-            )),
+            Some(DecorationLightTracking::Staged(engine, registry)),
         )
     }
 
@@ -1046,8 +1040,8 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(DecorationLightTracking::Fresh(tracker, registry)) => {
                 Some((&**tracker, *registry, false))
             }
-            Some(DecorationLightTracking::Staged(tracker, registry, _, _)) => {
-                Some((&**tracker, *registry, true))
+            Some(DecorationLightTracking::Staged(engine, registry)) => {
+                Some((&engine.fresh, *registry, true))
             }
             None => None,
         };
@@ -1064,6 +1058,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
                 tree_light_updates: BTreeSet::new(),
+                tree_light_order: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
         }
@@ -1098,7 +1093,11 @@ fn finish_decoration_with_light(
     light_tracking: &mut Option<DecorationLightTracking<'_>>,
 ) -> Result<()> {
     let mut staged_replay = None;
-    if let Some(DecorationLightTracking::Staged(tracker, _, frozen, active)) = &*light_tracking {
+    let mut incremental_columns = None;
+    if let Some(DecorationLightTracking::Staged(engine, registry)) = &*light_tracking {
+        let tracker = &engine.fresh;
+        let frozen = &engine.frozen_world;
+        let active = &engine.active;
         let guard = region
             .light_guard
             .as_ref()
@@ -1134,6 +1133,7 @@ fn finish_decoration_with_light(
             let bounds = native_world::block_light::LightBounds::new(tracker.min_y, max_y)
                 .context("unsupported light bounds")?;
             let mut sources = BTreeMap::new();
+            let mut needs_incremental = !engine.incremental_columns.is_empty();
             for pos in chunks {
                 let heights = native_world::sky_light::generated_chunk_sky_sources(
                     &region.world,
@@ -1141,12 +1141,10 @@ fn finish_decoration_with_light(
                     pos,
                 )
                 .context("updated sky sources unavailable")?;
-                // Replaying a new obstruction as if it existed before a
-                // neighboring activation can create sky light that Java's
-                // incremental queue never emitted. Preserve the old revision
-                // until that history can be replayed faithfully.
-                if tracker.has_skylight
-                    && !active.contains(&pos)
+                // A registered inactive chunk can contain light that was
+                // propagated from an active neighbor. Apply its checks to
+                // that stored revision instead of replaying the activation.
+                if !active.contains(&pos)
                     && (-1i32..=1).any(|dz| {
                         (-1i32..=1).any(|dx| {
                             pos.x
@@ -1156,23 +1154,62 @@ fn finish_decoration_with_light(
                         })
                     })
                 {
-                    let previous = tracker
-                        .sky_sources
-                        .get(&pos)
-                        .context("tree update requires previous sky sources")?;
-                    for p in guard
-                        .tree_light_updates
-                        .iter()
-                        .filter(|p| chunk(**p) == pos)
-                    {
-                        let index = (p[0].rem_euclid(16) + p[2].rem_euclid(16) * 16) as usize;
-                        ensure!(
-                            heights[index] <= previous[index],
-                            "inactive tree update raises a sky source near active light"
-                        );
-                    }
+                    needs_incremental = true;
                 }
                 sources.insert(pos, Arc::from(heights));
+            }
+            if needs_incremental {
+                ensure!(
+                    guard
+                        .tree_light_order
+                        .iter()
+                        .all(|p| !active.contains(&chunk(*p))),
+                    "incremental active tree light is not supported"
+                );
+                let mut covered = BTreeSet::new();
+                for &p in &guard.tree_light_order {
+                    let pos = chunk(p);
+                    for dz in -2i32..=2 {
+                        for dx in -2i32..=2 {
+                            covered.insert(ChunkPos {
+                                x: pos.x.checked_add(dx).context("light X overflow")?,
+                                z: pos.z.checked_add(dz).context("light Z overflow")?,
+                            });
+                        }
+                    }
+                }
+                let before = engine.snapshot(region.target, covered.iter().copied(), registry)?;
+                let after_block =
+                    native_world::generation_block_light::check_generated_block_light(
+                        &world,
+                        bounds,
+                        &before,
+                        active,
+                        &guard.tree_light_order,
+                    )
+                    .context("incremental tree block light inputs are incomplete or unsupported")?;
+                let after = if tracker.has_skylight {
+                    native_world::generation_sky_light::check_inactive_sky_blocks(
+                        &world,
+                        bounds,
+                        &after_block,
+                        active,
+                        &guard.tree_light_order,
+                    )
+                    .context("incremental tree sky light inputs are incomplete or unsupported")?
+                } else {
+                    after_block
+                };
+                let mut columns = BTreeMap::new();
+                for pos in covered {
+                    columns.insert(
+                        pos,
+                        after
+                            .complete_column(pos)
+                            .context("incremental light column missing")?,
+                    );
+                }
+                incremental_columns = Some(columns);
             }
             staged_replay = Some((Arc::new(world), sources));
         }
@@ -1224,7 +1261,7 @@ fn finish_decoration_with_light(
     let committed = region.finish_with_world()?;
     let tracker = match &mut *light_tracking {
         Some(DecorationLightTracking::Fresh(tracker, _)) => Some(&mut **tracker),
-        Some(DecorationLightTracking::Staged(tracker, _, _, _)) => Some(&mut **tracker),
+        Some(DecorationLightTracking::Staged(engine, _)) => Some(&mut engine.fresh),
         None => None,
     };
     if let Some(tracker) = tracker {
@@ -1241,13 +1278,15 @@ fn finish_decoration_with_light(
             .extend(checked.expect("tracked decoration has a light guard"));
     }
     if let Some((world, sources)) = staged_replay {
-        let Some(DecorationLightTracking::Staged(tracker, _, frozen, _)) = &mut *light_tracking
-        else {
+        let Some(DecorationLightTracking::Staged(engine, _)) = &mut *light_tracking else {
             unreachable!("staged replay requires staged tracking");
         };
-        tracker.sky_sources.extend(sources);
-        if frozen.is_some() {
-            **frozen = Some(world);
+        engine.fresh.sky_sources.extend(sources);
+        if engine.frozen_world.is_some() {
+            engine.frozen_world = Some(world);
+        }
+        if let Some(columns) = incremental_columns {
+            engine.incremental_columns.extend(columns);
         }
     }
     Ok(())
@@ -5058,11 +5097,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             .insert(key, updated);
                     }
                     if tree_light_update {
-                        self.light_guard
-                            .as_mut()
-                            .unwrap()
-                            .tree_light_updates
-                            .insert(p);
+                        let guard = self.light_guard.as_mut().unwrap();
+                        if guard.tree_light_updates.insert(p) {
+                            guard.tree_light_order.push(p);
+                        }
                     }
                     self.light_guard
                         .as_mut()
@@ -6206,6 +6244,8 @@ mod tests {
             "leaf_active_many",
             "log_active_full",
             "log_active_sparse",
+            "log_active_sparse_twice",
+            "log_active_sparse_missing",
         ] {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
@@ -6229,6 +6269,20 @@ mod tests {
             let center = ChunkPos { x: 0, z: 0 };
             let east = ChunkPos { x: 1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
+            let template = Arc::clone(world.chunks.get(&center).unwrap());
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = (*template).clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            if mode == "log_active_sparse_missing" {
+                world.chunks.remove(&ChunkPos { x: -2, z: 0 });
+            }
             if mode.starts_with("log_active_sparse") {
                 let air = world.intern_state(state("air"));
                 let section = Arc::make_mut(
@@ -6277,6 +6331,7 @@ mod tests {
                         changed_blocks: BTreeSet::new(),
                         changed_chunks: BTreeSet::new(),
                         tree_light_updates: BTreeSet::new(),
+                        tree_light_order: Vec::new(),
                         non_air_counts: BTreeMap::new(),
                     });
                     if tree_write {
@@ -6329,6 +6384,7 @@ mod tests {
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
                 tree_light_updates: BTreeSet::new(),
+                tree_light_order: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
             draft.set_tree_block([16, 10, 8], &leaf, 19).unwrap();
@@ -6336,29 +6392,33 @@ mod tests {
                 for [x, y, z] in [[17, 11, 8], [31, 10, 4], [16, 9, 10]] {
                     draft.set_tree_block([x, y, z], &leaf, 19).unwrap();
                 }
+                assert_eq!(
+                    draft.light_guard.as_ref().unwrap().tree_light_order,
+                    vec![[16, 10, 8], [17, 11, 8], [31, 10, 4], [16, 9, 10]]
+                );
             }
-            let mut tracking = Some(DecorationLightTracking::Staged(
-                &mut engine.fresh,
-                &registry,
-                &mut engine.frozen_world,
-                &engine.active,
-            ));
+            let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
             let result = finish_decoration_with_light(draft, &mut tracking);
             drop(tracking);
-            let rejected = mode != "leaf_active";
-            if rejected {
-                let error = result.unwrap_err().to_string();
-                assert!(
-                    error.contains("inactive tree update raises a sky source"),
-                    "{error}"
-                );
+            if mode == "log_active_sparse_missing" {
+                assert!(result.is_err());
                 assert!(Arc::ptr_eq(&previous_world, &terrain.world));
-            } else {
-                result.unwrap();
+                assert!(engine.incremental_columns.is_empty());
+                let unchanged = engine.snapshot(&terrain, [center], &registry).unwrap();
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [x, y, z];
+                            assert_eq!(unchanged.block_light(p), before.block_light(p));
+                            assert_eq!(unchanged.sky_light(p), before.sky_light(p));
+                        }
+                    }
+                }
+                continue;
             }
+            result.unwrap();
             let after = engine.snapshot(&terrain, [center], &registry).unwrap();
             for (stage, actual) in [&before, &before, &after].into_iter().enumerate() {
-                let expected_stage = if rejected && stage == 2 { 0 } else { stage };
                 for y in -16..32 {
                     for z in 0..16 {
                         for x in 0..16 {
@@ -6366,15 +6426,245 @@ mod tests {
                             let index = ((y + 16) * 256 + z * 16 + x) as usize;
                             assert_eq!(
                                 actual.block_light(p),
-                                Some(expected[expected_stage][0][index]),
+                                Some(expected[stage][0][index]),
                                 "{mode} block {stage} {p:?}"
                             );
                             assert_eq!(
                                 actual.sky_light(p),
-                                Some(expected[expected_stage][1][index]),
+                                Some(expected[stage][1][index]),
                                 "{mode} sky {stage} {p:?}"
                             );
                         }
+                    }
+                }
+            }
+            if mode == "log_active_sparse_twice" {
+                let mut draft = terrain
+                    .decoration_region(&tags, &motion, BTreeSet::from([east]))
+                    .unwrap();
+                draft.light_guard = Some(DecorationLightGuard {
+                    registered: BTreeSet::from([east]),
+                    registry: &registry,
+                    require_unchanged_light: true,
+                    changed_blocks: BTreeSet::new(),
+                    changed_chunks: BTreeSet::new(),
+                    tree_light_updates: BTreeSet::new(),
+                    tree_light_order: Vec::new(),
+                    non_air_counts: BTreeMap::new(),
+                });
+                draft.set_tree_block([16, 10, 9], &leaf, 19).unwrap();
+                let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
+                finish_decoration_with_light(draft, &mut tracking).unwrap();
+                drop(tracking);
+                let after_second = engine.snapshot(&terrain, [center], &registry).unwrap();
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                after.block_light(p),
+                                Some(expected[3][0][index]),
+                                "queued block {p:?}"
+                            );
+                            assert_eq!(
+                                after.sky_light(p),
+                                Some(expected[3][1][index]),
+                                "queued sky {p:?}"
+                            );
+                            assert_eq!(
+                                after_second.block_light(p),
+                                Some(expected[4][0][index]),
+                                "second block {p:?}"
+                            );
+                            assert_eq!(
+                                after_second.sky_light(p),
+                                Some(expected[4][1][index]),
+                                "second sky {p:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            if !engine.incremental_columns.is_empty() {
+                let old_active = engine.active.clone();
+                let error = engine
+                    .activate(&terrain, east, [center], &registry)
+                    .err()
+                    .unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("activation overlaps incremental light history")
+                );
+                assert_eq!(engine.active, old_active);
+                let next = ChunkPos { x: 2, z: 0 };
+                terrain.completed_decoration.insert(next);
+                let count = engine.fresh.registered.len();
+                let error = engine
+                    .initialize_chunk(&terrain, next, &registry)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("registration overlaps incremental light history")
+                );
+                assert_eq!(engine.fresh.registered.len(), count);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_sparse_tree_light_matches_java_in_25_columns() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let path = temp.path().join("staged-wide.json");
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StagedGenerationLightEngineOracle")
+            .arg(&path)
+            .arg("log_active_sparse_wide")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let expected: Vec<Vec<Vec<Vec<u8>>>> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut terrain, tags, _, _) = fixture();
+        let block_names = registry.ids().map(str::to_owned).collect();
+        let motion = HeightmapTags::load(&mut Data, &block_names).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let world = Arc::make_mut(&mut terrain.world);
+        let template = Arc::clone(world.chunks.get(&center).unwrap());
+        for z in -2..=2 {
+            for x in -2..=2 {
+                let pos = ChunkPos { x, z };
+                world.chunks.entry(pos).or_insert_with(|| {
+                    let mut chunk = (*template).clone();
+                    chunk.position = pos;
+                    Arc::new(chunk)
+                });
+            }
+        }
+        let air = world.intern_state(state("air"));
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&east).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap().fill(air);
+        let stone = world.intern_state(state("stone"));
+        world.set_block_id(31, 0, 0, stone).unwrap();
+        let registered: Vec<_> = (-1..=1)
+            .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+            .collect();
+        terrain
+            .completed_decoration
+            .extend(registered.iter().copied());
+        let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+        for pos in registered {
+            tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
+        }
+        let mut engine = StagedGenerationLightEngine::new(tracker);
+        let covered: Vec<_> = (-2..=2)
+            .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+            .collect();
+        let before = engine
+            .activate(&terrain, center, covered.iter().copied(), &registry)
+            .unwrap();
+        let mut draft = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([east]))
+            .unwrap();
+        draft.light_guard = Some(DecorationLightGuard {
+            registered: BTreeSet::from([east]),
+            registry: &registry,
+            require_unchanged_light: true,
+            changed_blocks: BTreeSet::new(),
+            changed_chunks: BTreeSet::new(),
+            tree_light_updates: BTreeSet::new(),
+            tree_light_order: Vec::new(),
+            non_air_counts: BTreeMap::new(),
+        });
+        let mut log = state("dark_oak_log");
+        log.properties.insert("axis".into(), "y".into());
+        draft.set_tree_block([16, 10, 8], &log, 19).unwrap();
+        let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
+        finish_decoration_with_light(draft, &mut tracking).unwrap();
+        drop(tracking);
+        let after = engine
+            .snapshot(&terrain, covered.iter().copied(), &registry)
+            .unwrap();
+        for (index, pos) in covered.iter().enumerate() {
+            for y in -16..32 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let p = [pos.x * 16 + x, y, pos.z * 16 + z];
+                        let i = ((y + 16) * 256 + z * 16 + x) as usize;
+                        assert_eq!(
+                            before.block_light(p),
+                            Some(expected[0][index][0][i]),
+                            "before block {p:?}"
+                        );
+                        assert_eq!(
+                            before.sky_light(p),
+                            Some(expected[0][index][1][i]),
+                            "before sky {p:?}"
+                        );
+                        assert_eq!(
+                            after.block_light(p),
+                            Some(expected[2][index][0][i]),
+                            "after block {p:?}"
+                        );
+                        assert_eq!(
+                            after.sky_light(p),
+                            Some(expected[2][index][1][i]),
+                            "after sky {p:?}"
+                        );
                     }
                 }
             }
@@ -7908,6 +8198,7 @@ mod tests {
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
                     tree_light_updates: BTreeSet::new(),
+                    tree_light_order: Vec::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -7938,6 +8229,7 @@ mod tests {
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
                     tree_light_updates: BTreeSet::new(),
+                    tree_light_order: Vec::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -8253,6 +8545,7 @@ mod tests {
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
                 tree_light_updates: BTreeSet::new(),
+                tree_light_order: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
             if initial == 0 {
@@ -8277,6 +8570,7 @@ mod tests {
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
                 tree_light_updates: BTreeSet::new(),
+                tree_light_order: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
             let initial = region.read([16, 0, 0]).unwrap();

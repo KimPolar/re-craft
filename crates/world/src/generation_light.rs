@@ -183,6 +183,11 @@ impl VisibleLightSnapshot {
         self.columns.insert(pos, column)
     }
 
+    /// Share a complete covered column, including which layers are allocated.
+    pub fn complete_column(&self, pos: ChunkPos) -> Option<VisibleLightColumn> {
+        self.columns.get(&pos).cloned()
+    }
+
     /// Whether this visible engine revision has storage for a block-light
     /// section. An uncovered column remains unknown rather than absent.
     pub fn block_section_allocated(&self, pos: ChunkPos, section_y: i32) -> Option<bool> {

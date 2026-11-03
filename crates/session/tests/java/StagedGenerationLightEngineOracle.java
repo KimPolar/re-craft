@@ -122,7 +122,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyMany=args.length>1 && args[1].equals("sky_inactive_many");
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany);
         boolean skyDark=args.length>1 && args[1].equals("sky_inactive_dark");
-        boolean skyWide=skyShadow || skyDark;
+        boolean skyWide=skyShadow || skyDark || (args.length>1 && args[1].equals("log_active_sparse_wide"));
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyWide);
         boolean treeEmptyFull=args.length>1 && args[1].equals("tree_empty_full");
         boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
@@ -219,6 +219,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(skyMany)engine.checkBlock(new BlockPos(16,10,8));
             if(skyWide && args.length>2) Files.writeString(Path.of(args[2]),pendingSkyChecks(engine).toString());
             stages.add(skyWide ? captureWide(engine) : capture(engine)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
+            if(args.length>1 && args[1].equals("log_active_sparse_twice")){
+                var pos=new BlockPos(16,10,9);
+                var old=eastSection.section.setBlockState(0,10,9,Blocks.DARK_OAK_LOG.defaultBlockState());
+                w.edits.put(pos,Blocks.DARK_OAK_LOG.defaultBlockState());
+                w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,10,9);
+                if(!LightEngine.hasDifferentLightProperties(old,Blocks.DARK_OAK_LOG.defaultBlockState()))throw new AssertionError("missing second light check");
+                engine.checkBlock(pos); stages.add(capture(engine)); drain(engine); stages.add(capture(engine));
+            }
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(vine){

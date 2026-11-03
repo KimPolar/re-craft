@@ -532,19 +532,20 @@ impl FreshGenerationLightTracker {
     }
 }
 
-/// A static batch of generation chunks with monotonically activated light
-/// sources. This is separate from the live world: it cannot accept section
-/// updates, registered-chunk edits or restored light. Additional completed
-/// chunks can be registered when already active neighborhoods are unchanged.
-/// Requested columns need their 3x3 neighborhood;
-/// uninitialized chunks must retain their default sky-source heightmaps.
-/// Once propagation starts, reads use the blocks seen at activation. Further
-/// activation requires its 3x3 input neighborhood to retain equivalent light
-/// behavior; registered chunks must remain completely unchanged.
+/// Generation lighting with monotonically activated source chunks. Most
+/// columns are calculated from the activation inputs; tracked inactive tree
+/// checks preserve their incrementally updated columns instead. Registration
+/// or activation overlapping that stored history is rejected until those
+/// operations also support incremental propagation. Section transitions,
+/// restored light and live-world edits are not supported here.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
     active: BTreeSet<native_world::loaded::ChunkPos>,
     frozen_world: Option<Arc<native_world::loaded::World>>,
+    incremental_columns: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_world::generation_light::VisibleLightColumn,
+    >,
 }
 
 // These worlds share the same append-only state registry lineage. Compare only
@@ -600,6 +601,7 @@ impl StagedGenerationLightEngine {
             fresh,
             active: BTreeSet::new(),
             frozen_world: None,
+            incremental_columns: BTreeMap::new(),
         }
     }
 
@@ -686,6 +688,18 @@ impl StagedGenerationLightEngine {
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<()> {
         self.validate_active_world(&terrain.world)?;
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let affected = native_world::loaded::ChunkPos {
+                    x: pos.x.checked_add(dx).context("light X overflow")?,
+                    z: pos.z.checked_add(dz).context("light Z overflow")?,
+                };
+                ensure!(
+                    !self.incremental_columns.contains_key(&affected),
+                    "light registration overlaps incremental light history"
+                );
+            }
+        }
         self.fresh.initialize_chunk(terrain, pos, registry)?;
         if self.frozen_world.is_some() {
             self.frozen_world = Some(Arc::clone(&terrain.world));
@@ -718,6 +732,18 @@ impl StagedGenerationLightEngine {
             "light chunk is not initialized"
         );
         ensure!(!self.active.contains(&pos), "light chunk is already active");
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let affected = native_world::loaded::ChunkPos {
+                    x: pos.x.checked_add(dx).context("light X overflow")?,
+                    z: pos.z.checked_add(dz).context("light Z overflow")?,
+                };
+                ensure!(
+                    !self.incremental_columns.contains_key(&affected),
+                    "light activation overlaps incremental light history"
+                );
+            }
+        }
         if let Some(frozen) = &self.frozen_world {
             for dz in -1i32..=1 {
                 for dx in -1i32..=1 {
@@ -772,6 +798,10 @@ impl StagedGenerationLightEngine {
             .fresh
             .snapshot(terrain, covered.iter().copied(), registry)?;
         for pos in covered {
+            if let Some(column) = self.incremental_columns.get(&pos) {
+                snapshot.insert_complete_column(pos, column.clone());
+                continue;
+            }
             // Propagation loses at least one level per horizontal step, so a
             // source more than one chunk away cannot reach this column.
             let affected = (-1i32..=1).any(|dz| {

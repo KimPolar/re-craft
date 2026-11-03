@@ -1373,7 +1373,6 @@ impl MaterializedTerrain {
     pub fn height(&self) -> i32 {
         self.height
     }
-
     /// Transfer the chunk and its unconsumed postprocessing flags together.
     pub fn into_parts(
         self,
@@ -1885,6 +1884,13 @@ impl TerrainGenerator {
     }
     pub fn height(&self) -> i32 {
         self.height
+    }
+    /// NoiseBasedChunkGenerator inherits ChunkGenerator's fixed spawn height.
+    pub fn spawn_height(&self) -> i32 {
+        64
+    }
+    pub fn sea_level(&self) -> i32 {
+        self.noise.sea_level()
     }
     /// Compute the initial origin with the same immutable data-pack stack
     /// used to build this generator, before requesting generated chunks.
@@ -2814,6 +2820,7 @@ mod tests {
         let mut config = definition();
         let generator =
             TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        assert_eq!(generator.spawn_height(), 64);
         assert!(generator.spawn_origin(&mut data).is_err());
         config["settings"]["spawn_target"] = json!([]);
         let generator =

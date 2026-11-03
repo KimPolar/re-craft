@@ -2940,6 +2940,7 @@ mod tests {
         let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
             "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
             "default_block":"minecraft:stone","default_fluid":"minecraft:water",
+            "spawn_target":[],
             "material_rule":{"type":"block","result_state":"minecraft:dirt"},
             "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
         }});
@@ -2981,6 +2982,8 @@ mod tests {
             })
         };
         let center = ChunkPos { x: 0, z: 0 };
+        let computed_origin = batch.spawn_origin(&mut data).unwrap();
+        assert_eq!(computed_origin, center);
         let targets = BTreeSet::from([center]);
         let mut renderer = IncrementalPreview::default();
         assert!(
@@ -3094,8 +3097,10 @@ mod tests {
                     .generated_spawn_blocks_clear(IVec3::new(0, 16, 8), &targets)
                     .is_err()
             );
-            let mut initial =
-                native_session::world_spawn::InitialWorldSpawn::new(0, 0, 16).unwrap();
+            let mut initial = generated
+                .initial_spawn_search(&session, computed_origin)
+                .unwrap();
+            assert_eq!(initial.requested_position().y, 64);
             assert_eq!(
                 session
                     .poll_generated_initial_spawn(&mut initial, None, &targets, 1)

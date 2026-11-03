@@ -6116,6 +6116,49 @@ impl LoadedSession {
         search.poll(&mut view, budget)
     }
 
+    /// Prepare the initial world-spawn suggestion using the generator's
+    /// origin and height. Java uses WORLD_SURFACE's first-available Y only
+    /// when the generator's height is below the dimension minimum.
+    pub fn generated_initial_spawn_search(
+        &self,
+        origin: ChunkPos,
+        generator_spawn_height: i32,
+        sea_level: i32,
+        generated_targets: &BTreeSet<ChunkPos>,
+    ) -> anyhow::Result<crate::world_spawn::InitialWorldSpawn> {
+        use anyhow::Context;
+        let search =
+            crate::world_spawn::InitialWorldSpawn::new(origin.x, origin.z, generator_spawn_height)?;
+        if generator_spawn_height >= self.bounds.min_y {
+            return Ok(search);
+        }
+        let x = origin.x * 16 + 8;
+        let z = origin.z * 16 + 8;
+        if !(-30_000_000..30_000_000).contains(&x) || !(-30_000_000..30_000_000).contains(&z) {
+            return crate::world_spawn::InitialWorldSpawn::new(
+                origin.x,
+                origin.z,
+                sea_level.wrapping_add(1),
+            );
+        }
+        let view = LoadedColumnSpawnView {
+            session: self,
+            ceiling_spawn_height: None,
+            generated: Some(generated_targets),
+        };
+        view.state_id(IVec3::new(x, self.bounds.min_y, z))?;
+        let highest = self
+            .spawn_heightmaps
+            .get(&origin)
+            .context("generated spawn heightmap is unavailable")?
+            .highest(SpawnHeightmapKind::WorldSurface, x, z)
+            .context("generated world surface heightmap is unavailable")?;
+        let first_available = highest
+            .checked_add(1)
+            .context("generated spawn height overflow")?;
+        crate::world_spawn::InitialWorldSpawn::new(origin.x, origin.z, first_available)
+    }
+
     /// Java's shared-spawn block and liquid collision query for a standing
     /// player. Entity collisions must be checked separately.
     pub fn world_spawn_blocks_clear(&self, pos: IVec3) -> anyhow::Result<bool> {
@@ -44261,6 +44304,83 @@ pub(crate) mod tests {
         assert!(
             session
                 .generated_spawn_blocks_clear(open, &targets)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_initial_spawn_uses_surface_only_below_dimension_minimum() {
+        use native_persistence::heightmap::{HeightBounds, SpawnHeightmaps};
+        let (mut world, origin, mut player) = fixture();
+        let home = ChunkPos {
+            x: origin.x.div_euclid(16),
+            z: origin.z.div_euclid(16),
+        };
+        let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+        chunk.block_light_correct = true;
+        let section = chunk.sections.remove(&0).unwrap();
+        chunk.sections.insert(5, section);
+        player.position.y = 81.0;
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 80,
+                max_y: 112,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        let targets = BTreeSet::from([home]);
+        assert!(
+            session
+                .generated_initial_spawn_search(home, 64, 63, &targets)
+                .is_err()
+        );
+        let search = session
+            .generated_initial_spawn_search(home, 80, 63, &targets)
+            .unwrap();
+        assert_eq!(search.requested_position().y, 80);
+        let maps = SpawnHeightmaps::from_first_available(
+            HeightBounds {
+                min_y: 80,
+                max_y: 112,
+            },
+            &[81; 256],
+            &[97; 256],
+            &[81; 256],
+        )
+        .unwrap();
+        session.set_initial_spawn_heightmaps(home, maps).unwrap();
+        let outside = session
+            .generated_initial_spawn_search(ChunkPos { x: 1_875_000, z: 0 }, 64, 40, &targets)
+            .unwrap();
+        assert_eq!(outside.requested_position().y, 41);
+        assert!(
+            session
+                .generated_initial_spawn_search(home, 64, 63, &BTreeSet::new())
+                .is_err()
+        );
+        let search = session
+            .generated_initial_spawn_search(home, 64, 63, &targets)
+            .unwrap();
+        assert_eq!(
+            search.requested_position(),
+            IVec3::new(origin.x, 97, origin.z)
+        );
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .block_light_correct = false;
+        assert!(
+            session
+                .generated_initial_spawn_search(home, 64, 63, &targets)
                 .is_err()
         );
     }

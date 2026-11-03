@@ -61,6 +61,13 @@ impl FreshTerrainBatch {
         Ok(ChunkPos { x, z })
     }
 
+    pub fn spawn_height(&self) -> i32 {
+        self.generator.spawn_height()
+    }
+    pub fn sea_level(&self) -> i32 {
+        self.generator.sea_level()
+    }
+
     /// The supplied generator must have been constructed without structure
     /// adjustment and for a new world with structures explicitly disabled.
     pub fn new_without_structures(

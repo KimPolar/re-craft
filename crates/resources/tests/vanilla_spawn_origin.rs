@@ -113,4 +113,13 @@ fn noise_spawn_origins_match_java() {
         custom_count += 1;
     }
     assert_eq!(custom_count, 6);
+    let heights: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("H "))
+        .collect();
+    assert_eq!(heights.len(), 12);
+    for line in heights {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(fields[4].parse::<i32>().unwrap(), 64, "{line}");
+    }
 }

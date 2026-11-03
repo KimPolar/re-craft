@@ -42,6 +42,26 @@ pub struct GenerationReady {
 }
 
 impl GenerationReady {
+    /// Start the initial spawn suggestion search at the origin calculated
+    /// from this batch's unchanged generator and data-pack stack.
+    pub fn initial_spawn_search(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        origin: ChunkPos,
+    ) -> Result<native_session::world_spawn::InitialWorldSpawn> {
+        let targets = self
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated session targets missing")?;
+        session.generated_initial_spawn_search(
+            origin,
+            self.batch.spawn_height(),
+            self.batch.sea_level(),
+            targets,
+        )
+    }
+
     /// Prepare spawn heightmaps with tags from the same immutable data-pack
     /// stack as this batch. Already primed generation values are preserved.
     pub fn start_session_with_spawn_heightmaps(

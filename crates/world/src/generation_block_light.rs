@@ -29,6 +29,65 @@ pub fn check_generated_block_light(
     active: &BTreeSet<ChunkPos>,
     positions: &[[i32; 3]],
 ) -> Option<VisibleLightSnapshot> {
+    apply_generated_block_light(world, bounds, before, active, positions, &[])
+}
+
+/// Propagate the block sources of one newly enabled generated chunk over a
+/// complete prior storage revision. No pending checks or allocation updates
+/// may remain; unsupported blocks or missing storage leave `before` intact.
+pub fn activate_generated_block_light(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    chunk: ChunkPos,
+) -> Option<VisibleLightSnapshot> {
+    if !before.has_block_channel() {
+        return None;
+    }
+    let start_x = chunk.x.checked_mul(16)?;
+    let start_z = chunk.z.checked_mul(16)?;
+    let data = world.chunks.get(&chunk)?;
+    let mut properties = HashMap::new();
+    let mut sources = Vec::new();
+    let range = bounds.build_range();
+    for sy in range.start.div_euclid(16)..range.end.div_euclid(16) {
+        let blocks = data
+            .sections
+            .get(&i8::try_from(sy).ok()?)?
+            .blocks
+            .as_ref()?;
+        for (index, &id) in blocks.iter().enumerate() {
+            let emission = if let Some(&value) = properties.get(&id.0) {
+                value
+            } else {
+                let value = light_properties(world.state(id)?)?.emission;
+                properties.insert(id.0, value);
+                value
+            };
+            if emission > 0 {
+                let x = i32::try_from(index % 16).ok()?;
+                let z = i32::try_from((index / 16) % 16).ok()?;
+                let y = sy
+                    .checked_mul(16)?
+                    .checked_add(i32::try_from(index / 256).ok()?)?;
+                sources.push((
+                    [start_x.checked_add(x)?, y, start_z.checked_add(z)?],
+                    emission,
+                ));
+            }
+        }
+    }
+    apply_generated_block_light(world, bounds, before, &BTreeSet::new(), &[], &sources)
+}
+
+fn apply_generated_block_light(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    positions: &[[i32; 3]],
+    sources: &[([i32; 3], u8)],
+) -> Option<VisibleLightSnapshot> {
     #[derive(Clone, Copy)]
     struct Entry {
         pos: [i32; 3],
@@ -102,6 +161,14 @@ pub fn check_generated_block_light(
                 emission: true,
             });
         }
+    }
+    for &(pos, level) in sources {
+        increases.push_back(Entry {
+            pos,
+            level,
+            directions: ALL,
+            emission: true,
+        });
     }
     while let Some(entry) = decreases.pop_front() {
         for direction in ORDER {

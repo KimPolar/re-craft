@@ -59,6 +59,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
             if(x==1 && z==0 && !blockCase && !magmaOnly && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
             if(x==0 && z==0 && blockCase){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
+            if(x==1 && z==0 && blockCase) for(var entry:edits.entrySet())
+                if(Math.floorDiv(entry.getKey().getX(),16)==1 && Math.floorDiv(entry.getKey().getZ(),16)==0 && entry.getValue().getLightEmission()>0) f.accept(entry.getKey(),entry.getValue());
             if(x==1 && z==0 && lateFar) f.accept(new BlockPos(31,10,8),Blocks.TORCH.defaultBlockState());
             if(x==2 && z==0 && lateFar) f.accept(new BlockPos(33,10,8),Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && edits.get(new BlockPos(16,7,8))==Blocks.MAGMA_BLOCK.defaultBlockState()) f.accept(new BlockPos(16,7,8),Blocks.MAGMA_BLOCK.defaultBlockState());
@@ -150,7 +152,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
         boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
-        w.wide=full;
+        w.wide=full || blockCase;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing"));
         w.magmaOnly=magma;
@@ -194,7 +196,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(blockCase){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine); stages.add(captureWide(engine));
             String mode=args[1];
-            int[][] positions=mode.equals("block_incremental_many") ? new int[][]{{14,10,8},{15,10,8},{16,10,8}} :
+            int[][] positions=mode.equals("block_incremental_activate_many") ? new int[][]{{16,10,8},{17,10,8},{30,10,4}} :
+                mode.equals("block_incremental_many") ? new int[][]{{14,10,8},{15,10,8},{16,10,8}} :
                 mode.equals("block_incremental_remove") ? new int[][]{{14,10,8}} :
                 mode.equals("block_incremental_obstruct") ? new int[][]{{15,10,8}} :
                 mode.equals("block_incremental_add_active") ? new int[][]{{13,10,9}} : new int[][]{{16,10,8}};
@@ -209,6 +212,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
             if(mode.equals("block_incremental_many"))engine.checkBlock(new BlockPos(14,10,8));
             stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine));
+            if(mode.startsWith("block_incremental_activate")){
+                engine.propagateLightSources(new ChunkPos(1,0)); stages.add(captureWide(engine));
+                drain(engine); stages.add(captureWide(engine));
+            }
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(leafActive){

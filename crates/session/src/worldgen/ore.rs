@@ -6192,6 +6192,8 @@ mod tests {
             "block_incremental_add_active",
             "block_incremental_add_inactive",
             "block_incremental_many",
+            "block_incremental_activate",
+            "block_incremental_activate_many",
         ] {
             let path = temp.path().join("block.json");
             let output = Command::new(java.join("java.exe"))
@@ -6212,6 +6214,17 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let (mut terrain, _, _, _) = fixture();
             let world = Arc::make_mut(&mut terrain.world);
+            let template = Arc::clone(world.chunks.get(&ChunkPos { x: 0, z: 0 }).unwrap());
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = (*template).clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
             let torch = world.intern_state(state("torch"));
             let air = world.intern_state(state("air"));
             let stone = world.intern_state(state("stone"));
@@ -6222,6 +6235,8 @@ mod tests {
                 "block_incremental_obstruct" => vec![[15, 10, 8]],
                 "block_incremental_add_active" => vec![[13, 10, 9]],
                 "block_incremental_add_inactive" => vec![[16, 10, 8]],
+                "block_incremental_activate" => vec![[16, 10, 8]],
+                "block_incremental_activate_many" => vec![[16, 10, 8], [17, 10, 8], [30, 10, 4]],
                 _ => vec![[14, 10, 8], [15, 10, 8], [16, 10, 8], [14, 10, 8]],
             };
             for &[x, y, z] in &positions {
@@ -6269,6 +6284,29 @@ mod tests {
                 world, bounds, &before, &active, &positions,
             )
             .expect("complete block-light inputs");
+            let activated = if mode.starts_with("block_incremental_activate") {
+                assert!(
+                    native_world::generation_block_light::activate_generated_block_light(
+                        world,
+                        bounds,
+                        &VisibleLightSnapshot::new(true, false),
+                        ChunkPos { x: 1, z: 0 },
+                    )
+                    .is_none(),
+                    "missing activation storage must be rejected"
+                );
+                Some(
+                    native_world::generation_block_light::activate_generated_block_light(
+                        world,
+                        bounds,
+                        &after,
+                        ChunkPos { x: 1, z: 0 },
+                    )
+                    .expect("complete activation inputs"),
+                )
+            } else {
+                None
+            };
             let mut changed = 0usize;
             for z in -2..=2 {
                 for x in -2..=2 {
@@ -6292,6 +6330,23 @@ mod tests {
                                     Some(expected[2][index][0][i]),
                                     "after {mode} {p:?}"
                                 );
+                                if let Some(activated) = &activated {
+                                    assert_eq!(
+                                        after.block_light(p),
+                                        Some(expected[3][index][0][i]),
+                                        "pending activation {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        activated.block_light(p),
+                                        Some(expected[4][index][0][i]),
+                                        "activation {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        after.block_light(p),
+                                        Some(expected[2][index][0][i]),
+                                        "activation must preserve previous snapshot {mode} {p:?}"
+                                    );
+                                }
                                 changed += usize::from(
                                     expected[0][index][0][i] != expected[2][index][0][i],
                                 );
@@ -6302,7 +6357,8 @@ mod tests {
             }
             assert_eq!(
                 changed == 0,
-                mode == "block_incremental_add_inactive",
+                mode == "block_incremental_add_inactive"
+                    || mode.starts_with("block_incremental_activate"),
                 "{mode}"
             );
         }

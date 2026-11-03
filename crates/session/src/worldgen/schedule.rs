@@ -2,7 +2,7 @@
 //! Completing a plan entry only records an already successful generation step.
 use anyhow::{Context, Result, ensure};
 use native_world::loaded::ChunkPos;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -213,6 +213,7 @@ impl GenerationStage {
 pub struct GenerationSchedule {
     required: BTreeMap<ChunkPos, GenerationStage>,
     completed: BTreeMap<ChunkPos, GenerationStage>,
+    ready: BTreeSet<ChunkPos>,
 }
 
 impl GenerationSchedule {
@@ -245,11 +246,20 @@ impl GenerationSchedule {
                 }
             }
         }
+        let mut changed = Vec::new();
         for (pos, needed) in staged {
+            if self.required.get(&pos).is_none_or(|&old| needed > old) {
+                changed.push(pos);
+            }
             self.required
                 .entry(pos)
                 .and_modify(|current| *current = (*current).max(needed))
                 .or_insert(needed);
+        }
+        // Neighbor requirements are always at least StructureStarts; adding
+        // an Empty entry therefore cannot make a neighbor ready by itself.
+        for pos in changed {
+            self.refresh_ready(pos);
         }
         Ok(())
     }
@@ -301,16 +311,49 @@ impl GenerationSchedule {
         true
     }
     pub fn next_ready(&self) -> Option<(ChunkPos, GenerationStage)> {
-        self.required.iter().find_map(|(&pos, &required)| {
-            let next = self.completed(pos)?.next()?;
-            (next <= required && self.ready(pos, next)).then_some((pos, next))
-        })
+        let &pos = self.ready.first()?;
+        Some((pos, self.completed(pos)?.next()?))
+    }
+
+    fn refresh_ready(&mut self, pos: ChunkPos) {
+        let next = self.completed(pos).and_then(GenerationStage::next);
+        if next.is_some_and(|stage| self.ready(pos, stage)) {
+            self.ready.insert(pos);
+        } else {
+            self.ready.remove(&pos);
+        }
     }
     /// Call only after the corresponding operation succeeded. A failed or
     /// cancelled operation must not be recorded as complete.
     pub fn complete(&mut self, pos: ChunkPos, target: GenerationStage) -> Result<()> {
         ensure!(self.ready(pos, target), "generation step is not ready");
         self.completed.insert(pos, target);
+        self.refresh_ready(pos);
+        // Only a next step depending on the stage just completed can have
+        // become ready. Preserve lexicographic order in the ready set.
+        let radius = GenerationStage::ALL
+            .iter()
+            .filter_map(|stage| stage.direct().iter().rposition(|&needed| needed == target))
+            .max()
+            .unwrap_or(0) as i32;
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                let (Some(x), Some(z)) = (pos.x.checked_add(dx), pos.z.checked_add(dz)) else {
+                    continue;
+                };
+                let neighbor = ChunkPos { x, z };
+                let Some(next) = self.completed(neighbor).and_then(GenerationStage::next) else {
+                    continue;
+                };
+                let distance = dx.abs().max(dz.abs()) as usize;
+                if next.direct().get(distance) == Some(&target) {
+                    self.refresh_ready(neighbor);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -520,6 +563,79 @@ impl GenerationSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scan_next(plan: &GenerationSchedule) -> Option<(ChunkPos, GenerationStage)> {
+        plan.required.iter().find_map(|(&pos, &required)| {
+            let next = plan.completed(pos)?.next()?;
+            (next <= required && plan.ready(pos, next)).then_some((pos, next))
+        })
+    }
+
+    #[test]
+    fn ready_index_matches_full_scan_with_interleaved_requests() {
+        // The index relies on new, uncompleted neighbors not satisfying a
+        // direct dependency. Guard that property when stages are changed.
+        for stage in GenerationStage::ALL {
+            assert!(stage.direct().iter().skip(1).all(|&needed| needed > Empty));
+        }
+        let mut plan = GenerationSchedule::new();
+        let requests = [
+            (ChunkPos { x: 0, z: 0 }, Features),
+            (ChunkPos { x: -2, z: 1 }, Terrain),
+            (ChunkPos { x: 0, z: 0 }, InitializeLight),
+            (ChunkPos { x: 3, z: -2 }, Light),
+            (ChunkPos { x: -2, z: 1 }, Full),
+            (
+                ChunkPos {
+                    x: i32::MAX,
+                    z: i32::MIN,
+                },
+                StructureStarts,
+            ),
+        ];
+        for step in 0..1800 {
+            if let Some(&(pos, target)) = requests.get(step / 80).filter(|_| step % 80 == 0) {
+                plan.request(pos, target).unwrap();
+            }
+            let expected = scan_next(&plan);
+            assert_eq!(plan.next_ready(), expected, "step {step}");
+            if step % 31 == 0 {
+                let all: BTreeSet<_> = plan
+                    .required
+                    .keys()
+                    .copied()
+                    .filter(|&pos| {
+                        plan.completed(pos)
+                            .and_then(GenerationStage::next)
+                            .is_some_and(|stage| plan.ready(pos, stage))
+                    })
+                    .collect();
+                assert_eq!(plan.ready, all, "ready set at step {step}");
+            }
+            let Some((mut pos, mut stage)) = expected else {
+                break;
+            };
+            // Callers may complete any ready step, not just next_ready().
+            if step % 7 == 0 {
+                pos = *plan.ready.last().unwrap();
+                stage = plan.completed(pos).unwrap().next().unwrap();
+            }
+            plan.complete(pos, stage).unwrap();
+        }
+        assert_eq!(
+            plan.required(ChunkPos {
+                x: i32::MAX,
+                z: i32::MIN,
+            }),
+            Some(StructureStarts)
+        );
+        while let Some((pos, stage)) = scan_next(&plan) {
+            assert_eq!(plan.next_ready(), Some((pos, stage)));
+            plan.complete(pos, stage).unwrap();
+        }
+        assert_eq!(plan.next_ready(), None);
+        assert!(plan.is_complete());
+    }
     #[test]
     fn requirements_match_accumulated_radii_for_every_stage() {
         let center = ChunkPos { x: -3, z: 4 };

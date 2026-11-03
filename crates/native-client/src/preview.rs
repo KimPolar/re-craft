@@ -3018,7 +3018,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
-        let crate::generation_worker::GenerationResult::Ready(generated) = generated else {
+        let crate::generation_worker::GenerationResult::Ready(mut generated) = generated else {
             panic!("expected generated terrain")
         };
         assert_eq!(
@@ -3026,6 +3026,45 @@ mod tests {
             crate::generation_worker::GenerationPhase::Ready
         );
         assert!(generation.progress().completed_steps > 0);
+        {
+            use native_session::{GameSession, PlayerPose, PlayerState, inventory::PlayerSlot};
+            let player = PlayerState {
+                position: glam::Vec3::new(8.5, 16.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: true,
+                pose: PlayerPose::Standing,
+            };
+            let mut outside = player;
+            outside.position.x = 16.0;
+            assert!(generated.start_session(outside).is_err());
+            let mut invalid = player;
+            invalid.position.x = f32::NAN;
+            assert!(generated.start_session(invalid).is_err());
+            let current = Arc::clone(&generated.mesh.world);
+            generated.mesh.world = Arc::new((*current).clone());
+            assert!(
+                generated
+                    .start_session(player)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("stale")
+            );
+            generated.mesh.world = current;
+            let mut session = generated.start_session(player).unwrap();
+            let before = session.snapshot();
+            let playable = before.world.loaded().unwrap();
+            assert_eq!(playable.chunks.len(), 1);
+            assert!(playable.chunks[&center].block_light_correct);
+            assert_eq!(playable.light(8, 16, 8, true), Some(15));
+            assert!(before.inventory.slot(PlayerSlot::Storage(0)).is_none());
+            assert!(!generated.mesh.world.chunks[&center].block_light_correct);
+            session.update(std::time::Duration::from_millis(50));
+            assert_eq!(session.snapshot().tick, 1);
+            assert_eq!(before.tick, 0);
+        }
         let mut batch = generated.batch;
         let job = generated.mesh;
         let (world, scene) = renderer

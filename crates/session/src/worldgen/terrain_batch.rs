@@ -429,6 +429,17 @@ impl FreshTerrainBatch {
     pub fn schedule(&self) -> &GenerationSchedule {
         &self.schedule
     }
+
+    /// Build limits of the selected dimension, before the two light padding sections.
+    pub fn build_bounds(&self) -> Result<(i32, i32)> {
+        Ok((
+            self.generator.min_y,
+            self.generator
+                .min_y
+                .checked_add(self.generator.height)
+                .context("generation height overflow")?,
+        ))
+    }
     pub fn snapshot(&self) -> Option<Arc<World>> {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }

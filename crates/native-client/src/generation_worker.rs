@@ -41,6 +41,93 @@ pub struct GenerationReady {
     pub mesh: MeshJob,
 }
 
+impl GenerationReady {
+    /// Construct a transient session from fully lit targets. The caller must
+    /// choose and validate the player spawn, and keep the batch for generation;
+    /// this does not create or save a Java world.
+    pub fn start_session(
+        &mut self,
+        player: native_session::PlayerState,
+    ) -> Result<native_session::loaded::LoadedSession> {
+        use native_session::{
+            inventory::PlayerInventory,
+            loaded::{BuildBounds, LoadedSession},
+        };
+        let targets = self
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated session requires light-complete targets")?;
+        ensure!(!targets.is_empty(), "generated session has no targets");
+        ensure!(
+            self.batch.is_complete(),
+            "generated session has pending generation work"
+        );
+        let current = self.batch.lit_render_snapshot(targets.iter().copied())?;
+        ensure!(
+            Arc::ptr_eq(&current, &self.mesh.world),
+            "generated session mesh snapshot is stale"
+        );
+        let (min_y, max_y) = self.batch.build_bounds()?;
+        ensure!(
+            player.position.is_finite(),
+            "invalid generated player position"
+        );
+        let absolute = player.position.as_dvec3() + self.mesh.origin.as_dvec3();
+        ensure!(
+            absolute.x >= f64::from(i32::MIN)
+                && absolute.x < f64::from(i32::MAX)
+                && absolute.z >= f64::from(i32::MIN)
+                && absolute.z < f64::from(i32::MAX)
+                && absolute.y >= f64::from(min_y)
+                && absolute.y <= f64::from(max_y),
+            "generated player position is outside supported bounds"
+        );
+        let player_chunk = ChunkPos {
+            x: (absolute.x.floor() as i32).div_euclid(16),
+            z: (absolute.z.floor() as i32).div_euclid(16),
+        };
+        ensure!(
+            targets.contains(&player_chunk),
+            "generated player is outside light-complete targets"
+        );
+        let mut world = (*self.mesh.world).clone();
+        world.chunks.retain(|pos, _| targets.contains(pos));
+        ensure!(
+            world.chunks.len() == targets.len(),
+            "generated session target is missing"
+        );
+        for chunk in world.chunks.values_mut() {
+            for sy in min_y.div_euclid(16) - 1..=max_y.div_euclid(16) {
+                let section = chunk
+                    .sections
+                    .get(&i8::try_from(sy)?)
+                    .context("generated session light section is missing")?;
+                ensure!(
+                    section.block_light.is_some() && section.sky_light.is_some(),
+                    "generated session light data is missing"
+                );
+                if sy >= min_y.div_euclid(16) && sy < max_y.div_euclid(16) {
+                    ensure!(
+                        section.blocks.is_some(),
+                        "generated session blocks are missing"
+                    );
+                }
+            }
+            Arc::make_mut(chunk).block_light_correct = true;
+        }
+        let mut session = LoadedSession::new(
+            world,
+            self.mesh.origin,
+            BuildBounds { min_y, max_y },
+            player,
+        )
+        .map_err(anyhow::Error::msg)?;
+        session.set_player_inventory(PlayerInventory::default());
+        Ok(session)
+    }
+}
+
 pub enum GenerationResult {
     Ready(GenerationReady),
     Cancelled,
@@ -297,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known incomplete: registered tree changes need incremental light updates"]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and a full generation batch"]
     fn installed_overworld_expands_to_adjacent_lit_mesh() -> Result<()> {
         installed_overworld_generation(true)
     }
@@ -328,7 +415,7 @@ mod tests {
             IVec3::ZERO,
         )?;
         let result = worker.result.recv_timeout(Duration::from_secs(300))?;
-        let generated = match result {
+        let mut generated = match result {
             GenerationResult::Ready(generated) => generated,
             GenerationResult::Failed(error) => {
                 return Err(error.context(format!("generation progress: {:?}", worker.progress())));
@@ -345,6 +432,25 @@ mod tests {
                 .chunks
                 .contains_key(&ChunkPos { x: 0, z: 0 })
         );
+        {
+            use native_session::{GameSession, PlayerPose, PlayerState};
+            let player = PlayerState {
+                position: glam::Vec3::new(8.5, 150.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: PlayerPose::Standing,
+            };
+            let session = generated.start_session(player)?;
+            let snapshot = session.snapshot();
+            let world = snapshot
+                .world
+                .loaded()
+                .context("generated session world missing")?;
+            assert_eq!(world.chunks.len(), 1);
+            assert!(world.chunks[&ChunkPos { x: 0, z: 0 }].block_light_correct);
+        }
         let mesher = crate::mesh_worker::MeshWorker::start(
             native_resources::packs::ResourceStack::open(&mesh_game)?,
         )?;

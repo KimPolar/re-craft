@@ -157,7 +157,9 @@ impl FreshTerrainBatch {
             "generation batch failed and must be discarded"
         );
         ensure!(self.decoration.is_some(), "decoration is not configured");
-        self.check_writes(pos, 1)?;
+        // The center must remain writable; actual cross-chunk feature writes
+        // are validated transactionally against the staged light engine.
+        self.check_writes(pos, 0)?;
         self.schedule.request(pos, GenerationStage::Features)
     }
 
@@ -484,7 +486,7 @@ impl FreshTerrainBatch {
                 Ok(())
             })(),
             GenerationStage::Features => (|| {
-                self.check_write_area(pos, 1)?;
+                self.check_write_area(pos, 0)?;
                 let config = self
                     .decoration
                     .as_ref()

@@ -630,6 +630,31 @@ impl StagedGenerationLightEngine {
         }) && !any_near(center, radius + 1, |pos| self.active.contains(pos))
     }
 
+    fn validate_active_world(&self, world: &native_world::loaded::World) -> Result<()> {
+        if let Some(frozen) = &self.frozen_world {
+            if !std::ptr::eq(frozen.as_ref(), world) {
+                for active in &self.active {
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let neighbor = native_world::loaded::ChunkPos {
+                                x: active.x.checked_add(dx).context("light X overflow")?,
+                                z: active.z.checked_add(dz).context("light Z overflow")?,
+                            };
+                            let unchanged =
+                                match (frozen.chunks.get(&neighbor), world.chunks.get(&neighbor)) {
+                                    (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                                    (None, None) => true,
+                                    _ => false,
+                                };
+                            ensure!(unchanged, "active light neighborhood changed");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register another completed chunk. Unregistered terrain outside every
     /// active chunk's 3x3 neighborhood may have changed since activation;
     /// registered chunks and all active input neighborhoods must be unchanged.
@@ -639,29 +664,7 @@ impl StagedGenerationLightEngine {
         pos: native_world::loaded::ChunkPos,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<()> {
-        if let Some(frozen) = &self.frozen_world {
-            if !Arc::ptr_eq(frozen, &terrain.world) {
-                for active in &self.active {
-                    for dz in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            let neighbor = native_world::loaded::ChunkPos {
-                                x: active.x.checked_add(dx).context("light X overflow")?,
-                                z: active.z.checked_add(dz).context("light Z overflow")?,
-                            };
-                            let unchanged = match (
-                                frozen.chunks.get(&neighbor),
-                                terrain.world.chunks.get(&neighbor),
-                            ) {
-                                (Some(before), Some(after)) => Arc::ptr_eq(before, after),
-                                (None, None) => true,
-                                _ => false,
-                            };
-                            ensure!(unchanged, "active light neighborhood changed");
-                        }
-                    }
-                }
-            }
-        }
+        self.validate_active_world(&terrain.world)?;
         self.fresh.initialize_chunk(terrain, pos, registry)?;
         if self.frozen_world.is_some() {
             self.frozen_world = Some(Arc::clone(&terrain.world));
@@ -2986,6 +2989,23 @@ mod tests {
             &cached,
             &batch.lit_snapshot([center]).unwrap()
         ));
+        // This feature can reach the initialized eastern chunk, but its
+        // actual mushroom placement stays in the new center chunk.
+        let adjacent = ChunkPos { x: 3, z: 0 };
+        batch.request_features(adjacent).unwrap();
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        assert_eq!(
+            batch.schedule().completed(adjacent),
+            Some(schedule::GenerationStage::Features)
+        );
+        assert_eq!(
+            batch.snapshot().unwrap().block(56, 8, 8).unwrap().name,
+            "minecraft:brown_mushroom"
+        );
         let distant = ChunkPos { x: 6, z: 0 };
         let nearby: Vec<_> = (-1..=1)
             .flat_map(|dz| {

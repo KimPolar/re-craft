@@ -89,7 +89,7 @@ enum DecorationLightTracking<'a> {
         &'a mut FreshGenerationLightTracker,
         &'a native_resources::block_registry::GeneratedBlockRegistry,
     ),
-    Frozen(&'a FreshGenerationLightTracker),
+    Frozen(&'a StagedGenerationLightEngine),
 }
 
 struct FreezeContext<'a> {
@@ -977,7 +977,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(&block),
             Some(&raw),
-            Some(DecorationLightTracking::Frozen(&engine.fresh)),
+            Some(DecorationLightTracking::Frozen(engine)),
         )
     }
 
@@ -1058,8 +1058,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .context("prepared ore is missing")?;
             results.push(region.place_planned_auto(self.plan, index, ore)?);
         }
-        if let Some(DecorationLightTracking::Frozen(tracker)) = &light_tracking {
-            tracker.validate_world(&region.world)?;
+        if let Some(DecorationLightTracking::Frozen(engine)) = &light_tracking {
+            engine.fresh.validate_world(&region.world)?;
+            engine.validate_active_world(&region.world)?;
         }
         let changes = region.light_guard.as_mut().map(|guard| {
             (
@@ -6159,6 +6160,58 @@ mod tests {
                     Some(13)
                 );
             }
+        }
+        // A staged feature must roll back both a registered-chunk write and
+        // an unregistered write in an active light input neighborhood.
+        for x in [8, 16] {
+            let schedule = FeatureSchedule::load(
+                &mut MushroomAt(x),
+                std::slice::from_ref(&plains),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let (_, _, neighborhood) = scheduled_fixture(None);
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let mut registry = batch_registry();
+            registry.insert("minecraft:brown_mushroom".into());
+            let prepared =
+                PreparedDecoration::load(&mut MushroomAt(x), &plan, &registry, &mut resolve_test)
+                    .unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let east = ChunkPos { x: 1, z: 0 };
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, false).unwrap();
+            tracker.initialize_chunk(&terrain, east, &vanilla).unwrap();
+            let mut engine = super::super::StagedGenerationLightEngine::new(tracker);
+            engine.activate(&terrain, east, [center], &vanilla).unwrap();
+            let before = terrain.snapshot();
+            let error = prepared
+                .execute_with_staged_light(&mut terrain, false, &engine, &vanilla)
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(if x == 8 {
+                    "active light neighborhood changed"
+                } else {
+                    "registered light chunk has changed"
+                }),
+                "{message}"
+            );
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert!(!terrain.completed_decoration.contains(&center));
         }
         let (mut invalid, _, _, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };

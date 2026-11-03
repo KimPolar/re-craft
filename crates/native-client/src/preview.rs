@@ -3086,6 +3086,16 @@ mod tests {
             );
             assert!(
                 session
+                    .generated_spawn_blocks_clear(IVec3::new(8, 16, 8), &targets)
+                    .unwrap()
+            );
+            assert!(
+                session
+                    .generated_spawn_blocks_clear(IVec3::new(0, 16, 8), &targets)
+                    .is_err()
+            );
+            assert!(
+                session
                     .generated_spawn_column_candidate(16, 8, None, &targets)
                     .is_err()
             );

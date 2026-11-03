@@ -6082,13 +6082,17 @@ impl LoadedSession {
     /// Java's shared-spawn block and liquid collision query for a standing
     /// player. Entity collisions must be checked separately.
     pub fn world_spawn_blocks_clear(&self, pos: IVec3) -> anyhow::Result<bool> {
-        let center = pos.as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
-        let half = f64::from(0.6_f32 / 2.0);
-        let bounds = BoundingBox {
-            min: center + DVec3::new(-half, 0.0, -half),
-            max: center + DVec3::new(half, f64::from(1.8_f32), half),
-        };
-        spawn_blocks_clear(self, bounds)
+        spawn_blocks_clear(self, player_spawn_bounds(pos), None)
+    }
+
+    /// Check block and liquid clearance in LIGHT-complete generated targets.
+    /// Entity collisions must still be checked before selecting a spawn.
+    pub fn generated_spawn_blocks_clear(
+        &self,
+        pos: IVec3,
+        targets: &BTreeSet<ChunkPos>,
+    ) -> anyhow::Result<bool> {
+        spawn_blocks_clear(self, player_spawn_bounds(pos), Some(targets))
     }
 
     pub fn set_entity_collision_registry(
@@ -19014,7 +19018,20 @@ impl LoadedColumnSpawnView<'_> {
     }
 }
 
-fn spawn_blocks_clear(session: &LoadedSession, bounds: BoundingBox) -> anyhow::Result<bool> {
+fn player_spawn_bounds(pos: IVec3) -> BoundingBox {
+    let center = pos.as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
+    let half = f64::from(0.6_f32 / 2.0);
+    BoundingBox {
+        min: center + DVec3::new(-half, 0.0, -half),
+        max: center + DVec3::new(half, f64::from(1.8_f32), half),
+    }
+}
+
+fn spawn_blocks_clear(
+    session: &LoadedSession,
+    bounds: BoundingBox,
+    generated: Option<&BTreeSet<ChunkPos>>,
+) -> anyhow::Result<bool> {
     use anyhow::Context;
     const EPSILON: f64 = 1.0e-7;
     const LIQUID: [Aabb; 1] = [Aabb {
@@ -19041,6 +19058,11 @@ fn spawn_blocks_clear(session: &LoadedSession, bounds: BoundingBox) -> anyhow::R
         edge(bounds.max.y + EPSILON, 1)?,
         edge(bounds.max.z + EPSILON, 1)?,
     );
+    let view = LoadedColumnSpawnView {
+        session,
+        ceiling_spawn_height: None,
+        generated,
+    };
     let mut unavailable = None;
     // Java's Cursor3D skips corners and only tests large shapes on its outer
     // faces. Keep an unknown result until all known collisions are examined.
@@ -19055,7 +19077,7 @@ fn spawn_blocks_clear(session: &LoadedSession, bounds: BoundingBox) -> anyhow::R
                 }
                 let pos = IVec3::new(x, y, z);
                 let query = (|| -> anyhow::Result<bool> {
-                    let id = session.respawn_state_id(pos)?;
+                    let id = view.state_id(pos)?;
                     let state = session
                         .world
                         .state(id)
@@ -44102,6 +44124,83 @@ pub(crate) mod tests {
             }),
             sections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn generated_spawn_clearance_matches_saved_and_rejects_missing_inputs() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let origin = session.origin;
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .block_light_correct = true;
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        let targets = BTreeSet::from([home]);
+        for z in 3..13 {
+            for x in 3..13 {
+                for y in 0..4 {
+                    let pos = origin + IVec3::new(x, y, z);
+                    assert_eq!(
+                        session.generated_spawn_blocks_clear(pos, &targets).unwrap(),
+                        session.world_spawn_blocks_clear(pos).unwrap(),
+                        "position {pos:?}"
+                    );
+                }
+            }
+        }
+        let open = origin + IVec3::new(8, 1, 8);
+        let solid = origin + IVec3::new(8, 0, 8);
+        assert!(
+            session
+                .generated_spawn_blocks_clear(open, &targets)
+                .unwrap()
+        );
+        assert!(
+            !session
+                .generated_spawn_blocks_clear(solid, &targets)
+                .unwrap()
+        );
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set(IVec3::new(8, 1, 8), water));
+        assert!(
+            !session
+                .generated_spawn_blocks_clear(open, &targets)
+                .unwrap()
+        );
+        assert_eq!(
+            session
+                .generated_spawn_blocks_clear(open, &targets)
+                .unwrap(),
+            session.world_spawn_blocks_clear(open).unwrap()
+        );
+        assert!(
+            session
+                .generated_spawn_blocks_clear(origin + IVec3::new(0, 2, 8), &targets)
+                .is_err()
+        );
+        assert!(
+            session
+                .generated_spawn_blocks_clear(open, &BTreeSet::new())
+                .is_err()
+        );
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .block_light_correct = false;
+        assert!(
+            session
+                .generated_spawn_blocks_clear(open, &targets)
+                .is_err()
+        );
     }
 
     #[test]

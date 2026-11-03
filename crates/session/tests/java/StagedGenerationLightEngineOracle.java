@@ -24,6 +24,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean sparseEast;
     boolean sparseColumn;
     boolean sparseShadow;
+    boolean sparseMany;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -31,7 +32,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     public BlockEntity getBlockEntity(BlockPos p){ return null; }
     public BlockState getBlockState(BlockPos p){
         if(edits.containsKey(p)) return edits.get(p);
-        if(sparseEast && ((sparseShadow && p.getX()==16 && p.getY()==11 && p.getZ()==8) || (!sparseShadow && p.getY()==0 && ((sparseColumn && p.getX()==16 && p.getZ()==8) || (!sparseColumn && p.getX()==31 && p.getZ()==0))))) return Blocks.STONE.defaultBlockState();
+        if(sparseEast && ((sparseShadow && p.getY()==11 && ((p.getX()==16 && p.getZ()==8) || (sparseMany && ((p.getX()==16 && p.getZ()==9) || (p.getX()==17 && p.getZ()==8))))) || (!sparseShadow && p.getY()==0 && ((sparseColumn && p.getX()==16 && p.getZ()==8) || (!sparseColumn && p.getX()==31 && p.getZ()==0))))) return Blocks.STONE.defaultBlockState();
         if(emptyEast && Math.floorDiv(p.getX(),16)==1 && Math.floorDiv(p.getZ(),16)==0) return Blocks.AIR.defaultBlockState();
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(lateFar && p.getX()==31 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
@@ -91,6 +92,17 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         for(int z=-2;z<=2;z++)for(int x=-2;x<=2;x++)result.add(capture(e,x,z));
         return result;
     }
+    static JsonArray pendingSkyChecks(LevelLightEngine e)throws Exception{
+        var engineField=LevelLightEngine.class.getDeclaredField("skyEngine"); engineField.setAccessible(true);
+        var nodesField=LightEngine.class.getDeclaredField("blockNodesToCheck"); nodesField.setAccessible(true);
+        var nodes=(it.unimi.dsi.fastutil.longs.LongOpenHashSet)nodesField.get(engineField.get(e));
+        var order=new JsonArray(); var iterator=nodes.iterator();
+        while(iterator.hasNext()){
+            var p=BlockPos.of(iterator.nextLong()); var point=new JsonArray();
+            point.add(p.getX()); point.add(p.getY()); point.add(p.getZ()); order.add(point);
+        }
+        return order;
+    }
     static JsonArray captureMixed(LevelLightEngine e,boolean far){
         var result=new JsonArray(); result.add(capture(e,0)); result.add(capture(e,far?1:-1)); result.add(capture(e,far?-1:0,far?0:-1)); return result;
     }
@@ -102,7 +114,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
-        boolean skyShadow=args.length>1 && args[1].equals("sky_inactive_shadow");
+        boolean skyMany=args.length>1 && args[1].equals("sky_inactive_many");
+        boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany);
         boolean skyDark=args.length>1 && args[1].equals("sky_inactive_dark");
         boolean skyWide=skyShadow || skyDark;
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyWide);
@@ -112,6 +125,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.sparseEast=treeSparse;
         w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
         w.sparseShadow=skyShadow;
+        w.sparseMany=skyMany;
         boolean logActive=args.length>1 && args[1].equals("log_active_full");
         boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
@@ -143,6 +157,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==2 && z==0) farSection=fake;
             if(!((treeEmpty || treeSparse) && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(treeSparse && x==1 && z==0) fake.section.setBlockState(w.sparseColumn || skyShadow?0:15,skyShadow?11:0,w.sparseColumn || skyShadow?8:0,Blocks.STONE.defaultBlockState());
+            if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
             if(x==1 && z==0 && !magma && !treeEmpty && !treeSparse) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
@@ -162,7 +177,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
             var state=(logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
-            int[][] positions=leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
+            int[][] positions=skyMany ? new int[][]{{16,10,8},{16,10,9},{17,10,8}} : leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(p[0]-16,p[1],p[2],state); w.edits.put(pos,state);
@@ -174,6 +189,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing leaf light check");
                 engine.checkBlock(pos);
             }
+            if(skyMany)engine.checkBlock(new BlockPos(16,10,8));
+            if(skyWide && args.length>2) Files.writeString(Path.of(args[2]),pendingSkyChecks(engine).toString());
             stages.add(skyWide ? captureWide(engine) : capture(engine)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }

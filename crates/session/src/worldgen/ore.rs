@@ -5701,14 +5701,20 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&compile.stderr)
         );
-        for mode in ["sky_inactive_shadow", "sky_inactive_dark"] {
+        for mode in [
+            "sky_inactive_shadow",
+            "sky_inactive_dark",
+            "sky_inactive_many",
+        ] {
             let path = temp.path().join("sky.json");
+            let order_path = temp.path().join("sky-order.json");
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
                 .arg("StagedGenerationLightEngineOracle")
                 .arg(&path)
                 .arg(mode)
+                .arg(&order_path)
                 .output()
                 .unwrap();
             assert!(
@@ -5719,6 +5725,31 @@ mod tests {
             );
             let expected: Vec<Vec<Vec<Vec<u8>>>> =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let positions: Vec<[i32; 3]> =
+                serde_json::from_slice(&std::fs::read(order_path).unwrap()).unwrap();
+            let expected_positions = if mode == "sky_inactive_many" {
+                BTreeSet::from([[16, 10, 8], [16, 10, 9], [17, 10, 8]])
+            } else {
+                BTreeSet::from([[16, 10, 8]])
+            };
+            let inserted = if mode == "sky_inactive_many" {
+                vec![[16, 10, 8], [16, 10, 9], [17, 10, 8], [16, 10, 8]]
+            } else {
+                vec![[16, 10, 8]]
+            };
+            assert_eq!(
+                native_world::generation_light::order_pending_light_checks(
+                    inserted.iter().copied()
+                )
+                .unwrap(),
+                positions,
+                "Java pending-node iteration order"
+            );
+            assert_eq!(positions.len(), expected_positions.len());
+            assert_eq!(
+                positions.iter().copied().collect::<BTreeSet<_>>(),
+                expected_positions
+            );
             let (mut terrain, _, _, _) = fixture();
             let east = ChunkPos { x: 1, z: 0 };
             let center = ChunkPos { x: 0, z: 0 };
@@ -5732,15 +5763,21 @@ mod tests {
             );
             section.blocks.as_mut().unwrap().fill(air);
             let stone = world.intern_state(state("stone"));
-            if mode == "sky_inactive_shadow" {
+            if mode != "sky_inactive_dark" {
                 world.set_block_id(16, 11, 8, stone).unwrap();
+                if mode == "sky_inactive_many" {
+                    world.set_block_id(16, 11, 9, stone).unwrap();
+                    world.set_block_id(17, 11, 8, stone).unwrap();
+                }
             } else {
                 world.set_block_id(31, 0, 0, stone).unwrap();
             }
             let mut log = state("dark_oak_log");
             log.properties.insert("axis".into(), "y".into());
             let log = world.intern_state(log);
-            world.set_block_id(16, 10, 8, log).unwrap();
+            for [x, y, z] in &positions {
+                world.set_block_id(*x, *y, *z, log).unwrap();
+            }
 
             let mut before = VisibleLightSnapshot::new(false, true);
             for z in -2..=2 {
@@ -5763,7 +5800,7 @@ mod tests {
             }
             assert_eq!(
                 before.sky_light([16, 10, 8]).unwrap() > 0,
-                mode == "sky_inactive_shadow",
+                mode != "sky_inactive_dark",
                 "{mode}"
             );
             let bounds = native_world::block_light::LightBounds::new(0, 16).unwrap();
@@ -5787,12 +5824,12 @@ mod tests {
                 )
                 .is_none()
             );
-            let after = native_world::generation_sky_light::check_inactive_sky_block(
+            let after = native_world::generation_sky_light::check_inactive_sky_blocks(
                 world,
                 bounds,
                 &before,
                 &BTreeSet::from([center]),
-                [16, 10, 8],
+                &inserted,
             )
             .expect("complete light inputs");
             for z in -2..=2 {

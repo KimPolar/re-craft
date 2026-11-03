@@ -14,6 +14,92 @@ use std::{
 /// Nibble-packed visible layers indexed by absolute section Y.
 pub type VisibleLayers = BTreeMap<i32, Arc<[u8; LIGHT_BYTES]>>;
 
+/// Order a drained batch as Java 26.3's newly emptied pending-node set does.
+/// Positions are supplied in `checkBlock` insertion order, including repeats.
+/// Java uses a 512-entry expected capacity, 0.5 load factor, and trims its
+/// set after every drain. Packed BlockPos values outside Java's range fail.
+pub fn order_pending_light_checks(
+    positions: impl IntoIterator<Item = [i32; 3]>,
+) -> Option<Vec<[i32; 3]>> {
+    fn pack([x, y, z]: [i32; 3]) -> Option<u64> {
+        if !(-33_554_432..=33_554_431).contains(&x)
+            || !(-2048..=2047).contains(&y)
+            || !(-33_554_432..=33_554_431).contains(&z)
+        {
+            return None;
+        }
+        Some(((x as u64 & 0x3ff_ffff) << 38) | ((z as u64 & 0x3ff_ffff) << 12) | (y as u64 & 0xfff))
+    }
+    fn slot(key: u64, mask: usize) -> usize {
+        let h = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let h = h ^ (h >> 32);
+        ((h ^ (h >> 16)) as usize) & mask
+    }
+    fn insert(table: &mut [u64], key: u64) -> bool {
+        let mask = table.len() - 1;
+        let mut index = slot(key, mask);
+        while table[index] != 0 {
+            if table[index] == key {
+                return false;
+            }
+            index = (index + 1) & mask;
+        }
+        table[index] = key;
+        true
+    }
+    let mut positions = positions.into_iter();
+    let Some(first) = positions.next() else {
+        return Some(Vec::new());
+    };
+    let Some(second) = positions.next() else {
+        pack(first)?;
+        return Some(vec![first]);
+    };
+    let mut table = vec![0u64; 1024];
+    let mut has_zero = false;
+    let mut size = 0usize;
+    for position in [first, second].into_iter().chain(positions) {
+        let key = pack(position)?;
+        let inserted = if key == 0 {
+            let was_new = !has_zero;
+            has_zero = true;
+            was_new
+        } else {
+            insert(&mut table, key)
+        };
+        if !inserted {
+            continue;
+        }
+        size += 1;
+        if size > table.len() / 2 {
+            let next = size
+                .checked_add(1)?
+                .checked_mul(2)?
+                .checked_next_power_of_two()?;
+            if next > (1usize << 30) {
+                return None;
+            }
+            let mut grown = vec![0u64; next];
+            for &old in table.iter().rev().filter(|&&old| old != 0) {
+                insert(&mut grown, old);
+            }
+            table = grown;
+        }
+    }
+    let mut ordered = Vec::with_capacity(size);
+    if has_zero {
+        ordered.push([0, 0, 0]);
+    }
+    for &key in table.iter().rev().filter(|&&key| key != 0) {
+        ordered.push([
+            ((key as i64) >> 38) as i32,
+            ((key << 52) as i64 >> 52) as i32,
+            ((key << 26) as i64 >> 38) as i32,
+        ]);
+    }
+    Some(ordered)
+}
+
 /// Determine which sections are nonempty in this immutable world snapshot.
 pub fn initialized_nonempty_sections(
     world: &World,
@@ -322,6 +408,119 @@ mod tests {
     use super::*;
     fn layer(n: u8) -> Arc<[u8; LIGHT_BYTES]> {
         Arc::new([n | (n << 4); LIGHT_BYTES])
+    }
+    #[test]
+    fn pending_checks_deduplicate_and_validate_packed_coordinates() {
+        let positions = [[3, -1, 2], [0, 0, 0], [3, -1, 2], [-2, 7, 9]];
+        let order = order_pending_light_checks(positions).unwrap();
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0], [0, 0, 0]);
+        assert_eq!(
+            order.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            positions.into_iter().collect()
+        );
+        assert!(order_pending_light_checks([[33_554_432, 0, 0]]).is_none());
+        assert!(order_pending_light_checks([[0, -2049, 0]]).is_none());
+        assert!(order_pending_light_checks([[0, 0, -33_554_433]]).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn pending_check_order_matches_java_fastutil() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("PendingLightChecksOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PendingLightChecksOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut batches = vec![
+            vec![],
+            vec![[0, 0, 0], [0, 0, 0], [3, -1, 2]],
+            vec![
+                [-33_554_432, -2048, -33_554_432],
+                [33_554_431, 2047, 33_554_431],
+            ],
+        ];
+        let mut random = 0x8213_a567_9f84_1234u64;
+        for count in [511, 512, 513, 1200, 17, 2000] {
+            let mut batch = vec![[0, 0, 0]];
+            for i in 0..count {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let p = [
+                    ((random & 0xffff) as i32) - 32768,
+                    (((random >> 16) & 0xfff) as i32) - 2048,
+                    (((random >> 28) & 0xffff) as i32) - 32768,
+                ];
+                batch.push(p);
+                if i % 9 == 0 {
+                    batch.push(p);
+                }
+            }
+            batches.push(batch);
+        }
+        let input = temp.path().join("input.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(&input, serde_json::to_vec(&batches).unwrap()).unwrap();
+        let run = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("PendingLightChecksOracle")
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let expected: Vec<Vec<[i32; 3]>> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(expected.len(), batches.len());
+        for (i, (batch, expected)) in batches.into_iter().zip(expected).enumerate() {
+            assert_eq!(
+                order_pending_light_checks(batch).unwrap(),
+                expected,
+                "batch {i}"
+            );
+        }
     }
     #[test]
     fn stored_sky_edits_preserve_previous_snapshots_and_absent_layers() {

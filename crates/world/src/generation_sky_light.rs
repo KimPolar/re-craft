@@ -9,7 +9,7 @@ use crate::{
         DIRECTIONS, LightBounds, LightProperties, faces_occlude, light_properties,
         transparent_light_properties,
     },
-    generation_light::{VisibleLayers, VisibleLightSnapshot},
+    generation_light::{VisibleLayers, VisibleLightSnapshot, order_pending_light_checks},
     loaded::{ChunkPos, LIGHT_BYTES, World},
 };
 
@@ -82,6 +82,19 @@ pub fn check_inactive_sky_block(
     active: &BTreeSet<ChunkPos>,
     position: [i32; 3],
 ) -> Option<VisibleLightSnapshot> {
+    check_inactive_sky_blocks(world, bounds, before, active, &[position])
+}
+
+/// Drain `checkBlock` calls in insertion order using Java's pending-node set.
+/// Duplicate positions are coalesced, and all checks run before propagation.
+/// The single-check function's storage and block-state preconditions apply.
+pub fn check_inactive_sky_blocks(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    positions: &[[i32; 3]],
+) -> Option<VisibleLightSnapshot> {
     #[derive(Clone, Copy)]
     struct Entry {
         pos: [i32; 3],
@@ -91,30 +104,33 @@ pub fn check_inactive_sky_block(
     const ALL: u8 = 0b11_1111;
     // Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
     const ORDER: [usize; 6] = [3, 2, 5, 4, 1, 0];
-    let chunk = ChunkPos {
-        x: position[0].div_euclid(16),
-        z: position[2].div_euclid(16),
-    };
-    if active.contains(&chunk)
-        || !bounds.build_range().contains(&position[1])
-        || !before.has_sky_channel()
-    {
+    if !before.has_sky_channel() {
         return None;
     }
     let mut draft = before.clone();
-    let Some(old) = draft.stored_sky(position)? else {
-        return Some(draft);
-    };
     let mut decreases = VecDeque::new();
     let mut increases = VecDeque::new();
-    if old > 0 {
-        draft.set_stored_sky(position, 0)?;
+    let ordered = order_pending_light_checks(positions.iter().copied())?;
+    for position in ordered {
+        let chunk = ChunkPos {
+            x: position[0].div_euclid(16),
+            z: position[2].div_euclid(16),
+        };
+        if active.contains(&chunk) || !bounds.build_range().contains(&position[1]) {
+            return None;
+        }
+        let Some(old) = draft.stored_sky(position)? else {
+            continue;
+        };
+        if old > 0 {
+            draft.set_stored_sky(position, 0)?;
+        }
+        decreases.push_back(Entry {
+            pos: position,
+            level: old.max(1),
+            directions: ALL,
+        });
     }
-    decreases.push_back(Entry {
-        pos: position,
-        level: old.max(1),
-        directions: ALL,
-    });
     let mut properties = HashMap::<u32, LightProperties>::new();
     let get_properties = |p: [i32; 3], cache: &mut HashMap<u32, LightProperties>| {
         if !bounds.build_range().contains(&p[1]) {

@@ -8,13 +8,193 @@ use crate::{
         DIRECTIONS, LightBounds, LightProperties, faces_occlude, light_properties,
         transparent_light_properties,
     },
-    generation_light::{VisibleLayers, VisibleLightSnapshot},
+    generation_light::{VisibleLayers, VisibleLightSnapshot, order_pending_light_checks},
     loaded::{ChunkPos, LIGHT_BYTES, World},
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
+
+/// Drain block-light checks while preserving the prior stored light revision.
+/// `positions` are checkBlock calls in insertion order, including duplicates.
+/// `world` must contain all final block states, `active` all source-enabled
+/// chunks, and `before` complete columns for every possible affected location.
+/// Section allocation cannot change during this batch. Missing or unsupported
+/// input returns None without changing the original snapshot.
+pub fn check_generated_block_light(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    positions: &[[i32; 3]],
+) -> Option<VisibleLightSnapshot> {
+    #[derive(Clone, Copy)]
+    struct Entry {
+        pos: [i32; 3],
+        level: u8,
+        directions: u8,
+        emission: bool,
+    }
+    const ALL: u8 = 0b11_1111;
+    const ORDER: [usize; 6] = [3, 2, 5, 4, 1, 0];
+    if !before.has_block_channel() {
+        return None;
+    }
+    let mut draft = before.clone();
+    let mut properties = HashMap::<u32, LightProperties>::new();
+    let get_properties = |p: [i32; 3], cache: &mut HashMap<u32, LightProperties>| {
+        if !bounds.build_range().contains(&p[1]) {
+            return Some(transparent_light_properties());
+        }
+        let id = world.block_id(p[0], p[1], p[2])?;
+        if let Some(value) = cache.get(&id.0) {
+            return Some(value.clone());
+        }
+        let value = light_properties(world.state(id)?)?;
+        cache.insert(id.0, value.clone());
+        Some(value)
+    };
+    let emission = |p: [i32; 3], cache: &mut HashMap<u32, LightProperties>| {
+        let properties = get_properties(p, cache)?;
+        let chunk = ChunkPos {
+            x: p[0].div_euclid(16),
+            z: p[2].div_euclid(16),
+        };
+        Some(if active.contains(&chunk) {
+            properties.emission
+        } else {
+            0
+        })
+    };
+    let neighbor = |p: [i32; 3], direction: usize| {
+        let (dx, dy, dz) = DIRECTIONS[direction];
+        Some([
+            p[0].checked_add(dx)?,
+            p[1].checked_add(dy)?,
+            p[2].checked_add(dz)?,
+        ])
+    };
+    let mut decreases = VecDeque::new();
+    let mut increases = VecDeque::new();
+    for position in order_pending_light_checks(positions.iter().copied())? {
+        if !bounds.build_range().contains(&position[1]) {
+            return None;
+        }
+        let Some(old) = draft.stored_block(position)? else {
+            continue;
+        };
+        let source = emission(position, &mut properties)?;
+        if source < old {
+            draft.set_stored_block(position, 0)?;
+        }
+        decreases.push_back(Entry {
+            pos: position,
+            level: if source < old { old } else { 1 },
+            directions: ALL,
+            emission: false,
+        });
+        if source > 0 {
+            increases.push_back(Entry {
+                pos: position,
+                level: source,
+                directions: ALL,
+                emission: true,
+            });
+        }
+    }
+    while let Some(entry) = decreases.pop_front() {
+        for direction in ORDER {
+            if entry.directions & (1 << direction) == 0 {
+                continue;
+            }
+            let next = neighbor(entry.pos, direction)?;
+            if !bounds.light_range().contains(&next[1]) {
+                continue;
+            }
+            let Some(level) = draft.stored_block(next)? else {
+                continue;
+            };
+            if level == 0 {
+                continue;
+            }
+            let opposite = direction ^ 1;
+            if level <= entry.level.saturating_sub(1) {
+                let source = emission(next, &mut properties)?;
+                draft.set_stored_block(next, 0)?;
+                if source < level {
+                    decreases.push_back(Entry {
+                        pos: next,
+                        level,
+                        directions: ALL & !(1 << opposite),
+                        emission: false,
+                    });
+                }
+                if source > 0 {
+                    increases.push_back(Entry {
+                        pos: next,
+                        level: source,
+                        directions: ALL,
+                        emission: true,
+                    });
+                }
+            } else {
+                increases.push_back(Entry {
+                    pos: next,
+                    level,
+                    directions: 1 << opposite,
+                    emission: false,
+                });
+            }
+        }
+    }
+    while let Some(entry) = increases.pop_front() {
+        let Some(mut level) = draft.stored_block(entry.pos)? else {
+            return None;
+        };
+        if entry.emission && level < entry.level {
+            draft.set_stored_block(entry.pos, entry.level)?;
+            level = entry.level;
+        }
+        if level != entry.level {
+            continue;
+        }
+        let from = get_properties(entry.pos, &mut properties)?;
+        for direction in ORDER {
+            if entry.directions & (1 << direction) == 0 {
+                continue;
+            }
+            let next = neighbor(entry.pos, direction)?;
+            if !bounds.light_range().contains(&next[1]) {
+                continue;
+            }
+            let Some(old) = draft.stored_block(next)? else {
+                continue;
+            };
+            if level.saturating_sub(1) <= old {
+                continue;
+            }
+            let to = get_properties(next, &mut properties)?;
+            let value = level.saturating_sub(to.opacity.max(1));
+            if value <= old
+                || ((from.has_faces || to.has_faces)
+                    && faces_occlude(&from.faces[direction], &to.faces[direction ^ 1]))
+            {
+                continue;
+            }
+            draft.set_stored_block(next, value)?;
+            if value > 1 {
+                increases.push_back(Entry {
+                    pos: next,
+                    level: value,
+                    directions: ALL & !(1 << (direction ^ 1)),
+                    emission: false,
+                });
+            }
+        }
+    }
+    Some(draft)
+}
 
 /// Compute one target chunk and its two padding sections without mutating the
 /// input. Any missing chunk, section, state or unsupported light behavior
@@ -227,6 +407,47 @@ mod tests {
         let i = x + z * 16 + y.rem_euclid(16) as usize * 256;
         let b = layer[i / 2];
         if i % 2 == 0 { b & 15 } else { b >> 4 }
+    }
+    #[test]
+    fn queued_emission_add_and_remove_preserve_previous_revisions() {
+        let mut world = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+        let initial = VisibleLightSnapshot::fresh_after_section_updates(
+            true,
+            false,
+            [(center, 0), (center, 1)],
+            covered,
+        )
+        .unwrap();
+        let torch = world.intern_state(BlockState {
+            name: "minecraft:torch".into(),
+            properties: Default::default(),
+        });
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        });
+        let position = [8, 8, 8];
+        world.set_block_id(8, 8, 8, torch).unwrap();
+        let active = BTreeSet::from([center]);
+        let lit =
+            check_generated_block_light(&world, bounds, &initial, &active, &[position, position])
+                .unwrap();
+        assert_eq!(initial.block_light(position), Some(0));
+        assert_eq!(lit.block_light(position), Some(14));
+        assert_eq!(lit.block_light([9, 8, 8]), Some(13));
+        let inactive =
+            check_generated_block_light(&world, bounds, &initial, &BTreeSet::new(), &[position])
+                .unwrap();
+        assert_eq!(inactive.block_light(position), Some(0));
+        world.set_block_id(8, 8, 8, air).unwrap();
+        let removed =
+            check_generated_block_light(&world, bounds, &lit, &active, &[position]).unwrap();
+        assert_eq!(removed.block_light(position), Some(0));
+        assert_eq!(removed.block_light([9, 8, 8]), Some(0));
+        assert_eq!(lit.block_light(position), Some(14));
     }
     #[test]
     fn starts_from_sources_in_neighbor_chunks_and_keeps_padding() {

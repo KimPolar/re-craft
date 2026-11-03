@@ -5863,6 +5863,170 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_block_light_checks_match_java_queue() {
+        use native_world::generation_light::{VisibleLightColumn, VisibleLightSnapshot};
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        for mode in [
+            "block_incremental_remove",
+            "block_incremental_obstruct",
+            "block_incremental_add_active",
+            "block_incremental_add_inactive",
+            "block_incremental_many",
+        ] {
+            let path = temp.path().join("block.json");
+            let output = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("StagedGenerationLightEngineOracle")
+                .arg(&path)
+                .arg(mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let expected: Vec<Vec<Vec<Vec<u8>>>> =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let torch = world.intern_state(state("torch"));
+            let air = world.intern_state(state("air"));
+            let stone = world.intern_state(state("stone"));
+            world.set_block_id(12, 10, 8, torch).unwrap();
+            world.set_block_id(14, 10, 8, torch).unwrap();
+            let positions: Vec<[i32; 3]> = match mode {
+                "block_incremental_remove" => vec![[14, 10, 8]],
+                "block_incremental_obstruct" => vec![[15, 10, 8]],
+                "block_incremental_add_active" => vec![[13, 10, 9]],
+                "block_incremental_add_inactive" => vec![[16, 10, 8]],
+                _ => vec![[14, 10, 8], [15, 10, 8], [16, 10, 8], [14, 10, 8]],
+            };
+            for &[x, y, z] in &positions {
+                let id = if x == 14 && z == 8 {
+                    air
+                } else if x == 15 && z == 8 {
+                    stone
+                } else {
+                    torch
+                };
+                world.set_block_id(x, y, z, id).unwrap();
+            }
+            let mut before = VisibleLightSnapshot::new(true, false);
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let index = ((z + 2) * 5 + x + 2) as usize;
+                    let mut layers = BTreeMap::new();
+                    for sy in -1..=1 {
+                        let mut layer = [0u8; native_world::loaded::LIGHT_BYTES];
+                        for i in 0..4096usize {
+                            let value = expected[0][index][0][((sy + 1) as usize) * 4096 + i];
+                            layer[i / 2] |= value << ((i % 2) * 4);
+                        }
+                        layers.insert(sy, Arc::new(layer));
+                    }
+                    before.insert_complete_column(
+                        ChunkPos { x, z },
+                        VisibleLightColumn::new(layers, BTreeMap::new()),
+                    );
+                }
+            }
+            let bounds = native_world::block_light::LightBounds::new(0, 16).unwrap();
+            let active = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+            assert!(
+                native_world::generation_block_light::check_generated_block_light(
+                    world,
+                    bounds,
+                    &VisibleLightSnapshot::new(true, false),
+                    &active,
+                    &positions,
+                )
+                .is_none()
+            );
+            let after = native_world::generation_block_light::check_generated_block_light(
+                world, bounds, &before, &active, &positions,
+            )
+            .expect("complete block-light inputs");
+            let mut changed = 0usize;
+            for z in -2..=2 {
+                for x in -2..=2 {
+                    let index = ((z + 2) * 5 + x + 2) as usize;
+                    for y in -16..32 {
+                        for lz in 0..16 {
+                            for lx in 0..16 {
+                                let i = ((y + 16) * 256 + lz * 16 + lx) as usize;
+                                let p = [x * 16 + lx, y, z * 16 + lz];
+                                assert_eq!(
+                                    before.block_light(p),
+                                    Some(expected[0][index][0][i]),
+                                    "before {mode} {p:?}"
+                                );
+                                assert_eq!(
+                                    expected[0][index][0][i], expected[1][index][0][i],
+                                    "pending {mode} {p:?}"
+                                );
+                                assert_eq!(
+                                    after.block_light(p),
+                                    Some(expected[2][index][0][i]),
+                                    "after {mode} {p:?}"
+                                );
+                                changed += usize::from(
+                                    expected[0][index][0][i] != expected[2][index][0][i],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                changed == 0,
+                mode == "block_incremental_add_inactive",
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "known lighting mismatch with multiple registered chunks; requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn empty_section_tree_light_reinitialization_matches_java() {
         use std::{path::PathBuf, process::Command};

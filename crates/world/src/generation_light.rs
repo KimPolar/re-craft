@@ -204,6 +204,40 @@ impl VisibleLightSnapshot {
         self.has_sky
     }
 
+    pub fn has_block_channel(&self) -> bool {
+        self.has_block
+    }
+
+    pub(crate) fn stored_block(&self, pos: [i32; 3]) -> Option<Option<u8>> {
+        let (column, section, x, y, z) = Self::position(pos)?;
+        if !self.has_block {
+            return None;
+        }
+        Some(
+            self.columns
+                .get(&column)?
+                .block
+                .get(&section)
+                .map(|layer| Self::nibble(layer, x, y, z)),
+        )
+    }
+
+    pub(crate) fn set_stored_block(&mut self, pos: [i32; 3], value: u8) -> Option<()> {
+        if value > 15 || !self.has_block {
+            return None;
+        }
+        let (column, section, x, y, z) = Self::position(pos)?;
+        let layer = Arc::make_mut(self.columns.get_mut(&column)?.block.get_mut(&section)?);
+        let index = x + z * 16 + y * 256;
+        let byte = &mut layer[index / 2];
+        if index % 2 == 0 {
+            *byte = (*byte & 0xf0) | value;
+        } else {
+            *byte = (*byte & 0x0f) | (value << 4);
+        }
+        Some(())
+    }
+
     // Unlike visible reads, propagation must distinguish absent storage from
     // an allocated zero layer. The outer Option denotes a covered column.
     pub(crate) fn stored_sky(&self, pos: [i32; 3]) -> Option<Option<u8>> {

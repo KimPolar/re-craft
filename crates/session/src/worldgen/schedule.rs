@@ -280,6 +280,12 @@ impl GenerationSchedule {
             .all(|(pos, required)| self.completed.get(pos).copied().unwrap_or(Empty) >= *required)
     }
 
+    pub(super) fn has_pending_stage(&self, stage: GenerationStage) -> bool {
+        self.required.iter().any(|(pos, &required)| {
+            required >= stage && self.completed.get(pos).copied().unwrap_or(Empty) < stage
+        })
+    }
+
     pub fn ready(&self, pos: ChunkPos, target: GenerationStage) -> bool {
         let Some(current) = self.completed(pos) else {
             return false;

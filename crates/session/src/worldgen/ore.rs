@@ -5345,6 +5345,15 @@ mod tests {
             let mixed_first = mixed_engine
                 .activate(&mixed_terrain, center, [center, west, north], &registry)
                 .unwrap();
+            assert!(!mixed_engine.allows_writes(west, 0));
+            assert!(!mixed_engine.allows_writes(ChunkPos { x: 2, z: 0 }, 1));
+            assert!(mixed_engine.allows_writes(
+                ChunkPos {
+                    x: i32::MAX,
+                    z: i32::MIN
+                },
+                1
+            ));
             let registered = if mode.starts_with("late") {
                 let frozen = Arc::clone(&mixed_terrain.world);
                 let world = Arc::make_mut(&mut mixed_terrain.world);

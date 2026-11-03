@@ -146,10 +146,7 @@ impl FreshTerrainBatch {
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
-        ensure!(
-            self.light_engine.is_none(),
-            "terrain batch is sealed for light propagation"
-        );
+        self.check_writes(pos, 0)?;
         self.schedule.request(pos, GenerationStage::Terrain)
     }
 
@@ -160,11 +157,31 @@ impl FreshTerrainBatch {
             "generation batch failed and must be discarded"
         );
         ensure!(self.decoration.is_some(), "decoration is not configured");
-        ensure!(
-            self.light_engine.is_none(),
-            "terrain batch is sealed for light propagation"
-        );
+        self.check_writes(pos, 1)?;
         self.schedule.request(pos, GenerationStage::Features)
+    }
+
+    fn check_writes(&self, pos: ChunkPos, radius: i64) -> Result<()> {
+        if self.light_engine.is_some() {
+            ensure!(
+                !self
+                    .schedule
+                    .has_pending_stage(GenerationStage::InitializeLight)
+                    && !self.schedule.has_pending_stage(GenerationStage::Light),
+                "finish pending light registration and propagation before requesting terrain"
+            );
+        }
+        self.check_write_area(pos, radius)
+    }
+
+    fn check_write_area(&self, pos: ChunkPos, radius: i64) -> Result<()> {
+        ensure!(
+            self.light_engine
+                .as_ref()
+                .is_none_or(|engine| engine.allows_writes(pos, radius)),
+            "generation writes overlap registered or active light chunks"
+        );
+        Ok(())
     }
 
     /// Request FEATURES and light section/source registration for a chunk.
@@ -180,6 +197,12 @@ impl FreshTerrainBatch {
         );
         if self.light_engine.is_some() {
             ensure!(
+                !self.schedule.has_pending_stage(GenerationStage::Terrain)
+                    && !self.schedule.has_pending_stage(GenerationStage::Features)
+                    && !self.schedule.has_pending_stage(GenerationStage::Light),
+                "finish pending terrain, decoration and propagation before light registration"
+            );
+            ensure!(
                 self.schedule.completed(pos) == Some(GenerationStage::Features),
                 "sealed batches can only initialize already decorated chunks"
             );
@@ -188,8 +211,8 @@ impl FreshTerrainBatch {
     }
 
     /// Finish all requested registrations before entering a frozen light
-    /// batch. After this, terrain and decoration requests are rejected;
-    /// already decorated chunks may be registered if active neighborhoods stay unchanged.
+    /// batch. Subsequent terrain and decoration writes must stay outside
+    /// registered chunks and the neighborhoods used by active lighting.
     pub fn seal_for_light_propagation(&mut self) -> Result<()> {
         ensure!(
             self.is_complete(),
@@ -229,6 +252,14 @@ impl FreshTerrainBatch {
         ensure!(
             self.has_light_dependencies(pos),
             "chunk light dependencies are incomplete"
+        );
+        ensure!(
+            !self.schedule.has_pending_stage(GenerationStage::Terrain)
+                && !self.schedule.has_pending_stage(GenerationStage::Features)
+                && !self
+                    .schedule
+                    .has_pending_stage(GenerationStage::InitializeLight),
+            "finish pending terrain, decoration and registration before propagating light"
         );
         self.schedule.request(pos, GenerationStage::Light)
     }
@@ -427,9 +458,9 @@ impl FreshTerrainBatch {
                 &mut self.biomes,
                 pos,
             ),
-            GenerationStage::Terrain => self
-                .schedule
-                .run_terrain(
+            GenerationStage::Terrain => (|| {
+                self.check_write_area(pos, 0)?;
+                self.schedule.run_terrain(
                     &mut self.generator,
                     provider,
                     &mut self.evaluator,
@@ -442,16 +473,18 @@ impl FreshTerrainBatch {
                     false,
                     classify,
                     resolve,
-                )
-                .map(|()| {
-                    if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
-                        if terrain.world.dimension_type != config.dimension_type {
-                            Arc::make_mut(&mut terrain.world).dimension_type =
-                                config.dimension_type.clone();
-                        }
+                )?;
+                if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
+                    if terrain.world.dimension_type != config.dimension_type {
+                        Arc::make_mut(&mut terrain.world).dimension_type =
+                            config.dimension_type.clone();
                     }
-                }),
+                }
+                self.lit_cache = None;
+                Ok(())
+            })(),
             GenerationStage::Features => (|| {
+                self.check_write_area(pos, 1)?;
                 let config = self
                     .decoration
                     .as_ref()
@@ -476,7 +509,15 @@ impl FreshTerrainBatch {
                             .all(|chunk| !chunk.block_light_correct),
                     "feature batch light engine is not fresh"
                 );
-                if let Some(tracker) = &mut self.light_tracker {
+                if let Some(engine) = &self.light_engine {
+                    let registry = self
+                        .light_registry
+                        .as_ref()
+                        .context("light registry is missing")?;
+                    self.schedule.run_features_with_staged_light(
+                        terrain, &prepared, false, engine, registry,
+                    )?;
+                } else if let Some(tracker) = &mut self.light_tracker {
                     let registry = self
                         .light_registry
                         .as_ref()
@@ -501,6 +542,7 @@ impl FreshTerrainBatch {
                     self.schedule
                         .run_features_with_visible_light(terrain, &prepared, false, &light)?;
                 }
+                self.lit_cache = None;
                 Ok(())
             })(),
             GenerationStage::InitializeLight => (|| {

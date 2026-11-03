@@ -603,6 +603,33 @@ impl StagedGenerationLightEngine {
         }
     }
 
+    /// Block writes must not touch registered chunks or the input halo of any
+    /// activated chunk. Probe only nearby positions, even for a large batch.
+    pub(super) fn allows_writes(
+        &self,
+        center: native_world::loaded::ChunkPos,
+        radius: i64,
+    ) -> bool {
+        fn any_near(
+            center: native_world::loaded::ChunkPos,
+            radius: i64,
+            contains: impl Fn(&native_world::loaded::ChunkPos) -> bool,
+        ) -> bool {
+            (-radius..=radius).any(|dz| {
+                (-radius..=radius).any(|dx| {
+                    let x = i32::try_from(i64::from(center.x) + dx);
+                    let z = i32::try_from(i64::from(center.z) + dz);
+                    x.ok()
+                        .zip(z.ok())
+                        .is_some_and(|(x, z)| contains(&native_world::loaded::ChunkPos { x, z }))
+                })
+            })
+        }
+        !any_near(center, radius, |pos| {
+            self.fresh.registered.contains_key(pos)
+        }) && !any_near(center, radius + 1, |pos| self.active.contains(pos))
+    }
+
     /// Register another completed chunk. Unregistered terrain outside every
     /// active chunk's 3x3 neighborhood may have changed since activation;
     /// registered chunks and all active input neighborhoods must be unchanged.
@@ -2959,6 +2986,58 @@ mod tests {
             &cached,
             &batch.lit_snapshot([center]).unwrap()
         ));
+        let distant = ChunkPos { x: 6, z: 0 };
+        let nearby: Vec<_> = (-1..=1)
+            .flat_map(|dz| {
+                (-1..=1).map(move |dx| ChunkPos {
+                    x: distant.x + dx,
+                    z: distant.z + dz,
+                })
+            })
+            .collect();
+        for &pos in &nearby {
+            batch.request_features(pos).unwrap();
+        }
+        assert!(batch.request_light(distant).is_err());
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        for &pos in &nearby {
+            assert_eq!(
+                batch.schedule().completed(pos),
+                Some(schedule::GenerationStage::Features)
+            );
+            batch.request_light_initialization(pos).unwrap();
+            assert!(batch.request_features(ChunkPos { x: 12, z: 0 }).is_err());
+        }
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        batch.request_light(distant).unwrap();
+        assert!(batch.request_features(ChunkPos { x: 12, z: 0 }).is_err());
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        assert_eq!(
+            batch.schedule().completed(distant),
+            Some(schedule::GenerationStage::Light)
+        );
+        let extended = batch.light_snapshot([center]).unwrap();
+        for y in -16..32 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = [x, y, z];
+                    assert_eq!(extended.block_light(pos), after.block_light(pos));
+                    assert_eq!(extended.sky_light(pos), after.sky_light(pos));
+                }
+            }
+        }
         let (schedule, _, terrain, light) = batch.into_parts().unwrap();
         assert_eq!(
             schedule.completed(center),

@@ -3893,6 +3893,17 @@ fn multiface_support(state: &BlockState) -> Result<bool> {
     ) {
         return Ok(true);
     }
+    if matches!(
+        simple_plant_kind(state),
+        Ok(SimplePlantKind::Vegetation
+            | SimplePlantKind::DryVegetation
+            | SimplePlantKind::Double
+            | SimplePlantKind::Seagrass
+            | SimplePlantKind::TallSeagrass
+            | SimplePlantKind::SporeBlossom)
+    ) {
+        return Ok(false);
+    }
     bail!("unsupported multiface support shape for {}", state.name)
 }
 
@@ -9854,6 +9865,46 @@ mod tests {
                 "missing Java faces for {name}"
             );
         }
+        let plants = [
+            "short_grass",
+            "fern",
+            "bush",
+            "dandelion",
+            "poppy",
+            "blue_orchid",
+            "allium",
+            "azure_bluet",
+            "red_tulip",
+            "orange_tulip",
+            "white_tulip",
+            "pink_tulip",
+            "oxeye_daisy",
+            "cornflower",
+            "lily_of_the_valley",
+            "firefly_bush",
+            "closed_eyeblossom",
+            "sweet_berry_bush",
+            "short_dry_grass",
+            "tall_dry_grass",
+            "dead_bush",
+            "sunflower",
+            "tall_grass",
+            "large_fern",
+            "rose_bush",
+            "peony",
+            "lilac",
+            "seagrass",
+            "tall_seagrass",
+            "spore_blossom",
+        ];
+        assert_eq!(plants.len(), 30);
+        assert_eq!(
+            plants
+                .iter()
+                .map(|name| families.get(*name).copied().expect(name))
+                .sum::<usize>(),
+            40 * 6
+        );
         let vine = VinesFeature::decode(&json!({"type":"minecraft:vines"}), &mut |_| {
             let mut value = state("vine");
             value.properties = ["up", "north", "south", "west", "east"]

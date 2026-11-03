@@ -3094,6 +3094,27 @@ mod tests {
                     .generated_spawn_blocks_clear(IVec3::new(0, 16, 8), &targets)
                     .is_err()
             );
+            let origin = IVec3::new(8, 16, 8);
+            let candidates =
+                native_session::world_spawn::WorldSpawnCandidates::new(origin, 0, 100.0, 0)
+                    .unwrap();
+            let mut search =
+                native_session::world_spawn::ResumableWorldSpawn::new(origin, Some(candidates))
+                    .unwrap();
+            assert!(
+                session
+                    .poll_generated_world_spawn(&mut search, None, &targets, 1)
+                    .is_err()
+            );
+            session
+                .set_initial_entity_chunk(center, native_session::loaded::SavedEntityData::Empty)
+                .unwrap();
+            assert_eq!(
+                session
+                    .poll_generated_world_spawn(&mut search, None, &targets, 1)
+                    .unwrap(),
+                Some(origin)
+            );
             assert!(
                 session
                     .generated_spawn_column_candidate(16, 8, None, &targets)

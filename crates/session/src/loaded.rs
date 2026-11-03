@@ -6079,6 +6079,26 @@ impl LoadedSession {
         crate::world_spawn::find_shared_spawn(&mut view, origin, candidates)
     }
 
+    /// Resume a shared-spawn search using generated targets and explicitly
+    /// supplied entity data. Missing information leaves the search in place.
+    /// This does not perform the separate initial world-spawn selection.
+    /// Restart the search if previously inspected terrain, entities, targets,
+    /// or ceiling height change; a completed result is otherwise cached.
+    pub fn poll_generated_world_spawn(
+        &self,
+        search: &mut crate::world_spawn::ResumableWorldSpawn,
+        ceiling_spawn_height: Option<i32>,
+        generated_targets: &BTreeSet<ChunkPos>,
+        budget: usize,
+    ) -> anyhow::Result<Option<IVec3>> {
+        let mut view = LoadedColumnSpawnView {
+            session: self,
+            ceiling_spawn_height,
+            generated: Some(generated_targets),
+        };
+        search.poll(&mut view, budget)
+    }
+
     /// Java's shared-spawn block and liquid collision query for a standing
     /// player. Entity collisions must be checked separately.
     pub fn world_spawn_blocks_clear(&self, pos: IVec3) -> anyhow::Result<bool> {
@@ -6113,10 +6133,30 @@ impl LoadedSession {
     /// Java first checks block/liquid collisions, then entity collisions. A
     /// saved type whose collision depends on live state remains unresolved.
     pub fn world_spawn_clear(&self, pos: IVec3) -> anyhow::Result<bool> {
-        use anyhow::Context;
         if !self.world_spawn_blocks_clear(pos)? {
             return Ok(false);
         }
+        self.spawn_entities_clear(pos, None)
+    }
+
+    /// Entity data must have been provided separately for every queried chunk.
+    pub fn generated_spawn_clear(
+        &self,
+        pos: IVec3,
+        targets: &BTreeSet<ChunkPos>,
+    ) -> anyhow::Result<bool> {
+        if !self.generated_spawn_blocks_clear(pos, targets)? {
+            return Ok(false);
+        }
+        self.spawn_entities_clear(pos, Some(targets))
+    }
+
+    fn spawn_entities_clear(
+        &self,
+        pos: IVec3,
+        targets: Option<&BTreeSet<ChunkPos>>,
+    ) -> anyhow::Result<bool> {
+        use anyhow::Context;
         const MARGIN: f64 = 2.0 + 1.0e-7;
         let center = pos.as_dvec3() + DVec3::new(0.5, 0.0, 0.5);
         let half = f64::from(0.6_f32 / 2.0);
@@ -6135,6 +6175,12 @@ impl LoadedSession {
         for z in min_z..=max_z {
             for x in min_x..=max_x {
                 let chunk_pos = ChunkPos { x, z };
+                if let Some(targets) = targets {
+                    anyhow::ensure!(
+                        targets.contains(&chunk_pos),
+                        "generated spawn entity chunk is not a light-complete target"
+                    );
+                }
                 match self.entity_chunks.get(&chunk_pos) {
                     Some(SavedEntityData::Empty) => {}
                     Some(SavedEntityData::Present(chunk)) if chunk.entities().is_empty() => {}
@@ -19214,11 +19260,10 @@ impl crate::world_spawn::SharedSpawnWorld for LoadedColumnSpawnView<'_> {
         Ok(covers_full_face(shapes, IVec3::Y))
     }
     fn clear_player(&mut self, pos: IVec3) -> anyhow::Result<bool> {
-        anyhow::ensure!(
-            self.generated.is_none(),
-            "generated spawn entity collisions are unavailable"
-        );
-        self.session.world_spawn_clear(pos)
+        match self.generated {
+            Some(targets) => self.session.generated_spawn_clear(pos, targets),
+            None => self.session.world_spawn_clear(pos),
+        }
     }
 }
 
@@ -44201,6 +44246,114 @@ pub(crate) mod tests {
                 .generated_spawn_blocks_clear(open, &targets)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn generated_shared_spawn_waits_for_entities_and_matches_saved_search() {
+        use crate::world_spawn::{ResumableWorldSpawn, WorldSpawnCandidates};
+
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let origin = session.origin + IVec3::new(8, 1, 8);
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .block_light_correct = true;
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(home, None))
+            .unwrap();
+        let targets = BTreeSet::from([home]);
+        let candidates = WorldSpawnCandidates::new(origin, 0, 100.0, 0).unwrap();
+        let mut search = ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
+        assert!(
+            session
+                .poll_generated_world_spawn(&mut search, None, &targets, 1)
+                .is_err()
+        );
+        assert_eq!(search.requested_position(), origin);
+        assert_eq!(search.result(), None);
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Unavailable)
+            .unwrap();
+        assert!(
+            session
+                .poll_generated_world_spawn(&mut search, None, &targets, 1)
+                .is_err()
+        );
+        assert_eq!(search.requested_position(), origin);
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        assert_eq!(
+            session
+                .poll_generated_world_spawn(&mut search, None, &targets, 1)
+                .unwrap(),
+            Some(origin)
+        );
+        assert_eq!(
+            session
+                .find_loaded_world_spawn(origin, Some(candidates), None)
+                .unwrap(),
+            origin
+        );
+        assert!(
+            session
+                .generated_spawn_clear(origin, &BTreeSet::new())
+                .is_err()
+        );
+
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![(
+                        "id".into(),
+                        Tag::String("minecraft:pig".into()),
+                    )])],
+                },
+            )]),
+        };
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::new(document),
+                })),
+            )
+            .unwrap();
+        assert!(session.generated_spawn_clear(origin, &targets).is_err());
+        assert!(session.world_spawn_clear(origin).is_err());
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+
+        for budget in [1, 2, 8] {
+            let high = origin + IVec3::Y * 4;
+            let expected = session.find_loaded_world_spawn(high, None, None).unwrap();
+            let mut search = ResumableWorldSpawn::new(high, None).unwrap();
+            let actual = loop {
+                if let Some(found) = session
+                    .poll_generated_world_spawn(&mut search, None, &targets, budget)
+                    .unwrap()
+                {
+                    break found;
+                }
+            };
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

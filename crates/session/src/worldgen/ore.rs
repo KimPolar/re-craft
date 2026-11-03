@@ -236,7 +236,9 @@ impl ConfiguredDecoration {
             Self::Simple(v) => v.possible_states().iter().any(|s| {
                 matches!(
                     s.name.as_str(),
-                    "minecraft:tall_seagrass" | "minecraft:small_dripleaf"
+                    "minecraft:tall_seagrass"
+                        | "minecraft:small_dripleaf"
+                        | "minecraft:spore_blossom"
                 )
             }),
             Self::VegetationPatch(_, nested) => nested.needs_water_fluids(),
@@ -559,6 +561,9 @@ impl ConfiguredDecoration {
                         }
                         Ok(SimplePlantKind::Seagrass | SimplePlantKind::TallSeagrass) => {
                             Some("minecraft:cannot_support_seagrass")
+                        }
+                        Ok(SimplePlantKind::SporeBlossom) => {
+                            Some("minecraft:unstable_bottom_center")
                         }
                         _ => None,
                     };
@@ -4114,6 +4119,7 @@ enum SimplePlantKind {
     Seagrass,
     TallSeagrass,
     SmallDripleaf,
+    SporeBlossom,
 }
 
 // All states of these vanilla blocks have been checked for their Java
@@ -4151,6 +4157,10 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
         "minecraft:small_dripleaf" => {
             generated_dripleaf(state)?;
             SimplePlantKind::SmallDripleaf
+        }
+        "minecraft:spore_blossom" => {
+            ensure!(state.properties.is_empty(), "invalid spore blossom state");
+            SimplePlantKind::SporeBlossom
         }
         "minecraft:short_grass"
         | "minecraft:fern"
@@ -4244,6 +4254,27 @@ impl DecorationRegion<'_> {
             )?)
     }
 
+    fn spore_blossom_survival(&mut self, pos: [i32; 3]) -> Result<bool> {
+        static UNSTABLE: OnceLock<ResourceId> = OnceLock::new();
+        static WATER: OnceLock<ResourceId> = OnceLock::new();
+        let above = [pos[0], pos[1].wrapping_add(1), pos[2]];
+        let support = self.block(above)?;
+        let unstable =
+            UNSTABLE.get_or_init(|| ResourceId::parse("minecraft:unstable_bottom_center").unwrap());
+        if self.tags.contains(unstable, &support.name)? {
+            return Ok(false);
+        }
+        let center = vanilla_full_occlusion(&support.name).with_context(|| {
+            format!("unsupported spore blossom center support {}", support.name)
+        })?;
+        if !center {
+            return Ok(false);
+        }
+        let current = self.block(pos)?;
+        let water = WATER.get_or_init(|| ResourceId::parse("minecraft:water").unwrap());
+        Ok(!DiskWorld::fluid_in_tag(self, &current, water)?)
+    }
+
     fn mushroom_survival(&mut self, pos: [i32; 3]) -> Result<bool> {
         let below = OreWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
         static OVERRIDE: OnceLock<ResourceId> = OnceLock::new();
@@ -4322,6 +4353,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
             let survives = match kind {
                 SimplePlantKind::Unconditional => true,
                 SimplePlantKind::Mushroom => self.mushroom_survival(pos)?,
+                SimplePlantKind::SporeBlossom => self.spore_blossom_survival(pos)?,
                 SimplePlantKind::Carpet => !is_air(&self.block(below)?),
                 SimplePlantKind::LeafLitter => {
                     let state = self.block(below)?;
@@ -5104,6 +5136,7 @@ mod tests {
             "small_dripleaf",
             "brown_mushroom",
             "red_mushroom",
+            "spore_blossom",
             "moss_carpet",
             "white_carpet",
             "orange_carpet",
@@ -9871,6 +9904,151 @@ mod tests {
             predicate
                 .required_tags()
                 .contains(&ResourceId::parse("minecraft:supports_azalea").unwrap())
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn spore_blossom_feature_matches_java_placement() {
+        use std::{path::PathBuf, process::Command};
+        struct SporeData(bool);
+        impl ResourceProvider for SporeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/unstable_bottom_center.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"values":if self.0 { vec!["minecraft:stone"] } else { vec![] }}),
+                    )?));
+                }
+                Data.read_data(path)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SporeBlossomOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/SporeBlossomOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("SporeBlossomOracle"));
+        let mut registry = batch_registry();
+        registry.extend(
+            [
+                "minecraft:spore_blossom",
+                "minecraft:dirt",
+                "minecraft:water",
+                "minecraft:lava",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let required =
+            BTreeSet::from([ResourceId::parse("minecraft:unstable_bottom_center").unwrap()]);
+        let motion = HeightmapTags::load(&mut SporeData(false), &registry).unwrap();
+        let feature = SimpleBlockFeature::decode(
+            &json!({"type":"minecraft:simple_block", "to_place":{"id":"minecraft:spore_blossom"}}),
+            &mut resolve_tree_test,
+        )
+        .unwrap();
+        let mut cases = 0;
+        for mode in 0..4u8 {
+            let tags =
+                OreBlockTags::load(&mut SporeData(mode & 1 != 0), &registry, &required).unwrap();
+            let water: BTreeSet<String> = if mode & 2 != 0 {
+                ["minecraft:water".into(), "minecraft:flowing_water".into()]
+                    .into_iter()
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let (mut terrain, _, _, _) = fixture();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            region.lake_water_fluids = Some(&water);
+            assert!(!DiskWorld::is_solid(&mut region, &state("spore_blossom")).unwrap());
+            for line in output
+                .lines()
+                .filter(|line| line.starts_with(&format!("S {mode} ")))
+            {
+                let p: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(p.len(), 9, "{line}");
+                let support: usize = p[2].parse().unwrap();
+                let current: usize = p[3].parse().unwrap();
+                let mut above = state(["air", "stone", "dirt", "water"][support]);
+                let mut here = state(["air", "water", "lava"][current]);
+                for block in [&mut above, &mut here] {
+                    if matches!(block.name.as_str(), "minecraft:water" | "minecraft:lava") {
+                        block.properties.insert("level".into(), "0".into());
+                    }
+                }
+                region.set_section_block([8, 9, 8], &above).unwrap();
+                region.set_section_block([8, 8, 8], &here).unwrap();
+                assert_eq!(
+                    region.spore_blossom_survival([8, 8, 8]).unwrap(),
+                    p[4] == "true",
+                    "{line}"
+                );
+                let mut random = DecorationRandom::new(42);
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[5] == "true",
+                    "{line}"
+                );
+                assert_eq!(
+                    feature.place(&mut region, &mut random, [8, 8, 8]).unwrap(),
+                    p[6] == "true",
+                    "{line}"
+                );
+                assert_eq!(region.read([8, 8, 8]).unwrap().name, p[7], "{line}");
+                assert_eq!(random.next_long(), p[8].parse::<i64>().unwrap(), "{line}");
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 48);
+        let placed = PlacedDecorationFeature::from_placement(&mut SporeData(false), PlacedFeature::decode(&json!({"feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:spore_blossom"}}, "placement":[]})).unwrap(), &mut resolve_tree_test).unwrap();
+        assert!(placed.needs_water_fluids());
+        assert!(
+            placed
+                .required_tags()
+                .contains(&ResourceId::parse("minecraft:unstable_bottom_center").unwrap())
         );
     }
 

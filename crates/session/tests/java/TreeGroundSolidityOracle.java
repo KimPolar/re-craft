@@ -17,7 +17,7 @@ public class TreeGroundSolidityOracle {
     "sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","tall_grass",
     "large_fern","sunflower","rose_bush","peony","lilac","oak_sapling","spruce_sapling",
     "birch_sapling","jungle_sapling","acacia_sapling","dark_oak_sapling","cherry_sapling",
-    "pale_oak_sapling","seagrass","tall_seagrass","small_dripleaf","brown_mushroom","red_mushroom",
+    "pale_oak_sapling","seagrass","tall_seagrass","small_dripleaf","brown_mushroom","red_mushroom","spore_blossom",
     "moss_carpet","white_carpet","orange_carpet","magenta_carpet","light_blue_carpet","yellow_carpet",
     "lime_carpet","pink_carpet","gray_carpet","light_gray_carpet","cyan_carpet","purple_carpet",
     "blue_carpet","brown_carpet","green_carpet","red_carpet","black_carpet");

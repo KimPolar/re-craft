@@ -91,7 +91,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
-        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany);
+        boolean logActive=args.length>1 && args[1].equals("log_active_full");
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
@@ -138,7 +139,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         drain(engine); var stages=new JsonArray();
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(capture(engine));
-            var state=Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=logActive ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             int[][] positions=leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();

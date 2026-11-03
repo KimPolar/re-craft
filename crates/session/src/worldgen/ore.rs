@@ -83,7 +83,7 @@ struct DecorationLightGuard<'a> {
     require_unchanged_light: bool,
     changed_blocks: BTreeSet<String>,
     changed_chunks: BTreeSet<ChunkPos>,
-    leaf_updates: BTreeSet<[i32; 3]>,
+    tree_light_updates: BTreeSet<[i32; 3]>,
     non_air_counts: BTreeMap<(ChunkPos, i8), usize>,
 }
 
@@ -1063,7 +1063,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 require_unchanged_light,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
-                leaf_updates: BTreeSet::new(),
+                tree_light_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
         }
@@ -1103,28 +1103,28 @@ fn finish_decoration_with_light(
             .light_guard
             .as_ref()
             .context("staged light guard missing")?;
-        if !guard.leaf_updates.is_empty() {
+        if !guard.tree_light_updates.is_empty() {
             let baseline = frozen.as_ref().unwrap_or(&region.target.world);
             // Preserve the current registry lineage and replay only tracked
             // registered writes into the earlier light input snapshot.
             let mut world = region.world.clone();
             world.chunks = baseline.chunks.clone();
             let mut chunks = BTreeSet::new();
-            for &p in &guard.leaf_updates {
+            for &p in &guard.tree_light_updates {
                 let pos = chunk(p);
                 ensure!(
                     tracker.sky_sources.contains_key(&pos),
-                    "leaf update requires initialized sky sources"
+                    "tree update requires initialized sky sources"
                 );
                 let state = region
                     .world
                     .block(p[0], p[1], p[2])
-                    .context("updated leaf missing")?
+                    .context("updated tree block missing")?
                     .clone();
                 let id = world.intern_state(state);
                 world
                     .set_block_id(p[0], p[1], p[2], id)
-                    .map_err(|error| anyhow::anyhow!("cannot replay leaf update: {error:?}"))?;
+                    .map_err(|error| anyhow::anyhow!("cannot replay tree update: {error:?}"))?;
                 chunks.insert(pos);
             }
             let max_y = tracker
@@ -4961,15 +4961,18 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         .context("registered light old state is unknown")?;
                     let new_air = super::generated_state_is_air(guard.registry, state)
                         .context("registered light new state is unknown")?;
-                    let leaf_update = guard.require_unchanged_light
+                    let tree_light_update = guard.require_unchanged_light
                         && self.tree_block_write
                         && old_air
-                        && state.name == "minecraft:dark_oak_leaves"
-                        && state.properties.get("waterlogged").map(String::as_str) == Some("false")
-                        && tree_generated_leaf(state)?;
+                        && ((state.name == "minecraft:dark_oak_leaves"
+                            && state.properties.get("waterlogged").map(String::as_str)
+                                == Some("false")
+                            && tree_generated_leaf(state)?)
+                            || (state.name == "minecraft:dark_oak_log"
+                                && tree_generated_log(state)));
                     if guard.require_unchanged_light {
                         ensure!(
-                            leaf_update
+                            tree_light_update
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {} -> {}",
@@ -4981,7 +4984,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // no active sources, unchanged sky behavior and section
                     // allocation, the checked stored light remains zero.
                     ensure!(
-                        leaf_update
+                        tree_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
@@ -5023,8 +5026,12 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             .non_air_counts
                             .insert(key, updated);
                     }
-                    if leaf_update {
-                        self.light_guard.as_mut().unwrap().leaf_updates.insert(p);
+                    if tree_light_update {
+                        self.light_guard
+                            .as_mut()
+                            .unwrap()
+                            .tree_light_updates
+                            .insert(p);
                     }
                     self.light_guard
                         .as_mut()
@@ -5623,7 +5630,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
-    fn active_leaf_update_matches_reinitialized_light() {
+    fn active_tree_updates_match_java_light_queue() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -5664,7 +5671,12 @@ mod tests {
         let path = temp.path().join("leaf.json");
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
-        for mode in ["leaf_active", "leaf_active_full", "leaf_active_many"] {
+        for mode in [
+            "leaf_active",
+            "leaf_active_full",
+            "leaf_active_many",
+            "log_active_full",
+        ] {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
@@ -5716,7 +5728,7 @@ mod tests {
                         require_unchanged_light: true,
                         changed_blocks: BTreeSet::new(),
                         changed_chunks: BTreeSet::new(),
-                        leaf_updates: BTreeSet::new(),
+                        tree_light_updates: BTreeSet::new(),
                         non_air_counts: BTreeMap::new(),
                     });
                     if tree_write {
@@ -5726,7 +5738,7 @@ mod tests {
                                 .light_guard
                                 .as_ref()
                                 .unwrap()
-                                .leaf_updates
+                                .tree_light_updates
                                 .contains(&[16, 10, 8])
                         );
                     } else {
@@ -5743,12 +5755,20 @@ mod tests {
             let before = engine
                 .activate(&terrain, active, [center], &registry)
                 .unwrap();
-            let mut leaf = state("dark_oak_leaves");
-            leaf.properties = BTreeMap::from([
-                ("distance".into(), "7".into()),
-                ("persistent".into(), "false".into()),
-                ("waterlogged".into(), "false".into()),
-            ]);
+            let mut leaf = state(if mode == "log_active_full" {
+                "dark_oak_log"
+            } else {
+                "dark_oak_leaves"
+            });
+            leaf.properties = if mode == "log_active_full" {
+                BTreeMap::from([("axis".into(), "y".into())])
+            } else {
+                BTreeMap::from([
+                    ("distance".into(), "7".into()),
+                    ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ])
+            };
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))
                 .unwrap();
@@ -5758,7 +5778,7 @@ mod tests {
                 require_unchanged_light: true,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
-                leaf_updates: BTreeSet::new(),
+                tree_light_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
             draft.set_tree_block([16, 10, 8], &leaf, 19).unwrap();
@@ -7325,7 +7345,7 @@ mod tests {
                     require_unchanged_light: false,
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
-                    leaf_updates: BTreeSet::new(),
+                    tree_light_updates: BTreeSet::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -7355,7 +7375,7 @@ mod tests {
                     require_unchanged_light: false,
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
-                    leaf_updates: BTreeSet::new(),
+                    tree_light_updates: BTreeSet::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -7670,7 +7690,7 @@ mod tests {
                 require_unchanged_light: false,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
-                leaf_updates: BTreeSet::new(),
+                tree_light_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
             if initial == 0 {
@@ -7694,7 +7714,7 @@ mod tests {
                 require_unchanged_light: false,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
-                leaf_updates: BTreeSet::new(),
+                tree_light_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
             let initial = region.read([16, 0, 0]).unwrap();

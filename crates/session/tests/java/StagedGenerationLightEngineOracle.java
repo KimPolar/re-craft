@@ -123,9 +123,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
         boolean blockCase=args.length>1 && args[1].startsWith("block_incremental_");
         w.blockCase=blockCase;
-        boolean skyMany=args.length>1 && args[1].equals("sky_inactive_many");
-        boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany);
-        boolean skyDark=args.length>1 && args[1].equals("sky_inactive_dark");
+        boolean skyMany=args.length>1 && (args[1].equals("sky_inactive_many") || args[1].equals("sky_inactive_activate_many"));
+        boolean skyActivate=args.length>1 && args[1].startsWith("sky_inactive_activate");
+        boolean skyDark=args.length>1 && (args[1].equals("sky_inactive_dark") || args[1].equals("sky_inactive_activate_dark"));
+        boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineActiveEmpty=vineActive && args[1].contains("_empty_");
         boolean vineActiveMany=vineActive && args[1].equals("vine_active_many");
@@ -152,7 +153,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
         boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
-        w.wide=full || blockCase;
+        w.wide=full || blockCase || skyActivate;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing"));
         w.magmaOnly=magma;
@@ -236,6 +237,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(skyMany)engine.checkBlock(new BlockPos(16,10,8));
             if(skyWide && args.length>2) Files.writeString(Path.of(args[2]),pendingSkyChecks(engine).toString());
             stages.add(skyWide ? captureWide(engine) : capture(engine)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
+            if(skyActivate){ engine.propagateLightSources(new ChunkPos(1,0)); stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine)); }
             if(registerAfter){
                 w.chunks.get(new ChunkPos(-1,0)).sources.fillFrom(westSection);
                 engine.updateSectionStatus(SectionPos.of(-1,0,0),westSection.section.hasOnlyAir());

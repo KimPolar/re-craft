@@ -5987,6 +5987,9 @@ mod tests {
             "sky_inactive_shadow",
             "sky_inactive_dark",
             "sky_inactive_many",
+            "sky_inactive_activate",
+            "sky_inactive_activate_dark",
+            "sky_inactive_activate_many",
         ] {
             let path = temp.path().join("sky.json");
             let order_path = temp.path().join("sky-order.json");
@@ -6009,12 +6012,12 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let positions: Vec<[i32; 3]> =
                 serde_json::from_slice(&std::fs::read(order_path).unwrap()).unwrap();
-            let expected_positions = if mode == "sky_inactive_many" {
+            let expected_positions = if mode.ends_with("_many") {
                 BTreeSet::from([[16, 10, 8], [16, 10, 9], [17, 10, 8]])
             } else {
                 BTreeSet::from([[16, 10, 8]])
             };
-            let inserted = if mode == "sky_inactive_many" {
+            let inserted = if mode.ends_with("_many") {
                 vec![[16, 10, 8], [16, 10, 9], [17, 10, 8], [16, 10, 8]]
             } else {
                 vec![[16, 10, 8]]
@@ -6036,6 +6039,19 @@ mod tests {
             let east = ChunkPos { x: 1, z: 0 };
             let center = ChunkPos { x: 0, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
+            if mode.starts_with("sky_inactive_activate") {
+                let template = Arc::clone(world.chunks.get(&center).unwrap());
+                for z in -2..=2 {
+                    for x in -2..=2 {
+                        let pos = ChunkPos { x, z };
+                        world.chunks.entry(pos).or_insert_with(|| {
+                            let mut chunk = (*template).clone();
+                            chunk.position = pos;
+                            Arc::new(chunk)
+                        });
+                    }
+                }
+            }
             let air = world.intern_state(state("air"));
             let section = Arc::make_mut(
                 Arc::make_mut(world.chunks.get_mut(&east).unwrap())
@@ -6045,9 +6061,9 @@ mod tests {
             );
             section.blocks.as_mut().unwrap().fill(air);
             let stone = world.intern_state(state("stone"));
-            if mode != "sky_inactive_dark" {
+            if !mode.ends_with("_dark") {
                 world.set_block_id(16, 11, 8, stone).unwrap();
-                if mode == "sky_inactive_many" {
+                if mode.ends_with("_many") {
                     world.set_block_id(16, 11, 9, stone).unwrap();
                     world.set_block_id(17, 11, 8, stone).unwrap();
                 }
@@ -6082,7 +6098,7 @@ mod tests {
             }
             assert_eq!(
                 before.sky_light([16, 10, 8]).unwrap() > 0,
-                mode != "sky_inactive_dark",
+                !mode.ends_with("_dark"),
                 "{mode}"
             );
             let bounds = native_world::block_light::LightBounds::new(0, 16).unwrap();
@@ -6114,6 +6130,39 @@ mod tests {
                 &inserted,
             )
             .expect("complete light inputs");
+            let activated = if mode.starts_with("sky_inactive_activate") {
+                let mut sources = BTreeMap::new();
+                for (x, z) in [(1, 0), (0, 0), (2, 0), (1, -1), (1, 1)] {
+                    let pos = ChunkPos { x, z };
+                    sources.insert(
+                        pos,
+                        Arc::from(
+                            native_world::sky_light::generated_chunk_sky_sources(
+                                world, bounds, pos,
+                            )
+                            .unwrap(),
+                        ),
+                    );
+                }
+                assert!(
+                    native_world::generation_sky_light::activate_generated_sky_light(
+                        world,
+                        bounds,
+                        &after,
+                        east,
+                        &BTreeMap::new()
+                    )
+                    .is_none()
+                );
+                Some(
+                    native_world::generation_sky_light::activate_generated_sky_light(
+                        world, bounds, &after, east, &sources,
+                    )
+                    .expect("complete sky activation inputs"),
+                )
+            } else {
+                None
+            };
             for z in -2..=2 {
                 for x in -2..=2 {
                     let index = ((z + 2) * 5 + x + 2) as usize;
@@ -6136,6 +6185,18 @@ mod tests {
                                     Some(expected[2][index][1][i]),
                                     "after {mode} {p:?}"
                                 );
+                                if let Some(activated) = &activated {
+                                    assert_eq!(
+                                        after.sky_light(p),
+                                        Some(expected[3][index][1][i]),
+                                        "pending activation {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        activated.sky_light(p),
+                                        Some(expected[4][index][1][i]),
+                                        "activation {mode} {p:?}"
+                                    );
+                                }
                             }
                         }
                     }

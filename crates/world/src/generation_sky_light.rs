@@ -1,6 +1,6 @@
 //! Initial sky-light values for generated blocks and a complete one-chunk halo.
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -95,11 +95,43 @@ pub fn check_inactive_sky_blocks(
     active: &BTreeSet<ChunkPos>,
     positions: &[[i32; 3]],
 ) -> Option<VisibleLightSnapshot> {
+    apply_sky_updates(world, bounds, before, active, positions, None)
+}
+
+/// Enable direct sky sources over an existing, fully allocated light revision.
+/// Source heights for the target and its four neighbors must reflect their
+/// current initialization state. Sparse vertical storage is not supported.
+pub fn activate_generated_sky_light(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    pos: ChunkPos,
+    sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+) -> Option<VisibleLightSnapshot> {
+    apply_sky_updates(
+        world,
+        bounds,
+        before,
+        &BTreeSet::new(),
+        &[],
+        Some((pos, sources)),
+    )
+}
+
+fn apply_sky_updates(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    positions: &[[i32; 3]],
+    activation: Option<(ChunkPos, &BTreeMap<ChunkPos, Arc<[i32; 256]>>)>,
+) -> Option<VisibleLightSnapshot> {
     #[derive(Clone, Copy)]
     struct Entry {
         pos: [i32; 3],
         level: u8,
         directions: u8,
+        source: bool,
     }
     const ALL: u8 = 0b11_1111;
     // Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
@@ -129,7 +161,63 @@ pub fn check_inactive_sky_blocks(
             pos: position,
             level: old.max(1),
             directions: ALL,
+            source: false,
         });
+    }
+    if let Some((chunk, sources)) = activation {
+        let base_x = chunk.x.checked_mul(16)?;
+        let base_z = chunk.z.checked_mul(16)?;
+        let height = |x: i32, z: i32| -> Option<i32> {
+            let pos = ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            };
+            let index = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize;
+            Some(*sources.get(&pos)?.get(index)?)
+        };
+        let light = bounds.light_range();
+        for sy in (light.start.div_euclid(16)..light.end.div_euclid(16)).rev() {
+            if !draft.sky_section_allocated(chunk, sy)? {
+                return None;
+            }
+            for z in 0..16 {
+                for x in 0..16 {
+                    let wx = base_x.checked_add(x)?;
+                    let wz = base_z.checked_add(z)?;
+                    let own = height(wx, wz)?;
+                    let neighbors = [
+                        height(wx.checked_add(1)?, wz)?,
+                        height(wx.checked_sub(1)?, wz)?,
+                        height(wx, wz.checked_add(1)?)?,
+                        height(wx, wz.checked_sub(1)?)?,
+                    ];
+                    for y in (sy * 16..sy * 16 + 16).rev() {
+                        if y < own {
+                            break;
+                        }
+                        let p = [wx, y, wz];
+                        draft.set_stored_sky(p, 15)?;
+                        let mut directions = 0;
+                        if y == own {
+                            directions |= 1 << 3;
+                        }
+                        for (i, neighbor) in neighbors.into_iter().enumerate() {
+                            if y < neighbor {
+                                directions |= 1 << [0, 1, 4, 5][i];
+                            }
+                        }
+                        if directions != 0 {
+                            increases.push_back(Entry {
+                                pos: p,
+                                level: 15,
+                                directions,
+                                source: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
     let mut properties = HashMap::<u32, LightProperties>::new();
     let get_properties = |p: [i32; 3], cache: &mut HashMap<u32, LightProperties>| {
@@ -188,12 +276,14 @@ pub fn check_inactive_sky_blocks(
                     pos: next,
                     level,
                     directions: ALL & !(1 << opposite),
+                    source: false,
                 });
             } else {
                 increases.push_back(Entry {
                     pos: next,
                     level,
                     directions: 1 << opposite,
+                    source: false,
                 });
             }
         }
@@ -203,7 +293,11 @@ pub fn check_inactive_sky_blocks(
             continue;
         }
         check_gap(&draft, entry.pos)?;
-        let from = get_properties(entry.pos, &mut properties)?;
+        let from = if entry.source {
+            transparent_light_properties()
+        } else {
+            get_properties(entry.pos, &mut properties)?
+        };
         for direction in ORDER {
             if entry.directions & (1 << direction) == 0 {
                 continue;
@@ -232,6 +326,7 @@ pub fn check_inactive_sky_blocks(
                     pos: next,
                     level,
                     directions: ALL & !(1 << (direction ^ 1)),
+                    source: false,
                 });
             }
         }

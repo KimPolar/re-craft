@@ -4768,11 +4768,14 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                         | "minecraft:tall_grass"
                         | "minecraft:large_fern" => true,
                         _ if disk_safe_solid(&upper.name).is_some()
+                            || tree_cave_vines(&upper)?
                             || simple_plant_kind(&upper).is_ok() =>
                         {
                             false
                         }
-                        _ => bail!("unsupported double-plant replacement state"),
+                        _ => bail!(
+                            "unsupported double-plant replacement state {upper:?} at {above:?}"
+                        ),
                     }
                 };
                 if !free {
@@ -11973,6 +11976,8 @@ mod tests {
                 4 | 5 => "small_dripleaf",
                 6 => "seagrass",
                 7 => "stone",
+                8 | 9 => "cave_vines",
+                10 | 11 => "cave_vines_plant",
                 _ => unreachable!(),
             });
             match i {
@@ -11989,6 +11994,14 @@ mod tests {
                     block
                         .properties
                         .insert("waterlogged".into(), (i == 5).to_string());
+                }
+                8..=11 => {
+                    if i < 10 {
+                        block.properties.insert("age".into(), "0".into());
+                    }
+                    block
+                        .properties
+                        .insert("berries".into(), (i % 2 == 1).to_string());
                 }
                 _ => {}
             }
@@ -12132,7 +12145,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 32 * 2 * 2 * 4 * 8 * 8);
+        assert_eq!(checked, 32 * 2 * 2 * 4 * 8 * 12);
         let predicate = BlockPredicate::decode(
             &json!({"type":"minecraft:would_survive","state":{"id":"minecraft:small_dripleaf"}}),
         )

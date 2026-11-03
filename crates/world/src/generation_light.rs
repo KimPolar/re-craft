@@ -188,6 +188,70 @@ impl VisibleLightSnapshot {
         self.columns.get(&pos).cloned()
     }
 
+    /// Apply empty-to-nonempty section events to updating storage. The caller
+    /// supplies the actual event order and only previously empty sections;
+    /// no removals, queued saved layers or concurrent updates may be pending.
+    /// Every affected 3x3 column must be covered. The visible input revision
+    /// is unchanged when an input or packed coordinate is unavailable.
+    pub fn allocate_nonempty_sections(
+        &self,
+        sections: &[(ChunkPos, i32)],
+        active: &std::collections::BTreeSet<ChunkPos>,
+    ) -> Option<Self> {
+        let mut draft = self.clone();
+        let zero = Arc::new([0; LIGHT_BYTES]);
+        let full = Arc::new([0xff; LIGHT_BYTES]);
+        for &(center, sy) in sections {
+            if !(-2_097_151..=2_097_150).contains(&center.x)
+                || !(-2_097_151..=2_097_150).contains(&center.z)
+                || !(-524_287..=524_286).contains(&sy)
+            {
+                return None;
+            }
+            let mut allocate = |pos: ChunkPos, y: i32| -> Option<()> {
+                let column = draft.columns.get_mut(&pos)?;
+                if draft.has_block {
+                    column.block.entry(y).or_insert_with(|| Arc::clone(&zero));
+                }
+                if draft.has_sky && !column.sky.contains_key(&y) {
+                    let layer = if let Some((_, above)) = column.sky.range((y + 1)..).next() {
+                        let mut layer = [0u8; LIGHT_BYTES];
+                        for slice in layer.chunks_exact_mut(LIGHT_BYTES / 16) {
+                            slice.copy_from_slice(&above[..LIGHT_BYTES / 16]);
+                        }
+                        Arc::new(layer)
+                    } else if active.contains(&pos) {
+                        Arc::clone(&full)
+                    } else {
+                        Arc::clone(&zero)
+                    };
+                    column.sky.insert(y, layer);
+                }
+                Some(())
+            };
+            // Java inserts the data section first, then visits x, y, z
+            // offsets in ascending order, skipping the center.
+            allocate(center, sy)?;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue;
+                        }
+                        allocate(
+                            ChunkPos {
+                                x: center.x + dx,
+                                z: center.z + dz,
+                            },
+                            sy + dy,
+                        )?;
+                    }
+                }
+            }
+        }
+        Some(draft)
+    }
+
     /// Whether this visible engine revision has storage for a block-light
     /// section. An uncovered column remains unknown rather than absent.
     pub fn block_section_allocated(&self, pos: ChunkPos, section_y: i32) -> Option<bool> {
@@ -447,6 +511,181 @@ mod tests {
     use super::*;
     fn layer(n: u8) -> Arc<[u8; LIGHT_BYTES]> {
         Arc::new([n | (n << 4); LIGHT_BYTES])
+    }
+    #[test]
+    fn adding_sections_inherits_sky_and_preserves_visible_revision() {
+        let center = ChunkPos { x: 0, z: 0 };
+        let active_neighbor = ChunkPos { x: 1, z: 0 };
+        let mut before = VisibleLightSnapshot::new(true, true);
+        for z in -1..=1 {
+            for x in -1..=1 {
+                before.insert_complete_column(ChunkPos { x, z }, VisibleLightColumn::default());
+            }
+        }
+        let mut upper = [0u8; LIGHT_BYTES];
+        for (i, byte) in upper[..LIGHT_BYTES / 16].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        before
+            .columns
+            .get_mut(&center)
+            .unwrap()
+            .sky
+            .insert(2, Arc::new(upper));
+        let after = before
+            .allocate_nonempty_sections(
+                &[(center, 0)],
+                &std::collections::BTreeSet::from([active_neighbor]),
+            )
+            .unwrap();
+        assert_eq!(before.block_section_allocated(center, 0), Some(false));
+        assert_eq!(after.block_section_allocated(center, 0), Some(true));
+        for y in -16..32 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(after.sky_light([x, y, z]), before.sky_light([x, 0, z]));
+                }
+            }
+        }
+        assert_eq!(after.sky_light([16, 0, 0]), Some(15));
+        assert_eq!(after.sky_light([-1, 0, 0]), Some(0));
+        let incomplete = VisibleLightSnapshot::new(true, true);
+        assert!(
+            incomplete
+                .allocate_nonempty_sections(&[(center, 0)], &Default::default())
+                .is_none()
+        );
+        assert_eq!(before.block_section_allocated(center, 0), Some(false));
+    }
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn section_allocation_inherits_java_nonuniform_sky() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft")
+            });
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SectionAllocationOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/SectionAllocationOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        for mode in ["inactive", "active"] {
+            let path = temp.path().join("sections.json");
+            let run = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("SectionAllocationOracle")
+                .arg(&path)
+                .arg(mode)
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let expected: Vec<Vec<Vec<Vec<u8>>>> =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let center = ChunkPos { x: 0, z: 0 };
+            let covered: Vec<_> = (-1..=1)
+                .flat_map(|z| (-1..=2).map(move |x| ChunkPos { x, z }))
+                .collect();
+            let mut before = VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [(center, 3)],
+                covered.iter().copied(),
+            )
+            .unwrap();
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        before
+                            .set_stored_sky([x, y + 32, z], ((x * 3 + z * 5 + y * 7) & 15) as u8)
+                            .unwrap();
+                    }
+                }
+            }
+            let active = if mode == "active" {
+                std::collections::BTreeSet::from([ChunkPos { x: 2, z: 0 }])
+            } else {
+                Default::default()
+            };
+            let after = before
+                .allocate_nonempty_sections(&[(ChunkPos { x: 1, z: 0 }, 0)], &active)
+                .unwrap();
+            assert_eq!(
+                after.sky_light([32, 0, 0]),
+                Some(if mode == "active" { 15 } else { 0 })
+            );
+            for (index, pos) in covered.iter().enumerate() {
+                for y in -16..80 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [pos.x * 16 + x, y, pos.z * 16 + z];
+                            let i = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                before.block_light(p),
+                                Some(expected[0][index][0][i]),
+                                "{mode} before block {p:?}"
+                            );
+                            assert_eq!(
+                                before.sky_light(p),
+                                Some(expected[0][index][1][i]),
+                                "{mode} before sky {p:?}"
+                            );
+                            assert_eq!(
+                                before.sky_light(p),
+                                Some(expected[1][index][1][i]),
+                                "{mode} pending sky {p:?}"
+                            );
+                            assert_eq!(
+                                after.block_light(p),
+                                Some(expected[2][index][0][i]),
+                                "{mode} after block {p:?}"
+                            );
+                            assert_eq!(
+                                after.sky_light(p),
+                                Some(expected[2][index][1][i]),
+                                "{mode} after sky {p:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn pending_checks_deduplicate_and_validate_packed_coordinates() {

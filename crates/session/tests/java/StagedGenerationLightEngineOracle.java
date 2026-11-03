@@ -122,9 +122,11 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyMany=args.length>1 && args[1].equals("sky_inactive_many");
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany);
         boolean skyDark=args.length>1 && args[1].equals("sky_inactive_dark");
-        boolean skyWide=skyShadow || skyDark || (args.length>1 && args[1].equals("log_active_sparse_wide"));
-        boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyWide);
-        boolean treeEmptyFull=args.length>1 && args[1].equals("tree_empty_full");
+        boolean emptyFullWide=args.length>1 && args[1].equals("tree_empty_full_wide");
+        boolean emptyPartialWide=args.length>1 && args[1].equals("tree_empty_partial_wide");
+        boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && args[1].equals("log_active_sparse_wide"));
+        boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
+        boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
         w.emptyEast=treeEmpty || treeSparse;
         w.sparseEast=treeSparse;
@@ -144,7 +146,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean plain=args.length>1 && args[1].startsWith("vine_plain");
         boolean existing=args.length>1 && args[1].startsWith("vine_existing");
         w.magmaOnly=magma;
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine || (leafActive && !leafFull));
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine || emptyPartialWide || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         boolean late=args.length>1 && args[1].startsWith("late");
         boolean lateMulti=args.length>1 && args[1].equals("late_multi");
@@ -175,7 +177,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
             if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
-            if((!partial && !w.mixed) || (x==1 && z==0 && !late) || (w.mixed && x==0 && z==0)){
+            if((!partial && !w.mixed) || (x==1 && z==0 && !late) || ((w.mixed || emptyPartialWide) && x==0 && z==0)){
                 chunk.sources.fillFrom(fake);
                 engine.updateSectionStatus(SectionPos.of(x,0,z),fake.section.hasOnlyAir());
             }

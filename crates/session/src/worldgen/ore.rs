@@ -1141,6 +1141,37 @@ fn finish_decoration_with_light(
                     pos,
                 )
                 .context("updated sky sources unavailable")?;
+                // Replaying a new obstruction as if it existed before a
+                // neighboring activation can create sky light that Java's
+                // incremental queue never emitted. Preserve the old revision
+                // until that history can be replayed faithfully.
+                if tracker.has_skylight
+                    && !active.contains(&pos)
+                    && (-1i32..=1).any(|dz| {
+                        (-1i32..=1).any(|dx| {
+                            pos.x
+                                .checked_add(dx)
+                                .zip(pos.z.checked_add(dz))
+                                .is_some_and(|(x, z)| active.contains(&ChunkPos { x, z }))
+                        })
+                    })
+                {
+                    let previous = tracker
+                        .sky_sources
+                        .get(&pos)
+                        .context("tree update requires previous sky sources")?;
+                    for p in guard
+                        .tree_light_updates
+                        .iter()
+                        .filter(|p| chunk(**p) == pos)
+                    {
+                        let index = (p[0].rem_euclid(16) + p[2].rem_euclid(16) * 16) as usize;
+                        ensure!(
+                            heights[index] <= previous[index],
+                            "inactive tree update raises a sky source near active light"
+                        );
+                    }
+                }
                 sources.insert(pos, Arc::from(heights));
             }
             staged_replay = Some((Arc::new(world), sources));
@@ -5760,7 +5791,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
-    fn active_tree_updates_match_java_light_queue() {
+    fn tracked_tree_light_updates_match_java_or_roll_back() {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -5802,10 +5833,12 @@ mod tests {
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
         for mode in [
+            "log_active_sparse_column",
             "leaf_active",
             "leaf_active_full",
             "leaf_active_many",
             "log_active_full",
+            "log_active_sparse",
         ] {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
@@ -5829,8 +5862,26 @@ mod tests {
             let center = ChunkPos { x: 0, z: 0 };
             let east = ChunkPos { x: 1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
-            let torch = world.intern_state(state("torch"));
-            world.set_block_id(17, 10, 8, torch).unwrap();
+            if mode.starts_with("log_active_sparse") {
+                let air = world.intern_state(state("air"));
+                let section = Arc::make_mut(
+                    Arc::make_mut(world.chunks.get_mut(&east).unwrap())
+                        .sections
+                        .get_mut(&0)
+                        .unwrap(),
+                );
+                section.blocks.as_mut().unwrap().fill(air);
+                let stone = world.intern_state(state("stone"));
+                let (x, z) = if mode == "log_active_sparse_column" {
+                    (16, 8)
+                } else {
+                    (31, 0)
+                };
+                world.set_block_id(x, 0, z, stone).unwrap();
+            } else {
+                let torch = world.intern_state(state("torch"));
+                world.set_block_id(17, 10, 8, torch).unwrap();
+            }
             let registered: Vec<_> = if mode != "leaf_active" {
                 (-1..=1)
                     .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
@@ -5885,12 +5936,13 @@ mod tests {
             let before = engine
                 .activate(&terrain, active, [center], &registry)
                 .unwrap();
-            let mut leaf = state(if mode == "log_active_full" {
+            let is_log = mode.starts_with("log_active_");
+            let mut leaf = state(if is_log {
                 "dark_oak_log"
             } else {
                 "dark_oak_leaves"
             });
-            leaf.properties = if mode == "log_active_full" {
+            leaf.properties = if is_log {
                 BTreeMap::from([("axis".into(), "y".into())])
             } else {
                 BTreeMap::from([
@@ -5899,6 +5951,7 @@ mod tests {
                     ("waterlogged".into(), "false".into()),
                 ])
             };
+            let previous_world = Arc::clone(&terrain.world);
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))
                 .unwrap();
@@ -5923,10 +5976,22 @@ mod tests {
                 &mut engine.frozen_world,
                 &engine.active,
             ));
-            finish_decoration_with_light(draft, &mut tracking).unwrap();
+            let result = finish_decoration_with_light(draft, &mut tracking);
             drop(tracking);
+            let rejected = mode != "leaf_active";
+            if rejected {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("inactive tree update raises a sky source"),
+                    "{error}"
+                );
+                assert!(Arc::ptr_eq(&previous_world, &terrain.world));
+            } else {
+                result.unwrap();
+            }
             let after = engine.snapshot(&terrain, [center], &registry).unwrap();
             for (stage, actual) in [&before, &before, &after].into_iter().enumerate() {
+                let expected_stage = if rejected && stage == 2 { 0 } else { stage };
                 for y in -16..32 {
                     for z in 0..16 {
                         for x in 0..16 {
@@ -5934,12 +5999,12 @@ mod tests {
                             let index = ((y + 16) * 256 + z * 16 + x) as usize;
                             assert_eq!(
                                 actual.block_light(p),
-                                Some(expected[stage][0][index]),
+                                Some(expected[expected_stage][0][index]),
                                 "{mode} block {stage} {p:?}"
                             );
                             assert_eq!(
                                 actual.sky_light(p),
-                                Some(expected[stage][1][index]),
+                                Some(expected[expected_stage][1][index]),
                                 "{mode} sky {stage} {p:?}"
                             );
                         }

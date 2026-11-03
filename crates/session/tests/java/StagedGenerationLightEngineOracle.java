@@ -21,6 +21,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean wide;
     boolean lateFar;
     boolean emptyEast;
+    boolean sparseEast;
+    boolean sparseColumn;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -28,6 +30,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     public BlockEntity getBlockEntity(BlockPos p){ return null; }
     public BlockState getBlockState(BlockPos p){
         if(edits.containsKey(p)) return edits.get(p);
+        if(sparseEast && p.getY()==0 && ((sparseColumn && p.getX()==16 && p.getZ()==8) || (!sparseColumn && p.getX()==31 && p.getZ()==0))) return Blocks.STONE.defaultBlockState();
         if(emptyEast && Math.floorDiv(p.getX(),16)==1 && Math.floorDiv(p.getZ(),16)==0) return Blocks.AIR.defaultBlockState();
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(lateFar && p.getX()==31 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
@@ -93,11 +96,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
+        boolean treeSparse=args.length>1 && args[1].startsWith("log_active_sparse");
         boolean treeEmptyFull=args.length>1 && args[1].equals("tree_empty_full");
         boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
-        w.emptyEast=treeEmpty;
+        w.emptyEast=treeEmpty || treeSparse;
+        w.sparseEast=treeSparse;
+        w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
         boolean logActive=args.length>1 && args[1].equals("log_active_full");
-        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull);
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
@@ -125,8 +131,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0) eastSection=fake;
             if(x==-1 && z==0) westSection=fake;
             if(x==2 && z==0) farSection=fake;
-            if(!(treeEmpty && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
-            if(x==1 && z==0 && !magma && !treeEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(!((treeEmpty || treeSparse) && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
+            if(treeSparse && x==1 && z==0) fake.section.setBlockState(w.sparseColumn?0:15,0,w.sparseColumn?8:0,Blocks.STONE.defaultBlockState());
+            if(x==1 && z==0 && !magma && !treeEmpty && !treeSparse) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
                 var initial=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,false);
@@ -144,7 +151,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         drain(engine); var stages=new JsonArray();
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(capture(engine));
-            var state=(logActive || treeEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=(logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             int[][] positions=leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();

@@ -59,6 +59,86 @@ fn run(command: &mut Command) {
 
 #[test]
 #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn initial_spawn_chunk_columns_match_java() {
+    use native_session::world_spawn::{InitialWorldSpawn, SharedSpawnWorld, SpawnColumnHeights};
+    struct WorldFixture {
+        target: i32,
+        trace: Vec<[i32; 2]>,
+    }
+    impl SharedSpawnWorld for WorldFixture {
+        fn min_y(&self) -> i32 {
+            -4
+        }
+        fn max_y(&self) -> i32 {
+            16
+        }
+        fn ceiling_spawn_height(&self) -> Option<i32> {
+            None
+        }
+        fn heights(&mut self, x: i32, z: i32) -> anyhow::Result<SpawnColumnHeights> {
+            let (x, z) = (x.rem_euclid(16), z.rem_euclid(16));
+            self.trace.push([x, z]);
+            let y = if x * 16 + z == self.target { 0 } else { -5 };
+            Ok(SpawnColumnHeights {
+                motion_blocking: y,
+                world_surface: y,
+                ocean_floor: y,
+            })
+        }
+        fn has_fluid(&mut self, _: IVec3) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn full_top_face(&mut self, pos: IVec3) -> anyhow::Result<bool> {
+            Ok(pos.y == 0)
+        }
+        fn clear_player(&mut self, _: IVec3) -> anyhow::Result<bool> {
+            panic!("unexpected collision query")
+        }
+    }
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("InitialSpawnChunkOracle.java");
+    let output = temp.path().join("initial-spawn.json");
+    std::fs::write(&source, include_str!("java/InitialSpawnChunkOracle.java")).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java_bin().join("javac"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java_bin().join("java"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg("InitialSpawnChunkOracle")
+        .arg(&output));
+    let cases: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    for case in cases.as_array().unwrap() {
+        let cx = case["cx"].as_i64().unwrap() as i32;
+        let cz = case["cz"].as_i64().unwrap() as i32;
+        let target = case["target"].as_i64().unwrap() as i32;
+        let mut world = WorldFixture {
+            target,
+            trace: Vec::new(),
+        };
+        let mut search = InitialWorldSpawn::new(cx, cz, 80).unwrap();
+        let result = search.poll(&mut world, 256).unwrap();
+        assert_eq!(
+            json!(world.trace),
+            case["trace"],
+            "chunk {cx}, {cz}, target {target}"
+        );
+        assert_eq!(
+            result
+                .map(|p| json!([p.x, p.y, p.z]))
+                .unwrap_or(Value::Null),
+            case["pos"]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
 fn saved_spawn_selection_matches_java() {
     use native_persistence::world::{DimensionId, PlayerRespawnConfig, RespawnData};
     use native_resources::{

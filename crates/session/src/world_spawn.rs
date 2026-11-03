@@ -173,6 +173,98 @@ pub fn column_spawn<W: SharedSpawnWorld>(world: &mut W, x: i32, z: i32) -> Resul
     Ok(None)
 }
 
+/// Incremental form of MinecraftServer's initial global-spawn search. The
+/// caller supplies the generator's origin chunk and fallback spawn height
+/// (including the WORLD_SURFACE fallback when the generator height is below
+/// the dimension minimum). This chooses the world's spawn suggestion, not a
+/// collision-checked player position.
+pub struct InitialWorldSpawn {
+    origin: (i32, i32),
+    fallback: IVec3,
+    dx: i32,
+    dz: i32,
+    step_x: i32,
+    step_z: i32,
+    chunks_visited: u16,
+    column: u16,
+    result: Option<IVec3>,
+}
+
+impl InitialWorldSpawn {
+    pub fn new(origin_chunk_x: i32, origin_chunk_z: i32, fallback_y: i32) -> Result<Self> {
+        for coord in [origin_chunk_x, origin_chunk_z] {
+            coord
+                .checked_sub(5)
+                .and_then(|v| v.checked_mul(16))
+                .ok_or_else(|| anyhow::anyhow!("initial spawn search is out of range"))?;
+            coord
+                .checked_add(5)
+                .and_then(|v| v.checked_mul(16))
+                .and_then(|v| v.checked_add(15))
+                .ok_or_else(|| anyhow::anyhow!("initial spawn search is out of range"))?;
+        }
+        Ok(Self {
+            origin: (origin_chunk_x, origin_chunk_z),
+            fallback: IVec3::new(origin_chunk_x * 16 + 8, fallback_y, origin_chunk_z * 16 + 8),
+            dx: 0,
+            dz: 0,
+            step_x: 0,
+            step_z: -1,
+            chunks_visited: 0,
+            column: 0,
+            result: None,
+        })
+    }
+
+    /// The next column that needs data. An error from the world leaves this
+    /// unchanged, so a caller may load the missing chunk and retry.
+    pub fn requested_position(&self) -> IVec3 {
+        if let Some(pos) = self.result {
+            return pos;
+        }
+        IVec3::new(
+            (self.origin.0 + self.dx) * 16 + i32::from(self.column / 16),
+            self.fallback.y,
+            (self.origin.1 + self.dz) * 16 + i32::from(self.column % 16),
+        )
+    }
+
+    pub fn poll<W: SharedSpawnWorld>(
+        &mut self,
+        world: &mut W,
+        budget: usize,
+    ) -> Result<Option<IVec3>> {
+        for _ in 0..budget {
+            if self.result.is_some() {
+                break;
+            }
+            let pos = self.requested_position();
+            if let Some(found) = column_spawn(world, pos.x, pos.z)? {
+                self.result = Some(found);
+                break;
+            }
+            self.column += 1;
+            if self.column == 256 {
+                self.column = 0;
+                self.chunks_visited += 1;
+                if self.chunks_visited == 121 {
+                    self.result = Some(self.fallback);
+                    break;
+                }
+                if self.dx == self.dz
+                    || (self.dx < 0 && self.dx == -self.dz)
+                    || (self.dx > 0 && self.dx == 1 - self.dz)
+                {
+                    (self.step_x, self.step_z) = (-self.step_z, self.step_x);
+                }
+                self.dx += self.step_x;
+                self.dz += self.step_z;
+            }
+        }
+        Ok(self.result)
+    }
+}
+
 /// `PlayerSpawnFinder.fixupSpawnHeight`, including its downward second pass.
 pub fn fixup_spawn_height<W: SharedSpawnWorld>(world: &mut W, mut pos: IVec3) -> Result<IVec3> {
     let min_y = world.min_y();
@@ -308,6 +400,107 @@ impl ResumableWorldSpawn {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    struct InitialWorld {
+        trace: Vec<(i32, i32)>,
+        target: Option<(i32, i32)>,
+        unavailable: Option<(i32, i32)>,
+    }
+    impl SharedSpawnWorld for InitialWorld {
+        fn min_y(&self) -> i32 {
+            -4
+        }
+        fn max_y(&self) -> i32 {
+            16
+        }
+        fn ceiling_spawn_height(&self) -> Option<i32> {
+            None
+        }
+        fn heights(&mut self, x: i32, z: i32) -> Result<SpawnColumnHeights> {
+            self.trace.push((x, z));
+            ensure!(self.unavailable != Some((x, z)), "column unavailable");
+            let height = if self.target == Some((x, z)) { 0 } else { -5 };
+            Ok(SpawnColumnHeights {
+                motion_blocking: height,
+                world_surface: height,
+                ocean_floor: height,
+            })
+        }
+        fn has_fluid(&mut self, _: IVec3) -> Result<bool> {
+            Ok(false)
+        }
+        fn full_top_face(&mut self, pos: IVec3) -> Result<bool> {
+            Ok(pos.y == 0)
+        }
+        fn clear_player(&mut self, _: IVec3) -> Result<bool> {
+            panic!("initial spawn must not test player collisions")
+        }
+    }
+
+    #[test]
+    fn initial_spawn_visits_columns_in_spiral_and_resumes_on_missing_data() {
+        let mut search = InitialWorldSpawn::new(-2, 3, 64).unwrap();
+        let mut world = InitialWorld {
+            trace: Vec::new(),
+            target: Some((-15, 49)),
+            unavailable: Some((-16, 49)),
+        };
+        assert_eq!(search.requested_position(), IVec3::new(-32, 64, 48));
+        assert_eq!(search.poll(&mut world, 256).unwrap(), None);
+        assert_eq!(search.requested_position(), IVec3::new(-16, 64, 48));
+        assert_eq!(search.poll(&mut world, 1).unwrap(), None);
+        assert!(search.poll(&mut world, 1).is_err());
+        assert_eq!(search.requested_position(), IVec3::new(-16, 64, 49));
+        world.unavailable = None;
+        assert_eq!(
+            search.poll(&mut world, 100).unwrap(),
+            Some(IVec3::new(-15, 1, 49))
+        );
+        assert_eq!(world.trace[0], (-32, 48));
+        assert_eq!(world.trace[1], (-32, 49));
+        assert_eq!(world.trace[255], (-17, 63));
+        assert_eq!(world.trace[256], (-16, 48));
+    }
+
+    #[test]
+    fn initial_spawn_exhaustion_covers_121_chunks_and_uses_fallback() {
+        let mut search = InitialWorldSpawn::new(2, -3, 71).unwrap();
+        let mut world = InitialWorld {
+            trace: Vec::new(),
+            target: None,
+            unavailable: None,
+        };
+        assert_eq!(
+            search.poll(&mut world, 121 * 256).unwrap(),
+            Some(IVec3::new(40, 71, -40))
+        );
+        let chunks: Vec<_> = world
+            .trace
+            .chunks_exact(256)
+            .map(|c| (c[0].0.div_euclid(16), c[0].1.div_euclid(16)))
+            .collect();
+        assert_eq!(
+            &chunks[..9],
+            &[
+                (2, -3),
+                (3, -3),
+                (3, -2),
+                (2, -2),
+                (1, -2),
+                (1, -3),
+                (1, -4),
+                (2, -4),
+                (3, -4)
+            ]
+        );
+        assert_eq!(chunks.iter().copied().collect::<BTreeSet<_>>().len(), 121);
+        assert!(
+            chunks
+                .iter()
+                .all(|&(x, z)| (x - 2).abs() <= 5 && (z + 3).abs() <= 5)
+        );
+        assert!(InitialWorldSpawn::new(i32::MAX, 0, 0).is_err());
+    }
 
     struct MockWorld {
         blocked: BTreeSet<i32>,

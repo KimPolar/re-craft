@@ -3094,6 +3094,14 @@ mod tests {
                     .generated_spawn_blocks_clear(IVec3::new(0, 16, 8), &targets)
                     .is_err()
             );
+            let mut initial =
+                native_session::world_spawn::InitialWorldSpawn::new(0, 0, 16).unwrap();
+            assert_eq!(
+                session
+                    .poll_generated_initial_spawn(&mut initial, None, &targets, 1)
+                    .unwrap(),
+                Some(IVec3::new(0, 16, 0))
+            );
             let origin = IVec3::new(8, 16, 8);
             let candidates =
                 native_session::world_spawn::WorldSpawnCandidates::new(origin, 0, 100.0, 0)

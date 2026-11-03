@@ -6099,6 +6099,23 @@ impl LoadedSession {
         search.poll(&mut view, budget)
     }
 
+    /// Resume the initial global-spawn suggestion search over generated
+    /// terrain. The caller must restart if previously examined inputs change.
+    pub fn poll_generated_initial_spawn(
+        &self,
+        search: &mut crate::world_spawn::InitialWorldSpawn,
+        ceiling_spawn_height: Option<i32>,
+        generated_targets: &BTreeSet<ChunkPos>,
+        budget: usize,
+    ) -> anyhow::Result<Option<IVec3>> {
+        let mut view = LoadedColumnSpawnView {
+            session: self,
+            ceiling_spawn_height,
+            generated: Some(generated_targets),
+        };
+        search.poll(&mut view, budget)
+    }
+
     /// Java's shared-spawn block and liquid collision query for a standing
     /// player. Entity collisions must be checked separately.
     pub fn world_spawn_blocks_clear(&self, pos: IVec3) -> anyhow::Result<bool> {

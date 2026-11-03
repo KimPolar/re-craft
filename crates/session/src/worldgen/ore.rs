@@ -2368,6 +2368,7 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
         || tree_leaf_litter(state)?
         || tree_cave_vines(state)?
         || tree_glow_lichen(state)?
+        || generated_dripleaf(state)?
         || state.name == "minecraft:vine"
     {
         return Ok(false);
@@ -2399,6 +2400,7 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
         || tree_leaf_litter(state)?
         || tree_cave_vines(state)?
         || tree_glow_lichen(state)?
+        || generated_dripleaf(state)?
         || state.name == "minecraft:vine"
     {
         return Ok(false);
@@ -5681,6 +5683,114 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_dripleaf_support_matches_java_states() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GeneratedDripleafSupportOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GeneratedDripleafSupportOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("GeneratedDripleafSupportOracle")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 9, "{line}");
+            let mut block = state(fields[0]);
+            for property in fields[1].split(',') {
+                let (name, value) = property.split_once('=').unwrap();
+                block.properties.insert(name.into(), value.into());
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                fields[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for (direction, expected) in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ]
+            .into_iter()
+            .zip(&fields[3..])
+            {
+                assert_eq!(
+                    generation_face_sturdy(&block, direction).unwrap(),
+                    expected.parse::<bool>().unwrap(),
+                    "{line} {direction:?}"
+                );
+            }
+            assert_eq!(
+                tree_sturdy_up(&block).unwrap(),
+                fields[4].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            *counts.entry(fields[0].to_owned()).or_default() += 1;
+        }
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("big_dripleaf".into(), 32),
+                ("big_dripleaf_stem".into(), 8),
+                ("small_dripleaf".into(), 16)
+            ])
+        );
+        let mut invalid = state("big_dripleaf");
+        invalid.properties = BTreeMap::from([
+            ("facing".into(), "north".into()),
+            ("waterlogged".into(), "false".into()),
+            ("tilt".into(), "invalid".into()),
+        ]);
+        assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
+    }
+
     fn fixture() -> (
         CarvedTerrainWorld,
         OreBlockTags,

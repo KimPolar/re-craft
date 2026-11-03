@@ -2934,6 +2934,9 @@ mod tests {
         );
         let mut data = Fixture;
         let tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let spawn_tags = Arc::new(
+            native_resources::heightmap_tags::HeightmapTags::load(&mut data, &registry).unwrap(),
+        );
         let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
             "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
             "default_block":"minecraft:stone","default_fluid":"minecraft:water",
@@ -3053,13 +3056,28 @@ mod tests {
                     .contains("stale")
             );
             generated.mesh.world = current;
-            let mut session = generated.start_session(player).unwrap();
+            let mut session = generated
+                .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
+                .unwrap();
             let before = session.snapshot();
             let playable = before.world.loaded().unwrap();
             assert_eq!(playable.chunks.len(), 1);
             assert!(playable.chunks[&center].block_light_correct);
             assert_eq!(playable.light(8, 16, 8, true), Some(15));
             assert!(before.inventory.slot(PlayerSlot::Storage(0)).is_none());
+            let maps = session
+                .spawn_heightmaps_for_chunk(center)
+                .expect("generated spawn maps");
+            use native_persistence::heightmap::SpawnHeightmapKind;
+            assert_eq!(
+                maps.highest(SpawnHeightmapKind::WorldSurface, 8, 8),
+                Some(15)
+            );
+            assert_eq!(maps.highest(SpawnHeightmapKind::OceanFloor, 8, 8), Some(15));
+            assert_eq!(
+                maps.highest(SpawnHeightmapKind::MotionBlocking, 8, 8),
+                Some(15)
+            );
             assert!(!generated.mesh.world.chunks[&center].block_light_correct);
             session.update(std::time::Duration::from_millis(50));
             assert_eq!(session.snapshot().tick, 1);

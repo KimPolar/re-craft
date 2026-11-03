@@ -71,6 +71,47 @@ impl SpawnHeightmapKind {
 }
 
 impl SpawnHeightmaps {
+    /// A set of not-yet-primed maps for an in-memory generated chunk.
+    pub fn unprimed(bounds: HeightBounds) -> Result<Self> {
+        bounds.height()?;
+        Ok(Self {
+            min_y: bounds.min_y,
+            max_y: bounds.max_y,
+            maps: [None, None, None],
+        })
+    }
+
+    /// Import already-primed first-available Y values without recomputing them
+    /// from blocks. This preserves Java's potentially stale generation maps.
+    pub fn from_first_available(
+        bounds: HeightBounds,
+        motion_blocking: &[i32; 256],
+        world_surface: &[i32; 256],
+        ocean_floor: &[i32; 256],
+    ) -> Result<Self> {
+        bounds.height()?;
+        let mut maps = [None, None, None];
+        for (target, source) in maps
+            .iter_mut()
+            .zip([motion_blocking, world_surface, ocean_floor])
+        {
+            let mut values = Box::new([0u32; 256]);
+            for (output, &height) in values.iter_mut().zip(source.iter()) {
+                ensure!(
+                    (bounds.min_y..=bounds.max_y).contains(&height),
+                    "generated heightmap value is out of bounds"
+                );
+                *output = (height - bounds.min_y) as u32;
+            }
+            *target = Some(values);
+        }
+        Ok(Self {
+            min_y: bounds.min_y,
+            max_y: bounds.max_y,
+            maps,
+        })
+    }
+
     /// Read the on-disk maps, without changing the source document. Java
     /// rebuilds absent maps and arrays whose length is wrong; callers must do
     /// the same instead of interpreting them as zero-height columns.
@@ -500,6 +541,43 @@ mod tests {
         nbt::TagType,
         world::ChunkPos,
     };
+
+    #[test]
+    fn generated_first_available_maps_preserve_values_and_validate_bounds() {
+        let bounds = HeightBounds {
+            min_y: -64,
+            max_y: 320,
+        };
+        let mut motion = [-64; 256];
+        let mut surface = [-64; 256];
+        let mut ocean = [-64; 256];
+        motion[255] = 64;
+        surface[255] = 65;
+        ocean[255] = 42;
+        let maps =
+            SpawnHeightmaps::from_first_available(bounds, &motion, &surface, &ocean).unwrap();
+        assert!(maps.is_complete());
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::MotionBlocking, -1, -1),
+            Some(63)
+        );
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::WorldSurface, -1, -1),
+            Some(64)
+        );
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::OceanFloor, -1, -1),
+            Some(41)
+        );
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::OceanFloor, 0, 0),
+            Some(-65)
+        );
+        surface[0] = 321;
+        assert!(SpawnHeightmaps::from_first_available(bounds, &motion, &surface, &ocean).is_err());
+        surface[0] = -65;
+        assert!(SpawnHeightmaps::from_first_available(bounds, &motion, &surface, &ocean).is_err());
+    }
 
     fn block(name: &str) -> BlockState {
         BlockState {

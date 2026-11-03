@@ -42,6 +42,30 @@ pub struct GenerationReady {
 }
 
 impl GenerationReady {
+    /// Prepare spawn heightmaps with tags from the same immutable data-pack
+    /// stack as this batch. Already primed generation values are preserved.
+    pub fn start_session_with_spawn_heightmaps(
+        &mut self,
+        player: native_session::PlayerState,
+        tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    ) -> Result<native_session::loaded::LoadedSession> {
+        let mut session = self.start_session(player)?;
+        session.set_spawn_heightmap_tags(tags)?;
+        let targets = self
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated session targets missing")?;
+        for &pos in targets.iter() {
+            if let Some(maps) = self.batch.spawn_heightmaps(pos)? {
+                session.set_initial_spawn_heightmaps(pos, maps)?;
+            } else {
+                session.prime_generated_spawn_heightmaps(pos)?;
+            }
+        }
+        Ok(session)
+    }
+
     /// Construct a transient session from fully lit targets. The caller must
     /// choose and validate the player spawn, and keep the batch for generation;
     /// this does not create or save a Java world.
@@ -442,7 +466,13 @@ mod tests {
                 on_ground: false,
                 pose: PlayerPose::Standing,
             };
-            let session = generated.start_session(player)?;
+            let mut resources = native_resources::packs::ResourceStack::open(&mesh_game)?;
+            let registry = resources.vanilla_block_ids()?;
+            let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut resources,
+                &registry,
+            )?);
+            let session = generated.start_session_with_spawn_heightmaps(player, tags)?;
             let snapshot = session.snapshot();
             let world = snapshot
                 .world
@@ -450,6 +480,12 @@ mod tests {
                 .context("generated session world missing")?;
             assert_eq!(world.chunks.len(), 1);
             assert!(world.chunks[&ChunkPos { x: 0, z: 0 }].block_light_correct);
+            assert!(
+                session
+                    .spawn_heightmaps_for_chunk(ChunkPos { x: 0, z: 0 })
+                    .context("generated spawn heightmaps missing")?
+                    .is_complete()
+            );
         }
         let mesher = crate::mesh_worker::MeshWorker::start(
             native_resources::packs::ResourceStack::open(&mesh_game)?,

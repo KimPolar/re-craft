@@ -113,7 +113,7 @@ struct FreezeContext<'a> {
 /// Final 26.3 terrain heightmaps in surface, ocean, motion and no-leaves order.
 #[derive(Clone)]
 pub(super) struct FinalHeightmaps {
-    values: Box<[[i32; 256]; 4]>,
+    pub(super) values: Box<[[i32; 256]; 4]>,
 }
 
 /// A placed feature bound to the exact configured feature it references.
@@ -10388,6 +10388,30 @@ mod tests {
         for kind in 1..4 {
             assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
         }
+        let original = region.final_heights[&ChunkPos { x: 0, z: 0 }].clone();
+        let converted = native_persistence::heightmap::SpawnHeightmaps::from_first_available(
+            native_persistence::heightmap::HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            &original.values[2],
+            &original.values[0],
+            &original.values[1],
+        )
+        .unwrap();
+        use native_persistence::heightmap::SpawnHeightmapKind;
+        assert_eq!(
+            converted.highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(12)
+        );
+        assert_eq!(
+            converted.highest(SpawnHeightmapKind::OceanFloor, 0, 0),
+            Some(6)
+        );
+        assert_eq!(
+            converted.highest(SpawnHeightmapKind::MotionBlocking, 0, 0),
+            Some(6)
+        );
         assert!(
             !region
                 .set_block([16, 7, 0], &state("ancient_debris"), 2)

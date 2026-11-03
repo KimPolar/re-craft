@@ -110,7 +110,7 @@ pub(crate) fn prepare_with_flags(
     Ok(maps)
 }
 
-fn prime(
+pub(crate) fn prime(
     maps: &mut SpawnHeightmaps,
     chunk: &Chunk,
     flags: &[Option<BlockHeightFlags>],

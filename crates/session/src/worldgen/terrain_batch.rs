@@ -440,6 +440,39 @@ impl FreshTerrainBatch {
                 .context("generation height overflow")?,
         ))
     }
+
+    /// Preserve already-primed generation heightmaps, including stale values
+    /// caused by direct section writes. `None` means Java has not primed them.
+    pub fn spawn_heightmaps(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<native_persistence::heightmap::SpawnHeightmaps>> {
+        use native_persistence::heightmap::{HeightBounds, SpawnHeightmaps};
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Features),
+            "generation chunk has not completed features"
+        );
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        let Some(maps) = terrain.final_heightmaps.get(&pos) else {
+            return Ok(None);
+        };
+        let (min_y, max_y) = self.build_bounds()?;
+        Ok(Some(SpawnHeightmaps::from_first_available(
+            HeightBounds { min_y, max_y },
+            &maps.values[2],
+            &maps.values[0],
+            &maps.values[1],
+        )?))
+    }
     pub fn snapshot(&self) -> Option<Arc<World>> {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }

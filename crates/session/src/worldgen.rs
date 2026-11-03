@@ -3315,6 +3315,7 @@ mod tests {
                 FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
                     .unwrap();
             assert!(batch.request_features(center).is_err());
+            assert!(batch.spawn_heightmaps(center).is_err());
             let lighting = GeneratedDimensionLighting {
                 dimension: ResourceId::parse("minecraft:overworld").unwrap(),
                 dimension_type: Some(ResourceId::parse("example:custom_type").unwrap()),
@@ -3390,6 +3391,24 @@ mod tests {
                 batch.schedule().completed(center),
                 Some(schedule::GenerationStage::Features)
             );
+            let maps = batch
+                .spawn_heightmaps(center)
+                .unwrap()
+                .expect("primed generation heightmaps");
+            use native_persistence::heightmap::SpawnHeightmapKind;
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        maps.highest(SpawnHeightmapKind::WorldSurface, x, z),
+                        Some(15)
+                    );
+                    assert_eq!(maps.highest(SpawnHeightmapKind::OceanFloor, x, z), Some(15));
+                    assert_eq!(
+                        maps.highest(SpawnHeightmapKind::MotionBlocking, x, z),
+                        Some(15)
+                    );
+                }
+            }
             let after = batch.snapshot().unwrap();
             assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:melon");
             assert_eq!(

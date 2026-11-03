@@ -5901,6 +5901,51 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Prime previously absent maps for an in-memory generated chunk. Every
+    /// block section must be present; this does not make the chunk saveable.
+    pub fn prime_generated_spawn_heightmaps(&mut self, pos: ChunkPos) -> anyhow::Result<()> {
+        use anyhow::Context;
+        anyhow::ensure!(
+            self.tick == 0,
+            "heightmaps must be prepared before the first tick"
+        );
+        anyhow::ensure!(
+            !self.spawn_heightmaps.contains_key(&pos),
+            "heightmaps are already present"
+        );
+        let air = self
+            .heightmap_air
+            .context("heightmap tags are unavailable")?;
+        let chunk = self
+            .world
+            .chunks
+            .get(&pos)
+            .context("heightmap chunk is missing")?;
+        anyhow::ensure!(chunk.position == pos, "heightmap chunk position differs");
+        for sy in self.bounds.min_y.div_euclid(16)..self.bounds.max_y.div_euclid(16) {
+            let section = chunk
+                .sections
+                .get(&i8::try_from(sy)?)
+                .context("generated heightmap section is missing")?;
+            anyhow::ensure!(
+                section.blocks.is_some(),
+                "generated heightmap block data is missing"
+            );
+        }
+        let bounds = HeightBounds {
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+        };
+        let mut maps = SpawnHeightmaps::unprimed(bounds)?;
+        crate::spawn_heightmaps::prime(&mut maps, chunk, &self.heightmap_flags, air)?;
+        self.set_initial_spawn_heightmaps(pos, maps)
+    }
+
+    /// Return a shared immutable heightmap revision for a prepared chunk.
+    pub fn spawn_heightmaps_for_chunk(&self, pos: ChunkPos) -> Option<Arc<SpawnHeightmaps>> {
+        self.spawn_heightmaps.get(&pos).cloned()
+    }
+
     /// Prepare an initial chunk using the already-cached state classifications.
     /// Call this from the world-loading worker, before the session starts.
     pub fn prepare_initial_spawn_heightmaps(
@@ -43965,6 +44010,21 @@ pub(crate) mod tests {
             }),
             sections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn generated_spawn_heightmaps_reject_missing_block_sections() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        let world = Arc::make_mut(&mut session.world);
+        Arc::make_mut(world.chunks.get_mut(&home).unwrap())
+            .sections
+            .remove(&1);
+        assert!(session.prime_generated_spawn_heightmaps(home).is_err());
+        assert!(session.spawn_heightmaps_for_chunk(home).is_none());
     }
 
     #[test]

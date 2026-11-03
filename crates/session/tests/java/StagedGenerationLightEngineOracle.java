@@ -20,6 +20,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean magmaOnly;
     boolean wide;
     boolean lateFar;
+    boolean emptyEast;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -27,6 +28,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     public BlockEntity getBlockEntity(BlockPos p){ return null; }
     public BlockState getBlockState(BlockPos p){
         if(edits.containsKey(p)) return edits.get(p);
+        if(emptyEast && Math.floorDiv(p.getX(),16)==1 && Math.floorDiv(p.getZ(),16)==0) return Blocks.AIR.defaultBlockState();
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(lateFar && p.getX()==31 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(magmaOnly && p.getX()==16 && p.getY()==8 && p.getZ()==8) return Blocks.WATER.defaultBlockState();
@@ -46,7 +48,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public int getHeight(){ return 16; }
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
-            if(x==1 && z==0 && !magmaOnly) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !magmaOnly && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && lateFar) f.accept(new BlockPos(31,10,8),Blocks.TORCH.defaultBlockState());
             if(x==2 && z==0 && lateFar) f.accept(new BlockPos(33,10,8),Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && edits.get(new BlockPos(16,7,8))==Blocks.MAGMA_BLOCK.defaultBlockState()) f.accept(new BlockPos(16,7,8),Blocks.MAGMA_BLOCK.defaultBlockState());
@@ -91,9 +93,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
+        boolean treeEmptyFull=args.length>1 && args[1].equals("tree_empty_full");
+        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
+        w.emptyEast=treeEmpty;
         boolean logActive=args.length>1 && args[1].equals("log_active_full");
-        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive);
-        boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull);
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull);
+        boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
         boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
@@ -120,8 +125,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0) eastSection=fake;
             if(x==-1 && z==0) westSection=fake;
             if(x==2 && z==0) farSection=fake;
-            for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
-            if(x==1 && z==0 && !magma) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(!(treeEmpty && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
+            if(x==1 && z==0 && !magma && !treeEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
                 var initial=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,false);
@@ -133,18 +138,21 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
             if((!partial && !w.mixed) || (x==1 && z==0 && !late) || (w.mixed && x==0 && z==0)){
                 chunk.sources.fillFrom(fake);
-                engine.updateSectionStatus(SectionPos.of(x,0,z),false);
+                engine.updateSectionStatus(SectionPos.of(x,0,z),fake.section.hasOnlyAir());
             }
         }
         drain(engine); var stages=new JsonArray();
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(capture(engine));
-            var state=logActive ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=(logActive || treeEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             int[][] positions=leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(p[0]-16,p[1],p[2],state); w.edits.put(pos,state);
-                if(wasEmpty!=eastSection.section.hasOnlyAir())throw new AssertionError("unexpected section transition");
+                if(wasEmpty!=eastSection.section.hasOnlyAir()) {
+                    if(!treeEmpty)throw new AssertionError("unexpected section transition");
+                    engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
+                }
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,p[0]-16,p[1],p[2]);
                 if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing leaf light check");
                 engine.checkBlock(pos);

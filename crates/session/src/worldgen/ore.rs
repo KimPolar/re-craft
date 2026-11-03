@@ -2118,6 +2118,11 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
     {
         return Ok(false);
     }
+    if tree_edge_plant(state)?.is_some()
+        || matches!(simple_plant_kind(state), Ok(kind) if !matches!(kind, SimplePlantKind::Unconditional))
+    {
+        return Ok(false);
+    }
     vanilla_full_occlusion(&state.name)
         .with_context(|| format!("unsupported tree ground shape {}", state.name))
 }
@@ -2129,6 +2134,13 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if tree_mushroom_block(state)? {
         return Ok(true);
     }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:azalea" | "minecraft:flowering_azalea"
+    ) {
+        simple_plant_kind(state)?;
+        return Ok(true);
+    }
     if tree_generated_leaf(state)?
         || tree_leaf_litter(state)?
         || tree_cave_vines(state)?
@@ -2137,13 +2149,35 @@ fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     {
         return Ok(false);
     }
-    if let Ok(kind) = simple_plant_kind(state)
-        && !matches!(kind, SimplePlantKind::Unconditional)
+    if tree_edge_plant(state)?.is_some()
+        || matches!(simple_plant_kind(state), Ok(kind) if !matches!(kind, SimplePlantKind::Unconditional))
     {
         return Ok(false);
     }
     vanilla_full_occlusion(&state.name)
         .with_context(|| format!("unsupported tree support shape {}", state.name))
+}
+
+fn generation_face_sturdy(state: &BlockState, direction: [i32; 3]) -> Result<bool> {
+    ensure!(
+        matches!(
+            direction,
+            [0, -1, 0] | [0, 1, 0] | [0, 0, -1] | [0, 0, 1] | [-1, 0, 0] | [1, 0, 0]
+        ),
+        "invalid support direction"
+    );
+    if matches!(
+        state.name.as_str(),
+        "minecraft:azalea" | "minecraft:flowering_azalea"
+    ) {
+        simple_plant_kind(state)?;
+        return Ok(direction == [0, 1, 0]);
+    }
+    if is_simple_carpet_id(&state.name) {
+        simple_plant_kind(state)?;
+        return Ok(direction == [0, -1, 0]);
+    }
+    tree_sturdy_up(state)
 }
 
 fn tree_grass_block(state: &BlockState) -> bool {
@@ -2415,8 +2449,13 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
     fn same_block(&mut self, a: &BlockState, b: &BlockState) -> Result<bool> {
         Ok(a.name == b.name)
     }
-    fn patch_face_sturdy(&mut self, state: &BlockState, _: [i32; 3], _: [i32; 3]) -> Result<bool> {
-        tree_sturdy_up(state)
+    fn patch_face_sturdy(
+        &mut self,
+        state: &BlockState,
+        _: [i32; 3],
+        direction: [i32; 3],
+    ) -> Result<bool> {
+        generation_face_sturdy(state, direction)
     }
     fn set_patch_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
         let result = (|| {
@@ -3811,8 +3850,13 @@ impl GeodeEnvironment for DecorationRegion<'_> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
-    fn face_sturdy(&mut self, state: &BlockState, _: [i32; 3], _: [i32; 3]) -> Result<bool> {
-        tree_sturdy_up(state)
+    fn face_sturdy(
+        &mut self,
+        state: &BlockState,
+        _: [i32; 3],
+        direction: [i32; 3],
+    ) -> Result<bool> {
+        generation_face_sturdy(state, direction)
     }
     fn integer_property_bounds(
         &mut self,
@@ -4904,6 +4948,76 @@ mod tests {
     }
 
     #[test]
+    fn generated_plant_variants_have_consistent_support_faces() {
+        let mut states = Vec::new();
+        for name in [
+            "oak_sapling",
+            "spruce_sapling",
+            "birch_sapling",
+            "jungle_sapling",
+            "acacia_sapling",
+            "dark_oak_sapling",
+            "cherry_sapling",
+            "pale_oak_sapling",
+        ] {
+            for stage in ["0", "1"] {
+                let mut block = state(name);
+                block.properties.insert("stage".into(), stage.into());
+                states.push(block);
+            }
+        }
+        for name in [
+            "tall_grass",
+            "large_fern",
+            "sunflower",
+            "rose_bush",
+            "peony",
+            "lilac",
+            "tall_seagrass",
+        ] {
+            for half in ["lower", "upper"] {
+                let mut block = state(name);
+                block.properties.insert("half".into(), half.into());
+                states.push(block);
+            }
+        }
+        for age in 0..=3 {
+            let mut block = state("sweet_berry_bush");
+            block.properties.insert("age".into(), age.to_string());
+            states.push(block);
+        }
+        for half in ["lower", "upper"] {
+            for facing in ["north", "south", "east", "west"] {
+                for waterlogged in ["true", "false"] {
+                    let mut block = state("small_dripleaf");
+                    block.properties = BTreeMap::from([
+                        ("half".into(), half.into()),
+                        ("facing".into(), facing.into()),
+                        ("waterlogged".into(), waterlogged.into()),
+                    ]);
+                    states.push(block);
+                }
+            }
+        }
+        for block in &states {
+            assert!(!tree_solid_render(block).unwrap(), "{block:?}");
+            for direction in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ] {
+                assert!(
+                    !generation_face_sturdy(block, direction).unwrap(),
+                    "{block:?} {direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tree_ground_solid_and_support_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -4948,6 +5062,65 @@ mod tests {
             "leaf_litter",
             "cave_vines",
             "cave_vines_plant",
+            "short_grass",
+            "fern",
+            "bush",
+            "dandelion",
+            "poppy",
+            "blue_orchid",
+            "allium",
+            "azure_bluet",
+            "red_tulip",
+            "orange_tulip",
+            "white_tulip",
+            "pink_tulip",
+            "oxeye_daisy",
+            "cornflower",
+            "lily_of_the_valley",
+            "firefly_bush",
+            "closed_eyeblossom",
+            "azalea",
+            "flowering_azalea",
+            "sweet_berry_bush",
+            "short_dry_grass",
+            "tall_dry_grass",
+            "dead_bush",
+            "tall_grass",
+            "large_fern",
+            "sunflower",
+            "rose_bush",
+            "peony",
+            "lilac",
+            "oak_sapling",
+            "spruce_sapling",
+            "birch_sapling",
+            "jungle_sapling",
+            "acacia_sapling",
+            "dark_oak_sapling",
+            "cherry_sapling",
+            "pale_oak_sapling",
+            "seagrass",
+            "tall_seagrass",
+            "small_dripleaf",
+            "brown_mushroom",
+            "red_mushroom",
+            "moss_carpet",
+            "white_carpet",
+            "orange_carpet",
+            "magenta_carpet",
+            "light_blue_carpet",
+            "yellow_carpet",
+            "lime_carpet",
+            "pink_carpet",
+            "gray_carpet",
+            "light_gray_carpet",
+            "cyan_carpet",
+            "purple_carpet",
+            "blue_carpet",
+            "brown_carpet",
+            "green_carpet",
+            "red_carpet",
+            "black_carpet",
             "coal_ore",
             "deepslate_coal_ore",
             "iron_ore",
@@ -5012,8 +5185,9 @@ mod tests {
             .unwrap();
         assert!(
             result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
         );
         let text = String::from_utf8(result.stdout).unwrap();
         let actual: Vec<_> = text.lines().filter(|v| v.starts_with("S ")).collect();
@@ -5045,6 +5219,31 @@ mod tests {
             if name == "cave_vines_plant" {
                 block.properties.insert("berries".into(), "false".into());
             }
+            if name.ends_with("_sapling") {
+                block.properties.insert("stage".into(), "0".into());
+            }
+            if matches!(
+                name,
+                "tall_grass"
+                    | "large_fern"
+                    | "sunflower"
+                    | "rose_bush"
+                    | "peony"
+                    | "lilac"
+                    | "tall_seagrass"
+                    | "small_dripleaf"
+            ) {
+                block.properties.insert("half".into(), "lower".into());
+            }
+            if name == "small_dripleaf" {
+                block.properties.insert("facing".into(), "north".into());
+                block
+                    .properties
+                    .insert("waterlogged".into(), "false".into());
+            }
+            if name == "sweet_berry_bush" {
+                block.properties.insert("age".into(), "0".into());
+            }
             assert_eq!(
                 *line,
                 format!(
@@ -5053,6 +5252,30 @@ mod tests {
                     tree_sturdy_up(&block).unwrap()
                 )
             );
+            if let Some(plant) = text
+                .lines()
+                .find(|line| line.starts_with(&format!("P {name} ")))
+            {
+                let expected: Vec<_> = plant.split_whitespace().skip(2).collect();
+                assert_eq!(expected.len(), 6, "{plant}");
+                for (direction, value) in [
+                    [0, -1, 0],
+                    [0, 1, 0],
+                    [0, 0, -1],
+                    [0, 0, 1],
+                    [-1, 0, 0],
+                    [1, 0, 0],
+                ]
+                .into_iter()
+                .zip(expected)
+                {
+                    assert_eq!(
+                        generation_face_sturdy(&block, direction).unwrap(),
+                        value.parse::<bool>().unwrap(),
+                        "{plant} {direction:?}"
+                    );
+                }
+            }
         }
         for name in [
             "oak_leaves",

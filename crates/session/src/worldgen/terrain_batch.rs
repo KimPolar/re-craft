@@ -189,7 +189,7 @@ impl FreshTerrainBatch {
 
     /// Finish all requested registrations before entering a frozen light
     /// batch. After this, terrain and decoration requests are rejected;
-    /// already decorated chunks may be registered if terrain stays unchanged.
+    /// already decorated chunks may be registered if active neighborhoods stay unchanged.
     pub fn seal_for_light_propagation(&mut self) -> Result<()> {
         ensure!(
             self.is_complete(),
@@ -514,7 +514,7 @@ impl FreshTerrainBatch {
                         self.schedule.ready(pos, GenerationStage::InitializeLight),
                         "light initialization dependencies are incomplete"
                     );
-                    engine.initialize_static_chunk(terrain, pos, registry)?;
+                    engine.initialize_chunk(terrain, pos, registry)?;
                     self.schedule
                         .complete(pos, GenerationStage::InitializeLight)?;
                     self.lit_cache = None;

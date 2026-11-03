@@ -535,7 +535,7 @@ impl FreshGenerationLightTracker {
 /// A static batch of generation chunks with monotonically activated light
 /// sources. This is separate from the live world: it cannot accept section
 /// updates, registered-chunk edits or restored light. Additional completed
-/// chunks can be registered only while the terrain revision stays unchanged.
+/// chunks can be registered when already active neighborhoods are unchanged.
 /// Requested columns need their 3x3 neighborhood;
 /// uninitialized chunks must retain their default sky-source heightmaps.
 /// Once propagation starts, reads use the blocks seen at activation. Further
@@ -603,22 +603,43 @@ impl StagedGenerationLightEngine {
         }
     }
 
-    /// Register a completed chunk in the same immutable terrain revision used
-    /// by earlier activations. Changes to terrain after activation still need
-    /// a mutable light engine and must not be mixed into this replay.
-    pub fn initialize_static_chunk(
+    /// Register another completed chunk. Unregistered terrain outside every
+    /// active chunk's 3x3 neighborhood may have changed since activation;
+    /// registered chunks and all active input neighborhoods must be unchanged.
+    pub fn initialize_chunk(
         &mut self,
         terrain: &CarvedTerrainWorld,
         pos: native_world::loaded::ChunkPos,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<()> {
-        ensure!(
-            self.frozen_world
-                .as_ref()
-                .is_none_or(|world| Arc::ptr_eq(world, &terrain.world)),
-            "light terrain changed since propagation"
-        );
-        self.fresh.initialize_chunk(terrain, pos, registry)
+        if let Some(frozen) = &self.frozen_world {
+            if !Arc::ptr_eq(frozen, &terrain.world) {
+                for active in &self.active {
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let neighbor = native_world::loaded::ChunkPos {
+                                x: active.x.checked_add(dx).context("light X overflow")?,
+                                z: active.z.checked_add(dz).context("light Z overflow")?,
+                            };
+                            let unchanged = match (
+                                frozen.chunks.get(&neighbor),
+                                terrain.world.chunks.get(&neighbor),
+                            ) {
+                                (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+                                (None, None) => true,
+                                _ => false,
+                            };
+                            ensure!(unchanged, "active light neighborhood changed");
+                        }
+                    }
+                }
+            }
+        }
+        self.fresh.initialize_chunk(terrain, pos, registry)?;
+        if self.frozen_world.is_some() {
+            self.frozen_world = Some(Arc::clone(&terrain.world));
+        }
+        Ok(())
     }
 
     /// Capture a revision without modifying the world or a previous snapshot.

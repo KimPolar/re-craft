@@ -5279,7 +5279,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&expected_path).unwrap()).unwrap();
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
-        for mode in ["mixed", "equivalent", "late"] {
+        for mode in ["mixed", "equivalent", "late", "late_multi", "late_far"] {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
@@ -5300,6 +5300,12 @@ mod tests {
             let east = ChunkPos { x: 1, z: 0 };
             let west = ChunkPos { x: -1, z: 0 };
             let north = ChunkPos { x: 0, z: -1 };
+            let far = ChunkPos { x: 2, z: 0 };
+            let columns = if mode == "late_far" {
+                [center, east, west]
+            } else {
+                [center, west, north]
+            };
             let world = Arc::make_mut(&mut mixed_terrain.world);
             let template = world.chunks[&center].as_ref().clone();
             for z in -2..=2 {
@@ -5315,12 +5321,22 @@ mod tests {
             let torch = world.intern_state(state("torch"));
             world.set_block_id(0, 10, 8, torch).unwrap();
             world.set_block_id(17, 10, 8, torch).unwrap();
-            mixed_terrain.completed_decoration.extend([center, east]);
+            if mode == "late_far" {
+                world.set_block_id(31, 10, 8, torch).unwrap();
+            }
+            let pending_far = if mode == "late_far" {
+                world.chunks.remove(&far)
+            } else {
+                None
+            };
+            mixed_terrain
+                .completed_decoration
+                .extend([center, east, west, far]);
             let mut mixed_tracker = FreshGenerationLightTracker::new(&mixed_terrain, true).unwrap();
             mixed_tracker
                 .initialize_chunk(&mixed_terrain, center, &registry)
                 .unwrap();
-            if mode != "late" {
+            if !mode.starts_with("late") {
                 mixed_tracker
                     .initialize_chunk(&mixed_terrain, east, &registry)
                     .unwrap();
@@ -5329,26 +5345,44 @@ mod tests {
             let mixed_first = mixed_engine
                 .activate(&mixed_terrain, center, [center, west, north], &registry)
                 .unwrap();
-            let registered = if mode == "late" {
+            let registered = if mode.starts_with("late") {
                 let frozen = Arc::clone(&mixed_terrain.world);
-                Arc::make_mut(&mut mixed_terrain.world).dimension_type = Some("changed".into());
+                let world = Arc::make_mut(&mut mixed_terrain.world);
+                let stone = world.intern_state(state("stone"));
+                world.set_block_id(0, 10, 8, stone).unwrap();
                 assert!(
                     mixed_engine
-                        .initialize_static_chunk(&mixed_terrain, east, &registry)
+                        .initialize_chunk(&mixed_terrain, east, &registry)
+                        .is_err()
+                );
+                mixed_terrain.world = Arc::clone(&frozen);
+                let world = Arc::make_mut(&mut mixed_terrain.world);
+                let stone = world.intern_state(state("stone"));
+                world.set_block_id(-1, 10, 8, stone).unwrap();
+                assert!(
+                    mixed_engine
+                        .initialize_chunk(&mixed_terrain, east, &registry)
                         .is_err()
                 );
                 mixed_terrain.world = frozen;
+                if mode == "late_far" {
+                    let world = Arc::make_mut(&mut mixed_terrain.world);
+                    assert!(world.chunks.insert(far, pending_far.unwrap()).is_none());
+                    let stone = world.intern_state(state("stone"));
+                    world.set_block_id(32, 10, 8, stone).unwrap();
+                    world.set_block_id(33, 10, 8, torch).unwrap();
+                }
                 mixed_engine
-                    .initialize_static_chunk(&mixed_terrain, east, &registry)
+                    .initialize_chunk(&mixed_terrain, east, &registry)
                     .unwrap();
                 assert!(
                     mixed_engine
-                        .initialize_static_chunk(&mixed_terrain, east, &registry)
+                        .initialize_chunk(&mixed_terrain, east, &registry)
                         .is_err()
                 );
                 Some(
                     mixed_engine
-                        .snapshot(&mixed_terrain, [center, west, north], &registry)
+                        .snapshot(&mixed_terrain, columns, &registry)
                         .unwrap(),
                 )
             } else {
@@ -5363,16 +5397,52 @@ mod tests {
                 None
             };
             let mixed_second = mixed_engine
-                .activate(&mixed_terrain, east, [center, west, north], &registry)
+                .activate(&mixed_terrain, east, columns, &registry)
                 .unwrap();
+            let mut additional = Vec::new();
+            if mode == "late_far" {
+                mixed_engine
+                    .initialize_chunk(&mixed_terrain, far, &registry)
+                    .unwrap();
+                additional.push(
+                    mixed_engine
+                        .snapshot(&mixed_terrain, columns, &registry)
+                        .unwrap(),
+                );
+                additional.push(
+                    mixed_engine
+                        .activate(&mixed_terrain, far, columns, &registry)
+                        .unwrap(),
+                );
+            }
+            if mode == "late_multi" {
+                mixed_engine
+                    .initialize_chunk(&mixed_terrain, west, &registry)
+                    .unwrap();
+                additional.push(
+                    mixed_engine
+                        .snapshot(&mixed_terrain, [center, west, north], &registry)
+                        .unwrap(),
+                );
+                additional.push(
+                    mixed_engine
+                        .activate(&mixed_terrain, west, [center, west, north], &registry)
+                        .unwrap(),
+                );
+            }
             let actual_stages = [&mixed_first]
                 .into_iter()
                 .chain(registered.as_ref())
-                .chain([&mixed_second]);
+                .chain([&mixed_second])
+                .chain(additional.iter());
             for (stage, actual) in actual_stages.enumerate() {
-                for (column, (base_x, base_z)) in
-                    [(0, 0), (-16, 0), (0, -16)].into_iter().enumerate()
-                {
+                let stage_columns = if mode == "late_far" && stage == 0 {
+                    [center, west, north]
+                } else {
+                    columns
+                };
+                for (column, chunk) in stage_columns.into_iter().enumerate() {
+                    let (base_x, base_z) = (chunk.x * 16, chunk.z * 16);
                     for y in -16..32 {
                         for z in 0..16 {
                             for x in 0..16 {

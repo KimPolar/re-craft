@@ -19,6 +19,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean mixed;
     boolean magmaOnly;
     boolean wide;
+    boolean lateFar;
     public int getMinY(){ return 0; }
     public int getHeight(){ return 16; }
     public BlockGetter getLevel(){ return this; }
@@ -27,6 +28,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     public BlockState getBlockState(BlockPos p){
         if(edits.containsKey(p)) return edits.get(p);
         if(mixed && p.getX()==0 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
+        if(lateFar && p.getX()==31 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(magmaOnly && p.getX()==16 && p.getY()==8 && p.getZ()==8) return Blocks.WATER.defaultBlockState();
         if(!magmaOnly && p.getX()==17 && p.getY()==10 && p.getZ()==8) return Blocks.TORCH.defaultBlockState();
         if(p.getY()>=0 && p.getY()<8 && Math.abs(Math.floorDiv(p.getX(),16))<=((mixed || wide)?2:1) && Math.abs(Math.floorDiv(p.getZ(),16))<=((mixed || wide)?2:1)) return Blocks.STONE.defaultBlockState();
@@ -45,6 +47,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
             if(x==1 && z==0 && !magmaOnly) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && lateFar) f.accept(new BlockPos(31,10,8),Blocks.TORCH.defaultBlockState());
+            if(x==2 && z==0 && lateFar) f.accept(new BlockPos(33,10,8),Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && edits.get(new BlockPos(16,7,8))==Blocks.MAGMA_BLOCK.defaultBlockState()) f.accept(new BlockPos(16,7,8),Blocks.MAGMA_BLOCK.defaultBlockState());
             var vine=edits.get(new BlockPos(16,10,8)); if(x==1 && z==0 && vine!=null && vine.getLightEmission()>0) f.accept(new BlockPos(16,10,8),vine);
             if(mixed && x==0 && z==0) f.accept(new BlockPos(0,10,8),Blocks.TORCH.defaultBlockState());
@@ -76,6 +80,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         for(int z=-1;z<=1;z++)for(int x=0;x<=2;x++)result.add(capture(e,x,z));
         return result;
     }
+    static JsonArray captureMixed(LevelLightEngine e,boolean far){
+        var result=new JsonArray(); result.add(capture(e,0)); result.add(capture(e,far?1:-1)); result.add(capture(e,far?-1:0,far?0:-1)); return result;
+    }
     public static void main(String[] args)throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var w=new StagedGenerationLightEngineOracle();
@@ -94,18 +101,23 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.magmaOnly=magma;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
-        boolean late=args.length>1 && args[1].equals("late");
+        boolean late=args.length>1 && args[1].startsWith("late");
+        boolean lateMulti=args.length>1 && args[1].equals("late_multi");
+        w.lateFar=args.length>1 && args[1].equals("late_far");
         w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent || late);
         int radius=(w.mixed || w.wide)?2:1;
-        FakeChunk eastSection=null;
+        FakeChunk eastSection=null, westSection=null, farSection=null;
         for(int z=-radius;z<=radius;z++) for(int x=-radius;x<=radius;x++){
             var chunk=w.new TestChunk(x,z); w.chunks.put(new ChunkPos(x,z),chunk);
             var fake=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
             var container=new PalettedContainer<>(Blocks.AIR.defaultBlockState(),Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
             fake.section=new LevelChunkSection(container,null);
             if(x==1 && z==0) eastSection=fake;
+            if(x==-1 && z==0) westSection=fake;
+            if(x==2 && z==0) farSection=fake;
             for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(x==1 && z==0 && !magma) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
                 var initial=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,false);
                 fake.section.setBlockState(0,10,8,initial);
@@ -167,13 +179,33 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         }
         if(w.mixed){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
-            var first=new JsonArray(); first.add(capture(engine,0)); first.add(capture(engine,-1)); first.add(capture(engine,0,-1)); stages.add(first);
+            stages.add(captureMixed(engine,false));
             if(late){
+                if(w.lateFar){
+                    w.edits.put(new BlockPos(32,10,8),Blocks.STONE.defaultBlockState());
+                    w.edits.put(new BlockPos(33,10,8),Blocks.TORCH.defaultBlockState());
+                    farSection.section.setBlockState(0,10,8,Blocks.STONE.defaultBlockState());
+                    farSection.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+                }
                 w.chunks.get(new ChunkPos(1,0)).sources.fillFrom(eastSection);
                 engine.updateSectionStatus(SectionPos.of(1,0,0),false); drain(engine);
-                var registered=new JsonArray(); registered.add(capture(engine,0)); registered.add(capture(engine,-1)); registered.add(capture(engine,0,-1)); stages.add(registered);
+                stages.add(captureMixed(engine,w.lateFar));
                 engine.propagateLightSources(new ChunkPos(1,0)); drain(engine);
-                var activated=new JsonArray(); activated.add(capture(engine,0)); activated.add(capture(engine,-1)); activated.add(capture(engine,0,-1)); stages.add(activated);
+                stages.add(captureMixed(engine,w.lateFar));
+                if(w.lateFar){
+                    w.chunks.get(new ChunkPos(2,0)).sources.fillFrom(farSection);
+                    engine.updateSectionStatus(SectionPos.of(2,0,0),false); drain(engine);
+                    stages.add(captureMixed(engine,true));
+                    engine.propagateLightSources(new ChunkPos(2,0)); drain(engine);
+                    stages.add(captureMixed(engine,true));
+                }
+                if(lateMulti){
+                    w.chunks.get(new ChunkPos(-1,0)).sources.fillFrom(westSection);
+                    engine.updateSectionStatus(SectionPos.of(-1,0,0),false); drain(engine);
+                    var registeredWest=new JsonArray(); registeredWest.add(capture(engine,0)); registeredWest.add(capture(engine,-1)); registeredWest.add(capture(engine,0,-1)); stages.add(registeredWest);
+                    engine.propagateLightSources(new ChunkPos(-1,0)); drain(engine);
+                    var activatedWest=new JsonArray(); activatedWest.add(capture(engine,0)); activatedWest.add(capture(engine,-1)); activatedWest.add(capture(engine,0,-1)); stages.add(activatedWest);
+                }
                 Files.writeString(Path.of(args[0]),stages.toString()); return;
             }
             if(equivalent) w.edits.put(new BlockPos(15,10,-1),Blocks.RED_MUSHROOM.defaultBlockState());

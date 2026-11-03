@@ -486,6 +486,27 @@ mod tests {
                     .context("generated spawn heightmaps missing")?
                     .is_complete()
             );
+            let mut unavailable = std::collections::BTreeMap::<String, usize>::new();
+            let mut unsuitable = 0;
+            let mut candidates = 0;
+            for z in 0..16 {
+                for x in 0..16 {
+                    match session.generated_spawn_column_candidate(x, z, None, &targets) {
+                        Ok(Some(pos)) => {
+                            assert_eq!(pos.x, x);
+                            assert_eq!(pos.z, z);
+                            candidates += 1;
+                        }
+                        Ok(None) => unsuitable += 1,
+                        Err(error) => *unavailable.entry(format!("{error:#}")).or_default() += 1,
+                    }
+                }
+            }
+            assert!(
+                unavailable.is_empty(),
+                "unavailable spawn columns: {unavailable:?}"
+            );
+            assert_eq!(candidates + unsuitable, 256);
         }
         let mesher = crate::mesh_worker::MeshWorker::start(
             native_resources::packs::ResourceStack::open(&mesh_game)?,

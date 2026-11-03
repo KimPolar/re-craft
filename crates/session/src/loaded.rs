@@ -6039,6 +6039,25 @@ impl LoadedSession {
         let mut view = LoadedColumnSpawnView {
             session: self,
             ceiling_spawn_height,
+            generated: None,
+        };
+        crate::world_spawn::column_spawn(&mut view, x, z)
+    }
+
+    /// Evaluate one column from the caller's LIGHT-complete generated target
+    /// set. This only finds a ground candidate; it does not test the player's
+    /// bounding box or entities and must not be treated as a final spawn.
+    pub fn generated_spawn_column_candidate(
+        &self,
+        x: i32,
+        z: i32,
+        ceiling_spawn_height: Option<i32>,
+        generated_targets: &BTreeSet<ChunkPos>,
+    ) -> anyhow::Result<Option<IVec3>> {
+        let mut view = LoadedColumnSpawnView {
+            session: self,
+            ceiling_spawn_height,
+            generated: Some(generated_targets),
         };
         crate::world_spawn::column_spawn(&mut view, x, z)
     }
@@ -6055,6 +6074,7 @@ impl LoadedSession {
         let mut view = LoadedColumnSpawnView {
             session: self,
             ceiling_spawn_height,
+            generated: None,
         };
         crate::world_spawn::find_shared_spawn(&mut view, origin, candidates)
     }
@@ -8737,6 +8757,7 @@ impl LoadedSession {
         let mut view = LoadedColumnSpawnView {
             session: self,
             ceiling_spawn_height: support.ceiling_spawn_height,
+            generated: None,
         };
         // Keep individual ticks responsive even when many columns are unsuitable.
         let polled = active.search.poll(&mut view, 8);
@@ -18948,6 +18969,49 @@ struct LoadedDismountView<'a> {
 struct LoadedColumnSpawnView<'a> {
     session: &'a LoadedSession,
     ceiling_spawn_height: Option<i32>,
+    generated: Option<&'a BTreeSet<ChunkPos>>,
+}
+
+impl LoadedColumnSpawnView<'_> {
+    fn state_id(&self, pos: IVec3) -> anyhow::Result<BlockStateId> {
+        use anyhow::Context;
+        let Some(targets) = self.generated else {
+            return self.session.respawn_state_id(pos);
+        };
+        let chunk_pos = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        anyhow::ensure!(
+            targets.contains(&chunk_pos),
+            "generated spawn chunk is not a light-complete target"
+        );
+        let chunk = self
+            .session
+            .world
+            .chunks
+            .get(&chunk_pos)
+            .context("generated spawn chunk is missing")?;
+        anyhow::ensure!(
+            chunk.position == chunk_pos && chunk.block_light_correct,
+            "generated spawn chunk lighting is incomplete"
+        );
+        if pos.y < self.session.bounds.min_y || pos.y >= self.session.bounds.max_y {
+            return Ok(self.session.states[0]);
+        }
+        let section = chunk
+            .sections
+            .get(&i8::try_from(pos.y.div_euclid(16))?)
+            .context("generated spawn section is missing")?;
+        let blocks = section
+            .blocks
+            .as_ref()
+            .context("generated spawn block data is missing")?;
+        let index = pos.x.rem_euclid(16) as usize
+            + pos.z.rem_euclid(16) as usize * 16
+            + pos.y.rem_euclid(16) as usize * 256;
+        Ok(blocks[index])
+    }
 }
 
 fn spawn_blocks_clear(session: &LoadedSession, bounds: BoundingBox) -> anyhow::Result<bool> {
@@ -19069,11 +19133,35 @@ impl crate::world_spawn::SharedSpawnWorld for LoadedColumnSpawnView<'_> {
         x: i32,
         z: i32,
     ) -> anyhow::Result<crate::world_spawn::SpawnColumnHeights> {
-        self.session.spawn_column_heights(x, z)
+        use anyhow::Context;
+        if self.generated.is_none() {
+            return self.session.spawn_column_heights(x, z);
+        }
+        self.state_id(IVec3::new(x, self.session.bounds.min_y, z))?;
+        let pos = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        let maps = self
+            .session
+            .spawn_heightmaps
+            .get(&pos)
+            .context("generated spawn heightmaps are unavailable")?;
+        Ok(crate::world_spawn::SpawnColumnHeights {
+            motion_blocking: maps
+                .highest(SpawnHeightmapKind::MotionBlocking, x, z)
+                .context("motion heightmap is unavailable")?,
+            world_surface: maps
+                .highest(SpawnHeightmapKind::WorldSurface, x, z)
+                .context("surface heightmap is unavailable")?,
+            ocean_floor: maps
+                .highest(SpawnHeightmapKind::OceanFloor, x, z)
+                .context("ocean-floor heightmap is unavailable")?,
+        })
     }
     fn has_fluid(&mut self, pos: IVec3) -> anyhow::Result<bool> {
         use anyhow::Context;
-        let id = self.session.respawn_state_id(pos)?;
+        let id = self.state_id(pos)?;
         Ok(self
             .session
             .heightmap_flags
@@ -19085,7 +19173,7 @@ impl crate::world_spawn::SharedSpawnWorld for LoadedColumnSpawnView<'_> {
     }
     fn full_top_face(&mut self, pos: IVec3) -> anyhow::Result<bool> {
         use anyhow::Context;
-        let id = self.session.respawn_state_id(pos)?;
+        let id = self.state_id(pos)?;
         let shapes = self
             .session
             .shapes
@@ -19104,6 +19192,10 @@ impl crate::world_spawn::SharedSpawnWorld for LoadedColumnSpawnView<'_> {
         Ok(covers_full_face(shapes, IVec3::Y))
     }
     fn clear_player(&mut self, pos: IVec3) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.generated.is_none(),
+            "generated spawn entity collisions are unavailable"
+        );
         self.session.world_spawn_clear(pos)
     }
 }
@@ -44010,6 +44102,73 @@ pub(crate) mod tests {
             }),
             sections: Vec::new(),
         }
+    }
+
+    #[test]
+    fn generated_spawn_column_matches_loaded_and_rejects_missing_inputs() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let origin = session.origin;
+        let air = session.states[0];
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+        chunk.block_light_correct = true;
+        chunk.sections.insert(
+            1,
+            Arc::new(Section {
+                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                biomes: None,
+                block_light: None,
+                sky_light: None,
+            }),
+        );
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(home, None))
+            .unwrap();
+        let targets = BTreeSet::from([home]);
+        for z in 0..16 {
+            for x in 0..16 {
+                let (x, z) = (origin.x + x, origin.z + z);
+                assert_eq!(
+                    session
+                        .generated_spawn_column_candidate(x, z, None, &targets)
+                        .unwrap(),
+                    session.spawn_column_candidate(x, z, None).unwrap()
+                );
+            }
+        }
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set(IVec3::new(8, 3, 6), water));
+        assert_eq!(
+            session
+                .generated_spawn_column_candidate(origin.x + 8, origin.z + 6, None, &targets)
+                .unwrap(),
+            None
+        );
+        assert!(
+            session
+                .generated_spawn_column_candidate(origin.x + 16, origin.z, None, &targets)
+                .is_err()
+        );
+        let world = Arc::make_mut(&mut session.world);
+        Arc::make_mut(world.chunks.get_mut(&home).unwrap()).block_light_correct = false;
+        assert!(
+            session
+                .generated_spawn_column_candidate(origin.x + 8, origin.z + 6, None, &targets)
+                .is_err()
+        );
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.get_mut(&home).unwrap());
+        chunk.block_light_correct = true;
+        chunk.sections.remove(&0);
+        assert!(
+            session
+                .generated_spawn_column_candidate(origin.x + 8, origin.z + 6, None, &targets)
+                .is_err()
+        );
     }
 
     #[test]

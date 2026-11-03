@@ -3078,6 +3078,21 @@ mod tests {
                 maps.highest(SpawnHeightmapKind::MotionBlocking, 8, 8),
                 Some(15)
             );
+            assert_eq!(
+                session
+                    .generated_spawn_column_candidate(8, 8, None, &targets)
+                    .unwrap(),
+                Some(IVec3::new(8, 16, 8))
+            );
+            assert!(
+                session
+                    .generated_spawn_column_candidate(16, 8, None, &targets)
+                    .is_err()
+            );
+            assert!(
+                session.spawn_column_candidate(8, 8, None).is_err(),
+                "generated terrain must not pretend to be a full saved chunk"
+            );
             assert!(!generated.mesh.world.chunks[&center].block_light_correct);
             session.update(std::time::Duration::from_millis(50));
             assert_eq!(session.snapshot().tick, 1);

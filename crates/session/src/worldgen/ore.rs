@@ -16356,7 +16356,7 @@ mod tests {
         registry.extend(["minecraft:water".into(), "minecraft:magma_block".into()]);
         let prepared =
             PreparedDecoration::load(&mut MagmaData, &plan, &registry, &mut resolve_test).unwrap();
-        for unknown in [false, true] {
+        for neighbor in [None, Some("diamond_ore"), Some("oak_planks")] {
             let (mut terrain, tags, motion, _) = fixture();
             let center = ChunkPos { x: 0, z: 0 };
             let mut setup = terrain
@@ -16365,14 +16365,14 @@ mod tests {
             let mut water = state("water");
             water.properties.insert("level".into(), "0".into());
             setup.set_section_block([8, 8, 8], &water).unwrap();
-            if unknown {
+            if let Some(neighbor) = neighbor {
                 setup
-                    .set_section_block([9, 7, 8], &state("diamond_ore"))
+                    .set_section_block([9, 7, 8], &state(neighbor))
                     .unwrap();
             }
             setup.finish().unwrap();
             let before = terrain.snapshot();
-            if unknown {
+            if neighbor == Some("oak_planks") {
                 assert!(prepared.execute(&mut terrain, false).is_err());
                 assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
                 assert!(terrain.feature_postprocessing(center).is_none());
@@ -16382,6 +16382,12 @@ mod tests {
                     terrain.snapshot().block(8, 7, 8).unwrap().name,
                     "minecraft:magma_block"
                 );
+                if neighbor == Some("diamond_ore") {
+                    assert_eq!(
+                        terrain.snapshot().block(9, 7, 8).unwrap().name,
+                        "minecraft:diamond_ore"
+                    );
+                }
                 assert_eq!(
                     terrain.feature_postprocessing(center).unwrap().sections()[0],
                     [0x888]

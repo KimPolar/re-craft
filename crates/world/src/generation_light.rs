@@ -600,7 +600,14 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        for mode in ["inactive", "active"] {
+        for mode in [
+            "inactive",
+            "active",
+            "inactive_many",
+            "active_many",
+            "inactive_many_reverse",
+            "active_many_reverse",
+        ] {
             let path = temp.path().join("sections.json");
             let run = Command::new(java.join("java.exe"))
                 .arg("-classpath")
@@ -638,17 +645,24 @@ mod tests {
                     }
                 }
             }
-            let active = if mode == "active" {
+            let active = if mode.starts_with("active") {
                 std::collections::BTreeSet::from([ChunkPos { x: 2, z: 0 }])
             } else {
                 Default::default()
             };
+            let mut sections = vec![(ChunkPos { x: 1, z: 0 }, 0)];
+            if mode.contains("many") {
+                sections.push((ChunkPos { x: 1, z: 0 }, 1));
+                if mode.ends_with("reverse") {
+                    sections.reverse();
+                }
+            }
             let after = before
-                .allocate_nonempty_sections(&[(ChunkPos { x: 1, z: 0 }, 0)], &active)
+                .allocate_nonempty_sections(&sections, &active)
                 .unwrap();
             assert_eq!(
                 after.sky_light([32, 0, 0]),
-                Some(if mode == "active" { 15 } else { 0 })
+                Some(if mode.starts_with("active") { 15 } else { 0 })
             );
             for (index, pos) in covered.iter().enumerate() {
                 for y in -16..80 {

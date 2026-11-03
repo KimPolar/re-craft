@@ -534,9 +534,9 @@ impl FreshGenerationLightTracker {
 
 /// Generation lighting with monotonically activated source chunks. Most
 /// columns are calculated from the activation inputs; tracked inactive tree
-/// and cave-vine checks preserve their updated columns instead. Registration
-/// or activation overlapping that stored history is rejected until those
-/// operations also support incremental propagation. Section transitions,
+/// and cave-vine checks preserve their updated columns instead. Light
+/// activation overlapping that stored history is rejected until that
+/// operation also supports incremental propagation. Section removals,
 /// restored light and live-world edits are not supported here.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
@@ -688,19 +688,69 @@ impl StagedGenerationLightEngine {
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<()> {
         self.validate_active_world(&terrain.world)?;
+        ensure!(
+            !self.fresh.registered.contains_key(&pos),
+            "light chunk is already registered"
+        );
+        ensure!(
+            terrain.completed_decoration.contains(&pos),
+            "light initialization requires completed features"
+        );
+        let mut affected = Vec::with_capacity(9);
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
-                let affected = native_world::loaded::ChunkPos {
+                affected.push(native_world::loaded::ChunkPos {
                     x: pos.x.checked_add(dx).context("light X overflow")?,
                     z: pos.z.checked_add(dz).context("light Z overflow")?,
-                };
-                ensure!(
-                    !self.incremental_columns.contains_key(&affected),
-                    "light registration overlaps incremental light history"
-                );
+                });
             }
         }
+        let updated = if affected
+            .iter()
+            .any(|p| self.incremental_columns.contains_key(p))
+        {
+            let max_y = self
+                .fresh
+                .min_y
+                .checked_add(self.fresh.height)
+                .context("light height overflow")?;
+            let sections = native_world::generation_light::initialized_nonempty_sections(
+                &terrain.world,
+                self.fresh.min_y.div_euclid(16)..max_y.div_euclid(16),
+                [pos],
+                |state| generated_state_is_air(registry, state),
+            )
+            .context("registered light sections are missing or unsupported")?;
+            if sections.is_empty() {
+                None
+            } else {
+                let before = self.snapshot(terrain, affected.iter().copied(), registry)?;
+                let after = before
+                    .allocate_nonempty_sections(&sections, &self.active)
+                    .context(
+                        "registration light section allocation is incomplete or unsupported",
+                    )?;
+                Some(
+                    affected
+                        .iter()
+                        .map(|&p| {
+                            Ok((
+                                p,
+                                after
+                                    .complete_column(p)
+                                    .context("registration light column missing")?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+        } else {
+            None
+        };
         self.fresh.initialize_chunk(terrain, pos, registry)?;
+        if let Some(columns) = updated {
+            self.incremental_columns.extend(columns);
+        }
         if self.frozen_world.is_some() {
             self.frozen_world = Some(Arc::clone(&terrain.world));
         }

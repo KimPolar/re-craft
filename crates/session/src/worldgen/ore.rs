@@ -6751,15 +6751,10 @@ mod tests {
                 let next = ChunkPos { x: 2, z: 0 };
                 terrain.completed_decoration.insert(next);
                 let count = engine.fresh.registered.len();
-                let error = engine
-                    .initialize_chunk(&terrain, next, &registry)
-                    .unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("registration overlaps incremental light history")
-                );
-                assert_eq!(engine.fresh.registered.len(), count);
+                engine.initialize_chunk(&terrain, next, &registry).unwrap();
+                assert_eq!(engine.fresh.registered.len(), count + 1);
+                assert!(engine.initialize_chunk(&terrain, next, &registry).is_err());
+                assert_eq!(engine.fresh.registered.len(), count + 1);
             }
         }
     }
@@ -6810,6 +6805,8 @@ mod tests {
             "log_active_sparse_wide",
             "tree_empty_full_wide",
             "tree_empty_partial_wide",
+            "tree_empty_partial_register",
+            "tree_empty_partial_register_empty",
         ] {
             let path = temp.path().join("staged-wide.json");
             let output = Command::new(java.join("java.exe"))
@@ -6853,11 +6850,21 @@ mod tests {
                     .unwrap(),
             );
             section.blocks.as_mut().unwrap().fill(air);
+            if mode == "tree_empty_partial_register_empty" {
+                let west = ChunkPos { x: -1, z: 0 };
+                let section = Arc::make_mut(
+                    Arc::make_mut(world.chunks.get_mut(&west).unwrap())
+                        .sections
+                        .get_mut(&0)
+                        .unwrap(),
+                );
+                section.blocks.as_mut().unwrap().fill(air);
+            }
             if mode == "log_active_sparse_wide" {
                 let stone = world.intern_state(state("stone"));
                 world.set_block_id(31, 0, 0, stone).unwrap();
             }
-            let registered: Vec<_> = if mode == "tree_empty_partial_wide" {
+            let registered: Vec<_> = if mode.starts_with("tree_empty_partial_") {
                 vec![center, east]
             } else {
                 (-1..=1)
@@ -6902,11 +6909,27 @@ mod tests {
             let after = engine
                 .snapshot(&terrain, covered.iter().copied(), &registry)
                 .unwrap();
-            if mode == "tree_empty_partial_wide" {
+            if mode.starts_with("tree_empty_partial_") {
                 let outer = ChunkPos { x: 2, z: 0 };
                 assert_eq!(before.block_section_allocated(outer, 0), Some(false));
                 assert_eq!(after.block_section_allocated(outer, 0), Some(true));
             }
+            let registered = if mode.starts_with("tree_empty_partial_register") {
+                let west = ChunkPos { x: -1, z: 0 };
+                terrain.completed_decoration.insert(west);
+                let count = engine.incremental_columns.len();
+                engine.initialize_chunk(&terrain, west, &registry).unwrap();
+                if mode.ends_with("_empty") {
+                    assert_eq!(engine.incremental_columns.len(), count);
+                }
+                Some(
+                    engine
+                        .snapshot(&terrain, covered.iter().copied(), &registry)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             for (index, pos) in covered.iter().enumerate() {
                 for y in -16..32 {
                     for z in 0..16 {
@@ -6943,6 +6966,28 @@ mod tests {
                                 Some(expected[2][index][1][i]),
                                 "{mode} after sky {p:?}"
                             );
+                            if let Some(registered) = &registered {
+                                assert_eq!(
+                                    after.block_light(p),
+                                    Some(expected[3][index][0][i]),
+                                    "{mode} pending registration block {p:?}"
+                                );
+                                assert_eq!(
+                                    after.sky_light(p),
+                                    Some(expected[3][index][1][i]),
+                                    "{mode} pending registration sky {p:?}"
+                                );
+                                assert_eq!(
+                                    registered.block_light(p),
+                                    Some(expected[4][index][0][i]),
+                                    "{mode} registered block {p:?}"
+                                );
+                                assert_eq!(
+                                    registered.sky_light(p),
+                                    Some(expected[4][index][1][i]),
+                                    "{mode} registered sky {p:?}"
+                                );
+                            }
                         }
                     }
                 }

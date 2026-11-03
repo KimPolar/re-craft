@@ -48,7 +48,7 @@ public class SectionAllocationOracle implements LightChunkGetter, BlockGetter {
         Bootstrap.bootStrap();
         var world = new SectionAllocationOracle();
         var engine = new LevelLightEngine(world, true, true);
-        if (args.length > 1 && args[1].equals("active")) engine.setLightEnabled(new ChunkPos(2, 0), true);
+        if (args.length > 1 && args[1].startsWith("active")) engine.setLightEnabled(new ChunkPos(2, 0), true);
         engine.updateSectionStatus(SectionPos.of(0, 3, 0), false);
         drain(engine);
         var upper = new DataLayer();
@@ -59,7 +59,11 @@ public class SectionAllocationOracle implements LightChunkGetter, BlockGetter {
         drain(engine);
         var stages = new JsonArray();
         stages.add(capture(engine));
+        boolean many=args.length > 1 && args[1].contains("many");
+        boolean reverse=args.length > 1 && args[1].endsWith("reverse");
+        if(many && reverse) engine.updateSectionStatus(SectionPos.of(1, 1, 0), false);
         engine.updateSectionStatus(SectionPos.of(1, 0, 0), false);
+        if(many && !reverse) engine.updateSectionStatus(SectionPos.of(1, 1, 0), false);
         stages.add(capture(engine));
         drain(engine);
         stages.add(capture(engine));

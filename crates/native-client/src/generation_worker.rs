@@ -298,6 +298,7 @@ mod tests {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mesh_game = game.clone();
         let targets = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
         let worker = GenerationWorker::start(
             move || {
@@ -334,6 +335,27 @@ mod tests {
                 .chunks
                 .contains_key(&ChunkPos { x: 0, z: 0 })
         );
+        let mesher = crate::mesh_worker::MeshWorker::start(
+            native_resources::packs::ResourceStack::open(&mesh_game)?,
+        )?;
+        mesher.submit(generated.mesh);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mesh = loop {
+            if let Some(result) = mesher.try_result()? {
+                break result;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "generated mesh timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(mesh.revision, 7);
+        assert_eq!(mesh.targets.as_deref(), Some(&targets));
+        let scene = mesh.scene?;
+        assert_eq!(scene.chunks.len(), 1);
+        assert!(scene.chunks.contains_key(&ChunkPos { x: 0, z: 0 }));
+        assert!(scene.opaque_len() > 0, "generated terrain mesh is empty");
         Ok(())
     }
 }

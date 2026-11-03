@@ -534,7 +534,7 @@ impl FreshGenerationLightTracker {
 
 /// Generation lighting with monotonically activated source chunks. Most
 /// columns are calculated from the activation inputs; tracked inactive tree
-/// checks preserve their incrementally updated columns instead. Registration
+/// and cave-vine checks preserve their updated columns instead. Registration
 /// or activation overlapping that stored history is rejected until those
 /// operations also support incremental propagation. Section transitions,
 /// restored light and live-world edits are not supported here.

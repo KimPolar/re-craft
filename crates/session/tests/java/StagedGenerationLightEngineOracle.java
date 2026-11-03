@@ -122,13 +122,17 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyMany=args.length>1 && args[1].equals("sky_inactive_many");
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany);
         boolean skyDark=args.length>1 && args[1].equals("sky_inactive_dark");
+        boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
+        boolean vineActiveEmpty=vineActive && args[1].contains("_empty_");
+        boolean vineActiveMany=vineActive && args[1].equals("vine_active_many");
+        boolean vineActiveTransition=vineActive && args[1].endsWith("_plain_then_glowing");
         boolean emptyFullWide=args.length>1 && args[1].equals("tree_empty_full_wide");
         boolean emptyPartialWide=args.length>1 && args[1].equals("tree_empty_partial_wide");
         boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && args[1].equals("log_active_sparse_wide"));
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
-        w.emptyEast=treeEmpty || treeSparse;
+        w.emptyEast=treeEmpty || treeSparse || vineActiveEmpty;
         w.sparseEast=treeSparse;
         w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
         w.sparseShadow=skyShadow;
@@ -140,13 +144,13 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
         boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
-        boolean vine=args.length>1 && (args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
+        boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
         w.wide=full;
-        boolean plain=args.length>1 && args[1].startsWith("vine_plain");
-        boolean existing=args.length>1 && args[1].startsWith("vine_existing");
+        boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
+        boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing"));
         w.magmaOnly=magma;
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine || emptyPartialWide || (leafActive && !leafFull));
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || (vine && !vineActive) || emptyPartialWide || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         boolean late=args.length>1 && args[1].startsWith("late");
         boolean lateMulti=args.length>1 && args[1].equals("late_multi");
@@ -163,10 +167,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==0 && z==0) centerSection=fake;
             if(x==-1 && z==0) westSection=fake;
             if(x==2 && z==0) farSection=fake;
-            if(!((treeEmpty || treeSparse) && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
+            if(!((treeEmpty || treeSparse || vineActiveEmpty) && x==1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(treeSparse && x==1 && z==0) fake.section.setBlockState(w.sparseColumn || skyShadow?0:15,skyShadow?11:0,w.sparseColumn || skyShadow?8:0,Blocks.STONE.defaultBlockState());
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
-            if(x==1 && z==0 && !blockCase && !magma && !treeEmpty && !treeSparse) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !blockCase && !magma && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(blockCase && x==0 && z==0){ fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState()); fake.section.setBlockState(14,10,8,Blocks.TORCH.defaultBlockState()); }
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
@@ -229,6 +233,26 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(!LightEngine.hasDifferentLightProperties(old,Blocks.DARK_OAK_LOG.defaultBlockState()))throw new AssertionError("missing second light check");
                 engine.checkBlock(pos); stages.add(capture(engine)); drain(engine); stages.add(capture(engine));
             }
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
+        if(vineActive){
+            engine.propagateLightSources(new ChunkPos(0,0)); drain(engine); stages.add(captureWide(engine));
+            int[][] positions=vineActiveTransition ? new int[][]{{16,10,8},{16,10,8}} : vineActiveMany ? new int[][]{{16,10,8},{16,9,8},{16,8,8}} : new int[][]{{16,10,8}};
+            for(int i=0;i<positions.length;i++){
+                var p=positions[i]; var pos=new BlockPos(p[0],p[1],p[2]);
+                boolean berries=vineActiveTransition ? i==1 : vineActiveMany ? i!=1 : !plain;
+                var block=args[1].equals("vine_active_head") ? Blocks.CAVE_VINES : Blocks.CAVE_VINES_PLANT;
+                var state=block.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,berries);
+                if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
+                boolean wasEmpty=eastSection.section.hasOnlyAir();
+                var old=eastSection.section.setBlockState(0,p[1],p[2],state); w.edits.put(pos,state);
+                if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
+                w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
+                boolean changed=LightEngine.hasDifferentLightProperties(old,state);
+                if(changed!=berries)throw new AssertionError("unexpected active vine light check");
+                if(changed)engine.checkBlock(pos);
+            }
+            stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine));
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(vine){

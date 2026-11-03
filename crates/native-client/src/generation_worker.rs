@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known incomplete: registered tree leaves need incremental light updates"]
+    #[ignore = "known incomplete: registered tree changes need incremental light updates"]
     fn installed_overworld_expands_to_adjacent_lit_mesh() -> Result<()> {
         installed_overworld_generation(true)
     }

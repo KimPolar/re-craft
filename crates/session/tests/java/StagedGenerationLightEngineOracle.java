@@ -141,14 +141,15 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && args[1].equals("log_active_sparse_wide"));
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
-        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull);
+        boolean treeFreshEmpty=args.length>1 && args[1].equals("tree_fresh_empty");
+        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull || treeFreshEmpty);
         w.emptyEast=treeEmpty || treeSparse || vineActiveEmpty;
         w.sparseEast=treeSparse;
         w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
         w.sparseShadow=skyShadow;
         w.sparseMany=skyMany;
         boolean logActive=args.length>1 && args[1].equals("log_active_full");
-        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse);
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse || treeFreshEmpty);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
@@ -197,6 +198,21 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(args.length>1 && args[1].startsWith("tree_fresh_")){
+            var before=new JsonArray(); before.add(capture(engine,0)); before.add(capture(engine,1)); stages.add(before);
+            var state=(args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var pos=new BlockPos(16,10,8);
+            boolean wasEmpty=eastSection.section.hasOnlyAir();
+            var old=eastSection.section.setBlockState(0,10,8,state); w.edits.put(pos,state);
+            if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
+            w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,10,8);
+            if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing tree light check");
+            engine.checkBlock(pos); drain(engine);
+            var checked=new JsonArray(); checked.add(capture(engine,0)); checked.add(capture(engine,1)); stages.add(checked);
+            engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
+            var active=new JsonArray(); active.add(capture(engine,0)); active.add(capture(engine,1)); stages.add(active);
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(blockCase){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine); stages.add(captureWide(engine));
             String mode=args[1];

@@ -13,6 +13,7 @@ public class GenerationSolidPredicateOracle {
   public static void main(String[] args) {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var names=List.of("leaf_litter","seagrass","tall_seagrass","short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac","melon","pumpkin","brown_mushroom","red_mushroom","red_mushroom_block","brown_mushroom_block","mushroom_stem","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf","glow_lichen","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore");
+    names=new ArrayList<>(names); names.addAll(List.of("smooth_basalt","amethyst_block","budding_amethyst"));
     var pos=new BlockPos(8,8,8); var target=pos.offset(1,-2,3);
     for(var name:names){
       var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));

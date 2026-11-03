@@ -27,6 +27,11 @@ public class TreeGroundSolidityOracle {
       var state=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name)).defaultBlockState();
       if((name.equals("air") || name.equals("cave_air") || name.equals("void_air")) && state.useShapeForLightOcclusion())throw new AssertionError("air unexpectedly uses shape occlusion: "+name);
       out.printf("S %s %s %s%n",name,state.isSolidRender(),state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,Direction.UP));
+      if(name.equals("smooth_basalt") || name.equals("amethyst_block") || name.equals("budding_amethyst")) {
+        out.printf("F %s",name);
+        for(var direction:Direction.values()) out.printf(" %s",state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
+        out.println();
+      }
       if(PLANTS.contains(name)) {
         for(var variant:state.getBlock().getStateDefinition().getPossibleStates()){
           if(variant.isSolidRender())throw new AssertionError("plant renders solid: "+variant);

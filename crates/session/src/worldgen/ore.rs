@@ -73,6 +73,7 @@ pub struct DecorationRegion<'a> {
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
+    tree_block_write: bool,
     failed: bool,
 }
 
@@ -82,6 +83,7 @@ struct DecorationLightGuard<'a> {
     require_unchanged_light: bool,
     changed_blocks: BTreeSet<String>,
     changed_chunks: BTreeSet<ChunkPos>,
+    leaf_updates: BTreeSet<[i32; 3]>,
     non_air_counts: BTreeMap<(ChunkPos, i8), usize>,
 }
 
@@ -93,7 +95,7 @@ enum DecorationLightTracking<'a> {
     Staged(
         &'a mut FreshGenerationLightTracker,
         &'a native_resources::block_registry::GeneratedBlockRegistry,
-        Option<&'a Arc<World>>,
+        &'a mut Option<Arc<World>>,
         &'a BTreeSet<ChunkPos>,
     ),
 }
@@ -991,7 +993,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(DecorationLightTracking::Staged(
                 &mut engine.fresh,
                 registry,
-                engine.frozen_world.as_ref(),
+                &mut engine.frozen_world,
                 &engine.active,
             )),
         )
@@ -1061,6 +1063,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 require_unchanged_light,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
+                leaf_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
         }
@@ -1084,70 +1087,139 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .context("prepared ore is missing")?;
             results.push(region.place_planned_auto(self.plan, index, ore)?);
         }
-        if let Some(DecorationLightTracking::Staged(tracker, _, frozen, active)) = &light_tracking {
-            StagedGenerationLightEngine::validate_active_world_parts(
-                *frozen,
-                active,
-                tracker.min_y,
-                tracker.height,
-                &region.world,
-            )?;
-            let guard = region
-                .light_guard
-                .as_ref()
-                .context("staged light guard missing")?;
-            for (pos, before) in &tracker.registered {
-                let after = region
-                    .world
-                    .chunks
-                    .get(pos)
-                    .context("registered light chunk is missing")?;
-                if !Arc::ptr_eq(before, after) {
-                    ensure!(
-                        guard.changed_chunks.contains(pos),
-                        "untracked registered light chunk change"
-                    );
-                    ensure!(
-                        super::unchanged_chunk_light_behavior(
-                            &region.target.world,
-                            &region.world,
-                            before,
-                            after,
-                            tracker.min_y,
-                            tracker.height
-                        )?,
-                        "registered light behavior changed"
-                    );
-                }
-            }
-        }
-        let changes = region.light_guard.as_mut().map(|guard| {
-            (
-                std::mem::take(&mut guard.changed_blocks),
-                std::mem::take(&mut guard.changed_chunks),
-            )
-        });
-        region.finish()?;
-        let tracker = match &mut light_tracking {
-            Some(DecorationLightTracking::Fresh(tracker, _)) => Some(&mut **tracker),
-            Some(DecorationLightTracking::Staged(tracker, _, _, _)) => Some(&mut **tracker),
-            None => None,
-        };
-        if let Some(tracker) = tracker {
-            let (checked_blocks, changed_chunks) =
-                changes.expect("fresh tracker has a light guard");
-            for pos in changed_chunks {
-                *tracker
-                    .registered
-                    .get_mut(&pos)
-                    .expect("guarded chunk is registered") =
-                    Arc::clone(&terrain.world.chunks[&pos]);
-            }
-            tracker.checked_blocks.extend(checked_blocks);
-        }
+        finish_decoration_with_light(region, &mut light_tracking)?;
         terrain.completed_decoration.insert(center);
         Ok(results)
     }
+}
+
+fn finish_decoration_with_light(
+    mut region: DecorationRegion<'_>,
+    light_tracking: &mut Option<DecorationLightTracking<'_>>,
+) -> Result<()> {
+    let mut staged_replay = None;
+    if let Some(DecorationLightTracking::Staged(tracker, _, frozen, active)) = &*light_tracking {
+        let guard = region
+            .light_guard
+            .as_ref()
+            .context("staged light guard missing")?;
+        if !guard.leaf_updates.is_empty() {
+            let baseline = frozen.as_ref().unwrap_or(&region.target.world);
+            // Preserve the current registry lineage and replay only tracked
+            // registered writes into the earlier light input snapshot.
+            let mut world = region.world.clone();
+            world.chunks = baseline.chunks.clone();
+            let mut chunks = BTreeSet::new();
+            for &p in &guard.leaf_updates {
+                let pos = chunk(p);
+                ensure!(
+                    tracker.sky_sources.contains_key(&pos),
+                    "leaf update requires initialized sky sources"
+                );
+                let state = region
+                    .world
+                    .block(p[0], p[1], p[2])
+                    .context("updated leaf missing")?
+                    .clone();
+                let id = world.intern_state(state);
+                world
+                    .set_block_id(p[0], p[1], p[2], id)
+                    .map_err(|error| anyhow::anyhow!("cannot replay leaf update: {error:?}"))?;
+                chunks.insert(pos);
+            }
+            let max_y = tracker
+                .min_y
+                .checked_add(tracker.height)
+                .context("light height overflow")?;
+            let bounds = native_world::block_light::LightBounds::new(tracker.min_y, max_y)
+                .context("unsupported light bounds")?;
+            let mut sources = BTreeMap::new();
+            for pos in chunks {
+                let heights = native_world::sky_light::generated_chunk_sky_sources(
+                    &region.world,
+                    bounds,
+                    pos,
+                )
+                .context("updated sky sources unavailable")?;
+                sources.insert(pos, Arc::from(heights));
+            }
+            staged_replay = Some((Arc::new(world), sources));
+        }
+        let validation_world = staged_replay
+            .as_ref()
+            .map(|(world, _)| world)
+            .or_else(|| frozen.as_ref());
+        StagedGenerationLightEngine::validate_active_world_parts(
+            validation_world,
+            active,
+            tracker.min_y,
+            tracker.height,
+            &region.world,
+        )?;
+        for (pos, before) in &tracker.registered {
+            let after = region
+                .world
+                .chunks
+                .get(pos)
+                .context("registered light chunk is missing")?;
+            if !Arc::ptr_eq(before, after) {
+                ensure!(
+                    guard.changed_chunks.contains(pos),
+                    "untracked registered light chunk change"
+                );
+                let reference_world = validation_world.unwrap_or(&region.target.world);
+                let reference_chunk = reference_world
+                    .chunks
+                    .get(pos)
+                    .context("registered light reference missing")?;
+                ensure!(
+                    super::unchanged_chunk_light_behavior(
+                        reference_world,
+                        &region.world,
+                        reference_chunk,
+                        after,
+                        tracker.min_y,
+                        tracker.height
+                    )?,
+                    "registered light behavior changed"
+                );
+            }
+        }
+    }
+    let checked = region
+        .light_guard
+        .as_mut()
+        .map(|guard| std::mem::take(&mut guard.changed_blocks));
+    let committed = region.finish_with_world()?;
+    let tracker = match &mut *light_tracking {
+        Some(DecorationLightTracking::Fresh(tracker, _)) => Some(&mut **tracker),
+        Some(DecorationLightTracking::Staged(tracker, _, _, _)) => Some(&mut **tracker),
+        None => None,
+    };
+    if let Some(tracker) = tracker {
+        for (pos, current) in &mut tracker.registered {
+            *current = Arc::clone(
+                committed
+                    .chunks
+                    .get(pos)
+                    .expect("registered light chunk was validated"),
+            );
+        }
+        tracker
+            .checked_blocks
+            .extend(checked.expect("tracked decoration has a light guard"));
+    }
+    if let Some((world, sources)) = staged_replay {
+        let Some(DecorationLightTracking::Staged(tracker, _, frozen, _)) = &mut *light_tracking
+        else {
+            unreachable!("staged replay requires staged tracking");
+        };
+        tracker.sky_sources.extend(sources);
+        if frozen.is_some() {
+            **frozen = Some(world);
+        }
+    }
+    Ok(())
 }
 
 impl<'a> ScheduledDecorationFeature<'a> {
@@ -1429,6 +1501,7 @@ impl CarvedTerrainWorld {
             monster_entities,
             pending_monster_spawners: 0,
             light_guard: None,
+            tree_block_write: false,
             failed: false,
         })
     }
@@ -1609,6 +1682,10 @@ impl DecorationRegion<'_> {
 
     /// Publish this intermediate state; it is not a finished or saveable chunk.
     pub fn finish(self) -> Result<()> {
+        self.finish_with_world().map(drop)
+    }
+
+    fn finish_with_world(self) -> Result<Arc<World>> {
         ensure!(!self.failed, "cannot publish a failed generation attempt");
         ensure!(
             self.pending_monster_spawners == 0,
@@ -1664,7 +1741,7 @@ impl DecorationRegion<'_> {
         self.target.feature_postprocessing = self.feature_marks;
         self.target.generated_bee_nests = self.bee_nests;
         self.target.generated_monster_entities = self.monster_entities;
-        Ok(())
+        Ok(Arc::clone(&self.target.world))
     }
 
     fn read(&self, p: [i32; 3]) -> Result<BlockState> {
@@ -2379,7 +2456,10 @@ impl DecorationRegion<'_> {
                 || tree_edge_plant(&old)?.is_some(),
             "unsupported tree source effects"
         );
-        self.set_section_block(pos, state)?;
+        self.tree_block_write = true;
+        let result = self.set_section_block(pos, state);
+        self.tree_block_write = false;
+        result?;
         self.update_final_heightmaps(pos, state)?;
         Ok(())
     }
@@ -4881,10 +4961,16 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         .context("registered light old state is unknown")?;
                     let new_air = super::generated_state_is_air(guard.registry, state)
                         .context("registered light new state is unknown")?;
+                    let leaf_update = guard.require_unchanged_light
+                        && self.tree_block_write
+                        && old_air
+                        && state.name == "minecraft:dark_oak_leaves"
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+                        && tree_generated_leaf(state)?;
                     if guard.require_unchanged_light {
                         ensure!(
-                            old_air == new_air
-                                && native_world::block_light::same_light_behavior(&old, state)
+                            leaf_update
+                                || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {} -> {}",
                             old.name,
@@ -4895,7 +4981,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // no active sources, unchanged sky behavior and section
                     // allocation, the checked stored light remains zero.
                     ensure!(
-                        native_world::sky_light::same_sky_behavior(&old, state) == Some(true),
+                        leaf_update
+                            || native_world::sky_light::same_sky_behavior(&old, state)
+                                == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
                         old.name,
                         state.name
@@ -4934,6 +5022,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             .unwrap()
                             .non_air_counts
                             .insert(key, updated);
+                    }
+                    if leaf_update {
+                        self.light_guard.as_mut().unwrap().leaf_updates.insert(p);
                     }
                     self.light_guard
                         .as_mut()
@@ -5528,6 +5619,184 @@ mod tests {
             generated_monster_entities: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn active_leaf_update_matches_reinitialized_light() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("StagedGenerationLightEngineOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/StagedGenerationLightEngineOracle.java"),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let path = temp.path().join("leaf.json");
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        for mode in ["leaf_active", "leaf_active_full", "leaf_active_many"] {
+            let output = Command::new(java.join("java.exe"))
+                .arg("-classpath")
+                .arg(&cp)
+                .arg("StagedGenerationLightEngineOracle")
+                .arg(&path)
+                .arg(mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let expected: Vec<Vec<Vec<u8>>> =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let (mut terrain, tags, _, _) = fixture();
+            let block_names: BTreeSet<_> = registry.ids().map(str::to_owned).collect();
+            let motion = HeightmapTags::load(&mut Data, &block_names).unwrap();
+            let center = ChunkPos { x: 0, z: 0 };
+            let east = ChunkPos { x: 1, z: 0 };
+            let world = Arc::make_mut(&mut terrain.world);
+            let torch = world.intern_state(state("torch"));
+            world.set_block_id(17, 10, 8, torch).unwrap();
+            let registered: Vec<_> = if mode != "leaf_active" {
+                (-1..=1)
+                    .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+                    .collect()
+            } else {
+                vec![east]
+            };
+            terrain
+                .completed_decoration
+                .extend(registered.iter().copied());
+            if mode == "leaf_active" {
+                let mut leaf = state("dark_oak_leaves");
+                leaf.properties = BTreeMap::from([
+                    ("distance".into(), "7".into()),
+                    ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+                for tree_write in [false, true] {
+                    let mut draft = terrain
+                        .decoration_region(&tags, &motion, BTreeSet::from([east]))
+                        .unwrap();
+                    draft.light_guard = Some(DecorationLightGuard {
+                        registered: BTreeSet::from([east]),
+                        registry: &registry,
+                        require_unchanged_light: true,
+                        changed_blocks: BTreeSet::new(),
+                        changed_chunks: BTreeSet::new(),
+                        leaf_updates: BTreeSet::new(),
+                        non_air_counts: BTreeMap::new(),
+                    });
+                    if tree_write {
+                        draft.set_tree_block([16, 10, 8], &leaf, 19).unwrap();
+                        assert!(
+                            draft
+                                .light_guard
+                                .as_ref()
+                                .unwrap()
+                                .leaf_updates
+                                .contains(&[16, 10, 8])
+                        );
+                    } else {
+                        assert!(draft.set_section_block([16, 10, 8], &leaf).is_err());
+                    }
+                }
+            }
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            for &pos in &registered {
+                tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
+            }
+            let mut engine = StagedGenerationLightEngine::new(tracker);
+            let active = if mode != "leaf_active" { center } else { east };
+            let before = engine
+                .activate(&terrain, active, [center], &registry)
+                .unwrap();
+            let mut leaf = state("dark_oak_leaves");
+            leaf.properties = BTreeMap::from([
+                ("distance".into(), "7".into()),
+                ("persistent".into(), "false".into()),
+                ("waterlogged".into(), "false".into()),
+            ]);
+            let mut draft = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([east]))
+                .unwrap();
+            draft.light_guard = Some(DecorationLightGuard {
+                registered: BTreeSet::from([east]),
+                registry: &registry,
+                require_unchanged_light: true,
+                changed_blocks: BTreeSet::new(),
+                changed_chunks: BTreeSet::new(),
+                leaf_updates: BTreeSet::new(),
+                non_air_counts: BTreeMap::new(),
+            });
+            draft.set_tree_block([16, 10, 8], &leaf, 19).unwrap();
+            if mode == "leaf_active_many" {
+                for [x, y, z] in [[17, 11, 8], [31, 10, 4], [16, 9, 10]] {
+                    draft.set_tree_block([x, y, z], &leaf, 19).unwrap();
+                }
+            }
+            let mut tracking = Some(DecorationLightTracking::Staged(
+                &mut engine.fresh,
+                &registry,
+                &mut engine.frozen_world,
+                &engine.active,
+            ));
+            finish_decoration_with_light(draft, &mut tracking).unwrap();
+            drop(tracking);
+            let after = engine.snapshot(&terrain, [center], &registry).unwrap();
+            for (stage, actual) in [&before, &before, &after].into_iter().enumerate() {
+                for y in -16..32 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let p = [x, y, z];
+                            let index = ((y + 16) * 256 + z * 16 + x) as usize;
+                            assert_eq!(
+                                actual.block_light(p),
+                                Some(expected[stage][0][index]),
+                                "{mode} block {stage} {p:?}"
+                            );
+                            assert_eq!(
+                                actual.sky_light(p),
+                                Some(expected[stage][1][index]),
+                                "{mode} sky {stage} {p:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -6934,6 +7203,19 @@ mod tests {
             native_world::block_light::same_light_behavior(&deep, &state("tuff")),
             Some(true)
         );
+        for facing in ["north", "south", "east", "west"] {
+            for segments in 1..=4 {
+                let mut litter = state("leaf_litter");
+                litter.properties = BTreeMap::from([
+                    ("facing".into(), facing.into()),
+                    ("segment_amount".into(), segments.to_string()),
+                ]);
+                assert_eq!(
+                    native_world::block_light::same_light_behavior(&state("air"), &litter),
+                    Some(true)
+                );
+            }
+        }
         let (mut staged_terrain, _, _, _) = fixture();
         let world = Arc::make_mut(&mut staged_terrain.world);
         let template = world.chunks[&center].as_ref().clone();
@@ -7043,6 +7325,7 @@ mod tests {
                     require_unchanged_light: false,
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
+                    leaf_updates: BTreeSet::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -7072,6 +7355,7 @@ mod tests {
                     require_unchanged_light: false,
                     changed_blocks: BTreeSet::new(),
                     changed_chunks: BTreeSet::new(),
+                    leaf_updates: BTreeSet::new(),
                     non_air_counts: BTreeMap::new(),
                 });
                 let mut glowing = state("cave_vines_plant");
@@ -7386,6 +7670,7 @@ mod tests {
                 require_unchanged_light: false,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
+                leaf_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
             if initial == 0 {
@@ -7409,6 +7694,7 @@ mod tests {
                 require_unchanged_light: false,
                 changed_blocks: BTreeSet::new(),
                 changed_chunks: BTreeSet::new(),
+                leaf_updates: BTreeSet::new(),
                 non_air_counts: BTreeMap::new(),
             });
             let initial = region.read([16, 0, 0]).unwrap();

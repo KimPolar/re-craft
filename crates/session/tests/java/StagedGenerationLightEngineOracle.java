@@ -90,6 +90,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var engine=new LevelLightEngine(w,true,true);
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
+        boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany);
+        boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
         boolean magma=args.length>1 && (args[1].equals("magma") || args[1].equals("magma_queued") || args[1].equals("magma_exposed") || args[1].equals("magma_exposed_queued"));
@@ -100,7 +103,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean plain=args.length>1 && args[1].startsWith("vine_plain");
         boolean existing=args.length>1 && args[1].startsWith("vine_existing");
         w.magmaOnly=magma;
-        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
+        boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         boolean late=args.length>1 && args[1].startsWith("late");
         boolean lateMulti=args.length>1 && args[1].equals("late_multi");
@@ -133,6 +136,21 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
+        if(leafActive){
+            engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(capture(engine));
+            var state=Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            int[][] positions=leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
+            for(var p:positions){
+                var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();
+                var old=eastSection.section.setBlockState(p[0]-16,p[1],p[2],state); w.edits.put(pos,state);
+                if(wasEmpty!=eastSection.section.hasOnlyAir())throw new AssertionError("unexpected section transition");
+                w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,p[0]-16,p[1],p[2]);
+                if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing leaf light check");
+                engine.checkBlock(pos);
+            }
+            stages.add(capture(engine)); drain(engine); stages.add(capture(engine));
+            Files.writeString(Path.of(args[0]),stages.toString()); return;
+        }
         if(vine){
             var pos=new BlockPos(16,10,8);
             var state=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,!plain);
@@ -173,6 +191,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(ore){
             if(oreActive){
                 if(LightEngine.hasDifferentLightProperties(Blocks.DEEPSLATE.defaultBlockState(),Blocks.TUFF.defaultBlockState()))throw new AssertionError("deepslate and tuff light properties differ");
+                for(var litter:Blocks.LEAF_LITTER.getStateDefinition().getPossibleStates())
+                    if(LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),litter))throw new AssertionError("leaf litter requires light check: "+litter);
                 engine.propagateLightSources(new ChunkPos(1,0)); drain(engine); stages.add(capture(engine));
             }
             // OreFeature writes the section directly after INITIALIZE_LIGHT.

@@ -534,9 +534,8 @@ impl FreshGenerationLightTracker {
 
 /// Generation lighting with monotonically activated source chunks. Most
 /// columns are calculated from the activation inputs; tracked inactive tree
-/// and cave-vine checks preserve their updated columns instead. Light
-/// activation overlapping that stored history is rejected until that
-/// operation also supports incremental propagation. Section removals,
+/// and cave-vine checks preserve their updated columns instead. Activations
+/// overlapping that history use incremental propagation. Section removals,
 /// restored light and live-world edits are not supported here.
 pub struct StagedGenerationLightEngine {
     fresh: FreshGenerationLightTracker,
@@ -782,16 +781,14 @@ impl StagedGenerationLightEngine {
             "light chunk is not initialized"
         );
         ensure!(!self.active.contains(&pos), "light chunk is already active");
+        let mut overlaps = false;
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
                 let affected = native_world::loaded::ChunkPos {
                     x: pos.x.checked_add(dx).context("light X overflow")?,
                     z: pos.z.checked_add(dz).context("light Z overflow")?,
                 };
-                ensure!(
-                    !self.incremental_columns.contains_key(&affected),
-                    "light activation overlaps incremental light history"
-                );
+                overlaps |= self.incremental_columns.contains_key(&affected);
             }
         }
         if let Some(frozen) = &self.frozen_world {
@@ -822,6 +819,79 @@ impl StagedGenerationLightEngine {
                     ensure!(same, "light inputs changed before activation");
                 }
             }
+        }
+        let covered: BTreeSet<_> = covered.into_iter().collect();
+        if overlaps {
+            let mut area = Vec::with_capacity(25);
+            for dz in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    area.push(native_world::loaded::ChunkPos {
+                        x: pos.x.checked_add(dx).context("light X overflow")?,
+                        z: pos.z.checked_add(dz).context("light Z overflow")?,
+                    });
+                }
+            }
+            let light_world = self.frozen_world.as_deref().unwrap_or(&terrain.world);
+            let max_y = self
+                .fresh
+                .min_y
+                .checked_add(self.fresh.height)
+                .context("light height overflow")?;
+            let bounds = native_world::block_light::LightBounds::new(self.fresh.min_y, max_y)
+                .context("unsupported light bounds")?;
+            let before = self.snapshot(terrain, area.iter().copied(), registry)?;
+            let after_block = native_world::generation_block_light::activate_generated_block_light(
+                light_world,
+                bounds,
+                &before,
+                pos,
+            )
+            .context("incremental block light activation inputs are incomplete or unsupported")?;
+            let after = if self.fresh.has_skylight {
+                native_world::generation_sky_light::activate_generated_sky_light(
+                    light_world,
+                    bounds,
+                    &after_block,
+                    pos,
+                    &self.fresh.sky_sources,
+                )
+                .with_context(|| {
+                    let missing_sources: Vec<_> = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+                        .into_iter()
+                        .filter_map(|(dx, dz)| {
+                            let p = native_world::loaded::ChunkPos {
+                                x: pos.x.checked_add(dx)?,
+                                z: pos.z.checked_add(dz)?,
+                            };
+                            (!self.fresh.sky_sources.contains_key(&p)).then_some(p)
+                        })
+                        .collect();
+                    let missing_sections: Vec<_> = (self.fresh.min_y.div_euclid(16) - 1
+                        ..=max_y.div_euclid(16))
+                        .filter(|&sy| after_block.sky_section_allocated(pos, sy) != Some(true))
+                        .collect();
+                    format!("incremental sky light activation inputs are incomplete or unsupported: missing sources {missing_sources:?}, missing target sections {missing_sections:?}")
+                })?
+            } else {
+                after_block
+            };
+            let mut result = self.snapshot(terrain, covered.iter().copied(), registry)?;
+            let mut updated = Vec::with_capacity(area.len());
+            for &column in &area {
+                let value = after
+                    .complete_column(column)
+                    .context("activation light column missing")?;
+                if covered.contains(&column) {
+                    result.insert_complete_column(column, value.clone());
+                }
+                updated.push((column, value));
+            }
+            self.incremental_columns.extend(updated);
+            self.active.insert(pos);
+            if self.frozen_world.is_none() {
+                self.frozen_world = Some(Arc::clone(&terrain.world));
+            }
+            return Ok(result);
         }
         let mut active = self.active.clone();
         active.insert(pos);

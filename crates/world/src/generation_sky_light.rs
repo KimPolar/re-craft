@@ -176,10 +176,15 @@ fn apply_sky_updates(
             Some(*sources.get(&pos)?.get(index)?)
         };
         let light = bounds.light_range();
+        let mut found_section = false;
         for sy in (light.start.div_euclid(16)..light.end.div_euclid(16)).rev() {
             if !draft.sky_section_allocated(chunk, sy)? {
-                return None;
+                if found_section {
+                    return None;
+                }
+                continue;
             }
+            found_section = true;
             for z in 0..16 {
                 for x in 0..16 {
                     let wx = base_x.checked_add(x)?;
@@ -217,6 +222,9 @@ fn apply_sky_updates(
                     }
                 }
             }
+        }
+        if !found_section {
+            return None;
         }
     }
     let mut properties = HashMap::<u32, LightProperties>::new();

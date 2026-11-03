@@ -27,8 +27,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean sparseShadow;
     boolean sparseMany;
     boolean blockCase;
+    boolean tallSky;
     public int getMinY(){ return 0; }
-    public int getHeight(){ return 16; }
+    public int getHeight(){ return tallSky ? 64 : 16; }
     public BlockGetter getLevel(){ return this; }
     public LightChunk getChunkForLighting(int x,int z){ return chunks.get(new ChunkPos(x,z)); }
     public BlockEntity getBlockEntity(BlockPos p){ return null; }
@@ -125,13 +126,15 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.blockCase=blockCase;
         boolean skyMany=args.length>1 && (args[1].equals("sky_inactive_many") || args[1].equals("sky_inactive_activate_many"));
         boolean skyActivate=args.length>1 && args[1].startsWith("sky_inactive_activate");
+        w.tallSky=args.length>1 && args[1].equals("sky_inactive_activate_tall");
         boolean skyDark=args.length>1 && (args[1].equals("sky_inactive_dark") || args[1].equals("sky_inactive_activate_dark"));
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineActiveEmpty=vineActive && args[1].contains("_empty_");
         boolean vineActiveMany=vineActive && args[1].equals("vine_active_many");
         boolean vineActiveTransition=vineActive && args[1].endsWith("_plain_then_glowing");
-        boolean emptyFullWide=args.length>1 && args[1].equals("tree_empty_full_wide");
+        boolean stagedActivate=args.length>1 && args[1].equals("tree_empty_full_activate");
+        boolean emptyFullWide=args.length>1 && (args[1].equals("tree_empty_full_wide") || stagedActivate);
         boolean registerAfter=args.length>1 && args[1].startsWith("tree_empty_partial_register");
         w.emptyWest=registerAfter && args[1].endsWith("_empty");
         boolean emptyPartialWide=args.length>1 && (args[1].equals("tree_empty_partial_wide") || registerAfter);
@@ -153,7 +156,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
         boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
-        w.wide=full || blockCase || skyActivate;
+        w.wide=full || blockCase || skyActivate || stagedActivate;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing"));
         w.magmaOnly=magma;
@@ -237,6 +240,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(skyMany)engine.checkBlock(new BlockPos(16,10,8));
             if(skyWide && args.length>2) Files.writeString(Path.of(args[2]),pendingSkyChecks(engine).toString());
             stages.add(skyWide ? captureWide(engine) : capture(engine)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
+            if(stagedActivate){ engine.propagateLightSources(new ChunkPos(1,0)); stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine)); }
             if(skyActivate){ engine.propagateLightSources(new ChunkPos(1,0)); stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine)); }
             if(registerAfter){
                 w.chunks.get(new ChunkPos(-1,0)).sources.fillFrom(westSection);

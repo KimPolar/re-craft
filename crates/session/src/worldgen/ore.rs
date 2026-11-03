@@ -5990,6 +5990,7 @@ mod tests {
             "sky_inactive_activate",
             "sky_inactive_activate_dark",
             "sky_inactive_activate_many",
+            "sky_inactive_activate_tall",
         ] {
             let path = temp.path().join("sky.json");
             let order_path = temp.path().join("sky-order.json");
@@ -6053,6 +6054,22 @@ mod tests {
                 }
             }
             let air = world.intern_state(state("air"));
+            if mode.ends_with("_tall") {
+                for chunk in world.chunks.values_mut() {
+                    let chunk = Arc::make_mut(chunk);
+                    for sy in 1..4 {
+                        chunk.sections.insert(
+                            sy,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([air; BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        );
+                    }
+                }
+            }
             let section = Arc::make_mut(
                 Arc::make_mut(world.chunks.get_mut(&east).unwrap())
                     .sections
@@ -6101,7 +6118,11 @@ mod tests {
                 !mode.ends_with("_dark"),
                 "{mode}"
             );
-            let bounds = native_world::block_light::LightBounds::new(0, 16).unwrap();
+            let bounds = native_world::block_light::LightBounds::new(
+                0,
+                if mode.ends_with("_tall") { 64 } else { 16 },
+            )
+            .unwrap();
             assert!(
                 native_world::generation_sky_light::check_inactive_sky_block(
                     world,
@@ -6859,11 +6880,9 @@ mod tests {
                     .activate(&terrain, east, [center], &registry)
                     .err()
                     .unwrap();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("activation overlaps incremental light history")
-                );
+                assert!(error.to_string().contains(
+                    "incremental sky light activation inputs are incomplete or unsupported"
+                ));
                 assert_eq!(engine.active, old_active);
                 let next = ChunkPos { x: 2, z: 0 };
                 terrain.completed_decoration.insert(next);
@@ -6924,6 +6943,7 @@ mod tests {
             "tree_empty_partial_wide",
             "tree_empty_partial_register",
             "tree_empty_partial_register_empty",
+            "tree_empty_full_activate",
         ] {
             let path = temp.path().join("staged-wide.json");
             let output = Command::new(java.join("java.exe"))
@@ -6981,7 +7001,11 @@ mod tests {
                 let stone = world.intern_state(state("stone"));
                 world.set_block_id(31, 0, 0, stone).unwrap();
             }
-            let registered: Vec<_> = if mode.starts_with("tree_empty_partial_") {
+            let registered: Vec<_> = if mode == "tree_empty_full_activate" {
+                (-2..=2)
+                    .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+                    .collect()
+            } else if mode.starts_with("tree_empty_partial_") {
                 vec![center, east]
             } else {
                 (-1..=1)
@@ -7047,6 +7071,15 @@ mod tests {
             } else {
                 None
             };
+            let activated = if mode == "tree_empty_full_activate" {
+                Some(
+                    engine
+                        .activate(&terrain, east, covered.iter().copied(), &registry)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             for (index, pos) in covered.iter().enumerate() {
                 for y in -16..32 {
                     for z in 0..16 {
@@ -7103,6 +7136,28 @@ mod tests {
                                     registered.sky_light(p),
                                     Some(expected[4][index][1][i]),
                                     "{mode} registered sky {p:?}"
+                                );
+                            }
+                            if let Some(activated) = &activated {
+                                assert_eq!(
+                                    after.block_light(p),
+                                    Some(expected[3][index][0][i]),
+                                    "{mode} pending activation block {p:?}"
+                                );
+                                assert_eq!(
+                                    after.sky_light(p),
+                                    Some(expected[3][index][1][i]),
+                                    "{mode} pending activation sky {p:?}"
+                                );
+                                assert_eq!(
+                                    activated.block_light(p),
+                                    Some(expected[4][index][0][i]),
+                                    "{mode} activation block {p:?}"
+                                );
+                                assert_eq!(
+                                    activated.sky_light(p),
+                                    Some(expected[4][index][1][i]),
+                                    "{mode} activation sky {p:?}"
                                 );
                             }
                         }

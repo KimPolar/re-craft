@@ -94,7 +94,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.magmaOnly=magma;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || vine);
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
-        w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent);
+        boolean late=args.length>1 && args[1].equals("late");
+        w.mixed=args.length>1 && (args[1].equals("mixed") || equivalent || late);
         int radius=(w.mixed || w.wide)?2:1;
         FakeChunk eastSection=null;
         for(int z=-radius;z<=radius;z++) for(int x=-radius;x<=radius;x++){
@@ -113,7 +114,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
             if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
-            if((!partial && !w.mixed) || (x==1 && z==0) || (w.mixed && x==0 && z==0)){
+            if((!partial && !w.mixed) || (x==1 && z==0 && !late) || (w.mixed && x==0 && z==0)){
                 chunk.sources.fillFrom(fake);
                 engine.updateSectionStatus(SectionPos.of(x,0,z),false);
             }
@@ -167,6 +168,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         if(w.mixed){
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
             var first=new JsonArray(); first.add(capture(engine,0)); first.add(capture(engine,-1)); first.add(capture(engine,0,-1)); stages.add(first);
+            if(late){
+                w.chunks.get(new ChunkPos(1,0)).sources.fillFrom(eastSection);
+                engine.updateSectionStatus(SectionPos.of(1,0,0),false); drain(engine);
+                var registered=new JsonArray(); registered.add(capture(engine,0)); registered.add(capture(engine,-1)); registered.add(capture(engine,0,-1)); stages.add(registered);
+                engine.propagateLightSources(new ChunkPos(1,0)); drain(engine);
+                var activated=new JsonArray(); activated.add(capture(engine,0)); activated.add(capture(engine,-1)); activated.add(capture(engine,0,-1)); stages.add(activated);
+                Files.writeString(Path.of(args[0]),stages.toString()); return;
+            }
             if(equivalent) w.edits.put(new BlockPos(15,10,-1),Blocks.RED_MUSHROOM.defaultBlockState());
             else w.edits.put(new BlockPos(-1,10,8),Blocks.STONE.defaultBlockState());
             engine.propagateLightSources(new ChunkPos(1,0)); drain(engine);

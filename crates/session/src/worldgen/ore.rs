@@ -5279,7 +5279,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&expected_path).unwrap()).unwrap();
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
-        for mode in ["mixed", "equivalent"] {
+        for mode in ["mixed", "equivalent", "late"] {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
@@ -5320,25 +5320,56 @@ mod tests {
             mixed_tracker
                 .initialize_chunk(&mixed_terrain, center, &registry)
                 .unwrap();
-            mixed_tracker
-                .initialize_chunk(&mixed_terrain, east, &registry)
-                .unwrap();
+            if mode != "late" {
+                mixed_tracker
+                    .initialize_chunk(&mixed_terrain, east, &registry)
+                    .unwrap();
+            }
             let mut mixed_engine = StagedGenerationLightEngine::new(mixed_tracker);
             let mixed_first = mixed_engine
                 .activate(&mixed_terrain, center, [center, west, north], &registry)
                 .unwrap();
-            let world = Arc::make_mut(&mut mixed_terrain.world);
-            if mode == "mixed" {
-                let stone = world.intern_state(state("stone"));
-                world.set_block_id(-1, 10, 8, stone).unwrap();
+            let registered = if mode == "late" {
+                let frozen = Arc::clone(&mixed_terrain.world);
+                Arc::make_mut(&mut mixed_terrain.world).dimension_type = Some("changed".into());
+                assert!(
+                    mixed_engine
+                        .initialize_static_chunk(&mixed_terrain, east, &registry)
+                        .is_err()
+                );
+                mixed_terrain.world = frozen;
+                mixed_engine
+                    .initialize_static_chunk(&mixed_terrain, east, &registry)
+                    .unwrap();
+                assert!(
+                    mixed_engine
+                        .initialize_static_chunk(&mixed_terrain, east, &registry)
+                        .is_err()
+                );
+                Some(
+                    mixed_engine
+                        .snapshot(&mixed_terrain, [center, west, north], &registry)
+                        .unwrap(),
+                )
             } else {
-                let mushroom = world.intern_state(state("red_mushroom"));
-                world.set_block_id(15, 10, -1, mushroom).unwrap();
-            }
+                let world = Arc::make_mut(&mut mixed_terrain.world);
+                if mode == "mixed" {
+                    let stone = world.intern_state(state("stone"));
+                    world.set_block_id(-1, 10, 8, stone).unwrap();
+                } else {
+                    let mushroom = world.intern_state(state("red_mushroom"));
+                    world.set_block_id(15, 10, -1, mushroom).unwrap();
+                }
+                None
+            };
             let mixed_second = mixed_engine
                 .activate(&mixed_terrain, east, [center, west, north], &registry)
                 .unwrap();
-            for (stage, actual) in [&mixed_first, &mixed_second].into_iter().enumerate() {
+            let actual_stages = [&mixed_first]
+                .into_iter()
+                .chain(registered.as_ref())
+                .chain([&mixed_second]);
+            for (stage, actual) in actual_stages.enumerate() {
                 for (column, (base_x, base_z)) in
                     [(0, 0), (-16, 0), (0, -16)].into_iter().enumerate()
                 {

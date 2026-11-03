@@ -532,11 +532,11 @@ impl FreshGenerationLightTracker {
     }
 }
 
-/// A frozen batch of initialized generation chunks with monotonically
-/// activated light sources. This is separate from the live world: it cannot
-/// accept section updates, registered-chunk edits, restored light or new registrations.
-/// Every initialized chunk that affects the batch must be registered before
-/// the tracker is moved here. Requested columns need their 3x3 neighborhood;
+/// A static batch of generation chunks with monotonically activated light
+/// sources. This is separate from the live world: it cannot accept section
+/// updates, registered-chunk edits or restored light. Additional completed
+/// chunks can be registered only while the terrain revision stays unchanged.
+/// Requested columns need their 3x3 neighborhood;
 /// uninitialized chunks must retain their default sky-source heightmaps.
 /// Once propagation starts, reads use the blocks seen at activation. Further
 /// activation requires its 3x3 input neighborhood to retain equivalent light
@@ -601,6 +601,24 @@ impl StagedGenerationLightEngine {
             active: BTreeSet::new(),
             frozen_world: None,
         }
+    }
+
+    /// Register a completed chunk in the same immutable terrain revision used
+    /// by earlier activations. Changes to terrain after activation still need
+    /// a mutable light engine and must not be mixed into this replay.
+    pub fn initialize_static_chunk(
+        &mut self,
+        terrain: &CarvedTerrainWorld,
+        pos: native_world::loaded::ChunkPos,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        ensure!(
+            self.frozen_world
+                .as_ref()
+                .is_none_or(|world| Arc::ptr_eq(world, &terrain.world)),
+            "light terrain changed since propagation"
+        );
+        self.fresh.initialize_chunk(terrain, pos, registry)
     }
 
     /// Capture a revision without modifying the world or a previous snapshot.
@@ -2787,6 +2805,7 @@ mod tests {
             .unwrap();
         let center = ChunkPos { x: 0, z: 0 };
         let east = ChunkPos { x: 1, z: 0 };
+        let later = ChunkPos { x: 2, z: 0 };
         for z in -1..=1 {
             for x in -1..=1 {
                 batch
@@ -2794,6 +2813,7 @@ mod tests {
                     .unwrap();
             }
         }
+        batch.request_features(later).unwrap();
         assert!(batch.seal_for_light_propagation().is_err());
         let mut classify = |v: &Value| -> Result<CarverBlockState> {
             let id = v
@@ -2903,6 +2923,21 @@ mod tests {
         assert_eq!(after.sky_light([8, 8, 8]), Some(0));
         assert_eq!(before.block_light([8, 8, 8]), Some(0));
         assert!(!batch.snapshot().unwrap().chunks[&center].block_light_correct);
+        assert_eq!(
+            batch.schedule().completed(later),
+            Some(schedule::GenerationStage::Features)
+        );
+        let cached = batch.lit_snapshot([center]).unwrap();
+        batch.request_light_initialization(later).unwrap();
+        assert_eq!(
+            batch.step(&mut data, &mut classify, &mut resolve).unwrap(),
+            Some((later, schedule::GenerationStage::InitializeLight))
+        );
+        assert!(batch.is_complete());
+        assert!(!Arc::ptr_eq(
+            &cached,
+            &batch.lit_snapshot([center]).unwrap()
+        ));
         let (schedule, _, terrain, light) = batch.into_parts().unwrap();
         assert_eq!(
             schedule.completed(center),

@@ -178,16 +178,18 @@ impl FreshTerrainBatch {
             self.light_registry.is_some(),
             "light initialization is not configured"
         );
-        ensure!(
-            self.light_engine.is_none(),
-            "terrain batch is sealed for light propagation"
-        );
+        if self.light_engine.is_some() {
+            ensure!(
+                self.schedule.completed(pos) == Some(GenerationStage::Features),
+                "sealed batches can only initialize already decorated chunks"
+            );
+        }
         self.schedule.request(pos, GenerationStage::InitializeLight)
     }
 
     /// Finish all requested registrations before entering a frozen light
-    /// batch. After this, terrain, decoration and registration requests are
-    /// rejected until a mutable incremental engine is implemented.
+    /// batch. After this, terrain and decoration requests are rejected;
+    /// already decorated chunks may be registered if terrain stays unchanged.
     pub fn seal_for_light_propagation(&mut self) -> Result<()> {
         ensure!(
             self.is_complete(),
@@ -218,7 +220,7 @@ impl FreshTerrainBatch {
     }
 
     /// Request LIGHT only when its complete accumulated dependencies have
-    /// already been generated and registered before the seal.
+    /// already been generated and registered.
     pub fn request_light(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(
             !self.failed && self.light_engine.is_some(),
@@ -507,6 +509,17 @@ impl FreshTerrainBatch {
                     .light_registry
                     .as_ref()
                     .context("light registry is missing")?;
+                if let Some(engine) = &mut self.light_engine {
+                    ensure!(
+                        self.schedule.ready(pos, GenerationStage::InitializeLight),
+                        "light initialization dependencies are incomplete"
+                    );
+                    engine.initialize_static_chunk(terrain, pos, registry)?;
+                    self.schedule
+                        .complete(pos, GenerationStage::InitializeLight)?;
+                    self.lit_cache = None;
+                    return Ok(());
+                }
                 if self.light_tracker.is_none() {
                     let config = self
                         .decoration

@@ -351,6 +351,22 @@ fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidS
 }
 
 impl GeneratedBlockView<'_> {
+    fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
+        if !state.name.starts_with("minecraft:")
+            || !state.name.ends_with("_slab")
+            || self.heightmap_tags?.for_block(&state.name).is_err()
+            || native_world::collision::slab_stair_solid(state) != Some(true)
+        {
+            return None;
+        }
+        let top = match state.properties.get("type")?.as_str() {
+            "top" => true,
+            "bottom" => false,
+            _ => return None,
+        };
+        Some((top, state.properties.get("waterlogged")? == "true"))
+    }
+
     fn read(&self, pos: [i32; 3]) -> Result<BlockState> {
         if !(self.min_y..self.max_y).contains(&pos[1]) {
             return Ok(BlockState {
@@ -377,6 +393,9 @@ impl GeneratedBlockView<'_> {
         let Ok(state) = self.read(pos.to_array()) else {
             return Cell::Unknown;
         };
+        if let Some((top, waterlogged)) = self.slab(&state) {
+            return Cell::Slab { top, waterlogged };
+        }
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             return liquid_state(&state)
                 .ok()
@@ -547,19 +566,28 @@ impl GeneratedBlockView<'_> {
                     glam::IVec3::Z,
                 ]
                 .contains(&direction);
-            ensure!(
-                valid_direction
-                    && matches!(change.block, ChangedBlock::Fluid(next)
-                    if next.kind == FluidKind::Water
-                        && ((direction == glam::IVec3::NEG_Y && !next.source && next.falling && next.amount == 8)
-                            || (direction != glam::IVec3::NEG_Y && !next.falling
+            let valid_target = match change.block {
+                ChangedBlock::Fluid(next) => {
+                    matches!(self.fluid_cell_for_spread(change.position), Cell::Air)
+                        && next.kind == FluidKind::Water
+                        && ((direction == glam::IVec3::NEG_Y
+                            && !next.source
+                            && next.falling
+                            && next.amount == 8)
+                            || (direction != glam::IVec3::NEG_Y
+                                && !next.falling
                                 && ((next.source && next.amount == 8)
-                                    || (!next.source && (1..=7).contains(&next.amount)))))),
-                "generated fluid tick requires unsupported block callbacks"
-            );
+                                    || (!next.source && (1..=7).contains(&next.amount)))))
+                }
+                ChangedBlock::WaterloggedSlab { top } => matches!(
+                    self.fluid_cell_for_spread(change.position),
+                    Cell::Slab { top: actual, waterlogged: false } if actual == top
+                ),
+                _ => false,
+            };
             ensure!(
-                matches!(self.fluid_cell_for_spread(change.position), Cell::Air),
-                "water spread cannot replace the existing block yet"
+                valid_direction && valid_target,
+                "generated fluid tick requires unsupported block callbacks"
             );
         }
         let settings = Settings {
@@ -623,6 +651,20 @@ impl GeneratedBlockView<'_> {
     ) -> Result<()> {
         use native_world::fluid_sim::Cell;
         let old = self.read(target.to_array())?;
+        if matches!(
+            self.fluid_cell(target),
+            Cell::Slab {
+                waterlogged: false,
+                ..
+            }
+        ) {
+            ensure!(fluid.source && !fluid.falling, "slab requires source water");
+            let mut next = old.clone();
+            next.properties.insert("waterlogged".into(), "true".into());
+            self.apply_water_change(target, &old, &next)?;
+            self.schedule_contained_water(target.to_array())?;
+            return Ok(());
+        }
         ensure!(
             matches!(self.fluid_cell(target), Cell::Air),
             "water target is not air"
@@ -643,6 +685,16 @@ impl GeneratedBlockView<'_> {
         self.apply_water_change(target, &old, &next)
     }
 
+    fn schedule_contained_water(&mut self, pos: [i32; 3]) -> Result<()> {
+        ensure!(
+            self.ticks
+                .schedule(TickRegistry::Fluid, "minecraft:water", pos, 5, 0)?
+                != ScheduleOutcome::MissingChunk,
+            "contained water tick container is missing"
+        );
+        Ok(())
+    }
+
     fn apply_water_change(
         &mut self,
         target: glam::IVec3,
@@ -657,9 +709,12 @@ impl GeneratedBlockView<'_> {
             "water uses unsupported lava callbacks"
         );
         let next_fluid = liquid_state(next)?;
+        let next_slab = self.slab(next);
+        let contained_source = next_slab.is_some_and(|(_, wet)| wet);
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
-                || (next.name == "minecraft:air" && next.properties.is_empty()),
+                || (next.name == "minecraft:air" && next.properties.is_empty())
+                || contained_source,
             "unsupported water replacement state"
         );
         let old_air = matches!(
@@ -669,10 +724,12 @@ impl GeneratedBlockView<'_> {
         ensure!(
             old_air
                 || liquid_state(old)?
-                    .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water),
+                    .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
+                || (self.slab(old).is_some_and(|(_, wet)| !wet)
+                    && next_slab.is_some_and(|(_, wet)| wet)),
             "unsupported original water state"
         );
-        let next_air = next_fluid.is_none();
+        let next_air = next.name == "minecraft:air";
         let chunk_pos = ChunkPos {
             x: target.x.div_euclid(16),
             z: target.z.div_euclid(16),
@@ -720,7 +777,10 @@ impl GeneratedBlockView<'_> {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
             ensure!(
-                matches!(self.fluid_cell(p), Cell::Air | Cell::Solid | Cell::Fluid(_)),
+                matches!(
+                    self.fluid_cell(p),
+                    Cell::Air | Cell::Solid | Cell::Fluid(_) | Cell::Slab { .. }
+                ),
                 "unsupported water neighbor callback"
             );
             if let Some(fluid) = liquid_state(&state)? {
@@ -757,7 +817,10 @@ impl GeneratedBlockView<'_> {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
             if let Some(neighbor_fluid) = liquid_state(&state)? {
-                if neighbor_fluid.source || next_fluid.is_some_and(|fluid| fluid.source) {
+                if neighbor_fluid.source
+                    || contained_source
+                    || next_fluid.is_some_and(|fluid| fluid.source)
+                {
                     self.schedule_water(p.to_array(), &state)?;
                 }
                 if neighbor_fluid.source {
@@ -778,6 +841,8 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
+            } else if self.slab(&state).is_some_and(|(_, wet)| wet) {
+                self.schedule_contained_water(p.to_array())?;
             } else if matches!(
                 state.name.as_str(),
                 "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
@@ -1021,7 +1086,14 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
         ]
         .contains(&direction);
         ensure!(
-            old == Cell::Air
+            (old == Cell::Air
+                || matches!(
+                    old,
+                    Cell::Slab {
+                        waterlogged: false,
+                        ..
+                    }
+                ) && fluid.source)
                 && pos == self.origin + direction
                 && fluid.kind == FluidKind::Water
                 && ((direction == glam::IVec3::NEG_Y
@@ -1751,7 +1823,7 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     return Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:sand"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab"]}"#.to_vec(),
                     ));
                 }
                 Ok(None)
@@ -1795,10 +1867,20 @@ mod tests {
         }
         world.set_block_id(origin_x, 8, 8, water).unwrap();
         match case {
-            "down" | "down_sand" => {
+            "down" | "down_sand" | "down_wet_slab" => {
                 world.set_block_id(8, 7, 8, air).unwrap();
                 if case == "down_sand" {
                     world.set_block_id(9, 7, 8, sand).unwrap();
+                }
+                if case == "down_wet_slab" {
+                    let slab = world.intern_state(BlockState {
+                        name: "minecraft:stone_slab".into(),
+                        properties: BTreeMap::from([
+                            ("type".into(), "bottom".into()),
+                            ("waterlogged".into(), "true".into()),
+                        ]),
+                    });
+                    world.set_block_id(9, 7, 8, slab).unwrap();
                 }
             }
             "sides" => {
@@ -1822,6 +1904,25 @@ mod tests {
                 if case == "convert_bubble" {
                     world.set_block_id(9, 7, 8, dirt).unwrap();
                 }
+            }
+            "slab_bottom" | "slab_top" | "slab_bottom_off" | "slab_oak" => {
+                let slab = world.intern_state(BlockState {
+                    name: if case == "slab_oak" {
+                        "minecraft:oak_slab"
+                    } else {
+                        "minecraft:stone_slab"
+                    }
+                    .into(),
+                    properties: BTreeMap::from([
+                        (
+                            "type".into(),
+                            if case == "slab_top" { "top" } else { "bottom" }.into(),
+                        ),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                });
+                world.set_block_id(9, 8, 8, slab).unwrap();
+                world.set_block_id(9, 8, 7, water).unwrap();
             }
             "flow_drain" | "flow_drain_sand" => {
                 let flowing = world.intern_state(BlockState {
@@ -1887,10 +1988,18 @@ mod tests {
             );
         }
         stage.region.ticks = RegionTicks::new(chunks, 100, 2).unwrap();
-        let registry = ["air", "water", "stone", "sand", "dirt"]
-            .into_iter()
-            .map(|name| format!("minecraft:{name}"))
-            .collect();
+        let registry = [
+            "air",
+            "water",
+            "stone",
+            "sand",
+            "dirt",
+            "stone_slab",
+            "oak_slab",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
         stage.heightmap_tags = Some(Arc::new(HeightmapTags::load(&mut Tags, &registry).unwrap()));
         stage.heightmaps.insert(chunk, fixture_maps(16));
         if case == "edge" {
@@ -1923,9 +2032,16 @@ mod tests {
                 | "convert_bubble"
                 | "origin_source_on"
                 | "origin_source_off"
+                | "slab_bottom"
+                | "slab_top"
+                | "slab_bottom_off"
+                | "slab_oak"
         ) {
             stage
-                .set_water_source_conversion(!matches!(case, "convert_off" | "origin_source_off"))
+                .set_water_source_conversion(!matches!(
+                    case,
+                    "convert_off" | "origin_source_off" | "slab_bottom_off"
+                ))
                 .unwrap();
         }
         while !stage.poll(chunk, 1).unwrap() {}
@@ -1936,8 +2052,9 @@ mod tests {
         assert_eq!(
             result.water_source_conversion(),
             match case {
-                "convert_off" | "origin_source_off" => Some(false),
-                "convert_on" | "convert_bubble" | "origin_source_on" => Some(true),
+                "convert_off" | "origin_source_off" | "slab_bottom_off" => Some(false),
+                "convert_on" | "convert_bubble" | "origin_source_on" | "slab_bottom"
+                | "slab_top" | "slab_oak" => Some(true),
                 _ => None,
             }
         );
@@ -1965,7 +2082,11 @@ mod tests {
             trace.push(format!(
                 "state {x},{y},{z} {} {}",
                 state.name,
-                state.properties.get("level").map_or("-", String::as_str)
+                state
+                    .properties
+                    .get("level")
+                    .or_else(|| state.properties.get("waterlogged"))
+                    .map_or("-", String::as_str)
             ));
         }
         for change in &result.edits {
@@ -2153,6 +2274,38 @@ mod tests {
     }
 
     #[test]
+    fn water_fills_slabs_only_when_a_source_forms() {
+        let bottom = water_spread_trace("slab_bottom");
+        assert!(
+            bottom
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:stone_slab true")
+        );
+        assert!(
+            bottom
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,8,8 5")
+        );
+        let disabled = water_spread_trace("slab_bottom_off");
+        assert!(
+            disabled
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:stone_slab false")
+        );
+        let oak = water_spread_trace("slab_oak");
+        assert!(
+            oak.iter()
+                .any(|line| line == "state 9,8,8 minecraft:oak_slab true")
+        );
+        let wet_neighbor = water_spread_trace("down_wet_slab");
+        assert!(
+            wet_neighbor
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,7,8 5")
+        );
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn water_source_postprocessing_matches_java() {
         let actual = java_results(
@@ -2177,6 +2330,11 @@ mod tests {
             "flow_sides",
             "origin_source_off",
             "origin_source_on",
+            "slab_bottom",
+            "slab_top",
+            "slab_bottom_off",
+            "slab_oak",
+            "down_wet_slab",
         ] {
             expected.extend(water_spread_trace(case));
         }

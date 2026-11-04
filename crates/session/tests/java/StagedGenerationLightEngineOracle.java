@@ -118,7 +118,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var w=new StagedGenerationLightEngineOracle();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
-        var engine=new LevelLightEngine(w,true,true);
+        boolean vineNoSky=args.length>1 && args[1].equals("tree_empty_vine_no_sky");
+        boolean noSky=args.length>1 && (args[1].equals("tree_empty_no_sky") || vineNoSky);
+        var engine=new LevelLightEngine(w,true,!noSky);
         boolean patchFreshWater=args.length>1 && args[1].equals("patch_fresh_clay_water");
         boolean freshWaterDripleaf=args.length>1 && args[1].equals("column_fresh_water_dripleaf");
         boolean freshWaterlogDripleaf=args.length>1 && args[1].equals("patch_fresh_waterlog_dripleaf");
@@ -146,7 +148,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeFreshEmpty=args.length>1 && args[1].equals("tree_fresh_empty");
-        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || treeEmptyFull || treeFreshEmpty);
+        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || noSky || treeEmptyFull || treeFreshEmpty);
         w.emptyEast=treeEmpty || treeSparse || vineActiveEmpty;
         w.sparseEast=treeSparse;
         w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
@@ -265,7 +267,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         }
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(leafFull?0:1,0)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
-            var state=(logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=vineNoSky ? Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,true) : (logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             int[][] positions=skyMany ? new int[][]{{16,10,8},{16,10,9},{17,10,8}} : leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();

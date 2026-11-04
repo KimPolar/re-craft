@@ -1089,6 +1089,85 @@ pub struct PlayerInventoryDraft {
 #[derive(Debug)]
 pub struct PlayerStateDraft(PlayerInventoryDraft);
 
+/// A newly created player's draft has no on-disk source. Its identity and
+/// level.dat update must be committed together with all other world changes.
+pub struct NewPlayerStateDraft {
+    uuid: [i32; 4],
+    draft: PlayerStateDraft,
+}
+
+impl NewPlayerStateDraft {
+    pub fn document(&self) -> &NamedTag {
+        self.draft.document()
+    }
+
+    /// Add the player and level identity to a partial world transaction.
+    /// This does not establish that every gameplay effect can be saved.
+    pub fn add_to_save_plan(
+        &self,
+        plan: &mut native_persistence::save::WorldSavePlan,
+        level_source: &NamedTag,
+        game_time: i64,
+    ) -> Result<()> {
+        plan.add_new_singleplayer(self.uuid, level_source, game_time, self.document(), |_| {
+            Ok(())
+        })
+    }
+}
+
+/// Draft a newly created player's represented state using Java's mode abilities.
+/// `enchantment_seed` must be the seed used by the live player, not a new draw
+/// made during saving. Other simulated fields and world effects remain separate.
+pub fn draft_new_player_state(
+    uuid: [i32; 4],
+    enchantment_seed: i32,
+    state: &PlayerSaveState,
+    inventory: &PlayerInventory,
+    flying: bool,
+) -> Result<NewPlayerStateDraft> {
+    ensure!(
+        state.game_mode.flight_after_change(flying) == flying,
+        "flight state is inconsistent with the game mode"
+    );
+    let mode = state.game_mode;
+    let ability = |value| Tag::Byte(i8::from(value));
+    let source = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            (
+                "DataVersion".into(),
+                Tag::Int(native_persistence::world::TARGET_DATA_VERSION),
+            ),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ("XpSeed".into(), Tag::Int(enchantment_seed)),
+            ("playerGameType".into(), Tag::Int(mode.legacy_id())),
+            (
+                "abilities".into(),
+                Tag::Compound(vec![
+                    (
+                        "invulnerable".into(),
+                        ability(matches!(mode, GameMode::Creative | GameMode::Spectator)),
+                    ),
+                    ("flying".into(), ability(flying)),
+                    (
+                        "mayfly".into(),
+                        ability(matches!(mode, GameMode::Creative | GameMode::Spectator)),
+                    ),
+                    ("instabuild".into(), ability(mode == GameMode::Creative)),
+                    (
+                        "mayBuild".into(),
+                        ability(matches!(mode, GameMode::Survival | GameMode::Creative)),
+                    ),
+                    ("flySpeed".into(), Tag::Float(0.05)),
+                    ("walkSpeed".into(), Tag::Float(0.1)),
+                ]),
+            ),
+        ]),
+    };
+    let draft = draft_player_state(&source, state, inventory)?;
+    Ok(NewPlayerStateDraft { uuid, draft })
+}
+
 impl PlayerStateDraft {
     pub fn document(&self) -> &NamedTag {
         self.0.document()
@@ -2634,6 +2713,108 @@ pub fn draft_player_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_player_state_is_staged_with_level_and_reopens() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+        for (mode, flying) in [
+            (GameMode::Survival, false),
+            (GameMode::Creative, true),
+            (GameMode::Adventure, false),
+            (GameMode::Spectator, true),
+        ] {
+            let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/session-save-test-temp");
+            std::fs::create_dir_all(&parent).unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("world-")
+                .tempdir_in(parent)
+                .unwrap();
+            let level = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "Data".into(),
+                    Tag::Compound(vec![(
+                        "DataVersion".into(),
+                        Tag::Int(native_persistence::world::TARGET_DATA_VERSION),
+                    )]),
+                )]),
+            };
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(&native_persistence::nbt::write(&level).unwrap())
+                .unwrap();
+            std::fs::write(root.path().join("level.dat"), gzip.finish().unwrap()).unwrap();
+            let state = PlayerSaveState {
+                position: DVec3::new(-17.25, 64.5, 99.75),
+                motion: SavedPlayerMotion {
+                    velocity: DVec3::ZERO,
+                    on_ground: true,
+                    fall_distance: 0.0,
+                },
+                yaw: 91.5,
+                pitch: -20.0,
+                dimension: "minecraft:overworld".into(),
+                game_mode: mode,
+                vitals: crate::survival::PlayerVitals::default(),
+                experience: crate::experience::Experience::default(),
+                score: 0,
+            };
+            let uuid = [1, -2, 3, 4];
+            let draft =
+                draft_new_player_state(uuid, 55, &state, &PlayerInventory::default(), flying)
+                    .unwrap();
+            assert_eq!(draft.document().value.get("XpSeed"), Some(&Tag::Int(55)));
+            let mut plan = native_persistence::save::WorldSavePlan::new();
+            draft.add_to_save_plan(&mut plan, &level, 42).unwrap();
+            let mut writer =
+                native_persistence::save::WorldWriteGuard::acquire(root.path()).unwrap();
+            writer.write_plan(plan, |_, _| Ok(())).unwrap();
+            let reader = native_persistence::world::WorldReader::open(
+                root.path(),
+                native_persistence::world::DimensionId::parse("overworld").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+            let saved = reader.read_player().unwrap().unwrap();
+            assert_eq!(read_saved_position(&saved).unwrap(), Some(state.position));
+            assert_eq!(read_saved_motion(&saved).unwrap(), state.motion);
+            assert_eq!(
+                saved.value.get("playerGameType"),
+                Some(&Tag::Int(mode.legacy_id()))
+            );
+            assert_eq!(read_saved_flying(&saved), flying);
+        }
+    }
+
+    #[test]
+    fn new_player_state_rejects_invalid_mode_flight() {
+        let mut state = PlayerSaveState {
+            position: DVec3::ZERO,
+            motion: SavedPlayerMotion {
+                velocity: DVec3::ZERO,
+                on_ground: false,
+                fall_distance: 0.0,
+            },
+            yaw: 0.0,
+            pitch: 0.0,
+            dimension: "minecraft:overworld".into(),
+            game_mode: GameMode::Survival,
+            vitals: crate::survival::PlayerVitals::default(),
+            experience: crate::experience::Experience::default(),
+            score: 0,
+        };
+        assert!(
+            draft_new_player_state([0; 4], 55, &state, &PlayerInventory::default(), true).is_err()
+        );
+        assert!(
+            draft_new_player_state([0; 4], 0, &state, &PlayerInventory::default(), false).is_ok()
+        );
+        state.game_mode = GameMode::Spectator;
+        assert!(
+            draft_new_player_state([0; 4], 55, &state, &PlayerInventory::default(), false).is_err()
+        );
+    }
 
     #[test]
     fn tooltip_reads_attack_bases_without_equipment_modifiers() {

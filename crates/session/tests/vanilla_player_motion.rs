@@ -625,6 +625,7 @@ import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.player.Abilities;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
@@ -707,6 +708,49 @@ public class PlayerSaveOracle {
             compare(reference, rust, motionFields);
             compare(reference, rust, foodFields);
             compare(reference, rust, xpFields);
+            var fresh = NbtIo.read(Path.of(args[0], "fresh-" + i + ".nbt"));
+            compare(reference, fresh, motionFields);
+            compare(reference, fresh, foodFields);
+            String[] freshXpFields = {"XpP", "XpLevel", "XpTotal", "Score"};
+            compare(reference, fresh, freshXpFields);
+            int freshSeed = state.get("fresh_seed").getAsInt();
+            if (fresh.getIntOr("XpSeed", -1) != freshSeed) throw new AssertionError("new player enchantment seed");
+            if (!(fresh.get("UUID") instanceof net.minecraft.nbt.IntArrayTag freshUuid)
+                || !java.util.Arrays.equals(freshUuid.getAsIntArray(), new int[]{1,-2,3,4}))
+                throw new AssertionError("new player UUID");
+            var freshInput = TagValueInput.create(ProblemReporter.DISCARDING, lookup, fresh);
+            var freshPlayer = new TestPlayer(level);
+            freshPlayer.getRandom().setSeed(123456L);
+            int reloadedSeed = freshSeed == 0 ? net.minecraft.util.RandomSource.create(123456L).nextInt() : freshSeed;
+            freshPlayer.load(freshInput);
+            var freshRoundTrip = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, lookup);
+            freshPlayer.saveWithoutId(freshRoundTrip);
+            compare(reference, freshRoundTrip.buildResult(), motionFields);
+            compare(reference, freshRoundTrip.buildResult(), foodFields);
+            compare(reference, freshRoundTrip.buildResult(), freshXpFields);
+            if (freshRoundTrip.buildResult().getIntOr("XpSeed", 0) != reloadedSeed)
+                throw new AssertionError("reloaded enchantment seed");
+            int mode = state.get("mode").getAsInt();
+            if (fresh.getIntOr("playerGameType", -1) != mode) throw new AssertionError("new player game mode");
+            var expectedAbilities = new Abilities();
+            expectedAbilities.flying = state.get("flying").getAsBoolean();
+            (switch (mode) {
+                case 0 -> GameType.SURVIVAL;
+                case 1 -> GameType.CREATIVE;
+                case 2 -> GameType.ADVENTURE;
+                case 3 -> GameType.SPECTATOR;
+                default -> throw new AssertionError("invalid mode");
+            }).updatePlayerAbilities(expectedAbilities);
+            var actualAbilities = new Abilities();
+            actualAbilities.apply(freshInput.read("abilities", Abilities.Packed.CODEC).orElseThrow());
+            if (actualAbilities.invulnerable != expectedAbilities.invulnerable
+                || actualAbilities.flying != expectedAbilities.flying
+                || actualAbilities.mayfly != expectedAbilities.mayfly
+                || actualAbilities.instabuild != expectedAbilities.instabuild
+                || actualAbilities.mayBuild != expectedAbilities.mayBuild
+                || actualAbilities.getFlyingSpeed() != expectedAbilities.getFlyingSpeed()
+                || actualAbilities.getWalkingSpeed() != expectedAbilities.getWalkingSpeed())
+                throw new AssertionError("new player abilities for mode " + mode);
             var loaded = new TestEntity(level);
             var input = TagValueInput.create(ProblemReporter.DISCARDING, lookup, rust);
             loaded.load(input);
@@ -736,7 +780,9 @@ fn drafted_player_state_matches_vanilla_save_and_load() {
     use native_session::{
         GameMode,
         inventory::PlayerInventory,
-        player_data::{PlayerSaveState, SavedPlayerMotion, draft_player_state},
+        player_data::{
+            PlayerSaveState, SavedPlayerMotion, draft_new_player_state, draft_player_state,
+        },
         survival::PlayerVitals,
     };
     use serde_json::json;
@@ -811,6 +857,19 @@ fn drafted_player_state_matches_vanilla_save_and_load() {
             vitals,
         };
         let draft = draft_player_state(&original, &state, &inventory).unwrap();
+        let mode = i % 4;
+        let flying = mode == 3 || (mode == 1 && i % 8 == 1);
+        let mut fresh_state = state.clone();
+        fresh_state.game_mode = GameMode::from_legacy_id(mode);
+        let fresh_seed = if i % 16 == 0 { 0 } else { 55 };
+        let fresh =
+            draft_new_player_state([1, -2, 3, 4], fresh_seed, &fresh_state, &inventory, flying)
+                .unwrap();
+        std::fs::write(
+            temp.path().join(format!("fresh-{i}.nbt")),
+            native_persistence::nbt::write(fresh.document()).unwrap(),
+        )
+        .unwrap();
         std::fs::write(
             temp.path().join(format!("rust-{i}.nbt")),
             native_persistence::nbt::write(draft.document()).unwrap(),
@@ -818,7 +877,7 @@ fn drafted_player_state_matches_vanilla_save_and_load() {
         .unwrap();
         inputs.push(json!({"pos": position.to_array(), "vel": velocity.to_array(), "ground": state.motion.on_ground, "fall": state.motion.fall_distance, "yaw": state.yaw, "pitch": state.pitch,
             "food": vitals.food, "saturation": vitals.saturation, "exhaustion": vitals.exhaustion, "timer": vitals.food_tick_timer, "health": vitals.health, "absorption": vitals.absorption, "air": vitals.air,
-            "xp_progress": state.experience.progress, "xp_level": state.experience.level, "xp_total": state.experience.total, "score": state.score}));
+            "xp_progress": state.experience.progress, "xp_level": state.experience.level, "xp_total": state.experience.total, "score": state.score, "mode": mode, "flying": flying, "fresh_seed": fresh_seed}));
         drafts.push(draft);
     }
     std::fs::write(

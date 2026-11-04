@@ -4893,10 +4893,29 @@ mod tests {
             .begin_generated_postprocessing([center], 42, 10)
             .unwrap();
         while !generated.poll(center, 4).unwrap() {}
-        let processed = generated.finish().unwrap();
+        let mut processed = generated.finish().unwrap();
         assert!(Arc::ptr_eq(&original, &processed.world));
         assert!(processed.edits.is_empty());
         assert!(processed.light_checks.is_empty());
+        let light = batch.postprocessed_light_snapshot(&processed).unwrap();
+        let spawn_light = batch.light_snapshot([center]).unwrap();
+        assert_eq!(
+            light.block_light([8, 8, 8]),
+            spawn_light.block_light([8, 8, 8])
+        );
+        assert_eq!(light.sky_light([8, 8, 8]), spawn_light.sky_light([8, 8, 8]));
+        processed
+            .light_checks
+            .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
+        assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        processed.light_checks.clear();
+        let revision = processed.batch_revision;
+        processed.batch_revision = revision.map(|value| value.wrapping_add(1));
+        assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        processed.batch_revision = revision;
+        processed.chunks.clear();
+        assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        processed.chunks.insert(center);
         assert_eq!(
             processed.heightmaps[&center].to_tag().unwrap(),
             batch.converted_full_heightmap_data(center).unwrap()

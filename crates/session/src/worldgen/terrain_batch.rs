@@ -1540,7 +1540,7 @@ impl FreshTerrainBatch {
                 native_persistence::heightmap::FullHeightmaps::from_converted(bounds, &raw)?,
             );
         }
-        Ok(super::GeneratedPostprocessing::new(
+        let mut stage = super::GeneratedPostprocessing::new(
             world,
             min_y,
             max_y,
@@ -1549,7 +1549,70 @@ impl FreshTerrainBatch {
             mushroom_tags,
             heightmaps,
             Some(heightmap_tags),
-        ))
+        );
+        stage.bind_batch_revision(self.schedule.revision());
+        Ok(stage)
+    }
+
+    /// Preview one drained batch of the postprocessing light checks. The
+    /// caller must choose a drain point with no other pending light-engine
+    /// work. Both channels are updated on an isolated snapshot; neither the
+    /// batch nor the intermediate block result is changed on failure.
+    pub fn postprocessed_light_snapshot(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<VisibleLightSnapshot> {
+        ensure!(
+            !self.failed,
+            "generation batch failed and must be discarded"
+        );
+        ensure!(
+            processed.batch_revision == Some(self.schedule.revision())
+                && self
+                    .snapshot()
+                    .is_some_and(|world| Arc::ptr_eq(&world, &processed.source)),
+            "postprocessing belongs to a different generation revision"
+        );
+        ensure!(
+            Arc::ptr_eq(&processed.world, &processed.sealed_world)
+                && processed.light_checks == processed.sealed_checks
+                && processed.chunks == processed.sealed_chunks,
+            "postprocessing result was modified"
+        );
+        let (min_y, max_y) = self.build_bounds()?;
+        ensure!(
+            (min_y, max_y) == (processed.min_y, processed.max_y),
+            "postprocessing light bounds changed"
+        );
+        let bounds = native_world::block_light::LightBounds::new(min_y, max_y)
+            .context("unsupported postprocessing light bounds")?;
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        let mut covered = processed.chunks.clone();
+        let mut checks = Vec::with_capacity(processed.sealed_checks.len());
+        for pos in &processed.sealed_checks {
+            let p = [pos.x, pos.y, pos.z];
+            checks.push(p);
+            for dz in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    covered.insert(ChunkPos {
+                        x: pos.chunk().x.checked_add(dx).context("light X overflow")?,
+                        z: pos.chunk().z.checked_add(dz).context("light Z overflow")?,
+                    });
+                }
+            }
+        }
+        let before = self.light_snapshot(covered)?;
+        super::postprocessing_world::drain_postprocessing_light(
+            &processed.world,
+            bounds,
+            &before,
+            &engine.active,
+            &engine.fresh.sky_sources,
+            &checks,
+        )
     }
 
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the

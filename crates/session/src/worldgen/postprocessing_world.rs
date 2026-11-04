@@ -26,6 +26,8 @@ use super::{
 /// returned if a callback fails or if any chunk remains unfinished.
 pub struct GeneratedPostprocessing {
     world: Arc<World>,
+    source: Arc<World>,
+    batch_revision: Option<u64>,
     min_y: i32,
     max_y: i32,
     region: ConvertedPostprocessingRegion,
@@ -52,6 +54,37 @@ pub struct PostprocessedGeneratedRegion {
     pub light_checks: Vec<BlockPosition>,
     /// Updated FULL maps; other chunk and world validation remains necessary.
     pub heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+    pub(super) source: Arc<World>,
+    pub(super) sealed_world: Arc<World>,
+    pub(super) sealed_checks: Vec<BlockPosition>,
+    pub(super) sealed_chunks: BTreeSet<ChunkPos>,
+    pub(super) batch_revision: Option<u64>,
+    pub(super) min_y: i32,
+    pub(super) max_y: i32,
+}
+
+/// Apply one explicitly chosen light-engine drain to a complete input
+/// revision. Source heights already include all edits affecting direct sky.
+pub(super) fn drain_postprocessing_light(
+    world: &World,
+    bounds: native_world::block_light::LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    checks: &[[i32; 3]],
+) -> Result<VisibleLightSnapshot> {
+    let block = native_world::generation_block_light::check_generated_block_light(
+        world, bounds, before, active, checks,
+    )
+    .context("postprocessing block-light inputs are incomplete or unsupported")?;
+    if before.has_sky_channel() {
+        native_world::generation_sky_light::check_generated_sky_blocks(
+            world, bounds, &block, active, checks, sources,
+        )
+        .context("postprocessing sky-light inputs are incomplete or unsupported")
+    } else {
+        Ok(block)
+    }
 }
 
 impl GeneratedPostprocessing {
@@ -66,7 +99,9 @@ impl GeneratedPostprocessing {
         heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     ) -> Self {
         Self {
+            source: Arc::clone(&world),
             world,
+            batch_revision: None,
             min_y,
             max_y,
             region,
@@ -80,6 +115,10 @@ impl GeneratedPostprocessing {
             heightmaps,
             heightmap_tags,
         }
+    }
+
+    pub(super) fn bind_batch_revision(&mut self, revision: u64) {
+        self.batch_revision = Some(revision);
     }
 
     /// Run a bounded number of callbacks without interleaving another chunk.
@@ -129,12 +168,19 @@ impl GeneratedPostprocessing {
             "generated postprocessing is incomplete"
         );
         Ok(PostprocessedGeneratedRegion {
+            sealed_world: Arc::clone(&self.world),
             world: self.world,
             ticks: self.region.ticks,
+            sealed_chunks: self.completed.clone(),
             chunks: self.completed,
             edits: self.edits,
+            sealed_checks: self.light_checks.clone(),
             light_checks: self.light_checks,
             heightmaps: self.heightmaps,
+            source: self.source,
+            batch_revision: self.batch_revision,
+            min_y: self.min_y,
+            max_y: self.max_y,
         })
     }
 }
@@ -259,6 +305,10 @@ impl GeneratedBlockView<'_> {
         );
         let same_light = native_world::block_light::same_light_behavior(&old, next)
             .context("mushroom light behavior unavailable")?;
+        ensure!(
+            native_world::sky_light::same_sky_behavior(&old, next) == Some(true),
+            "mushroom removal changes direct sky sources"
+        );
         if !same_light {
             let change = native_world::block_light::light_change(&old, next)
                 .context("mushroom light change unavailable")?;
@@ -733,6 +783,89 @@ mod tests {
             mushroom_case("red_mushroom", "air", false, 0),
             "minecraft:red_mushroom minecraft:air false 0 minecraft:air 1 276"
         );
+    }
+
+    #[test]
+    fn drained_mushroom_light_preserves_prior_revision_and_requires_both_channels() {
+        use native_world::{
+            block_light::LightBounds, generation_light::VisibleLightColumn, loaded::LIGHT_BYTES,
+        };
+        let pos = ChunkPos { x: 0, z: 0 };
+        let p = [8, 8, 8];
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:spawn".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([air; BLOCK_COUNT])),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let mut layer = [0; LIGHT_BYTES];
+        let index = 8 + 8 * 16 + 8 * 256;
+        layer[index / 2] = 1;
+        let column =
+            VisibleLightColumn::new(BTreeMap::from([(0, Arc::new(layer))]), BTreeMap::new());
+        let mut before = VisibleLightSnapshot::new(true, false);
+        before.insert_complete_column(pos, column.clone());
+        let bounds = LightBounds::new(0, 16).unwrap();
+        let active = BTreeSet::from([pos]);
+        let after =
+            drain_postprocessing_light(&world, bounds, &before, &active, &BTreeMap::new(), &[p, p])
+                .unwrap();
+        assert_eq!(before.block_light(p), Some(1));
+        assert_eq!(after.block_light(p), Some(0));
+        assert_eq!(after.block_section_allocated(pos, 0), Some(true));
+
+        let mut both = VisibleLightSnapshot::new(true, true);
+        both.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(
+                BTreeMap::from([(0, Arc::new(layer))]),
+                BTreeMap::from([(0, Arc::new(layer))]),
+            ),
+        );
+        let after_both = drain_postprocessing_light(
+            &world,
+            bounds,
+            &both,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &[p],
+        )
+        .unwrap();
+        assert_eq!(after_both.block_light(p), Some(0));
+        assert_eq!(after_both.sky_light(p), Some(0));
+        assert_eq!(both.block_light(p), Some(1));
+        assert_eq!(both.sky_light(p), Some(1));
+
+        let mut missing_sky = VisibleLightSnapshot::new(true, true);
+        missing_sky.insert_complete_column(pos, column);
+        assert!(
+            drain_postprocessing_light(
+                &world,
+                bounds,
+                &missing_sky,
+                &active,
+                &BTreeMap::new(),
+                &[p],
+            )
+            .is_err()
+        );
+        assert_eq!(missing_sky.block_light(p), Some(1));
     }
 
     #[test]

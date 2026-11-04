@@ -50,7 +50,7 @@ pub struct GenerationReady {
     /// Initial world-spawn suggestion, not the collision-checked player spawn.
     pub suggested_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
-    pub initial_clocks: Option<Arc<BTreeMap<native_resources::packs::ResourceId, i64>>>,
+    pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +285,25 @@ impl GenerationReady {
         )
         .map_err(anyhow::Error::msg)?;
         session.set_player_inventory(PlayerInventory::default());
+        if let Some(initial) = &self.initial_clocks {
+            use native_persistence::world::{DimensionId, SavedClock};
+            let clocks = initial
+                .ticks
+                .iter()
+                .map(|(id, &total_ticks)| {
+                    let id = DimensionId::parse(&format!("{}:{}", id.namespace, id.path))?;
+                    Ok((
+                        id,
+                        SavedClock {
+                            total_ticks,
+                            ..SavedClock::default()
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            session.set_registered_clocks(Arc::new(clocks.keys().cloned().collect()));
+            session.set_world_clocks(clocks, initial.advance_time);
+        }
         Ok(session)
     }
 }
@@ -1506,14 +1525,12 @@ mod tests {
                         min_z: -100.0,
                         max_z: 100.0,
                     };
-                    let inputs = prepared.into_new_world_inputs(border, spawn_mobs)?;
+                    let inputs = prepared.into_new_world_inputs(border, spawn_mobs, true)?;
                     assert_eq!(inputs.creatures.is_some(), spawn_mobs && !disabled);
                     assert_eq!(
-                        inputs
-                            .initial_clocks
-                            .get(&native_resources::packs::ResourceId::parse(
-                                "example:creatures"
-                            )?),
+                        inputs.initial_clocks.ticks.get(
+                            &native_resources::packs::ResourceId::parse("example:creatures")?
+                        ),
                         Some(&0)
                     );
                     Ok(inputs)
@@ -1529,7 +1546,7 @@ mod tests {
             };
             let targets = ready.mesh.targets.as_deref().context("targets missing")?;
             assert_eq!(
-                ready.initial_clocks.as_ref().unwrap().get(
+                ready.initial_clocks.as_ref().unwrap().ticks.get(
                     &native_resources::packs::ResourceId::parse("example:creatures")?
                 ),
                 Some(&0)

@@ -3577,10 +3577,10 @@ mod tests {
                 native_persistence::nbt::Tag::Long(42),
             )]),
         };
-        let initial_clocks = Arc::new(BTreeMap::from([(
-            ResourceId::parse("example:clock").unwrap(),
-            0_i64,
-        )]));
+        let initial_clocks = Arc::new(crate::fresh_generation::InitialWorldClocks {
+            ticks: BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), 0_i64)]),
+            advance_time: true,
+        });
         let ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
@@ -3642,6 +3642,28 @@ mod tests {
         let session = expanded
             .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
             .unwrap();
+        use native_session::GameSession;
+        let clock_id = native_persistence::world::DimensionId::parse("example:clock").unwrap();
+        assert_eq!(session.world_clock(&clock_id).unwrap().total_ticks, 0);
+        let mut running = expanded.start_session(player).unwrap();
+        running.update(std::time::Duration::from_millis(150));
+        assert_eq!(running.world_clock(&clock_id).unwrap().total_ticks, 3);
+        let mut split_frames = expanded.start_session(player).unwrap();
+        for _ in 0..15 {
+            split_frames.update(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            split_frames.world_clock(&clock_id),
+            running.world_clock(&clock_id)
+        );
+        expanded.initial_clocks = Some(Arc::new(crate::fresh_generation::InitialWorldClocks {
+            ticks: initial_clocks.ticks.clone(),
+            advance_time: false,
+        }));
+        let mut stopped = expanded.start_session(player).unwrap();
+        stopped.update(std::time::Duration::from_millis(150));
+        assert_eq!(stopped.world_clock(&clock_id).unwrap().total_ticks, 0);
+        expanded.initial_clocks = Some(Arc::clone(&initial_clocks));
         assert_eq!(
             session
                 .generated_spawn_column_candidate(16, 8, None, &expanded_targets)

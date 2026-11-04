@@ -51,7 +51,14 @@ pub struct PreparedInitialWorld {
     pub worldgen_settings: native_persistence::nbt::NamedTag,
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
-    pub initial_clocks: Arc<BTreeMap<ResourceId, i64>>,
+    pub initial_clocks: Arc<InitialWorldClocks>,
+}
+
+/// Clock ticks sampled during generation and the selected time game rule.
+/// Newly created clocks use Java's default rate, partial tick and pause state.
+pub struct InitialWorldClocks {
+    pub ticks: BTreeMap<ResourceId, i64>,
+    pub advance_time: bool,
 }
 
 /// All inputs for world-generation creatures, resolved from the same active
@@ -190,12 +197,13 @@ impl PreparedFreshGeneration {
         mut self,
         border: native_session::respawn::RespawnBorder,
         spawn_mobs: bool,
+        advance_time: bool,
     ) -> Result<PreparedInitialWorld> {
         let clocks = native_resources::world_clock::registered_clocks(&mut self.resources)?
             .into_iter()
             .map(|id| (id, 0))
             .collect();
-        self.into_initial_world_inputs(border, clocks, spawn_mobs)
+        self.into_initial_world_inputs(border, clocks, spawn_mobs, advance_time)
     }
 
     /// Resolve world-spawn and creature inputs from the already-selected pack
@@ -205,8 +213,12 @@ impl PreparedFreshGeneration {
         border: native_session::respawn::RespawnBorder,
         clocks: BTreeMap<ResourceId, i64>,
         spawn_mobs: bool,
+        advance_time: bool,
     ) -> Result<PreparedInitialWorld> {
-        let initial_clocks = Arc::new(clocks.clone());
+        let initial_clocks = Arc::new(InitialWorldClocks {
+            ticks: clocks.clone(),
+            advance_time,
+        });
         let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
             Some(PreparedCreatureSpawning::load(
                 &mut self.resources,
@@ -467,7 +479,7 @@ mod tests {
             min_z: -100.0,
             max_z: 100.0,
         };
-        let mut inputs = prepared.into_initial_world_inputs(border, clocks, true)?;
+        let mut inputs = prepared.into_initial_world_inputs(border, clocks, true, true)?;
         let active: Value = serde_json::from_slice(
             &inputs
                 .resources

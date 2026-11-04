@@ -1,8 +1,10 @@
 //! Compare the marked-position part of chunk postprocessing with Java 26.3.
 use anyhow::{Result, bail};
 use native_core::postprocessing::PostProcessing;
+use native_resources::tree_leaf_update::ShapeEdgeWorld;
 use native_session::worldgen::postprocessing::{
     PostprocessingBlocks, PostprocessingChunk, PostprocessingTask, PostprocessingWorld,
+    update_from_neighbor_shapes,
 };
 use native_world::loaded::ChunkPos;
 use serde_json::Value;
@@ -19,6 +21,205 @@ struct World {
 }
 fn pos(p: [i32; 3]) -> String {
     format!("{},{},{}", p[0], p[1], p[2])
+}
+
+struct ShapeTrace {
+    case: usize,
+    origin: [i32; 3],
+    neighbors: BTreeMap<[i32; 3], String>,
+    events: Vec<String>,
+    fail_after: Option<usize>,
+}
+
+impl ShapeEdgeWorld for ShapeTrace {
+    type State = String;
+    fn block(&mut self, p: [i32; 3]) -> Result<String> {
+        self.neighbors
+            .get(&p)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing neighbor"))
+    }
+    fn update_shape(
+        &mut self,
+        _: [i32; 3],
+        state: &String,
+        direction: [i32; 3],
+        neighbor: [i32; 3],
+        other: &String,
+    ) -> Result<String> {
+        let name = match direction {
+            [-1, 0, 0] => "west",
+            [1, 0, 0] => "east",
+            [0, 0, -1] => "north",
+            [0, 0, 1] => "south",
+            [0, -1, 0] => "down",
+            [0, 1, 0] => "up",
+            _ => unreachable!(),
+        };
+        self.events.push(format!(
+            "N {} {state} {name} {} {other}",
+            self.case,
+            pos(neighbor)
+        ));
+        if direction == [-1, 0, 0] {
+            self.neighbors.insert(
+                [
+                    self.origin[0].wrapping_add(1),
+                    self.origin[1],
+                    self.origin[2],
+                ],
+                "changed".into(),
+            );
+        }
+        if self.fail_after == Some(self.events.len()) {
+            bail!("shape callback failed");
+        }
+        let index: usize = state.strip_prefix('S').unwrap().parse().unwrap();
+        Ok(format!("S{}", index + 1))
+    }
+    fn set_block(&mut self, _: [i32; 3], _: &String, _: i32) -> Result<()> {
+        panic!("shape calculation must not write the resulting block")
+    }
+}
+
+fn shape_fixture(case: usize, origin: [i32; 3]) -> ShapeTrace {
+    let directions = [
+        [-1i32, 0, 0],
+        [1, 0, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+        [0, -1, 0],
+        [0, 1, 0],
+    ];
+    let neighbors = directions
+        .into_iter()
+        .enumerate()
+        .map(|(i, direction)| {
+            (
+                [
+                    origin[0].wrapping_add(direction[0]),
+                    origin[1].wrapping_add(direction[1]),
+                    origin[2].wrapping_add(direction[2]),
+                ],
+                format!("N{i}"),
+            )
+        })
+        .collect();
+    ShapeTrace {
+        case,
+        origin,
+        neighbors,
+        events: Vec::new(),
+        fail_after: None,
+    }
+}
+
+fn shape_trace() -> Vec<String> {
+    let mut events = Vec::new();
+    for (case, origin) in [
+        [8, 4, 8],
+        [i32::MAX, 0, i32::MIN],
+        [i32::MIN, -64, i32::MAX],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut world = shape_fixture(case, origin);
+        let result = update_from_neighbor_shapes(&mut world, origin, &"S0".to_owned()).unwrap();
+        events.extend(world.events);
+        events.push(format!("R {case} {result}"));
+    }
+    events
+}
+
+struct ShapePostprocessing {
+    shape: ShapeTrace,
+}
+
+impl PostprocessingWorld for ShapePostprocessing {
+    type State = String;
+    type Fluid = ();
+    fn block(&mut self, _: [i32; 3]) -> Result<String> {
+        Ok("S0".into())
+    }
+    fn fluid(&mut self, _: &String) -> Result<Option<()>> {
+        Ok(None)
+    }
+    fn tick_fluid(&mut self, _: [i32; 3], _: &String, _: &()) -> Result<()> {
+        unreachable!()
+    }
+    fn is_liquid_block(&mut self, _: &String) -> Result<bool> {
+        Ok(false)
+    }
+    fn tick_liquid_block(&mut self, _: [i32; 3], _: &String) -> Result<()> {
+        unreachable!()
+    }
+    fn update_neighbor_shapes(&mut self, p: [i32; 3], original: &String) -> Result<String> {
+        update_from_neighbor_shapes(&mut self.shape, p, original)
+    }
+    fn set_block(&mut self, p: [i32; 3], state: &String, flags: i32) -> Result<()> {
+        self.shape
+            .events
+            .push(format!("W {} {state} {flags}", pos(p)));
+        Ok(())
+    }
+    fn clear_processed_section(&mut self, section: usize) -> Result<()> {
+        self.shape.events.push(format!("CS {section}"));
+        Ok(())
+    }
+}
+
+impl PostprocessingChunk for ShapePostprocessing {
+    fn pending_block_entity_positions(&mut self) -> Result<Vec<[i32; 3]>> {
+        Ok(Vec::new())
+    }
+    fn promote_pending_block_entity(&mut self, _: [i32; 3]) -> Result<()> {
+        unreachable!()
+    }
+    fn clear_pending_block_entities(&mut self) -> Result<()> {
+        self.shape.events.push("CE".into());
+        Ok(())
+    }
+    fn apply_upgrade_data(&mut self) -> Result<()> {
+        self.shape.events.push("U".into());
+        Ok(())
+    }
+}
+
+fn shape_postprocessing() -> (PostprocessingTask, ShapePostprocessing) {
+    let origin = [-16, -15, 32];
+    let mut marks = PostProcessing::new(-16, 32).unwrap();
+    assert!(marks.mark(origin[0], origin[1], origin[2]));
+    (
+        PostprocessingTask::new(Arc::new(marks), ChunkPos { x: -1, z: 2 }),
+        ShapePostprocessing {
+            shape: shape_fixture(3, origin),
+        },
+    )
+}
+
+#[test]
+fn neighbor_shapes_chain_states_and_read_live_neighbors() {
+    let events = shape_trace();
+    assert_eq!(events.len(), 21);
+    assert_eq!(events[0], "N 0 S0 west 7,4,8 N0");
+    assert_eq!(events[1], "N 0 S1 east 9,4,8 changed");
+    assert_eq!(events[6], "R 0 S6");
+    let origin = [8, 4, 8];
+    let mut world = shape_fixture(0, origin);
+    world.fail_after = Some(3);
+    assert!(update_from_neighbor_shapes(&mut world, origin, &"S0".to_owned()).is_err());
+    assert_eq!(world.events.len(), 3);
+    let (mut task, mut world) = shape_postprocessing();
+    while !task.poll(&mut world, 1).unwrap() {}
+    assert_eq!(world.shape.events[6], "W -16,-15,32 S6 276");
+    assert_eq!(&world.shape.events[7..], ["CS 0", "CE", "U"]);
+    let (mut task, mut world) = shape_postprocessing();
+    world.shape.fail_after = Some(3);
+    assert!(task.poll(&mut world, 10).is_err());
+    let events = world.shape.events.clone();
+    assert!(task.poll(&mut world, 10).is_err());
+    assert_eq!(world.shape.events, events);
 }
 impl PostprocessingWorld for World {
     type State = char;
@@ -253,10 +454,16 @@ fn marked_positions_match_java_level_chunk() {
         .arg("-classpath")
         .arg(&cp)
         .arg(&source));
-    let output = run(Command::new(java.join("java.exe"))
+    let all_output = run(Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&cp)
         .arg("PostprocessingOracle"));
+    let (output, remaining) = all_output.split_once("BEGIN_SHAPES").unwrap();
+    let postprocessing_shapes: Vec<_> = remaining
+        .lines()
+        .filter(|line| !line.is_empty())
+        .take_while(|line| *line != "END_SHAPES")
+        .collect();
     let (marks, mut world) = fixture();
     let mut runner = PostprocessingBlocks::new(marks, ChunkPos { x: -1, z: 2 });
     while !runner.poll(&mut world, 1).unwrap() {}
@@ -292,4 +499,23 @@ fn marked_positions_match_java_level_chunk() {
         world.events.iter().map(String::as_str).collect::<Vec<_>>()
     );
     assert!(output.lines().any(|line| line == "BE 0"));
+    let java_shapes: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("N ") || line.starts_with("R "))
+        .collect();
+    assert_eq!(
+        java_shapes,
+        shape_trace().iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let (mut task, mut world) = shape_postprocessing();
+    while !task.poll(&mut world, 1).unwrap() {}
+    assert_eq!(
+        postprocessing_shapes,
+        world
+            .shape
+            .events
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
 }

@@ -10,6 +10,35 @@ use anyhow::{Result, bail};
 use native_core::postprocessing::PostProcessing;
 use native_world::loaded::ChunkPos;
 
+/// Apply `Block.updateFromNeighbourShapes` using a world's real updateShape
+/// implementation and its scheduled-tick/random side effects. Reads happen
+/// immediately before each callback because earlier callbacks may mutate the
+/// world. The returned state is not written by this function.
+pub fn update_from_neighbor_shapes<W: native_resources::tree_leaf_update::ShapeEdgeWorld>(
+    world: &mut W,
+    pos: [i32; 3],
+    original: &W::State,
+) -> Result<W::State> {
+    let mut state = original.clone();
+    for direction in [
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+        [0, -1, 0],
+        [0, 1, 0],
+    ] {
+        let neighbor = [
+            pos[0].wrapping_add(direction[0]),
+            pos[1].wrapping_add(direction[1]),
+            pos[2].wrapping_add(direction[2]),
+        ];
+        let other = world.block(neighbor)?;
+        state = world.update_shape(pos, &state, direction, neighbor, &other)?;
+    }
+    Ok(state)
+}
+
 /// Access to a generation world with its real block/fluid and neighbor rules.
 /// State equality must be registry identity, as Java compares canonical states.
 pub trait PostprocessingWorld {

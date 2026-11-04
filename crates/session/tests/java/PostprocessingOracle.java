@@ -22,6 +22,11 @@ public class PostprocessingOracle {
   static sun.misc.Unsafe unsafe;
   static Map<BlockPos,CompoundTag> pending;
   static BlockPos entity1,entity2,entity3;
+  static boolean shapeTrace;
+  static int shapeCase,shapeIndex;
+  static BlockPos shapeOrigin;
+  static TraceState[] shapeStates;
+  static TraceState replacement;
   static void set(Object object,String name,Object value)throws Exception {
     Class<?> type=object.getClass();
     while(type!=null) { try {var field=type.getDeclaredField(name);field.setAccessible(true);field.set(object,value);return;}catch(NoSuchFieldException e){type=type.getSuperclass();} }
@@ -46,13 +51,18 @@ public class PostprocessingOracle {
       output.println("L "+pos(p)+" "+name);blocks.put(p.immutable(),b);
     }
     @Override public BlockState updateShape(LevelReader level,ScheduledTickAccess ticks,BlockPos p,Direction direction,BlockPos neighbour,BlockState other,RandomSource random) {
+      if(shapeTrace){
+        output.println("N "+shapeCase+" "+name+" "+direction.getSerializedName()+" "+pos(neighbour)+" "+((TraceState)other).name);
+        if(direction==Direction.WEST)blocks.put(shapeOrigin.relative(Direction.EAST).immutable(),replacement);
+        return shapeStates[++shapeIndex];
+      }
       if(shapeCount++%6==0)output.println("S "+pos(p)+" "+name);
       return change?d:this;
     }
   }
   static class FakeLevel extends ServerLevel {
     FakeLevel(){super(null,null,null,null,null,null,false,0L,List.of(),false);}
-    @Override public BlockState getBlockState(BlockPos pos){return Blocks.AIR.defaultBlockState();}
+    @Override public BlockState getBlockState(BlockPos pos){return shapeTrace?blocks.get(pos):Blocks.AIR.defaultBlockState();}
     @Override public RandomSource getRandom(){return RandomSource.create(3);}
     @Override public boolean setBlock(BlockPos p,BlockState state,int flags,int recursion){
       var result=(TraceState)state;output.println("W "+pos(p)+" "+result.name+" "+flags);blocks.put(p.immutable(),result);return true;
@@ -105,5 +115,25 @@ public class PostprocessingOracle {
     chunk.postProcessGeneration(level);
     output.println("E "+lists[0].size()+" "+lists[1].size());
     output.println("BE "+pending.size());
+    shapeTrace=true;
+    BlockPos[] origins={new BlockPos(8,4,8),new BlockPos(Integer.MAX_VALUE,0,Integer.MIN_VALUE),new BlockPos(Integer.MIN_VALUE,-64,Integer.MAX_VALUE)};
+    Direction[] directions={Direction.WEST,Direction.EAST,Direction.NORTH,Direction.SOUTH,Direction.DOWN,Direction.UP};
+    for(shapeCase=0;shapeCase<origins.length;shapeCase++){
+      blocks.clear();shapeOrigin=origins[shapeCase];shapeIndex=0;shapeStates=new TraceState[7];
+      for(int i=0;i<7;i++)shapeStates[i]=state("S"+i,false,false,false);
+      for(int i=0;i<6;i++)blocks.put(shapeOrigin.relative(directions[i]).immutable(),state("N"+i,false,false,false));
+      replacement=state("changed",false,false,false);
+      var result=Block.updateFromNeighbourShapes(shapeStates[0],level,shapeOrigin);
+      if(result!=shapeStates[6] || shapeIndex!=6)throw new AssertionError("shape chain differs");
+      output.println("R "+shapeCase+" "+((TraceState)result).name);
+    }
+    shapeCase=3;shapeOrigin=p1;shapeIndex=0;shapeStates=new TraceState[7];blocks.clear();
+    for(int i=0;i<7;i++)shapeStates[i]=state("S"+i,false,false,false);
+    blocks.put(shapeOrigin,shapeStates[0]);
+    for(int i=0;i<6;i++)blocks.put(shapeOrigin.relative(directions[i]).immutable(),state("N"+i,false,false,false));
+    replacement=state("changed",false,false,false);
+    ShortList[] second={new TraceList(0),null};second[0].add(ProtoChunk.packOffsetCoordinates(shapeOrigin));
+    pending=new TracePending();set(chunk,"postProcessing",second);set(chunk,"pendingBlockEntities",pending);
+    output.println("BEGIN_SHAPES");chunk.postProcessGeneration(level);output.println("END_SHAPES");
   }
 }

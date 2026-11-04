@@ -10235,6 +10235,36 @@ mod tests {
     }
 
     #[test]
+    fn postprocessing_neighbor_shapes_use_generated_mushroom_states() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut mushroom = state("red_mushroom_block");
+        mushroom.properties = ["down", "up", "north", "south", "west", "east"]
+            .into_iter()
+            .map(|face| (face.into(), "true".into()))
+            .collect();
+        for pos in [[8, 8, 8], [7, 8, 8], [9, 8, 8], [8, 8, 7]] {
+            region.set_section_block(pos, &mushroom).unwrap();
+        }
+        let result = super::super::postprocessing::update_from_neighbor_shapes(
+            &mut region,
+            [8, 8, 8],
+            &mushroom,
+        )
+        .unwrap();
+        for face in ["west", "east", "north"] {
+            assert_eq!(result.properties[face], "false", "{face}");
+        }
+        for face in ["down", "up", "south"] {
+            assert_eq!(result.properties[face], "true", "{face}");
+        }
+        assert_eq!(region.read([8, 8, 8]).unwrap(), mushroom);
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tree_mushroom_edge_updates_match_java() {
         use native_resources::tree_leaf_update::ShapeEdgeWorld;
@@ -10394,6 +10424,59 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3 * 64 * 6 * 6);
+        let order = [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ];
+        let mut combined = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("P ")) {
+            let values: Vec<usize> = line
+                .split_whitespace()
+                .map(|part| part.parse().unwrap())
+                .collect();
+            let [kind, mask, surround, expected] = <[usize; 4]>::try_from(values).unwrap();
+            let mut original = state(names[kind]);
+            original.properties = faces
+                .iter()
+                .enumerate()
+                .map(|(bit, face)| ((*face).into(), ((mask & (1 << bit)) != 0).to_string()))
+                .collect();
+            let mut same = state(names[kind]);
+            same.properties = faces
+                .iter()
+                .map(|face| ((*face).into(), "true".into()))
+                .collect();
+            let air = state("air");
+            for (bit, direction) in order.iter().enumerate() {
+                let neighbor = [8 + direction[0], 8 + direction[1], 8 + direction[2]];
+                region
+                    .set_section_block(
+                        neighbor,
+                        if surround & (1 << bit) != 0 {
+                            &same
+                        } else {
+                            &air
+                        },
+                    )
+                    .unwrap();
+            }
+            let result = super::super::postprocessing::update_from_neighbor_shapes(
+                &mut region,
+                [8, 8, 8],
+                &original,
+            )
+            .unwrap();
+            let result_mask = faces.iter().enumerate().fold(0usize, |value, (bit, face)| {
+                value | (usize::from(result.properties[*face] == "true") << bit)
+            });
+            assert_eq!(result_mask, expected, "{line}");
+            combined += 1;
+        }
+        assert_eq!(combined, 3 * 6 * 8);
         let mut block = state("red_mushroom_block");
         block.properties = faces
             .iter()

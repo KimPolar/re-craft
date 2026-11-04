@@ -47,6 +47,43 @@ pub struct FreshTerrainBatch {
     failed: bool,
 }
 
+pub(super) fn updated_postprocessing_sky_sources(
+    before: &World,
+    after: &World,
+    checks: &[native_world::loaded::BlockPosition],
+    bounds: native_world::block_light::LightBounds,
+    original: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+) -> Result<Option<BTreeMap<ChunkPos, Arc<[i32; 256]>>>> {
+    let mut changed_chunks = BTreeSet::new();
+    for pos in checks {
+        let old = before
+            .block(pos.x, pos.y, pos.z)
+            .context("original postprocessing light state missing")?;
+        let new = after
+            .block(pos.x, pos.y, pos.z)
+            .context("updated postprocessing light state missing")?;
+        if !native_world::sky_light::same_sky_behavior(old, new)
+            .context("unsupported postprocessing sky behavior")?
+        {
+            changed_chunks.insert(pos.chunk());
+        }
+    }
+    if changed_chunks.is_empty() {
+        return Ok(None);
+    }
+    let mut sources = original.clone();
+    for pos in changed_chunks {
+        ensure!(
+            sources.contains_key(&pos),
+            "postprocessing sky sources were not initialized"
+        );
+        let heights = native_world::sky_light::generated_chunk_sky_sources(after, bounds, pos)
+            .context("updated postprocessing sky sources unavailable")?;
+        sources.insert(pos, Arc::from(heights));
+    }
+    Ok(Some(sources))
+}
+
 pub(super) struct SpawnStamp {
     world: Arc<World>,
     entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
@@ -70,6 +107,8 @@ struct DecorationConfig {
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    washed_blocks: Option<Arc<BTreeSet<String>>>,
+    lava_fluids: Option<Arc<BTreeSet<String>>>,
 }
 
 /// Examine every branch without consuming generation randomness or the block
@@ -810,6 +849,13 @@ impl FreshTerrainBatch {
             native_resources::fluid_tags::BubbleColumnTags::load(provider, &block_registry)
                 .ok()
                 .map(Arc::new);
+        let washed_blocks =
+            native_resources::fluid_tags::load_washed_away_blocks(provider, &block_registry)
+                .ok()
+                .map(Arc::new);
+        let lava_fluids = native_resources::fluid_tags::load_lava(provider)
+            .ok()
+            .map(Arc::new);
         self.decoration = Some(DecorationConfig {
             schedule,
             features_cannot_spawn_entities,
@@ -818,6 +864,8 @@ impl FreshTerrainBatch {
             mushroom_tags,
             leaf_tags,
             bubble_tags,
+            washed_blocks,
+            lava_fluids,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -1577,6 +1625,14 @@ impl FreshTerrainBatch {
                 .as_ref()
                 .and_then(|config| config.bubble_tags.clone()),
         );
+        stage.set_fluid_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.washed_blocks.clone()),
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.lava_fluids.clone()),
+        );
         Ok(stage)
     }
 
@@ -1631,12 +1687,25 @@ impl FreshTerrainBatch {
             }
         }
         let before = self.light_snapshot(covered)?;
+        let updated_sources = if before.has_sky_channel() {
+            updated_postprocessing_sky_sources(
+                &processed.source,
+                &processed.world,
+                &processed.sealed_checks,
+                bounds,
+                &engine.fresh.sky_sources,
+            )?
+        } else {
+            None
+        };
         super::postprocessing_world::drain_postprocessing_light(
             &processed.world,
             bounds,
             &before,
             &engine.active,
-            &engine.fresh.sky_sources,
+            updated_sources
+                .as_ref()
+                .unwrap_or(&engine.fresh.sky_sources),
             &checks,
         )
     }

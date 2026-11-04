@@ -38,6 +38,8 @@ pub struct GeneratedPostprocessing {
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    washed_blocks: Option<Arc<BTreeSet<String>>>,
+    lava_fluids: Option<Arc<BTreeSet<String>>>,
     edits: Vec<BlockPosition>,
     light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -114,6 +116,8 @@ impl GeneratedPostprocessing {
             mushroom_tags,
             leaf_tags: None,
             bubble_tags: None,
+            washed_blocks: None,
+            lava_fluids: None,
             edits: Vec::new(),
             light_checks: Vec::new(),
             heightmaps,
@@ -137,6 +141,15 @@ impl GeneratedPostprocessing {
         tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     ) {
         self.bubble_tags = tags;
+    }
+
+    pub(super) fn set_fluid_tags(
+        &mut self,
+        washed: Option<Arc<BTreeSet<String>>>,
+        lava: Option<Arc<BTreeSet<String>>>,
+    ) {
+        self.washed_blocks = washed;
+        self.lava_fluids = lava;
     }
 
     /// Run a bounded number of callbacks without interleaving another chunk.
@@ -167,6 +180,8 @@ impl GeneratedPostprocessing {
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
+            washed_blocks: self.washed_blocks.as_deref(),
+            lava_fluids: self.lava_fluids.as_deref(),
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -214,6 +229,8 @@ struct GeneratedBlockView<'a> {
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
+    washed_blocks: Option<&'a BTreeSet<String>>,
+    lava_fluids: Option<&'a BTreeSet<String>>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -365,8 +382,8 @@ impl GeneratedBlockView<'_> {
         }
     }
 
-    fn tick_unchanged_fluid(
-        &self,
+    fn tick_generated_fluid(
+        &mut self,
         pos: [i32; 3],
         fluid: native_world::fluid::FluidState,
     ) -> Result<()> {
@@ -397,6 +414,7 @@ impl GeneratedBlockView<'_> {
         // accept only ticks that need no writes under every possible setting.
         // Such ticks do not sample the lava spread-delay RNG either: any
         // changed flowing state would appear in the rejected change list.
+        let mut planned = None;
         for converts in [false, true] {
             for fast_lava in [false, true] {
                 if fluid.kind == FluidKind::Water && fast_lava {
@@ -416,9 +434,210 @@ impl GeneratedBlockView<'_> {
                 .map_err(|error| {
                     anyhow::anyhow!("generated fluid tick is incomplete: {error:?}")
                 })?;
+                if let Some(previous) = &planned {
+                    ensure!(
+                        *previous == changes,
+                        "generated fluid tick depends on unavailable settings"
+                    );
+                } else {
+                    planned = Some(changes);
+                }
+            }
+        }
+        let planned = planned.context("fluid settings were not evaluated")?;
+        if planned.is_empty() {
+            return Ok(());
+        }
+        use native_world::fluid_sim::ChangedBlock;
+        ensure!(
+            fluid.kind == FluidKind::Water && fluid.source,
+            "generated flowing fluid callbacks are unsupported"
+        );
+        let below = glam::IVec3::from_array(pos) + glam::IVec3::NEG_Y;
+        ensure!(
+            matches!(planned.as_slice(), [change]
+            if change.position == below
+                && matches!(change.block, ChangedBlock::Fluid(next)
+                    if next.kind == FluidKind::Water && next.falling && !next.source && next.amount == 8)),
+            "generated fluid tick requires unsupported block callbacks"
+        );
+        let mut live = GeneratedWaterTick {
+            view: self,
+            origin: glam::IVec3::from_array(pos),
+        };
+        native_world::fluid_sim::tick_live(
+            &mut live,
+            glam::IVec3::from_array(pos),
+            fluid,
+            Settings::default(),
+        )
+        .map_err(|error| anyhow::anyhow!("generated water tick failed: {error:?}"))?;
+        Ok(())
+    }
+
+    fn schedule_water(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        let fluid = liquid_state(state)?.context("water callback has no fluid")?;
+        ensure!(
+            fluid.kind == native_world::fluid::FluidKind::Water,
+            "unsupported fluid callback"
+        );
+        let id = if fluid.source {
+            "minecraft:water"
+        } else {
+            "minecraft:flowing_water"
+        };
+        ensure!(
+            self.ticks.schedule(TickRegistry::Fluid, id, pos, 5, 0)?
+                != ScheduleOutcome::MissingChunk,
+            "water tick container is missing"
+        );
+        Ok(())
+    }
+
+    fn schedule_water_bubble(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        let fluid = liquid_state(state)?.context("water callback has no fluid")?;
+        let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
+        if fluid.source && tags.can_occupy_fluid("minecraft:water") {
+            let support = self.read([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+            if tags.enables(&support.name) {
                 ensure!(
-                    changes.is_empty(),
-                    "generated fluid tick requires block callbacks"
+                    self.ticks
+                        .schedule(TickRegistry::Block, "minecraft:water", pos, 20, 0)?
+                        != ScheduleOutcome::MissingChunk,
+                    "bubble tick container is missing"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn spread_water_down(&mut self, origin: glam::IVec3, target: glam::IVec3) -> Result<()> {
+        use native_world::fluid_sim::Cell;
+        ensure!(
+            target == origin + glam::IVec3::NEG_Y,
+            "unsupported water spread direction"
+        );
+        let lava_tags = self.lava_fluids.context("lava fluid tags unavailable")?;
+        ensure!(
+            !lava_tags.contains("minecraft:water")
+                && !lava_tags.contains("minecraft:flowing_water"),
+            "water uses unsupported lava callbacks"
+        );
+        let old = self.read(target.to_array())?;
+        ensure!(
+            matches!(self.fluid_cell(target), Cell::Air),
+            "water target is not air"
+        );
+        ensure!(
+            self.washed_blocks
+                .context("fluid replacement tags unavailable")?
+                .contains(&old.name),
+            "water target is not tagged as washable"
+        );
+        let chunk_pos = ChunkPos {
+            x: target.x.div_euclid(16),
+            z: target.z.div_euclid(16),
+        };
+        let section_y =
+            i8::try_from(target.y.div_euclid(16)).context("water section out of range")?;
+        let blocks = self
+            .world
+            .chunks
+            .get(&chunk_pos)
+            .and_then(|chunk| chunk.sections.get(&section_y))
+            .and_then(|section| section.blocks.as_ref())
+            .context("water section unavailable")?;
+        let mut nonempty = false;
+        for id in blocks.iter() {
+            let state = self
+                .world
+                .state(*id)
+                .context("water section state missing")?;
+            if !matches!(
+                state.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ) {
+                nonempty = true;
+                break;
+            }
+        }
+        ensure!(nonempty, "water spread requires light section allocation");
+        let directions = [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+        ];
+        for d in directions {
+            let p = target + glam::IVec3::from_array(d);
+            let state = self.read(p.to_array())?;
+            ensure!(
+                matches!(self.fluid_cell(p), Cell::Air | Cell::Solid | Cell::Fluid(_)),
+                "unsupported water neighbor callback"
+            );
+            if let Some(fluid) = liquid_state(&state)? {
+                ensure!(
+                    fluid.kind == native_world::fluid::FluidKind::Water,
+                    "water touches unsupported liquid"
+                );
+            }
+        }
+        let next = BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "8".into())]),
+        };
+        self.write_postprocessed_state(target.to_array(), &old, &next)?;
+        self.schedule_water(target.to_array(), &next)?;
+        // Redstone neighbor callbacks precede shape updates.
+        for d in directions {
+            let p = target + glam::IVec3::from_array(d);
+            let state = self.read(p.to_array())?;
+            if liquid_state(&state)?.is_some() {
+                self.schedule_water(p.to_array(), &state)?;
+                self.schedule_water_bubble(p.to_array(), &state)?;
+            }
+        }
+        for d in [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ] {
+            let p = target + glam::IVec3::from_array(d);
+            let state = self.read(p.to_array())?;
+            if let Some(fluid) = liquid_state(&state)? {
+                if fluid.source {
+                    self.schedule_water(p.to_array(), &state)?;
+                    let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
+                    if d == [0, 1, 0]
+                        && tags.can_occupy_fluid("minecraft:water")
+                        && tags.enables(&next.name)
+                    {
+                        ensure!(
+                            self.ticks.schedule(
+                                TickRegistry::Block,
+                                "minecraft:water",
+                                p.to_array(),
+                                20,
+                                0
+                            )? != ScheduleOutcome::MissingChunk,
+                            "bubble tick container is missing"
+                        );
+                    }
+                }
+            } else if matches!(
+                state.name.as_str(),
+                "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+            ) {
+                ensure!(
+                    self.ticks
+                        .schedule(TickRegistry::Block, &state.name, p.to_array(), 2, 0)?
+                        != ScheduleOutcome::MissingChunk,
+                    "falling tick container is missing"
                 );
             }
         }
@@ -501,13 +720,24 @@ impl GeneratedBlockView<'_> {
                 "mushroom light change requires propagation during postprocessing"
             );
         }
+        self.write_postprocessed_state(pos, &old, next)
+    }
+
+    fn write_postprocessed_state(
+        &mut self,
+        pos: [i32; 3],
+        old: &BlockState,
+        next: &BlockState,
+    ) -> Result<()> {
+        let same_light = native_world::block_light::same_light_behavior(old, next)
+            .context("postprocessing light behavior unavailable")?;
         let world = Arc::make_mut(self.world);
         let id = world.intern_state(next.clone());
         ensure!(
             world
                 .set_block_id(pos[0], pos[1], pos[2], id)
-                .map_err(|error| anyhow::anyhow!("cannot update generated mushroom: {error:?}"))?,
-            "generated mushroom write was unchanged"
+                .map_err(|error| anyhow::anyhow!("cannot update generated block: {error:?}"))?,
+            "generated block write was unchanged"
         );
         let tags = self
             .heightmap_tags
@@ -544,6 +774,65 @@ impl GeneratedBlockView<'_> {
             self.light_checks.push(position);
         }
         Ok(())
+    }
+}
+
+struct GeneratedWaterTick<'a, 'b> {
+    view: &'a mut GeneratedBlockView<'b>,
+    origin: glam::IVec3,
+}
+
+impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
+    type Error = anyhow::Error;
+
+    fn cell(&self, pos: glam::IVec3) -> native_world::fluid_sim::Cell {
+        self.view.fluid_cell(pos)
+    }
+
+    fn delay(
+        &mut self,
+        _: glam::IVec3,
+        _: native_world::fluid::FluidState,
+        _: Option<native_world::fluid::FluidState>,
+    ) -> Result<u64> {
+        bail!("flowing-fluid recalculation requires the world random state")
+    }
+
+    fn update_origin(
+        &mut self,
+        _: glam::IVec3,
+        _: Option<native_world::fluid::FluidState>,
+    ) -> Result<()> {
+        bail!("flowing-fluid origin updates are unsupported")
+    }
+
+    fn schedule(
+        &mut self,
+        _: glam::IVec3,
+        _: native_world::fluid::FluidState,
+        _: u64,
+    ) -> Result<()> {
+        bail!("flowing-fluid scheduling is unsupported")
+    }
+
+    fn spread_to(
+        &mut self,
+        pos: glam::IVec3,
+        old: native_world::fluid_sim::Cell,
+        fluid: native_world::fluid::FluidState,
+        direction: glam::IVec3,
+    ) -> Result<()> {
+        use native_world::{fluid::FluidKind, fluid_sim::Cell};
+        ensure!(
+            old == Cell::Air
+                && direction == glam::IVec3::NEG_Y
+                && fluid.kind == FluidKind::Water
+                && fluid.amount == 8
+                && fluid.falling
+                && !fluid.source,
+            "unsupported generated water spread"
+        );
+        self.view.spread_water_down(self.origin, pos)
     }
 }
 
@@ -626,7 +915,7 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         Ok(None)
     }
     fn tick_fluid(&mut self, pos: [i32; 3], _: &BlockState, fluid: &Self::Fluid) -> Result<()> {
-        self.tick_unchanged_fluid(pos, *fluid)
+        self.tick_generated_fluid(pos, *fluid)
     }
     fn is_liquid_block(&mut self, state: &BlockState) -> Result<bool> {
         Ok(liquid_state(state)?.is_some())
@@ -1246,6 +1535,210 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+    }
+
+    fn falling_water_trace(sand_neighbor: bool) -> Vec<String> {
+        use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceProvider};
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.ends_with("blocks_motion_in_heightmap.json")
+                    || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
+                {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:sand"]}"#.to_vec(),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+        let (mut stage, _, chunk) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let sand = world.intern_state(BlockState {
+            name: "minecraft:sand".into(),
+            properties: BTreeMap::new(),
+        });
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(stone);
+        world.set_block_id(8, 8, 8, water).unwrap();
+        world.set_block_id(8, 7, 8, air).unwrap();
+        if sand_neighbor {
+            world.set_block_id(9, 7, 8, sand).unwrap();
+        }
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        stage.region.tasks =
+            BTreeMap::from([(chunk, PostprocessingTask::new(Arc::new(marks), chunk))]);
+        stage.region.ticks = RegionTicks::new(
+            BTreeMap::from([(
+                chunk,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                },
+            )]),
+            100,
+            2,
+        )
+        .unwrap();
+        let registry = ["air", "water", "stone", "sand"]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+        stage.heightmap_tags = Some(Arc::new(HeightmapTags::load(&mut Tags, &registry).unwrap()));
+        stage.heightmaps.insert(chunk, fixture_maps(16));
+        stage.set_bubble_tags(Some(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(BTreeSet::new(), BTreeSet::new()),
+        )));
+        stage.set_fluid_tags(
+            Some(Arc::new(BTreeSet::from(["minecraft:air".into()]))),
+            Some(Arc::new(BTreeSet::from([
+                "minecraft:lava".into(),
+                "minecraft:flowing_lava".into(),
+            ]))),
+        );
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert_eq!(source.block(8, 7, 8).unwrap().name, "minecraft:air");
+        assert_eq!(result.edits, vec![BlockPosition { x: 8, y: 7, z: 8 }]);
+        assert_eq!(result.light_checks, result.edits);
+        assert_eq!(
+            result
+                .world
+                .block(8, 7, 8)
+                .unwrap()
+                .properties
+                .get("level")
+                .unwrap(),
+            "8"
+        );
+        let mut trace = vec![format!("sand {sand_neighbor}")];
+        let ticks = result.ticks.chunk(chunk).unwrap();
+        for tick in ticks.blocks.pack(100) {
+            trace.push(format!(
+                "block {} {},{},{} {}",
+                tick.kind, tick.position[0], tick.position[1], tick.position[2], tick.delay
+            ));
+        }
+        for tick in ticks.fluids.pack(100) {
+            trace.push(format!(
+                "fluid {} {},{},{} {}",
+                tick.kind, tick.position[0], tick.position[1], tick.position[2], tick.delay
+            ));
+        }
+        trace.push(format!("counter {}", result.ticks.next_sub_tick()));
+        trace
+    }
+
+    #[test]
+    fn downward_water_spread_updates_world_ticks_and_light_checks() {
+        let plain = falling_water_trace(false);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line == "fluid minecraft:flowing_water 8,7,8 5")
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|line| line == "fluid minecraft:water 8,8,8 5")
+        );
+        let sand = falling_water_trace(true);
+        assert!(
+            sand.iter()
+                .any(|line| line == "block minecraft:sand 9,7,8 2")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn downward_water_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+        );
+        let mut expected = falling_water_trace(false);
+        expected.extend(falling_water_trace(true));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn water_edits_refresh_direct_sky_sources_without_touching_the_input() {
+        use native_world::{block_light::LightBounds, sky_light::generated_chunk_sky_sources};
+        let (mut stage, _, pos) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "8".into())]),
+        });
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&pos).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(air);
+        let before = Arc::clone(&stage.world);
+        let bounds = LightBounds::new(0, 16).unwrap();
+        let original_heights =
+            Arc::from(generated_chunk_sky_sources(&before, bounds, pos).unwrap());
+        let original = BTreeMap::from([(pos, original_heights)]);
+        Arc::make_mut(&mut stage.world)
+            .set_block_id(8, 7, 8, water)
+            .unwrap();
+        let checks = [BlockPosition { x: 8, y: 7, z: 8 }];
+        let updated = super::super::terrain_batch::updated_postprocessing_sky_sources(
+            &before,
+            &stage.world,
+            &checks,
+            bounds,
+            &original,
+        )
+        .unwrap()
+        .unwrap();
+        let expected = generated_chunk_sky_sources(&stage.world, bounds, pos).unwrap();
+        assert_eq!(updated[&pos].as_ref(), expected.as_ref());
+        assert_ne!(updated[&pos][8 + 8 * 16], original[&pos][8 + 8 * 16]);
+        assert!(
+            super::super::terrain_batch::updated_postprocessing_sky_sources(
+                &before,
+                &stage.world,
+                &checks,
+                bounds,
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+        assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:air");
     }
 
     #[test]

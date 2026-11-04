@@ -3618,7 +3618,61 @@ mod tests {
                 packs: None,
             }),
             initial_respawn: None,
+            postprocessed: None,
         };
+        let postprocessor = crate::generation_worker::GenerationWorker::postprocess(
+            ready,
+            vec![center],
+            42,
+            7,
+            true,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ready = loop {
+            if let Some(result) = postprocessor.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Ready(ready) => break ready,
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        panic!("postprocessing failed: {error:#}")
+                    }
+                    crate::generation_worker::GenerationResult::Cancelled => {
+                        panic!("postprocessing cancelled")
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "postprocessing worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            postprocessor.progress().phase,
+            crate::generation_worker::GenerationPhase::Ready
+        );
+        assert_eq!(postprocessor.progress().completed_steps, 1);
+        let output = ready.postprocessed.as_ref().unwrap();
+        assert_eq!(output.region.chunks, BTreeSet::from([center]));
+        assert_eq!(
+            output.chunks[&center].chunk.value.get("Status"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:full".into()
+            ))
+        );
+        assert!(
+            ready
+                .start_session(native_session::PlayerState {
+                    position: glam::Vec3::new(8.5, 16.0, 8.5),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: true,
+                    pose: native_session::PlayerPose::Standing,
+                })
+                .is_err()
+        );
+        ready.postprocessed = None;
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
         let expansion = crate::generation_worker::GenerationWorker::expand(

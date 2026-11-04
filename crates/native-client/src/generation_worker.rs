@@ -26,6 +26,7 @@ pub enum GenerationPhase {
     Spawning,
     PreparingMesh,
     SearchingSpawn,
+    Postprocessing,
     Ready,
     Cancelled,
     Failed,
@@ -59,6 +60,13 @@ pub struct GenerationReady {
         Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
     pub(crate) initial_respawn: Option<InitialRespawnSettings>,
+    /// Isolated postprocessing output; it is not yet a playable world.
+    pub postprocessed: Option<PostprocessedGeneration>,
+}
+
+pub struct PostprocessedGeneration {
+    pub region: native_session::worldgen::PostprocessedGeneratedRegion,
+    pub chunks: BTreeMap<ChunkPos, native_session::worldgen::PostprocessedChunkDraft>,
 }
 
 #[derive(Clone)]
@@ -382,6 +390,10 @@ impl GenerationReady {
         &mut self,
         player: native_session::PlayerState,
     ) -> Result<native_session::loaded::LoadedSession> {
+        ensure!(
+            self.postprocessed.is_none(),
+            "postprocessed chunks cannot yet be opened in a session"
+        );
         use native_session::{
             inventory::PlayerInventory,
             loaded::{BuildBounds, LoadedSession},
@@ -662,6 +674,62 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Run the isolated post-generation callbacks and assemble chunk drafts on
+    /// the worker, in the caller's explicit chunk order. A failure or
+    /// cancellation discards the owned batch and all partial results.
+    pub fn postprocess(
+        mut ready: GenerationReady,
+        positions: Vec<ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+    ) -> Result<Self> {
+        ensure!(!positions.is_empty(), "no postprocessing chunks");
+        let unique: BTreeSet<_> = positions.iter().copied().collect();
+        ensure!(
+            unique.len() == positions.len(),
+            "duplicate postprocessing chunk"
+        );
+        ensure!(
+            ready.postprocessed.is_none(),
+            "generation was already postprocessed"
+        );
+        Self::spawn(move |cancelled, progress| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            set_phase(progress, GenerationPhase::Postprocessing);
+            let mut stage = ready.batch.begin_generated_postprocessing(
+                positions.iter().copied(),
+                game_time,
+                next_sub_tick,
+            )?;
+            stage.set_water_source_conversion(water_source_conversion)?;
+            for &pos in &positions {
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if stage.poll(pos, 256)? {
+                        break;
+                    }
+                }
+                let mut state = progress.lock().unwrap_or_else(|error| error.into_inner());
+                state.completed_steps = state.completed_steps.saturating_add(1);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let region = stage.finish()?;
+            let chunks = ready.batch.postprocessed_chunk_drafts(&region, positions)?;
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            ready.postprocessed = Some(PostprocessedGeneration { region, chunks });
+            Ok(Some(ready))
+        })
+    }
+
     /// Generate and select the initial spawn, then process creature spawning
     /// without reopening or changing the selected world data-pack stack.
     /// This produces intermediate chunks; it does not save or start play.
@@ -1145,6 +1213,7 @@ impl GenerationWorker {
                 entity_collision_registry: None,
                 level_settings: None,
                 initial_respawn: None,
+                postprocessed: None,
             }))
         })
     }
@@ -1211,6 +1280,10 @@ impl GenerationWorker {
 }
 
 fn checked_spawn_targets(ready: &mut GenerationReady) -> Result<BTreeSet<ChunkPos>> {
+    ensure!(
+        ready.postprocessed.is_none(),
+        "postprocessed generation cannot be respawned"
+    );
     let targets = ready
         .mesh
         .targets
@@ -1728,6 +1801,7 @@ fn generate_spawn_origin(
         entity_collision_registry: None,
         level_settings: None,
         initial_respawn: None,
+        postprocessed: None,
     }))
 }
 
@@ -1753,7 +1827,12 @@ fn expand_with_inputs(
         entity_collision_registry,
         level_settings,
         initial_respawn,
+        postprocessed,
     } = ready;
+    ensure!(
+        postprocessed.is_none(),
+        "postprocessed generation cannot be expanded"
+    );
     ensure!(
         revision != mesh.revision,
         "expanded mesh needs a new revision"
@@ -1847,6 +1926,7 @@ fn expand_with_inputs(
         entity_collision_registry,
         level_settings,
         initial_respawn,
+        postprocessed: None,
     }))
 }
 

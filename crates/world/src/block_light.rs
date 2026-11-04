@@ -536,6 +536,8 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:deepslate_iron_ore"
         | "minecraft:copper_ore"
         | "minecraft:deepslate_copper_ore"
+        | "minecraft:raw_iron_block"
+        | "minecraft:raw_copper_block"
         | "minecraft:gold_ore"
         | "minecraft:deepslate_gold_ore"
         | "minecraft:diamond_ore"
@@ -2766,6 +2768,8 @@ mod tests {
             "deepslate_iron_ore",
             "copper_ore",
             "deepslate_copper_ore",
+            "raw_iron_block",
+            "raw_copper_block",
             "gold_ore",
             "deepslate_gold_ore",
             "diamond_ore",

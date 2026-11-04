@@ -700,6 +700,11 @@ pub fn try_tick(
 pub trait LiveFluidWorld {
     type Error;
 
+    /// Preserve a caller's existing conservative barrier policy for unknown
+    /// cells. Generation and other strict callers should use the default.
+    fn unknown_is_barrier(&self) -> bool {
+        false
+    }
     fn cell(&self, position: IVec3) -> Cell;
     fn delay(
         &mut self,
@@ -746,7 +751,7 @@ fn inspect_live<W: LiveFluidWorld, T>(
         cell
     };
     let value = inspect(&read);
-    match unknown.get() {
+    match unknown.get().filter(|_| !world.unknown_is_barrier()) {
         Some(pos) => Err(LiveTickError::Incomplete(IncompleteTick::Unknown(pos))),
         None => Ok(value),
     }

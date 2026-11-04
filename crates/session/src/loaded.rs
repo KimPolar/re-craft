@@ -16779,6 +16779,143 @@ impl LoadedSession {
         self.intern_block(state(name, &[("level", &level.to_string())]))
     }
 
+    fn apply_fluid_tick_change(
+        &mut self,
+        change: fluid_sim::Change,
+        kind: FluidKind,
+        settings: fluid_sim::Settings,
+    ) -> bool {
+        let plant = match change.block {
+            fluid_sim::ChangedBlock::Fluid(_) => match cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                change.position,
+                self.states[0],
+            ) {
+                Cell::State(id) => self
+                    .world
+                    .state(id)
+                    .filter(|state| {
+                        Self::fluid_washable_plant(state)
+                            && self
+                                .washed_away_blocks
+                                .as_ref()
+                                .is_some_and(|blocks| blocks.contains(&state.name))
+                    })
+                    .cloned(),
+                Cell::Missing => None,
+            },
+            _ => None,
+        };
+        let id = match change.block {
+            fluid_sim::ChangedBlock::Air => self.states[0],
+            fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
+            fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
+            fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+            | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
+            | fluid_sim::ChangedBlock::WaterloggedChest => {
+                let expected = match change.block {
+                    fluid_sim::ChangedBlock::WaterloggedSlab { top } => fluid_sim::Cell::Slab {
+                        top,
+                        waterlogged: false,
+                    },
+                    fluid_sim::ChangedBlock::WaterloggedStairs { voxels } => {
+                        fluid_sim::Cell::Stairs {
+                            voxels,
+                            waterlogged: false,
+                        }
+                    }
+                    fluid_sim::ChangedBlock::WaterloggedChest => {
+                        fluid_sim::Cell::Chest { waterlogged: false }
+                    }
+                    _ => unreachable!(),
+                };
+                if self.simulation_cell(change.position) != expected {
+                    return true;
+                }
+                let Cell::State(previous) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    change.position,
+                    self.states[0],
+                ) else {
+                    return true;
+                };
+                let Some(mut state) = self.world.state(previous).cloned() else {
+                    return true;
+                };
+                state.properties.insert("waterlogged".into(), "true".into());
+                self.intern_block(state)
+            }
+        };
+        let checked_plant = if let Some(plant) = &plant
+            && kind == FluidKind::Water
+        {
+            let Some(checked) = self.check_block_set(change.position, id, true, false) else {
+                return false;
+            };
+            let Some(position) = add(self.origin, change.position) else {
+                return false;
+            };
+            let Ok((drops, _)) = self.stage_block_loot_without_entity(plant) else {
+                return false;
+            };
+            self.dropped_items.drop_block_resources(
+                position,
+                drops,
+                None,
+                self.block_drops,
+                &mut self.level_random,
+            );
+            Some(checked)
+        } else {
+            None
+        };
+        let fizz_before = kind == FluidKind::Lava && plant.is_some();
+        let evicted_fizz = if fizz_before {
+            self.push_lava_fizz(change.position)
+        } else {
+            None
+        };
+        let changed = if let Some(checked) = checked_plant {
+            self.apply_block_set(change.position, id, true, checked)
+        } else {
+            self.set(change.position, id)
+        };
+        if changed {
+            if kind == FluidKind::Lava
+                && matches!(
+                    change.block,
+                    fluid_sim::ChangedBlock::Solid(fluid_sim::Solidified::Stone)
+                )
+            {
+                let _ = self.push_lava_fizz(change.position);
+            }
+            if matches!(
+                change.block,
+                fluid_sim::ChangedBlock::WaterloggedSlab { .. }
+                    | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
+                    | fluid_sim::ChangedBlock::WaterloggedChest
+            ) && let Some(water) = self.simulated_fluid(id)
+            {
+                self.schedule_fluid(change.position, water, settings.delay(water.kind));
+            }
+        } else {
+            if fizz_before {
+                self.lava_fizz.pop_back();
+                if let Some(evicted) = evicted_fizz {
+                    self.lava_fizz.push_front(evicted);
+                }
+            }
+            if plant.is_some() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn advance_fluid_ticks(&mut self) {
         let settings = self.fluid_settings();
         let mut unloaded = Vec::new();
@@ -16848,174 +16985,28 @@ impl LoadedSession {
             if fluid.kind != scheduled.key.kind || fluid.source != scheduled.key.source {
                 continue;
             }
-            let changes = fluid_sim::tick(
-                &|pos| self.simulation_cell(pos),
-                relative,
-                fluid.kind,
-                settings,
-            );
-            let next = changes
-                .iter()
-                .find_map(|change| {
-                    (change.position == relative).then_some(match change.block {
-                        fluid_sim::ChangedBlock::Fluid(next) => Some(next),
-                        _ => None,
-                    })
-                })
-                .flatten();
-            let delay = if fluid.kind == FluidKind::Lava && next.is_some() {
-                let above_same = add(relative, IVec3::Y).is_some_and(|above| {
-                    matches!(self.simulation_cell(above), fluid_sim::Cell::Fluid(state) if state.kind == fluid.kind)
-                });
-                fluid_sim::spread_delay(settings, fluid.kind, Some(fluid), next, above_same, || {
-                    self.level_random.next_int_bound(4).expect("positive bound") as u32
-                })
-            } else {
-                settings.delay(fluid.kind)
+            let (retry_wash, result) = {
+                let mut live = SessionFluidTick {
+                    session: self,
+                    settings,
+                    kind: fluid.kind,
+                    retry_wash: false,
+                };
+                // Existing gameplay treats unsupported or unloaded cells as
+                // barriers. Generation uses the strict variant instead.
+                let result = fluid_sim::tick_live(&mut live, relative, fluid, settings);
+                (live.retry_wash, result)
             };
-            let mut retry_wash = false;
-            for change in changes {
-                let plant = match change.block {
-                    fluid_sim::ChangedBlock::Fluid(_) => match cell(
-                        &self.world,
-                        self.origin,
-                        self.bounds,
-                        change.position,
-                        self.states[0],
-                    ) {
-                        Cell::State(id) => self
-                            .world
-                            .state(id)
-                            .filter(|state| {
-                                Self::fluid_washable_plant(state)
-                                    && self
-                                        .washed_away_blocks
-                                        .as_ref()
-                                        .is_some_and(|blocks| blocks.contains(&state.name))
-                            })
-                            .cloned(),
-                        Cell::Missing => None,
-                    },
-                    _ => None,
-                };
-                let id = match change.block {
-                    fluid_sim::ChangedBlock::Air => self.states[0],
-                    fluid_sim::ChangedBlock::Fluid(fluid) => self.intern_liquid(fluid),
-                    fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
-                    fluid_sim::ChangedBlock::WaterloggedSlab { .. }
-                    | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
-                    | fluid_sim::ChangedBlock::WaterloggedChest => {
-                        let expected = match change.block {
-                            fluid_sim::ChangedBlock::WaterloggedSlab { top } => {
-                                fluid_sim::Cell::Slab {
-                                    top,
-                                    waterlogged: false,
-                                }
-                            }
-                            fluid_sim::ChangedBlock::WaterloggedStairs { voxels } => {
-                                fluid_sim::Cell::Stairs {
-                                    voxels,
-                                    waterlogged: false,
-                                }
-                            }
-                            fluid_sim::ChangedBlock::WaterloggedChest => {
-                                fluid_sim::Cell::Chest { waterlogged: false }
-                            }
-                            _ => unreachable!(),
-                        };
-                        if self.simulation_cell(change.position) != expected {
-                            continue;
-                        }
-                        let Cell::State(previous) = cell(
-                            &self.world,
-                            self.origin,
-                            self.bounds,
-                            change.position,
-                            self.states[0],
-                        ) else {
-                            continue;
-                        };
-                        let Some(mut state) = self.world.state(previous).cloned() else {
-                            continue;
-                        };
-                        state.properties.insert("waterlogged".into(), "true".into());
-                        self.intern_block(state)
-                    }
-                };
-                let checked_plant = if let Some(plant) = &plant
-                    && fluid.kind == FluidKind::Water
-                {
-                    let Some(checked) = self.check_block_set(change.position, id, true, false)
-                    else {
-                        retry_wash = true;
-                        continue;
-                    };
-                    let Some(position) = add(self.origin, change.position) else {
-                        retry_wash = true;
-                        continue;
-                    };
-                    let Ok((drops, _)) = self.stage_block_loot_without_entity(plant) else {
-                        retry_wash = true;
-                        continue;
-                    };
-                    self.dropped_items.drop_block_resources(
-                        position,
-                        drops,
-                        None,
-                        self.block_drops,
-                        &mut self.level_random,
-                    );
-                    Some(checked)
-                } else {
-                    None
-                };
-                // Lava burns a replaceable block before changing it. Its fizz
-                // must precede any reactions caused by the ensuing update.
-                let fizz_before = fluid.kind == FluidKind::Lava && plant.is_some();
-                let evicted_fizz = if fizz_before {
-                    self.push_lava_fizz(change.position)
-                } else {
-                    None
-                };
-                let changed = if let Some(checked) = checked_plant {
-                    self.apply_block_set(change.position, id, true, checked)
-                } else {
-                    self.set(change.position, id)
-                };
-                if changed {
-                    if fluid.kind == FluidKind::Lava
-                        && matches!(
-                            change.block,
-                            fluid_sim::ChangedBlock::Solid(fluid_sim::Solidified::Stone)
-                        )
-                    {
-                        let _ = self.push_lava_fizz(change.position);
-                    }
-                    if change.position == relative
-                        && let fluid_sim::ChangedBlock::Fluid(next) = change.block
-                    {
-                        self.schedule_fluid(relative, next, delay);
-                    }
-                    if matches!(
-                        change.block,
-                        fluid_sim::ChangedBlock::WaterloggedSlab { .. }
-                            | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
-                            | fluid_sim::ChangedBlock::WaterloggedChest
-                    ) && let Some(water) = self.simulated_fluid(id)
-                    {
-                        self.schedule_fluid(change.position, water, settings.delay(water.kind));
-                    }
-                } else {
-                    if fizz_before {
-                        self.lava_fizz.pop_back();
-                        if let Some(evicted) = evicted_fizz {
-                            self.lava_fizz.push_front(evicted);
-                        }
-                    }
-                    if plant.is_some() {
-                        retry_wash = true;
-                    }
+            match result {
+                Ok(()) => {}
+                // Barrier mode cannot fail on a later unknown read, so these
+                // errors occur before callbacks have changed the world.
+                Err(fluid_sim::LiveTickError::Incomplete(_)) => {
+                    self.fluid_pending.insert(scheduled.key);
+                    unloaded.push((order, scheduled));
+                    continue;
                 }
+                Err(fluid_sim::LiveTickError::World(never)) => match never {},
             }
             if retry_wash
                 && let Cell::State(id) = cell(
@@ -19533,6 +19524,121 @@ fn draft_falling_sand(
         cancel_drop: entity.cancel_drop,
     };
     crate::saved_falling_block::draft(&original, state)
+}
+
+struct SessionFluidTick<'a> {
+    session: &'a mut LoadedSession,
+    settings: fluid_sim::Settings,
+    kind: FluidKind,
+    retry_wash: bool,
+}
+
+impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
+    type Error = std::convert::Infallible;
+
+    fn unknown_is_barrier(&self) -> bool {
+        true
+    }
+
+    fn cell(&self, position: IVec3) -> fluid_sim::Cell {
+        self.session.simulation_cell(position)
+    }
+
+    fn delay(
+        &mut self,
+        position: IVec3,
+        old: FluidState,
+        next: Option<FluidState>,
+    ) -> Result<u64, Self::Error> {
+        let above_same = add(position, IVec3::Y).is_some_and(|above| {
+            matches!(self.session.simulation_cell(above), fluid_sim::Cell::Fluid(state) if state.kind == old.kind)
+        });
+        Ok(fluid_sim::spread_delay(
+            self.settings,
+            old.kind,
+            Some(old),
+            next,
+            above_same,
+            || {
+                self.session
+                    .level_random
+                    .next_int_bound(4)
+                    .expect("positive bound") as u32
+            },
+        ))
+    }
+
+    fn update_origin(
+        &mut self,
+        position: IVec3,
+        next: Option<FluidState>,
+    ) -> Result<(), Self::Error> {
+        let change = fluid_sim::Change {
+            position,
+            block: next.map_or(fluid_sim::ChangedBlock::Air, fluid_sim::ChangedBlock::Fluid),
+        };
+        self.retry_wash |= !self
+            .session
+            .apply_fluid_tick_change(change, self.kind, self.settings);
+        Ok(())
+    }
+
+    fn schedule(
+        &mut self,
+        position: IVec3,
+        fluid: FluidState,
+        delay: u64,
+    ) -> Result<(), Self::Error> {
+        self.session.schedule_fluid(position, fluid, delay);
+        Ok(())
+    }
+
+    fn spread_to(
+        &mut self,
+        position: IVec3,
+        old: fluid_sim::Cell,
+        fluid: FluidState,
+        direction: IVec3,
+    ) -> Result<(), Self::Error> {
+        use fluid_sim::{Cell as FluidCell, ChangedBlock, Solidified};
+        let block = match old {
+            FluidCell::Unknown => return Ok(()),
+            FluidCell::Fluid(other)
+                if fluid.kind == FluidKind::Lava
+                    && other.kind == FluidKind::Water
+                    && direction == IVec3::NEG_Y =>
+            {
+                ChangedBlock::Solid(Solidified::Stone)
+            }
+            FluidCell::Slab {
+                top,
+                waterlogged: false,
+            } if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedSlab { top }
+            }
+            FluidCell::Stairs {
+                voxels,
+                waterlogged: false,
+            } if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedStairs { voxels }
+            }
+            FluidCell::Chest { waterlogged: false }
+                if fluid.kind == FluidKind::Water && fluid.source =>
+            {
+                ChangedBlock::WaterloggedChest
+            }
+            FluidCell::Slab { .. } | FluidCell::Stairs { .. } | FluidCell::Chest { .. } => {
+                return Ok(());
+            }
+            _ => ChangedBlock::Fluid(fluid),
+        };
+        self.retry_wash |= !self.session.apply_fluid_tick_change(
+            fluid_sim::Change { position, block },
+            self.kind,
+            self.settings,
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -62150,6 +62256,133 @@ pub(crate) mod tests {
             session.simulation_cell(sand_pos),
             fluid_sim::Cell::Fluid(fluid) if fluid.kind == FluidKind::Water
         ));
+    }
+
+    fn fluid_neighbor_callback_states() -> Vec<String> {
+        let mut session = session();
+        let center = IVec3::new(8, 5, 8);
+        let lava = FluidState {
+            kind: FluidKind::Lava,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let lava_id = session.intern_liquid(lava);
+        let water_id = session.intern_liquid(water);
+        for pos in [
+            center,
+            center + IVec3::NEG_Z,
+            center + IVec3::Z,
+            center + IVec3::NEG_X,
+        ] {
+            assert!(session.set_with_notify(pos, lava_id, false));
+        }
+        for pos in [center + IVec3::Y, center + IVec3::NEG_Y] {
+            assert!(session.set_with_notify(pos, water_id, false));
+        }
+        let before = fluid_sim::tick(
+            &|pos| session.simulation_cell(pos),
+            center,
+            lava.kind,
+            session.fluid_settings(),
+        );
+        assert!(
+            before
+                .iter()
+                .any(|change| change.position == center + IVec3::X)
+        );
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.schedule_fluid(center, lava, 0);
+        session.advance_fluid_ticks();
+        let absolute = session.origin + center;
+        [absolute, absolute + IVec3::NEG_Y, absolute + IVec3::X]
+            .into_iter()
+            .map(|pos| {
+                session
+                    .world
+                    .block(pos.x, pos.y, pos.z)
+                    .unwrap()
+                    .name
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fluid_tick_uses_world_after_downward_lava_reaction() {
+        assert_eq!(
+            fluid_neighbor_callback_states(),
+            ["minecraft:obsidian", "minecraft:stone", "minecraft:air"]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn fluid_tick_with_lava_neighbor_callbacks_matches_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let base = temp.path().join("BubbleTickCallbackOracle.java");
+        let source = temp.path().join("FluidNeighborCallbackOracle.java");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &base,
+            include_str!("../tests/java/BubbleTickCallbackOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/FluidNeighborCallbackOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&base)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("FluidNeighborCallbackOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let java: Vec<String> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(fluid_neighbor_callback_states(), java);
     }
 
     #[test]

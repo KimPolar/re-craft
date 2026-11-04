@@ -69,6 +69,30 @@ impl FreshTerrainBatch {
         self.generator.sea_level()
     }
 
+    /// Biome used for the natural-mob-spawns attribute: Java samples the
+    /// chunk's minimum X/Z at the region's inclusive maximum Y. The biome
+    /// neighborhood supplies the same seeded block-to-quart zoom.
+    pub fn mob_spawn_biome(&self, pos: ChunkPos) -> Result<ResourceId> {
+        ensure!(
+            !self.failed
+                && self
+                    .schedule
+                    .completed(pos)
+                    .is_some_and(|stage| stage >= GenerationStage::Light),
+            "mob spawn biome requires a light-complete chunk"
+        );
+        let (_, max_y) = self.build_bounds()?;
+        let x = pos
+            .x
+            .checked_mul(16)
+            .context("mob spawn biome X overflow")?;
+        let z = pos
+            .z
+            .checked_mul(16)
+            .context("mob spawn biome Z overflow")?;
+        Ok(self.biomes.biome_at_block(x, max_y - 1, z)?.clone())
+    }
+
     /// The supplied generator must have been constructed without structure
     /// adjustment and for a new world with structures explicitly disabled.
     pub fn new_without_structures(

@@ -3113,6 +3113,7 @@ mod tests {
         let center = ChunkPos { x: 0, z: 0 };
         let east = ChunkPos { x: 1, z: 0 };
         let later = ChunkPos { x: 2, z: 0 };
+        assert!(batch.mob_spawn_biome(center).is_err());
         for z in -1..=1 {
             for x in -1..=1 {
                 batch
@@ -3186,6 +3187,10 @@ mod tests {
                 .step(&mut data, &mut classify, &mut resolve)
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            batch.mob_spawn_biome(center).unwrap(),
+            ResourceId::parse("minecraft:plains").unwrap()
         );
         let after = batch.light_snapshot([center]).unwrap();
         let after_view = batch.lit_snapshot([center]).unwrap();

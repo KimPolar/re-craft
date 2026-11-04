@@ -1,7 +1,10 @@
 //! Placement modifiers for data-pack features. Feature execution itself is
 //! separate: callers must consume the same random source between positions.
 use anyhow::{Context, Result, bail, ensure};
-use native_core::{random::DecorationRandom, simplex::Simplex2D};
+use native_core::{
+    random::{DecorationRandom, LegacyRandom},
+    simplex::Simplex2D,
+};
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -18,6 +21,20 @@ pub(crate) enum IntProvider {
     Trapezoid(i32, i32, i32),
     Weighted(Vec<(i32, IntProvider)>, i32),
     Clamped(Box<IntProvider>, i32, i32),
+}
+
+trait IntProviderRandom {
+    fn bounded(&mut self, bound: i32) -> Option<i32>;
+}
+impl IntProviderRandom for DecorationRandom {
+    fn bounded(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+}
+impl IntProviderRandom for LegacyRandom {
+    fn bounded(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
 }
 
 fn integer(value: &Value, key: &str) -> Result<i32> {
@@ -151,38 +168,43 @@ impl IntProvider {
         }
     }
     pub(crate) fn sample(&self, random: &mut DecorationRandom) -> i32 {
+        self.sample_with(random)
+    }
+    pub(crate) fn sample_legacy(&self, random: &mut LegacyRandom) -> i32 {
+        self.sample_with(random)
+    }
+    fn sample_with(&self, random: &mut impl IntProviderRandom) -> i32 {
         match self {
             Self::Constant(v) => *v,
-            Self::Uniform(a, b) => a.wrapping_add(random.next_int_bound(b - a + 1).unwrap()),
+            Self::Uniform(a, b) => a.wrapping_add(random.bounded(b - a + 1).unwrap()),
             Self::Biased(a, b) => {
-                let bound = random.next_int_bound(b - a + 1).unwrap() + 1;
-                a.wrapping_add(random.next_int_bound(bound).unwrap())
+                let bound = random.bounded(b - a + 1).unwrap() + 1;
+                a.wrapping_add(random.bounded(bound).unwrap())
             }
             Self::Trapezoid(a, b, plateau) => {
                 if *plateau == 0 && *b == a.wrapping_neg() {
-                    return random.next_int_bound(b + 1).unwrap()
-                        - random.next_int_bound(b + 1).unwrap();
+                    return random.bounded(b + 1).unwrap() - random.bounded(b + 1).unwrap();
                 }
                 let width = b - a;
                 if *plateau == width {
-                    return a.wrapping_add(random.next_int_bound(width + 1).unwrap());
+                    return a.wrapping_add(random.bounded(width + 1).unwrap());
                 }
                 let slope = (width - plateau) / 2;
                 let high = width - slope;
-                a.wrapping_add(random.next_int_bound(high + 1).unwrap())
-                    .wrapping_add(random.next_int_bound(slope + 1).unwrap())
+                a.wrapping_add(random.bounded(high + 1).unwrap())
+                    .wrapping_add(random.bounded(slope + 1).unwrap())
             }
             Self::Weighted(items, total) => {
-                let mut choice = random.next_int_bound(*total).unwrap();
+                let mut choice = random.bounded(*total).unwrap();
                 for (weight, provider) in items {
                     choice -= weight;
                     if choice < 0 {
-                        return provider.sample(random);
+                        return provider.sample_with(random);
                     }
                 }
                 unreachable!("validated weight sum")
             }
-            Self::Clamped(source, min, max) => source.sample(random).max(*min).min(*max),
+            Self::Clamped(source, min, max) => source.sample_with(random).max(*min).min(*max),
         }
     }
 }

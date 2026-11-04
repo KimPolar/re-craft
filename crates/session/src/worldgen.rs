@@ -1954,6 +1954,19 @@ impl TerrainGenerator {
     pub fn disable_mob_generation(&self) -> Option<bool> {
         self.disable_mob_generation
     }
+    /// Create the random source for one new WorldGenRegion centered on this
+    /// chunk. Reuse it throughout that region's generation step.
+    pub fn region_random(
+        &self,
+        chunk: native_world::loaded::ChunkPos,
+    ) -> native_resources::worldgen_region_random::RegionRandom {
+        native_resources::worldgen_region_random::RegionRandom::new(
+            self.seed,
+            self.noise.router().random,
+            chunk.x,
+            chunk.z,
+        )
+    }
     /// Compute the initial origin with the same immutable data-pack stack
     /// used to build this generator, before requesting generated chunks.
     pub fn spawn_origin(&self, provider: &mut impl ResourceProvider) -> Result<[i32; 2]> {
@@ -2892,6 +2905,25 @@ mod tests {
         let generator =
             TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
         assert!(generator.spawn_origin(&mut data).is_err());
+    }
+    #[test]
+    fn generator_uses_noise_settings_for_region_random() {
+        use native_resources::{density::WorldgenRandom, worldgen_region_random::RegionRandom};
+        use native_world::loaded::ChunkPos;
+
+        for (legacy, algorithm) in [
+            (true, WorldgenRandom::Legacy),
+            (false, WorldgenRandom::Xoroshiro),
+        ] {
+            let mut config = definition();
+            config["settings"]["legacy_random_source"] = json!(legacy);
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(&mut Data, &config, 42, 0, 16)
+                    .unwrap();
+            let mut actual = generator.region_random(ChunkPos { x: -13, z: 17 });
+            let mut expected = RegionRandom::new(42, algorithm, -13, 17);
+            assert_eq!(actual.next_long(), expected.next_long());
+        }
     }
     #[test]
     fn generator_reads_mob_generation_switch_and_rejects_invalid_values() {

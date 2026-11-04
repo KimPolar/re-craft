@@ -85,6 +85,7 @@ pub mod world_clock;
 pub mod worldgen_mob_geometry;
 pub mod worldgen_mob_rules;
 pub mod worldgen_mob_spawner;
+pub mod worldgen_region_random;
 
 pub const TARGET_VERSION: &str = "26.3";
 pub const DEMO_PLANKS_TILE_START: u32 = 5;

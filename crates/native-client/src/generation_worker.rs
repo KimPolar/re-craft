@@ -104,7 +104,62 @@ pub struct InitialPlayerSpawnOptions {
     pub saved_border: Option<native_persistence::world::SavedWorldBorder>,
 }
 
+/// A transient player and matching level metadata. This is not a completed
+/// world and cannot be saved until chunk and saved-data validation succeeds.
+pub struct GeneratedInitialPlayer {
+    pub session: native_session::loaded::LoadedSession,
+    pub uuid: [i32; 4],
+    pub level_data: native_persistence::nbt::NamedTag,
+}
+
 impl GenerationReady {
+    /// Create the initial local player from the checked spawn, retaining one
+    /// identity in both the player state and the matching level-data draft.
+    pub fn start_initial_player_session(
+        &mut self,
+        last_played_ms: i64,
+    ) -> Result<GeneratedInitialPlayer> {
+        let spawn = self.player_spawn.context("initial player spawn missing")?;
+        ensure!(
+            self.initial_respawn.is_some(),
+            "initial player respawn settings missing"
+        );
+        // Validate the matching settings before generating a player identity.
+        self.draft_initial_level_data(last_played_ms, None, true)?;
+        let local =
+            spawn.as_dvec3() - self.mesh.origin.as_dvec3() + glam::DVec3::new(0.5, 0.0, 0.5);
+        let position = local.as_vec3();
+        ensure!(
+            position.as_dvec3() == local,
+            "initial player position cannot be represented exactly"
+        );
+        let player = native_session::PlayerState {
+            position,
+            yaw: std::f32::consts::PI,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = self.start_session(player)?;
+        let targets = self
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated session targets missing")?;
+        ensure!(
+            session.generated_spawn_clear(spawn, targets)?,
+            "initial player spawn is obstructed"
+        );
+        let uuid = session.initialize_new_player()?;
+        let level_data = self.draft_initial_level_data(last_played_ms, Some(uuid), true)?;
+        Ok(GeneratedInitialPlayer {
+            session,
+            uuid,
+            level_data,
+        })
+    }
+
     /// The shared world spawn is chosen in the overworld. A preview of another
     /// dimension does not establish or replace the overworld's spawn.
     pub fn initial_world_spawn(&self) -> Result<Option<native_persistence::world::RespawnData>> {
@@ -2568,6 +2623,43 @@ mod tests {
                     Arc::clone(collision_height_tags.as_ref().unwrap()),
                 )?;
                 assert!(session.generated_spawn_clear(spawn, &targets)?);
+                let initial = ready.start_initial_player_session(123)?;
+                let player_draft = initial.session.draft_new_player_state()?;
+                assert_eq!(
+                    native_session::player_data::read_saved_position(player_draft.document())?,
+                    Some(spawn.as_dvec3() + glam::DVec3::new(0.5, 0.0, 0.5))
+                );
+                assert_eq!(
+                    player_draft.document().value.get("UUID"),
+                    Some(&native_persistence::nbt::Tag::IntArray(
+                        initial.uuid.to_vec()
+                    ))
+                );
+                let data = initial.level_data.value.get("Data").unwrap();
+                assert_eq!(
+                    data.get("singleplayer_uuid"),
+                    Some(&native_persistence::nbt::Tag::IntArray(
+                        initial.uuid.to_vec()
+                    ))
+                );
+                assert_eq!(
+                    data.get("initialized"),
+                    Some(&native_persistence::nbt::Tag::Byte(1))
+                );
+                assert_eq!(
+                    data.get("GameType"),
+                    Some(&native_persistence::nbt::Tag::Int(1))
+                );
+                assert_eq!(
+                    player_draft.document().value.get("XpSeed"),
+                    Some(&native_persistence::nbt::Tag::Int(0))
+                );
+                let previous = ready.player_spawn.take();
+                assert!(ready.start_initial_player_session(123).is_err());
+                ready.player_spawn = previous;
+                ready.player_spawn = Some(spawn - IVec3::Y);
+                assert!(ready.start_initial_player_session(123).is_err());
+                ready.player_spawn = previous;
             } else {
                 assert!(ready.player_spawn.is_none());
             }

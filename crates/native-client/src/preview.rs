@@ -3687,6 +3687,30 @@ mod tests {
         expanded.level_settings.as_mut().unwrap().session.seed = 43;
         assert!(expanded.draft_initial_level_data(123, None, false).is_err());
         expanded.level_settings.as_mut().unwrap().session.seed = 42;
+        assert!(expanded.start_initial_player_session(123).is_err());
+        expanded.player_spawn = Some(IVec3::new(8, 16, 8));
+        let initial_player = expanded.start_initial_player_session(123).unwrap();
+        let player_draft = initial_player.session.draft_new_player_state().unwrap();
+        assert_eq!(
+            native_session::player_data::read_saved_position(player_draft.document()).unwrap(),
+            Some(glam::DVec3::new(8.5, 16.0, 8.5))
+        );
+        assert!(matches!(
+            player_draft.document().value.get("Rotation"),
+            Some(native_persistence::nbt::Tag::List { values, .. })
+                if values == &[native_persistence::nbt::Tag::Float(0.0), native_persistence::nbt::Tag::Float(0.0)]
+        ));
+        assert_eq!(
+            initial_player
+                .level_data
+                .value
+                .get("Data")
+                .unwrap()
+                .get("singleplayer_uuid"),
+            Some(&native_persistence::nbt::Tag::IntArray(
+                initial_player.uuid.to_vec()
+            ))
+        );
         let player = native_session::PlayerState {
             position: glam::Vec3::new(8.5, 16.0, 8.5),
             yaw: 0.0,

@@ -609,6 +609,54 @@ impl FreshTerrainBatch {
         terrain.generated_heightmap_data(pos)
     }
 
+    /// Encode generated block and fluid ticks in the order recorded by the
+    /// protochunk. Sections, entities and other save data remain separate.
+    pub fn spawned_tick_data(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<(native_persistence::nbt::Tag, native_persistence::nbt::Tag)> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before encoding ticks"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "tick encoding requires a spawn-complete chunk"
+        );
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        let registry = &self
+            .decoration
+            .as_ref()
+            .context("generation registry is missing")?
+            .block_registry;
+        let world = terrain.snapshot();
+        ensure!(
+            world.chunks.contains_key(&pos),
+            "generated chunk is missing"
+        );
+        let blocks = world
+            .saved_block_ticks
+            .get(&pos)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let fluids = world
+            .saved_fluid_ticks
+            .get(&pos)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Ok((
+            native_persistence::generated_ticks::encode_block_ticks(pos, blocks, |id| {
+                registry.contains(id)
+            })?,
+            native_persistence::generated_ticks::encode_fluid_ticks(pos, fluids)?,
+        ))
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

@@ -3123,7 +3123,7 @@ mod tests {
                         "minecraft:red_mushroom"
                     };
                     let mut features = vec![
-                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":mushroom}},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":mushroom},"schedule_tick":true},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
                     ];
                     if self.crossing {
                         features.push(json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:offset","x":-1,"y":8,"z":8}]}));
@@ -3935,6 +3935,7 @@ mod tests {
         let original = batch.snapshot().unwrap();
         assert!(batch.spawned_section_data(center).is_err());
         assert!(batch.spawned_heightmap_data(center).is_err());
+        assert!(batch.spawned_tick_data(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
         assert_eq!(
             batch.schedule().completed(center),
@@ -3950,6 +3951,25 @@ mod tests {
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
         assert!(heightmaps.get("WORLD_SURFACE_WG").is_some());
         assert!(heightmaps.get("OCEAN_FLOOR_WG").is_some());
+        let (block_ticks, fluid_ticks) = batch.spawned_tick_data(center).unwrap();
+        let native_persistence::nbt::Tag::List { values: ticks, .. } = block_ticks else {
+            panic!("missing block ticks")
+        };
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(
+            ticks[0].get("i"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:brown_mushroom".into()
+            ))
+        );
+        assert_eq!(
+            ticks[0].get("t"),
+            Some(&native_persistence::nbt::Tag::Int(0))
+        );
+        let native_persistence::nbt::Tag::List { values: ticks, .. } = fluid_ticks else {
+            panic!("missing fluid ticks")
+        };
+        assert!(ticks.is_empty());
         let sections = batch.spawned_section_data(center).unwrap();
         let decoded = native_persistence::palette::decode_sections(
             &native_persistence::nbt::Tag::Compound(vec![("sections".into(), sections)]),

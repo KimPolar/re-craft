@@ -3338,6 +3338,7 @@ impl<'a> Menu<'a> {
                 scale: self.scale,
                 generation: self.software_generation,
                 seconds,
+                cache_background: self.state.video.panorama_speed.value() == 0.0,
                 blurred,
                 blur_radius: self.state.video.menu_blur,
                 assets: self.state.assets.clone(),

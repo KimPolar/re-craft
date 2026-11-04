@@ -9,11 +9,14 @@ use winit::window::Window;
 
 use crate::{menu_assets::MenuAssets, menu_draw::Canvas};
 
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct SoftwareFrame {
     pub size: (u32, u32),
     pub scale: u32,
     pub generation: u64,
     pub seconds: f32,
+    /// A stopped panorama can reuse its physical-resolution background.
+    pub cache_background: bool,
     pub blurred: bool,
     pub blur_radius: u8,
     pub assets: Option<Arc<MenuAssets>>,
@@ -111,8 +114,9 @@ impl MenuSoftwareWorker {
             .name("menu-software-renderer".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(|| {
+                    let mut background = None;
                     while let Some(frame) = shared.receive() {
-                        let image = compose(frame, Some(&shared));
+                        let image = compose(frame, Some(&shared), &mut background);
                         if !shared.complete(image) {
                             break;
                         }
@@ -154,14 +158,61 @@ impl Drop for MenuSoftwareWorker {
     }
 }
 
-fn compose(frame: SoftwareFrame, mailbox: Option<&Mailbox>) -> SoftwareImage {
-    let mut canvas = Canvas::new(frame.size.0, frame.size.1);
-    if let Some(assets) = &frame.assets {
-        canvas.panorama(&assets.panorama, &assets.panorama_overlay, frame.seconds);
-        if frame.blurred {
-            canvas.blur_radius(frame.blur_radius);
-        }
+struct CachedBackground {
+    size: (u32, u32),
+    seconds: u32,
+    blurred: bool,
+    blur_radius: u8,
+    assets: Option<Arc<MenuAssets>>,
+    pixels: Vec<u32>,
+}
+
+impl CachedBackground {
+    fn matches(&self, frame: &SoftwareFrame) -> bool {
+        self.size == frame.size
+            && self.seconds == frame.seconds.to_bits()
+            && self.blurred == frame.blurred
+            && self.blur_radius == frame.blur_radius
+            && match (&self.assets, &frame.assets) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
+}
+
+fn compose(
+    frame: SoftwareFrame,
+    mailbox: Option<&Mailbox>,
+    background: &mut Option<CachedBackground>,
+) -> SoftwareImage {
+    let mut canvas = if frame.cache_background
+        && let Some(cached) = background.as_ref().filter(|cached| cached.matches(&frame))
+    {
+        Canvas {
+            width: frame.size.0 as i32,
+            height: frame.size.1 as i32,
+            pixels: cached.pixels.clone(),
+            glint: None,
+        }
+    } else {
+        let mut canvas = Canvas::new(frame.size.0, frame.size.1);
+        if let Some(assets) = &frame.assets {
+            canvas.panorama(&assets.panorama, &assets.panorama_overlay, frame.seconds);
+            if frame.blurred {
+                canvas.blur_radius(frame.blur_radius);
+            }
+        }
+        *background = frame.cache_background.then(|| CachedBackground {
+            size: frame.size,
+            seconds: frame.seconds.to_bits(),
+            blurred: frame.blurred,
+            blur_radius: frame.blur_radius,
+            assets: frame.assets.clone(),
+            pixels: canvas.pixels.clone(),
+        });
+        canvas
+    };
     // Pick up the newest controls after the expensive panorama and blur work.
     // A different scene must be rendered separately, never composited here.
     let overlay = mailbox
@@ -219,6 +270,7 @@ mod tests {
             scale: 3,
             generation,
             seconds: generation as f32,
+            cache_background: false,
             blurred: false,
             blur_radius: 5,
             assets: None,
@@ -280,8 +332,8 @@ mod tests {
             assert!(mailbox.submit(frame(generation)));
         }
         assert_eq!(mailbox.receive().unwrap().generation, 100);
-        assert!(mailbox.complete(compose(frame(1), None)));
-        assert!(mailbox.complete(compose(frame(100), None)));
+        assert!(mailbox.complete(compose(frame(1), None, &mut None)));
+        assert!(mailbox.complete(compose(frame(100), None, &mut None)));
         let image = mailbox.take().unwrap().unwrap();
         assert_eq!(image.generation, 100);
         assert_eq!(image.size, (7, 5));
@@ -312,7 +364,10 @@ mod tests {
         overlay.pixels[0] = 0xffab_cdef;
         newer.overlay = Arc::new(overlay);
         assert!(mailbox.submit(newer));
-        assert_eq!(compose(current, Some(&mailbox)).pixels[0], 0xffab_cdef);
+        assert_eq!(
+            compose(current, Some(&mailbox), &mut None).pixels[0],
+            0xffab_cdef
+        );
 
         let mut old_scene = frame(7);
         let mut old = Canvas::new(2, 1);
@@ -323,7 +378,75 @@ mod tests {
         overlay.pixels[0] = 0xffab_cdef;
         other_scene.overlay = Arc::new(overlay);
         assert!(mailbox.submit(other_scene));
-        assert_eq!(compose(old_scene, Some(&mailbox)).pixels[0], 0xff12_3456);
+        assert_eq!(
+            compose(old_scene, Some(&mailbox), &mut None).pixels[0],
+            0xff12_3456
+        );
+    }
+
+    #[test]
+    fn stationary_background_is_reused_and_invalidated_by_visual_inputs() {
+        let mut cache = None;
+        let mut input = frame(7);
+        input.cache_background = true;
+        let first = compose(input.clone(), None, &mut cache);
+        cache.as_mut().unwrap().pixels[0] = 0xff12_3456;
+        let reused = compose(input.clone(), None, &mut cache);
+        assert_eq!(reused.pixels[0], 0xff12_3456);
+        input.seconds += 1.0;
+        let changed = compose(input.clone(), None, &mut cache);
+        assert_eq!(changed.pixels, first.pixels);
+        cache.as_mut().unwrap().pixels[0] = 0xff12_3456;
+        input.blur_radius += 1;
+        assert_eq!(
+            compose(input.clone(), None, &mut cache).pixels,
+            first.pixels
+        );
+        input.cache_background = false;
+        compose(input, None, &mut cache);
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    #[ignore = "performance measurement using locally installed Minecraft 26.3 assets"]
+    fn stationary_background_matches_uncached_and_reports_cost() {
+        use std::time::Instant;
+        let directory = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&directory, &[]).unwrap());
+        let mut input = SoftwareFrame {
+            size: (1920, 1080),
+            scale: 3,
+            generation: 1,
+            seconds: 2.0,
+            cache_background: true,
+            blurred: true,
+            blur_radius: 5,
+            assets: Some(assets),
+            overlay: Arc::new(Canvas::new(640, 360)),
+        };
+        let mut cache = None;
+        let started = Instant::now();
+        let original = compose(input.clone(), None, &mut cache);
+        let uncached = started.elapsed();
+        let started = Instant::now();
+        let reused = compose(input.clone(), None, &mut cache);
+        let cached = started.elapsed();
+        assert_eq!(original.pixels, reused.pixels);
+        let mut overlay = Canvas::new(640, 360);
+        overlay.pixel(5, 5, [255, 0, 0, 255]);
+        input.overlay = Arc::new(overlay);
+        let changed_overlay = compose(input.clone(), None, &mut cache);
+        assert_eq!(changed_overlay.pixels[15 * 1920 + 15], 0xffff_0000);
+        input.seconds += 1.0;
+        let changed = compose(input.clone(), None, &mut cache);
+        input.cache_background = false;
+        let fresh = compose(input, None, &mut None);
+        assert_eq!(changed.pixels, fresh.pixels);
+        eprintln!(
+            "1080p stationary software menu, one sample each: first={uncached:?}, cached={cached:?}; includes blur and compositing"
+        );
     }
 
     #[test]
@@ -341,12 +464,13 @@ mod tests {
             scale: 2,
             generation: 17,
             seconds: 2.0,
+            cache_background: false,
             blurred: true,
             blur_radius: 5,
             assets: Some(Arc::clone(&assets)),
             overlay,
         };
-        let actual = compose(frame, None);
+        let actual = compose(frame, None, &mut None);
         let mut expected = Canvas::new(641, 481);
         expected.panorama(&assets.panorama, &assets.panorama_overlay, 2.0);
         expected.blur_radius(5);

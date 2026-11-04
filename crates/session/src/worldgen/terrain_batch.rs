@@ -80,6 +80,67 @@ struct EntityFeatureClassifier<'a, P> {
     nodes: usize,
 }
 
+fn known_minecraft_type(value: &Value, allowed: &[&str]) -> Result<bool> {
+    let name = value
+        .get("type")
+        .and_then(Value::as_str)
+        .context("component type is missing")?;
+    let id = ResourceId::parse(name)?;
+    Ok(id.namespace == "minecraft" && allowed.contains(&id.path.as_str()))
+}
+
+fn known_tree_decorators(value: &Value, field: &str, allowed: &[&str]) -> Result<bool> {
+    let decorators = value
+        .get(field)
+        .and_then(Value::as_array)
+        .context("tree decorators are missing")?;
+    ensure!(decorators.len() <= 4096, "too many tree decorators");
+    for decorator in decorators {
+        if !known_minecraft_type(decorator, allowed)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn known_entity_free_tree(value: &Value, fallen: bool) -> Result<bool> {
+    if fallen {
+        return Ok(known_tree_decorators(
+            value,
+            "stump_decorators",
+            &["trunk_vine", "attached_to_logs"],
+        )? && known_tree_decorators(
+            value,
+            "log_decorators",
+            &["trunk_vine", "attached_to_logs"],
+        )?);
+    }
+    if value.get("root_placer").is_some() {
+        return Ok(false);
+    }
+    Ok(known_minecraft_type(
+        value
+            .get("trunk_placer")
+            .context("tree trunk placer is missing")?,
+        &[
+            "straight_trunk_placer",
+            "fancy_trunk_placer",
+            "dark_oak_trunk_placer",
+            "bending_trunk_placer",
+        ],
+    )? && known_minecraft_type(
+        value
+            .get("foliage_placer")
+            .context("tree foliage placer is missing")?,
+        &[
+            "blob_foliage_placer",
+            "fancy_foliage_placer",
+            "dark_oak_foliage_placer",
+            "random_spread_foliage_placer",
+        ],
+    )? && known_tree_decorators(value, "decorators", &["beehive", "place_on_ground"])?)
+}
+
 impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
     fn named(&mut self, id: &ResourceId, placed: bool, depth: usize) -> Result<bool> {
         if placed {
@@ -273,6 +334,8 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
                 value.get("feature").context("root feature is missing")?,
                 depth + 1,
             ),
+            "tree" => known_entity_free_tree(value, false),
+            "fallen_tree" => known_entity_free_tree(value, true),
             _ => Ok(false),
         }
     }
@@ -1784,6 +1847,42 @@ mod entity_source_tests {
                 &mut data, &schedule, &registry
             ));
         }
+    }
+
+    #[test]
+    fn tree_entity_evidence_requires_supported_components() {
+        let tree = json!({
+            "type":"minecraft:tree",
+            "trunk_placer":{"type":"minecraft:straight_trunk_placer"},
+            "foliage_placer":{"type":"minecraft:blob_foliage_placer"},
+            "decorators":[{"type":"minecraft:beehive"}, {"type":"minecraft:place_on_ground"}]
+        });
+        assert!(known_entity_free_tree(&tree, false).unwrap());
+        for (field, replacement) in [
+            ("trunk_placer", json!({"type":"example:trunk"})),
+            (
+                "foliage_placer",
+                json!({"type":"minecraft:unknown_foliage"}),
+            ),
+            ("decorators", json!([{"type":"example:creature_decorator"}])),
+            (
+                "root_placer",
+                json!({"type":"minecraft:mangrove_root_placer"}),
+            ),
+        ] {
+            let mut unknown = tree.clone();
+            unknown[field] = replacement;
+            assert!(!known_entity_free_tree(&unknown, false).unwrap());
+        }
+        let fallen = json!({"stump_decorators":[{"type":"minecraft:trunk_vine"}],
+            "log_decorators":[{"type":"minecraft:attached_to_logs"}]});
+        assert!(known_entity_free_tree(&fallen, true).unwrap());
+        let mut unknown = fallen.clone();
+        unknown["log_decorators"] = json!([{"type":"example:unknown"}]);
+        assert!(!known_entity_free_tree(&unknown, true).unwrap());
+        let mut missing = fallen;
+        missing.as_object_mut().unwrap().remove("stump_decorators");
+        assert!(known_entity_free_tree(&missing, true).is_err());
     }
 
     #[test]

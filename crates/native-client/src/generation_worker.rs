@@ -1773,23 +1773,30 @@ mod tests {
             (true, true, "minecraft:sheep", 0),
             (true, true, "minecraft:sheep", 1),
             (true, true, "minecraft:sheep", 2),
+            (true, true, "minecraft:sheep", 3),
+            (true, true, "minecraft:sheep", 4),
             (true, false, "minecraft:sheep", 0),
             (true, false, "minecraft:sheep", 1),
             (true, false, "minecraft:sheep", 2),
+            (true, false, "minecraft:sheep", 3),
             (true, false, "minecraft:horse", 0),
             (true, false, "minecraft:donkey", 0),
         ] {
             let mut selected_biome = biome.clone();
             if feature_kind != 0 {
                 let simple = json!({"feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:short_grass"}},"placement":[]});
-                let configured = if feature_kind == 1 {
-                    simple["feature"].clone()
-                } else {
-                    json!({"type":"minecraft:random_boolean_selector", "feature_true":simple, "feature_false":simple})
+                let configured = match feature_kind {
+                    1 => simple["feature"].clone(),
+                    2 => {
+                        json!({"type":"minecraft:random_boolean_selector", "feature_true":simple, "feature_false":simple})
+                    }
+                    3 => json!("minecraft:oak_bees_002"),
+                    4 => json!("minecraft:fallen_oak_tree"),
+                    _ => unreachable!(),
                 };
                 selected_biome["features"] = json!([[{
                     "feature": configured,
-                    "placement": [{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+                    "placement": if feature_kind <= 2 {json!([{"type":"minecraft:offset","x":8,"y":8,"z":8}])} else {json!([{"type":"minecraft:count","count":0}])}
                 }]]);
             }
             selected_biome["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]

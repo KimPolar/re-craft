@@ -89,6 +89,16 @@ pub enum SavedEntityData {
     Unavailable,
 }
 
+/// A generated player-spawn search must not skip a candidate when its
+/// terrain or entity data is not yet available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedPlayerSpawnProgress {
+    Pending,
+    NeedsTerrain(ChunkPos),
+    NeedsEntities(ChunkPos),
+    Found(IVec3),
+}
+
 /// A missing POI entry, a decoded entry, and a read failure are distinct.
 #[derive(Clone)]
 pub enum SavedPoiData {
@@ -6097,6 +6107,86 @@ impl LoadedSession {
             generated: Some(generated_targets),
         };
         search.poll(&mut view, budget)
+    }
+
+    /// Poll one candidate at a time and surface missing generated inputs
+    /// without advancing past an unresolved earlier candidate. The caller
+    /// must restart the search if previously examined terrain changes.
+    pub fn poll_generated_player_spawn(
+        &self,
+        search: &mut crate::world_spawn::ResumableWorldSpawn,
+        ceiling_spawn_height: Option<i32>,
+        generated_targets: &BTreeSet<ChunkPos>,
+        budget: usize,
+    ) -> anyhow::Result<GeneratedPlayerSpawnProgress> {
+        use GeneratedPlayerSpawnProgress as Progress;
+        if let Some(found) = search.result() {
+            return Ok(Progress::Found(found));
+        }
+        for _ in 0..budget {
+            let pos = search.requested_position();
+            let column = ChunkPos {
+                x: pos.x.div_euclid(16),
+                z: pos.z.div_euclid(16),
+            };
+            if !generated_targets.contains(&column) {
+                return Ok(Progress::NeedsTerrain(column));
+            }
+            match self.poll_generated_world_spawn(
+                search,
+                ceiling_spawn_height,
+                generated_targets,
+                1,
+            ) {
+                Ok(Some(found)) => return Ok(Progress::Found(found)),
+                Ok(None) => continue,
+                Err(error) => {
+                    // Entity collision checks cover a two-block margin around
+                    // the standing player; it also encloses block queries.
+                    let start_x = pos
+                        .x
+                        .checked_sub(2)
+                        .ok_or_else(|| anyhow::anyhow!("spawn query X overflow"))?
+                        .div_euclid(16);
+                    let end_x = pos
+                        .x
+                        .checked_add(2)
+                        .ok_or_else(|| anyhow::anyhow!("spawn query X overflow"))?
+                        .div_euclid(16);
+                    let start_z = pos
+                        .z
+                        .checked_sub(2)
+                        .ok_or_else(|| anyhow::anyhow!("spawn query Z overflow"))?
+                        .div_euclid(16);
+                    let end_z = pos
+                        .z
+                        .checked_add(2)
+                        .ok_or_else(|| anyhow::anyhow!("spawn query Z overflow"))?
+                        .div_euclid(16);
+                    for z in start_z..=end_z {
+                        for x in start_x..=end_x {
+                            let chunk = ChunkPos { x, z };
+                            if !generated_targets.contains(&chunk) {
+                                return Ok(Progress::NeedsTerrain(chunk));
+                            }
+                        }
+                    }
+                    for z in start_z..=end_z {
+                        for x in start_x..=end_x {
+                            let chunk = ChunkPos { x, z };
+                            if matches!(
+                                self.saved_entity_chunk(chunk),
+                                None | Some(SavedEntityData::Unavailable)
+                            ) {
+                                return Ok(Progress::NeedsEntities(chunk));
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Progress::Pending)
     }
 
     /// Resume the initial global-spawn suggestion search over generated
@@ -44407,6 +44497,38 @@ pub(crate) mod tests {
             .unwrap();
         let targets = BTreeSet::from([home]);
         let candidates = WorldSpawnCandidates::new(origin, 0, 100.0, 0).unwrap();
+        let mut typed = ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
+        assert_eq!(
+            session
+                .poll_generated_player_spawn(&mut typed, None, &targets, 1)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::NeedsEntities(home)
+        );
+        assert_eq!(typed.requested_position(), origin);
+        let other = origin + IVec3::X * 16;
+        let mut missing_terrain = ResumableWorldSpawn::new(other, None).unwrap();
+        assert_eq!(
+            session
+                .poll_generated_player_spawn(&mut missing_terrain, None, &targets, 1)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::NeedsTerrain(ChunkPos {
+                x: home.x + 1,
+                z: home.z
+            })
+        );
+        assert_eq!(missing_terrain.requested_position(), other);
+        let edge = origin + IVec3::X * 7;
+        let mut edge_search = ResumableWorldSpawn::new(edge, None).unwrap();
+        assert_eq!(
+            session
+                .poll_generated_player_spawn(&mut edge_search, None, &targets, 1)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::NeedsTerrain(ChunkPos {
+                x: home.x + 1,
+                z: home.z
+            })
+        );
+        assert_eq!(edge_search.requested_position(), edge);
         let mut search = ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
         assert!(
             session
@@ -44418,6 +44540,12 @@ pub(crate) mod tests {
         session
             .set_initial_entity_chunk(home, SavedEntityData::Unavailable)
             .unwrap();
+        assert_eq!(
+            session
+                .poll_generated_player_spawn(&mut typed, None, &targets, 1)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::NeedsEntities(home)
+        );
         assert!(
             session
                 .poll_generated_world_spawn(&mut search, None, &targets, 1)
@@ -44429,13 +44557,25 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             session
+                .poll_generated_player_spawn(&mut typed, None, &targets, 1)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::Found(origin)
+        );
+        assert_eq!(
+            session
+                .poll_generated_player_spawn(&mut typed, None, &targets, 0)
+                .unwrap(),
+            GeneratedPlayerSpawnProgress::Found(origin)
+        );
+        assert_eq!(
+            session
                 .poll_generated_world_spawn(&mut search, None, &targets, 1)
                 .unwrap(),
             Some(origin)
         );
         assert_eq!(
             session
-                .find_loaded_world_spawn(origin, Some(candidates), None)
+                .find_loaded_world_spawn(origin, Some(candidates.clone()), None)
                 .unwrap(),
             origin
         );
@@ -44473,6 +44613,14 @@ pub(crate) mod tests {
             .unwrap();
         assert!(session.generated_spawn_clear(origin, &targets).is_err());
         assert!(session.world_spawn_clear(origin).is_err());
+        let mut unknown_entity =
+            ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
+        assert!(
+            session
+                .poll_generated_player_spawn(&mut unknown_entity, None, &targets, 1)
+                .is_err()
+        );
+        assert_eq!(unknown_entity.requested_position(), origin);
         session
             .set_initial_entity_chunk(home, SavedEntityData::Empty)
             .unwrap();

@@ -54,6 +54,44 @@ pub enum InitialSpawnProgress {
 }
 
 impl GenerationReady {
+    /// Prepare the separate player-spawn search using explicitly supplied
+    /// entity data. Missing entity chunks remain unknown rather than empty.
+    pub fn start_player_spawn_search(
+        &mut self,
+        player: native_session::PlayerState,
+        tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+        entities: impl IntoIterator<Item = (ChunkPos, native_session::loaded::SavedEntityData)>,
+        candidates: Option<native_session::world_spawn::WorldSpawnCandidates>,
+    ) -> Result<(
+        native_session::loaded::LoadedSession,
+        native_session::world_spawn::ResumableWorldSpawn,
+    )> {
+        let suggestion = self
+            .suggested_spawn
+            .context("world spawn suggestion missing")?;
+        let search = native_session::world_spawn::ResumableWorldSpawn::new(suggestion, candidates)?;
+        let mut session = self.start_session_with_spawn_heightmaps(player, tags)?;
+        for (pos, data) in entities {
+            session.set_initial_entity_chunk(pos, data)?;
+        }
+        Ok((session, search))
+    }
+
+    pub fn poll_player_spawn(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        search: &mut native_session::world_spawn::ResumableWorldSpawn,
+        ceiling_spawn_height: Option<i32>,
+        budget: usize,
+    ) -> Result<native_session::loaded::GeneratedPlayerSpawnProgress> {
+        let targets = self
+            .mesh
+            .targets
+            .as_deref()
+            .context("generated session targets missing")?;
+        session.poll_generated_player_spawn(search, ceiling_spawn_height, targets, budget)
+    }
+
     /// Poll within the currently available chunk so reaching the next chunk
     /// requests generation instead of treating absent terrain as an error.
     /// Create a new search and session after expanding the batch.

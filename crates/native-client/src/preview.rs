@@ -3189,6 +3189,68 @@ mod tests {
             assert_eq!(session.snapshot().tick, 1);
             assert_eq!(before.tick, 0);
         }
+        {
+            use native_session::{
+                PlayerPose, PlayerState,
+                loaded::{GeneratedPlayerSpawnProgress, SavedEntityData},
+                world_spawn::WorldSpawnCandidates,
+            };
+            let player = PlayerState {
+                position: glam::Vec3::new(8.5, 16.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: true,
+                pose: PlayerPose::Standing,
+            };
+            let suggested = IVec3::new(8, 16, 8);
+            let candidates = || WorldSpawnCandidates::new(suggested, 0, 100.0, 0).unwrap();
+            assert!(
+                generated
+                    .start_player_spawn_search(
+                        player,
+                        Arc::clone(&spawn_tags),
+                        [],
+                        Some(candidates())
+                    )
+                    .is_err()
+            );
+            generated.suggested_spawn = Some(suggested);
+            let (mut session, mut search) = generated
+                .start_player_spawn_search(player, Arc::clone(&spawn_tags), [], Some(candidates()))
+                .unwrap();
+            assert_eq!(
+                generated
+                    .poll_player_spawn(&session, &mut search, None, 1)
+                    .unwrap(),
+                GeneratedPlayerSpawnProgress::NeedsEntities(center)
+            );
+            assert_eq!(search.requested_position(), suggested);
+            session
+                .set_initial_entity_chunk(center, SavedEntityData::Empty)
+                .unwrap();
+            assert_eq!(
+                generated
+                    .poll_player_spawn(&session, &mut search, None, 1)
+                    .unwrap(),
+                GeneratedPlayerSpawnProgress::Found(suggested)
+            );
+            let (session, mut search) = generated
+                .start_player_spawn_search(
+                    player,
+                    Arc::clone(&spawn_tags),
+                    [(center, SavedEntityData::Empty)],
+                    Some(candidates()),
+                )
+                .unwrap();
+            assert_eq!(
+                generated
+                    .poll_player_spawn(&session, &mut search, None, 1)
+                    .unwrap(),
+                GeneratedPlayerSpawnProgress::Found(suggested)
+            );
+            generated.suggested_spawn = None;
+        }
         let mut batch = generated.batch;
         let job = generated.mesh;
         let (world, scene) = renderer

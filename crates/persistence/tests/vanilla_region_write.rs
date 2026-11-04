@@ -15,7 +15,7 @@ use native_persistence::{
     heightmap::{BlockHeightFlags, HeightBounds},
     nbt,
     palette::BlockState,
-    save::{FreshRegionDraft, FreshRegionKind, WorldSavePlan, WorldWriteGuard},
+    save::{FreshRegionDraft, FreshRegionKind, FreshWorldDraft, WorldSavePlan, WorldWriteGuard},
     world::{ChunkPos, DimensionId, WorldReader},
 };
 use serde_json::Value;
@@ -99,6 +99,19 @@ public class RegionWriteOracle {
                      var out = region.getChunkDataOutputStream(new ChunkPos(xs[i], 0))) {
                     NbtIo.write(chunk(xs[i]), (DataOutput)out);
                 }
+            }
+            System.out.println("OK");
+        } else if (args[0].equals("verifyFreshWorld")) {
+            var level=NbtIo.readCompressed(world.resolve("level.dat"),NbtAccounter.unlimitedHeap()).getCompoundOrEmpty("Data");
+            if(level.getIntOr("DataVersion",0)!=5023 || !Arrays.equals(level.getIntArray("singleplayer_uuid").orElseThrow(),new int[]{0,0,0,1})) throw new AssertionError("level identity");
+            var generator=NbtIo.readCompressed(world.resolve("data/minecraft/world_gen_settings.dat"),NbtAccounter.unlimitedHeap());
+            if(generator.getIntOr("DataVersion",0)!=5023 || generator.getCompoundOrEmpty("data").getLongOr("seed",0)!=42) throw new AssertionError("world seed");
+            var player=NbtIo.readCompressed(world.resolve("players/data/00000000-0000-0000-0000-000000000001.dat"),NbtAccounter.unlimitedHeap());
+            if(!Arrays.equals(player.getIntArray("UUID").orElseThrow(),new int[]{0,0,0,1})) throw new AssertionError("player identity");
+            var clocks=NbtIo.readCompressed(world.resolve("data/minecraft/world_clocks.dat"),NbtAccounter.unlimitedHeap());
+            if(clocks.getIntOr("DataVersion",0)!=5023) throw new AssertionError("clock version");
+            try(var region=open(dir); var in=region.getChunkDataInputStream(new ChunkPos(0,0))) {
+                if(in==null || !NbtIo.read((DataInput)in).equals(chunk(0))) throw new AssertionError("spawn chunk");
             }
             System.out.println("OK");
         } else if (args[0].equals("verify")) {
@@ -1723,6 +1736,108 @@ fn exercise_entity_chunk_drafts(new_region: bool) {
         })
         .lines()
         .any(|line| line == "OK")
+    );
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn fresh_world_stage_is_readable_by_java_26_3() {
+    use native_persistence::nbt::{NamedTag, Tag};
+    use std::collections::BTreeMap;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-fresh-world-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let original = temp.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    let invoke = |action: &str, world: &Path| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(world))
+    };
+    assert!(invoke("seed", &original).lines().any(|line| line == "OK"));
+    let uuid = [0, 0, 0, 1];
+    let level = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "Data".into(),
+            Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Time".into(), Tag::Long(0)),
+                ("singleplayer_uuid".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        )]),
+    };
+    let worldgen = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            (
+                "data".into(),
+                Tag::Compound(vec![
+                    ("seed".into(), Tag::Long(42)),
+                    (
+                        "dimensions".into(),
+                        Tag::Compound(vec![(
+                            "minecraft:overworld".into(),
+                            Tag::Compound(vec![(
+                                "generator".into(),
+                                Tag::Compound(vec![(
+                                    "type".into(),
+                                    Tag::String("minecraft:noise".into()),
+                                )]),
+                            )]),
+                        )]),
+                    ),
+                ]),
+            ),
+        ]),
+    };
+    let player = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+        ]),
+    };
+    let mut draft =
+        FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+    let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+    let original_region = original.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+    let original_chunk = RegionReader::open(&original_region)
+        .unwrap()
+        .read_chunk(0, 0)
+        .unwrap()
+        .unwrap();
+    terrain
+        .add(ChunkPos { x: 0, z: 0 }, &original_chunk, 42)
+        .unwrap();
+    draft
+        .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+        .unwrap();
+    let stage = draft.stage(temp.path()).unwrap();
+    assert!(
+        invoke("verifyFreshWorld", stage.path())
+            .lines()
+            .any(|line| line == "OK")
     );
 }
 

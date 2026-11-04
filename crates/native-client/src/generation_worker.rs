@@ -126,7 +126,95 @@ pub struct GeneratedInitialPlayer {
     pub level_data: native_persistence::nbt::NamedTag,
 }
 
+/// A staged initial world and its matching, unadvanced local session.
+/// The staging tree is temporary and is not yet safe to publish as a world.
+pub struct StagedInitialWorld {
+    pub initial: GeneratedInitialPlayer,
+    pub stage: native_persistence::save::FreshWorldStage,
+}
+
 impl GenerationReady {
+    /// Stage the exact postprocessed targets and a new player together.
+    /// Pack files and remaining generation/save dependencies are not yet
+    /// established, so the result must not be published as a playable world.
+    pub fn stage_initial_world(
+        &mut self,
+        parent: &std::path::Path,
+        last_played_ms: i64,
+        region_timestamp: u32,
+    ) -> Result<StagedInitialWorld> {
+        use native_persistence::{
+            save::FreshWorldDraft,
+            world::{DimensionId, SavedClock},
+        };
+        use native_session::GameSession;
+        ensure!(
+            self.postprocessed.is_some(),
+            "initial world has not been postprocessed"
+        );
+        let initial = self.start_initial_player_session(last_played_ms)?;
+        let snapshot = initial.session.snapshot();
+        ensure!(snapshot.tick == 0, "initial session has already advanced");
+        let processed = self
+            .postprocessed
+            .as_ref()
+            .context("initial world has not been postprocessed")?;
+        ensure!(
+            snapshot.game_time == processed.region.ticks().game_time(),
+            "initial session time differs from postprocessing"
+        );
+        let targets = self
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated targets are missing")?;
+        let regions = self.batch.postprocessed_region_drafts(
+            &processed.region,
+            targets.iter().copied(),
+            region_timestamp,
+        )?;
+        let settings = self
+            .level_settings
+            .as_ref()
+            .context("initial level settings are missing")?;
+        let worldgen = self
+            .worldgen_settings_draft
+            .as_ref()
+            .context("world generation settings are missing")?;
+        let clock_data = self
+            .initial_clocks
+            .as_ref()
+            .context("initial world clocks are missing")?;
+        let clocks = clock_data
+            .ticks
+            .iter()
+            .map(|(id, &total_ticks)| {
+                Ok((
+                    DimensionId::parse(&format!("{}:{}", id.namespace, id.path))?,
+                    SavedClock {
+                        total_ticks,
+                        ..SavedClock::default()
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let player = initial.session.draft_new_player_state()?;
+        let mut draft = FreshWorldDraft::new(
+            initial.level_data.clone(),
+            worldgen.clone(),
+            player.document().clone(),
+            initial.uuid,
+            settings.session.seed,
+            clocks,
+        )?;
+        let dimension = DimensionId::parse(&self.mesh.world.dimension)?;
+        for ((_, _, _), region) in regions {
+            draft.add_region(dimension.clone(), region)?;
+        }
+        let stage = draft.stage(parent)?;
+        Ok(StagedInitialWorld { initial, stage })
+    }
+
     /// Create the initial local player from the checked spawn, retaining one
     /// identity in both the player state and the matching level-data draft.
     pub fn start_initial_player_session(
@@ -3137,6 +3225,43 @@ mod tests {
                 ));
             }
             assert_eq!(worker.progress().phase, GenerationPhase::Ready);
+            if !spawn_mobs {
+                let positions: Vec<_> = targets.iter().copied().collect();
+                let next_revision = ready
+                    .mesh
+                    .revision
+                    .checked_add(1)
+                    .context("mesh revision overflow")?;
+                let worker =
+                    GenerationWorker::postprocess(ready, positions, 0, 0, true, next_revision)?;
+                let mut ready = match worker.result.recv_timeout(Duration::from_secs(120))? {
+                    GenerationResult::Ready(ready) => ready,
+                    GenerationResult::Failed(error) => return Err(error),
+                    GenerationResult::Cancelled => anyhow::bail!("postprocessing cancelled"),
+                };
+                let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+                let mut reader = native_persistence::world::WorldReader::open(
+                    staged.stage.path(),
+                    native_persistence::world::DimensionId::parse("overworld")?,
+                )?;
+                assert_eq!(reader.singleplayer_uuid_words()?, Some(staged.initial.uuid));
+                assert_eq!(reader.saved_world_seed()?, Some(42));
+                let spawn = reader.world_spawn()?;
+                assert!(
+                    reader
+                        .read_chunk(
+                            spawn.position[0].div_euclid(16),
+                            spawn.position[2].div_euclid(16)
+                        )?
+                        .is_some()
+                );
+                assert_eq!(
+                    reader.read_player()?.unwrap().value.get("UUID"),
+                    Some(&native_persistence::nbt::Tag::IntArray(
+                        staged.initial.uuid.to_vec()
+                    ))
+                );
+            }
         }
         Ok(())
     }

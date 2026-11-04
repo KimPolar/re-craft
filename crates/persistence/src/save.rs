@@ -145,6 +145,247 @@ impl FreshRegionDraft {
     }
 }
 
+/// A new world's checked metadata and region drafts. This still requires the
+/// caller to validate generation, packs and every other saved-data dependency.
+pub struct FreshWorldDraft {
+    level: nbt::NamedTag,
+    worldgen: nbt::NamedTag,
+    player: nbt::NamedTag,
+    uuid: [i32; 4],
+    seed: i64,
+    clocks: BTreeMap<DimensionId, crate::world::SavedClock>,
+    regions: BTreeMap<(DimensionId, FreshRegionKind, i32, i32), FreshRegionDraft>,
+}
+
+/// A private, automatically removed staging tree. It is not a published world.
+pub struct FreshWorldStage {
+    _directory: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl FreshWorldStage {
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl FreshWorldDraft {
+    pub fn new(
+        level: nbt::NamedTag,
+        worldgen: nbt::NamedTag,
+        player: nbt::NamedTag,
+        uuid: [i32; 4],
+        seed: i64,
+        clocks: BTreeMap<DimensionId, crate::world::SavedClock>,
+    ) -> Result<Self> {
+        crate::world::WorldReader::validate_level_game_time(&level)?;
+        ensure!(
+            crate::world::WorldReader::world_seed_from_document(&worldgen)? == seed,
+            "world generation seed differs from the generated world"
+        );
+        validate_player_document(&player)?;
+        let data = level.value.get("Data").context("level data missing")?;
+        let Tag::Compound(data_fields) = data else {
+            anyhow::bail!("level data must be a compound")
+        };
+        let level_ids: Vec<_> = data_fields
+            .iter()
+            .filter(|(name, _)| name.matches("singleplayer_uuid"))
+            .collect();
+        ensure!(
+            matches!(level_ids.as_slice(), [(_, Tag::IntArray(words))] if words.as_slice() == uuid),
+            "level player UUID differs from the new player"
+        );
+        let Tag::Compound(player_fields) = &player.value else {
+            unreachable!()
+        };
+        let player_ids: Vec<_> = player_fields
+            .iter()
+            .filter(|(name, _)| name.matches("UUID"))
+            .collect();
+        ensure!(
+            matches!(player_ids.as_slice(), [(_, Tag::IntArray(words))] if words.as_slice() == uuid),
+            "player UUID differs from its level and filename"
+        );
+        crate::world::WorldReader::create_world_clock_document(&clocks)?;
+        nbt::write(&level)?;
+        nbt::write(&worldgen)?;
+        Ok(Self {
+            level,
+            worldgen,
+            player,
+            uuid,
+            seed,
+            clocks,
+            regions: BTreeMap::new(),
+        })
+    }
+
+    pub fn add_region(&mut self, dimension: DimensionId, region: FreshRegionDraft) -> Result<()> {
+        let parsed = DimensionId::parse(&format!("{}:{}", dimension.namespace, dimension.path))?;
+        ensure!(parsed == dimension, "invalid generated region dimension");
+        ensure!(region.chunk_count() > 0, "generated region is empty");
+        let key = (dimension, region.kind, region.region_x, region.region_z);
+        ensure!(
+            !self.regions.contains_key(&key),
+            "duplicate generated region"
+        );
+        self.regions.insert(key, region);
+        Ok(())
+    }
+
+    /// Create and re-read an isolated tree. No existing world is touched and
+    /// dropping the result removes the tree; this does not authorize publishing.
+    pub fn stage(&self, parent: &Path) -> Result<FreshWorldStage> {
+        ensure!(
+            self.regions
+                .keys()
+                .any(|(_, kind, _, _)| *kind == FreshRegionKind::Terrain),
+            "generated world has no terrain regions"
+        );
+        let directory = tempfile::Builder::new()
+            .prefix(".re-craft-world-")
+            .tempdir_in(parent)
+            .context("cannot create a new world staging directory")?;
+        // Keep level.dat one level below the temporary directory so a stage
+        // created inside saves is not listed as a selectable world.
+        let world_path = directory.path().join("world");
+        fs::create_dir(&world_path)?;
+        let root = world_path.as_path();
+        fs::create_dir_all(root.join("data/minecraft"))?;
+        fs::create_dir_all(root.join("players/data"))?;
+        write_new_gzip(&root.join("level.dat"), &self.level)?;
+        write_new_gzip(
+            &root.join("data/minecraft/world_gen_settings.dat"),
+            &self.worldgen,
+        )?;
+        let clock_document = crate::world::WorldReader::create_world_clock_document(&self.clocks)?;
+        write_new_gzip(
+            &root.join("data/minecraft/world_clocks.dat"),
+            &clock_document,
+        )?;
+        write_new_gzip(
+            &root
+                .join("players/data")
+                .join(player_data_filename(self.uuid)),
+            &self.player,
+        )?;
+        for ((dimension, kind, rx, rz), region) in &self.regions {
+            let region_dir = match kind {
+                FreshRegionKind::Terrain => dimension.region_dir(root),
+                FreshRegionKind::Entities => dimension.entity_region_dir(root),
+                FreshRegionKind::Poi => dimension.poi_region_dir(root),
+            };
+            fs::create_dir_all(&region_dir)?;
+            let path = region_dir.join(format!("r.{rx}.{rz}.mca"));
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            for external in region.write_staged(&mut file)? {
+                let path = region_dir.join(format!(
+                    "c.{}.{}.mcc",
+                    external.position.x, external.position.z
+                ));
+                let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+                file.write_all(&external.compressed)?;
+                file.sync_all()?;
+            }
+            file.sync_all()?;
+            drop(file);
+            let mut reader = RegionReader::open(&path)?;
+            for (position, (expected, _)) in &region.chunks {
+                ensure!(
+                    reader
+                        .read_chunk_nbt_bytes(position.x, position.z)?
+                        .as_deref()
+                        == Some(expected.as_slice()),
+                    "staged generated chunk did not round-trip"
+                );
+            }
+        }
+        let reader =
+            crate::world::WorldReader::open(root, DimensionId::parse("minecraft:overworld")?)?;
+        ensure!(
+            reader.singleplayer_uuid_words()? == Some(self.uuid),
+            "staged player UUID changed"
+        );
+        ensure!(
+            reader.saved_world_seed()? == Some(self.seed),
+            "staged world seed changed"
+        );
+        ensure!(
+            reader.read_player()?.as_ref() == Some(&self.player),
+            "staged player did not round-trip"
+        );
+        ensure!(
+            reader.world_clocks()? == self.clocks,
+            "staged clocks did not round-trip"
+        );
+        let generators = reader
+            .saved_dimension_generators()?
+            .context("staged dimension generators are missing")?;
+        for (dimension, _, _, _) in self.regions.keys() {
+            ensure!(
+                generators.contains_key(dimension),
+                "staged region has no matching dimension generator"
+            );
+        }
+        let spawn = reader.world_spawn()?;
+        let pos = crate::world::ChunkPos {
+            x: spawn.position[0].div_euclid(16),
+            z: spawn.position[2].div_euclid(16),
+        };
+        let key = (
+            spawn.dimension.clone(),
+            FreshRegionKind::Terrain,
+            pos.x.div_euclid(32),
+            pos.z.div_euclid(32),
+        );
+        ensure!(
+            self.regions
+                .get(&key)
+                .is_some_and(|region| region.chunks.contains_key(&pos)),
+            "staged world spawn chunk is missing"
+        );
+        // Ensure the level can decode its selected spawn dimension's terrain.
+        drop(reader);
+        let mut reader = crate::world::WorldReader::open(root, spawn.dimension)?;
+        ensure!(
+            reader.read_chunk(pos.x, pos.z)?.is_some(),
+            "staged spawn chunk cannot be read"
+        );
+        drop(reader);
+        Ok(FreshWorldStage {
+            _directory: directory,
+            root: world_path,
+        })
+    }
+}
+
+fn write_new_gzip(path: &Path, document: &nbt::NamedTag) -> Result<()> {
+    let bytes = nbt::write(document)?;
+    ensure!(
+        bytes.len() <= nbt::MAX_NBT_BYTES,
+        "generated data exceeds NBT limit"
+    );
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("cannot create staged {}", path.display()))?;
+    let mut gzip = GzEncoder::new(file, Compression::default());
+    gzip.write_all(&bytes)?;
+    gzip.finish()?.sync_all()?;
+    let round_trip = nbt::read_gzip(File::open(path)?)?;
+    ensure!(
+        nbt::write(&round_trip)? == bytes,
+        "staged gzip data did not round-trip"
+    );
+    Ok(())
+}
+
 fn ordinary(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return false;
@@ -3135,6 +3376,156 @@ mod tests {
                 .is_err()
         );
         assert_eq!(empty.metadata().unwrap().len(), 0);
+    }
+
+    fn fresh_world_metadata() -> (NamedTag, NamedTag, NamedTag, [i32; 4]) {
+        let uuid = [1, -2, 3, 4];
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    ("Time".into(), Tag::Long(0)),
+                    ("singleplayer_uuid".into(), Tag::IntArray(uuid.to_vec())),
+                    (
+                        "spawn".into(),
+                        Tag::Compound(vec![
+                            (
+                                "dimension".into(),
+                                Tag::String("minecraft:overworld".into()),
+                            ),
+                            ("pos".into(), Tag::IntArray(vec![0, 64, 0])),
+                            ("yaw".into(), Tag::Float(0.0)),
+                            ("pitch".into(), Tag::Float(0.0)),
+                        ]),
+                    ),
+                ]),
+            )]),
+        };
+        let generator = Tag::Compound(vec![("type".into(), Tag::String("minecraft:noise".into()))]);
+        let worldgen = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![
+                        ("seed".into(), Tag::Long(42)),
+                        (
+                            "dimensions".into(),
+                            Tag::Compound(vec![(
+                                "minecraft:overworld".into(),
+                                Tag::Compound(vec![
+                                    ("type".into(), Tag::String("minecraft:overworld".into())),
+                                    ("generator".into(), generator),
+                                ]),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        (level, worldgen, player, uuid)
+    }
+
+    #[test]
+    fn fresh_world_stage_round_trips_metadata_and_regions_without_publishing() {
+        let parent = tempfile::tempdir().unwrap();
+        let sentinel = parent.path().join("existing-world");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let clocks = BTreeMap::from([(
+            DimensionId::parse("minecraft:overworld").unwrap(),
+            crate::world::SavedClock::default(),
+        )]);
+        let mut draft = FreshWorldDraft::new(
+            level.clone(),
+            worldgen.clone(),
+            player.clone(),
+            uuid,
+            42,
+            clocks.clone(),
+        )
+        .unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(
+                crate::world::ChunkPos { x: 0, z: 0 },
+                &chunk(0, "stage"),
+                123,
+            )
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        let stage = draft.stage(parent.path()).unwrap();
+        let staged_path = stage.path().to_owned();
+        assert!(!stage.path().parent().unwrap().join("level.dat").exists());
+        let mut reader =
+            crate::world::WorldReader::open(stage.path(), DimensionId::parse("overworld").unwrap())
+                .unwrap();
+        assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+        assert_eq!(reader.saved_world_seed().unwrap(), Some(42));
+        assert_eq!(reader.read_player().unwrap(), Some(player));
+        assert_eq!(reader.world_clocks().unwrap(), clocks);
+        assert!(reader.read_chunk(0, 0).unwrap().is_some());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        drop(reader);
+        drop(stage);
+        assert!(!staged_path.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn fresh_world_stage_rejects_mismatches_and_missing_spawn_without_leaking_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        assert!(
+            FreshWorldDraft::new(
+                level.clone(),
+                worldgen.clone(),
+                player.clone(),
+                uuid,
+                43,
+                BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            FreshWorldDraft::new(
+                level.clone(),
+                worldgen.clone(),
+                player.clone(),
+                [0; 4],
+                42,
+                BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        assert!(draft.stage(parent.path()).is_err());
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 1, 0);
+        terrain
+            .add(
+                crate::world::ChunkPos { x: 32, z: 0 },
+                &chunk(32, "not-spawn"),
+                1,
+            )
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        assert!(draft.stage(parent.path()).is_err());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 
     #[test]

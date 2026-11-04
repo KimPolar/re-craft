@@ -96,7 +96,7 @@ mod world_banner;
 mod world_creation;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -683,6 +683,47 @@ fn run_prepared_world(
 
 /// All disk reads and CPU scene preparation are independent of the window
 /// event loop; GUI launches run this on a background thread.
+/// Columns may be selected from any starting offset. Include the two-block
+/// entity-collision margin and the fallback origin without loading their full
+/// bounding square.
+fn initial_spawn_chunk_positions(
+    origin: IVec3,
+    candidates: Option<&native_session::world_spawn::WorldSpawnCandidates>,
+) -> Result<BTreeSet<ChunkPos>> {
+    let mut chunks = BTreeSet::new();
+    let mut add_column = |x: i32, z: i32| -> Result<()> {
+        let min_x = x
+            .checked_sub(2)
+            .context("spawn X collision range overflow")?
+            .div_euclid(16);
+        let max_x = x
+            .checked_add(2)
+            .context("spawn X collision range overflow")?
+            .div_euclid(16);
+        let min_z = z
+            .checked_sub(2)
+            .context("spawn Z collision range overflow")?
+            .div_euclid(16);
+        let max_z = z
+            .checked_add(2)
+            .context("spawn Z collision range overflow")?
+            .div_euclid(16);
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                chunks.insert(ChunkPos { x, z });
+            }
+        }
+        Ok(())
+    };
+    add_column(origin.x, origin.z)?;
+    if let Some(candidates) = candidates {
+        for (x, z) in candidates.possible_columns() {
+            add_column(x, z)?;
+        }
+    }
+    Ok(chunks)
+}
+
 fn prepare_existing_world(
     world_dir: &std::path::Path,
     minecraft_dir: &std::path::Path,
@@ -781,37 +822,50 @@ fn prepare_existing_world(
     };
     // Load only the immediate playable area before opening the window; the
     // streamer fills the configured render distance in the background.
-    let initial_radius = if let Some((spawn, border)) = &initial_spawn {
-        let bounds = native_session::respawn::RespawnBorder::from_saved(*border, 0)?;
-        let origin = IVec3::new(center.x * 16, spawn.position[1], center.z * 16);
-        let camera = player.as_ref().expect("initial spawn has a camera");
-        let x = camera.position[0].floor();
-        let z = camera.position[2].floor();
-        let distance = (x - bounds.min_x)
-            .min(bounds.max_x - x)
-            .min(z - bounds.min_z)
-            .min(bounds.max_z - z);
-        let spawn_radius =
-            if native_session::GameMode::from_legacy_id(reader.default_game_type_id()?)
-                == native_session::GameMode::Adventure
-            {
-                0
-            } else {
-                native_session::world_spawn::WorldSpawnCandidates::new(
-                    origin,
-                    reader.fluid_game_rules()?.respawn_radius,
-                    distance,
-                    0,
-                )?
-                .radius() as u32
-            };
-        (spawn_radius.saturating_add(17) / 16).max(1)
+    let initial_radius = if initial_spawn.is_some() {
+        1
     } else if play {
         radius.min(1)
     } else {
         radius
     };
-    let area = reader.read_area(center, initial_radius)?;
+    let mut area = reader.read_area(center, initial_radius)?;
+    if let Some((spawn, border)) = &initial_spawn {
+        let bounds = native_session::respawn::RespawnBorder::from_saved(*border, 0)?;
+        let camera = player.as_ref().expect("initial spawn has a camera");
+        let x = camera.position[0].floor();
+        let z = camera.position[2].floor();
+        let origin = IVec3::new(x as i32, spawn.position[1], z as i32);
+        let distance = (x - bounds.min_x)
+            .min(bounds.max_x - x)
+            .min(z - bounds.min_z)
+            .min(bounds.max_z - z);
+        let candidates = if native_session::GameMode::from_legacy_id(reader.default_game_type_id()?)
+            == native_session::GameMode::Adventure
+        {
+            None
+        } else {
+            Some(native_session::world_spawn::WorldSpawnCandidates::new(
+                origin,
+                reader.fluid_game_rules()?.respawn_radius,
+                distance,
+                0,
+            )?)
+        };
+        for pos in initial_spawn_chunk_positions(origin, candidates.as_ref())? {
+            if (i64::from(pos.x) - i64::from(center.x)).abs() <= 1
+                && (i64::from(pos.z) - i64::from(center.z)).abs() <= 1
+            {
+                continue;
+            }
+            match reader.read_chunk(pos.x, pos.z)? {
+                Some(chunk) => {
+                    area.chunks.insert(pos, Arc::new(chunk));
+                }
+                None => area.missing.push(pos),
+            }
+        }
+    }
     if area.chunks.is_empty() {
         bail!("no saved chunks found in the selected area");
     }
@@ -3253,6 +3307,46 @@ mod world_open_tests {
     use std::io::Write;
 
     #[test]
+    fn initial_spawn_preloads_every_possible_collision_chunk_without_large_squares() {
+        use native_session::world_spawn::WorldSpawnCandidates;
+        for radius in [0, 1, 8, 10, 16, 100, 500, 1_000_000] {
+            let origin = IVec3::new(8, 64, 8);
+            let candidates = WorldSpawnCandidates::new(origin, radius, 2_000_000.0, 0).unwrap();
+            let chunks = initial_spawn_chunk_positions(origin, Some(&candidates)).unwrap();
+            for offset in [
+                0,
+                candidates.candidate_count() / 2,
+                candidates.candidate_count() - 1,
+            ] {
+                for (x, z) in
+                    WorldSpawnCandidates::new(origin, radius, 2_000_000.0, offset).unwrap()
+                {
+                    for dx in [-2, 2] {
+                        for dz in [-2, 2] {
+                            assert!(
+                                chunks.contains(&ChunkPos {
+                                    x: (x + dx).div_euclid(16),
+                                    z: (z + dz).div_euclid(16)
+                                }),
+                                "radius={radius}, offset={offset}"
+                            );
+                        }
+                    }
+                }
+            }
+            if radius == 500 {
+                // The previous square loaded 65×65 chunks; even adding the
+                // initial 3×3 area, the candidate set needs fewer than 100.
+                assert!(chunks.len() + 9 < 100);
+            }
+            if radius == 1_000_000 {
+                assert!(chunks.len() + 9 < 100);
+            }
+        }
+        assert!(initial_spawn_chunk_positions(IVec3::new(i32::MAX, 0, 0), None).is_err());
+    }
+
+    #[test]
     #[ignore = "requires locally installed Minecraft 26.3 assets"]
     fn saved_player_dimension_selects_the_matching_world_data() {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -3273,9 +3367,16 @@ mod world_open_tests {
             (2, "minecraft:the_end", "minecraft:the_end", false),
             (3, "example:custom/nested", "minecraft:the_nether", false),
             (4, "minecraft:overworld", "minecraft:overworld", true),
+            (5, "minecraft:overworld", "minecraft:overworld", true),
+            (6, "minecraft:overworld", "minecraft:overworld", true),
         ] {
             let root = parent.path().join(format!("world-{index}"));
             std::fs::create_dir_all(&root).unwrap();
+            let spawn_radius = match index {
+                5 => 500,
+                6 => 1_000_000,
+                _ => 0,
+            };
             let mut level_data = vec![("DataVersion".into(), Tag::Int(5023))];
             if new_player {
                 level_data.push((
@@ -3326,7 +3427,10 @@ mod world_open_tests {
                         ("DataVersion".into(), Tag::Int(5023)),
                         (
                             "data".into(),
-                            Tag::Compound(vec![("minecraft:respawn_radius".into(), Tag::Int(0))]),
+                            Tag::Compound(vec![(
+                                "minecraft:respawn_radius".into(),
+                                Tag::Int(spawn_radius),
+                            )]),
                         ),
                     ]),
                 };
@@ -3381,21 +3485,74 @@ mod world_open_tests {
                     ),
                 ]),
             };
-            let encoded = nbt::write(&chunk).unwrap();
-            assert!(encoded.len() + 5 < 4096);
             let dimension = DimensionId::parse(name).unwrap();
-            let region_path = root
+            let region_directory = root
                 .join("dimensions")
                 .join(&dimension.namespace)
                 .join(&dimension.path)
-                .join("region/r.0.0.mca");
-            std::fs::create_dir_all(region_path.parent().unwrap()).unwrap();
-            let mut region = vec![0u8; 3 * 4096];
-            region[0..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
-            region[8192..8196].copy_from_slice(&((encoded.len() + 1) as u32).to_be_bytes());
-            region[8196] = 3;
-            region[8197..8197 + encoded.len()].copy_from_slice(&encoded);
-            std::fs::write(&region_path, &region).unwrap();
+                .join("region");
+            std::fs::create_dir_all(&region_directory).unwrap();
+            let positions = if index >= 5 {
+                let origin = IVec3::new(8, 65, 8);
+                let candidates = native_session::world_spawn::WorldSpawnCandidates::new(
+                    origin,
+                    spawn_radius,
+                    29_999_976.0,
+                    0,
+                )
+                .unwrap();
+                let mut positions =
+                    initial_spawn_chunk_positions(origin, Some(&candidates)).unwrap();
+                for x in -1..=1 {
+                    for z in -1..=1 {
+                        positions.insert(ChunkPos { x, z });
+                    }
+                }
+                assert!(positions.len() < 100);
+                positions
+            } else {
+                BTreeSet::from([ChunkPos { x: 0, z: 0 }])
+            };
+            let mut regions = BTreeMap::<(i32, i32), Vec<(ChunkPos, Vec<u8>)>>::new();
+            for pos in positions {
+                let mut document = chunk.clone();
+                let Tag::Compound(fields) = &mut document.value else {
+                    unreachable!()
+                };
+                fields
+                    .iter_mut()
+                    .find(|(key, _)| key.matches("xPos"))
+                    .unwrap()
+                    .1 = Tag::Int(pos.x);
+                fields
+                    .iter_mut()
+                    .find(|(key, _)| key.matches("zPos"))
+                    .unwrap()
+                    .1 = Tag::Int(pos.z);
+                let encoded = nbt::write(&document).unwrap();
+                assert!(encoded.len() + 5 < 4096);
+                regions
+                    .entry((pos.x.div_euclid(32), pos.z.div_euclid(32)))
+                    .or_default()
+                    .push((pos, encoded));
+            }
+            let mut originals = Vec::new();
+            for ((rx, rz), records) in regions {
+                let mut region = vec![0u8; (2 + records.len()) * 4096];
+                for (number, (pos, encoded)) in records.into_iter().enumerate() {
+                    let slot = pos.x.rem_euclid(32) as usize + 32 * pos.z.rem_euclid(32) as usize;
+                    let sector = number + 2;
+                    region[slot * 4..slot * 4 + 4]
+                        .copy_from_slice(&(((sector as u32) << 8) | 1).to_be_bytes());
+                    let at = sector * 4096;
+                    region[at..at + 4].copy_from_slice(&((encoded.len() + 1) as u32).to_be_bytes());
+                    region[at + 4] = 3;
+                    region[at + 5..at + 5 + encoded.len()].copy_from_slice(&encoded);
+                }
+                let path = region_directory.join(format!("r.{rx}.{rz}.mca"));
+                std::fs::write(&path, &region).unwrap();
+                originals.push((path, region));
+            }
             let prepared = prepare_existing_world(
                 &root,
                 &game,
@@ -3425,8 +3582,26 @@ mod world_open_tests {
                 if new_player { 16.0 } else { 65.0 }
             );
             if new_player {
-                assert_eq!(snapshot.player.position.x, 8.5);
-                assert_eq!(snapshot.player.position.z, 8.5);
+                if index >= 5 {
+                    let origin = IVec3::new(8, 65, 8);
+                    let candidates = native_session::world_spawn::WorldSpawnCandidates::new(
+                        origin,
+                        spawn_radius,
+                        29_999_976.0,
+                        0,
+                    )
+                    .unwrap();
+                    assert!(
+                        candidates
+                            .possible_columns()
+                            .any(|(x, z)| snapshot.player.position.x == x as f32 + 0.5
+                                && snapshot.player.position.z == z as f32 + 0.5)
+                    );
+                    assert!(loaded.chunks.len() < 100);
+                } else {
+                    assert_eq!(snapshot.player.position.x, 8.5);
+                    assert_eq!(snapshot.player.position.z, 8.5);
+                }
                 assert_eq!(snapshot.player.yaw, 270_f32.to_radians());
                 assert_eq!(snapshot.player.pitch, (-20_f32).to_radians());
                 let draft = prepared.session.draft_new_player_state().unwrap();
@@ -3436,7 +3611,11 @@ mod world_open_tests {
                 );
                 assert_eq!(
                     native_session::player_data::read_saved_position(draft.document()).unwrap(),
-                    Some(DVec3::new(8.5, 16.0, 8.5))
+                    Some(DVec3::new(
+                        f64::from(snapshot.player.position.x),
+                        16.0,
+                        f64::from(snapshot.player.position.z)
+                    ))
                 );
             }
             assert_eq!(std::fs::read(level_path).unwrap(), level_bytes);
@@ -3446,7 +3625,9 @@ mod world_open_tests {
                 assert!(!player_path.exists());
             }
             assert_eq!(std::fs::read(settings_path).unwrap(), settings_bytes);
-            assert_eq!(std::fs::read(region_path).unwrap(), region);
+            for (path, region) in originals {
+                assert_eq!(std::fs::read(path).unwrap(), region);
+            }
         }
     }
 }

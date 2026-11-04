@@ -92,6 +92,27 @@ impl WorldSpawnCandidates {
     pub fn candidate_count(&self) -> i32 {
         self.count
     }
+
+    /// Every column that any random offset can choose, without changing the
+    /// actual search order. Java visits at most 1024 indexed candidates.
+    pub fn possible_columns(&self) -> impl ExactSizeIterator<Item = (i32, i32)> + '_ {
+        (0..self.count).map(|index| self.column_at(index))
+    }
+
+    fn column_at(&self, index: i32) -> (i32, i32) {
+        let side = self.radius * 2 + 1;
+        let x = self
+            .origin
+            .x
+            .wrapping_add(index % side)
+            .wrapping_sub(self.radius);
+        let z = self
+            .origin
+            .z
+            .wrapping_add(index / side)
+            .wrapping_sub(self.radius);
+        (x, z)
+    }
 }
 
 impl Iterator for WorldSpawnCandidates {
@@ -104,18 +125,7 @@ impl Iterator for WorldSpawnCandidates {
         let coprime = if self.count <= 16 { self.count - 1 } else { 17 };
         let index = (self.offset + coprime * self.next) % self.count;
         self.next += 1;
-        let side = self.radius * 2 + 1;
-        let x = self
-            .origin
-            .x
-            .wrapping_add(index % side)
-            .wrapping_sub(self.radius);
-        let z = self
-            .origin
-            .z
-            .wrapping_add(index / side)
-            .wrapping_sub(self.radius);
-        Some((x, z))
+        Some(self.column_at(index))
     }
 }
 
@@ -440,6 +450,34 @@ mod tests {
         fn clear_player(&mut self, _: IVec3) -> Result<bool> {
             panic!("initial spawn must not test player collisions")
         }
+    }
+
+    #[test]
+    fn possible_columns_cover_every_start_offset_even_when_stride_repeats() {
+        for radius in [0, 1, 8, 10, 16, 100, 500, 1_000_000] {
+            let origin = IVec3::new(8, 64, -9);
+            let reference = WorldSpawnCandidates::new(origin, radius, 2_000_000.0, 0).unwrap();
+            let possible: BTreeSet<_> = reference.possible_columns().collect();
+            assert_eq!(possible.len(), reference.candidate_count() as usize);
+            for offset in [
+                0,
+                reference.candidate_count() / 2,
+                reference.candidate_count() - 1,
+            ] {
+                for column in
+                    WorldSpawnCandidates::new(origin, radius, 2_000_000.0, offset).unwrap()
+                {
+                    assert!(
+                        possible.contains(&column),
+                        "radius={radius}, offset={offset}"
+                    );
+                }
+            }
+        }
+        // The stride 17 revisits the same subset at radius 8; offset zero
+        // alone must not be used as the complete set of possible columns.
+        let search = WorldSpawnCandidates::new(IVec3::ZERO, 8, 100.0, 0).unwrap();
+        assert!(search.clone().collect::<BTreeSet<_>>().len() < search.possible_columns().len());
     }
 
     #[test]

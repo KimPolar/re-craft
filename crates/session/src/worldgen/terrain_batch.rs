@@ -309,6 +309,30 @@ impl FreshTerrainBatch {
             .recorded_generated_entities(pos)
     }
 
+    /// Prove an entity chunk empty for a generator without structures,
+    /// biome features, or world-generation mobs. Other configurations may
+    /// still have unrecorded entity sources and must remain unavailable.
+    pub fn generated_entity_chunk_is_known_empty(&self, pos: ChunkPos) -> Result<bool> {
+        ensure!(self.is_complete(), "generation batch has pending work");
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "entity completeness requires a spawn-complete chunk"
+        );
+        let decoration = self.decoration.as_ref().context("decoration is missing")?;
+        if !self.mob_generation_disabled()?
+            || decoration
+                .schedule
+                .steps()
+                .iter()
+                .any(|step| !step.is_empty())
+        {
+            return Ok(false);
+        }
+        Ok(self.recorded_generated_entities(pos)?.is_empty())
+    }
+
     /// Stage all addFreshEntityWithPassengers visits and publish only after
     /// every destination and compound has been validated.
     pub(super) fn record_finalized_creature(

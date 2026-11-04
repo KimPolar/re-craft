@@ -3336,6 +3336,12 @@ mod tests {
             let mut session = generated
                 .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
                 .unwrap();
+            assert!(
+                generated
+                    .batch
+                    .generated_entity_chunk_is_known_empty(center)
+                    .is_err()
+            );
             let before = session.snapshot();
             let playable = before.world.loaded().unwrap();
             assert_eq!(playable.chunks.len(), 1);

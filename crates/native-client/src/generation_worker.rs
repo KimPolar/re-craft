@@ -293,6 +293,20 @@ impl GenerationReady {
             player,
         )
         .map_err(anyhow::Error::msg)?;
+        for &pos in targets.iter() {
+            if self
+                .batch
+                .schedule()
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn)
+                && self.batch.generated_entity_chunk_is_known_empty(pos)?
+            {
+                session.set_initial_entity_chunk(
+                    pos,
+                    native_session::loaded::SavedEntityData::Empty,
+                )?;
+            }
+        }
         session.set_player_inventory(PlayerInventory::default());
         if let Some(registry) = &self.entity_collision_registry {
             session.set_entity_collision_registry(Arc::clone(registry))?;
@@ -1725,21 +1739,30 @@ mod tests {
             pack.join("data/minecraft/tags/block/animals_spawnable_on.json"),
             br#"{"replace":true,"values":["minecraft:dirt"]}"#,
         )?;
-        for (spawn_mobs, disabled, species) in [
-            (false, false, "minecraft:sheep"),
-            (true, true, "minecraft:sheep"),
-            (true, false, "minecraft:sheep"),
-            (true, false, "minecraft:horse"),
-            (true, false, "minecraft:donkey"),
+        for (spawn_mobs, disabled, species, has_features) in [
+            (false, false, "minecraft:sheep", false),
+            (true, true, "minecraft:sheep", false),
+            (true, true, "minecraft:sheep", true),
+            (true, false, "minecraft:sheep", false),
+            (true, false, "minecraft:horse", false),
+            (true, false, "minecraft:donkey", false),
         ] {
             let mut selected_biome = biome.clone();
+            if has_features {
+                selected_biome["features"] = json!([[{
+                    "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+                    "placement": [{"type":"minecraft:count","count":0}]
+                }]]);
+            }
             selected_biome["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]
                 ["creature"][0]["type"] = json!(species);
             std::fs::write(
                 pack.join("data/example/worldgen/biome/flat.json"),
                 serde_json::to_vec(&selected_biome)?,
             )?;
-            let collision_height_tags = if spawn_mobs && !disabled && species == "minecraft:sheep" {
+            let collision_height_tags = if disabled
+                || (spawn_mobs && !disabled && species == "minecraft:sheep")
+            {
                 let mut resources = native_resources::packs::ResourceStack::open(&game)?;
                 let warnings = resources.configure_world_data(
                     &world,
@@ -1853,6 +1876,10 @@ mod tests {
             );
             for &pos in &targets {
                 use native_persistence::nbt::Tag;
+                assert_eq!(
+                    ready.batch.generated_entity_chunk_is_known_empty(pos)?,
+                    disabled && !has_features
+                );
                 let source = ready.batch.spawned_heightmap_data(pos)?;
                 let full = ready.batch.converted_full_heightmap_data(pos)?;
                 for name in [
@@ -1886,6 +1913,29 @@ mod tests {
                 }
             } else {
                 assert_eq!(count, 0);
+            }
+            if disabled && !has_features {
+                use native_session::loaded::SavedEntityData;
+                let target = *targets.iter().next().unwrap();
+                let position = IVec3::new(target.x * 16 + 8, 16, target.z * 16 + 8);
+                let player = native_session::PlayerState {
+                    position: (position - ready.mesh.origin).as_vec3()
+                        + glam::Vec3::new(0.5, 0.0, 0.5),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: true,
+                    pose: native_session::PlayerPose::Standing,
+                };
+                let mut session = ready.start_session(player)?;
+                assert!(targets.iter().all(|&pos| matches!(
+                    session.saved_entity_chunk(pos),
+                    Some(SavedEntityData::Empty)
+                )));
+                session.set_spawn_heightmap_tags(Arc::clone(
+                    collision_height_tags.as_ref().unwrap(),
+                ))?;
+                assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if spawn_mobs && !disabled && species == "minecraft:sheep" {
                 use native_persistence::{

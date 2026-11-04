@@ -3123,6 +3123,9 @@ mod tests {
             brown: true,
         };
         let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
+        let mob_height_tags =
+            native_resources::heightmap_tags::HeightmapTags::load(&mut data, &block_registry)
+                .unwrap();
         let mut spawn_settings = definition();
         spawn_settings["settings"]["disable_mob_generation"] = json!(false);
         let generator =
@@ -3242,6 +3245,7 @@ mod tests {
                 MobSpawnHeightmap::MotionBlockingNoLeaves,
                 border,
                 &tag,
+                &mob_height_tags,
             )
             .unwrap();
             let mut search = TopMobSpawnPosition::new(8, 8, 0, false);
@@ -3258,12 +3262,41 @@ mod tests {
                 MobSpawnHeightmap::MotionBlockingNoLeaves,
                 border,
                 &tag,
+                &mob_height_tags,
             )
             .unwrap();
             assert!(!on_ground_spawn_position_ok(&mut view, top).unwrap());
             assert!(
                 on_ground_spawn_position_ok(&mut view, IVec3::new(1000, 16, 8)).is_ok_and(|ok| !ok)
             );
+        }
+        // The snapshot has never had these maps requested; a query should
+        // still work without materializing or modifying any terrain blocks.
+        batch.forget_final_heightmaps_for_test(center);
+        {
+            use native_resources::mob_spawn_placement::{MobPlacementWorld, MobSpawnHeightmap};
+            let before = batch.snapshot().unwrap();
+            let border = crate::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            };
+            let tag = BTreeSet::new();
+            for kind in [
+                MobSpawnHeightmap::WorldSurface,
+                MobSpawnHeightmap::OceanFloor,
+                MobSpawnHeightmap::MotionBlocking,
+                MobSpawnHeightmap::MotionBlockingNoLeaves,
+            ] {
+                assert_eq!(batch.primed_mob_spawn_height(8, 8, kind).unwrap(), None);
+                let mut view =
+                    GeneratedMobPlacementView::new(&batch, kind, border, &tag, &mob_height_tags)
+                        .unwrap();
+                assert_eq!(view.height(8, 8).unwrap(), 16);
+                assert_eq!(view.height(8, 8).unwrap(), 16);
+            }
+            assert!(Arc::ptr_eq(&before, &batch.snapshot().unwrap()));
         }
         let mut mob_spawns = native_resources::mob_spawns::CreatureSpawns::default();
         let attributes = json!({"gameplay/natural_mob_spawns":{
@@ -3301,6 +3334,7 @@ mod tests {
                 MobSpawnHeightmap::MotionBlockingNoLeaves,
                 border,
                 &tag,
+                &mob_height_tags,
             )
             .unwrap();
             let mut probe = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
@@ -3324,6 +3358,7 @@ mod tests {
                 MobSpawnHeightmap::MotionBlockingNoLeaves,
                 border,
                 &tag,
+                &mob_height_tags,
             )
             .unwrap();
             let mut denied = GeneratedCreatureProbe::new(attempt, 0, false, true);

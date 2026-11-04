@@ -625,6 +625,12 @@ impl FreshTerrainBatch {
             .context("generated terrain is missing")?
             .primed_mob_spawn_height(x, z, kind)
     }
+
+    #[cfg(test)]
+    pub(super) fn forget_final_heightmaps_for_test(&mut self, pos: ChunkPos) {
+        self.terrain.as_mut().unwrap().final_heightmaps.remove(&pos);
+    }
+
     pub fn snapshot(&self) -> Option<Arc<World>> {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }

@@ -188,7 +188,7 @@ impl GenerationReady {
             .context("generated session targets missing")?;
         for &pos in targets.iter() {
             if let Some(maps) = self.batch.spawn_heightmaps(pos)? {
-                session.set_initial_spawn_heightmaps(pos, maps)?;
+                session.complete_generated_spawn_heightmaps(pos, maps)?;
             } else {
                 session.prime_generated_spawn_heightmaps(pos)?;
             }

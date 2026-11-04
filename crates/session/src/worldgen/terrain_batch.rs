@@ -653,11 +653,11 @@ impl FreshTerrainBatch {
             return Ok(None);
         };
         let (min_y, max_y) = self.build_bounds()?;
-        Ok(Some(SpawnHeightmaps::from_first_available(
+        Ok(Some(SpawnHeightmaps::from_optional_first_available(
             HeightBounds { min_y, max_y },
-            &maps.values[2],
-            &maps.values[0],
-            &maps.values[1],
+            (maps.primed & 0b0100 != 0).then_some(&maps.values[2]),
+            (maps.primed & 0b0001 != 0).then_some(&maps.values[0]),
+            (maps.primed & 0b0010 != 0).then_some(&maps.values[1]),
         )?))
     }
 

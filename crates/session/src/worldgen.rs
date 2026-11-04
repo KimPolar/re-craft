@@ -1309,6 +1309,7 @@ impl CarvedTerrainWorld {
         Ok(self
             .final_heightmaps
             .get(&pos)
+            .filter(|maps| maps.primed & (1 << map) != 0)
             .map(|maps| maps.values[map][index]))
     }
 

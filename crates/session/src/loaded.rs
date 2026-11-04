@@ -5914,6 +5914,20 @@ impl LoadedSession {
     /// Prime previously absent maps for an in-memory generated chunk. Every
     /// block section must be present; this does not make the chunk saveable.
     pub fn prime_generated_spawn_heightmaps(&mut self, pos: ChunkPos) -> anyhow::Result<()> {
+        let bounds = HeightBounds {
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+        };
+        self.complete_generated_spawn_heightmaps(pos, SpawnHeightmaps::unprimed(bounds)?)
+    }
+
+    /// Prime only missing maps, retaining generation's existing, possibly
+    /// stale, values. The session is unchanged if any input is incomplete.
+    pub fn complete_generated_spawn_heightmaps(
+        &mut self,
+        pos: ChunkPos,
+        mut maps: SpawnHeightmaps,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
         anyhow::ensure!(
             self.tick == 0,
@@ -5922,6 +5936,14 @@ impl LoadedSession {
         anyhow::ensure!(
             !self.spawn_heightmaps.contains_key(&pos),
             "heightmaps are already present"
+        );
+        anyhow::ensure!(
+            maps.bounds()
+                == HeightBounds {
+                    min_y: self.bounds.min_y,
+                    max_y: self.bounds.max_y
+                },
+            "heightmap bounds differ from the dimension"
         );
         let air = self
             .heightmap_air
@@ -5942,11 +5964,6 @@ impl LoadedSession {
                 "generated heightmap block data is missing"
             );
         }
-        let bounds = HeightBounds {
-            min_y: self.bounds.min_y,
-            max_y: self.bounds.max_y,
-        };
-        let mut maps = SpawnHeightmaps::unprimed(bounds)?;
         crate::spawn_heightmaps::prime(&mut maps, chunk, &self.heightmap_flags, air)?;
         self.set_initial_spawn_heightmaps(pos, maps)
     }
@@ -44721,6 +44738,60 @@ pub(crate) mod tests {
             .remove(&1);
         assert!(session.prime_generated_spawn_heightmaps(home).is_err());
         assert!(session.spawn_heightmaps_for_chunk(home).is_none());
+    }
+
+    #[test]
+    fn generated_spawn_heightmaps_preserve_existing_and_prime_missing() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 32,
+        };
+        let stale_surface = [12; 256];
+        let maps = SpawnHeightmaps::from_optional_first_available(
+            bounds,
+            None,
+            Some(&stale_surface),
+            None,
+        )
+        .unwrap();
+        assert!(
+            session
+                .complete_generated_spawn_heightmaps(home, maps.clone())
+                .is_err()
+        );
+        assert!(session.spawn_heightmaps_for_chunk(home).is_none());
+
+        let air = session.states[0];
+        let world = Arc::make_mut(&mut session.world);
+        Arc::make_mut(world.chunks.get_mut(&home).unwrap())
+            .sections
+            .insert(
+                1,
+                Arc::new(Section {
+                    blocks: Some(Box::new([air; BLOCK_COUNT])),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                }),
+            );
+        session
+            .complete_generated_spawn_heightmaps(home, maps)
+            .unwrap();
+        let maps = session.spawn_heightmaps_for_chunk(home).unwrap();
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(11)
+        );
+        assert_eq!(
+            maps.highest(SpawnHeightmapKind::MotionBlocking, 0, 0),
+            Some(0)
+        );
+        assert_eq!(maps.highest(SpawnHeightmapKind::OceanFloor, 0, 0), Some(0));
     }
 
     #[test]

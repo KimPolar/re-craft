@@ -299,6 +299,12 @@ fn scattered_features_and_heightmaps_match_java_protochunks() {
         let mut region = terrain
             .decoration_region(&tags, &motion, before.chunks.keys().copied().collect())
             .unwrap();
+        // The Java fixture primes every heightmap before placing the feature.
+        for pos in before.chunks.keys().copied() {
+            region
+                .prime_heightmaps(pos, FINAL_HEIGHTMAPS | WORLDGEN_HEIGHTMAPS)
+                .unwrap();
+        }
         let mut random = DecorationRandom::new(0);
         let deco = random.set_decoration_seed(case.seed, -16, 32);
         random.set_feature_seed(deco, 7, 3);

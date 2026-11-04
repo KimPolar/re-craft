@@ -115,7 +115,13 @@ struct FreezeContext<'a> {
 #[derive(Clone)]
 pub(super) struct FinalHeightmaps {
     pub(super) values: Box<[[i32; 256]; 4]>,
+    pub(super) primed: u8,
 }
+
+const FINAL_HEIGHTMAPS: u8 = 0b00_1111;
+const OCEAN_FLOOR_WG: u8 = 0b01_0000;
+const WORLD_SURFACE_WG: u8 = 0b10_0000;
+const WORLDGEN_HEIGHTMAPS: u8 = OCEAN_FLOOR_WG | WORLD_SURFACE_WG;
 
 /// A placed feature bound to the exact configured feature it references.
 pub struct PlacedDecorationFeature {
@@ -1934,11 +1940,13 @@ impl DecorationRegion<'_> {
 
     // Java primes the entire heightmap on first access. Direct ore section
     // writes do not update it, including for data-pack replacement states.
-    fn prime_heightmaps(&mut self, pos: ChunkPos) -> Result<()> {
-        let need_ocean = !self.heights.contains_key(&pos);
-        let need_surface = !self.surface_heights.contains_key(&pos);
-        let need_final = !self.final_heights.contains_key(&pos);
-        if !need_ocean && !need_surface && !need_final {
+    fn prime_heightmaps(&mut self, pos: ChunkPos, requested: u8) -> Result<()> {
+        let need_ocean = requested & OCEAN_FLOOR_WG != 0 && !self.heights.contains_key(&pos);
+        let need_surface =
+            requested & WORLD_SURFACE_WG != 0 && !self.surface_heights.contains_key(&pos);
+        let present = self.final_heights.get(&pos).map_or(0, |m| m.primed);
+        let need_final = requested & FINAL_HEIGHTMAPS & !present;
+        if !need_ocean && !need_surface && need_final == 0 {
             return Ok(());
         }
         let base_x = pos.x.checked_mul(16).context("chunk X overflow")?;
@@ -1953,15 +1961,21 @@ impl DecorationRegion<'_> {
         );
         let mut ocean = Box::new([self.target.min_y; 256]);
         let mut surface = Box::new([self.target.min_y; 256]);
-        let mut final_maps = FinalHeightmaps {
-            values: Box::new([[self.target.min_y; 256]; 4]),
-        };
+        let mut final_maps = self
+            .final_heights
+            .get(&pos)
+            .map(|maps| (**maps).clone())
+            .unwrap_or_else(|| FinalHeightmaps {
+                values: Box::new([[self.target.min_y; 256]; 4]),
+                primed: 0,
+            });
         let mut final_cache = BTreeMap::<BlockStateId, [bool; 4]>::new();
         for z in 0..16 {
             for x in 0..16 {
                 let mut missing_ocean = need_ocean;
                 let mut missing_surface = need_surface;
-                let mut missing_final = [need_final; 4];
+                let mut missing_final =
+                    std::array::from_fn::<_, 4, _>(|kind| need_final & (1 << kind) != 0);
                 for y in (self.target.min_y..self.target.min_y + self.target.height).rev() {
                     let id = self
                         .world
@@ -2019,7 +2033,8 @@ impl DecorationRegion<'_> {
         if need_surface {
             self.surface_heights.insert(pos, Arc::from(surface));
         }
-        if need_final {
+        if need_final != 0 {
+            final_maps.primed |= need_final;
             self.final_heights.insert(pos, Arc::new(final_maps));
         }
         Ok(())
@@ -2040,7 +2055,8 @@ impl DecorationRegion<'_> {
 
     fn final_height(&mut self, kind: usize, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
-        self.prime_heightmaps(pos)?;
+        ensure!(kind < 4, "invalid final heightmap kind");
+        self.prime_heightmaps(pos, 1 << kind)?;
         Ok(self.final_heights[&pos].values[kind]
             [(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
@@ -2050,13 +2066,16 @@ impl DecorationRegion<'_> {
     fn update_final_heightmaps(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
         let pos = chunk(p);
         let index = (p[0].rem_euclid(16) + p[2].rem_euclid(16) * 16) as usize;
-        let old = self
-            .final_heights
-            .get(&pos)
-            .context("final heightmaps missing")?;
+        let Some(old) = self.final_heights.get(&pos) else {
+            return self.prime_heightmaps(pos, FINAL_HEIGHTMAPS);
+        };
+        let primed = old.primed;
         let flags = self.final_predicates(state)?;
         let mut values = [0; 4];
         for kind in 0..4 {
+            if primed & (1 << kind) == 0 {
+                continue;
+            }
             let previous = old.values[kind][index];
             values[kind] = previous;
             if p[1] <= previous - 2 {
@@ -2084,14 +2103,16 @@ impl DecorationRegion<'_> {
                 .context("final heightmaps missing")?,
         );
         for kind in 0..4 {
-            maps.values[kind][index] = values[kind];
+            if primed & (1 << kind) != 0 {
+                maps.values[kind][index] = values[kind];
+            }
         }
-        Ok(())
+        self.prime_heightmaps(pos, FINAL_HEIGHTMAPS)
     }
 
     fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
-        self.prime_heightmaps(pos)?;
+        self.prime_heightmaps(pos, WORLD_SURFACE_WG)?;
         Ok(self.surface_heights[&pos][(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
 
@@ -5226,7 +5247,7 @@ impl LakeWorld for DecorationRegion<'_> {
 impl OreVeinWorld for DecorationRegion<'_> {
     fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
-        self.prime_heightmaps(pos)?;
+        self.prime_heightmaps(pos, OCEAN_FLOOR_WG)?;
         Ok(self.heights[&pos][(x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize])
     }
     fn outside_build_height(&self, y: i32) -> bool {
@@ -5427,7 +5448,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
         }
         // Preserve both original maps before the first direct write in this
         // chunk; untouched neighbors need no heightmap scan.
-        self.prime_heightmaps(chunk(p))?;
+        self.prime_heightmaps(chunk(p), WORLDGEN_HEIGHTMAPS)?;
         if unchanged_registered {
             return Ok(());
         }
@@ -10908,6 +10929,9 @@ mod tests {
         let mut region = terrain
             .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
             .unwrap();
+        for kind in 0..4 {
+            assert_eq!(region.final_height(kind, 0, 0).unwrap(), 8);
+        }
         region
             .set_section_block([0, 12, 0], &state("stone"))
             .unwrap();
@@ -10953,6 +10977,143 @@ mod tests {
                 .primed_mob_spawn_height(1000, 0, MobSpawnHeightmap::OceanFloor)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn final_heightmaps_are_primed_only_when_accessed_or_written() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region
+            .set_section_block([0, 12, 0], &state("stone"))
+            .unwrap();
+        assert!(!region.final_heights.contains_key(&center));
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        assert_eq!(region.final_heights[&center].primed, 0b0001);
+        region
+            .set_section_block([0, 13, 0], &state("stone"))
+            .unwrap();
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        assert_eq!(region.final_height(1, 0, 0).unwrap(), 14);
+        assert_eq!(region.final_heights[&center].primed, 0b0011);
+        region
+            .set_block([0, 7, 0], &state("ancient_debris"), 2)
+            .unwrap();
+        assert_eq!(region.final_heights[&center].primed, 0b1111);
+        assert_eq!(region.final_height(0, 0, 0).unwrap(), 13);
+        assert_eq!(region.final_height(1, 0, 0).unwrap(), 14);
+        assert_eq!(region.final_height(2, 0, 0).unwrap(), 14);
+        assert_eq!(region.final_height(3, 0, 0).unwrap(), 14);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn heightmap_priming_lifecycle_matches_java_protochunk() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("HeightmapLifecycleOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/HeightmapLifecycleOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source));
+        let output = temp.path().join("heightmaps.json");
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("HeightmapLifecycleOracle")
+            .arg(&output));
+        let expected: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        let (mut terrain, tags, motion, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let debris = world.intern_state(state("ancient_debris"));
+        world.set_block_id(1, 7, 0, debris).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.ocean_floor_height(0, 0).unwrap();
+        region.world_surface_height(0, 0).unwrap();
+        let capture = |region: &DecorationRegion<'_>| {
+            let mut result = serde_json::Map::new();
+            if let Some(map) = region.heights.get(&center) {
+                result.insert("OCEAN_FLOOR_WG".into(), json!(map[0]));
+            }
+            if let Some(map) = region.surface_heights.get(&center) {
+                result.insert("WORLD_SURFACE_WG".into(), json!(map[0]));
+            }
+            if let Some(maps) = region.final_heights.get(&center) {
+                for (i, name) in [
+                    "WORLD_SURFACE",
+                    "OCEAN_FLOOR",
+                    "MOTION_BLOCKING",
+                    "MOTION_BLOCKING_NO_LEAVES",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if maps.primed & (1 << i) != 0 {
+                        result.insert(name.into(), json!(maps.values[i][0]));
+                    }
+                }
+            }
+            Value::Object(result)
+        };
+        let mut actual = vec![capture(&region)];
+        region
+            .set_block([1, 7, 0], &state("ancient_debris"), 2)
+            .unwrap();
+        actual.push(capture(&region));
+        region
+            .set_section_block([0, 12, 0], &state("stone"))
+            .unwrap();
+        actual.push(capture(&region));
+        region.final_height(0, 0, 0).unwrap();
+        actual.push(capture(&region));
+        region
+            .set_section_block([0, 13, 0], &state("stone"))
+            .unwrap();
+        actual.push(capture(&region));
+        region.final_height(1, 0, 0).unwrap();
+        actual.push(capture(&region));
+        region
+            .set_block([0, 7, 0], &state("ancient_debris"), 2)
+            .unwrap();
+        actual.push(capture(&region));
+        assert_eq!(actual, expected);
     }
 
     #[test]

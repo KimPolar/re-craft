@@ -89,12 +89,28 @@ impl SpawnHeightmaps {
         world_surface: &[i32; 256],
         ocean_floor: &[i32; 256],
     ) -> Result<Self> {
+        Self::from_optional_first_available(
+            bounds,
+            Some(motion_blocking),
+            Some(world_surface),
+            Some(ocean_floor),
+        )
+    }
+
+    /// Preserve individually primed maps without fabricating missing maps.
+    pub fn from_optional_first_available(
+        bounds: HeightBounds,
+        motion_blocking: Option<&[i32; 256]>,
+        world_surface: Option<&[i32; 256]>,
+        ocean_floor: Option<&[i32; 256]>,
+    ) -> Result<Self> {
         bounds.height()?;
         let mut maps = [None, None, None];
         for (target, source) in maps
             .iter_mut()
             .zip([motion_blocking, world_surface, ocean_floor])
         {
+            let Some(source) = source else { continue };
             let mut values = Box::new([0u32; 256]);
             for (output, &height) in values.iter_mut().zip(source.iter()) {
                 ensure!(

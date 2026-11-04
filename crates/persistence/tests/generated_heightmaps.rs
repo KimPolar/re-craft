@@ -94,6 +94,38 @@ fn generated_maps_preserve_values_and_omit_unprimed_maps() {
 }
 
 #[test]
+fn partial_spawn_maps_preserve_existing_values_when_missing_maps_are_primed() {
+    use native_persistence::heightmap::BlockHeightFlags;
+    let bounds = HeightBounds {
+        min_y: 0,
+        max_y: 16,
+    };
+    let stale = [12; 256];
+    let mut maps =
+        SpawnHeightmaps::from_optional_first_available(bounds, None, Some(&stale), None).unwrap();
+    assert!(!maps.is_complete());
+    maps.prime_missing(|_, y, _| {
+        Ok(BlockHeightFlags {
+            is_air: y >= 4,
+            blocks_motion: y < 4,
+            blocks_motion_no_leaves: y < 4,
+            has_fluid: false,
+        })
+    })
+    .unwrap();
+    assert!(maps.is_complete());
+    assert_eq!(
+        maps.highest(SpawnHeightmapKind::WorldSurface, 3, 7),
+        Some(11)
+    );
+    assert_eq!(
+        maps.highest(SpawnHeightmapKind::MotionBlocking, 3, 7),
+        Some(3)
+    );
+    assert_eq!(maps.highest(SpawnHeightmapKind::OceanFloor, 3, 7), Some(3));
+}
+
+#[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn generated_maps_match_java_packed_storage() {
     let game = std::env::var_os("MINECRAFT_DIR")

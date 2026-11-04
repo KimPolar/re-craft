@@ -69,6 +69,7 @@ struct DecorationConfig {
     ambient_light: Option<f32>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
 }
 
 /// Examine every branch without consuming generation randomness or the block
@@ -805,6 +806,10 @@ impl FreshTerrainBatch {
         )
         .ok()
         .map(Arc::new);
+        let bubble_tags =
+            native_resources::fluid_tags::BubbleColumnTags::load(provider, &block_registry)
+                .ok()
+                .map(Arc::new);
         self.decoration = Some(DecorationConfig {
             schedule,
             features_cannot_spawn_entities,
@@ -812,6 +817,7 @@ impl FreshTerrainBatch {
             heightmap_tags,
             mushroom_tags,
             leaf_tags,
+            bubble_tags,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -1565,6 +1571,11 @@ impl FreshTerrainBatch {
             self.decoration
                 .as_ref()
                 .and_then(|config| config.leaf_tags.clone()),
+        );
+        stage.set_bubble_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.bubble_tags.clone()),
         );
         Ok(stage)
     }

@@ -37,6 +37,7 @@ pub struct GeneratedPostprocessing {
     light: Option<VisibleLightSnapshot>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     edits: Vec<BlockPosition>,
     light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -112,6 +113,7 @@ impl GeneratedPostprocessing {
             light,
             mushroom_tags,
             leaf_tags: None,
+            bubble_tags: None,
             edits: Vec::new(),
             light_checks: Vec::new(),
             heightmaps,
@@ -128,6 +130,13 @@ impl GeneratedPostprocessing {
         tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     ) {
         self.leaf_tags = tags;
+    }
+
+    pub(super) fn set_bubble_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
+    ) {
+        self.bubble_tags = tags;
     }
 
     /// Run a bounded number of callbacks without interleaving another chunk.
@@ -157,6 +166,7 @@ impl GeneratedPostprocessing {
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
+            bubble_tags: self.bubble_tags.as_deref(),
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -203,6 +213,7 @@ struct GeneratedBlockView<'a> {
     light: Option<&'a VisibleLightSnapshot>,
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -279,6 +290,25 @@ fn supported_dry_block(state: &BlockState) -> Result<DryBlock> {
     }
 }
 
+fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidState>> {
+    if !matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+        return Ok(None);
+    }
+    let raw = state
+        .properties
+        .get("level")
+        .context("liquid level missing")?;
+    ensure!(
+        state.properties.len() == 1
+            && raw
+                .parse::<u8>()
+                .ok()
+                .is_some_and(|level| level <= 15 && level.to_string() == *raw),
+        "invalid generated liquid state"
+    );
+    native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)
+}
+
 impl GeneratedBlockView<'_> {
     fn read(&self, pos: [i32; 3]) -> Result<BlockState> {
         if !(self.min_y..self.max_y).contains(&pos[1]) {
@@ -299,6 +329,100 @@ impl GeneratedBlockView<'_> {
             .block(pos[0], pos[1], pos[2])
             .cloned()
             .context("generated postprocessing block is missing")
+    }
+
+    fn fluid_cell(&self, pos: glam::IVec3) -> native_world::fluid_sim::Cell {
+        use native_world::fluid_sim::Cell;
+        let Ok(state) = self.read(pos.to_array()) else {
+            return Cell::Unknown;
+        };
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            return liquid_state(&state)
+                .ok()
+                .flatten()
+                .map_or(Cell::Unknown, Cell::Fluid);
+        }
+        if !state.properties.is_empty() {
+            return Cell::Unknown;
+        }
+        match state.name.as_str() {
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => Cell::Air,
+            "minecraft:stone"
+            | "minecraft:dirt"
+            | "minecraft:coarse_dirt"
+            | "minecraft:rooted_dirt"
+            | "minecraft:deepslate"
+            | "minecraft:tuff"
+            | "minecraft:granite"
+            | "minecraft:diorite"
+            | "minecraft:andesite"
+            | "minecraft:bedrock"
+            | "minecraft:sand"
+            | "minecraft:red_sand"
+            | "minecraft:gravel"
+            | "minecraft:clay" => Cell::Solid,
+            _ => Cell::Unknown,
+        }
+    }
+
+    fn tick_unchanged_fluid(
+        &self,
+        pos: [i32; 3],
+        fluid: native_world::fluid::FluidState,
+    ) -> Result<()> {
+        use native_world::{
+            fluid::FluidKind,
+            fluid_sim::{Cell, Settings, try_tick},
+        };
+        // A source enclosed on the bottom and all four sides cannot flow,
+        // regardless of gamerules or the dimension's lava speed.
+        if fluid.source
+            && pos
+                .iter()
+                .all(|value| value.checked_sub(6).is_some() && value.checked_add(6).is_some())
+            && self.fluid_cell(glam::IVec3::from_array(pos)) == Cell::Fluid(fluid)
+            && [[0, -1, 0], [-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]]
+                .into_iter()
+                .all(|delta| {
+                    self.fluid_cell(glam::IVec3::new(
+                        pos[0] + delta[0],
+                        pos[1] + delta[1],
+                        pos[2] + delta[2],
+                    )) == Cell::Solid
+                })
+        {
+            return Ok(());
+        }
+        // Until the caller supplies the dimension timeline and gamerules,
+        // accept only ticks that need no writes under every possible setting.
+        // Such ticks do not sample the lava spread-delay RNG either: any
+        // changed flowing state would appear in the rejected change list.
+        for converts in [false, true] {
+            for fast_lava in [false, true] {
+                if fluid.kind == FluidKind::Water && fast_lava {
+                    continue;
+                }
+                let settings = Settings {
+                    water_source_conversion: converts,
+                    lava_source_conversion: converts,
+                    fast_lava,
+                };
+                let changes = try_tick(
+                    &|p| self.fluid_cell(p),
+                    glam::IVec3::from_array(pos),
+                    fluid,
+                    settings,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("generated fluid tick is incomplete: {error:?}")
+                })?;
+                ensure!(
+                    changes.is_empty(),
+                    "generated fluid tick requires block callbacks"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn mushroom_survives(&self, pos: [i32; 3]) -> Result<bool> {
@@ -489,23 +613,27 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
 
 impl PostprocessingWorld for GeneratedBlockView<'_> {
     type State = BlockState;
-    type Fluid = ();
+    type Fluid = native_world::fluid::FluidState;
 
     fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
         self.read(pos)
     }
-    fn fluid(&mut self, state: &BlockState) -> Result<Option<()>> {
+    fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
+        if let Some(fluid) = liquid_state(state)? {
+            return Ok(Some(fluid));
+        }
         supported_dry_block(state)?;
         Ok(None)
     }
-    fn tick_fluid(&mut self, _: [i32; 3], _: &BlockState, _: &()) -> Result<()> {
-        bail!("generated fluid postprocessing is not implemented")
+    fn tick_fluid(&mut self, pos: [i32; 3], _: &BlockState, fluid: &Self::Fluid) -> Result<()> {
+        self.tick_unchanged_fluid(pos, *fluid)
     }
-    fn is_liquid_block(&mut self, _: &BlockState) -> Result<bool> {
-        Ok(false)
+    fn is_liquid_block(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(liquid_state(state)?.is_some())
     }
-    fn tick_liquid_block(&mut self, _: [i32; 3], _: &BlockState) -> Result<()> {
-        bail!("generated liquid postprocessing is not implemented")
+    fn tick_liquid_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
+        crate::bubble_column::tick_liquid_block(self, glam::IVec3::from_array(pos), state, tags)
     }
     fn update_neighbor_shapes(&mut self, pos: [i32; 3], state: &BlockState) -> Result<BlockState> {
         update_from_neighbor_shapes(self, pos, state)
@@ -515,6 +643,20 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     }
     fn clear_processed_section(&mut self, _: usize) -> Result<()> {
         Ok(())
+    }
+}
+
+impl crate::bubble_column::ColumnWorld for GeneratedBlockView<'_> {
+    fn block(&mut self, pos: glam::IVec3) -> Result<BlockState> {
+        self.read(pos.to_array())
+    }
+
+    fn set_block(&mut self, pos: glam::IVec3, state: &BlockState) -> Result<bool> {
+        ensure!(
+            self.read(pos.to_array())? == *state,
+            "bubble-column update requires block callbacks"
+        );
+        Ok(false)
     }
 }
 
@@ -982,6 +1124,128 @@ mod tests {
         assert!(stage.poll(pos, 1).is_err());
         assert!(stage.finish().is_err());
         assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:oak_leaves");
+    }
+
+    fn contained_liquid_case(name: &str, level: u8, occupy: bool) -> String {
+        let (mut stage, _, chunk) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        let liquid = world.intern_state(BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::from([("level".into(), level.to_string())]),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap().fill(stone);
+        world.set_block_id(8, 8, 8, liquid).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        stage.region.tasks =
+            BTreeMap::from([(chunk, PostprocessingTask::new(Arc::new(marks), chunk))]);
+        stage.set_bubble_tags(Some(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                BTreeSet::new(),
+                BTreeSet::new(),
+                if occupy {
+                    BTreeSet::from([format!("minecraft:{name}")])
+                } else {
+                    BTreeSet::new()
+                },
+            ),
+        )));
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert!(Arc::ptr_eq(&source, &result.world));
+        assert!(result.edits.is_empty());
+        format!(
+            "minecraft:{name} {level} {occupy} {}",
+            result.world.block(8, 8, 8).unwrap().name
+        )
+    }
+
+    #[test]
+    fn enclosed_liquid_ticks_preserve_world_and_reject_flow_or_bubbles() {
+        assert_eq!(
+            contained_liquid_case("water", 0, true),
+            "minecraft:water 0 true minecraft:water"
+        );
+        assert_eq!(
+            contained_liquid_case("lava", 0, false),
+            "minecraft:lava 0 false minecraft:lava"
+        );
+        let (mut stage, source, pos) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        world.set_block_id(8, 8, 8, water).unwrap();
+        world.set_block_id(8, 7, 8, air).unwrap();
+        let before = Arc::clone(&stage.world);
+        assert!(stage.poll(pos, 1).is_err());
+        assert!(stage.finish().is_err());
+        assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:air");
+        assert_eq!(source.block(8, 8, 8).unwrap().name, "minecraft:sand");
+
+        let (mut stage, _, pos) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&pos).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(stone);
+        world.set_block_id(8, 8, 8, water).unwrap();
+        let before = Arc::clone(&stage.world);
+        stage.set_bubble_tags(Some(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::new(
+                BTreeSet::from(["minecraft:stone".into()]),
+                BTreeSet::new(),
+            ),
+        )));
+        assert!(stage.poll(pos, 1).is_err());
+        assert!(stage.finish().is_err());
+        assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:water");
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn contained_liquid_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedContainedLiquidPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedContainedLiquidPostprocessingOracle.java"),
+        );
+        let mut expected = Vec::new();
+        for liquid in ["water", "lava"] {
+            for occupy in [false, true] {
+                for fast in [false, true] {
+                    expected.push(format!(
+                        "{} {fast}",
+                        contained_liquid_case(liquid, 0, occupy)
+                    ));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

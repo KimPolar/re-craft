@@ -552,6 +552,11 @@ impl GenerationReady {
                 .copied()
                 .filter(|pos| targets.contains(pos))
                 .collect();
+            let block_order = region_ticks.captured_indexed_queue_for(
+                native_session::worldgen::chunk_ticks::TickRegistry::Block,
+                &activation,
+            )?;
+            session.install_generated_block_order(&selected, block_order)?;
             let fluid_order = region_ticks.captured_indexed_queue_for(
                 native_session::worldgen::chunk_ticks::TickRegistry::Fluid,
                 &activation,

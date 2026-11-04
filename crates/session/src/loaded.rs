@@ -831,7 +831,8 @@ pub struct LoadedSession {
     fluid_ticks: BTreeMap<(i128, i32, i64, u64), ScheduledFluid>,
     fluid_pending: BTreeSet<FluidTickKey>,
     fluid_sequence: u64,
-    generated_fluid_order: Option<GeneratedFluidOrder>,
+    generated_fluid_order: Option<GeneratedTickOrder>,
+    generated_block_order: Option<GeneratedTickOrder>,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -1018,7 +1019,7 @@ struct BubbleTickKey {
     kind: BubbleTickKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectedBlockTick {
     Sand(SandTickKey),
     Button(ButtonTickKey),
@@ -1027,6 +1028,50 @@ enum CollectedBlockTick {
     Ice((i32, i32, i32)),
     Bubble(BubbleTickKey),
     Sensor((i32, i32, i32, bool)),
+}
+
+impl CollectedBlockTick {
+    fn identity(self) -> (&'static str, [i32; 3]) {
+        match self {
+            Self::Sand(k) => (k.kind.id(), [k.x, k.y, k.z]),
+            Self::Button(k) => (k.kind.id(), [k.x, k.y, k.z]),
+            Self::Soil(p, k) => (k.id(), p.to_array()),
+            Self::Lamp((x, y, z)) => ("minecraft:redstone_lamp", [x, y, z]),
+            Self::Ice((x, y, z)) => ("minecraft:frosted_ice", [x, y, z]),
+            Self::Bubble(k) => (k.kind.id(), [k.x, k.y, k.z]),
+            Self::Sensor((x, y, z, calibrated)) => (
+                if calibrated {
+                    "minecraft:calibrated_sculk_sensor"
+                } else {
+                    "minecraft:sculk_sensor"
+                },
+                [x, y, z],
+            ),
+        }
+    }
+}
+
+fn generated_block_key(
+    tick: &crate::worldgen::chunk_ticks::ScheduledTick,
+) -> Option<CollectedBlockTick> {
+    let [x, y, z] = tick.position;
+    Some(match GeneratedBlockTickKind::from_id(&tick.kind)? {
+        GeneratedBlockTickKind::Falling(kind) => {
+            CollectedBlockTick::Sand(SandTickKey { x, y, z, kind })
+        }
+        GeneratedBlockTickKind::Button(kind) => {
+            CollectedBlockTick::Button(ButtonTickKey { x, y, z, kind })
+        }
+        GeneratedBlockTickKind::Soil(kind) => CollectedBlockTick::Soil(IVec3::new(x, y, z), kind),
+        GeneratedBlockTickKind::Lamp => CollectedBlockTick::Lamp((x, y, z)),
+        GeneratedBlockTickKind::Ice => CollectedBlockTick::Ice((x, y, z)),
+        GeneratedBlockTickKind::Bubble(kind) => {
+            CollectedBlockTick::Bubble(BubbleTickKey { x, y, z, kind })
+        }
+        GeneratedBlockTickKind::Sensor(calibrated) => {
+            CollectedBlockTick::Sensor((x, y, z, calibrated))
+        }
+    })
 }
 
 /// Transient, ordered presentation events emitted by completed game ticks.
@@ -1323,7 +1368,7 @@ struct ScheduledFluid {
     key: FluidTickKey,
 }
 
-struct GeneratedFluidOrder {
+struct GeneratedTickOrder {
     base_time: i64,
     queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
 }
@@ -5680,6 +5725,13 @@ impl LoadedSession {
         {
             self.generated_fluid_order = None;
         }
+        if self
+            .generated_block_order
+            .as_ref()
+            .is_some_and(|order| order.base_time != value)
+        {
+            self.generated_block_order = None;
+        }
         self.game_time = value;
         self.initial_game_time_set = true;
         self.level_time_source = None;
@@ -5843,6 +5895,78 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Attach the generation-time block tick index to an unadvanced session.
+    pub fn install_generated_block_order(
+        &mut self,
+        ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
+        queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "generated block ordering must be installed before simulation begins"
+        );
+        ensure!(
+            self.generated_ticks_installed && self.generated_block_order.is_none(),
+            "generated block ticks are not ready or ordering is already installed"
+        );
+        ensure!(
+            self.game_time == ticks.game_time && self.world.chunks.keys().eq(ticks.chunks.keys()),
+            "generated block ordering belongs to a different session"
+        );
+        let mut expected = BTreeMap::new();
+        for (&pos, chunk) in &ticks.chunks {
+            let captured = queue
+                .container(pos)
+                .context("generated block container is missing")?;
+            ensure!(
+                captured.activated(0) == chunk.blocks,
+                "generated block container differs from the activated snapshot"
+            );
+            for tick in &chunk.blocks {
+                let identity = generated_block_key(tick)
+                    .context("unsupported generated block tick")?
+                    .identity();
+                let order = (
+                    i128::from(tick.trigger) - i128::from(ticks.game_time),
+                    tick.priority,
+                    tick.sub_tick,
+                    identity,
+                );
+                *expected.entry(order).or_insert(0usize) += 1;
+            }
+        }
+        let mut actual = BTreeMap::new();
+        macro_rules! count_ticks {
+            ($queue:expr, $make:expr) => {
+                for (order, &key) in &$queue {
+                    let entry: CollectedBlockTick = $make(key);
+                    *actual
+                        .entry((order.0, order.1, order.2, entry.identity()))
+                        .or_insert(0usize) += 1;
+                }
+            };
+        }
+        count_ticks!(self.sand_ticks, CollectedBlockTick::Sand);
+        count_ticks!(self.button_ticks, CollectedBlockTick::Button);
+        count_ticks!(self.soil_ticks, |(pos, kind)| CollectedBlockTick::Soil(
+            pos, kind
+        ));
+        count_ticks!(self.lamp_ticks, CollectedBlockTick::Lamp);
+        count_ticks!(self.ice_ticks, CollectedBlockTick::Ice);
+        count_ticks!(self.bubble_ticks, CollectedBlockTick::Bubble);
+        count_ticks!(self.sensor_ticks, CollectedBlockTick::Sensor);
+        ensure!(
+            actual == expected,
+            "session block ticks changed before ordering was installed"
+        );
+        self.generated_block_order = Some(GeneratedTickOrder {
+            base_time: ticks.game_time,
+            queue,
+        });
+        Ok(())
+    }
+
     /// Use a captured generated fluid index while its queues and resident
     /// chunks remain synchronized with this unadvanced session.
     pub fn install_generated_fluid_order(
@@ -5893,7 +6017,7 @@ impl LoadedSession {
             actual == expected,
             "session fluid ticks changed before ordering was installed"
         );
-        self.generated_fluid_order = Some(GeneratedFluidOrder {
+        self.generated_fluid_order = Some(GeneratedTickOrder {
             base_time: ticks.game_time,
             queue,
         });
@@ -6445,6 +6569,7 @@ impl LoadedSession {
             fluid_pending: BTreeSet::new(),
             fluid_sequence: 0,
             generated_fluid_order: None,
+            generated_block_order: None,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -10348,6 +10473,7 @@ impl LoadedSession {
     fn apply_streaming(&mut self) {
         if !self.incoming.is_empty() {
             self.generated_fluid_order = None;
+            self.generated_block_order = None;
         }
         let mut changed = false;
         let mut respawn_changed = false;
@@ -10399,6 +10525,7 @@ impl LoadedSession {
                 .any(|pos| !within_window(*pos, window));
             if !outside.is_empty() || !restore.is_empty() || old_missing {
                 self.generated_fluid_order = None;
+                self.generated_block_order = None;
                 let mut restored_ticks = Vec::new();
                 let unsaved: BTreeSet<_> = outside
                     .iter()
@@ -14693,6 +14820,43 @@ impl LoadedSession {
         value
     }
 
+    fn mirror_generated_block_tick(
+        &mut self,
+        kind: &'static str,
+        absolute: IVec3,
+        delay: i64,
+        subtick: i64,
+        duplicate: bool,
+    ) {
+        use crate::worldgen::chunk_ticks::{ScheduleOutcome, ScheduledTick};
+        if let Some(indexed) = &mut self.generated_block_order {
+            let trigger = i64::try_from(
+                i128::from(indexed.base_time) + i128::from(self.tick) + i128::from(delay),
+            );
+            let outcome = trigger.ok().and_then(|trigger| {
+                indexed
+                    .queue
+                    .schedule(ScheduledTick {
+                        kind: kind.into(),
+                        position: absolute.to_array(),
+                        trigger,
+                        priority: 0,
+                        sub_tick: subtick,
+                    })
+                    .ok()
+            });
+            if outcome
+                != Some(if duplicate {
+                    ScheduleOutcome::Duplicate
+                } else {
+                    ScheduleOutcome::Added
+                })
+            {
+                self.generated_block_order = None;
+            }
+        }
+    }
+
     fn insert_fluid_tick(&mut self, key: FluidTickKey, due: i128, priority: i32, subtick: i64) {
         if !self.fluid_pending.insert(key) {
             return;
@@ -14756,6 +14920,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_sand(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             let Some(kind) = FallingKind::from_id(&tick.block) else {
                 continue;
@@ -14782,6 +14947,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_buttons(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             let Some(kind) = native_core::button::Button::from_id(&tick.block) else {
                 continue;
@@ -14808,6 +14974,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_lamps(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             if !matches!(
                 tick.block.as_str(),
@@ -14839,6 +15006,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_bubble(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             let Some(kind) = BubbleTickKind::from_id(&tick.block) else {
                 continue;
@@ -14878,7 +15046,9 @@ impl LoadedSession {
             kind,
         };
         let subtick = self.next_scheduled_sub_tick();
-        if !self.bubble_pending.insert(key) {
+        let duplicate = !self.bubble_pending.insert(key);
+        self.mirror_generated_block_tick(kind.id(), absolute, i64::from(delay), subtick, duplicate);
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.x, key.z);
@@ -14998,6 +15168,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_ice(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             if !matches!(tick.block.as_str(), "minecraft:frosted_ice" | "frosted_ice") {
                 continue;
@@ -15028,6 +15199,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_sensors(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             let calibrated = match tick.block.as_str() {
                 "minecraft:sculk_sensor" | "sculk_sensor" => false,
@@ -15060,7 +15232,19 @@ impl LoadedSession {
     fn schedule_sensor(&mut self, absolute: IVec3, calibrated: bool, delay: u8) {
         let key = (absolute.x, absolute.y, absolute.z, calibrated);
         let subtick = self.next_scheduled_sub_tick();
-        if !self.sensor_pending.insert(key) {
+        let duplicate = !self.sensor_pending.insert(key);
+        self.mirror_generated_block_tick(
+            if calibrated {
+                "minecraft:calibrated_sculk_sensor"
+            } else {
+                "minecraft:sculk_sensor"
+            },
+            absolute,
+            i64::from(delay),
+            subtick,
+            duplicate,
+        );
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.0, key.2);
@@ -15083,7 +15267,15 @@ impl LoadedSession {
         };
         let key = (absolute.x, absolute.y, absolute.z);
         let subtick = self.next_scheduled_sub_tick();
-        if !self.ice_pending.insert(key) {
+        let duplicate = !self.ice_pending.insert(key);
+        self.mirror_generated_block_tick(
+            "minecraft:frosted_ice",
+            absolute,
+            i64::from(delay),
+            subtick,
+            duplicate,
+        );
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.0, key.2);
@@ -15106,7 +15298,15 @@ impl LoadedSession {
         };
         let key = (absolute.x, absolute.y, absolute.z);
         let subtick = self.next_scheduled_sub_tick();
-        if !self.lamp_pending.insert(key) {
+        let duplicate = !self.lamp_pending.insert(key);
+        self.mirror_generated_block_tick(
+            "minecraft:redstone_lamp",
+            absolute,
+            4,
+            subtick,
+            duplicate,
+        );
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.0, key.2);
@@ -15151,6 +15351,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_soil(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
         for (index, tick) in ticks.iter().enumerate() {
             let Some(soil) = SoilKind::from_name(&tick.block) else {
                 continue;
@@ -15188,7 +15389,15 @@ impl LoadedSession {
             kind,
         };
         let subtick = self.next_scheduled_sub_tick();
-        if !self.button_pending.insert(key) {
+        let duplicate = !self.button_pending.insert(key);
+        self.mirror_generated_block_tick(
+            kind.id(),
+            absolute,
+            i64::from(kind.duration()),
+            subtick,
+            duplicate,
+        );
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.x, key.z);
@@ -15353,6 +15562,138 @@ impl LoadedSession {
         self.advance_scheduled_block_ticks(false, false, true, false, false, false, false);
     }
 
+    fn collect_generated_block_ticks(
+        &mut self,
+    ) -> Option<Vec<((i128, i32, i64, u64), CollectedBlockTick)>> {
+        let mut indexed = self.generated_block_order.take()?;
+        let next = [
+            self.sand_ticks.first_key_value().map(|(order, _)| order.0),
+            self.button_ticks
+                .first_key_value()
+                .map(|(order, _)| order.0),
+            self.soil_ticks.first_key_value().map(|(order, _)| order.0),
+            self.lamp_ticks.first_key_value().map(|(order, _)| order.0),
+            self.ice_ticks.first_key_value().map(|(order, _)| order.0),
+            self.bubble_ticks
+                .first_key_value()
+                .map(|(order, _)| order.0),
+            self.sensor_ticks
+                .first_key_value()
+                .map(|(order, _)| order.0),
+        ];
+        if next
+            .into_iter()
+            .flatten()
+            .all(|due| due > i128::from(self.tick))
+        {
+            self.generated_block_order = Some(indexed);
+            return Some(Vec::new());
+        }
+        let time = i64::try_from(i128::from(indexed.base_time) + i128::from(self.tick)).ok()?;
+        let world = &self.world;
+        let selected = indexed.queue.collect_due(time, 65_536, |pos| {
+            world
+                .chunks
+                .get(&pos)
+                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+        });
+        let mut orders = BTreeSet::new();
+        let mut entries = Vec::with_capacity(selected.len());
+        for tick in selected {
+            let entry = generated_block_key(&tick)?;
+            let due = i128::from(tick.trigger) - i128::from(indexed.base_time);
+            if due > i128::from(self.tick) {
+                return None;
+            }
+            let start = (due, tick.priority, tick.sub_tick, 0);
+            let end = (due, tick.priority, tick.sub_tick, u64::MAX);
+            macro_rules! find_order {
+                ($queue:expr, $make:expr, $tag:expr) => {{
+                    let (&order, _) = $queue.range(start..=end).find(|(order, key)| {
+                        let candidate: CollectedBlockTick = $make(**key);
+                        candidate == entry && !orders.contains(&($tag, **order))
+                    })?;
+                    orders.insert(($tag, order));
+                    order
+                }};
+            }
+            let order = match entry {
+                CollectedBlockTick::Sand(_) => {
+                    find_order!(self.sand_ticks, CollectedBlockTick::Sand, 0)
+                }
+                CollectedBlockTick::Button(_) => {
+                    find_order!(self.button_ticks, CollectedBlockTick::Button, 1)
+                }
+                CollectedBlockTick::Soil(..) => find_order!(
+                    self.soil_ticks,
+                    |(pos, kind)| CollectedBlockTick::Soil(pos, kind),
+                    2
+                ),
+                CollectedBlockTick::Lamp(_) => {
+                    find_order!(self.lamp_ticks, CollectedBlockTick::Lamp, 3)
+                }
+                CollectedBlockTick::Ice(_) => {
+                    find_order!(self.ice_ticks, CollectedBlockTick::Ice, 4)
+                }
+                CollectedBlockTick::Bubble(_) => {
+                    find_order!(self.bubble_ticks, CollectedBlockTick::Bubble, 5)
+                }
+                CollectedBlockTick::Sensor(_) => {
+                    find_order!(self.sensor_ticks, CollectedBlockTick::Sensor, 6)
+                }
+            };
+            let (_, position) = entry.identity();
+            let relative = subtract(IVec3::from_array(position), self.origin)?;
+            if !matches!(
+                cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0]
+                ),
+                Cell::State(_)
+            ) {
+                return None;
+            }
+            entries.push((order, entry));
+        }
+        for (order, entry) in &entries {
+            match *entry {
+                CollectedBlockTick::Sand(key) => {
+                    self.sand_ticks.remove(order);
+                    self.sand_pending.remove(&key);
+                }
+                CollectedBlockTick::Button(key) => {
+                    self.button_ticks.remove(order);
+                    self.button_pending.remove(&key);
+                }
+                CollectedBlockTick::Soil(pos, kind) => {
+                    self.soil_ticks.remove(order);
+                    self.soil_pending.remove(&(pos.x, pos.y, pos.z, kind));
+                }
+                CollectedBlockTick::Lamp(key) => {
+                    self.lamp_ticks.remove(order);
+                    self.lamp_pending.remove(&key);
+                }
+                CollectedBlockTick::Ice(key) => {
+                    self.ice_ticks.remove(order);
+                    self.ice_pending.remove(&key);
+                }
+                CollectedBlockTick::Bubble(key) => {
+                    self.bubble_ticks.remove(order);
+                    self.bubble_pending.remove(&key);
+                }
+                CollectedBlockTick::Sensor(key) => {
+                    self.sensor_ticks.remove(order);
+                    self.sensor_pending.remove(&key);
+                }
+            }
+        }
+        self.generated_block_order = Some(indexed);
+        Some(entries)
+    }
+
     fn advance_scheduled_block_ticks(
         &mut self,
         process_sand: bool,
@@ -15397,9 +15738,23 @@ impl LoadedSession {
         let mut deferred_ice = Vec::new();
         let mut deferred_bubble = Vec::new();
         let mut deferred_sensors = Vec::new();
-        let mut collected = Vec::new();
+        let indexed = if process_sand
+            && process_buttons
+            && process_soil
+            && process_lamps
+            && process_ice
+            && process_bubble
+            && process_sensor
+        {
+            self.collect_generated_block_ticks()
+        } else {
+            self.generated_block_order = None;
+            None
+        };
+        let using_index = indexed.is_some();
+        let mut collected = indexed.unwrap_or_default();
         let mut ready = 0;
-        while ready < 65_536 {
+        while !using_index && ready < 65_536 {
             let sand_order = process_sand
                 .then(|| self.sand_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
@@ -16073,6 +16428,16 @@ impl LoadedSession {
                 }
             }
         }
+        if !deferred_sand.is_empty()
+            || !deferred_buttons.is_empty()
+            || !deferred_soil.is_empty()
+            || !deferred_lamps.is_empty()
+            || !deferred_ice.is_empty()
+            || !deferred_bubble.is_empty()
+            || !deferred_sensors.is_empty()
+        {
+            self.generated_block_order = None;
+        }
         if process_soil {
             self.soil_deferred.extend(deferred_soil);
             self.soil_deferred_revision = Some(revision);
@@ -16218,7 +16583,9 @@ impl LoadedSession {
             kind,
         };
         let subtick = self.next_scheduled_sub_tick();
-        if !self.sand_pending.insert(key) {
+        let duplicate = !self.sand_pending.insert(key);
+        self.mirror_generated_block_tick(kind.id(), absolute, 2, subtick, duplicate);
+        if duplicate {
             return;
         }
         self.mark_tick_chunk_dirty(key.x, key.z);
@@ -16882,7 +17249,9 @@ impl LoadedSession {
             }
             let key = (absolute.x, absolute.y, absolute.z, kind);
             let subtick = self.next_scheduled_sub_tick();
-            if self.soil_pending.insert(key) {
+            let duplicate = !self.soil_pending.insert(key);
+            self.mirror_generated_block_tick(kind.id(), absolute, 1, subtick, duplicate);
+            if !duplicate {
                 let sequence = self.block_tick_sequence;
                 self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
                 self.soil_ticks.insert(
@@ -23254,6 +23623,225 @@ pub(crate) mod tests {
         assert_eq!(session.sand_ticks.first_key_value().unwrap().0.2, i64::MAX);
         assert_eq!(session.ice_ticks.first_key_value().unwrap().0.2, i64::MIN);
         assert_eq!(session.next_sub_tick, i64::MIN + 1);
+    }
+
+    #[test]
+    fn generated_session_orders_block_ticks_by_chunk_and_tracks_new_schedules() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut other = world.chunks[&home].as_ref().clone();
+        other.position = neighbor;
+        world.chunks.insert(neighbor, Arc::new(other));
+        let a = [origin.x + 1, 2, origin.z + 1];
+        let b = [origin.x + 17, 2, origin.z + 1];
+        let make = |pos, position, delay, priority, kind: &str| ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(
+                pos,
+                vec![SavedTick {
+                    kind: kind.into(),
+                    position,
+                    delay,
+                    priority,
+                }],
+            )
+            .unwrap(),
+            fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        };
+        let region = RegionTicks::new_ordered(
+            BTreeMap::from([
+                (home, make(home, a, -2, 0, "minecraft:sand")),
+                (neighbor, make(neighbor, b, 0, -1, "minecraft:frosted_ice")),
+            ]),
+            42,
+            0,
+            &[home, neighbor],
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.install_generated_ticks(&snapshot).unwrap();
+        let mut wrong = snapshot.clone();
+        wrong.chunks.get_mut(&home).unwrap().blocks[0].trigger += 1;
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Block, &[home, neighbor])
+            .unwrap();
+        assert!(
+            session
+                .install_generated_block_order(&wrong, queue)
+                .is_err()
+        );
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Block, &[home, neighbor])
+            .unwrap();
+        session
+            .install_generated_block_order(&snapshot, queue)
+            .unwrap();
+        let selected = session.collect_generated_block_ticks().unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.identity().1)
+                .collect::<Vec<_>>(),
+            [b, a]
+        );
+        let pos = IVec3::new(1, 2, 1);
+        session.schedule_sand(pos, FallingKind::Sand);
+        session.schedule_sand(pos, FallingKind::Sand);
+        session.schedule_ice(pos, 2);
+        assert!(session.generated_block_order.is_some());
+        session.tick = 2;
+        let selected = session.collect_generated_block_ticks().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.identity().0)
+                .collect::<Vec<_>>(),
+            ["minecraft:sand", "minecraft:frosted_ice"]
+        );
+        session.schedule_sand(pos, FallingKind::Sand);
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
+        assert!(session.generated_block_order.is_none());
+        assert_eq!(session.sand_ticks.len(), 1);
+    }
+
+    #[test]
+    fn generated_block_order_controls_actual_falling_block_callbacks() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut other = world.chunks[&home].as_ref().clone();
+        other.position = neighbor;
+        world.chunks.insert(neighbor, Arc::new(other));
+        let a = [origin.x + 1, 2, origin.z + 1];
+        let b = [origin.x + 17, 2, origin.z + 1];
+        let sand = world.intern_state(state("minecraft:sand", &[]));
+        for [x, y, z] in [a, b] {
+            world.set_block_id(x, y, z, sand).unwrap();
+        }
+        let make = |pos, position, delay, priority| ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(
+                pos,
+                vec![SavedTick {
+                    kind: "minecraft:sand".into(),
+                    position,
+                    delay,
+                    priority,
+                }],
+            )
+            .unwrap(),
+            fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        };
+        let region = RegionTicks::new_ordered(
+            BTreeMap::from([
+                (home, make(home, a, -2, 0)),
+                (neighbor, make(neighbor, b, 0, -1)),
+            ]),
+            42,
+            0,
+            &[home, neighbor],
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.install_generated_ticks(&snapshot).unwrap();
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Block, &[home, neighbor])
+            .unwrap();
+        session
+            .install_generated_block_order(&snapshot, queue)
+            .unwrap();
+        session.advance_block_ticks();
+        assert_eq!(
+            session
+                .falling_sand
+                .iter()
+                .map(|entity| entity.motion.position.x.floor() as i32)
+                .collect::<Vec<_>>(),
+            [b[0], a[0]]
+        );
+        assert!(session.generated_block_order.is_some());
+    }
+
+    #[test]
+    fn mismatched_generated_block_order_falls_back_without_losing_ticks() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let mut session = session();
+        let home = *session.world.chunks.keys().next().unwrap();
+        let position = (session.origin + IVec3::new(1, 2, 1)).to_array();
+        let region = RegionTicks::new(
+            BTreeMap::from([(
+                home,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(
+                        home,
+                        vec![SavedTick {
+                            kind: "minecraft:sand".into(),
+                            position,
+                            delay: 0,
+                            priority: 0,
+                        }],
+                    )
+                    .unwrap(),
+                    fluids: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                },
+            )]),
+            42,
+            0,
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        session.install_generated_ticks(&snapshot).unwrap();
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Block, &[home])
+            .unwrap();
+        session
+            .install_generated_block_order(&snapshot, queue)
+            .unwrap();
+        let (order, tick) = session.sand_ticks.pop_first().unwrap();
+        session
+            .sand_ticks
+            .insert((order.0, 1, order.2, order.3), tick);
+        assert!(session.collect_generated_block_ticks().is_none());
+        assert!(session.generated_block_order.is_none());
+        assert_eq!(session.sand_ticks.len(), 1);
+        session.advance_block_ticks();
+        assert!(session.sand_ticks.is_empty());
     }
 
     #[test]

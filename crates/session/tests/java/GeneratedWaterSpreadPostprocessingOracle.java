@@ -85,13 +85,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             FluidTags.LAVA,List.of(Fluids.LAVA.builtInRegistryHolder(),Fluids.FLOWING_LAVA.builtInRegistryHolder()),
             FluidTags.BUBBLE_COLUMN_CAN_OCCUPY,List.of(Fluids.WATER.builtInRegistryHolder())))).apply();
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);var unsafe=(sun.misc.Unsafe)f.get(null);
+        var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
         var level=(FakeLevel)unsafe.allocateInstance(FakeLevel.class);
         var chunk=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        for(String scenario:List.of("down","down_sand","sides","mixed","edge")) {
+        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble")) {
+            bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off"),null);
             blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
@@ -101,6 +104,11 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             }
             if(scenario.equals("edge"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            if(scenario.equals("convert_off")||scenario.equals("convert_on")||scenario.equals("convert_bubble")) {
+                blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
+                if(scenario.equals("convert_bubble"))blocks.put(pos.east().below(),Blocks.DIRT.defaultBlockState());
+            }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());

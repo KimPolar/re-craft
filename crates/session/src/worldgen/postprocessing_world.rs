@@ -40,6 +40,7 @@ pub struct GeneratedPostprocessing {
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
+    water_source_conversion: Option<bool>,
     edits: Vec<BlockPosition>,
     light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -65,6 +66,14 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) batch_revision: Option<u64>,
     pub(super) min_y: i32,
     pub(super) max_y: i32,
+    water_source_conversion: Option<bool>,
+}
+
+impl PostprocessedGeneratedRegion {
+    /// The explicit rule used for this pass, if supplied by its caller.
+    pub fn water_source_conversion(&self) -> Option<bool> {
+        self.water_source_conversion
+    }
 }
 
 /// Apply one explicitly chosen light-engine drain to a complete input
@@ -118,6 +127,7 @@ impl GeneratedPostprocessing {
             bubble_tags: None,
             washed_blocks: None,
             lava_fluids: None,
+            water_source_conversion: None,
             edits: Vec::new(),
             light_checks: Vec::new(),
             heightmaps,
@@ -152,6 +162,17 @@ impl GeneratedPostprocessing {
         self.lava_fluids = lava;
     }
 
+    /// Supply the level's actual gamerule before executing any chunk. The
+    /// caller must keep it fixed while this isolated generation pass runs.
+    pub fn set_water_source_conversion(&mut self, enabled: bool) -> Result<()> {
+        ensure!(
+            !self.failed && self.active.is_none() && self.completed.is_empty(),
+            "water source conversion must be set before postprocessing begins"
+        );
+        self.water_source_conversion = Some(enabled);
+        Ok(())
+    }
+
     /// Run a bounded number of callbacks without interleaving another chunk.
     /// Java runs each chunk's pass synchronously against its live neighbors.
     pub fn poll(&mut self, pos: ChunkPos, budget: usize) -> Result<bool> {
@@ -182,6 +203,7 @@ impl GeneratedPostprocessing {
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
+            water_source_conversion: self.water_source_conversion,
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -216,6 +238,7 @@ impl GeneratedPostprocessing {
             batch_revision: self.batch_revision,
             min_y: self.min_y,
             max_y: self.max_y,
+            water_source_conversion: self.water_source_conversion,
         })
     }
 }
@@ -231,6 +254,7 @@ struct GeneratedBlockView<'a> {
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
     lava_fluids: Option<&'a BTreeSet<String>>,
+    water_source_conversion: Option<bool>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -433,11 +457,17 @@ impl GeneratedBlockView<'_> {
         {
             return Ok(());
         }
-        // Until the caller supplies the dimension timeline and gamerules,
-        // require the same plan under every possible setting. Only water
-        // sources may write; they do not use the lava spread-delay RNG.
+        // Unknown rules must yield the same plan for both possible values.
+        // Only water sources may write; they do not use lava's delay RNG.
         let mut planned = None;
         for converts in [false, true] {
+            if fluid.kind == FluidKind::Water
+                && self
+                    .water_source_conversion
+                    .is_some_and(|rule| rule != converts)
+            {
+                continue;
+            }
             for fast_lava in [false, true] {
                 if fluid.kind == FluidKind::Water && fast_lava {
                     continue;
@@ -477,6 +507,12 @@ impl GeneratedBlockView<'_> {
         );
         let origin = glam::IVec3::from_array(pos);
         for converts in [false, true] {
+            if self
+                .water_source_conversion
+                .is_some_and(|rule| rule != converts)
+            {
+                continue;
+            }
             let settings = Settings {
                 water_source_conversion: converts,
                 ..Settings::default()
@@ -503,12 +539,18 @@ impl GeneratedBlockView<'_> {
             ensure!(
                 valid_direction
                     && matches!(change.block, ChangedBlock::Fluid(next)
-                    if next.kind == FluidKind::Water && !next.source
-                        && ((direction == glam::IVec3::NEG_Y && next.falling && next.amount == 8)
-                            || (direction != glam::IVec3::NEG_Y && !next.falling && (1..=7).contains(&next.amount)))),
+                    if next.kind == FluidKind::Water
+                        && ((direction == glam::IVec3::NEG_Y && !next.source && next.falling && next.amount == 8)
+                            || (direction != glam::IVec3::NEG_Y && !next.falling
+                                && ((next.source && next.amount == 8)
+                                    || (!next.source && (1..=7).contains(&next.amount)))))),
                 "generated fluid tick requires unsupported block callbacks"
             );
         }
+        let settings = Settings {
+            water_source_conversion: self.water_source_conversion.unwrap_or(true),
+            ..Settings::default()
+        };
         let mut live = GeneratedWaterTick {
             view: self,
             origin: glam::IVec3::from_array(pos),
@@ -517,7 +559,7 @@ impl GeneratedBlockView<'_> {
             &mut live,
             glam::IVec3::from_array(pos),
             fluid,
-            Settings::default(),
+            settings,
         )
         .map_err(|error| anyhow::anyhow!("generated water tick failed: {error:?}"))?;
         Ok(())
@@ -641,6 +683,9 @@ impl GeneratedBlockView<'_> {
         };
         self.write_postprocessed_state(target.to_array(), &old, &next)?;
         self.schedule_water(target.to_array(), &next)?;
+        if fluid.source {
+            self.schedule_water_bubble(target.to_array(), &next)?;
+        }
         // Redstone neighbor callbacks precede shape updates.
         for d in directions {
             let p = target + glam::IVec3::from_array(d);
@@ -660,9 +705,11 @@ impl GeneratedBlockView<'_> {
         ] {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
-            if let Some(fluid) = liquid_state(&state)? {
-                if fluid.source {
+            if let Some(neighbor_fluid) = liquid_state(&state)? {
+                if neighbor_fluid.source || fluid.source {
                     self.schedule_water(p.to_array(), &state)?;
+                }
+                if neighbor_fluid.source {
                     let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
                     if d == [0, 1, 0]
                         && tags.can_occupy_fluid("minecraft:water")
@@ -885,9 +932,14 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
             old == Cell::Air
                 && pos == self.origin + direction
                 && fluid.kind == FluidKind::Water
-                && !fluid.source
-                && ((direction == glam::IVec3::NEG_Y && fluid.falling && fluid.amount == 8)
-                    || (horizontal && !fluid.falling && (1..=7).contains(&fluid.amount))),
+                && ((direction == glam::IVec3::NEG_Y
+                    && !fluid.source
+                    && fluid.falling
+                    && fluid.amount == 8)
+                    || (horizontal
+                        && !fluid.falling
+                        && ((fluid.source && fluid.amount == 8)
+                            || (!fluid.source && (1..=7).contains(&fluid.amount))))),
             "unsupported generated water spread"
         );
         self.view.spread_water(pos, fluid)
@@ -1628,6 +1680,10 @@ mod tests {
             name: "minecraft:sand".into(),
             properties: BTreeMap::new(),
         });
+        let dirt = world.intern_state(BlockState {
+            name: "minecraft:dirt".into(),
+            properties: BTreeMap::new(),
+        });
         Arc::make_mut(
             Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
                 .sections
@@ -1668,6 +1724,13 @@ mod tests {
             "edge" => {
                 world.set_block_id(16, 8, 8, air).unwrap();
             }
+            "convert_on" | "convert_off" | "convert_bubble" => {
+                world.set_block_id(9, 8, 8, air).unwrap();
+                world.set_block_id(9, 8, 7, water).unwrap();
+                if case == "convert_bubble" {
+                    world.set_block_id(9, 7, 8, dirt).unwrap();
+                }
+            }
             _ => panic!("unknown water fixture"),
         }
         stage.source = Arc::clone(&stage.world);
@@ -1698,7 +1761,7 @@ mod tests {
             );
         }
         stage.region.ticks = RegionTicks::new(chunks, 100, 2).unwrap();
-        let registry = ["air", "water", "stone", "sand"]
+        let registry = ["air", "water", "stone", "sand", "dirt"]
             .into_iter()
             .map(|name| format!("minecraft:{name}"))
             .collect();
@@ -1708,7 +1771,14 @@ mod tests {
             stage.heightmaps.insert(east_chunk, fixture_maps(16));
         }
         stage.set_bubble_tags(Some(Arc::new(
-            native_resources::fluid_tags::BubbleColumnTags::new(BTreeSet::new(), BTreeSet::new()),
+            native_resources::fluid_tags::BubbleColumnTags::new(
+                if case == "convert_bubble" {
+                    BTreeSet::from(["minecraft:dirt".into()])
+                } else {
+                    BTreeSet::new()
+                },
+                BTreeSet::new(),
+            ),
         )));
         stage.set_fluid_tags(
             Some(Arc::new(BTreeSet::from([
@@ -1720,11 +1790,24 @@ mod tests {
                 "minecraft:flowing_lava".into(),
             ]))),
         );
+        if matches!(case, "convert_on" | "convert_off" | "convert_bubble") {
+            stage
+                .set_water_source_conversion(case != "convert_off")
+                .unwrap();
+        }
         while !stage.poll(chunk, 1).unwrap() {}
         if case == "edge" {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        assert_eq!(
+            result.water_source_conversion(),
+            match case {
+                "convert_off" => Some(false),
+                "convert_on" | "convert_bubble" => Some(true),
+                _ => None,
+            }
+        );
         assert_eq!(result.light_checks, result.edits);
         let mut trace = vec![format!("case {case}")];
         for [x, y, z] in [
@@ -1820,6 +1903,32 @@ mod tests {
             edge.iter()
                 .any(|line| line == "fluid minecraft:flowing_water 16,8,8 5")
         );
+        let source = water_spread_trace("convert_on");
+        assert!(
+            source
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:water 0")
+        );
+        assert!(
+            source
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,8,8 5")
+        );
+        let flow = water_spread_trace("convert_off");
+        assert!(
+            flow.iter()
+                .any(|line| line == "state 9,8,8 minecraft:water 1")
+        );
+        assert!(
+            flow.iter()
+                .any(|line| line == "fluid minecraft:flowing_water 9,8,8 5")
+        );
+        let bubble = water_spread_trace("convert_bubble");
+        assert!(
+            bubble
+                .iter()
+                .any(|line| line == "block minecraft:water 9,8,8 20")
+        );
     }
 
     #[test]
@@ -1892,6 +2001,14 @@ mod tests {
     }
 
     #[test]
+    fn source_conversion_rule_is_fixed_before_chunk_processing() {
+        let (mut stage, _, pos) = fixture(false);
+        stage.set_water_source_conversion(false).unwrap();
+        assert!(!stage.poll(pos, 0).unwrap());
+        assert!(stage.set_water_source_conversion(true).is_err());
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn water_source_postprocessing_matches_java() {
         let actual = java_results(
@@ -1899,7 +2016,16 @@ mod tests {
             include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
         );
         let mut expected = Vec::new();
-        for case in ["down", "down_sand", "sides", "mixed", "edge"] {
+        for case in [
+            "down",
+            "down_sand",
+            "sides",
+            "mixed",
+            "edge",
+            "convert_off",
+            "convert_on",
+            "convert_bubble",
+        ] {
             expected.extend(water_spread_trace(case));
         }
         assert_eq!(actual, expected);

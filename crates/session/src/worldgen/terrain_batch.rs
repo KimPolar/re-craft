@@ -11,7 +11,10 @@ use native_resources::{
 use native_world::generation_light::VisibleLightSnapshot;
 use native_world::loaded::{BlockState, ChunkPos, World};
 use serde_json::Value;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use super::{
     BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
@@ -38,8 +41,14 @@ pub struct FreshTerrainBatch {
     light_tracker: Option<FreshGenerationLightTracker>,
     light_engine: Option<StagedGenerationLightEngine>,
     lit_cache: Option<(BTreeSet<ChunkPos>, Arc<World>)>,
-    spawn_without_mobs: BTreeSet<ChunkPos>,
+    spawn_ready: BTreeSet<ChunkPos>,
     failed: bool,
+}
+
+pub(super) struct SpawnStamp {
+    world: Arc<World>,
+    entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
+    schedule_revision: u64,
 }
 
 /// The light-engine history accompanying intermediate generated terrain.
@@ -58,6 +67,44 @@ struct DecorationConfig {
 }
 
 impl FreshTerrainBatch {
+    pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
+        ensure!(self.is_complete(), "generation batch has pending work");
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        Ok(SpawnStamp {
+            world: terrain.snapshot(),
+            entities: Arc::clone(&terrain.generated_entities),
+            schedule_revision: self.schedule.revision(),
+        })
+    }
+
+    pub(super) fn validate_spawn_stamp(&self, stamp: &SpawnStamp, center: ChunkPos) -> Result<()> {
+        ensure!(self.is_complete(), "generation batch has pending work");
+        ensure!(
+            self.schedule.completed(center) == Some(GenerationStage::Light),
+            "spawn chunk is no longer light-complete"
+        );
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        ensure!(
+            self.schedule.revision() == stamp.schedule_revision
+                && Arc::ptr_eq(&stamp.world, &terrain.snapshot())
+                && Arc::ptr_eq(&stamp.entities, &terrain.generated_entities),
+            "generation batch changed during creature spawning"
+        );
+        Ok(())
+    }
+
+    pub(super) fn spawn_region_random(
+        &self,
+        pos: ChunkPos,
+    ) -> native_resources::worldgen_region_random::RegionRandom {
+        self.generator.region_random(pos)
+    }
     /// The provider must use the same unchanged data-pack stack as the generator.
     pub fn spawn_origin(&self, provider: &mut impl ResourceProvider) -> Result<ChunkPos> {
         let [x, z] = self.generator.spawn_origin(provider)?;
@@ -243,7 +290,7 @@ impl FreshTerrainBatch {
             light_tracker: None,
             light_engine: None,
             lit_cache: None,
-            spawn_without_mobs: BTreeSet::new(),
+            spawn_ready: BTreeSet::new(),
             failed: false,
         })
     }
@@ -465,6 +512,15 @@ impl FreshTerrainBatch {
             disabled || !spawn_mobs,
             "world-generation mob spawning is not implemented"
         );
+        self.request_completed_spawn(pos)
+    }
+
+    /// Schedule an already completed spawn operation; this is not a FULL chunk.
+    pub(super) fn request_completed_spawn(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before spawning"
+        );
         ensure!(
             self.schedule.completed(pos) == Some(GenerationStage::Light),
             "spawn requires a light-complete chunk"
@@ -495,7 +551,30 @@ impl FreshTerrainBatch {
             }
         }
         self.schedule.request(pos, GenerationStage::Spawn)?;
-        self.spawn_without_mobs.insert(pos);
+        self.spawn_ready.insert(pos);
+        Ok(())
+    }
+
+    /// Validate every entity before requesting SPAWN, then publish the staged
+    /// records only after the schedule accepted the complete operation.
+    pub(super) fn publish_completed_spawn(
+        &mut self,
+        pos: ChunkPos,
+        additions: &[super::GeneratedEntityAddition],
+    ) -> Result<()> {
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        let mut staged = Arc::clone(&terrain.generated_entities);
+        for addition in additions.iter().cloned() {
+            super::stage_generated_entity(&terrain.world, &mut staged, addition)?;
+        }
+        self.request_completed_spawn(pos)?;
+        self.terrain
+            .as_mut()
+            .expect("validated generated terrain")
+            .generated_entities = staged;
         Ok(())
     }
 
@@ -1115,11 +1194,11 @@ impl FreshTerrainBatch {
             })(),
             GenerationStage::Spawn => (|| {
                 ensure!(
-                    self.spawn_without_mobs.contains(&pos),
-                    "world-generation mob spawning is not implemented"
+                    self.spawn_ready.contains(&pos),
+                    "world-generation mob spawning is incomplete"
                 );
                 self.schedule.complete(pos, stage)?;
-                self.spawn_without_mobs.remove(&pos);
+                self.spawn_ready.remove(&pos);
                 Ok(())
             })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),

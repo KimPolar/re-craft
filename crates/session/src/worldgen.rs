@@ -66,12 +66,14 @@ pub enum GeneratedMonsterRoomEntity {
 
 /// Result of serializing one generation-time entity. Java does not add a
 /// passenger as a separate protochunk entry; a saved compound can be empty.
+#[derive(Clone)]
 pub enum GeneratedEntityRecord {
     Passenger,
     Saved(native_persistence::nbt::Tag),
 }
 
 /// One runtime entity visited by Java's addFreshEntityWithPassengers.
+#[derive(Clone)]
 pub struct GeneratedEntityAddition {
     pub block_position: [i32; 3],
     pub record: GeneratedEntityRecord,
@@ -4219,103 +4221,6 @@ mod tests {
                     .record_finalized(&mut bright_planner, &mut batch, vec![saved()])
                     .is_err()
             );
-
-            let planner = [0.5, 0.75, 0.9, 0.99]
-                .into_iter()
-                .find_map(|probability| {
-                    let planner = batch
-                        .plan_creature_spawning(center, true, probability, mob_spawns.clone())
-                        .unwrap();
-                    let mut check = planner.clone();
-                    matches!(check.next(1).unwrap(), CreatureSpawnProgress::Attempt(_))
-                        .then_some(planner)
-                })
-                .expect("seed must produce a sheep group");
-            let mut driver = GeneratedSheepSpawner::new(
-                planner,
-                native_resources::worldgen_region_random::RegionRandom::new(
-                    42,
-                    native_resources::density::WorldgenRandom::Legacy,
-                    center.x,
-                    center.z,
-                ),
-            );
-            let mut light = native_world::generation_light::VisibleLightSnapshot::new(true, false);
-            light.insert_complete_column(
-                center,
-                native_world::generation_light::VisibleLightColumn::new(
-                    BTreeMap::from([(1, Arc::new([0xff; native_world::loaded::LIGHT_BYTES]))]),
-                    BTreeMap::new(),
-                ),
-            );
-            driver.set_rule_light_for_test(center, light);
-            let empty = BTreeSet::new();
-            let inputs = SheepSpawnInputs {
-                border,
-                prevent_inside: &empty,
-                height_tags: &mob_height_tags,
-                ground_tags: &ground_spawn_tags,
-                biome_tags: &tags,
-                has_ceiling: false,
-            };
-            let mut next_uuid = 10;
-            let mut uuid = || {
-                let value = [0, 1, 0, next_uuid];
-                next_uuid += 1;
-                Ok(value)
-            };
-            let mut recorded = 0;
-            let mut finished = false;
-            for _ in 0..10_000 {
-                match driver.advance(&mut batch, &inputs, &mut uuid).unwrap() {
-                    SheepSpawnProgress::Recorded(id) => {
-                        recorded += 1;
-                        assert_eq!(id, [0, 1, 0, 9 + recorded]);
-                    }
-                    SheepSpawnProgress::Finished => {
-                        finished = true;
-                        break;
-                    }
-                    SheepSpawnProgress::Pending | SheepSpawnProgress::Rejected => {}
-                }
-            }
-            assert!(finished && recorded > 0);
-            assert_eq!(
-                batch.recorded_generated_entities(center).unwrap().len(),
-                recorded as usize + 1
-            );
-            assert!(driver.into_random().is_ok());
-            let mut unsupported = native_resources::mob_spawns::CreatureSpawns::default();
-            unsupported.apply(native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(
-                &json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:pig","count":1,"weight":1}]},"spawn_costs":{}}}), |_| Some(false),
-            ).unwrap().unwrap());
-            let planner = batch
-                .plan_creature_spawning(center, true, 0.999_999_9, unsupported)
-                .unwrap();
-            let mut driver = GeneratedSheepSpawner::new(
-                planner,
-                native_resources::worldgen_region_random::RegionRandom::new(
-                    42,
-                    native_resources::density::WorldgenRandom::Legacy,
-                    0,
-                    0,
-                ),
-            );
-            let mut no_uuid =
-                || -> Result<[i32; 4]> { anyhow::bail!("unsupported creature was constructed") };
-            for _ in 0..2 {
-                assert!(
-                    driver
-                        .advance(&mut batch, &inputs, &mut no_uuid)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("unsupported generated creature")
-                );
-            }
-            assert_eq!(
-                batch.recorded_generated_entities(center).unwrap().len(),
-                recorded as usize + 1
-            );
         }
         assert_eq!(
             batch.schedule().completed(center),
@@ -4460,7 +4365,137 @@ mod tests {
             batch.schedule().completed(center),
             Some(schedule::GenerationStage::Light)
         );
-        batch.request_spawn_without_mobs(center, false).unwrap();
+        assert!(
+            batch
+                .publish_completed_spawn(
+                    center,
+                    &[
+                        GeneratedEntityAddition {
+                            block_position: [8, 16, 8],
+                            record: GeneratedEntityRecord::Saved(
+                                native_persistence::nbt::Tag::Compound(vec![])
+                            )
+                        },
+                        GeneratedEntityAddition {
+                            block_position: [1_000_000, 0, 0],
+                            record: GeneratedEntityRecord::Passenger
+                        },
+                    ]
+                )
+                .is_err()
+        );
+        assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+        assert_eq!(
+            batch.schedule().completed(center),
+            Some(schedule::GenerationStage::Light)
+        );
+        assert!(batch.is_complete());
+        let sheep_tags =
+            native_resources::worldgen_region_random::SheepBiomeTags::load(&mut data).unwrap();
+        let empty = BTreeSet::new();
+        let inputs = SheepSpawnInputs {
+            border: crate::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            },
+            prevent_inside: &empty,
+            height_tags: &mob_height_tags,
+            ground_tags: &ground_spawn_tags,
+            biome_tags: &sheep_tags,
+            has_ceiling: false,
+        };
+        let mut unsupported = native_resources::mob_spawns::CreatureSpawns::default();
+        unsupported.apply(native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(
+            &json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:pig","count":1,"weight":1}]},"spawn_costs":{}}}), |_| Some(false),
+        ).unwrap().unwrap());
+        let mut unknown =
+            GeneratedSheepSpawner::new(&batch, center, 0.999_999_9, unsupported, inputs).unwrap();
+        let mut no_uuid =
+            || -> Result<[i32; 4]> { anyhow::bail!("unsupported creature was constructed") };
+        for _ in 0..2 {
+            assert!(
+                unknown
+                    .advance(&mut batch, &mut no_uuid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported generated creature")
+            );
+        }
+        let probability = [0.5, 0.75, 0.9, 0.99]
+            .into_iter()
+            .find(|&probability| {
+                let mut planner = batch
+                    .plan_creature_spawning(center, true, probability, mob_spawns.clone())
+                    .unwrap();
+                matches!(
+                    planner.next(1).unwrap(),
+                    native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_)
+                )
+            })
+            .expect("seed must produce a sheep group");
+        let mut driver =
+            GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
+                .unwrap();
+        let mut stale =
+            GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
+                .unwrap();
+        assert!(driver.schedule_spawn(&mut batch).is_err());
+        let mut light = native_world::generation_light::VisibleLightSnapshot::new(true, false);
+        light.insert_complete_column(
+            center,
+            native_world::generation_light::VisibleLightColumn::new(
+                BTreeMap::from([(1, Arc::new([0xff; native_world::loaded::LIGHT_BYTES]))]),
+                BTreeMap::new(),
+            ),
+        );
+        driver.set_rule_light_for_test(center, light.clone());
+        let mut abandoned =
+            GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
+                .unwrap();
+        abandoned.set_rule_light_for_test(center, light);
+        let mut next_uuid = 10;
+        let mut uuid = || {
+            let value = [0, 1, 0, next_uuid];
+            next_uuid += 1;
+            Ok(value)
+        };
+        let mut staged = false;
+        for _ in 0..10_000 {
+            match abandoned.advance(&mut batch, &mut uuid).unwrap() {
+                SheepSpawnProgress::Prepared(_) => {
+                    staged = true;
+                    break;
+                }
+                SheepSpawnProgress::Finished => break,
+                SheepSpawnProgress::Pending | SheepSpawnProgress::Rejected => {}
+            }
+        }
+        assert!(staged);
+        drop(abandoned);
+        assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+        let mut prepared = 0;
+        let mut finished = false;
+        for _ in 0..10_000 {
+            match driver.advance(&mut batch, &mut uuid).unwrap() {
+                SheepSpawnProgress::Prepared(_) => prepared += 1,
+                SheepSpawnProgress::Finished => {
+                    finished = true;
+                    break;
+                }
+                SheepSpawnProgress::Pending | SheepSpawnProgress::Rejected => {}
+            }
+        }
+        assert!(finished && prepared > 0);
+        assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+        driver.schedule_spawn(&mut batch).unwrap();
+        assert_eq!(
+            batch.recorded_generated_entities(center).unwrap().len(),
+            1 + prepared
+        );
+        assert!(stale.advance(&mut batch, &mut uuid).is_err());
+        assert!(driver.schedule_spawn(&mut batch).is_err());
         assert_eq!(
             batch.step(&mut data, &mut classify, &mut resolve).unwrap(),
             Some((center, schedule::GenerationStage::Spawn))

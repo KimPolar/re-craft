@@ -214,6 +214,7 @@ pub struct GenerationSchedule {
     required: BTreeMap<ChunkPos, GenerationStage>,
     completed: BTreeMap<ChunkPos, GenerationStage>,
     ready: BTreeSet<ChunkPos>,
+    revision: u64,
 }
 
 impl GenerationSchedule {
@@ -261,7 +262,11 @@ impl GenerationSchedule {
         for pos in changed {
             self.refresh_ready(pos);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
     }
     pub fn required(&self, pos: ChunkPos) -> Option<GenerationStage> {
         self.required.get(&pos).copied()
@@ -334,6 +339,7 @@ impl GenerationSchedule {
     pub fn complete(&mut self, pos: ChunkPos, target: GenerationStage) -> Result<()> {
         ensure!(self.ready(pos, target), "generation step is not ready");
         self.completed.insert(pos, target);
+        self.revision = self.revision.wrapping_add(1);
         self.refresh_ready(pos);
         // Only a next step depending on the stage just completed can have
         // become ready. Preserve lexicographic order in the ready set.

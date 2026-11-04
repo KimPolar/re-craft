@@ -7,10 +7,9 @@ use native_resources::{
     worldgen_mob_spawner::{ChunkCreatureSpawner, CreatureSpawnProgress},
     worldgen_region_random::{AnimalGroupData, RegionRandom, SheepBiomeTags},
 };
-#[cfg(test)]
 use native_world::loaded::ChunkPos;
 use native_world::movement::BoundingBox;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
     FreshTerrainBatch, GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
@@ -20,6 +19,7 @@ use super::{
 use crate::respawn::RespawnBorder;
 
 /// All tags must be from the same unchanged data-pack stack as the batch.
+#[derive(Clone, Copy)]
 pub struct SheepSpawnInputs<'a> {
     pub border: RespawnBorder,
     pub prevent_inside: &'a BTreeSet<String>,
@@ -29,11 +29,20 @@ pub struct SheepSpawnInputs<'a> {
     pub has_ceiling: bool,
 }
 
+struct OwnedSheepSpawnInputs {
+    border: RespawnBorder,
+    prevent_inside: BTreeSet<String>,
+    height_tags: HeightmapTags,
+    ground_tags: GroundSpawnTags,
+    biome_tags: SheepBiomeTags,
+    has_ceiling: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SheepSpawnProgress {
     Pending,
     Rejected,
-    Recorded([i32; 4]),
+    Prepared([i32; 4]),
     Finished,
 }
 
@@ -48,21 +57,25 @@ enum Stage {
     Obstruction,
     Record,
     Finished,
+    Scheduled,
 }
 
 /// Owns the region RNG and group state across resumable candidate checks.
-/// The supplied planner and region RNG must belong to the same generation
-/// region and remain paired with this batch. An unsupported creature stops
+/// An unsupported creature stops
 /// with its attempt unresolved; this does not mark SPAWN complete or save.
 pub struct GeneratedSheepSpawner {
     planner: ChunkCreatureSpawner,
     random: RegionRandom,
+    center: ChunkPos,
+    stamp: super::terrain_batch::SpawnStamp,
+    inputs: Arc<OwnedSheepSpawnInputs>,
     group_id: Option<u64>,
     group: AnimalGroupData,
     stage: Stage,
     probe: Option<GeneratedCreatureProbe>,
     pose: Option<GeneratedCreaturePose>,
     uuid: Option<[i32; 4]>,
+    additions: Vec<super::GeneratedEntityAddition>,
     #[cfg(test)]
     rule_light: Option<(
         ChunkPos,
@@ -71,19 +84,40 @@ pub struct GeneratedSheepSpawner {
 }
 
 impl GeneratedSheepSpawner {
-    pub fn new(planner: ChunkCreatureSpawner, region_random: RegionRandom) -> Self {
-        Self {
+    /// The spawn list and probability must contain all applicable environment
+    /// layers at this chunk's spawn query position.
+    pub fn new(
+        batch: &FreshTerrainBatch,
+        center: ChunkPos,
+        probability: f32,
+        spawns: native_resources::mob_spawns::CreatureSpawns,
+        inputs: SheepSpawnInputs<'_>,
+    ) -> Result<Self> {
+        let planner = batch.plan_creature_spawning(center, true, probability, spawns)?;
+        let stamp = batch.spawn_stamp()?;
+        Ok(Self {
             planner,
-            random: region_random,
+            random: batch.spawn_region_random(center),
+            center,
+            stamp,
+            inputs: Arc::new(OwnedSheepSpawnInputs {
+                border: inputs.border,
+                prevent_inside: inputs.prevent_inside.clone(),
+                height_tags: inputs.height_tags.clone(),
+                ground_tags: inputs.ground_tags.clone(),
+                biome_tags: inputs.biome_tags.clone(),
+                has_ceiling: inputs.has_ceiling,
+            }),
             group_id: None,
             group: AnimalGroupData::default(),
             stage: Stage::Begin,
             probe: None,
             pose: None,
             uuid: None,
+            additions: Vec::new(),
             #[cfg(test)]
             rule_light: None,
-        }
+        })
     }
 
     fn rejected(&mut self) -> SheepSpawnProgress {
@@ -100,11 +134,13 @@ impl GeneratedSheepSpawner {
     pub fn advance(
         &mut self,
         batch: &mut FreshTerrainBatch,
-        inputs: &SheepSpawnInputs<'_>,
         new_uuid: &mut impl FnMut() -> Result<[i32; 4]>,
     ) -> Result<SheepSpawnProgress> {
+        batch.validate_spawn_stamp(&self.stamp, self.center)?;
+        let inputs = Arc::clone(&self.inputs);
         match self.stage {
             Stage::Finished => Ok(SheepSpawnProgress::Finished),
+            Stage::Scheduled => anyhow::bail!("creature spawning was already scheduled"),
             Stage::Begin => match self.planner.next(1)? {
                 CreatureSpawnProgress::Pending => Ok(SheepSpawnProgress::Pending),
                 CreatureSpawnProgress::Finished => {
@@ -148,30 +184,32 @@ impl GeneratedSheepSpawner {
             }
             Stage::Record => {
                 let uuid = self.uuid.context("missing constructed sheep UUID")?;
-                self.probe
+                let addition = self
+                    .probe
                     .as_mut()
                     .context("missing creature probe")?
-                    .finalize_fresh_sheep_and_record(
+                    .prepare_fresh_sheep(
                         &mut self.planner,
                         batch,
-                        inputs.biome_tags,
+                        &inputs.biome_tags,
                         &mut self.random,
                         &mut self.group,
                         uuid,
                     )?;
+                self.additions.push(addition);
                 self.probe = None;
                 self.pose = None;
                 self.uuid = None;
                 self.stage = Stage::Begin;
-                Ok(SheepSpawnProgress::Recorded(uuid))
+                Ok(SheepSpawnProgress::Prepared(uuid))
             }
             stage => {
                 let mut view = GeneratedMobPlacementView::new(
                     batch,
                     MobSpawnHeightmap::MotionBlockingNoLeaves,
                     inputs.border,
-                    inputs.prevent_inside,
-                    inputs.height_tags,
+                    &inputs.prevent_inside,
+                    &inputs.height_tags,
                 )?;
                 #[cfg(test)]
                 if let Some((pos, light)) = &self.rule_light {
@@ -195,7 +233,7 @@ impl GeneratedSheepSpawner {
                     Stage::Rules => match probe.check_spawn_rules(
                         &mut self.planner,
                         &mut view,
-                        inputs.ground_tags,
+                        &inputs.ground_tags,
                     )? {
                         GeneratedCreatureRuleProgress::NeedsConstruction(_) => {
                             self.stage = Stage::Construct
@@ -237,10 +275,24 @@ impl GeneratedSheepSpawner {
         }
     }
 
+    /// Schedule SPAWN after every selected creature has been handled and all
+    /// generation dependencies are complete. The chunk remains intermediate.
+    pub fn schedule_spawn(&mut self, batch: &mut FreshTerrainBatch) -> Result<()> {
+        ensure!(
+            matches!(self.stage, Stage::Finished),
+            "creature spawning is unfinished"
+        );
+        batch.validate_spawn_stamp(&self.stamp, self.center)?;
+        batch.publish_completed_spawn(self.center, &self.additions)?;
+        self.additions.clear();
+        self.stage = Stage::Scheduled;
+        Ok(())
+    }
+
     /// The random source is returned only when all groups were processed.
     pub fn into_random(self) -> Result<RegionRandom> {
         ensure!(
-            matches!(self.stage, Stage::Finished),
+            matches!(self.stage, Stage::Finished | Stage::Scheduled),
             "sheep generation is unfinished"
         );
         Ok(self.random)

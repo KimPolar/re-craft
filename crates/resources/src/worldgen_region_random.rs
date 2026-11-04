@@ -17,6 +17,7 @@ use crate::{
 };
 
 /// The active world's farm-animal variant biome tags, including pack overrides.
+#[derive(Clone)]
 pub struct SheepBiomeTags {
     registry: BTreeSet<ResourceId>,
     warm: BTreeSet<ResourceId>,

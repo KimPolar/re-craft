@@ -390,6 +390,52 @@ impl GeneratedCreatureProbe {
         )
     }
 
+    /// Prepare a fresh sheep without publishing its entity record. The caller
+    /// can discard the entire pending spawn operation before chunk publication.
+    pub(super) fn prepare_fresh_sheep(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        batch: &FreshTerrainBatch,
+        tags: &native_resources::worldgen_region_random::SheepBiomeTags,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+    ) -> Result<super::GeneratedEntityAddition> {
+        ensure!(
+            self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "sheep",
+            "pending creature is not a sheep"
+        );
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "sheep is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed sheep is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        let position = geometry_block_position(geometry)?.to_array();
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let initialized =
+            batch.initialize_sheep(position, tags, &mut next_random, &mut next_group, false)?;
+        let tag = super::draft_fresh_sheep(uuid, geometry.position, yaw, initialized)?;
+        let mut next_planner = planner.clone();
+        next_planner.finish_entity(true)?;
+        *planner = next_planner;
+        *random = next_random;
+        *group = next_group;
+        self.finalized = true;
+        Ok(super::GeneratedEntityAddition {
+            block_position: position,
+            record: super::GeneratedEntityRecord::Saved(tag),
+        })
+    }
+
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
     /// advancing the planner. The caller still checks collision and mob rules.

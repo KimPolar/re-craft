@@ -12,6 +12,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.pathfinder.PathComputationType;
+import net.minecraft.world.phys.shapes.Shapes;
 
 public final class MobSpawnBlockFactsOracle {
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -48,6 +49,18 @@ public final class MobSpawnBlockFactsOracle {
                     });
                     boolean support = state.isValidSpawn(world, pos, EntityTypes.PIG);
                     boolean dangerous = EntityTypes.PIG.isBlockDangerous(state);
+                    if (first == null) {
+                        var shape = state.getCollisionShape(world, pos);
+                        entry.addProperty("canonical_full", shape == Shapes.block());
+                        entry.addProperty("large", state.hasLargeCollisionShape());
+                        var boxes = new JsonArray();
+                        for (var box : shape.toAabbs()) {
+                            var values = new JsonArray();
+                            for (double value : new double[]{box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ}) values.add(value);
+                            boxes.add(values);
+                        }
+                        entry.add("collision_boxes", boxes);
+                    }
                     boolean[] facts = {state.isAir(), state.isPathfindable(PathComputationType.LAND), support,
                         state.isCollisionShapeFullBlock(world, pos), state.isSignalSource(), state.getFluidState().isEmpty(), dangerous};
                     for (var entity : BuiltInRegistries.ENTITY_TYPE) {

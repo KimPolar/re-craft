@@ -31,6 +31,7 @@ mod carving;
 mod generated_beehive;
 mod generated_chest;
 mod generated_spawner;
+mod mob_collision;
 mod mob_placement;
 mod ore;
 pub mod postprocessing;
@@ -41,7 +42,8 @@ pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
-    GeneratedCreatureProbe, GeneratedCreatureProbeProgress, GeneratedMobPlacementView,
+    GeneratedCreatureBlockCollisionProgress, GeneratedCreatureProbe,
+    GeneratedCreatureProbeProgress, GeneratedMobPlacementView,
 };
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
@@ -3354,6 +3356,10 @@ mod tests {
             assert!(geometry.position[2] >= f64::from(0.9_f32));
             assert_eq!(geometry.position[1], 16.0);
             assert!(probe.collision_geometry(top + IVec3::Y).is_err());
+            assert_eq!(
+                probe.check_block_collision(&mut planner, &view).unwrap(),
+                GeneratedCreatureBlockCollisionProgress::NeedsEntityAndBorderCollision(geometry)
+            );
             assert_eq!(
                 planner.next(0).unwrap(),
                 CreatureSpawnProgress::Attempt(attempt.clone())

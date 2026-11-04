@@ -144,6 +144,16 @@ fn supported_block_states_match_all_java_entity_types() {
         if let Some(facts) = common_mob_spawn_block_facts(&state) {
             assert_eq!(entry["universal"], true, "{state:?}");
             assert_eq!(entry["context_independent"], true, "{state:?}");
+            assert_eq!(entry["large"], false, "{state:?}");
+            if facts.full_collision {
+                assert_eq!(entry["canonical_full"], true, "{state:?}");
+            } else if let Some(boxes) = native_world::collision::block_shape(&state) {
+                let boxes: Vec<_> = boxes
+                    .iter()
+                    .map(|b| json!([b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z]))
+                    .collect();
+                assert_eq!(json!(boxes), entry["collision_boxes"], "{state:?}");
+            }
             assert_eq!(
                 json!([
                     facts.air,

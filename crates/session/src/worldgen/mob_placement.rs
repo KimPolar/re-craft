@@ -25,6 +25,14 @@ pub enum GeneratedCreatureProbeProgress {
     NeedsCollision(IVec3),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GeneratedCreatureBlockCollisionProgress {
+    Rejected,
+    /// Block collision passed. Existing entities and the world border still
+    /// need Java's null-entity collision checks before checking mob rules.
+    NeedsEntityAndBorderCollision(native_resources::worldgen_mob_geometry::CreatureSpawnGeometry),
+}
+
 pub struct GeneratedCreatureProbe {
     attempt: CreatureAttempt,
     top_search: native_resources::mob_spawn_placement::TopMobSpawnPosition,
@@ -73,6 +81,27 @@ impl GeneratedCreatureProbe {
             self.attempt.z,
             dimensions,
         )
+    }
+
+    /// Test block collisions only. A definite collision skips the random walk,
+    /// as in Java; missing data leaves the pending attempt unchanged.
+    pub fn check_block_collision(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        world: &GeneratedMobPlacementView<'_>,
+    ) -> Result<GeneratedCreatureBlockCollisionProgress> {
+        ensure!(
+            planner.next(0)? == CreatureSpawnProgress::Attempt(self.attempt.clone()),
+            "creature planner attempt changed"
+        );
+        let top = self.top.context("creature placement is unresolved")?;
+        let geometry = self.collision_geometry(top)?;
+        if !super::mob_collision::no_block_collision(geometry, |pos| world.block(pos))? {
+            planner.reject(AttemptRejection::CollisionRuleOrConstruction)?;
+            self.rejected = true;
+            return Ok(GeneratedCreatureBlockCollisionProgress::Rejected);
+        }
+        Ok(GeneratedCreatureBlockCollisionProgress::NeedsEntityAndBorderCollision(geometry))
     }
 
     /// Resolve one pending planner attempt against generated blocks. Missing

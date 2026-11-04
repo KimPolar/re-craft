@@ -1114,6 +1114,47 @@ impl CarvedTerrainWorld {
         ))
     }
 
+    /// Encode the currently present maps without priming or recomputing them.
+    /// This is one component of a future chunk save, not permission to save it.
+    pub fn generated_heightmap_data(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::heightmap::{
+            GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps,
+        };
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "generation chunk is missing"
+        );
+        let final_maps = self.final_heightmaps.get(&pos);
+        let final_map = |index: usize| {
+            final_maps
+                .and_then(|maps| (maps.primed & (1 << index) != 0).then_some(&maps.values[index]))
+        };
+        let maps = GeneratedHeightmaps {
+            world_surface: final_map(0),
+            ocean_floor: final_map(1),
+            motion_blocking: final_map(2),
+            motion_blocking_no_leaves: final_map(3),
+            world_surface_wg: self
+                .feature_world_surface_heights
+                .get(&pos)
+                .map(AsRef::as_ref),
+            ocean_floor_wg: self.ore_ocean_floor_heights.get(&pos).map(AsRef::as_ref),
+        };
+        encode_generated_heightmaps(
+            HeightBounds {
+                min_y: self.min_y,
+                max_y: self
+                    .min_y
+                    .checked_add(self.height)
+                    .context("generation height overflow")?,
+            },
+            &maps,
+        )
+    }
+
     /// Start with a generated chunk without copying its block sections.
     pub fn new(first: MaterializedTerrain) -> Self {
         let MaterializedTerrain {
@@ -3893,6 +3934,7 @@ mod tests {
         }
         let original = batch.snapshot().unwrap();
         assert!(batch.spawned_section_data(center).is_err());
+        assert!(batch.spawned_heightmap_data(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
         assert_eq!(
             batch.schedule().completed(center),
@@ -3905,6 +3947,9 @@ mod tests {
         );
         assert!(batch.is_complete());
         assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
+        let heightmaps = batch.spawned_heightmap_data(center).unwrap();
+        assert!(heightmaps.get("WORLD_SURFACE_WG").is_some());
+        assert!(heightmaps.get("OCEAN_FLOOR_WG").is_some());
         let sections = batch.spawned_section_data(center).unwrap();
         let decoded = native_persistence::palette::decode_sections(
             &native_persistence::nbt::Tag::Compound(vec![("sections".into(), sections)]),

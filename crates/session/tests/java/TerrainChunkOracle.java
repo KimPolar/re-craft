@@ -45,6 +45,9 @@ public class TerrainChunkOracle {
         var line=new StringBuilder("H ").append(entry.getKey());
         for(int z=0;z<16;z++)for(int x=0;x<16;x++)line.append(' ').append(entry.getValue().getFirstAvailable(x,z));
         output.println(line);
+        var raw=new StringBuilder("W ").append(entry.getKey());
+        for(long word:entry.getValue().getRawData())raw.append(' ').append(Long.toUnsignedString(word,16));
+        output.println(raw);
       }
       return;
     }

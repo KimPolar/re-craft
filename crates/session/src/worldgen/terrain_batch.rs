@@ -585,6 +585,30 @@ impl FreshTerrainBatch {
         )
     }
 
+    /// Export the maps actually primed in this SPAWN-stage chunk, including
+    /// stale generation maps. Other chunk data still needs coordinated saving.
+    pub fn spawned_heightmap_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before encoding heightmaps"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "heightmap encoding requires a spawn-complete chunk"
+        );
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        ensure!(
+            terrain.worldgen_heightmaps(pos).is_some(),
+            "generation heightmaps are missing"
+        );
+        terrain.generated_heightmap_data(pos)
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

@@ -6269,7 +6269,22 @@ mod tests {
         // Java retained the terrain-stage maps before this direct section write.
         assert_eq!(region.ocean_floor_height(3, 4).unwrap(), 8);
         assert_eq!(region.world_surface_height(3, 4).unwrap(), 8);
+        assert_eq!(region.final_height(0, 3, 4).unwrap(), 13);
         region.finish().unwrap();
+        let encoded = terrain.generated_heightmap_data(center).unwrap();
+        let column = 3 + 4 * 16;
+        let read = |name| {
+            let Some(native_persistence::nbt::Tag::LongArray(words)) = encoded.get(name) else {
+                panic!("missing {name}")
+            };
+            ((words[column / 12] as u64 >> ((column % 12) * 5)) & 31) as u32
+        };
+        assert_eq!(read("WORLD_SURFACE_WG"), 8);
+        assert_eq!(read("OCEAN_FLOOR_WG"), 8);
+        assert_eq!(read("WORLD_SURFACE"), 13);
+        assert!(encoded.get("OCEAN_FLOOR").is_none());
+        assert!(encoded.get("MOTION_BLOCKING").is_none());
+        assert!(encoded.get("MOTION_BLOCKING_NO_LEAVES").is_none());
         assert!(
             terrain
                 .initialize_worldgen_heightmaps(center, &motion)

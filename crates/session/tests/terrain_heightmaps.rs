@@ -91,11 +91,17 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
             "42",
             "0",
             "0",
+            "custom",
+            "2345",
+            "0",
+            "0",
         ]));
     let mut stages = Vec::<BTreeMap<String, Vec<i32>>>::new();
+    let mut raw_stages = Vec::<BTreeMap<String, Vec<i64>>>::new();
     for line in output.lines() {
         if line.starts_with("S ") {
             stages.push(BTreeMap::new());
+            raw_stages.push(BTreeMap::new());
         }
         if let Some(line) = line.strip_prefix("H ") {
             let mut words = line.split_whitespace();
@@ -103,8 +109,22 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
             let values = words.map(|word| word.parse().unwrap()).collect();
             assert!(stages.last_mut().unwrap().insert(name, values).is_none());
         }
+        if let Some(line) = line.strip_prefix("W ") {
+            let mut words = line.split_whitespace();
+            let name = words.next().unwrap().to_owned();
+            let values = words
+                .map(|word| u64::from_str_radix(word, 16).unwrap() as i64)
+                .collect();
+            assert!(
+                raw_stages
+                    .last_mut()
+                    .unwrap()
+                    .insert(name, values)
+                    .is_none()
+            );
+        }
     }
-    assert_eq!(stages.len(), 12);
+    assert_eq!(stages.len(), 15);
     let preset: Value = serde_json::from_slice(
         &resources
             .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")?
@@ -117,13 +137,25 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
         ("minecraft:overworld", 12345, [-100, 17], -64, 384),
         ("minecraft:the_nether", 42, [0, 0], 0, 256),
         ("minecraft:the_end", 42, [0, 0], 0, 256),
+        ("minecraft:overworld", 2345, [0, 0], -64, 384),
     ]
     .into_iter()
     .enumerate()
     {
+        let mut definition = preset["dimensions"][dimension]["generator"].clone();
+        if index == 4 {
+            let bytes = resources
+                .read_builtin_data("data/minecraft/worldgen/noise_settings/overworld.json")?
+                .context("missing overworld noise settings")?;
+            let mut settings: Value = serde_json::from_slice(&bytes)?;
+            settings["material_rule"] = serde_json::json!({"type":"minecraft:condition",
+                "if_true":{"type":"minecraft:y_above", "anchor":{"absolute":-60}, "surface_depth_multiplier":0, "add_stone_depth":false},
+                "then_run":{"type":"minecraft:block", "result_state":{"id":"minecraft:water"}}});
+            definition["settings"] = settings;
+        }
         let mut generator = TerrainGenerator::without_terrain_adjustments(
             &mut resources,
-            &preset["dimensions"][dimension]["generator"],
+            &definition,
             seed,
             min_y,
             height,
@@ -183,6 +215,16 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
             expected.get("OCEAN_FLOOR_WG").map(Vec::as_slice),
             "{dimension} {seed} {pos:?}"
         );
+        let encoded = terrain.generated_heightmap_data(chunk_pos)?;
+        for name in ["WORLD_SURFACE_WG", "OCEAN_FLOOR_WG"] {
+            assert_eq!(
+                encoded.get(name),
+                Some(&native_persistence::nbt::Tag::LongArray(
+                    raw_stages[index * 3 + 2][name].clone()
+                )),
+                "{dimension} {seed} {pos:?} {name}"
+            );
+        }
     }
     Ok(())
 }

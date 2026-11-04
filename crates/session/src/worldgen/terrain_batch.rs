@@ -596,6 +596,14 @@ impl FreshTerrainBatch {
         self.request_completed_spawn(pos)
     }
 
+    /// The generator's `disable_mob_generation` setting. Incomplete
+    /// synthetic generator settings cannot establish either outcome.
+    pub fn mob_generation_disabled(&self) -> Result<bool> {
+        self.generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")
+    }
+
     /// Schedule an already completed spawn operation; this is not a FULL chunk.
     pub(super) fn request_completed_spawn(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(

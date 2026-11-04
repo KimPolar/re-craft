@@ -306,6 +306,90 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Generate and select the initial spawn, then process creature spawning
+    /// without reopening or changing the selected world data-pack stack.
+    /// This produces intermediate chunks; it does not save or start play.
+    pub fn start_initial_world<F>(
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+        ceiling_spawn_height: Option<i32>,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
+    {
+        Self::spawn(move |cancelled, progress| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let crate::fresh_generation::PreparedInitialWorld {
+                batch,
+                mut resources,
+                mut classify,
+                mut resolve,
+                height_tags,
+                worldgen_settings,
+                creatures,
+                spawn_mobs,
+            } = prepare()?;
+            let Some(mut ready) = generate_spawn_origin(
+                batch,
+                &mut resources,
+                &mut classify,
+                &mut resolve,
+                revision,
+                biome_blend,
+                cancelled,
+                progress,
+            )?
+            else {
+                return Ok(None);
+            };
+            ready.worldgen_settings_draft = Some(worldgen_settings);
+            let Some(mut ready) = complete_spawn_search(
+                ready,
+                &mut resources,
+                &mut classify,
+                &mut resolve,
+                height_tags,
+                biome_blend,
+                ceiling_spawn_height,
+                cancelled,
+                progress,
+            )?
+            else {
+                return Ok(None);
+            };
+            let targets = checked_spawn_targets(&mut ready)?;
+            let mut build = |batch: &FreshTerrainBatch,
+                             resources: &mut native_resources::packs::ResourceStack,
+                             pos| {
+                creatures
+                    .as_ref()
+                    .context("creature spawn inputs are unavailable")?
+                    .build_spawner(batch, resources, pos)
+            };
+            let mut construct = |id: &native_resources::packs::ResourceId| {
+                Ok(native_session::worldgen::FreshCreatureRandom::from_entropy(id)?.construction)
+            };
+            if !complete_creature_spawning_with_inputs(
+                &mut ready,
+                &targets,
+                &mut resources,
+                &mut classify,
+                &mut resolve,
+                &mut build,
+                &mut construct,
+                spawn_mobs,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
+            }
+            Ok(Some(ready))
+        })
+    }
+
     /// Use the active data-pack-derived spawn configuration and independent
     /// entity RNGs on the same worker as the chunk spawn operation.
     pub fn complete_creature_spawning_from_packs<C, R, F>(
@@ -359,62 +443,25 @@ impl GenerationWorker {
         ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
     {
         Self::spawn(move |cancelled, progress| {
-            let targets = ready
-                .mesh
-                .targets
-                .as_deref()
-                .context("generated session targets missing")?
-                .clone();
-            ensure!(!targets.is_empty(), "generated session has no targets");
-            ensure!(
-                ready.batch.is_complete(),
-                "generation batch has pending work"
-            );
-            let current = ready.batch.lit_render_snapshot(targets.iter().copied())?;
-            ensure!(
-                Arc::ptr_eq(&current, &ready.mesh.world),
-                "generated mesh snapshot is stale"
-            );
+            let targets = checked_spawn_targets(&mut ready)?;
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
             let (mut provider, mut classify, mut resolve, mut build_spawner, mut construct) =
                 prepare()?;
-            set_phase(progress, GenerationPhase::Spawning);
-            for &pos in &targets {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if ready.batch.schedule().completed(pos) == Some(GenerationStage::Spawn) {
-                    continue;
-                }
-                ensure!(
-                    ready.batch.schedule().completed(pos) == Some(GenerationStage::Light),
-                    "creature spawning requires a light-complete target"
-                );
-                let mut spawner = build_spawner(&ready.batch, &mut provider, pos)?;
-                loop {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Ok(None);
-                    }
-                    match spawner.advance_with_construction(&mut ready.batch, &mut construct)? {
-                        native_session::worldgen::SheepSpawnProgress::Finished => break,
-                        native_session::worldgen::SheepSpawnProgress::Pending
-                        | native_session::worldgen::SheepSpawnProgress::Rejected
-                        | native_session::worldgen::SheepSpawnProgress::Prepared(_) => {}
-                    }
-                }
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                spawner.schedule_spawn(&mut ready.batch)?;
-                let completed =
-                    generation_step(&mut ready.batch, &mut provider, &mut classify, &mut resolve)?;
-                ensure!(
-                    completed == Some((pos, GenerationStage::Spawn)),
-                    "unexpected generation step after creature spawning"
-                );
-                note_step(progress, pos, GenerationStage::Spawn);
+            if !complete_creature_spawning_with_inputs(
+                &mut ready,
+                &targets,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                &mut build_spawner,
+                &mut construct,
+                true,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
             }
             Ok(Some(ready))
         })
@@ -717,6 +764,94 @@ impl GenerationWorker {
     }
 }
 
+fn checked_spawn_targets(ready: &mut GenerationReady) -> Result<BTreeSet<ChunkPos>> {
+    let targets = ready
+        .mesh
+        .targets
+        .as_deref()
+        .context("generated session targets missing")?
+        .clone();
+    ensure!(!targets.is_empty(), "generated session has no targets");
+    ensure!(
+        ready.batch.is_complete(),
+        "generation batch has pending work"
+    );
+    let current = ready.batch.lit_render_snapshot(targets.iter().copied())?;
+    ensure!(
+        Arc::ptr_eq(&current, &ready.mesh.world),
+        "generated mesh snapshot is stale"
+    );
+    Ok(targets)
+}
+
+/// Run on the generation thread while retaining the original resource stack.
+fn complete_creature_spawning_with_inputs<P, C, R, M, K>(
+    ready: &mut GenerationReady,
+    targets: &BTreeSet<ChunkPos>,
+    provider: &mut P,
+    classify: &mut C,
+    resolve: &mut R,
+    build_spawner: &mut M,
+    construct: &mut K,
+    spawn_mobs: bool,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<bool>
+where
+    P: ResourceProvider,
+    C: FnMut(&Value) -> Result<CarverBlockState>,
+    R: FnMut(&Value) -> Result<BlockState>,
+    M: FnMut(
+        &FreshTerrainBatch,
+        &mut P,
+        ChunkPos,
+    ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+    K: FnMut(
+        &native_resources::packs::ResourceId,
+    ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+{
+    set_phase(progress, GenerationPhase::Spawning);
+    for &pos in targets {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if ready.batch.schedule().completed(pos) == Some(GenerationStage::Spawn) {
+            continue;
+        }
+        ensure!(
+            ready.batch.schedule().completed(pos) == Some(GenerationStage::Light),
+            "creature spawning requires a light-complete target"
+        );
+        if !spawn_mobs || ready.batch.mob_generation_disabled()? {
+            ready.batch.request_spawn_without_mobs(pos, spawn_mobs)?;
+        } else {
+            let mut spawner = build_spawner(&ready.batch, provider, pos)?;
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                match spawner.advance_with_construction(&mut ready.batch, construct)? {
+                    native_session::worldgen::SheepSpawnProgress::Finished => break,
+                    native_session::worldgen::SheepSpawnProgress::Pending
+                    | native_session::worldgen::SheepSpawnProgress::Rejected
+                    | native_session::worldgen::SheepSpawnProgress::Prepared(_) => {}
+                }
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            spawner.schedule_spawn(&mut ready.batch)?;
+        }
+        let completed = generation_step(&mut ready.batch, provider, classify, resolve)?;
+        ensure!(
+            completed == Some((pos, GenerationStage::Spawn)),
+            "unexpected generation step after creature spawning"
+        );
+        note_step(progress, pos, GenerationStage::Spawn);
+    }
+    Ok(true)
+}
+
 fn complete_spawn_search(
     mut ready: GenerationReady,
     provider: &mut impl ResourceProvider,
@@ -1001,6 +1136,136 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn initial_world_worker_keeps_selected_pack_through_creature_spawning() -> Result<()> {
+        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+        use native_resources::datapacks::DataPackSettings;
+        use serde_json::json;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/compact");
+        for dir in [
+            "data/example/worldgen/world_preset",
+            "data/example/worldgen/biome",
+            "data/example/dimension_type",
+            "data/minecraft/tags/block",
+        ] {
+            std::fs::create_dir_all(pack.join(dir))?;
+        }
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        let generator = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:flat"},"settings":{
+            "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
+            "default_block":"minecraft:stone","default_fluid":"minecraft:water","disable_mob_generation":false,
+            "spawn_target":[],"material_rule":{"type":"minecraft:block","result_state":"minecraft:dirt"},
+            "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
+        }});
+        let preset = json!({"dimensions":{"minecraft:overworld":{"type":"example:compact","generator":generator}}});
+        std::fs::write(
+            pack.join("data/example/worldgen/world_preset/compact.json"),
+            serde_json::to_vec(&preset)?,
+        )?;
+        let mut disabled_preset = preset.clone();
+        disabled_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["disable_mob_generation"] =
+            json!(true);
+        std::fs::write(
+            pack.join("data/example/worldgen/world_preset/compact_disabled.json"),
+            serde_json::to_vec(&disabled_preset)?,
+        )?;
+        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0});
+        std::fs::write(
+            pack.join("data/example/dimension_type/compact.json"),
+            serde_json::to_vec(&dimension)?,
+        )?;
+        let biome = json!({"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[],"attributes":{
+            "minecraft:gameplay/creature_world_gen_spawn_probability":0.75,
+            "minecraft:gameplay/natural_mob_spawns":{"spawn_costs":{},"spawns_by_category":{"creature":[{"type":"minecraft:sheep","count":1,"weight":1}]}}
+        }});
+        std::fs::write(
+            pack.join("data/example/worldgen/biome/flat.json"),
+            serde_json::to_vec(&biome)?,
+        )?;
+        std::fs::write(
+            pack.join("data/minecraft/tags/block/animals_spawnable_on.json"),
+            br#"{"replace":true,"values":["minecraft:dirt"]}"#,
+        )?;
+        for (spawn_mobs, disabled) in [(false, false), (true, true), (true, false)] {
+            let game = game.clone();
+            let world = world.clone();
+            let worker = GenerationWorker::start_initial_world(
+                move || {
+                    let prepared = prepare(FreshGenerationSettings {
+                        minecraft_dir: game,
+                        preset: if disabled {
+                            "example:compact_disabled"
+                        } else {
+                            "example:compact"
+                        }
+                        .into(),
+                        dimension: "minecraft:overworld".into(),
+                        seed: 42,
+                        bonus_chest: false,
+                        structures_enabled: false,
+                        data_packs: Some((
+                            world,
+                            DataPackSettings {
+                                enabled: vec!["vanilla".into(), "file/compact".into()],
+                                disabled: vec![],
+                                enabled_features: vec!["minecraft:vanilla".into()],
+                            },
+                        )),
+                    })?;
+                    let border = native_session::respawn::RespawnBorder {
+                        min_x: -100.0,
+                        max_x: 100.0,
+                        min_z: -100.0,
+                        max_z: 100.0,
+                    };
+                    let inputs = prepared.into_initial_world_inputs(
+                        border,
+                        Default::default(),
+                        spawn_mobs,
+                    )?;
+                    assert_eq!(inputs.creatures.is_some(), spawn_mobs && !disabled);
+                    Ok(inputs)
+                },
+                80,
+                0,
+                None,
+            )?;
+            let ready = match worker.result.recv_timeout(Duration::from_secs(60))? {
+                GenerationResult::Ready(ready) => ready,
+                GenerationResult::Failed(error) => return Err(error),
+                GenerationResult::Cancelled => anyhow::bail!("initial world cancelled"),
+            };
+            let targets = ready.mesh.targets.as_deref().context("targets missing")?;
+            assert!(ready.suggested_spawn.is_some());
+            assert!(
+                targets
+                    .iter()
+                    .all(|pos| ready.batch.schedule().completed(*pos)
+                        == Some(GenerationStage::Spawn))
+            );
+            let count: usize = targets
+                .iter()
+                .map(|&pos| ready.batch.recorded_generated_entities(pos).unwrap().len())
+                .sum();
+            if spawn_mobs && !disabled {
+                assert!(count > 0, "expected generated sheep");
+            } else {
+                assert_eq!(count, 0);
+            }
+            assert_eq!(worker.progress().phase, GenerationPhase::Ready);
+        }
+        Ok(())
+    }
 
     #[test]
     fn cancellation_and_errors_report_terminal_state() {

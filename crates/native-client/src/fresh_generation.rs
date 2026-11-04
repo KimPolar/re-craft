@@ -41,6 +41,18 @@ pub struct PreparedFreshGeneration {
     resolve: Resolver,
 }
 
+/// Inputs kept together from pack selection through initial creature spawning.
+pub struct PreparedInitialWorld {
+    pub batch: FreshTerrainBatch,
+    pub resources: ResourceStack,
+    pub classify: Classifier,
+    pub resolve: Resolver,
+    pub height_tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    pub worldgen_settings: native_persistence::nbt::NamedTag,
+    pub creatures: Option<PreparedCreatureSpawning>,
+    pub spawn_mobs: bool,
+}
+
 /// All inputs for world-generation creatures, resolved from the same active
 /// pack stack and world clock state used by the generation batch.
 pub struct PreparedCreatureSpawning {
@@ -170,6 +182,45 @@ impl PreparedCreatureSpawning {
 }
 
 impl PreparedFreshGeneration {
+    /// Resolve world-spawn and creature inputs from the already-selected pack
+    /// stack, then transfer that same stack to the generation worker.
+    pub fn into_initial_world_inputs(
+        mut self,
+        border: native_session::respawn::RespawnBorder,
+        clocks: BTreeMap<ResourceId, i64>,
+        spawn_mobs: bool,
+    ) -> Result<PreparedInitialWorld> {
+        let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
+            Some(PreparedCreatureSpawning::load(
+                &mut self.resources,
+                &self.lighting,
+                border,
+                clocks,
+            )?)
+        } else {
+            None
+        };
+        let height_tags = if let Some(creatures) = &creatures {
+            Arc::new(creatures.height_tags.clone())
+        } else {
+            let blocks = self.resources.vanilla_block_ids()?;
+            Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut self.resources,
+                &blocks,
+            )?)
+        };
+        Ok(PreparedInitialWorld {
+            batch: self.batch,
+            resources: self.resources,
+            classify: self.classify,
+            resolve: self.resolve,
+            height_tags,
+            worldgen_settings: self.worldgen_settings,
+            creatures,
+            spawn_mobs,
+        })
+    }
+
     /// Compute the generation origin before moving these inputs to a worker.
     pub fn spawn_origin(&mut self) -> Result<native_world::loaded::ChunkPos> {
         self.batch.spawn_origin(&mut self.resources)
@@ -335,6 +386,106 @@ mod tests {
                 native_resources::animal_variants::FarmAnimal::Chicken
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn initial_world_inputs_keep_selected_pack_for_terrain_and_creatures() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut vanilla = ResourceStack::open(&game)?;
+        let mut dimension: Value = serde_json::from_slice(
+            &vanilla
+                .read_data("data/minecraft/dimension_type/overworld.json")?
+                .context("dimension missing")?,
+        )?;
+        dimension["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"] =
+            json!(0.31);
+        let clocks: BTreeMap<_, _> =
+            native_resources::world_clock::registered_clocks(&mut vanilla)?
+                .into_iter()
+                .map(|id| (id, 0))
+                .collect();
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/overrides");
+        let dimension_dir = pack.join("data/minecraft/dimension_type");
+        let tag_dir = pack.join("data/minecraft/tags/block");
+        std::fs::create_dir_all(&dimension_dir)?;
+        std::fs::create_dir_all(&tag_dir)?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        std::fs::write(
+            dimension_dir.join("overworld.json"),
+            serde_json::to_vec(&dimension)?,
+        )?;
+        std::fs::write(
+            tag_dir.join("blocks_motion_in_heightmap.json"),
+            br#"{"replace":true,"values":["minecraft:grass_block"]}"#,
+        )?;
+        let prepared = prepare(FreshGenerationSettings {
+            minecraft_dir: game,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            bonus_chest: false,
+            structures_enabled: false,
+            data_packs: Some((
+                world,
+                DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/overrides".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                },
+            )),
+        })?;
+        let border = native_session::respawn::RespawnBorder {
+            min_x: -100.0,
+            max_x: 100.0,
+            min_z: -100.0,
+            max_z: 100.0,
+        };
+        let mut inputs = prepared.into_initial_world_inputs(border, clocks, true)?;
+        let active: Value = serde_json::from_slice(
+            &inputs
+                .resources
+                .read_data("data/minecraft/dimension_type/overworld.json")?
+                .context("active dimension missing")?,
+        )?;
+        assert_eq!(active, dimension);
+        assert_eq!(
+            inputs
+                .creatures
+                .as_ref()
+                .unwrap()
+                .environment
+                .dimension_attributes()["minecraft:gameplay/creature_world_gen_spawn_probability"],
+            json!(0.31)
+        );
+        assert!(
+            inputs
+                .height_tags
+                .for_block("minecraft:grass_block")?
+                .blocks_motion
+        );
+        assert!(
+            !inputs
+                .height_tags
+                .for_block("minecraft:stone")?
+                .blocks_motion
+        );
+        assert_eq!(
+            inputs
+                .worldgen_settings
+                .value
+                .get("data")
+                .and_then(|v| v.get("seed")),
+            Some(&native_persistence::nbt::Tag::Long(42))
+        );
         Ok(())
     }
 

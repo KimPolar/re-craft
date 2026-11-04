@@ -3340,6 +3340,10 @@ mod tests {
             let playable = before.world.loaded().unwrap();
             assert_eq!(playable.chunks.len(), 1);
             assert!(playable.chunks[&center].block_light_correct);
+            assert_eq!(
+                playable.saved_block_entities[&center],
+                native_world::loaded::SavedBlockEntities::Unavailable
+            );
             assert_eq!(playable.light(8, 16, 8, true), Some(15));
             assert!(before.inventory.slot(PlayerSlot::Storage(0)).is_none());
             let maps = session

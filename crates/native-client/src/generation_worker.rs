@@ -279,6 +279,13 @@ impl GenerationReady {
             }
             Arc::make_mut(chunk).block_light_correct = true;
         }
+        for &pos in targets.iter() {
+            let stage = self.batch.schedule().completed(pos);
+            let payload = generated_session_block_entities(stage, || {
+                self.batch.spawned_block_entity_data(pos)
+            });
+            world.saved_block_entities.insert(pos, payload);
+        }
         let mut session = LoadedSession::new(
             world,
             self.mesh.origin,
@@ -337,6 +344,38 @@ impl GenerationReady {
             }
         }
         Ok(session)
+    }
+}
+
+/// A lit protochunk may still change during generation. Only publish block
+/// entities after SPAWN and after the batch verifies all block/entity pairs.
+fn generated_session_block_entities(
+    stage: Option<GenerationStage>,
+    load: impl FnOnce() -> Result<native_persistence::nbt::Tag>,
+) -> native_world::loaded::SavedBlockEntities {
+    use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+    use native_world::loaded::SavedBlockEntities;
+
+    if !stage.is_some_and(|stage| stage >= GenerationStage::Spawn) {
+        return SavedBlockEntities::Unavailable;
+    }
+    match load() {
+        Ok(Tag::List { values, .. }) if values.is_empty() => SavedBlockEntities::Empty,
+        Ok(
+            tag @ Tag::List {
+                element_type: TagType::Compound,
+                ..
+            },
+        ) => {
+            match nbt::write(&NamedTag {
+                name: "".into(),
+                value: tag,
+            }) {
+                Ok(bytes) => SavedBlockEntities::Encoded(bytes.into()),
+                Err(_) => SavedBlockEntities::Unavailable,
+            }
+        }
+        _ => SavedBlockEntities::Unavailable,
     }
 }
 
@@ -1336,6 +1375,66 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn generated_session_block_entities_preserve_verified_data() {
+        use native_persistence::nbt::{self, Tag, TagType};
+        use native_resources::structure_start::HorizontalDirection;
+        use native_session::worldgen::GeneratedLootChest;
+        use native_world::loaded::SavedBlockEntities;
+
+        let chest = GeneratedLootChest::new(
+            [3, 8, 2],
+            HorizontalDirection::West,
+            "minecraft:chests/simple_dungeon",
+            -7,
+        )
+        .unwrap();
+        let list = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![chest.block_entity()],
+        };
+        let payload =
+            generated_session_block_entities(Some(GenerationStage::Spawn), || Ok(list.clone()));
+        let SavedBlockEntities::Encoded(bytes) = &payload else {
+            panic!("verified generated chest was not encoded");
+        };
+        assert_eq!(nbt::read(bytes).unwrap().value, list);
+        let error = native_session::saved_chest::read(
+            &payload,
+            ChunkPos { x: 0, z: 0 },
+            IVec3::new(3, 8, 2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("loot table must be generated"));
+
+        let empty = || {
+            Ok(Tag::List {
+                element_type: TagType::Compound,
+                values: vec![],
+            })
+        };
+        assert_eq!(
+            generated_session_block_entities(Some(GenerationStage::Spawn), empty),
+            SavedBlockEntities::Empty
+        );
+        assert_eq!(
+            generated_session_block_entities(Some(GenerationStage::Light), || panic!(
+                "premature load"
+            )),
+            SavedBlockEntities::Unavailable
+        );
+        assert_eq!(
+            generated_session_block_entities(Some(GenerationStage::Spawn), || anyhow::bail!(
+                "incomplete record"
+            )),
+            SavedBlockEntities::Unavailable
+        );
+        assert_eq!(
+            generated_session_block_entities(Some(GenerationStage::Spawn), || Ok(Tag::Int(1))),
+            SavedBlockEntities::Unavailable
+        );
+    }
+
+    #[test]
     fn generated_session_retains_only_selected_chunk_metadata() {
         use native_world::loaded::{
             Chunk, SavedBlockEntities, SavedBlockTick, SavedFluidTick, World,
@@ -1869,6 +1968,11 @@ mod tests {
                     pose: native_session::PlayerPose::Standing,
                 };
                 let mut session = ready.start_session(player)?;
+                let snapshot = session.snapshot();
+                assert!(targets.iter().all(|pos| matches!(
+                    snapshot.world.loaded().unwrap().saved_block_entities.get(pos),
+                    Some(native_world::loaded::SavedBlockEntities::Empty)
+                )));
                 assert_eq!(
                     session.snapshot().game_mode,
                     native_session::GameMode::Creative

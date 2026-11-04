@@ -315,14 +315,31 @@ impl Canvas {
     }
 
     pub fn blur_radius(&mut self, radius: u8) {
+        self.blur_radius_cancellable(radius, &|| false);
+    }
+
+    /// A cancelled canvas is incomplete and must be discarded by the caller.
+    pub(crate) fn blur_radius_cancellable(
+        &mut self,
+        radius: u8,
+        cancelled: &impl Fn() -> bool,
+    ) -> bool {
         if radius == 0 || self.width == 0 || self.height == 0 {
-            return;
+            return !cancelled();
         }
         let mut temporary = vec![0; self.pixels.len()];
         let mut columns = vec![[0u32; 3]; self.width as usize];
         for _ in 0..3 {
-            self.blur_pass(i32::from(radius.min(10)), &mut temporary, &mut columns);
+            if !self.blur_pass(
+                i32::from(radius.min(10)),
+                &mut temporary,
+                &mut columns,
+                cancelled,
+            ) {
+                return false;
+            }
         }
+        !cancelled()
     }
 
     #[cfg(test)]
@@ -332,12 +349,21 @@ impl Canvas {
         }
         let mut temporary = vec![0; self.pixels.len()];
         let mut columns = vec![[0u32; 3]; self.width as usize];
-        self.blur_pass(radius, &mut temporary, &mut columns);
+        self.blur_pass(radius, &mut temporary, &mut columns, &|| false);
     }
 
-    fn blur_pass(&mut self, radius: i32, temporary: &mut [u32], columns: &mut [[u32; 3]]) {
+    fn blur_pass(
+        &mut self,
+        radius: i32,
+        temporary: &mut [u32],
+        columns: &mut [[u32; 3]],
+        cancelled: &impl Fn() -> bool,
+    ) -> bool {
         let count = (radius * 2 + 1) as u32;
         for y in 0..self.height {
+            if y % 8 == 0 && cancelled() {
+                return false;
+            }
             let mut sums = [0u32; 3];
             for offset in -radius..=radius {
                 let pixel =
@@ -373,6 +399,9 @@ impl Canvas {
             }
         }
         for y in 0..self.height {
+            if y % 8 == 0 && cancelled() {
+                return false;
+            }
             let row = y as usize * width;
             let old_row = (y - radius).clamp(0, self.height - 1) as usize * width;
             let new_row = (y + radius + 1).clamp(0, self.height - 1) as usize * width;
@@ -388,17 +417,32 @@ impl Canvas {
                 sums[2] = sums[2] - (old & 255) + (new & 255);
             }
         }
+        true
     }
 
     pub fn panorama(&mut self, faces: &[RgbaImage], overlay: &RgbaImage, seconds: f32) {
+        self.panorama_cancellable(faces, overlay, seconds, &|| false);
+    }
+
+    /// A cancelled canvas is incomplete and must be discarded by the caller.
+    pub(crate) fn panorama_cancellable(
+        &mut self,
+        faces: &[RgbaImage],
+        overlay: &RgbaImage,
+        seconds: f32,
+        cancelled: &(impl Fn() -> bool + Sync),
+    ) -> bool {
         if crate::menu_assets::validate_panorama_faces(faces).is_err() {
-            return;
+            return !cancelled();
         }
         let yaw = seconds * (std::f32::consts::PI / 90.0);
         let (sin, cos) = yaw.sin_cos();
         let aspect = self.width as f32 / self.height.max(1) as f32;
         if self.glint.is_some() {
             for y in 0..self.height {
+                if y % 8 == 0 && cancelled() {
+                    return false;
+                }
                 for x in 0..self.width {
                     let uv = [
                         (x as f32 + 0.5) / self.width as f32,
@@ -424,8 +468,13 @@ impl Canvas {
                 1
             };
             let rows = height.div_ceil(workers);
+            let stopped = std::sync::atomic::AtomicBool::new(false);
             let draw = |index: usize, chunk: &mut [u32]| {
                 for (local_y, row) in chunk.chunks_mut(width).enumerate() {
+                    if local_y % 8 == 0 && cancelled() {
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                     let y = index * rows + local_y;
                     for (x, pixel) in row.iter_mut().enumerate() {
                         let uv = [
@@ -450,6 +499,9 @@ impl Canvas {
                     }
                 });
             }
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) || cancelled() {
+                return false;
+            }
         }
         self.image(
             overlay,
@@ -460,6 +512,7 @@ impl Canvas {
                 h: self.height,
             },
         );
+        !cancelled()
     }
 
     pub fn button(
@@ -1345,6 +1398,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn panorama_and_blur_stop_when_scene_is_superseded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let faces: Vec<_> = (0..6)
+            .map(|_| RgbaImage::from_pixel(4, 4, image::Rgba([100, 80, 60, 255])))
+            .collect();
+        let overlay = RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut canvas = Canvas::new(64, 64);
+        let checks = AtomicUsize::new(0);
+        assert!(!canvas.panorama_cancellable(&faces, &overlay, 0.0, &|| {
+            checks.fetch_add(1, Ordering::Relaxed) >= 1
+        }));
+        assert_ne!(canvas.pixels[0], 0);
+        assert_eq!(canvas.pixels[16 * 64], 0);
+
+        let checks = AtomicUsize::new(0);
+        assert!(
+            !canvas.blur_radius_cancellable(5, &|| { checks.fetch_add(1, Ordering::Relaxed) >= 1 })
+        );
+        assert!(checks.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    #[ignore = "CPU cancellation measurement"]
+    fn measure_panorama_cancellation_after_scene_change() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::Instant;
+        let faces: Vec<_> = (0..6)
+            .map(|face| {
+                RgbaImage::from_fn(256, 256, |x, y| {
+                    image::Rgba([
+                        (x + face * 31) as u8,
+                        (y + face * 47) as u8,
+                        (x + y) as u8,
+                        255,
+                    ])
+                })
+            })
+            .collect();
+        let overlay = RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut baseline = Canvas::new(1920, 1080);
+        let started = Instant::now();
+        baseline.panorama(&faces, &overlay, 2.0);
+        let full = started.elapsed();
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let stopped = AtomicBool::new(false);
+        let first = AtomicBool::new(true);
+        let checks = AtomicUsize::new(0);
+        let elapsed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut canvas = Canvas::new(1920, 1080);
+                canvas.panorama_cancellable(&faces, &overlay, 2.0, &|| {
+                    if checks.fetch_add(1, Ordering::Relaxed) >= 16
+                        && first.swap(false, Ordering::Relaxed)
+                    {
+                        entered.wait();
+                        resume.wait();
+                    }
+                    stopped.load(Ordering::Relaxed)
+                })
+            });
+            entered.wait();
+            let started = Instant::now();
+            stopped.store(true, Ordering::Relaxed);
+            resume.wait();
+            assert!(!worker.join().unwrap());
+            started.elapsed()
+        });
+        eprintln!(
+            "1080p software panorama, one sample each: complete={full:?}, cancellation={elapsed:?}; excludes display"
+        );
     }
 
     #[test]

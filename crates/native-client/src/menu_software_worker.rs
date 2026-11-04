@@ -1,7 +1,10 @@
 //! CPU menu composition runs away from the window event loop. Only the latest
 //! request and completed image are kept while the compositor is busy.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Result, anyhow};
@@ -35,12 +38,15 @@ struct State {
     completed: Option<SoftwareImage>,
     closed: bool,
     failed: bool,
+    generation: Option<u64>,
 }
 
 #[derive(Default)]
 struct Mailbox {
     state: Mutex<State>,
     changed: Condvar,
+    generation: AtomicU64,
+    closed: AtomicBool,
 }
 
 impl Mailbox {
@@ -49,6 +55,8 @@ impl Mailbox {
         if state.closed {
             return false;
         }
+        state.generation = Some(frame.generation);
+        self.generation.store(frame.generation, Ordering::Release);
         state.pending = Some(frame);
         self.changed.notify_one();
         true
@@ -71,8 +79,14 @@ impl Mailbox {
         if state.closed {
             return false;
         }
-        state.completed = Some(image);
+        if state.generation == Some(image.generation) {
+            state.completed = Some(image);
+        }
         true
+    }
+
+    fn superseded(&self, generation: u64) -> bool {
+        self.closed.load(Ordering::Acquire) || self.generation.load(Ordering::Acquire) != generation
     }
 
     fn latest_overlay(&self, generation: u64) -> Option<Arc<Canvas>> {
@@ -95,6 +109,7 @@ impl Mailbox {
     fn close(&self, failed: bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
+        self.closed.store(true, Ordering::Release);
         state.failed = failed;
         state.pending = None;
         self.changed.notify_one();
@@ -116,7 +131,9 @@ impl MenuSoftwareWorker {
                 let result = std::panic::catch_unwind(|| {
                     let mut background = None;
                     while let Some(frame) = shared.receive() {
-                        let image = compose(frame, Some(&shared), &mut background);
+                        let Some(image) = compose(frame, Some(&shared), &mut background) else {
+                            continue;
+                        };
                         if !shared.complete(image) {
                             break;
                         }
@@ -185,7 +202,12 @@ fn compose(
     frame: SoftwareFrame,
     mailbox: Option<&Mailbox>,
     background: &mut Option<CachedBackground>,
-) -> SoftwareImage {
+) -> Option<SoftwareImage> {
+    let generation = frame.generation;
+    let cancelled = || mailbox.is_some_and(|mailbox| mailbox.superseded(generation));
+    if cancelled() {
+        return None;
+    }
     let mut canvas = if frame.cache_background
         && let Some(cached) = background.as_ref().filter(|cached| cached.matches(&frame))
     {
@@ -198,10 +220,20 @@ fn compose(
     } else {
         let mut canvas = Canvas::new(frame.size.0, frame.size.1);
         if let Some(assets) = &frame.assets {
-            canvas.panorama(&assets.panorama, &assets.panorama_overlay, frame.seconds);
-            if frame.blurred {
-                canvas.blur_radius(frame.blur_radius);
+            if !canvas.panorama_cancellable(
+                &assets.panorama,
+                &assets.panorama_overlay,
+                frame.seconds,
+                &cancelled,
+            ) {
+                return None;
             }
+            if frame.blurred && !canvas.blur_radius_cancellable(frame.blur_radius, &cancelled) {
+                return None;
+            }
+        }
+        if cancelled() {
+            return None;
         }
         *background = frame.cache_background.then(|| CachedBackground {
             size: frame.size,
@@ -219,11 +251,14 @@ fn compose(
         .and_then(|mailbox| mailbox.latest_overlay(frame.generation))
         .unwrap_or(frame.overlay);
     composite_scaled(&mut canvas, &overlay, frame.scale);
-    SoftwareImage {
+    if cancelled() {
+        return None;
+    }
+    Some(SoftwareImage {
         size: frame.size,
         generation: frame.generation,
         pixels: canvas.pixels,
-    }
+    })
 }
 
 fn composite_scaled(background: &mut Canvas, overlay: &Canvas, scale: u32) {
@@ -332,8 +367,8 @@ mod tests {
             assert!(mailbox.submit(frame(generation)));
         }
         assert_eq!(mailbox.receive().unwrap().generation, 100);
-        assert!(mailbox.complete(compose(frame(1), None, &mut None)));
-        assert!(mailbox.complete(compose(frame(100), None, &mut None)));
+        assert!(mailbox.complete(compose(frame(1), None, &mut None).unwrap()));
+        assert!(mailbox.complete(compose(frame(100), None, &mut None).unwrap()));
         let image = mailbox.take().unwrap().unwrap();
         assert_eq!(image.generation, 100);
         assert_eq!(image.size, (7, 5));
@@ -365,7 +400,7 @@ mod tests {
         newer.overlay = Arc::new(overlay);
         assert!(mailbox.submit(newer));
         assert_eq!(
-            compose(current, Some(&mailbox), &mut None).pixels[0],
+            compose(current, Some(&mailbox), &mut None).unwrap().pixels[0],
             0xffab_cdef
         );
 
@@ -378,10 +413,7 @@ mod tests {
         overlay.pixels[0] = 0xffab_cdef;
         other_scene.overlay = Arc::new(overlay);
         assert!(mailbox.submit(other_scene));
-        assert_eq!(
-            compose(old_scene, Some(&mailbox), &mut None).pixels[0],
-            0xff12_3456
-        );
+        assert!(compose(old_scene, Some(&mailbox), &mut None).is_none());
     }
 
     #[test]
@@ -389,22 +421,41 @@ mod tests {
         let mut cache = None;
         let mut input = frame(7);
         input.cache_background = true;
-        let first = compose(input.clone(), None, &mut cache);
+        let first = compose(input.clone(), None, &mut cache).unwrap();
         cache.as_mut().unwrap().pixels[0] = 0xff12_3456;
-        let reused = compose(input.clone(), None, &mut cache);
+        let reused = compose(input.clone(), None, &mut cache).unwrap();
         assert_eq!(reused.pixels[0], 0xff12_3456);
         input.seconds += 1.0;
-        let changed = compose(input.clone(), None, &mut cache);
+        let changed = compose(input.clone(), None, &mut cache).unwrap();
         assert_eq!(changed.pixels, first.pixels);
         cache.as_mut().unwrap().pixels[0] = 0xff12_3456;
         input.blur_radius += 1;
         assert_eq!(
-            compose(input.clone(), None, &mut cache).pixels,
+            compose(input.clone(), None, &mut cache).unwrap().pixels,
             first.pixels
         );
         input.cache_background = false;
-        compose(input, None, &mut cache);
+        compose(input, None, &mut cache).unwrap();
         assert!(cache.is_none());
+    }
+
+    #[test]
+    fn superseded_or_closed_scene_is_not_published() {
+        let mailbox = Mailbox::default();
+        assert!(mailbox.submit(frame(1)));
+        let old = mailbox.receive().unwrap();
+        assert!(mailbox.submit(frame(2)));
+        assert!(mailbox.superseded(old.generation));
+        assert!(compose(old.clone(), Some(&mailbox), &mut None).is_none());
+        // Completion can race with submission, so the mailbox rechecks it.
+        assert!(mailbox.complete(compose(old, None, &mut None).unwrap()));
+        assert!(mailbox.take().unwrap().is_none());
+        let latest = mailbox.receive().unwrap();
+        assert!(!mailbox.superseded(latest.generation));
+        assert!(mailbox.complete(compose(latest, None, &mut None).unwrap()));
+        assert_eq!(mailbox.take().unwrap().unwrap().generation, 2);
+        mailbox.close(false);
+        assert!(mailbox.superseded(2));
     }
 
     #[test]
@@ -428,21 +479,21 @@ mod tests {
         };
         let mut cache = None;
         let started = Instant::now();
-        let original = compose(input.clone(), None, &mut cache);
+        let original = compose(input.clone(), None, &mut cache).unwrap();
         let uncached = started.elapsed();
         let started = Instant::now();
-        let reused = compose(input.clone(), None, &mut cache);
+        let reused = compose(input.clone(), None, &mut cache).unwrap();
         let cached = started.elapsed();
         assert_eq!(original.pixels, reused.pixels);
         let mut overlay = Canvas::new(640, 360);
         overlay.pixel(5, 5, [255, 0, 0, 255]);
         input.overlay = Arc::new(overlay);
-        let changed_overlay = compose(input.clone(), None, &mut cache);
+        let changed_overlay = compose(input.clone(), None, &mut cache).unwrap();
         assert_eq!(changed_overlay.pixels[15 * 1920 + 15], 0xffff_0000);
         input.seconds += 1.0;
-        let changed = compose(input.clone(), None, &mut cache);
+        let changed = compose(input.clone(), None, &mut cache).unwrap();
         input.cache_background = false;
-        let fresh = compose(input, None, &mut None);
+        let fresh = compose(input, None, &mut None).unwrap();
         assert_eq!(changed.pixels, fresh.pixels);
         eprintln!(
             "1080p stationary software menu, one sample each: first={uncached:?}, cached={cached:?}; includes blur and compositing"
@@ -470,7 +521,7 @@ mod tests {
             assets: Some(Arc::clone(&assets)),
             overlay,
         };
-        let actual = compose(frame, None, &mut None);
+        let actual = compose(frame, None, &mut None).unwrap();
         let mut expected = Canvas::new(641, 481);
         expected.panorama(&assets.panorama, &assets.panorama_overlay, 2.0);
         expected.blur_radius(5);

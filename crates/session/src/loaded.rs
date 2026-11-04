@@ -46234,6 +46234,177 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn new_player_can_transfer_chest_items_in_a_partial_world_save() {
+        use flate2::{
+            Compression,
+            write::{GzEncoder, ZlibEncoder},
+        };
+        use native_persistence::{
+            edit::{BlockChange, draft_chunk_blocks},
+            nbt::{self, NamedTag, Tag},
+            palette::BlockState as SavedState,
+            world::{ChunkPos as SavedPos, DimensionId, WorldReader},
+        };
+        use native_world::loaded::SavedBlockEntities;
+        use std::io::Write;
+
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/session-save-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("world-")
+            .tempdir_in(parent)
+            .unwrap();
+        let gzip = |path: &std::path::Path, tag: &NamedTag| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut out = GzEncoder::new(Vec::new(), Compression::default());
+            out.write_all(&nbt::write(tag).unwrap()).unwrap();
+            std::fs::write(path, out.finish().unwrap()).unwrap();
+        };
+        let level = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Time".into(), Tag::Long(41)),
+                ]),
+            )]),
+        });
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        gzip(&root.path().join("level.dat"), &level);
+        gzip(&root.path().join("data/minecraft/world_clocks.dat"), &clock);
+
+        let (mut session, source_world, position, home) = saved_chest_fixture();
+        session.set_new_player_last_death().unwrap();
+        let uuid = session.initialize_new_player().unwrap();
+        session.set_initial_game_time(41).unwrap();
+        session
+            .capture_level_time_source(Arc::clone(&level))
+            .unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let block = |name: &str, properties: &[(&str, &str)]| SavedState {
+            name: name.into(),
+            properties: properties
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        };
+        let change = BlockChange {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+            expected: block("minecraft:stone", &[]),
+            replacement: block(
+                "minecraft:chest",
+                &[
+                    ("facing", "north"),
+                    ("type", "single"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        };
+        let mut source = draft_chunk_blocks(
+            &fixture_chunk_document(home),
+            SavedPos {
+                x: home.x,
+                z: home.z,
+            },
+            &[change],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let SavedBlockEntities::Encoded(bytes) = &source_world.saved_block_entities[&home] else {
+            panic!("missing chest")
+        };
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), nbt::read(bytes).unwrap().value));
+        let raw = nbt::write(&source).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let sectors = (compressed.len() + 5).div_ceil(4096);
+        assert!(sectors < 256);
+        let mut region = vec![0u8; (2 + sectors) * 4096];
+        let index = home.x.rem_euclid(32) as usize + 32 * home.z.rem_euclid(32) as usize;
+        region[index * 4..index * 4 + 4]
+            .copy_from_slice(&((2u32 << 8) | sectors as u32).to_be_bytes());
+        region[8192..8196].copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+        region[8196] = 2;
+        region[8197..8197 + compressed.len()].copy_from_slice(&compressed);
+        let directory = root.path().join("dimensions/minecraft/overworld/region");
+        std::fs::create_dir_all(&directory).unwrap();
+        let region_path = directory.join(format!(
+            "r.{}.{}.mca",
+            home.x.div_euclid(32),
+            home.z.div_euclid(32)
+        ));
+        std::fs::write(&region_path, &region).unwrap();
+        assert!(session.try_open_saved_chest(position - session.origin));
+        session.submit_command(PlayerCommand::InventoryQuickMove {
+            slot: crate::inventory::PlayerSlot::Chest(3),
+        });
+        session.update(TICK);
+        session.submit_command(PlayerCommand::ToggleInventory);
+        session.update(TICK);
+        let terrain = BTreeMap::from([(home, &source)]);
+        let make = || {
+            session.draft_new_player_terrain_entities_and_clocks(
+                &terrain,
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+        };
+        let draft = make().unwrap();
+        let inventory =
+            crate::player_data::read_saved_player(draft.player_and_terrain().player()).unwrap();
+        assert_eq!(
+            inventory
+                .slot(crate::inventory::PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            5
+        );
+        let plan = draft
+            .into_new_player_save_plan(&BTreeMap::new(), &clock, 1)
+            .unwrap();
+        let mut writer = native_persistence::save::WorldWriteGuard::acquire(root.path()).unwrap();
+        writer.write_plan(plan, |_, _| Ok(())).unwrap();
+        let mut reader =
+            WorldReader::open(root.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+        let saved = reader.read_player().unwrap().unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_player(&saved)
+                .unwrap()
+                .slot(crate::inventory::PlayerSlot::Storage(8))
+                .unwrap()
+                .count(),
+            5
+        );
+        let chunk = reader.read_chunk(home.x, home.z).unwrap().unwrap();
+        let Some(Tag::List { values, .. }) = chunk.document.value.get("block_entities") else {
+            panic!("missing chest")
+        };
+        assert!(
+            matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        assert_eq!(reader.game_time().unwrap(), 43);
+    }
+
+    #[test]
     fn new_player_partial_plan_requires_captured_level_source() {
         use native_persistence::nbt::{NamedTag, Tag};
         let clock = NamedTag {

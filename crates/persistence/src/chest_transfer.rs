@@ -209,6 +209,20 @@ pub(crate) fn validate(
     Ok(())
 }
 
+/// A new player has no persisted inventory, equipment or ender chest. Use a
+/// fixed empty baseline rather than accepting caller-supplied starting items.
+pub(crate) fn validate_new_player(
+    replacement: &NamedTag,
+    uuid: [i32; 4],
+    changes: &[&CheckedChestInventory],
+) -> Result<()> {
+    let source = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![("UUID".into(), Tag::IntArray(uuid.to_vec()))]),
+    };
+    validate(&source, replacement, uuid, changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

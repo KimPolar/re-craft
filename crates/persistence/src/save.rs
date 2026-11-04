@@ -863,18 +863,20 @@ impl WorldWriteGuard {
                 "chest inventory changes require exactly one player"
             );
             let player = &plan.players[0];
-            let source = nbt::read(
-                player
-                    .source_nbt
-                    .as_ref()
-                    .context("chest inventory changes require an existing player source")?,
-            )?;
-            crate::chest_transfer::validate(
-                &source,
-                &player.document,
-                player.uuid_words,
-                &chest_changes,
-            )?;
+            if let Some(source) = &player.source_nbt {
+                crate::chest_transfer::validate(
+                    &nbt::read(source)?,
+                    &player.document,
+                    player.uuid_words,
+                    &chest_changes,
+                )?;
+            } else {
+                crate::chest_transfer::validate_new_player(
+                    &player.document,
+                    player.uuid_words,
+                    &chest_changes,
+                )?;
+            }
         }
         let mut groups = BTreeMap::<(RegionKind, DimensionId, i32, i32), Vec<RegionChange>>::new();
         for chunk in &plan.chunks {
@@ -4392,6 +4394,132 @@ mod tests {
         guard.write_plan(valid, |_, _| Ok(())).unwrap();
         assert_ne!(fs::read(&region_path).unwrap(), region);
         assert_ne!(fs::read(&player_path).unwrap(), player_bytes);
+    }
+
+    #[test]
+    fn new_player_chest_transfer_requires_conservation_and_commits_atomically() {
+        use crate::edit::BlockEntityChange;
+        let world = test_world();
+        let (region_path, mut region, _) = fixture(world.path());
+        let (_, level) = anvil::read_level_document(world.path()).unwrap();
+        let level_before = fs::read(world.path().join("level.dat")).unwrap();
+        let position = ChunkPos { x: 0, z: 0 };
+        let mut source = draft_chunk_blocks(
+            &editable_chunk(0),
+            position,
+            &[BlockChange {
+                x: 0,
+                y: 0,
+                z: 0,
+                expected: block_state("minecraft:stone"),
+                replacement: block_state("minecraft:chest"),
+            }],
+        )
+        .unwrap()
+        .document()
+        .clone();
+        let stack = |slot, count| {
+            Tag::Compound(vec![
+                ("Slot".into(), Tag::Byte(slot)),
+                ("id".into(), Tag::String("minecraft:diamond".into())),
+                ("count".into(), Tag::Int(count)),
+            ])
+        };
+        let items = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let chest = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(0)),
+            ("y".into(), Tag::Int(0)),
+            ("z".into(), Tag::Int(0)),
+            ("Items".into(), items(vec![stack(3, 5)])),
+            ("future".into(), Tag::Int(42)),
+        ]);
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields.push(("block_entities".into(), items(vec![chest.clone()])));
+        store_record(&mut region, 0, 2, &source, 10);
+        fs::write(&region_path, &region).unwrap();
+        let mut replacement = chest.clone();
+        let Tag::Compound(fields) = &mut replacement else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Items"))
+            .unwrap()
+            .1 = items(vec![]);
+        let change = BlockEntityChange {
+            expected: chest,
+            replacement,
+        };
+        let make_draft = || {
+            let mut draft = draft_chunk_blocks(&source, position, &[]).unwrap();
+            draft
+                .stage_checked_chest_inventories(std::slice::from_ref(&change))
+                .unwrap();
+            draft
+        };
+        let uuid = [0, 0, 0, 1];
+        let player = |count| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                ("Inventory".into(), items(vec![stack(8, count)])),
+            ]),
+        };
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let make_plan = |player: &NamedTag| {
+            let mut plan = WorldSavePlan::new();
+            plan.add_chunk(dimension.clone(), make_draft(), 20).unwrap();
+            plan.add_new_singleplayer(uuid, &level, 42, player, |_| Ok(()))
+                .unwrap();
+            plan
+        };
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let path = world
+            .path()
+            .join("players/data")
+            .join(player_data_filename(uuid));
+        assert!(
+            guard
+                .write_plan(make_plan(&player(6)), |_, _| Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), region);
+        assert_eq!(
+            fs::read(world.path().join("level.dat")).unwrap(),
+            level_before
+        );
+        assert!(!path.exists());
+        let result = guard
+            .write_plan(make_plan(&player(5)), |_, _| Ok(()))
+            .unwrap();
+        assert!(
+            result
+                .backup_directory
+                .join("world-data/level.dat")
+                .exists()
+        );
+        let reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
+        assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+        assert_eq!(reader.read_player().unwrap(), Some(player(5)));
+        let saved = RegionReader::open_for_region(&region_path, 0, 0)
+            .unwrap()
+            .read_chunk(0, 0)
+            .unwrap()
+            .unwrap();
+        let Some(Tag::List { values, .. }) = saved.value.get("block_entities") else {
+            panic!("missing chest")
+        };
+        assert!(
+            matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        assert_eq!(values[0].get("future"), Some(&Tag::Int(42)));
     }
 
     #[test]

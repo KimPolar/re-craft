@@ -862,6 +862,16 @@ fn java_and_rust_round_trip_named_loot_and_random_sequence() {
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_and_rust_round_trip_chest_and_player_transfer() {
+    java_and_rust_chest_transfer(false);
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_and_rust_round_trip_new_player_chest_transfer() {
+    java_and_rust_chest_transfer(true);
+}
+
+fn java_and_rust_chest_transfer(new_player: bool) {
     use native_session::{
         inventory::{PlayerInventory, PlayerSlot},
         player_data,
@@ -907,6 +917,7 @@ fn java_and_rust_round_trip_chest_and_player_transfer() {
         .unwrap();
     let dimension = DimensionId::parse("overworld").unwrap();
     let mut reader = WorldReader::open(&world, dimension.clone()).unwrap();
+    let level_source = reader.level.clone();
     let area = reader.read_area(ChunkPos { x: 0, z: 0 }, 0).unwrap();
     let defaults = std::collections::BTreeMap::from([(
         "minecraft:chest".into(),
@@ -956,20 +967,39 @@ fn java_and_rust_round_trip_chest_and_player_transfer() {
     let player_draft = player_data::draft_player_inventory(&player_source, &inventory).unwrap();
     let mut plan = WorldSavePlan::new();
     plan.add_chunk(dimension.clone(), draft, 2).unwrap();
-    plan.add_player_data(
-        [0, 0, 0, 1],
-        &player_source,
-        player_draft.document(),
-        |source, _| {
-            anyhow::ensure!(player_draft.matches_source(source)?);
-            Ok(())
-        },
-    )
-    .unwrap();
+    if new_player {
+        std::fs::remove_file(&player_path).unwrap();
+        plan.add_new_singleplayer(
+            [0, 0, 0, 1],
+            &level_source,
+            0,
+            player_draft.document(),
+            |_| Ok(()),
+        )
+        .unwrap();
+    } else {
+        plan.add_player_data(
+            [0, 0, 0, 1],
+            &player_source,
+            player_draft.document(),
+            |source, _| {
+                anyhow::ensure!(player_draft.matches_source(source)?);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
     let mut writer = WorldWriteGuard::acquire(&world).unwrap();
     let result = writer.write_plan(plan, |_, _| Ok(())).unwrap();
     assert!(result.backup_directory.exists());
     drop(writer);
+    if new_player {
+        let reader = WorldReader::open(&world, dimension.clone()).unwrap();
+        assert_eq!(
+            reader.singleplayer_uuid_words().unwrap(),
+            Some([0, 0, 0, 1])
+        );
+    }
     assert!(invoke("verifyAndRestoreChestTransfer").contains("OK"));
     let chunk = RegionReader::open(&region)
         .unwrap()

@@ -95,8 +95,10 @@ mod window_test;
 mod world_banner;
 mod world_creation;
 
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -105,7 +107,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use glam::{DVec3, IVec3, Vec3};
 use native_persistence::nbt::{NamedTag, Tag};
-use native_persistence::world::{ChunkPos, DimensionId, WorldReader};
+use native_persistence::world::{ChunkArea, ChunkPos, DimensionId, WorldReader};
 use native_resources::transforms::{BlockTransformers, ToolKind};
 use native_resources::{TextureAtlas, packs::ResourceStack, recipes::CraftingRecipes};
 #[cfg(debug_assertions)]
@@ -681,11 +683,10 @@ fn run_prepared_world(
     }
 }
 
-/// All disk reads and CPU scene preparation are independent of the window
-/// event loop; GUI launches run this on a background thread.
 /// Columns may be selected from any starting offset. Include the two-block
 /// entity-collision margin and the fallback origin without loading their full
 /// bounding square.
+#[cfg(test)]
 fn initial_spawn_chunk_positions(
     origin: IVec3,
     candidates: Option<&native_session::world_spawn::WorldSpawnCandidates>,
@@ -724,6 +725,8 @@ fn initial_spawn_chunk_positions(
     Ok(chunks)
 }
 
+/// All disk reads and CPU scene preparation are independent of the window
+/// event loop; GUI launches run this on a background thread.
 fn prepare_existing_world(
     world_dir: &std::path::Path,
     minecraft_dir: &std::path::Path,
@@ -822,51 +825,17 @@ fn prepare_existing_world(
     };
     // Load only the immediate playable area before opening the window; the
     // streamer fills the configured render distance in the background.
-    let initial_radius = if initial_spawn.is_some() {
-        1
-    } else if play {
-        radius.min(1)
-    } else {
-        radius
-    };
-    let mut area = reader.read_area(center, initial_radius)?;
-    if let Some((spawn, border)) = &initial_spawn {
-        let bounds = native_session::respawn::RespawnBorder::from_saved(*border, 0)?;
-        let camera = player.as_ref().expect("initial spawn has a camera");
-        let x = camera.position[0].floor();
-        let z = camera.position[2].floor();
-        let origin = IVec3::new(x as i32, spawn.position[1], z as i32);
-        let distance = (x - bounds.min_x)
-            .min(bounds.max_x - x)
-            .min(z - bounds.min_z)
-            .min(bounds.max_z - z);
-        let candidates = if native_session::GameMode::from_legacy_id(reader.default_game_type_id()?)
-            == native_session::GameMode::Adventure
-        {
-            None
-        } else {
-            Some(native_session::world_spawn::WorldSpawnCandidates::new(
-                origin,
-                reader.fluid_game_rules()?.respawn_radius,
-                distance,
-                0,
-            )?)
-        };
-        for pos in initial_spawn_chunk_positions(origin, candidates.as_ref())? {
-            if (i64::from(pos.x) - i64::from(center.x)).abs() <= 1
-                && (i64::from(pos.z) - i64::from(center.z)).abs() <= 1
-            {
-                continue;
-            }
-            match reader.read_chunk(pos.x, pos.z)? {
-                Some(chunk) => {
-                    area.chunks.insert(pos, Arc::new(chunk));
-                }
-                None => area.missing.push(pos),
-            }
+    let mut area = if initial_spawn.is_some() {
+        ChunkArea {
+            center,
+            radius: 0,
+            chunks: BTreeMap::new(),
+            missing: Vec::new(),
         }
-    }
-    if area.chunks.is_empty() {
+    } else {
+        reader.read_area(center, if play { radius.min(1) } else { radius })?
+    };
+    if area.chunks.is_empty() && initial_spawn.is_none() {
         bail!("no saved chunks found in the selected area");
     }
     let defaults = if let Some(directory) = block_report {
@@ -1311,9 +1280,6 @@ fn prepare_existing_world(
                 );
             }
         }
-        session
-            .publish_initial_weather_terrain()
-            .map_err(anyhow::Error::msg)?;
         if let Some((spawn, border)) = &initial_spawn {
             let default_mode =
                 native_session::GameMode::from_legacy_id(reader.default_game_type_id()?);
@@ -1331,9 +1297,59 @@ fn prepare_existing_world(
                 ceiling_spawn_height: None,
             })?;
             session.set_saved_respawn_absent()?;
-            let spawn = session
-                .find_initial_player_spawn()
-                .context("cannot determine a safe initial player spawn")?;
+            let spawn = loop {
+                match session.poll_initial_player_spawn() {
+                    Ok(Some(spawn)) => break spawn,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let Some(missing) =
+                            error.downcast_ref::<native_session::loaded::MissingSpawnChunk>()
+                        else {
+                            return Err(error)
+                                .context("cannot determine a safe initial player spawn");
+                        };
+                        let loaded_pos = missing.0;
+                        if session.initial_spawn_chunk_loaded(loaded_pos) {
+                            return Err(error)
+                                .context("cannot determine a safe initial player spawn");
+                        }
+                        let pos = ChunkPos {
+                            x: loaded_pos.x,
+                            z: loaded_pos.z,
+                        };
+                        let saved = Arc::new(reader.read_chunk(pos.x, pos.z)
+                            .with_context(|| format!("cannot read initial spawn chunk {}, {}", pos.x, pos.z))?
+                            .with_context(|| format!("initial spawn chunk {}, {} is missing and cannot yet be generated", pos.x, pos.z))?);
+                        let single = ChunkArea {
+                            center: pos,
+                            radius: 0,
+                            chunks: BTreeMap::from([(pos, Arc::clone(&saved))]),
+                            missing: Vec::new(),
+                        };
+                        let chunk_world =
+                            single.materialize_with_defaults(reader.dimension(), &defaults)?;
+                        let entities = chunk_stream::read_entity_data(&mut reader, loaded_pos);
+                        let poi = chunk_stream::read_poi_data(&mut reader, loaded_pos);
+                        let maps = heightmap_tags.as_ref().and_then(|tags| {
+                            match native_session::spawn_heightmaps::prepare(&saved, &chunk_world, native_persistence::heightmap::HeightBounds { min_y, max_y }, tags) {
+                                Ok(maps) => Some(maps),
+                                Err(error) => {
+                                    eprintln!("Could not prepare spawn heightmaps for chunk {}, {}: {error:#}", pos.x, pos.z);
+                                    None
+                                }
+                            }
+                        });
+                        session.import_initial_spawn_chunk(
+                            loaded_pos,
+                            chunk_world,
+                            entities,
+                            poi,
+                            maps,
+                        )?;
+                        area.chunks.insert(pos, saved);
+                    }
+                }
+            };
             session
                 .restore_saved_motion(
                     spawn.position - origin.as_dvec3(),
@@ -1363,6 +1379,9 @@ fn prepare_existing_world(
                 .restore_saved_motion(position, motion)
                 .map_err(anyhow::Error::msg)?;
         }
+        session
+            .publish_initial_weather_terrain()
+            .map_err(anyhow::Error::msg)?;
         let default_mode = native_session::GameMode::from_legacy_id(reader.default_game_type_id()?);
         let mode = player_data
             .as_ref()
@@ -3369,6 +3388,7 @@ mod world_open_tests {
             (4, "minecraft:overworld", "minecraft:overworld", true),
             (5, "minecraft:overworld", "minecraft:overworld", true),
             (6, "minecraft:overworld", "minecraft:overworld", true),
+            (7, "minecraft:overworld", "minecraft:overworld", true),
         ] {
             let root = parent.path().join(format!("world-{index}"));
             std::fs::create_dir_all(&root).unwrap();
@@ -3492,7 +3512,7 @@ mod world_open_tests {
                 .join(&dimension.path)
                 .join("region");
             std::fs::create_dir_all(&region_directory).unwrap();
-            let positions = if index >= 5 {
+            let positions = if (5..=6).contains(&index) {
                 let origin = IVec3::new(8, 65, 8);
                 let candidates = native_session::world_spawn::WorldSpawnCandidates::new(
                     origin,
@@ -3553,6 +3573,21 @@ mod world_open_tests {
                 std::fs::write(&path, &region).unwrap();
                 originals.push((path, region));
             }
+            if index == 4 {
+                // This unrelated neighboring chunk has a location entry past
+                // EOF. The first spawn is safely inside chunk 0, 0 and must
+                // not require reading the corrupt neighbor.
+                let mut corrupt = vec![0u8; 8192];
+                corrupt[1023 * 4..1023 * 4 + 4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+                let path = region_directory.join("r.-1.-1.mca");
+                std::fs::write(&path, &corrupt).unwrap();
+                originals.push((path, corrupt));
+            }
+            if index == 7 {
+                let (path, region) = &mut originals[0];
+                region[0..4].copy_from_slice(&((4u32 << 8) | 1).to_be_bytes());
+                std::fs::write(path, region).unwrap();
+            }
             let prepared = prepare_existing_world(
                 &root,
                 &game,
@@ -3567,8 +3602,19 @@ mod world_open_tests {
                     video: menu_settings::VideoSettings::default(),
                 },
                 None,
-            )
-            .unwrap();
+            );
+            if index == 7 {
+                let error = match prepared {
+                    Ok(_) => panic!("corrupt required spawn chunk must fail"),
+                    Err(error) => error,
+                };
+                assert!(format!("{error:#}").contains("cannot read initial spawn chunk 0, 0"));
+                for (path, region) in originals {
+                    assert_eq!(std::fs::read(path).unwrap(), region);
+                }
+                continue;
+            }
+            let prepared = prepared.unwrap();
             let PreparedWorld::Play(prepared) = prepared else {
                 panic!("expected play session")
             };
@@ -3576,7 +3622,20 @@ mod world_open_tests {
             let loaded = snapshot.world.loaded().unwrap();
             assert_eq!(loaded.dimension, name);
             assert_eq!(loaded.dimension_type.as_deref(), Some(expected_type));
-            assert_eq!(loaded.block(0, 0, 0).unwrap().name, "minecraft:stone");
+            let block_x = if index >= 5 {
+                snapshot.player.position.x.floor() as i32
+            } else {
+                0
+            };
+            let block_z = if index >= 5 {
+                snapshot.player.position.z.floor() as i32
+            } else {
+                0
+            };
+            assert_eq!(
+                loaded.block(block_x, 0, block_z).unwrap().name,
+                "minecraft:stone"
+            );
             assert_eq!(
                 snapshot.player.position.y,
                 if new_player { 16.0 } else { 65.0 }
@@ -3597,10 +3656,16 @@ mod world_open_tests {
                             .any(|(x, z)| snapshot.player.position.x == x as f32 + 0.5
                                 && snapshot.player.position.z == z as f32 + 0.5)
                     );
-                    assert!(loaded.chunks.len() < 100);
+                    assert!(
+                        loaded.chunks.len() <= 4,
+                        "only the first successful candidate and its collision neighbors should be loaded"
+                    );
                 } else {
                     assert_eq!(snapshot.player.position.x, 8.5);
                     assert_eq!(snapshot.player.position.z, 8.5);
+                    if index == 4 {
+                        assert_eq!(loaded.chunks.len(), 1);
+                    }
                 }
                 assert_eq!(snapshot.player.yaw, 270_f32.to_radians());
                 assert_eq!(snapshot.player.pitch, (-20_f32).to_radians());

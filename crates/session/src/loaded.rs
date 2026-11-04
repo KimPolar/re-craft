@@ -51,6 +51,22 @@ pub struct BuildBounds {
     pub max_y: i32,
 }
 
+/// A spawn query requires this terrain or entity chunk before it can proceed.
+#[derive(Debug)]
+pub struct MissingSpawnChunk(pub ChunkPos);
+
+impl std::fmt::Display for MissingSpawnChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "respawn chunk at {}, {} is not loaded",
+            self.0.x, self.0.z
+        )
+    }
+}
+
+impl std::error::Error for MissingSpawnChunk {}
+
 /// Data needed to attempt an in-memory respawn at an existing saved bed or
 /// anchor. Missing chunks, rules and unsupported blocks remain unavailable.
 pub struct SavedRespawnSupport {
@@ -1956,12 +1972,30 @@ impl LoadedSession {
         );
         self.world_respawn_search = None;
         loop {
-            if let Some(spawn) = self.advance_world_respawn()? {
-                // A later death must evaluate the then-current border and terrain.
-                self.world_respawn_search = None;
+            if let Some(spawn) = self.poll_initial_player_spawn()? {
                 return Ok(spawn);
             }
         }
+    }
+
+    /// Advance the first-player search without changing ticks or skipping an
+    /// unresolved candidate. A caller can load missing chunks and retry.
+    pub fn poll_initial_player_spawn(
+        &mut self,
+    ) -> anyhow::Result<Option<crate::respawn::SavedSpawnResult>> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "initial player spawn must be resolved before the first tick"
+        );
+        let result = self.advance_world_respawn()?;
+        if result.is_some() {
+            self.world_respawn_search = None;
+        }
+        Ok(result)
+    }
+
+    pub fn initial_spawn_chunk_loaded(&self, pos: ChunkPos) -> bool {
+        self.world.chunks.contains_key(&pos)
     }
 
     /// Expose the saved shared spawn to clients even when respawn search is unavailable.
@@ -5549,7 +5583,10 @@ impl LoadedSession {
             return Err("initial weather terrain must be published before simulation begins");
         }
         let terrain = self.weather_terrain();
-        Arc::make_mut(&mut self.snapshot).weather_terrain = terrain;
+        let snapshot = Arc::make_mut(&mut self.snapshot);
+        snapshot.world = SessionWorld::Loaded(Arc::clone(&self.world));
+        snapshot.world_revision = self.revision;
+        snapshot.weather_terrain = terrain;
         Ok(())
     }
 
@@ -6811,9 +6848,10 @@ impl LoadedSession {
                             anyhow::bail!("{error}");
                         }
                     }
-                    Some(SavedEntityData::Unavailable) | None => {
+                    Some(SavedEntityData::Unavailable) => {
                         anyhow::bail!("entity chunk {x}, {z} is unavailable")
                     }
+                    None => return Err(MissingSpawnChunk(chunk_pos).into()),
                 }
             }
         }
@@ -6836,6 +6874,86 @@ impl LoadedSession {
         validate_entity_chunk(pos, &entities)?;
         self.entity_chunks.insert(pos, entities);
         self.entity_collision_cache.insert(pos, OnceLock::new());
+        Ok(())
+    }
+
+    /// Add a disk chunk while resolving the first player spawn, before ticks
+    /// or a published world snapshot can observe the partially loaded area.
+    pub fn import_initial_spawn_chunk(
+        &mut self,
+        pos: ChunkPos,
+        source: World,
+        entities: SavedEntityData,
+        poi: SavedPoiData,
+        heightmaps: Option<SpawnHeightmaps>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "initial spawn chunks must be imported before the first tick"
+        );
+        anyhow::ensure!(
+            !self.world.chunks.contains_key(&pos),
+            "initial spawn chunk is already loaded"
+        );
+        validate_entity_chunk(pos, &entities)?;
+        validate_poi_chunk(pos, &poi)?;
+        if let Some(maps) = &heightmaps {
+            self.validate_spawn_heightmaps(maps)?;
+        }
+        let fluid_ticks = source
+            .saved_fluid_ticks
+            .get(&pos)
+            .cloned()
+            .unwrap_or_default();
+        let block_ticks = source
+            .saved_block_ticks
+            .get(&pos)
+            .cloned()
+            .unwrap_or_default();
+        let old_count = self.world.state_count();
+        let imported = Arc::make_mut(&mut self.world)
+            .import_chunk(&source, pos)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot import initial spawn chunk {}, {}: {error}",
+                    pos.x,
+                    pos.z
+                )
+            })?;
+        anyhow::ensure!(imported, "initial spawn chunk is already loaded");
+        for (_, state) in self.world.states().skip(old_count) {
+            let shape = block_shape(state);
+            self.unsupported_states += usize::from(shape.is_none());
+            self.stair_octants
+                .push(stair_octants(state, shape.as_deref()));
+            self.shapes.push(shape);
+            self.outlines.push(block_outline(state));
+            self.fluids
+                .push(FluidState::from_block(state).ok().flatten());
+            if let Some(tags) = &self.heightmap_tags {
+                self.heightmap_flags
+                    .push(crate::spawn_heightmaps::classify(state, tags).ok());
+            }
+        }
+        self.entity_chunks.insert(pos, entities);
+        self.entity_collision_cache.insert(pos, OnceLock::new());
+        self.poi_chunks.insert(pos, poi);
+        if let Some(maps) = heightmaps {
+            Arc::make_mut(&mut self.spawn_heightmaps).insert(pos, Arc::new(maps));
+        }
+        if self.fluid_chunks_seen.insert(pos) {
+            self.enqueue_saved_fluids(pos, &fluid_ticks);
+            self.enqueue_saved_sand(&block_ticks);
+            self.enqueue_saved_buttons(&block_ticks);
+            self.enqueue_saved_lamps(&block_ticks);
+            self.enqueue_saved_ice(&block_ticks);
+            self.enqueue_saved_sensors(&block_ticks);
+            self.enqueue_saved_bubble(&block_ticks);
+            self.enqueue_saved_soil(&block_ticks);
+        }
+        self.register_saved_sculk_chunk(pos);
+        self.revision += 1;
+        self.respawn_revision += 1;
         Ok(())
     }
 
@@ -9225,9 +9343,7 @@ impl LoadedSession {
             .chunks
             .get(&key)
             .or_else(|| self.parked_chunks.get(&key))
-            .ok_or_else(|| {
-                anyhow::anyhow!("respawn chunk at {}, {} is not loaded", key.x, key.z)
-            })?;
+            .ok_or(MissingSpawnChunk(key))?;
         anyhow::ensure!(
             chunk.status.as_deref() == Some("minecraft:full"),
             "respawn chunk is not complete"
@@ -19824,7 +19940,14 @@ fn spawn_blocks_clear(
                     Ok(true) => return Ok(false),
                     Ok(false) => {}
                     Err(error) => {
-                        if unavailable.is_none() {
+                        // A known collision can settle the query even if a
+                        // different block is unsupported. Load missing data
+                        // first so such a collision is not overlooked.
+                        let is_missing_chunk = error.downcast_ref::<MissingSpawnChunk>().is_some();
+                        if unavailable.as_ref().is_none_or(|previous: &anyhow::Error| {
+                            is_missing_chunk
+                                && previous.downcast_ref::<MissingSpawnChunk>().is_none()
+                        }) {
                             unavailable = Some(error);
                         }
                     }
@@ -45442,6 +45565,101 @@ pub(crate) mod tests {
                 .unwrap()
                 .world_surface,
             0
+        );
+    }
+
+    #[test]
+    fn initial_spawn_chunk_import_preserves_snapshots_and_requires_pre_tick() {
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let tags = test_heightmap_tags();
+        session.set_spawn_heightmap_tags(Arc::clone(&tags)).unwrap();
+        let (mut incoming, _, _) = fixture();
+        let mut neighbor_chunk = (*incoming.chunks.remove(&home).unwrap()).clone();
+        neighbor_chunk.position = neighbor;
+        incoming.chunks.insert(neighbor, Arc::new(neighbor_chunk));
+        let maps = crate::spawn_heightmaps::prepare(
+            &saved_heightmap_chunk(neighbor, None),
+            &incoming,
+            HeightBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            &tags,
+        )
+        .unwrap();
+        let old = session.snapshot();
+        session
+            .import_initial_spawn_chunk(
+                neighbor,
+                incoming.clone(),
+                SavedEntityData::Empty,
+                SavedPoiData::Missing,
+                Some(maps),
+            )
+            .unwrap();
+        assert!(!old.world.loaded().unwrap().chunks.contains_key(&neighbor));
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .chunks
+                .contains_key(&neighbor)
+        );
+        session.publish_initial_weather_terrain().unwrap();
+        let published = session.snapshot();
+        assert!(
+            published
+                .world
+                .loaded()
+                .unwrap()
+                .chunks
+                .contains_key(&neighbor)
+        );
+        assert!(!old.world.loaded().unwrap().chunks.contains_key(&neighbor));
+        assert_eq!(
+            session
+                .spawn_column_heights(session.origin.x + 24, session.origin.z + 6)
+                .unwrap()
+                .world_surface,
+            2
+        );
+        assert!(matches!(
+            session.saved_entity_chunk(neighbor),
+            Some(SavedEntityData::Empty)
+        ));
+        assert!(matches!(
+            session.saved_poi_chunk(neighbor),
+            Some(SavedPoiData::Missing)
+        ));
+        assert!(
+            session
+                .import_initial_spawn_chunk(
+                    neighbor,
+                    incoming.clone(),
+                    SavedEntityData::Empty,
+                    SavedPoiData::Missing,
+                    None
+                )
+                .is_err()
+        );
+        session.update(TICK);
+        assert!(
+            session
+                .import_initial_spawn_chunk(
+                    neighbor,
+                    incoming,
+                    SavedEntityData::Empty,
+                    SavedPoiData::Missing,
+                    None
+                )
+                .is_err()
         );
     }
 

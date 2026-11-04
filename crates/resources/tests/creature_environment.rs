@@ -53,6 +53,7 @@ fn creature_environment_layers_match_java() {
         }
     }
     let mut resources = ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_entity_category_registry().unwrap();
     let biomes = resources.list_data("worldgen/biome").unwrap();
     assert!(!biomes.is_empty());
     for biome in biomes {
@@ -114,7 +115,7 @@ fn creature_environment_layers_match_java() {
             &case["spawn_biome"],
             &case["probability_biome"],
             case["later"].as_array().unwrap(),
-            |id| (id.namespace == "minecraft").then_some(false),
+            |id| registry.is_misc(id),
         )
         .unwrap();
         let mut random = LegacyRandom::new(42);

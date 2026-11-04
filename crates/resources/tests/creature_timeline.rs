@@ -67,16 +67,16 @@ fn creature_timeline_tracks_match_java() {
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
     let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
     let mut resources = ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_entity_category_registry().unwrap();
     for dimension in [
         "minecraft:overworld",
         "minecraft:overworld_caves",
         "minecraft:the_nether",
         "minecraft:the_end",
     ] {
-        let environment = CreatureSpawnEnvironment::load(&mut resources, dimension, |id| {
-            (id.namespace == "minecraft").then_some(false)
-        })
-        .unwrap();
+        let environment =
+            CreatureSpawnEnvironment::load_with_registry(&mut resources, dimension, &registry)
+                .unwrap();
         environment.sample_layers(|_| Some(0)).unwrap();
     }
     let ticks = [-41_i64, -20, -1, 0, 1, 5, 9, 10, 11, 15, 19, 20, 21, 41];

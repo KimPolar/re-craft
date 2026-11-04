@@ -19,6 +19,15 @@ pub struct CreatureSpawnEnvironment {
 }
 
 impl CreatureSpawnEnvironment {
+    /// Decode against categories read from the verified client registration.
+    pub fn load_with_registry(
+        provider: &mut impl ResourceProvider,
+        dimension_type: &str,
+        registry: &crate::entity_category::EntityCategoryRegistry,
+    ) -> Result<Self> {
+        Self::load(provider, dimension_type, |id| registry.is_misc(id))
+    }
+
     /// Load the active dimension and its referenced timelines. Entity types are
     /// checked against the same registry used to decode spawn settings.
     pub fn load(

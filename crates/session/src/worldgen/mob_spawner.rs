@@ -84,6 +84,27 @@ pub struct GeneratedSheepSpawner {
 }
 
 impl GeneratedSheepSpawner {
+    /// Use categories decoded from the installed, verified client JAR.
+    pub fn from_verified_environment(
+        batch: &FreshTerrainBatch,
+        provider: &mut impl native_resources::packs::ResourceProvider,
+        center: ChunkPos,
+        environment: &native_resources::creature_timeline::CreatureSpawnEnvironment,
+        clock_ticks: impl FnMut(&native_resources::packs::ResourceId) -> Option<i64>,
+        registry: &native_resources::entity_category::EntityCategoryRegistry,
+        inputs: SheepSpawnInputs<'_>,
+    ) -> Result<Self> {
+        Self::from_timed_environment(
+            batch,
+            provider,
+            center,
+            environment,
+            clock_ticks,
+            |id| registry.is_misc(id),
+            inputs,
+        )
+    }
+
     /// Load the dimension's already-resolved timeline definitions using the
     /// supplied world clock values before starting this spawn operation.
     pub fn from_timed_environment(

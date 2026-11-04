@@ -27,7 +27,7 @@ fn creature_layers_and_weighted_samples_match_java() {
         .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
         .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
     let mut resources = ResourceStack::open(&game).unwrap();
-    let registry = resources.vanilla_entity_collision_registry().unwrap();
+    let registry = resources.vanilla_entity_category_registry().unwrap();
     let entry = |name, weight, count: Value| json!({"type":name,"weight":weight,"count":count});
     let settings = |creature: Option<Value>| {
         let mut categories = json!({});
@@ -152,11 +152,8 @@ fn creature_layers_and_weighted_samples_match_java() {
     for (case, expected) in cases.iter().zip(results) {
         let mut spawns = CreatureSpawns::default();
         for layer in case["layers"].as_array().unwrap() {
-            if let Some(layer) = CreatureSpawnLayer::from_attributes(layer, |id| {
-                let name = format!("{}:{}", id.namespace, id.path);
-                registry.kind(&name).map(|_| name == "minecraft:item")
-            })
-            .unwrap()
+            if let Some(layer) =
+                CreatureSpawnLayer::from_attributes(layer, |id| registry.is_misc(id)).unwrap()
             {
                 spawns.apply(layer);
             }
@@ -176,11 +173,9 @@ fn creature_layers_and_weighted_samples_match_java() {
         if let Some(biome) = case.get("biome").and_then(Value::as_str) {
             let id = native_resources::packs::ResourceId::parse(biome).unwrap();
             let mut loaded = CreatureSpawns::default();
-            if let Some(layer) = CreatureSpawnLayer::load_biome(&mut resources, &id, |id| {
-                let name = format!("{}:{}", id.namespace, id.path);
-                registry.kind(&name).map(|_| name == "minecraft:item")
-            })
-            .unwrap()
+            if let Some(layer) =
+                CreatureSpawnLayer::load_biome(&mut resources, &id, |id| registry.is_misc(id))
+                    .unwrap()
             {
                 loaded.apply(layer);
             }

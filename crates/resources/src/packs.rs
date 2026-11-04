@@ -278,6 +278,13 @@ impl ResourceStack {
         })
     }
 
+    /// Read spawn categories from the hash-verified client registration code.
+    pub fn vanilla_entity_category_registry(
+        &mut self,
+    ) -> Result<crate::entity_category::EntityCategoryRegistry> {
+        crate::entity_category::EntityCategoryRegistry::load(|path| read_zip(&mut self.base, path))
+    }
+
     /// Read registration code only from the hash-verified client JAR.
     pub fn vanilla_item_registry(&mut self) -> Result<crate::item_registry::ItemRegistry> {
         crate::item_registry::ItemRegistry::load(|path| read_zip(&mut self.base, path))

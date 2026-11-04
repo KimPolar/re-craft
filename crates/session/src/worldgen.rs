@@ -4477,31 +4477,33 @@ mod tests {
                 "gameplay/creature_world_gen_spawn_probability":{"keyframes":[{"ticks":0,"value":probability}]}
             }}),
         };
-        let environment = native_resources::creature_timeline::CreatureSpawnEnvironment::load(
-            &mut timed,
-            "example:test",
-            |_| Some(false),
-        )
-        .unwrap();
+        let categories = resources.vanilla_entity_category_registry().unwrap();
+        let environment =
+            native_resources::creature_timeline::CreatureSpawnEnvironment::load_with_registry(
+                &mut timed,
+                "example:test",
+                &categories,
+            )
+            .unwrap();
         assert!(
-            GeneratedSheepSpawner::from_timed_environment(
+            GeneratedSheepSpawner::from_verified_environment(
                 &batch,
                 &mut timed,
                 center,
                 &environment,
                 |_| None,
-                |_| Some(false),
+                &categories,
                 inputs,
             )
             .is_err()
         );
-        let mut driver = GeneratedSheepSpawner::from_timed_environment(
+        let mut driver = GeneratedSheepSpawner::from_verified_environment(
             &batch,
             &mut timed,
             center,
             &environment,
             |_| Some(7),
-            |_| Some(false),
+            &categories,
             inputs,
         )
         .unwrap();

@@ -555,6 +555,15 @@ impl Class {
         ))
     }
     pub(crate) fn instructions(&self) -> Result<Vec<Ins>> {
+        self.decode_instructions(false)
+    }
+
+    /// EntityTypes has a few additional straight-line array/value opcodes.
+    pub(crate) fn entity_type_instructions(&self) -> Result<Vec<Ins>> {
+        self.decode_instructions(true)
+    }
+
+    fn decode_instructions(&self, entity_types: bool) -> Result<Vec<Ins>> {
         let mut r = Reader {
             bytes: self.code.as_deref().context("missing class initializer")?,
             pos: 0,
@@ -565,6 +574,7 @@ impl Class {
             let index = match op {
                 0x12 => Some(u16::from(r.u8()?)),
                 0x13 | 0xb2..=0xb8 | 0xbb | 0xbd => Some(r.u16()?),
+                0x14 if entity_types => Some(r.u16()?),
                 0xba => {
                     let index = r.u16()?;
                     ensure!(r.u16()? == 0, "invalid invokedynamic");
@@ -574,11 +584,16 @@ impl Class {
                     r.u8()?;
                     None
                 }
+                0xbc if entity_types => {
+                    r.u8()?;
+                    None
+                }
                 0x11 => {
                     r.u16()?;
                     None
                 }
                 0x03..=0x08 | 0x0b..=0x0d | 0x53 | 0x59 | 0xb1 => None,
+                0x0e | 0x51 if entity_types => None,
                 _ => bail!("unsupported initializer opcode {op:#x}"),
             };
             out.push(Ins { op, index });

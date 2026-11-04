@@ -362,6 +362,7 @@ pub(crate) struct Ins {
 pub(crate) struct Class {
     pub(crate) name: String,
     pub(crate) superclass: Option<String>,
+    pub(crate) interfaces: Vec<String>,
     constants: Vec<Constant>,
     code: Option<Vec<u8>>,
     methods: std::collections::BTreeSet<(String, String)>,
@@ -424,8 +425,11 @@ impl Class {
         } else {
             Some(class(parent)?.to_owned())
         };
-        let interfaces = r.u16()? as usize;
-        r.take(interfaces * 2)?;
+        let interface_count = r.u16()? as usize;
+        let mut interfaces = Vec::with_capacity(interface_count);
+        for _ in 0..interface_count {
+            interfaces.push(class(r.u16()?)?.to_owned());
+        }
         for _ in 0..r.u16()? {
             r.take(6)?;
             for _ in 0..r.u16()? {
@@ -520,6 +524,7 @@ impl Class {
         Ok(Self {
             name,
             superclass,
+            interfaces,
             constants,
             code,
             methods,
@@ -916,6 +921,7 @@ mod tests {
         let class = Class {
             name: "net/minecraft/world/level/block/Blocks".into(),
             superclass: None,
+            interfaces: vec![],
             constants: vec![
                 Constant::Other,
                 Constant::Utf8(b"net/minecraft/world/level/block/SandBlock".to_vec()),

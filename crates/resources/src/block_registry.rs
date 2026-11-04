@@ -20,6 +20,7 @@ pub type DefaultProperties = BTreeMap<String, BTreeMap<String, String>>;
 #[derive(Clone)]
 pub struct GeneratedBlockRegistry {
     states: BTreeMap<String, StateSchema>,
+    block_entities: BTreeMap<String, Option<bool>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -393,7 +394,9 @@ impl GeneratedBlockRegistry {
         }
         drop(load);
         let mut cache = BTreeMap::new();
+        let mut entity_cache = BTreeMap::new();
         let mut states = BTreeMap::new();
+        let mut block_entities = BTreeMap::new();
         for (id, class) in registered_classes {
             let schema = match class.as_str() {
                 "net/minecraft/world/level/block/SnowyBlock"
@@ -461,6 +464,13 @@ impl GeneratedBlockRegistry {
                 _ => None,
             };
             if let Some(schema) = schema {
+                let has_entity = entity_block_class(
+                    &class,
+                    &mut read_class,
+                    &mut entity_cache,
+                    &mut BTreeSet::new(),
+                )?;
+                block_entities.insert(id.clone(), has_entity);
                 states.insert(id, schema);
             }
         }
@@ -468,11 +478,19 @@ impl GeneratedBlockRegistry {
             states.contains_key("minecraft:stone") && states.contains_key("minecraft:dirt"),
             "block registration format is unsupported"
         );
-        Ok(Self { states })
+        Ok(Self {
+            states,
+            block_entities,
+        })
     }
 
     pub fn contains(&self, id: &str) -> bool {
         self.states.contains_key(id)
+    }
+    /// Whether the verified block class implements Java's EntityBlock.
+    /// None means the block or part of its inheritance graph is unavailable.
+    pub fn has_block_entity(&self, id: &str) -> Option<bool> {
+        self.block_entities.get(id).copied().flatten()
     }
     /// Check a fully materialized state without applying codec defaults or
     /// silently dropping unknown/invalid property values.
@@ -531,6 +549,53 @@ impl GeneratedBlockRegistry {
         }
         Ok((name, properties))
     }
+}
+
+fn entity_block_class(
+    name: &str,
+    read_class: &mut impl FnMut(&str) -> Result<Option<Vec<u8>>>,
+    cache: &mut BTreeMap<String, Option<bool>>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<Option<bool>> {
+    const ENTITY_BLOCK: &str = "net/minecraft/world/level/block/EntityBlock";
+    if name == ENTITY_BLOCK {
+        return Ok(Some(true));
+    }
+    // Bootstrap classes cannot depend on Minecraft's application classes.
+    if name.starts_with("java/") || name.starts_with("javax/") {
+        return Ok(Some(false));
+    }
+    if let Some(result) = cache.get(name) {
+        return Ok(*result);
+    }
+    ensure!(
+        name.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/_$".contains(&c))
+            && visiting.insert(name.to_owned())
+            && visiting.len() <= 128,
+        "invalid or cyclic class inheritance"
+    );
+    let result = (|| {
+        let Some(bytes) = read_class(&format!("{name}.class"))? else {
+            return Ok(None);
+        };
+        let class = crate::item_registry::Class::read(&bytes)?;
+        ensure!(class.name == name, "class name does not match its path");
+        let mut unknown = false;
+        for parent in class.superclass.iter().chain(&class.interfaces) {
+            match entity_block_class(parent, read_class, cache, visiting)? {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        Ok((!unknown).then_some(false))
+    })();
+    visiting.remove(name);
+    if let Ok(value) = result {
+        cache.insert(name.to_owned(), value);
+    }
+    result
 }
 
 fn stateless_class(
@@ -713,6 +778,7 @@ mod tests {
                 ("minecraft:stone".into(), StateSchema::Stateless),
                 ("minecraft:water".into(), StateSchema::Liquid),
             ]),
+            block_entities: BTreeMap::new(),
         };
         assert!(registry.is_canonical_state("minecraft:stone", &BTreeMap::new()));
         assert!(!registry.is_canonical_state("minecraft:water", &BTreeMap::new()));

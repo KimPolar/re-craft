@@ -27,6 +27,7 @@ public class BlockDefaultsOracle {
             var values = block.defaultBlockState().getValues()
                 .map(value -> value.property().getName() + "=" + value.valueName()).sorted().toList();
             output.println(BuiltInRegistries.BLOCK.getKey(block) + "\t" + String.join("\t", values));
+            output.println("ENTITY\t" + BuiltInRegistries.BLOCK.getKey(block) + "\t" + block.defaultBlockState().hasBlockEntity());
         }
         if (args.length > 0) {
             var digits=new JsonArray();
@@ -324,6 +325,14 @@ fn generated_block_defaults_match_java() {
             )
         })
         .collect();
+    let entity_expected: BTreeMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("ENTITY\t"))
+        .map(|line| {
+            let (id, value) = line.split_once('\t').unwrap();
+            (id.to_owned(), value.parse::<bool>().unwrap())
+        })
+        .collect();
     assert!(
         registry.len() >= 100,
         "block registry is unexpectedly small"
@@ -349,6 +358,11 @@ fn generated_block_defaults_match_java() {
     }
     println!("verified {} generated block defaults", registry.len());
     for id in registry.ids() {
+        assert_eq!(
+            registry.has_block_entity(id),
+            Some(entity_expected[id]),
+            "Java block entity: {id}"
+        );
         let expected = expected
             .get(id)
             .unwrap_or_else(|| panic!("Java block missing: {id}"));

@@ -462,6 +462,9 @@ impl GenerationReady {
             player,
         )
         .map_err(anyhow::Error::msg)?;
+        session
+            .set_has_skylight(self.batch.has_skylight()?)
+            .map_err(anyhow::Error::msg)?;
         if let Some(spawn) = self.initial_world_spawn()? {
             session.set_world_spawn(spawn.clone())?;
             if let Some(initial) = &self.initial_respawn {
@@ -2422,6 +2425,13 @@ mod tests {
             (true, false, "minecraft:horse", 0),
             (true, false, "minecraft:donkey", 0),
         ] {
+            let has_skylight = !disabled || feature_kind % 2 == 0;
+            let mut selected_dimension = dimension.clone();
+            selected_dimension["has_skylight"] = json!(has_skylight);
+            std::fs::write(
+                pack.join("data/example/dimension_type/compact.json"),
+                serde_json::to_vec(&selected_dimension)?,
+            )?;
             let mut selected_biome = biome.clone();
             if feature_kind != 0 {
                 let simple = json!({"feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:short_grass"}},"placement":[]});
@@ -2765,6 +2775,20 @@ mod tests {
                     pose: native_session::PlayerPose::Standing,
                 };
                 let mut session = ready.start_session(player)?;
+                use native_session::GameSession;
+                session.set_precipitation_environment(Arc::new(BTreeMap::new()), None);
+                session
+                    .publish_initial_weather_terrain()
+                    .map_err(anyhow::Error::msg)?;
+                assert_eq!(
+                    session
+                        .snapshot()
+                        .weather_terrain
+                        .as_ref()
+                        .unwrap()
+                        .has_skylight,
+                    Some(has_skylight)
+                );
                 if ready.initial_respawn.is_none() {
                     session.set_spawn_heightmap_tags(Arc::clone(
                         collision_height_tags.as_ref().unwrap(),

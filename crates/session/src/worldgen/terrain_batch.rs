@@ -809,6 +809,15 @@ impl FreshTerrainBatch {
             .context("dimension ambient light is unavailable")
     }
 
+    /// Return the skylight capability used to generate this batch's lighting.
+    pub fn has_skylight(&self) -> Result<bool> {
+        Ok(self
+            .decoration
+            .as_ref()
+            .context("generation lighting is missing")?
+            .has_skylight)
+    }
+
     pub(super) fn generated_block_registry(&self) -> Result<&GeneratedBlockRegistry> {
         self.light_registry
             .as_ref()

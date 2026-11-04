@@ -1084,6 +1084,8 @@ fn prepare_existing_world(
                 }
             }
         });
+        // LoadedSession registers resident saved chunks in the world's map order.
+        let tick_registration: Vec<_> = world.chunks.keys().copied().collect();
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
@@ -1097,6 +1099,10 @@ fn prepare_existing_world(
         session
             .set_initial_game_time(reader.game_time()?)
             .map_err(anyhow::Error::msg)?;
+        let (block_order, fluid_order) = session.install_saved_tick_orders(&tick_registration)?;
+        if !block_order || !fluid_order {
+            eprintln!("Saved tick ordering is unavailable for one or more registries");
+        }
         if let Err(error) = session.capture_level_time_source(Arc::clone(&reader.level)) {
             eprintln!("Level data is not eligible for a save draft: {error:#}");
         }

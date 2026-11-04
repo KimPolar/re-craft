@@ -5795,6 +5795,134 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Build scheduler indexes from the actual registration order used when
+    /// loading a saved world. The returned flags indicate which registries
+    /// could be represented and validated against the session's typed queues.
+    /// The order supplied here is not evidence of another run's load order.
+    pub fn install_saved_tick_orders(
+        &mut self,
+        registration: &[ChunkPos],
+    ) -> anyhow::Result<(bool, bool)> {
+        use crate::worldgen::chunk_ticks::{
+            ActivatedChunkTicks, ActivatedRegionTicks, IndexedRegionQueue, SavedTick,
+        };
+        use anyhow::ensure;
+        ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO && self.initial_game_time_set,
+            "saved tick ordering must be initialized after game time and before simulation"
+        );
+        ensure!(
+            !self.generated_ticks_installed
+                && self.generated_block_order.is_none()
+                && self.generated_fluid_order.is_none(),
+            "tick ordering is already installed"
+        );
+        let mut seen = BTreeSet::new();
+        ensure!(
+            registration.len() == self.world.chunks.len()
+                && registration
+                    .iter()
+                    .all(|pos| self.world.chunks.contains_key(pos) && seen.insert(*pos)),
+            "saved tick registration must contain each resident chunk exactly once"
+        );
+        let new_order = || GeneratedTickOrder {
+            base_time: self.game_time,
+            queue: IndexedRegionQueue::default(),
+            parked: BTreeMap::new(),
+        };
+        let mut blocks = Some(new_order());
+        let mut fluids = Some(new_order());
+        for &pos in registration {
+            let saved_blocks = self
+                .world
+                .saved_block_ticks
+                .get(&pos)
+                .map_or(&[][..], Vec::as_slice);
+            if let Some(order) = &mut blocks {
+                let supported = saved_blocks
+                    .iter()
+                    .all(|tick| GeneratedBlockTickKind::from_id(&tick.block).is_some());
+                let saved = || {
+                    saved_blocks
+                        .iter()
+                        .map(|tick| SavedTick {
+                            kind: tick.block.clone(),
+                            position: tick.position,
+                            delay: tick.delay,
+                            priority: tick.priority,
+                        })
+                        .collect()
+                };
+                if !supported || !order.register_saved(pos, 0, saved()) {
+                    blocks = None;
+                }
+            }
+            let saved_fluids = self
+                .world
+                .saved_fluid_ticks
+                .get(&pos)
+                .map_or(&[][..], Vec::as_slice);
+            if let Some(order) = &mut fluids {
+                let supported = saved_fluids.iter().all(|tick| {
+                    matches!(
+                        tick.fluid.as_str(),
+                        "minecraft:water"
+                            | "water"
+                            | "minecraft:flowing_water"
+                            | "flowing_water"
+                            | "minecraft:lava"
+                            | "lava"
+                            | "minecraft:flowing_lava"
+                            | "flowing_lava"
+                    )
+                });
+                let saved = || {
+                    saved_fluids
+                        .iter()
+                        .map(|tick| SavedTick {
+                            kind: tick.fluid.clone(),
+                            position: tick.position,
+                            delay: tick.delay,
+                            priority: tick.priority,
+                        })
+                        .collect()
+                };
+                if !supported || !order.register_saved(pos, 0, saved()) {
+                    fluids = None;
+                }
+            }
+        }
+        let mut snapshot = ActivatedRegionTicks {
+            game_time: self.game_time,
+            next_sub_tick: self.next_sub_tick,
+            chunks: BTreeMap::new(),
+        };
+        for &pos in registration {
+            snapshot.chunks.insert(
+                pos,
+                ActivatedChunkTicks {
+                    blocks: blocks
+                        .as_ref()
+                        .and_then(|order| order.queue.container(pos))
+                        .map_or_else(Vec::new, |ticks| ticks.activated(0)),
+                    fluids: fluids
+                        .as_ref()
+                        .and_then(|order| order.queue.container(pos))
+                        .map_or_else(Vec::new, |ticks| ticks.activated(0)),
+                },
+            );
+        }
+        let blocks_installed = blocks.is_some_and(|order| {
+            self.install_block_tick_order(&snapshot, order.queue)
+                .is_ok()
+        });
+        let fluids_installed = fluids.is_some_and(|order| {
+            self.install_fluid_tick_order(&snapshot, order.queue)
+                .is_ok()
+        });
+        Ok((blocks_installed, fluids_installed))
+    }
+
     /// Transfer activated generation queues into a fresh, unadvanced session.
     /// Unsupported ticks are rejected before any session state is changed.
     /// This does not establish that the resulting world is ready for play or saving.
@@ -5957,14 +6085,26 @@ impl LoadedSession {
         ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
         queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.generated_ticks_installed,
+            "generated block ticks are not ready"
+        );
+        self.install_block_tick_order(ticks, queue)
+    }
+
+    fn install_block_tick_order(
+        &mut self,
+        ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
+        queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         ensure!(
             self.tick == 0 && self.accumulated == Duration::ZERO,
             "generated block ordering must be installed before simulation begins"
         );
         ensure!(
-            self.generated_ticks_installed && self.generated_block_order.is_none(),
-            "generated block ticks are not ready or ordering is already installed"
+            self.generated_block_order.is_none(),
+            "block tick ordering is already installed"
         );
         ensure!(
             self.game_time == ticks.game_time && self.world.chunks.keys().eq(ticks.chunks.keys()),
@@ -6031,14 +6171,26 @@ impl LoadedSession {
         ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
         queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.generated_ticks_installed,
+            "generated fluid ticks are not ready"
+        );
+        self.install_fluid_tick_order(ticks, queue)
+    }
+
+    fn install_fluid_tick_order(
+        &mut self,
+        ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
+        queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    ) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         ensure!(
             self.tick == 0 && self.accumulated == Duration::ZERO,
             "generated fluid ordering must be installed before simulation begins"
         );
         ensure!(
-            self.generated_ticks_installed && self.generated_fluid_order.is_none(),
-            "generated fluid ticks are not ready or ordering is already installed"
+            self.generated_fluid_order.is_none(),
+            "fluid tick ordering is already installed"
         );
         ensure!(
             self.game_time == ticks.game_time && self.world.chunks.keys().eq(ticks.chunks.keys()),
@@ -23761,6 +23913,170 @@ pub(crate) mod tests {
         assert_eq!(session.sand_ticks.first_key_value().unwrap().0.2, i64::MAX);
         assert_eq!(session.ice_ticks.first_key_value().unwrap().0.2, i64::MIN);
         assert_eq!(session.next_sub_tick, i64::MIN + 1);
+    }
+
+    #[test]
+    fn saved_session_uses_registered_chunk_tick_order_and_tracks_streamed_chunks() {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut chunk = world.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        world.chunks.insert(neighbor, Arc::new(chunk));
+        let a = [origin.x + 1, 2, origin.z + 1];
+        let b = [origin.x + 17, 2, origin.z + 1];
+        for (pos, at, delay, priority) in [(home, a, -2, 0), (neighbor, b, 0, -1)] {
+            world.saved_block_ticks.insert(
+                pos,
+                vec![SavedBlockTick {
+                    block: "minecraft:sand".into(),
+                    position: at,
+                    delay,
+                    priority,
+                }],
+            );
+            world.saved_fluid_ticks.insert(
+                pos,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: at,
+                    delay,
+                    priority,
+                }],
+            );
+        }
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_initial_game_time(42).unwrap();
+        assert_eq!(
+            session
+                .install_saved_tick_orders(&[neighbor, home])
+                .unwrap(),
+            (true, true)
+        );
+        let blocks = session.collect_generated_block_ticks().unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|(_, tick)| tick.identity().1)
+                .collect::<Vec<_>>(),
+            [b, a]
+        );
+        let fluids = session.collect_due_fluid_ticks();
+        assert_eq!(
+            fluids
+                .iter()
+                .map(|(_, tick)| tick.key.x)
+                .collect::<Vec<_>>(),
+            [b[0], a[0]]
+        );
+        session.schedule_sand(IVec3::new(17, 2, 1), FallingKind::Sand);
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
+        assert!(session.generated_block_order.is_some());
+        session.tick = 2;
+        assert!(session.collect_generated_block_ticks().unwrap().is_empty());
+        session.queue_chunk_window(home, 1);
+        session.apply_streaming();
+        assert_eq!(session.collect_generated_block_ticks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saved_tick_order_rejects_bad_registration_and_keeps_supported_registry() {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let at = (origin + IVec3::new(1, 2, 1)).to_array();
+        world.saved_block_ticks.insert(
+            home,
+            vec![SavedBlockTick {
+                block: "minecraft:oak_leaves".into(),
+                position: at,
+                delay: 5,
+                priority: 0,
+            }],
+        );
+        world.saved_fluid_ticks.insert(
+            home,
+            vec![SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: at,
+                delay: 5,
+                priority: 0,
+            }],
+        );
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert!(session.install_saved_tick_orders(&[home]).is_err());
+        session.set_initial_game_time(42).unwrap();
+        assert!(session.install_saved_tick_orders(&[]).is_err());
+        assert!(session.install_saved_tick_orders(&[home, home]).is_err());
+        assert_eq!(
+            session.install_saved_tick_orders(&[home]).unwrap(),
+            (false, true)
+        );
+        assert!(session.generated_block_order.is_none());
+        assert!(session.generated_fluid_order.is_some());
+        assert_eq!(session.world.saved_block_ticks[&home].len(), 1);
+        assert_eq!(session.fluid_ticks.len(), 1);
+        session.tick = 5;
+        assert_eq!(session.collect_due_fluid_ticks().len(), 1);
+    }
+
+    #[test]
+    fn saved_tick_order_rejects_a_changed_session_queue_without_dropping_it() {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let at = (origin + IVec3::new(1, 2, 1)).to_array();
+        world.saved_block_ticks.insert(
+            home,
+            vec![SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position: at,
+                delay: 5,
+                priority: 0,
+            }],
+        );
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_initial_game_time(42).unwrap();
+        let (order, tick) = session.sand_ticks.pop_first().unwrap();
+        session
+            .sand_ticks
+            .insert((order.0, 1, order.2, order.3), tick);
+        assert_eq!(
+            session.install_saved_tick_orders(&[home]).unwrap(),
+            (false, true)
+        );
+        assert!(session.generated_block_order.is_none());
+        assert_eq!(session.sand_ticks.first_key_value().unwrap().0.1, 1);
+        assert!(session.generated_fluid_order.is_some());
     }
 
     #[test]

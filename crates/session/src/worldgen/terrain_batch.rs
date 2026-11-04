@@ -5,8 +5,9 @@ use native_resources::{
     carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
     dimension_lighting::GeneratedDimensionLighting,
-    feature_order::FeatureSchedule,
+    feature_order::{FeatureKey, FeatureSchedule},
     packs::{ResourceId, ResourceProvider},
+    placed_feature::PlacedFeature,
 };
 use native_world::generation_light::VisibleLightSnapshot;
 use native_world::loaded::{BlockState, ChunkPos, World};
@@ -60,11 +61,77 @@ pub enum FreshBatchLight {
 
 struct DecorationConfig {
     schedule: FeatureSchedule,
+    features_cannot_spawn_entities: bool,
     block_registry: BTreeSet<String>,
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
     dimension_type: Option<String>,
     ambient_light: Option<f32>,
+}
+
+/// Only vanilla feature types whose generation paths have been checked for
+/// entity creation may certify a complete generated entity list. Missing,
+/// malformed, custom and nested feature types remain unknown.
+fn feature_cannot_spawn_entities(
+    provider: &mut impl ResourceProvider,
+    schedule: &FeatureSchedule,
+    key: &FeatureKey,
+) -> Result<bool> {
+    let placed = match key {
+        FeatureKey::Registered(id) => PlacedFeature::load(provider, id)?,
+        FeatureKey::Inline { biome, .. } => {
+            let value = schedule
+                .biome(biome)
+                .and_then(|biome| biome.inline.get(key))
+                .context("inline placed feature is missing")?;
+            PlacedFeature::decode(value)?
+        }
+    };
+    let configured = if let Some(name) = placed.feature.as_str() {
+        let id = ResourceId::parse(name)?;
+        let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .context("configured feature is missing")?;
+        serde_json::from_slice::<Value>(&bytes)?
+    } else {
+        placed.feature
+    };
+    let name = configured
+        .get("type")
+        .and_then(Value::as_str)
+        .context("feature type is missing")?;
+    let id = ResourceId::parse(name)?;
+    Ok(id.namespace == "minecraft"
+        && matches!(
+            id.path.as_str(),
+            "simple_block"
+                | "ore"
+                | "scattered_ore"
+                | "disk"
+                | "spring_feature"
+                | "underwater_magma"
+                | "block_column"
+                | "lake"
+                | "freeze_top_layer"
+                | "monster_room"
+                | "geode"
+                | "multiface_growth"
+                | "vines"
+                | "huge_brown_mushroom"
+                | "huge_red_mushroom"
+        ))
+}
+
+fn features_cannot_spawn_entities(
+    provider: &mut impl ResourceProvider,
+    schedule: &FeatureSchedule,
+) -> bool {
+    schedule
+        .steps()
+        .iter()
+        .flatten()
+        .all(|key| feature_cannot_spawn_entities(provider, schedule, key).unwrap_or(false))
 }
 
 #[derive(Default)]
@@ -334,7 +401,7 @@ impl FreshTerrainBatch {
     }
 
     /// Return complete records only when this no-structures batch has no
-    /// biome features and the chunk's own spawn operation was fully recorded.
+    /// unverified entity-producing features and spawning was fully recorded.
     /// Unsupported or cross-chunk entity sources keep the result unknown.
     pub fn complete_generated_entity_records(
         &self,
@@ -349,11 +416,7 @@ impl FreshTerrainBatch {
         );
         let decoration = self.decoration.as_ref().context("decoration is missing")?;
         if !self.entity_sources.contains_complete_spawn(pos)
-            || decoration
-                .schedule
-                .steps()
-                .iter()
-                .any(|step| !step.is_empty())
+            || !decoration.features_cannot_spawn_entities
         {
             return Ok(None);
         }
@@ -465,10 +528,12 @@ impl FreshTerrainBatch {
             "invalid dimension ambient light"
         );
         let schedule = self.generator.feature_schedule(provider, placed_features)?;
+        let features_cannot_spawn_entities = features_cannot_spawn_entities(provider, &schedule);
         let heightmap_tags =
             native_resources::heightmap_tags::HeightmapTags::load(provider, &block_registry)?;
         self.decoration = Some(DecorationConfig {
             schedule,
+            features_cannot_spawn_entities,
             block_registry,
             heightmap_tags,
             has_skylight: lighting.has_skylight,
@@ -1410,6 +1475,64 @@ impl FreshTerrainBatch {
 mod entity_source_tests {
     use super::*;
     use crate::worldgen::{GeneratedEntityAddition, GeneratedEntityRecord};
+    use serde_json::json;
+
+    #[derive(Default)]
+    struct Data(BTreeMap<String, Vec<u8>>);
+
+    impl ResourceProvider for Data {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.get(path).cloned())
+        }
+    }
+
+    #[test]
+    fn feature_entity_evidence_uses_active_inline_and_registered_definitions() {
+        let mut data = Data::default();
+        let put = |data: &mut Data, path: &str, value: Value| {
+            data.0
+                .insert(path.into(), serde_json::to_vec(&value).unwrap());
+        };
+        put(
+            &mut data,
+            "data/test/worldgen/biome/plain.json",
+            json!({"features":[[
+                {"feature":{"type":"minecraft:simple_block"},"placement":[]}, "test:placed"
+            ]]}),
+        );
+        put(
+            &mut data,
+            "data/test/worldgen/placed_feature/placed.json",
+            json!({"feature":"test:configured","placement":[]}),
+        );
+        put(
+            &mut data,
+            "data/test/worldgen/feature/configured.json",
+            json!({"type":"minecraft:ore"}),
+        );
+        let biome = ResourceId::parse("test:plain").unwrap();
+        let placed = ResourceId::parse("test:placed").unwrap();
+        let schedule =
+            FeatureSchedule::load(&mut data, &[biome], &BTreeSet::from([placed])).unwrap();
+        assert!(features_cannot_spawn_entities(&mut data, &schedule));
+        put(
+            &mut data,
+            "data/test/worldgen/feature/configured.json",
+            json!({"type":"minecraft:random_boolean_selector"}),
+        );
+        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+        put(
+            &mut data,
+            "data/test/worldgen/feature/configured.json",
+            json!({"type":"test:ore"}),
+        );
+        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+        data.0.remove("data/test/worldgen/feature/configured.json");
+        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+    }
 
     #[test]
     fn cross_chunk_and_untracked_sources_invalidate_spawn_evidence() {

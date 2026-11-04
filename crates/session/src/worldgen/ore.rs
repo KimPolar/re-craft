@@ -1146,14 +1146,6 @@ fn finish_decoration_with_light(
             .as_ref()
             .context("staged light guard missing")?;
         if !guard.light_replay_positions.is_empty() {
-            ensure!(
-                !tracker.has_skylight
-                    || guard
-                        .vine_light_positions
-                        .iter()
-                        .all(|p| !active.contains(&chunk(*p))),
-                "incremental active cave vine lighting is not supported"
-            );
             let baseline = frozen.as_ref().unwrap_or(&region.target.world);
             // Preserve the current registry lineage and replay only tracked
             // registered writes into the earlier light input snapshot.
@@ -7692,6 +7684,11 @@ mod tests {
             "vine_active_many",
             "vine_active_plain_then_glowing",
             "vine_active_empty_plain_then_glowing",
+            "vine_active_self_empty_plain",
+            "vine_active_self_empty_glowing",
+            "vine_active_self_empty_plain_then_glowing",
+            "vine_active_self_existing",
+            "vine_active_self_many",
         ] {
             let path = temp.path().join("vine-wide.json");
             let output = Command::new(java.join("java.exe"))
@@ -7717,8 +7714,10 @@ mod tests {
             let east = ChunkPos { x: 1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
             let template = Arc::clone(world.chunks.get(&center).unwrap());
-            for z in -2..=2 {
-                for x in -2..=2 {
+            let self_active = mode.starts_with("vine_active_self_");
+            let halo = if self_active { 3 } else { 2 };
+            for z in -halo..=halo {
+                for x in -halo..=halo {
                     let pos = ChunkPos { x, z };
                     world.chunks.entry(pos).or_insert_with(|| {
                         let mut chunk = (*template).clone();
@@ -7740,14 +7739,15 @@ mod tests {
                 let torch = world.intern_state(state("torch"));
                 world.set_block_id(17, 10, 8, torch).unwrap();
             }
-            if mode == "vine_active_existing" {
+            if mode.ends_with("_existing") {
                 let mut plain = state("cave_vines_plant");
                 plain.properties.insert("berries".into(), "false".into());
                 let id = world.intern_state(plain);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
-            let registered: Vec<_> = (-1..=1)
-                .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+            let radius = if self_active { 2 } else { 1 };
+            let registered: Vec<_> = (-radius..=radius)
+                .flat_map(|z| (-radius..=radius).map(move |x| ChunkPos { x, z }))
                 .collect();
             terrain
                 .completed_decoration
@@ -7761,7 +7761,12 @@ mod tests {
                 .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
                 .collect();
             let before = engine
-                .activate(&terrain, center, covered.iter().copied(), &registry)
+                .activate(
+                    &terrain,
+                    if self_active { east } else { center },
+                    covered.iter().copied(),
+                    &registry,
+                )
                 .unwrap();
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))
@@ -7780,7 +7785,7 @@ mod tests {
             });
             let positions = if mode.ends_with("_plain_then_glowing") {
                 vec![[16, 10, 8], [16, 10, 8]]
-            } else if mode == "vine_active_many" {
+            } else if mode.ends_with("_many") {
                 vec![[16, 10, 8], [16, 9, 8], [16, 8, 8]]
             } else {
                 vec![[16, 10, 8]]
@@ -7788,7 +7793,7 @@ mod tests {
             for (i, p) in positions.iter().copied().enumerate() {
                 let berries = if mode.ends_with("_plain_then_glowing") {
                     i == 1
-                } else if mode == "vine_active_many" {
+                } else if mode.ends_with("_many") {
                     i != 1
                 } else {
                     !mode.ends_with("_plain")
@@ -7806,7 +7811,7 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode == "vine_active_many" {
+            let expected_checks = if mode.ends_with("_many") {
                 2
             } else if mode.ends_with("_plain") {
                 0
@@ -7825,37 +7830,6 @@ mod tests {
             let after = engine
                 .snapshot(&terrain, covered.iter().copied(), &registry)
                 .unwrap();
-            if mode == "vine_active_glowing" {
-                let original = Arc::clone(&terrain.world);
-                let mut draft = terrain
-                    .decoration_region(&tags, &motion, BTreeSet::from([center]))
-                    .unwrap();
-                draft.light_guard = Some(DecorationLightGuard {
-                    registered: BTreeSet::from([center]),
-                    registry: &registry,
-                    require_unchanged_light: true,
-                    changed_blocks: BTreeSet::new(),
-                    changed_chunks: BTreeSet::new(),
-                    light_replay_positions: BTreeSet::new(),
-                    light_check_order: Vec::new(),
-                    vine_light_positions: BTreeSet::new(),
-                    new_nonempty_sections: Vec::new(),
-                    non_air_counts: BTreeMap::new(),
-                });
-                let mut vine = state("cave_vines_plant");
-                vine.properties.insert("berries".into(), "true".into());
-                assert!(draft.set_column_block([0, 10, 8], &vine).unwrap());
-                let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
-                let error = finish_decoration_with_light(draft, &mut tracking).unwrap_err();
-                drop(tracking);
-                assert!(error.to_string().contains("active cave vine lighting"));
-                assert!(Arc::ptr_eq(&original, &terrain.world));
-                let restored = engine.snapshot(&terrain, [center], &registry).unwrap();
-                for p in [[0, 10, 8], [15, 10, 8], [8, -1, 8]] {
-                    assert_eq!(restored.block_light(p), after.block_light(p));
-                    assert_eq!(restored.sky_light(p), after.sky_light(p));
-                }
-            }
             for (index, pos) in covered.iter().enumerate() {
                 for y in -16..32 {
                     for z in 0..16 {

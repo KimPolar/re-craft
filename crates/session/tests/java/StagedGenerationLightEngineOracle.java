@@ -136,8 +136,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyDark=args.length>1 && (args[1].equals("sky_inactive_dark") || args[1].equals("sky_inactive_activate_dark"));
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
+        boolean vineSelf=vineActive && args[1].startsWith("vine_active_self_");
         boolean vineActiveEmpty=vineActive && args[1].contains("_empty_");
-        boolean vineActiveMany=vineActive && args[1].equals("vine_active_many");
+        boolean vineActiveMany=vineActive && (args[1].equals("vine_active_many") || args[1].equals("vine_active_self_many"));
         boolean vineActiveTransition=vineActive && args[1].endsWith("_plain_then_glowing");
         boolean stagedActivate=args.length>1 && args[1].equals("tree_empty_full_activate");
         boolean activeEmptyWide=args.length>1 && args[1].equals("tree_empty_active_wide");
@@ -165,9 +166,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
         boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
-        w.wide=full || blockCase || skyActivate || stagedActivate || activeEmptyWide;
+        w.wide=full || blockCase || skyActivate || stagedActivate || activeEmptyWide || vineSelf;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
-        boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing"));
+        boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing") || args[1].equals("vine_active_self_existing"));
         w.magmaOnly=magma;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || (vine && !vineActive) || emptyPartialWide || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
@@ -303,7 +304,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(vineActive){
-            engine.propagateLightSources(new ChunkPos(0,0)); drain(engine); stages.add(captureWide(engine));
+            engine.propagateLightSources(new ChunkPos(vineSelf?1:0,0)); drain(engine); stages.add(captureWide(engine));
             int[][] positions=vineActiveTransition ? new int[][]{{16,10,8},{16,10,8}} : vineActiveMany ? new int[][]{{16,10,8},{16,9,8},{16,8,8}} : new int[][]{{16,10,8}};
             for(int i=0;i<positions.length;i++){
                 var p=positions[i]; var pos=new BlockPos(p[0],p[1],p[2]);

@@ -164,11 +164,89 @@ impl WorldCreationSettings {
     pub fn effective_bonus_chest(&self) -> bool {
         self.mode != GameMode::Hardcore && self.bonus_chest
     }
+
+    /// Prepare initial metadata only after the caller has resolved the pack stack
+    /// and spawn. Other world files and chunks still need to be created.
+    pub fn draft_level_data(
+        &self,
+        spawn: &native_persistence::world::RespawnData,
+        last_played_ms: i64,
+        singleplayer_uuid: Option<[i32; 4]>,
+        packs: Option<&native_resources::datapacks::DataPackSettings>,
+        initialized: bool,
+    ) -> anyhow::Result<native_persistence::nbt::NamedTag> {
+        use native_persistence::level_data::{
+            NewLevelData, NewWorldDifficulty, NewWorldGameType, draft_new_level_data,
+        };
+        let game_type = match self.mode {
+            GameMode::Survival | GameMode::Hardcore => NewWorldGameType::Survival,
+            GameMode::Creative => NewWorldGameType::Creative,
+        };
+        let difficulty = match self.effective_difficulty() {
+            Difficulty::Peaceful => NewWorldDifficulty::Peaceful,
+            Difficulty::Easy => NewWorldDifficulty::Easy,
+            Difficulty::Normal => NewWorldDifficulty::Normal,
+            Difficulty::Hard => NewWorldDifficulty::Hard,
+        };
+        draft_new_level_data(&NewLevelData {
+            name: self.name.value(),
+            game_type,
+            difficulty,
+            hardcore: self.mode == GameMode::Hardcore,
+            difficulty_locked: false,
+            allow_commands: self.effective_allow_commands(),
+            spawn,
+            game_time: 0,
+            initialized,
+            last_played_ms,
+            singleplayer_uuid,
+            packs,
+            server_brands: &[],
+            was_modded: false,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_metadata_applies_game_mode_overrides() {
+        use native_persistence::{nbt::Tag, world::RespawnData};
+        let mut state = WorldCreationSettings::new("  Test  ".into());
+        state.mode = GameMode::Hardcore;
+        state.difficulty = Difficulty::Easy;
+        state.allow_commands = Some(true);
+        let spawn = RespawnData::default();
+        let metadata = state
+            .draft_level_data(&spawn, 123, None, None, false)
+            .unwrap();
+        let data = metadata.value.get("Data").unwrap();
+        assert_eq!(data.get("LevelName"), Some(&Tag::String("Test".into())));
+        assert_eq!(data.get("GameType"), Some(&Tag::Int(0)));
+        assert_eq!(data.get("allowCommands"), Some(&Tag::Byte(0)));
+        let difficulty = data.get("difficulty_settings").unwrap();
+        assert_eq!(
+            difficulty.get("difficulty"),
+            Some(&Tag::String("hard".into()))
+        );
+        assert_eq!(difficulty.get("hardcore"), Some(&Tag::Byte(1)));
+        assert_eq!(difficulty.get("locked"), Some(&Tag::Byte(0)));
+        state.mode = GameMode::Creative;
+        state.allow_commands = None;
+        let metadata = state
+            .draft_level_data(&spawn, 123, None, None, true)
+            .unwrap();
+        let data = metadata.value.get("Data").unwrap();
+        assert_eq!(data.get("GameType"), Some(&Tag::Int(1)));
+        assert_eq!(data.get("allowCommands"), Some(&Tag::Byte(1)));
+        assert_eq!(data.get("initialized"), Some(&Tag::Byte(1)));
+        assert_eq!(
+            data.get("difficulty_settings").unwrap().get("difficulty"),
+            Some(&Tag::String("easy".into()))
+        );
+    }
 
     #[test]
     fn folder_worker_coalesces_requests_and_discards_stale_results() {

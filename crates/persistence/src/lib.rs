@@ -4,6 +4,7 @@ mod chest_transfer;
 pub mod edit;
 pub mod generated_section;
 pub mod heightmap;
+pub mod level_data;
 pub mod nbt;
 pub mod palette;
 pub mod poi;

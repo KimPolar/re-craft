@@ -1437,6 +1437,161 @@ impl CarvedTerrainWorld {
             .filter_map(Option::as_ref)
     }
 
+    /// Prepare known block entities after checking every block in this chunk.
+    /// This intermediate list does not establish Java's iteration order or
+    /// authorize saving the rest of the generated chunk.
+    pub fn generated_block_entity_data(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<native_persistence::nbt::Tag> {
+        self.generated_block_entity_data_with(pos, |state| {
+            registry
+                .is_canonical_state(&state.name, &state.properties)
+                .then(|| registry.has_block_entity(&state.name))
+                .flatten()
+        })
+    }
+
+    fn generated_block_entity_data_with(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+        mut has_entity: impl FnMut(&native_world::loaded::BlockState) -> Option<bool>,
+    ) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::nbt::{Tag, TagType};
+        use native_world::loaded::BlockState;
+
+        let chunk = self
+            .world
+            .chunks
+            .get(&pos)
+            .context("generated chunk is missing")?;
+        ensure!(chunk.position == pos, "generated chunk position mismatch");
+        ensure!(
+            self.min_y.rem_euclid(16) == 0 && self.height > 0 && self.height % 16 == 0,
+            "invalid generated height"
+        );
+        let end_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("generated height overflow")?;
+        let origin_x = pos
+            .x
+            .checked_mul(16)
+            .context("generated chunk X overflow")?;
+        let origin_z = pos
+            .z
+            .checked_mul(16)
+            .context("generated chunk Z overflow")?;
+        let belongs = |p: [i32; 3]| p[0].div_euclid(16) == pos.x && p[2].div_euclid(16) == pos.z;
+        let mut entities = BTreeMap::<[i32; 3], (BlockState, Tag)>::new();
+        for (&p, nest) in self
+            .generated_bee_nests
+            .iter()
+            .filter(|(p, _)| belongs(**p))
+        {
+            ensure!(p == nest.position, "generated nest position mismatch");
+            let state = self
+                .world
+                .block(p[0], p[1], p[2])
+                .context("generated nest block is missing")?;
+            ensure!(
+                state.name == "minecraft:bee_nest",
+                "generated nest block mismatch"
+            );
+            ensure!(
+                entities
+                    .insert(p, (state.clone(), nest.block_entity()))
+                    .is_none(),
+                "duplicate generated block entity"
+            );
+        }
+        for (&p, entity) in self
+            .generated_monster_entities
+            .iter()
+            .filter(|(p, _)| belongs(**p))
+        {
+            let (state, data) = match entity.as_ref().context("generated spawner is unfinished")? {
+                GeneratedMonsterRoomEntity::Chest(chest) => {
+                    ensure!(p == chest.position, "generated chest position mismatch");
+                    let expected = chest.block_state();
+                    (
+                        BlockState {
+                            name: expected.name.to_string_lossy(),
+                            properties: expected
+                                .properties
+                                .iter()
+                                .map(|(k, v)| (k.to_string_lossy(), v.to_string_lossy()))
+                                .collect(),
+                        },
+                        chest.block_entity(),
+                    )
+                }
+                GeneratedMonsterRoomEntity::Spawner(spawner) => {
+                    ensure!(p == spawner.position, "generated spawner position mismatch");
+                    (
+                        BlockState {
+                            name: "minecraft:spawner".into(),
+                            properties: BTreeMap::new(),
+                        },
+                        spawner.block_entity(),
+                    )
+                }
+            };
+            ensure!(
+                entities.insert(p, (state, data)).is_none(),
+                "duplicate generated block entity"
+            );
+        }
+        let mut resolved = vec![None; self.world.state_count()];
+        let mut values = Vec::with_capacity(entities.len());
+        for sy in (self.min_y / 16)..(end_y / 16) {
+            let section = chunk
+                .sections
+                .get(&i8::try_from(sy)?)
+                .context("generated section is missing")?;
+            let blocks = section
+                .blocks
+                .as_ref()
+                .context("generated block data is missing")?;
+            for (index, id) in blocks.iter().enumerate() {
+                let state = self
+                    .world
+                    .state(*id)
+                    .context("generated block state is missing")?;
+                let is_entity = match resolved[id.0 as usize] {
+                    Some(value) => value,
+                    None => {
+                        let value = has_entity(state)
+                            .context("generated block entity classification is unknown")?;
+                        resolved[id.0 as usize] = Some(value);
+                        value
+                    }
+                };
+                if is_entity {
+                    let p = [
+                        origin_x + (index % 16) as i32,
+                        sy * 16 + (index / 256) as i32,
+                        origin_z + ((index / 16) % 16) as i32,
+                    ];
+                    let (expected, data) = entities
+                        .remove(&p)
+                        .context("generated block entity data is missing")?;
+                    ensure!(&expected == state, "generated block entity state mismatch");
+                    values.push(data);
+                }
+            }
+        }
+        ensure!(
+            entities.is_empty(),
+            "generated block entity has no matching block"
+        );
+        Ok(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        })
+    }
+
     /// Return the already-primed first-available Y without recomputing stale
     /// generation heightmaps. None means the requested map is not primed.
     pub fn primed_mob_spawn_height(
@@ -3951,6 +4106,7 @@ mod tests {
         let original = batch.snapshot().unwrap();
         assert!(batch.spawned_section_data(center).is_err());
         assert!(batch.spawned_heightmap_data(center).is_err());
+        assert!(batch.spawned_block_entity_data(center).is_err());
         assert!(batch.spawned_tick_data(center).is_err());
         assert!(batch.spawned_postprocessing_data(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
@@ -3966,6 +4122,13 @@ mod tests {
         assert!(batch.is_complete());
         assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
+        let native_persistence::nbt::Tag::List {
+            values: entities, ..
+        } = batch.spawned_block_entity_data(center).unwrap()
+        else {
+            panic!("missing block entities")
+        };
+        assert!(entities.is_empty());
         assert!(heightmaps.get("WORLD_SURFACE_WG").is_some());
         assert!(heightmaps.get("OCEAN_FLOOR_WG").is_some());
         let marks = batch.spawned_postprocessing_data(center).unwrap();

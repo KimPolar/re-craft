@@ -609,6 +609,30 @@ impl FreshTerrainBatch {
         terrain.generated_heightmap_data(pos)
     }
 
+    /// Prepare the known block entities of a spawn-complete chunk. Other
+    /// chunk data and Java's block entity iteration order remain separate.
+    pub fn spawned_block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before encoding block entities"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "block entities require a spawn-complete chunk"
+        );
+        self.terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .generated_block_entity_data(
+                pos,
+                self.light_registry
+                    .as_ref()
+                    .context("block registry is missing")?,
+            )
+    }
+
     /// Encode generated block and fluid ticks in the order recorded by the
     /// protochunk. Sections, entities and other save data remain separate.
     pub fn spawned_tick_data(

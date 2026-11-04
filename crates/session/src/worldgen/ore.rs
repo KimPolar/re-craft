@@ -15718,6 +15718,129 @@ mod tests {
     }
 
     #[test]
+    fn generated_block_entity_data_checks_blocks_and_complete_records() {
+        use super::super::{
+            GeneratedBeeNest, GeneratedLootChest, GeneratedMonsterRoomEntity,
+            GeneratedMonsterSpawner,
+        };
+        use native_persistence::nbt::{Tag, TagType};
+        use native_resources::{monster_room::RoomMob, structure_start::HorizontalDirection};
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let nest = GeneratedBeeNest::new([2, 8, 2], vec![1, 2]).unwrap();
+        let chest = GeneratedLootChest::new(
+            [3, 8, 2],
+            HorizontalDirection::West,
+            "minecraft:chests/simple_dungeon",
+            -7,
+        )
+        .unwrap();
+        let spawner = GeneratedMonsterSpawner {
+            position: [4, 8, 2],
+            mob: RoomMob::Zombie,
+        };
+        let nest_state = BlockState {
+            name: "minecraft:bee_nest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("honey_level".into(), "0".into()),
+            ]),
+        };
+        let chest_state = BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "west".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        let world = Arc::make_mut(&mut terrain.world);
+        for (p, state) in [
+            (nest.position, nest_state),
+            (chest.position, chest_state),
+            (spawner.position, state("spawner")),
+        ] {
+            let id = world.intern_state(state);
+            world.set_block_id(p[0], p[1], p[2], id).unwrap();
+        }
+        Arc::make_mut(&mut terrain.generated_bee_nests).insert(nest.position, nest.clone());
+        Arc::make_mut(&mut terrain.generated_monster_entities).insert(
+            chest.position,
+            Some(GeneratedMonsterRoomEntity::Chest(chest.clone())),
+        );
+        Arc::make_mut(&mut terrain.generated_monster_entities).insert(
+            spawner.position,
+            Some(GeneratedMonsterRoomEntity::Spawner(spawner.clone())),
+        );
+        let classify = |state: &BlockState| {
+            Some(matches!(
+                state.name.as_str(),
+                "minecraft:bee_nest" | "minecraft:chest" | "minecraft:spawner"
+            ))
+        };
+        let encoded = terrain
+            .generated_block_entity_data_with(center, classify)
+            .unwrap();
+        assert_eq!(
+            encoded,
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![
+                    nest.block_entity(),
+                    chest.block_entity(),
+                    spawner.block_entity()
+                ]
+            }
+        );
+        assert!(
+            terrain
+                .generated_block_entity_data_with(ChunkPos { x: -1, z: -1 }, classify)
+                .is_ok()
+        );
+        assert!(
+            terrain
+                .generated_block_entity_data_with(ChunkPos { x: 3, z: 3 }, classify)
+                .is_err()
+        );
+        assert!(
+            terrain
+                .generated_block_entity_data_with(center, |_| None)
+                .is_err()
+        );
+        Arc::make_mut(&mut terrain.generated_monster_entities).insert(spawner.position, None);
+        assert!(
+            terrain
+                .generated_block_entity_data_with(center, classify)
+                .is_err()
+        );
+        Arc::make_mut(&mut terrain.generated_monster_entities).remove(&spawner.position);
+        assert!(
+            terrain
+                .generated_block_entity_data_with(center, classify)
+                .is_err()
+        );
+        Arc::make_mut(&mut terrain.generated_monster_entities).insert(
+            spawner.position,
+            Some(GeneratedMonsterRoomEntity::Spawner(spawner)),
+        );
+        let world = Arc::make_mut(&mut terrain.world);
+        let stone = world.intern_state(state("stone"));
+        world
+            .set_block_id(
+                chest.position[0],
+                chest.position[1],
+                chest.position[2],
+                stone,
+            )
+            .unwrap();
+        assert!(
+            terrain
+                .generated_block_entity_data_with(center, classify)
+                .is_err()
+        );
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn installed_fallen_oak_chunk_matches_java() {
         use std::{path::PathBuf, process::Command};

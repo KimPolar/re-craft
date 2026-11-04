@@ -631,6 +631,7 @@ pub struct LoadedSession {
     advance_weather: bool,
     game_time: i64,
     initial_game_time_set: bool,
+    generated_ticks_installed: bool,
     level_time_source: Option<Arc<native_persistence::nbt::NamedTag>>,
     biome_climates: Option<Arc<BTreeMap<String, native_resources::biome_climate::BiomeClimate>>>,
     generator_sea_level: Option<i32>,
@@ -956,6 +957,37 @@ type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), ButtonTickKey>;
 enum BubbleTickKind {
     Water,
     Column,
+}
+
+#[derive(Clone, Copy)]
+enum GeneratedBlockTickKind {
+    Falling(FallingKind),
+    Button(native_core::button::Button),
+    Lamp,
+    Ice,
+    Sensor(bool),
+    Bubble(BubbleTickKind),
+    Soil(SoilKind),
+}
+
+impl GeneratedBlockTickKind {
+    fn from_id(id: &str) -> Option<Self> {
+        if let Some(kind) = FallingKind::from_id(id) {
+            return Some(Self::Falling(kind));
+        }
+        if let Some(kind) = native_core::button::Button::from_id(id) {
+            return Some(Self::Button(kind));
+        }
+        match id {
+            "minecraft:redstone_lamp" => Some(Self::Lamp),
+            "minecraft:frosted_ice" => Some(Self::Ice),
+            "minecraft:sculk_sensor" => Some(Self::Sensor(false)),
+            "minecraft:calibrated_sculk_sensor" => Some(Self::Sensor(true)),
+            _ => BubbleTickKind::from_id(id)
+                .map(Self::Bubble)
+                .or_else(|| SoilKind::from_name(id).map(Self::Soil)),
+        }
+    }
 }
 
 impl BubbleTickKind {
@@ -5612,6 +5644,166 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Transfer activated generation queues into a fresh, unadvanced session.
+    /// Unsupported ticks are rejected before any session state is changed.
+    /// This does not establish that the resulting world is ready for play or saving.
+    pub fn install_generated_ticks(
+        &mut self,
+        ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
+    ) -> anyhow::Result<()> {
+        use anyhow::{bail, ensure};
+
+        ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "generated ticks must be installed before simulation begins"
+        );
+        ensure!(
+            !self.generated_ticks_installed,
+            "generated ticks already installed"
+        );
+        ensure!(
+            self.block_tick_sequence == 0 && self.fluid_sequence == 0,
+            "session already has scheduled ticks"
+        );
+        ensure!(
+            self.world.saved_block_ticks.values().all(Vec::is_empty)
+                && self.world.saved_fluid_ticks.values().all(Vec::is_empty),
+            "session contains saved ticks"
+        );
+        ensure!(
+            self.world.chunks.keys().eq(ticks.chunks.keys()),
+            "generated tick containers do not match loaded chunks"
+        );
+        ensure!(
+            !self.initial_game_time_set || self.game_time == ticks.game_time,
+            "generated ticks have a different game time"
+        );
+        ensure!(
+            ticks.next_sub_tick >= 0,
+            "generated sub-tick counter wrapped"
+        );
+
+        let mut blocks = Vec::new();
+        let mut fluids = Vec::new();
+        for (chunk, queues) in &ticks.chunks {
+            for tick in queues.blocks.iter().chain(&queues.fluids) {
+                ensure!(
+                    tick.position[0].div_euclid(16) == chunk.x
+                        && tick.position[2].div_euclid(16) == chunk.z,
+                    "generated tick is outside chunk {}, {}",
+                    chunk.x,
+                    chunk.z
+                );
+                ensure!(
+                    (-3..=3).contains(&tick.priority),
+                    "invalid generated tick priority"
+                );
+                ensure!(
+                    tick.sub_tick < 0 || tick.sub_tick < ticks.next_sub_tick,
+                    "generated tick exceeds the sub-tick counter"
+                );
+                ensure!(
+                    tick.trigger.checked_sub(ticks.game_time).is_some(),
+                    "generated tick time wrapped"
+                );
+            }
+            for tick in &queues.blocks {
+                let Some(kind) = GeneratedBlockTickKind::from_id(&tick.kind) else {
+                    bail!("unsupported generated block tick {}", tick.kind);
+                };
+                blocks.push((*chunk, tick, kind));
+            }
+            for tick in &queues.fluids {
+                let (kind, source) = match tick.kind.as_str() {
+                    "minecraft:water" => (FluidKind::Water, true),
+                    "minecraft:flowing_water" => (FluidKind::Water, false),
+                    "minecraft:lava" => (FluidKind::Lava, true),
+                    "minecraft:flowing_lava" => (FluidKind::Lava, false),
+                    _ => bail!("unsupported generated fluid tick {}", tick.kind),
+                };
+                fluids.push((*chunk, tick, kind, source));
+            }
+        }
+
+        if !self.initial_game_time_set {
+            self.set_initial_game_time(ticks.game_time)
+                .map_err(anyhow::Error::msg)?;
+        }
+        for (chunk, tick, kind) in blocks {
+            let [x, y, z] = tick.position;
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            let order = (
+                i128::from(tick.trigger) - i128::from(ticks.game_time),
+                tick.priority,
+                tick.sub_tick,
+                sequence,
+            );
+            self.tick_chunks_needing_dirty.insert(chunk);
+            match kind {
+                GeneratedBlockTickKind::Falling(kind) => {
+                    let key = SandTickKey { x, y, z, kind };
+                    self.sand_pending.insert(key);
+                    self.sand_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Button(kind) => {
+                    let key = ButtonTickKey { x, y, z, kind };
+                    self.button_pending.insert(key);
+                    self.button_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Lamp => {
+                    let key = (x, y, z);
+                    self.lamp_pending.insert(key);
+                    self.lamp_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Ice => {
+                    let key = (x, y, z);
+                    self.ice_pending.insert(key);
+                    self.ice_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Sensor(calibrated) => {
+                    let key = (x, y, z, calibrated);
+                    self.sensor_pending.insert(key);
+                    self.sensor_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Bubble(kind) => {
+                    let key = BubbleTickKey { x, y, z, kind };
+                    self.bubble_pending.insert(key);
+                    self.bubble_ticks.insert(order, key);
+                }
+                GeneratedBlockTickKind::Soil(kind) => {
+                    self.soil_pending.insert((x, y, z, kind));
+                    self.soil_ticks.insert(order, (IVec3::new(x, y, z), kind));
+                }
+            }
+        }
+        for (chunk, tick, kind, source) in fluids {
+            let [x, y, z] = tick.position;
+            let key = FluidTickKey {
+                x,
+                y,
+                z,
+                kind,
+                source,
+            };
+            self.fluid_pending.insert(key);
+            self.tick_chunks_needing_dirty.insert(chunk);
+            self.insert_fluid_tick_unchecked(
+                key,
+                i128::from(tick.trigger) - i128::from(ticks.game_time),
+                tick.priority,
+                tick.sub_tick,
+            );
+        }
+        // Runtime queues have separate sequence counters. Start both after the
+        // generation counter so later ticks remain after imported sub-ticks.
+        let next = ticks.next_sub_tick as u64;
+        self.block_tick_sequence = self.block_tick_sequence.max(next);
+        self.fluid_sequence = self.fluid_sequence.max(next);
+        self.generated_ticks_installed = true;
+        Ok(())
+    }
+
     /// Capture the original level.dat document before advancing the session.
     pub fn capture_level_time_source(
         &mut self,
@@ -5975,6 +6167,7 @@ impl LoadedSession {
             advance_weather: true,
             game_time: 0,
             initial_game_time_set: false,
+            generated_ticks_installed: false,
             level_time_source: None,
             biome_climates: None,
             generator_sea_level: None,
@@ -22519,6 +22712,127 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    fn generated_tick_fixture() -> crate::worldgen::chunk_ticks::ActivatedRegionTicks {
+        use crate::worldgen::chunk_ticks::{
+            ActivatedChunkTicks, ActivatedRegionTicks, ScheduledTick,
+        };
+        let tick = |kind: &str, x, trigger, priority, sub_tick| ScheduledTick {
+            kind: kind.into(),
+            position: [16_000_000 + x, 2, -15_999_998],
+            trigger,
+            priority,
+            sub_tick,
+        };
+        ActivatedRegionTicks {
+            game_time: 42,
+            next_sub_tick: 10,
+            chunks: BTreeMap::from([(
+                ChunkPos {
+                    x: 1_000_000,
+                    z: -1_000_000,
+                },
+                ActivatedChunkTicks {
+                    blocks: vec![
+                        tick("minecraft:sand", 1, 45, 0, -2),
+                        tick("minecraft:sand", 1, 45, 0, -1),
+                        tick("minecraft:water", 2, 45, -1, 4),
+                        tick("minecraft:frosted_ice", 3, 46, 0, 6),
+                        tick("minecraft:frosted_ice", 3, 46, 0, 7),
+                    ],
+                    fluids: vec![
+                        tick("minecraft:water", 4, 45, 0, -2),
+                        tick("minecraft:water", 4, 45, 0, -1),
+                        tick("minecraft:flowing_lava", 5, 48, 1, 8),
+                    ],
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn generated_ticks_preserve_time_order_and_duplicates() {
+        let mut session = session();
+        let ticks = generated_tick_fixture();
+        session.install_generated_ticks(&ticks).unwrap();
+        assert_eq!(session.game_time, 42);
+        assert_eq!(session.snapshot.game_time, 42);
+        assert_eq!(
+            session
+                .sand_ticks
+                .keys()
+                .map(|key| key.2)
+                .collect::<Vec<_>>(),
+            [-2, -1]
+        );
+        assert_eq!(session.sand_pending.len(), 1);
+        assert_eq!(session.ice_ticks.len(), 2);
+        assert_eq!(session.ice_pending.len(), 1);
+        assert_eq!(session.bubble_ticks.first_key_value().unwrap().0.0, 3);
+        assert_eq!(session.bubble_ticks.first_key_value().unwrap().0.1, -1);
+        assert_eq!(
+            session
+                .fluid_ticks
+                .keys()
+                .map(|key| (key.0, key.2))
+                .collect::<Vec<_>>(),
+            [(3, -2), (3, -1), (6, 8)]
+        );
+        assert_eq!(session.fluid_pending.len(), 2);
+        assert_eq!(session.block_tick_sequence, 10);
+        assert_eq!(session.fluid_sequence, 10);
+        assert!(session.tick_chunks_needing_dirty.contains(&ChunkPos {
+            x: 1_000_000,
+            z: -1_000_000
+        }));
+        assert!(session.install_generated_ticks(&ticks).is_err());
+    }
+
+    #[test]
+    fn generated_ticks_reject_unknown_or_malformed_data_atomically() {
+        let mut session = session();
+        let mut ticks = generated_tick_fixture();
+        let chunk = ticks
+            .chunks
+            .get_mut(&ChunkPos {
+                x: 1_000_000,
+                z: -1_000_000,
+            })
+            .unwrap();
+        chunk.blocks.last_mut().unwrap().kind = "minecraft:oak_leaves".into();
+        assert!(session.install_generated_ticks(&ticks).is_err());
+        assert_eq!(session.game_time, 0);
+        assert!(!session.initial_game_time_set);
+        assert!(session.sand_ticks.is_empty());
+        assert!(session.fluid_ticks.is_empty());
+        let mut ticks = generated_tick_fixture();
+        ticks
+            .chunks
+            .get_mut(&ChunkPos {
+                x: 1_000_000,
+                z: -1_000_000,
+            })
+            .unwrap()
+            .fluids[0]
+            .position[0] = 16_000_016;
+        assert!(session.install_generated_ticks(&ticks).is_err());
+        let mut ticks = generated_tick_fixture();
+        ticks
+            .chunks
+            .get_mut(&ChunkPos {
+                x: 1_000_000,
+                z: -1_000_000,
+            })
+            .unwrap()
+            .fluids[0]
+            .sub_tick = 10;
+        assert!(session.install_generated_ticks(&ticks).is_err());
+        assert!(
+            session
+                .install_generated_ticks(&generated_tick_fixture())
+                .is_ok()
+        );
     }
 
     struct SplashTestPacks;

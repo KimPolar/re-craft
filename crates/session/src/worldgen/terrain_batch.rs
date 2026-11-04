@@ -861,6 +861,21 @@ impl FreshTerrainBatch {
         terrain.generated_heightmap_data(pos)
     }
 
+    /// Convert the current SPAWN-stage maps as Java's LevelChunk constructor
+    /// does. This is not a completed FULL chunk; later block changes still
+    /// need to update the maps before saving.
+    pub fn converted_full_heightmap_data(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        let maps = self.spawned_heightmap_data(pos)?;
+        let (min_y, max_y) = self.build_bounds()?;
+        native_persistence::heightmap::generated_full_heightmaps(
+            native_persistence::heightmap::HeightBounds { min_y, max_y },
+            &maps,
+        )
+    }
+
     /// Prepare the known block entities of a spawn-complete chunk. Other
     /// chunk data remains separate. Identity-dependent Java hash ties are rejected.
     pub fn spawned_block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {

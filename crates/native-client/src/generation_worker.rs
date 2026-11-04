@@ -1652,6 +1652,26 @@ mod tests {
                     .all(|pos| ready.batch.schedule().completed(*pos)
                         == Some(GenerationStage::Spawn))
             );
+            for &pos in &targets {
+                use native_persistence::nbt::Tag;
+                let source = ready.batch.spawned_heightmap_data(pos)?;
+                let full = ready.batch.converted_full_heightmap_data(pos)?;
+                for name in [
+                    "WORLD_SURFACE",
+                    "OCEAN_FLOOR",
+                    "MOTION_BLOCKING",
+                    "MOTION_BLOCKING_NO_LEAVES",
+                ] {
+                    match source.get(name) {
+                        Some(value) => assert_eq!(full.get(name), Some(value)),
+                        None => assert!(
+                            matches!(full.get(name), Some(Tag::LongArray(words)) if words.iter().all(|&word| word == 0))
+                        ),
+                    }
+                }
+                assert!(full.get("WORLD_SURFACE_WG").is_none());
+                assert!(full.get("OCEAN_FLOOR_WG").is_none());
+            }
             let count: usize = targets
                 .iter()
                 .map(|&pos| ready.batch.recorded_generated_entities(pos).unwrap().len())

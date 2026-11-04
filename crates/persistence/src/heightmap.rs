@@ -510,6 +510,49 @@ pub fn encode_generated_heightmaps(
     Ok(Tag::Compound(output))
 }
 
+/// Heightmaps immediately after Java constructs a LevelChunk from a
+/// ProtoChunk. Final maps absent from the source start at the minimum height;
+/// world-generation maps are not copied. This does not run postprocessing or
+/// authorize saving the chunk.
+pub fn generated_full_heightmaps(bounds: HeightBounds, source: &Tag) -> Result<Tag> {
+    use std::collections::BTreeSet;
+    let height = bounds.height()?;
+    let Tag::Compound(entries) = source else {
+        bail!("generated heightmaps must be a compound")
+    };
+    let names = [
+        "WORLD_SURFACE",
+        "OCEAN_FLOOR",
+        "MOTION_BLOCKING",
+        "MOTION_BLOCKING_NO_LEAVES",
+        "WORLD_SURFACE_WG",
+        "OCEAN_FLOOR_WG",
+    ];
+    let mut seen = BTreeSet::new();
+    for (name, value) in entries {
+        let index = names
+            .iter()
+            .position(|candidate| name.matches(candidate))
+            .context("unknown generated heightmap")?;
+        ensure!(seen.insert(index), "duplicate generated heightmap");
+        let Tag::LongArray(values) = value else {
+            bail!("generated heightmap is not a long array")
+        };
+        raw_values(values, height)?;
+    }
+    let empty = encode(&[0; 256], height, None)?;
+    let mut result = Vec::with_capacity(4);
+    for name in &names[..4] {
+        let map = entries
+            .iter()
+            .find(|(key, _)| key.matches(name))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| Tag::LongArray(empty.clone()));
+        result.push(((*name).into(), map));
+    }
+    Ok(Tag::Compound(result))
+}
+
 /// Rebuild a draft while verifying any original known heightmaps against its
 /// original blocks. Unknown NBT and unused bits are retained byte-for-byte.
 pub(crate) fn rebuild(

@@ -1371,6 +1371,30 @@ struct ScheduledFluid {
 struct GeneratedTickOrder {
     base_time: i64,
     queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    parked: BTreeMap<ChunkPos, crate::worldgen::chunk_ticks::ChunkTicks>,
+}
+
+impl GeneratedTickOrder {
+    fn park(&mut self, pos: ChunkPos) -> bool {
+        if self.parked.contains_key(&pos) {
+            return false;
+        }
+        let Some(container) = self.queue.remove_container(pos) else {
+            return false;
+        };
+        self.parked.insert(pos, container);
+        true
+    }
+
+    fn restore(&mut self, pos: ChunkPos) -> bool {
+        if self.queue.container(pos).is_some() {
+            return false;
+        }
+        let Some(container) = self.parked.remove(&pos) else {
+            return false;
+        };
+        matches!(self.queue.add_container(pos, container), Ok(None))
+    }
 }
 
 fn generated_fluid_key(tick: &crate::worldgen::chunk_ticks::ScheduledTick) -> Option<FluidTickKey> {
@@ -5963,6 +5987,7 @@ impl LoadedSession {
         self.generated_block_order = Some(GeneratedTickOrder {
             base_time: ticks.game_time,
             queue,
+            parked: BTreeMap::new(),
         });
         Ok(())
     }
@@ -6020,6 +6045,7 @@ impl LoadedSession {
         self.generated_fluid_order = Some(GeneratedTickOrder {
             base_time: ticks.game_time,
             queue,
+            parked: BTreeMap::new(),
         });
         Ok(())
     }
@@ -10471,7 +10497,11 @@ impl LoadedSession {
     }
 
     fn apply_streaming(&mut self) {
-        if !self.incoming.is_empty() {
+        if self.incoming.iter().any(|incoming| {
+            incoming.world.is_some()
+                && !self.world.chunks.contains_key(&incoming.pos)
+                && !self.parked_chunks.contains_key(&incoming.pos)
+        }) {
             self.generated_fluid_order = None;
             self.generated_block_order = None;
         }
@@ -10524,8 +10554,17 @@ impl LoadedSession {
                 .iter()
                 .any(|pos| !within_window(*pos, window));
             if !outside.is_empty() || !restore.is_empty() || old_missing {
-                self.generated_fluid_order = None;
-                self.generated_block_order = None;
+                for order in [
+                    &mut self.generated_fluid_order,
+                    &mut self.generated_block_order,
+                ] {
+                    if order.as_mut().is_some_and(|order| {
+                        !outside.iter().copied().all(|pos| order.park(pos))
+                            || !restore.iter().copied().all(|pos| order.restore(pos))
+                    }) {
+                        *order = None;
+                    }
+                }
                 let mut restored_ticks = Vec::new();
                 let unsaved: BTreeSet<_> = outside
                     .iter()
@@ -23716,10 +23755,96 @@ pub(crate) mod tests {
             ["minecraft:sand", "minecraft:frosted_ice"]
         );
         session.schedule_sand(pos, FallingKind::Sand);
+        session.schedule_sand(IVec3::new(17, 2, 1), FallingKind::Sand);
         session.queue_chunk_window(home, 0);
         session.apply_streaming();
+        assert!(session.generated_block_order.is_some());
+        assert!(session.parked_chunks.contains_key(&neighbor));
+        session.tick = 4;
+        let selected = session.collect_generated_block_ticks().unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.identity().1)
+                .collect::<Vec<_>>(),
+            [a]
+        );
+        session.queue_chunk_window(home, 1);
+        session.apply_streaming();
+        assert!(session.generated_block_order.is_some());
+        let selected = session.collect_generated_block_ticks().unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.identity().1)
+                .collect::<Vec<_>>(),
+            [b]
+        );
+    }
+
+    #[test]
+    fn generated_order_survives_unrelated_stream_events_and_falls_back_for_new_chunks() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let mut session = session();
+        let home = *session.world.chunks.keys().next().unwrap();
+        let pos = (session.origin + IVec3::new(1, 2, 1)).to_array();
+        let saved = |kind: &str| SavedTick {
+            kind: kind.into(),
+            position: pos,
+            delay: 20,
+            priority: 0,
+        };
+        let region = RegionTicks::new(
+            BTreeMap::from([(
+                home,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(home, vec![saved("minecraft:sand")]).unwrap(),
+                    fluids: ChunkTicks::from_saved(home, vec![saved("minecraft:water")]).unwrap(),
+                },
+            )]),
+            42,
+            0,
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        session.install_generated_ticks(&snapshot).unwrap();
+        session
+            .install_generated_block_order(
+                &snapshot,
+                region
+                    .captured_indexed_queue(TickRegistry::Block, &[home])
+                    .unwrap(),
+            )
+            .unwrap();
+        session
+            .install_generated_fluid_order(
+                &snapshot,
+                region
+                    .captured_indexed_queue(TickRegistry::Fluid, &[home])
+                    .unwrap(),
+            )
+            .unwrap();
+        session.queue_missing_chunk(home);
+        session.apply_streaming();
+        assert!(session.generated_block_order.is_some());
+        assert!(session.generated_fluid_order.is_some());
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut source = session.world.as_ref().clone();
+        let mut chunk = source.chunks[&home].as_ref().clone();
+        chunk.position = neighbor;
+        source.chunks.insert(neighbor, Arc::new(chunk));
+        session.queue_loaded_chunk(neighbor, source);
+        session.apply_streaming();
+        assert!(session.world.chunks.contains_key(&neighbor));
         assert!(session.generated_block_order.is_none());
+        assert!(session.generated_fluid_order.is_none());
         assert_eq!(session.sand_ticks.len(), 1);
+        assert_eq!(session.fluid_ticks.len(), 1);
     }
 
     #[test]
@@ -23934,10 +24059,31 @@ pub(crate) mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].1.key.x, a[0]);
         session.schedule_fluid(IVec3::new(1, 2, 1), water, 10);
+        session.schedule_fluid(IVec3::new(17, 2, 1), water, 10);
         session.queue_chunk_window(home, 0);
         session.apply_streaming();
-        assert!(session.generated_fluid_order.is_none());
-        assert_eq!(session.fluid_ticks.len(), 1);
+        assert!(session.generated_fluid_order.is_some());
+        assert!(session.parked_chunks.contains_key(&neighbor));
+        session.tick = 15;
+        let selected = session.collect_due_fluid_ticks();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.key.x)
+                .collect::<Vec<_>>(),
+            [a[0]]
+        );
+        session.queue_chunk_window(home, 1);
+        session.apply_streaming();
+        assert!(session.generated_fluid_order.is_some());
+        let selected = session.collect_due_fluid_ticks();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.key.x)
+                .collect::<Vec<_>>(),
+            [b[0]]
+        );
     }
 
     #[test]

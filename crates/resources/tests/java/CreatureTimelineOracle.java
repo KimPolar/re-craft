@@ -20,6 +20,7 @@ public class CreatureTimelineOracle {
         for (var item:cases) {
             var c=item.getAsJsonObject();
             var clock=new ServerClockManager.ServerClockInstance(); ClockManager manager=ignored->clock;
+            if (clock.totalTicks()!=0L) throw new AssertionError("new server clock must start at zero");
             Optional<Integer> period=c.has("period") && !c.get("period").isJsonNull() ? Optional.of(c.get("period").getAsInt()) : Optional.empty();
             var rows=new JsonArray();
             if(c.get("kind").getAsString().equals("probability")) {

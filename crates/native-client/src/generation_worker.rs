@@ -49,6 +49,8 @@ pub struct GenerationReady {
     pub spawn_origin: Option<ChunkPos>,
     /// Initial world-spawn suggestion, not the collision-checked player spawn.
     pub suggested_spawn: Option<IVec3>,
+    /// Starting clock ticks from the same pack stack, when prepared for a new world.
+    pub initial_clocks: Option<Arc<BTreeMap<native_resources::packs::ResourceId, i64>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +335,7 @@ impl GenerationWorker {
                 worldgen_settings,
                 creatures,
                 spawn_mobs,
+                initial_clocks,
             } = prepare()?;
             let Some(mut ready) = generate_spawn_origin(
                 batch,
@@ -348,6 +351,7 @@ impl GenerationWorker {
                 return Ok(None);
             };
             ready.worldgen_settings_draft = Some(worldgen_settings);
+            ready.initial_clocks = Some(initial_clocks);
             let Some(mut ready) = complete_spawn_search(
                 ready,
                 &mut resources,
@@ -703,6 +707,7 @@ impl GenerationWorker {
                 worldgen_settings_draft: None,
                 spawn_origin: None,
                 suggested_spawn: None,
+                initial_clocks: None,
             }))
         })
     }
@@ -1079,6 +1084,7 @@ fn generate_spawn_origin(
         worldgen_settings_draft: None,
         spawn_origin: Some(spawn),
         suggested_spawn: None,
+        initial_clocks: None,
     }))
 }
 
@@ -1099,6 +1105,7 @@ fn expand_with_inputs(
         spawn_origin,
         suggested_spawn: _,
         worldgen_settings_draft,
+        initial_clocks,
     } = ready;
     ensure!(
         revision != mesh.revision,
@@ -1188,6 +1195,7 @@ fn expand_with_inputs(
         worldgen_settings_draft,
         spawn_origin,
         suggested_spawn: None,
+        initial_clocks,
     }))
 }
 
@@ -1398,6 +1406,8 @@ mod tests {
             "data/example/worldgen/world_preset",
             "data/example/worldgen/biome",
             "data/example/dimension_type",
+            "data/example/world_clock",
+            "data/example/timeline",
             "data/minecraft/tags/block",
         ] {
             std::fs::create_dir_all(pack.join(dir))?;
@@ -1424,13 +1434,23 @@ mod tests {
             pack.join("data/example/worldgen/world_preset/compact_disabled.json"),
             serde_json::to_vec(&disabled_preset)?,
         )?;
-        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0});
+        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0,"timelines":["example:creatures"]});
         std::fs::write(
             pack.join("data/example/dimension_type/compact.json"),
             serde_json::to_vec(&dimension)?,
         )?;
+        std::fs::write(pack.join("data/example/world_clock/creatures.json"), b"{}")?;
+        let timeline = json!({"clock":"example:creatures","period_ticks":20,"tracks":{
+            "minecraft:gameplay/creature_world_gen_spawn_probability":{
+                "modifier":"override","keyframes":[{"ticks":0,"value":0.75},{"ticks":10,"value":0.0}]
+            }
+        }});
+        std::fs::write(
+            pack.join("data/example/timeline/creatures.json"),
+            serde_json::to_vec(&timeline)?,
+        )?;
         let biome = json!({"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[],"attributes":{
-            "minecraft:gameplay/creature_world_gen_spawn_probability":0.75,
+            "minecraft:gameplay/creature_world_gen_spawn_probability":0.0,
             "minecraft:gameplay/natural_mob_spawns":{"spawn_costs":{},"spawns_by_category":{"creature":[{"type":"minecraft:sheep","count":1,"weight":1}]}}
         }});
         std::fs::write(
@@ -1486,12 +1506,16 @@ mod tests {
                         min_z: -100.0,
                         max_z: 100.0,
                     };
-                    let inputs = prepared.into_initial_world_inputs(
-                        border,
-                        Default::default(),
-                        spawn_mobs,
-                    )?;
+                    let inputs = prepared.into_new_world_inputs(border, spawn_mobs)?;
                     assert_eq!(inputs.creatures.is_some(), spawn_mobs && !disabled);
+                    assert_eq!(
+                        inputs
+                            .initial_clocks
+                            .get(&native_resources::packs::ResourceId::parse(
+                                "example:creatures"
+                            )?),
+                        Some(&0)
+                    );
                     Ok(inputs)
                 },
                 80,
@@ -1504,6 +1528,12 @@ mod tests {
                 GenerationResult::Cancelled => anyhow::bail!("initial world cancelled"),
             };
             let targets = ready.mesh.targets.as_deref().context("targets missing")?;
+            assert_eq!(
+                ready.initial_clocks.as_ref().unwrap().get(
+                    &native_resources::packs::ResourceId::parse("example:creatures")?
+                ),
+                Some(&0)
+            );
             assert!(ready.suggested_spawn.is_some());
             assert!(
                 targets

@@ -51,6 +51,7 @@ pub struct PreparedInitialWorld {
     pub worldgen_settings: native_persistence::nbt::NamedTag,
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
+    pub initial_clocks: Arc<BTreeMap<ResourceId, i64>>,
 }
 
 /// All inputs for world-generation creatures, resolved from the same active
@@ -182,6 +183,21 @@ impl PreparedCreatureSpawning {
 }
 
 impl PreparedFreshGeneration {
+    /// Initialize every registered clock from the selected pack stack to the
+    /// fresh server's default tick. Debug-world time changes are handled by
+    /// their own world initialization and are not supported by this generator.
+    pub fn into_new_world_inputs(
+        mut self,
+        border: native_session::respawn::RespawnBorder,
+        spawn_mobs: bool,
+    ) -> Result<PreparedInitialWorld> {
+        let clocks = native_resources::world_clock::registered_clocks(&mut self.resources)?
+            .into_iter()
+            .map(|id| (id, 0))
+            .collect();
+        self.into_initial_world_inputs(border, clocks, spawn_mobs)
+    }
+
     /// Resolve world-spawn and creature inputs from the already-selected pack
     /// stack, then transfer that same stack to the generation worker.
     pub fn into_initial_world_inputs(
@@ -190,6 +206,7 @@ impl PreparedFreshGeneration {
         clocks: BTreeMap<ResourceId, i64>,
         spawn_mobs: bool,
     ) -> Result<PreparedInitialWorld> {
+        let initial_clocks = Arc::new(clocks.clone());
         let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
             Some(PreparedCreatureSpawning::load(
                 &mut self.resources,
@@ -218,6 +235,7 @@ impl PreparedFreshGeneration {
             worldgen_settings: self.worldgen_settings,
             creatures,
             spawn_mobs,
+            initial_clocks,
         })
     }
 

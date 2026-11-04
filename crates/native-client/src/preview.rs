@@ -3577,12 +3577,17 @@ mod tests {
                 native_persistence::nbt::Tag::Long(42),
             )]),
         };
+        let initial_clocks = Arc::new(BTreeMap::from([(
+            ResourceId::parse("example:clock").unwrap(),
+            0_i64,
+        )]));
         let ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
             worldgen_settings_draft: Some(worldgen_draft.clone()),
             spawn_origin: Some(center),
             suggested_spawn: None,
+            initial_clocks: Some(Arc::clone(&initial_clocks)),
         };
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
@@ -3617,6 +3622,10 @@ mod tests {
         assert_eq!(expanded.mesh.targets.as_deref(), Some(&expanded_targets));
         assert_eq!(expanded.mesh.revision, 9);
         assert_eq!(expanded.spawn_origin, Some(center));
+        assert!(Arc::ptr_eq(
+            expanded.initial_clocks.as_ref().unwrap(),
+            &initial_clocks
+        ));
         assert_eq!(
             expanded.worldgen_settings_draft.as_ref(),
             Some(&worldgen_draft)

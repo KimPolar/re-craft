@@ -23,7 +23,7 @@ public final class AnimalInstanceSpawnOracle {
         var unsafe = (Unsafe) unsafeField.get(null);
         var blockPos = Entity.class.getDeclaredField("blockPosition"); blockPos.setAccessible(true);
         var classes = new HashMap<String,Class<?>>();
-        for (String name : List.of("pig", "cow", "sheep", "chicken", "horse", "goat", "rabbit")) {
+        for (String name : List.of("pig", "cow", "sheep", "chicken", "horse", "donkey", "goat", "rabbit")) {
             var field = EntityTypes.class.getField(name.toUpperCase(Locale.ROOT));
             var type = (ParameterizedType) field.getGenericType();
             var clazz = (Class<?>) type.getActualTypeArguments()[0];

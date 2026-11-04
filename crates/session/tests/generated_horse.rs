@@ -3,10 +3,18 @@ use std::{path::PathBuf, process::Command};
 use native_persistence::nbt::{NamedTag, write};
 use native_resources::{
     density::WorldgenRandom,
-    worldgen_region_random::{HorseGroupData, RegionRandom, finalize_horse},
+    worldgen_region_random::{
+        DonkeyGroupData, DonkeyInitialization, HorseGroupData, HorseInitialization, RegionRandom,
+        finalize_donkey, finalize_horse,
+    },
 };
-use native_session::worldgen::{FreshCreatureRandom, draft_fresh_horse};
+use native_session::worldgen::{FreshCreatureRandom, draft_fresh_donkey, draft_fresh_horse};
 use serde_json::{Value, json};
+
+enum EquineInitialization {
+    Horse(HorseInitialization),
+    Donkey(DonkeyInitialization),
+}
 
 #[test]
 fn horse_group_matches_java_seed_42() {
@@ -31,6 +39,18 @@ fn horse_group_matches_java_seed_42() {
         }
     }
     assert_eq!(random.next_long(), -403792309887560671);
+}
+
+#[test]
+fn donkey_group_matches_java_seed_42() {
+    let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, -13, 17);
+    let mut group = DonkeyGroupData::default();
+    for health in [27.0, 24.0, 21.0, 21.0, 27.0, 21.0] {
+        let donkey = finalize_donkey(&mut random, &mut group, false);
+        assert_eq!(donkey.max_health, health);
+        assert!(!donkey.animal.set_baby_age);
+    }
+    assert_eq!(random.next_long(), 1087479121136914901);
 }
 
 #[test]
@@ -72,37 +92,52 @@ fn fresh_horse_groups_and_drafts_match_java() {
         .arg(&source));
     let mut cases = Vec::new();
     let mut expected = Vec::new();
-    for legacy in [true, false] {
-        for seed in [0_i64, 1, 42, -1, i64::MIN, i64::MAX] {
-            let algorithm = if legacy {
-                WorldgenRandom::Legacy
-            } else {
-                WorldgenRandom::Xoroshiro
-            };
-            let mut random = RegionRandom::new(seed, algorithm, -13, 17);
-            let mut group = HorseGroupData::default();
-            let mut docs = Vec::new();
-            let mut animals = Vec::new();
-            for index in 0..6 {
-                let init = finalize_horse(&mut random, &mut group, false);
-                let tag = draft_fresh_horse([0, 1, 0, 2], [3.5, 10.0, -2.5], 22.5, init).unwrap();
-                let path = temp
-                    .path()
-                    .join(format!("horse-{}-{index}.nbt", cases.len()));
-                std::fs::write(
-                    &path,
-                    write(&NamedTag {
-                        name: "".into(),
-                        value: tag,
-                    })
-                    .unwrap(),
-                )
-                .unwrap();
-                docs.push(path);
-                animals.push(init);
+    for species in ["horse", "donkey"] {
+        for legacy in [true, false] {
+            for seed in [0_i64, 1, 42, -1, i64::MIN, i64::MAX] {
+                let algorithm = if legacy {
+                    WorldgenRandom::Legacy
+                } else {
+                    WorldgenRandom::Xoroshiro
+                };
+                let mut random = RegionRandom::new(seed, algorithm, -13, 17);
+                let mut group = HorseGroupData::default();
+                let mut donkey_group = DonkeyGroupData::default();
+                let mut docs = Vec::new();
+                let mut animals = Vec::new();
+                for index in 0..6 {
+                    let (tag, init) = if species == "horse" {
+                        let init = finalize_horse(&mut random, &mut group, false);
+                        (
+                            draft_fresh_horse([0, 1, 0, 2], [3.5, 10.0, -2.5], 22.5, init).unwrap(),
+                            EquineInitialization::Horse(init),
+                        )
+                    } else {
+                        let init = finalize_donkey(&mut random, &mut donkey_group, false);
+                        (
+                            draft_fresh_donkey([0, 1, 0, 2], [3.5, 10.0, -2.5], 22.5, init)
+                                .unwrap(),
+                            EquineInitialization::Donkey(init),
+                        )
+                    };
+                    let path = temp
+                        .path()
+                        .join(format!("horse-{}-{index}.nbt", cases.len()));
+                    std::fs::write(
+                        &path,
+                        write(&NamedTag {
+                            name: "".into(),
+                            value: tag,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    docs.push(path);
+                    animals.push(init);
+                }
+                cases.push(json!({"legacy":legacy,"seed":seed,"paths":docs,"species":species}));
+                expected.push((animals, random.next_long()));
             }
-            cases.push(json!({"legacy":legacy,"seed":seed,"paths":docs}));
-            expected.push((animals, random.next_long()));
         }
     }
     let input = temp.path().join("cases.json");
@@ -117,28 +152,46 @@ fn fresh_horse_groups_and_drafts_match_java() {
         .arg(&output)
         .arg(&constructors));
     let actual: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-    for ((animals, next), result) in expected.iter().zip(actual.as_array().unwrap()) {
+    for (((animals, next), result), case) in
+        expected.iter().zip(actual.as_array().unwrap()).zip(&cases)
+    {
+        let id =
+            native_resources::packs::ResourceId::parse(case["species"].as_str().unwrap()).unwrap();
+        let dimensions =
+            native_resources::worldgen_mob_geometry::known_creature_spawn_dimensions(&id).unwrap();
+        assert_eq!(dimensions.width, result["width"].as_f64().unwrap() as f32);
+        assert_eq!(dimensions.height, result["height"].as_f64().unwrap() as f32);
         assert_eq!(*next, result["next"].as_i64().unwrap());
-        for (horse, saved) in animals.iter().zip(result["animals"].as_array().unwrap()) {
-            assert_eq!(u64::from(horse.variant), saved["variant"].as_u64().unwrap());
+        for (equine, saved) in animals.iter().zip(result["animals"].as_array().unwrap()) {
+            let (health, animal, speed, jump) = match equine {
+                EquineInitialization::Horse(horse) => {
+                    assert_eq!(u64::from(horse.variant), saved["variant"].as_u64().unwrap());
+                    assert_eq!(
+                        u64::from(horse.markings),
+                        saved["markings"].as_u64().unwrap()
+                    );
+                    (
+                        horse.max_health,
+                        horse.animal,
+                        horse.movement_speed,
+                        horse.jump_strength,
+                    )
+                }
+                EquineInitialization::Donkey(donkey) => {
+                    (donkey.max_health, donkey.animal, f64::from(0.175_f32), 0.5)
+                }
+            };
             assert_eq!(
-                u64::from(horse.markings),
-                saved["markings"].as_u64().unwrap()
-            );
-            assert_eq!(
-                horse.max_health.to_bits() as i32 as i64,
+                health.to_bits() as i32 as i64,
                 saved["health_bits"].as_i64().unwrap()
             );
             assert_eq!(
-                horse.movement_speed.to_bits() as i64,
+                speed.to_bits() as i64,
                 saved["speed_bits"].as_i64().unwrap()
             );
-            assert_eq!(
-                horse.jump_strength.to_bits() as i64,
-                saved["jump_bits"].as_i64().unwrap()
-            );
-            assert_eq!(horse.animal.set_baby_age, saved["baby"].as_bool().unwrap());
-            assert_eq!(horse.animal.left_handed, saved["left"].as_bool().unwrap());
+            assert_eq!(jump.to_bits() as i64, saved["jump_bits"].as_i64().unwrap());
+            assert_eq!(animal.set_baby_age, saved["baby"].as_bool().unwrap());
+            assert_eq!(animal.left_handed, saved["left"].as_bool().unwrap());
         }
     }
     let constructors: Value =
@@ -157,7 +210,8 @@ fn fresh_horse_groups_and_drafts_match_java() {
             state = state.wrapping_sub(11).wrapping_mul(0xdfe05bcb1365) & ((1_u64 << 48) - 1);
             let random = native_core::random::LegacyRandom::from_state(state).unwrap();
             let horse = FreshCreatureRandom::from_random(
-                &native_resources::packs::ResourceId::parse("minecraft:horse").unwrap(),
+                &native_resources::packs::ResourceId::parse(case["species"].as_str().unwrap())
+                    .unwrap(),
                 random,
             )
             .unwrap();

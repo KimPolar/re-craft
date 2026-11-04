@@ -25,6 +25,7 @@ pub fn known_creature_spawn_dimensions(
         "sheep" | "goat" => (0.9, 1.3, 1.0),
         "chicken" => (0.4, 0.7, 1.0),
         "horse" => (1.3964844, 1.6, 1.0),
+        "donkey" => (1.3964844, 1.5, 1.0),
         "rabbit" => (0.49, 0.6, 1.0),
         "slime" | "magma_cube" => (0.52, 0.52, 4.0),
         "sulfur_cube" => (0.49, 0.49, 2.0),

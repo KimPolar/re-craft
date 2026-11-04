@@ -198,7 +198,9 @@ mod tests {
             ),
             state("short_grass", &[]),
         ];
-        let entities = ["pig", "cow", "sheep", "chicken", "horse", "goat", "rabbit"];
+        let entities = [
+            "pig", "cow", "sheep", "chicken", "horse", "donkey", "goat", "rabbit",
+        ];
         let mut cases = Vec::new();
         let mut inputs = Vec::new();
         for (index, state) in states.iter().enumerate() {

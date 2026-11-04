@@ -63,7 +63,9 @@ fn ground_rules_match_java_results_call_order_and_random() {
         .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
         .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
     let mut cases = Vec::new();
-    for entity in ["pig", "cow", "sheep", "chicken", "horse", "goat", "rabbit"] {
+    for entity in [
+        "pig", "cow", "sheep", "chicken", "horse", "donkey", "goat", "rabbit",
+    ] {
         for mask in 0..8 {
             for light in 0..=15 {
                 for position in [[0, 64, 0], [-17, -16, 31]] {

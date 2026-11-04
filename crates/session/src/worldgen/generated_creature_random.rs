@@ -69,7 +69,7 @@ fn validate_entity(entity: &ResourceId) -> Result<()> {
         entity.namespace == "minecraft"
             && matches!(
                 entity.path.as_str(),
-                "sheep" | "pig" | "cow" | "chicken" | "horse"
+                "sheep" | "pig" | "cow" | "chicken" | "horse" | "donkey"
             ),
         "unsupported creature construction"
     );
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!((first.construction.uuid[1] as u32) & 0xf000, 0x4000);
         assert_eq!((first.construction.uuid[2] as u32) >> 30, 2);
         assert!(
-            FreshCreatureRandom::from_seed(&ResourceId::parse("minecraft:donkey").unwrap(), 42)
+            FreshCreatureRandom::from_seed(&ResourceId::parse("minecraft:llama").unwrap(), 42)
                 .is_err()
         );
     }

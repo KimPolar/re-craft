@@ -52,7 +52,7 @@ public final class CreatureObstructionOracle {
         var palette = new PalettedContainerFactory(Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY), Blocks.AIR.defaultBlockState(), null, Strategy.createForBiomes(ids), biome, null);
         var region = (Region)unsafe.allocateInstance(Region.class); region.palette = palette; region.height = LevelHeightAccessor.create(-16,32);
         var entities = new HashMap<String,Class<?>>();
-        for (String name : List.of("pig","cow","sheep","chicken","horse","goat","rabbit")) {
+        for (String name : List.of("pig","cow","sheep","chicken","horse","donkey","goat","rabbit")) {
             var type = (ParameterizedType)EntityTypes.class.getField(name.toUpperCase(Locale.ROOT)).getGenericType();
             var clazz = (Class<?>)type.getActualTypeArguments()[0];
             if (clazz.getMethod("checkSpawnObstruction", LevelReader.class).getDeclaringClass() != Mob.class)

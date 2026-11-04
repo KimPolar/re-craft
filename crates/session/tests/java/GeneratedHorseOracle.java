@@ -11,6 +11,7 @@ import net.minecraft.util.*;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.animal.equine.Horse;
+import net.minecraft.world.entity.animal.equine.Donkey;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.storage.TagValueOutput;
@@ -33,6 +34,18 @@ public class GeneratedHorseOracle {
         TestHorse(World world) { super(EntityTypes.HORSE,world); }
         @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return null; }
         @Override protected void registerGoals() {}
+    }
+    static class TestDonkey extends Donkey {
+        TestDonkey(World world) { super(EntityTypes.DONKEY,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return null; }
+        @Override protected void registerGoals() {}
+    }
+    static class ObserveDonkey extends Donkey {
+        ObserveDonkey(World world) { super(EntityTypes.DONKEY,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) {
+            try { return (DummyNavigation)unsafe.allocateInstance(DummyNavigation.class); }
+            catch (InstantiationException error) { throw new AssertionError(error); }
+        }
     }
     static class ObserveHorse extends Horse {
         ObserveHorse(World world) { super(EntityTypes.HORSE,world); }
@@ -65,7 +78,8 @@ public class GeneratedHorseOracle {
             SpawnGroupData group = null;
             var animals = new JsonArray();
             for (int i=0; i<6; i++) {
-                var horse = new TestHorse(world);
+                boolean donkey = test.has("species") && test.get("species").getAsString().equals("donkey");
+                net.minecraft.world.entity.animal.equine.AbstractHorse horse = donkey ? new TestDonkey(world) : new TestHorse(world);
                 horse.setUUID(new UUID(1,2)); horse.setPos(3.5,10,-2.5); horse.setYRot(22.5f); horse.setXRot(0);
                 group = horse.finalizeSpawn(region,null,EntitySpawnReason.CHUNK_GENERATION,group);
                 var tagOut = TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
@@ -79,8 +93,7 @@ public class GeneratedHorseOracle {
                     if (!javaTag.equals(rustTag)) throw new AssertionError("seed="+seed+" index="+i+" java="+javaTag+" rust="+rustTag);
                 }
                 var result = new JsonObject();
-                result.addProperty("variant",horse.getVariant().getId());
-                result.addProperty("markings",horse.getMarkings().getId());
+                if (horse instanceof Horse h) { result.addProperty("variant",h.getVariant().getId()); result.addProperty("markings",h.getMarkings().getId()); }
                 result.addProperty("health_bits",Float.floatToRawIntBits((float)horse.getAttributeValue(Attributes.MAX_HEALTH)));
                 result.addProperty("speed_bits",Double.doubleToRawLongBits(horse.getAttributeValue(Attributes.MOVEMENT_SPEED)));
                 result.addProperty("jump_bits",Double.doubleToRawLongBits(horse.getAttributeValue(Attributes.JUMP_STRENGTH)));
@@ -89,19 +102,21 @@ public class GeneratedHorseOracle {
                 result.addProperty("nbt",javaTag.toString());
                 animals.add(result);
             }
-            var result = new JsonObject(); result.add("animals",animals); result.addProperty("next",random.nextLong()); output.add(result);
+            var result = new JsonObject(); result.add("animals",animals); result.addProperty("next",random.nextLong());
+            var dimensions = (test.has("species") && test.get("species").getAsString().equals("donkey") ? EntityTypes.DONKEY : EntityTypes.HORSE).getDimensions();
+            result.addProperty("width", dimensions.width()); result.addProperty("height", dimensions.height()); output.add(result);
         }
         Files.writeString(Path.of(args[1]),output.toString());
         if (args.length > 2) {
             var seedField = LegacyRandomSource.class.getDeclaredField("seed"); seedField.setAccessible(true);
             var constructors = new JsonArray();
-            for (int i=0; i<32; i++) {
-                var horse = new ObserveHorse(world);
+            for (String species : List.of("horse", "donkey")) for (int i=0; i<32; i++) {
+                net.minecraft.world.entity.animal.equine.AbstractHorse horse = species.equals("horse") ? new ObserveHorse(world) : new ObserveDonkey(world);
                 var state = ((java.util.concurrent.atomic.AtomicLong)seedField.get(horse.getRandom())).get();
                 var uuid = horse.getUUID(); var value = new JsonObject(); var words = new JsonArray();
                 words.add((int)(uuid.getMostSignificantBits()>>>32)); words.add((int)uuid.getMostSignificantBits());
                 words.add((int)(uuid.getLeastSignificantBits()>>>32)); words.add((int)uuid.getLeastSignificantBits());
-                value.add("uuid",words); value.addProperty("state",state);
+                value.addProperty("species", species); value.add("uuid",words); value.addProperty("state",state);
                 value.addProperty("yaw_bits",Float.floatToRawIntBits(horse.getYRot())); constructors.add(value);
             }
             Files.writeString(Path.of(args[2]),constructors.toString());

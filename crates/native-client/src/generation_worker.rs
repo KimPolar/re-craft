@@ -1201,6 +1201,7 @@ mod tests {
             (true, true, "minecraft:sheep"),
             (true, false, "minecraft:sheep"),
             (true, false, "minecraft:horse"),
+            (true, false, "minecraft:donkey"),
         ] {
             let mut selected_biome = biome.clone();
             selected_biome["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]

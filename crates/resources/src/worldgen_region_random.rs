@@ -215,6 +215,44 @@ pub fn finalize_horse(
     }
 }
 
+/// AbstractHorse creates a group with a 20% baby chance for donkeys. Unlike
+/// horses, their spawn randomization changes only the maximum health.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DonkeyGroupData {
+    animal: AnimalGroupData,
+}
+
+impl Default for DonkeyGroupData {
+    fn default() -> Self {
+        Self {
+            animal: AnimalGroupData {
+                baby_spawn_chance: 0.2,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DonkeyInitialization {
+    pub max_health: f32,
+    pub animal: AnimalBaseInitialization,
+}
+
+pub fn finalize_donkey(
+    random: &mut RegionRandom,
+    group: &mut DonkeyGroupData,
+    has_follow_range_bonus: bool,
+) -> DonkeyInitialization {
+    let max_health = 15.0_f32
+        + random.next_int_bound(8).expect("positive health bound") as f32
+        + random.next_int_bound(9).expect("positive health bound") as f32;
+    DonkeyInitialization {
+        max_health,
+        animal: finalize_animal_base(random, &mut group.animal, has_follow_range_bonus),
+    }
+}
+
 /// Wool colors that may be selected for a naturally spawned sheep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SheepSpawnColor {

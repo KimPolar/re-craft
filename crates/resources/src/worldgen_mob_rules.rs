@@ -79,7 +79,7 @@ pub fn check_animal_instance_spawn(
     if entity.namespace != "minecraft"
         || !matches!(
             entity.path.as_str(),
-            "pig" | "cow" | "sheep" | "chicken" | "horse" | "goat" | "rabbit"
+            "pig" | "cow" | "sheep" | "chicken" | "horse" | "donkey" | "goat" | "rabbit"
         )
     {
         bail!("unsupported animal instance spawn rule");
@@ -128,7 +128,7 @@ pub fn check_ground_creature_spawn(
         bail!("unsupported creature spawn rule");
     }
     let (tag, light_first) = match entity.path.as_str() {
-        "pig" | "cow" | "sheep" | "chicken" | "horse" => (GroundSpawnTag::Animals, true),
+        "pig" | "cow" | "sheep" | "chicken" | "horse" | "donkey" => (GroundSpawnTag::Animals, true),
         "goat" => (GroundSpawnTag::Goats, false),
         "rabbit" => (GroundSpawnTag::Rabbits, false),
         _ => bail!("unsupported creature spawn rule"),

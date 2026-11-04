@@ -6,7 +6,9 @@ use native_resources::{
     mob_spawn_placement::MobSpawnHeightmap,
     worldgen_mob_rules::GroundSpawnTags,
     worldgen_mob_spawner::{ChunkCreatureSpawner, CreatureSpawnProgress},
-    worldgen_region_random::{AnimalGroupData, HorseGroupData, RegionRandom, SheepBiomeTags},
+    worldgen_region_random::{
+        AnimalGroupData, DonkeyGroupData, HorseGroupData, RegionRandom, SheepBiomeTags,
+    },
 };
 use native_world::loaded::ChunkPos;
 use native_world::movement::BoundingBox;
@@ -82,7 +84,7 @@ enum Stage {
 }
 
 /// Owns the region RNG and group state across resumable candidate checks.
-/// Sheep and horses are enabled by default. Pigs, cows, and chickens require
+/// Sheep, horses, and donkeys are enabled by default. Pigs, cows, and chickens require
 /// their active variant registries; unsupported creatures remain unresolved.
 pub struct GeneratedSheepSpawner {
     planner: ChunkCreatureSpawner,
@@ -93,6 +95,7 @@ pub struct GeneratedSheepSpawner {
     group_id: Option<u64>,
     group: AnimalGroupData,
     horse_group: HorseGroupData,
+    donkey_group: DonkeyGroupData,
     stage: Stage,
     probe: Option<GeneratedCreatureProbe>,
     pose: Option<GeneratedCreaturePose>,
@@ -199,6 +202,7 @@ impl GeneratedSheepSpawner {
             group_id: None,
             group: AnimalGroupData::default(),
             horse_group: HorseGroupData::default(),
+            donkey_group: DonkeyGroupData::default(),
             stage: Stage::Begin,
             probe: None,
             pose: None,
@@ -281,7 +285,10 @@ impl GeneratedSheepSpawner {
                 CreatureSpawnProgress::Attempt(attempt) => {
                     ensure!(
                         (attempt.entity.namespace == "minecraft"
-                            && matches!(attempt.entity.path.as_str(), "sheep" | "horse"))
+                            && matches!(
+                                attempt.entity.path.as_str(),
+                                "sheep" | "horse" | "donkey"
+                            ))
                             || farm_index(&attempt.entity)
                                 .is_some_and(|index| self.farm_variants[index].is_some()),
                         "unsupported generated creature {}:{}",
@@ -293,6 +300,7 @@ impl GeneratedSheepSpawner {
                         self.group_id = Some(id);
                         self.group = AnimalGroupData::default();
                         self.horse_group = HorseGroupData::default();
+                        self.donkey_group = DonkeyGroupData::default();
                     }
                     let (min_y, _) = batch.build_bounds()?;
                     self.probe = Some(GeneratedCreatureProbe::new(
@@ -340,37 +348,46 @@ impl GeneratedSheepSpawner {
                     .created_attempt()
                     .context("missing constructed creature attempt")?;
                 let probe = self.probe.as_mut().context("missing creature probe")?;
-                let addition =
-                    if attempt.entity.path == "horse" && attempt.entity.namespace == "minecraft" {
-                        probe.prepare_fresh_horse(
-                            &mut self.planner,
-                            &mut self.random,
-                            &mut self.horse_group,
-                            construction.uuid,
-                        )?
-                    } else if let Some(index) = farm_index(&attempt.entity) {
-                        let variants = self.farm_variants[index]
-                            .as_ref()
-                            .context("farm animal registry is missing")?;
-                        probe.prepare_fresh_farm_animal(
-                            &mut self.planner,
-                            batch,
-                            variants,
-                            &mut self.random,
-                            &mut self.group,
-                            construction.uuid,
-                            construction.chicken_egg_time,
-                        )?
-                    } else {
-                        probe.prepare_fresh_sheep(
-                            &mut self.planner,
-                            batch,
-                            &inputs.biome_tags,
-                            &mut self.random,
-                            &mut self.group,
-                            construction.uuid,
-                        )?
-                    };
+                let addition = if attempt.entity.path == "horse"
+                    && attempt.entity.namespace == "minecraft"
+                {
+                    probe.prepare_fresh_horse(
+                        &mut self.planner,
+                        &mut self.random,
+                        &mut self.horse_group,
+                        construction.uuid,
+                    )?
+                } else if attempt.entity.path == "donkey" && attempt.entity.namespace == "minecraft"
+                {
+                    probe.prepare_fresh_donkey(
+                        &mut self.planner,
+                        &mut self.random,
+                        &mut self.donkey_group,
+                        construction.uuid,
+                    )?
+                } else if let Some(index) = farm_index(&attempt.entity) {
+                    let variants = self.farm_variants[index]
+                        .as_ref()
+                        .context("farm animal registry is missing")?;
+                    probe.prepare_fresh_farm_animal(
+                        &mut self.planner,
+                        batch,
+                        variants,
+                        &mut self.random,
+                        &mut self.group,
+                        construction.uuid,
+                        construction.chicken_egg_time,
+                    )?
+                } else {
+                    probe.prepare_fresh_sheep(
+                        &mut self.planner,
+                        batch,
+                        &inputs.biome_tags,
+                        &mut self.random,
+                        &mut self.group,
+                        construction.uuid,
+                    )?
+                };
                 self.additions.push(addition);
                 self.probe = None;
                 self.pose = None;

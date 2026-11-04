@@ -42,7 +42,9 @@ fn constructed_animal_rules_match_java_including_world_edges() {
         .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
         .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
     let mut cases = Vec::new();
-    for entity in ["pig", "cow", "sheep", "chicken", "horse", "goat", "rabbit"] {
+    for entity in [
+        "pig", "cow", "sheep", "chicken", "horse", "donkey", "goat", "rabbit",
+    ] {
         for grass in [false, true] {
             for light in 0..=15 {
                 for ambient in [0.0, 0.1, 0.2, 0.25, 0.5, 1.0] {

@@ -66,6 +66,7 @@ fn creature_generation_attempts_match_java() {
         "sheep",
         "chicken",
         "horse",
+        "donkey",
         "goat",
         "rabbit",
         "slime",

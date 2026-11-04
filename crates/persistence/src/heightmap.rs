@@ -605,6 +605,20 @@ impl FullHeightmaps {
         })
     }
 
+    /// Copy the three FULL maps consulted by spawn searches without priming
+    /// them again. The converted maps may deliberately contain stale heights.
+    pub fn spawn_heightmaps(&self) -> SpawnHeightmaps {
+        SpawnHeightmaps {
+            min_y: self.bounds.min_y,
+            max_y: self.bounds.max_y,
+            maps: [
+                Some(self.values[2].clone()),
+                Some(self.values[0].clone()),
+                Some(self.values[1].clone()),
+            ],
+        }
+    }
+
     /// Apply Java's incremental update after the block has changed. Reads
     /// below the edit are shared by maps, and an error leaves all maps intact.
     /// The callback must read one unchanged world without observable effects.
@@ -1078,6 +1092,68 @@ mod tests {
                 .is_err()
         );
         assert_eq!(crate::nbt::write(draft.document()).unwrap(), before);
+    }
+
+    #[test]
+    fn converted_spawn_heightmaps_preserve_each_full_map_and_later_updates() {
+        let bounds = HeightBounds {
+            min_y: -64,
+            max_y: 320,
+        };
+        let values: [[u32; 256]; 4] = std::array::from_fn(|kind| {
+            std::array::from_fn(|column| ((column * (kind + 1) + kind * 37) % 385) as u32)
+        });
+        let tag = Tag::Compound(
+            FULL_NAMES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    (
+                        (*name).into(),
+                        Tag::LongArray(encode(&values[i], 384, None).unwrap()),
+                    )
+                })
+                .collect(),
+        );
+        let mut full = FullHeightmaps::from_converted(bounds, &tag).unwrap();
+        let encoded_view = |full: &FullHeightmaps| {
+            SpawnHeightmaps::read(
+                &NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![("Heightmaps".into(), full.to_tag().unwrap())]),
+                },
+                bounds,
+            )
+            .unwrap()
+        };
+        let snapshot = full.spawn_heightmaps();
+        assert_eq!(snapshot, encoded_view(&full));
+        assert!(snapshot.is_complete());
+        assert_eq!(
+            snapshot.highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(-65)
+        );
+        assert_eq!(
+            snapshot.highest(SpawnHeightmapKind::OceanFloor, 0, 0),
+            Some(-28)
+        );
+        assert_eq!(
+            snapshot.highest(SpawnHeightmapKind::MotionBlocking, 0, 0),
+            Some(9)
+        );
+        let stone = classify(&block("minecraft:stone")).unwrap();
+        full.update_after_change(0, 319, 0, stone, |_, _, _| unreachable!())
+            .unwrap();
+        assert_eq!(full.spawn_heightmaps(), encoded_view(&full));
+        assert_eq!(
+            full.spawn_heightmaps()
+                .highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(319)
+        );
+        assert_eq!(
+            snapshot.highest(SpawnHeightmapKind::WorldSurface, 0, 0),
+            Some(-65)
+        );
     }
 
     #[test]

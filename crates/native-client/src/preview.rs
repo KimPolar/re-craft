@@ -3603,7 +3603,7 @@ mod tests {
             hardcore: true,
             allow_commands: false,
         };
-        let ready = crate::generation_worker::GenerationReady {
+        let mut ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
             worldgen_settings_draft: Some(worldgen_draft.clone()),
@@ -3620,6 +3620,16 @@ mod tests {
             initial_respawn: None,
             postprocessed: None,
         };
+        let mut height_session = ready
+            .start_session(native_session::PlayerState {
+                position: glam::Vec3::new(8.5, 16.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: true,
+                pose: native_session::PlayerPose::Standing,
+            })
+            .unwrap();
         let postprocessor = crate::generation_worker::GenerationWorker::postprocess(
             ready,
             vec![center],
@@ -3693,6 +3703,14 @@ mod tests {
             Some(&native_persistence::nbt::Tag::String(
                 "minecraft:full".into()
             ))
+        );
+        let processed_heights = output.region.heightmaps()[&center].spawn_heightmaps();
+        ready
+            .install_spawn_heightmaps(&mut height_session, Arc::clone(&spawn_tags))
+            .unwrap();
+        assert_eq!(
+            height_session.spawn_heightmaps_for_chunk(center).as_deref(),
+            Some(&processed_heights)
         );
         assert!(
             ready

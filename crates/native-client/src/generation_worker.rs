@@ -354,19 +354,35 @@ impl GenerationReady {
         Ok(session)
     }
 
-    fn install_spawn_heightmaps(
+    pub(crate) fn install_spawn_heightmaps(
         &mut self,
         session: &mut native_session::loaded::LoadedSession,
         tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
     ) -> Result<()> {
-        session.set_spawn_heightmap_tags(tags)?;
         let targets = self
             .mesh
             .targets
             .as_ref()
             .context("generated session targets missing")?;
+        let mut selected = Vec::with_capacity(targets.len());
         for &pos in targets.iter() {
-            if let Some(maps) = self.batch.spawn_heightmaps(pos)? {
+            let maps = if let Some(processed) = &self.postprocessed {
+                Some(
+                    processed
+                        .region
+                        .heightmaps()
+                        .get(&pos)
+                        .context("postprocessed spawn heightmaps are missing")?
+                        .spawn_heightmaps(),
+                )
+            } else {
+                self.batch.spawn_heightmaps(pos)?
+            };
+            selected.push((pos, maps));
+        }
+        session.set_spawn_heightmap_tags(tags)?;
+        for (pos, maps) in selected {
+            if let Some(maps) = maps {
                 session.complete_generated_spawn_heightmaps(pos, maps)?;
             } else {
                 session.prime_generated_spawn_heightmaps(pos)?;

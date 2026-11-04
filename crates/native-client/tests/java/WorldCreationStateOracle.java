@@ -3,6 +3,7 @@ import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.data.registries.VanillaRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.level.levelgen.WorldOptions;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
@@ -23,7 +24,9 @@ public class WorldCreationStateOracle {
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         output = new java.io.PrintWriter(java.nio.file.Files.newBufferedWriter(java.nio.file.Path.of(args[0])));
-        var dims = WorldPresets.createNormalWorldDimensions(VanillaRegistries.createWorldLookup());
+        var lookup = VanillaRegistries.createWorldLookup();
+        var dims = WorldPresets.createNormalWorldDimensions(lookup);
+        var debugDims = lookup.lookupOrThrow(Registries.WORLD_PRESET).getOrThrow(WorldPresets.DEBUG).value().createWorldDimensions();
         var unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
         unsafeField.setAccessible(true);
         var unsafe = (sun.misc.Unsafe)unsafeField.get(null);
@@ -45,6 +48,20 @@ public class WorldCreationStateOracle {
                             state.setGameMode(SelectedGameMode.HARDCORE); capture(state);
                             state.setGameMode(SelectedGameMode.CREATIVE); capture(state);
                         }
+                    }
+                }
+            }
+        }
+        for (var mode : new SelectedGameMode[] {SelectedGameMode.SURVIVAL, SelectedGameMode.HARDCORE, SelectedGameMode.CREATIVE}) {
+            for (var difficulty : Difficulty.values()) {
+                for (Boolean commands : new Boolean[] {null, false, true}) {
+                    for (boolean bonus : new boolean[] {false, true}) for (boolean structures : new boolean[] {false, true}) {
+                        var context = new WorldCreationContext(new WorldOptions(42, structures, bonus), null, debugDims, null, null, null, null);
+                        var state = (WorldCreationUiState)unsafe.allocateInstance(WorldCreationUiState.class);
+                        field(state, "settings", context); field(state, "listeners", new ArrayList<>());
+                        field(state, "gameMode", mode); field(state, "difficulty", difficulty);
+                        field(state, "allowCommands", commands); field(state, "bonusChest", bonus); field(state, "generateStructures", structures);
+                        output.println("DEBUG " + state.getGameMode().name() + " " + state.isHardcore() + " " + state.getDifficulty().name() + " " + state.isAllowCommands() + " " + state.isBonusChest() + " " + state.isGenerateStructures());
                     }
                 }
             }

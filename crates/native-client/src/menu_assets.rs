@@ -18,6 +18,7 @@ use serde_json::Value;
 
 pub struct MenuAssets {
     pub minecraft_dir: std::path::PathBuf,
+    pub world_presets: Option<native_resources::world_presets::WorldPresets>,
     pub chat: crate::chat_hud::ChatSettings,
     pub item_models: Arc<Mutex<crate::held_items::Loader>>,
     pub item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
@@ -737,9 +738,11 @@ impl MenuAssets {
         let item_registry = stack.vanilla_item_registry().ok().map(Arc::new);
         let enchantments =
             Arc::new(crate::enchantment_tooltip::Registry::load(&mut stack).unwrap_or_default());
+        let world_presets = native_resources::world_presets::WorldPresets::load(&mut stack).ok();
         let item_models = Arc::new(Mutex::new(crate::held_items::Loader::from_stack(stack)));
         Ok(Self {
             minecraft_dir: minecraft_dir.to_owned(),
+            world_presets,
             chat,
             item_models,
             item_registry,

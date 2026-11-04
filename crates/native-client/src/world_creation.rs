@@ -125,6 +125,8 @@ pub struct WorldCreationSettings {
     pub allow_commands: Option<bool>,
     pub generate_structures: bool,
     pub bonus_chest: bool,
+    pub preset: native_resources::packs::ResourceId,
+    preset_index: usize,
 }
 
 impl WorldCreationSettings {
@@ -137,6 +139,9 @@ impl WorldCreationSettings {
             allow_commands: None,
             generate_structures: true,
             bonus_chest: false,
+            preset: native_resources::packs::ResourceId::parse("minecraft:normal")
+                .expect("built-in preset"),
+            preset_index: 0,
         }
     }
 
@@ -150,7 +155,7 @@ impl WorldCreationSettings {
     }
 
     pub fn effective_difficulty(&self) -> Difficulty {
-        if self.mode == GameMode::Hardcore {
+        if self.is_hardcore() {
             Difficulty::Hard
         } else {
             self.difficulty
@@ -158,7 +163,9 @@ impl WorldCreationSettings {
     }
 
     pub fn effective_allow_commands(&self) -> bool {
-        if self.mode == GameMode::Hardcore {
+        if self.is_debug() {
+            true
+        } else if self.is_hardcore() {
             false
         } else {
             self.allow_commands
@@ -167,7 +174,70 @@ impl WorldCreationSettings {
     }
 
     pub fn effective_bonus_chest(&self) -> bool {
-        self.mode != GameMode::Hardcore && self.bonus_chest
+        !self.is_debug() && !self.is_hardcore() && self.bonus_chest
+    }
+
+    pub fn is_debug(&self) -> bool {
+        self.preset.namespace == "minecraft" && self.preset.path == "debug_all_block_states"
+    }
+
+    pub fn is_hardcore(&self) -> bool {
+        !self.is_debug() && self.mode == GameMode::Hardcore
+    }
+
+    pub fn effective_generate_structures(&self) -> bool {
+        !self.is_debug() && self.generate_structures
+    }
+
+    pub fn align_preset_index(&mut self, presets: &native_resources::world_presets::WorldPresets) {
+        if let Some(index) = presets
+            .normal
+            .iter()
+            .position(|preset| preset == &self.preset)
+        {
+            self.preset_index = index;
+        }
+    }
+
+    /// CycleButton retains its index when Alt switches between the normal and
+    /// extended tag lists; Shift reverses the direction.
+    pub fn cycle_preset(
+        &mut self,
+        presets: &native_resources::world_presets::WorldPresets,
+        alt: bool,
+        reverse: bool,
+    ) {
+        let values = if alt {
+            &presets.alternate
+        } else {
+            &presets.normal
+        };
+        if values.is_empty() {
+            return;
+        }
+        self.preset_index = if reverse {
+            (self.preset_index + values.len() - 1) % values.len()
+        } else {
+            (self.preset_index + 1) % values.len()
+        };
+        self.preset = values[self.preset_index].clone();
+    }
+
+    /// Freeze screen settings once when starting the background generator.
+    pub fn fresh_generation_settings(
+        &self,
+        minecraft_dir: PathBuf,
+        data_packs: Option<(PathBuf, native_resources::datapacks::DataPackSettings)>,
+    ) -> crate::fresh_generation::FreshGenerationSettings {
+        crate::fresh_generation::FreshGenerationSettings {
+            minecraft_dir,
+            preset: format!("{}:{}", self.preset.namespace, self.preset.path),
+            dimension: "minecraft:overworld".into(),
+            seed: self.resolve_seed(),
+            bonus_chest: self.effective_bonus_chest(),
+            structures_enabled: self.effective_generate_structures(),
+            data_packs,
+        }
     }
 
     /// Prepare initial metadata only after the caller has resolved the pack stack
@@ -183,9 +253,13 @@ impl WorldCreationSettings {
         use native_persistence::level_data::{
             NewLevelData, NewWorldDifficulty, NewWorldGameType, draft_new_level_data,
         };
-        let game_type = match self.mode {
-            GameMode::Survival | GameMode::Hardcore => NewWorldGameType::Survival,
-            GameMode::Creative => NewWorldGameType::Creative,
+        let game_type = if self.is_debug() {
+            NewWorldGameType::Spectator
+        } else {
+            match self.mode {
+                GameMode::Survival | GameMode::Hardcore => NewWorldGameType::Survival,
+                GameMode::Creative => NewWorldGameType::Creative,
+            }
         };
         let difficulty = match self.effective_difficulty() {
             Difficulty::Peaceful => NewWorldDifficulty::Peaceful,
@@ -197,7 +271,7 @@ impl WorldCreationSettings {
             name: self.name.value(),
             game_type,
             difficulty,
-            hardcore: self.mode == GameMode::Hardcore,
+            hardcore: self.is_hardcore(),
             difficulty_locked: false,
             allow_commands: self.effective_allow_commands(),
             spawn,
@@ -215,6 +289,79 @@ impl WorldCreationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_cycle_keeps_options_and_freezes_selected_generation_inputs() {
+        use native_persistence::nbt::Tag;
+        use native_resources::{packs::ResourceId, world_presets::WorldPresets};
+        let ids = |items: &[&str]| {
+            items
+                .iter()
+                .map(|id| ResourceId::parse(id).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let presets = WorldPresets {
+            normal: ids(&[
+                "normal",
+                "flat",
+                "large_biomes",
+                "amplified",
+                "single_biome_surface",
+            ]),
+            alternate: ids(&[
+                "normal",
+                "flat",
+                "large_biomes",
+                "amplified",
+                "single_biome_surface",
+                "debug_all_block_states",
+            ]),
+        };
+        let mut state = WorldCreationSettings::new("World".into());
+        state.mode = GameMode::Hardcore;
+        state.difficulty = Difficulty::Easy;
+        state.allow_commands = Some(false);
+        state.generate_structures = true;
+        state.bonus_chest = true;
+        state.seed = crate::chat_input::ChatInput::field("-123");
+        state.cycle_preset(&presets, false, false);
+        assert_eq!(state.preset, ResourceId::parse("flat").unwrap());
+        state.cycle_preset(&presets, false, true);
+        assert_eq!(state.preset, ResourceId::parse("normal").unwrap());
+        state.cycle_preset(&presets, true, true);
+        assert!(state.is_debug());
+        assert!(!state.is_hardcore());
+        assert_eq!(state.effective_difficulty(), Difficulty::Easy);
+        assert!(state.effective_allow_commands());
+        assert!(!state.effective_bonus_chest());
+        assert!(!state.effective_generate_structures());
+        let data = state
+            .draft_level_data(
+                &native_persistence::world::RespawnData::default(),
+                0,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let data = data.value.get("Data").unwrap();
+        assert_eq!(data.get("GameType"), Some(&Tag::Int(3)));
+        assert_eq!(data.get("allowCommands"), Some(&Tag::Byte(1)));
+        assert_eq!(
+            data.get("difficulty_settings").unwrap().get("hardcore"),
+            Some(&Tag::Byte(0))
+        );
+        let inputs = state.fresh_generation_settings(PathBuf::from("game"), None);
+        assert_eq!(inputs.preset, "minecraft:debug_all_block_states");
+        assert_eq!(inputs.seed, -123);
+        assert!(!inputs.structures_enabled && !inputs.bonus_chest);
+        state.cycle_preset(&presets, false, false);
+        assert_eq!(state.preset, ResourceId::parse("flat").unwrap());
+        assert!(state.is_hardcore());
+        assert_eq!(state.effective_difficulty(), Difficulty::Hard);
+        assert!(!state.effective_allow_commands());
+        assert!(state.generate_structures && state.bonus_chest);
+    }
 
     #[test]
     fn entered_seed_is_used_when_resolving_world_creation() {
@@ -397,7 +544,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let java_rows: Vec<_> = std::fs::read_to_string(result_path)
+        let java_rows: Vec<_> = std::fs::read_to_string(&result_path)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with("CASE "))
@@ -444,5 +591,47 @@ mod tests {
         for (index, (actual, expected)) in rows.iter().zip(&java_rows).enumerate() {
             assert_eq!(actual, expected, "world creation state case {index}");
         }
+        let debug_rows: Vec<_> = std::fs::read_to_string(&result_path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("DEBUG "))
+            .map(str::to_owned)
+            .collect();
+        let mut actual = Vec::new();
+        for mode in [GameMode::Survival, GameMode::Hardcore, GameMode::Creative] {
+            for difficulty in [
+                Difficulty::Peaceful,
+                Difficulty::Easy,
+                Difficulty::Normal,
+                Difficulty::Hard,
+            ] {
+                for commands in [None, Some(false), Some(true)] {
+                    for bonus in [false, true] {
+                        for structures in [false, true] {
+                            let mut state = WorldCreationSettings::new("New World".into());
+                            state.preset = native_resources::packs::ResourceId::parse(
+                                "minecraft:debug_all_block_states",
+                            )
+                            .unwrap();
+                            state.mode = mode;
+                            state.difficulty = difficulty;
+                            state.allow_commands = commands;
+                            state.bonus_chest = bonus;
+                            state.generate_structures = structures;
+                            actual.push(format!(
+                                "DEBUG DEBUG {} {} {} {} {}",
+                                state.is_hardcore(),
+                                format!("{:?}", state.effective_difficulty()).to_uppercase(),
+                                state.effective_allow_commands(),
+                                state.effective_bonus_chest(),
+                                state.effective_generate_structures()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(actual.len(), 144);
+        assert_eq!(actual, debug_rows);
     }
 }

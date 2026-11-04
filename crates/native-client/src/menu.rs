@@ -109,6 +109,7 @@ enum ButtonId {
     CreationMoreTab,
     CreationName,
     CreationSeed,
+    CreationPreset,
     CreationMode,
     CreationDifficulty,
     CreationCommands,
@@ -1622,10 +1623,14 @@ impl<'a> Menu<'a> {
                 };
                 match self.state.creation_tab {
                     CreationTab::Game => {
-                        let (mode_key, mode) = match settings.mode {
-                            GameMode::Survival => ("selectWorld.gameMode.survival", "Survival"),
-                            GameMode::Hardcore => ("selectWorld.gameMode.hardcore", "Hardcore"),
-                            GameMode::Creative => ("selectWorld.gameMode.creative", "Creative"),
+                        let (mode_key, mode) = if settings.is_debug() {
+                            ("selectWorld.gameMode.spectator", "Spectator")
+                        } else {
+                            match settings.mode {
+                                GameMode::Survival => ("selectWorld.gameMode.survival", "Survival"),
+                                GameMode::Hardcore => ("selectWorld.gameMode.hardcore", "Hardcore"),
+                                GameMode::Creative => ("selectWorld.gameMode.creative", "Creative"),
+                            }
                         };
                         let (difficulty_key, difficulty) = match settings.effective_difficulty() {
                             Difficulty::Peaceful => ("options.difficulty.peaceful", "Peaceful"),
@@ -1651,7 +1656,7 @@ impl<'a> Menu<'a> {
                                 tr("selectWorld.gameMode", "Game Mode"),
                                 tr(mode_key, mode)
                             ),
-                            true,
+                            !settings.is_debug(),
                         );
                         add(
                             ButtonId::CreationDifficulty,
@@ -1663,7 +1668,7 @@ impl<'a> Menu<'a> {
                                 tr("options.difficulty", "Difficulty"),
                                 tr(difficulty_key, difficulty)
                             ),
-                            settings.mode != GameMode::Hardcore,
+                            !settings.is_hardcore(),
                         );
                         add(
                             ButtonId::CreationCommands,
@@ -1675,21 +1680,29 @@ impl<'a> Menu<'a> {
                                 tr("selectWorld.allowCommands", "Allow Cheats"),
                                 yes_no(settings.effective_allow_commands())
                             ),
-                            settings.mode != GameMode::Hardcore,
+                            !settings.is_hardcore() && !settings.is_debug(),
                         );
                     }
                     CreationTab::World => {
+                        let preset_key = format!(
+                            "generator.{}.{}",
+                            settings.preset.namespace, settings.preset.path
+                        );
                         add(
-                            ButtonId::Unavailable,
+                            ButtonId::CreationPreset,
                             w / 2 - 155,
                             top,
                             210,
                             format!(
                                 "{}: {}",
                                 tr("selectWorld.mapType", "World Type"),
-                                tr("selectWorld.mapType.normal", "Normal")
+                                tr(&preset_key, &preset_key)
                             ),
-                            false,
+                            self.state
+                                .assets
+                                .as_ref()
+                                .and_then(|assets| assets.world_presets.as_ref())
+                                .is_some(),
                         );
                         add(
                             ButtonId::Unavailable,
@@ -1715,9 +1728,9 @@ impl<'a> Menu<'a> {
                             format!(
                                 "{}: {}",
                                 tr("selectWorld.mapFeatures", "Generate Structures"),
-                                yes_no(settings.generate_structures)
+                                yes_no(settings.effective_generate_structures())
                             ),
-                            true,
+                            !settings.is_debug(),
                         );
                         add(
                             ButtonId::CreationBonusChest,
@@ -1729,7 +1742,7 @@ impl<'a> Menu<'a> {
                                 tr("selectWorld.bonusItems", "Bonus Chest"),
                                 yes_no(settings.effective_bonus_chest())
                             ),
-                            settings.mode != GameMode::Hardcore,
+                            !settings.is_hardcore() && !settings.is_debug(),
                         );
                     }
                     CreationTab::More => {
@@ -2095,6 +2108,14 @@ impl<'a> Menu<'a> {
                 );
                 self.state.creation =
                     crate::world_creation::WorldCreationSettings::new(name.clone());
+                if let Some(presets) = self
+                    .state
+                    .assets
+                    .as_ref()
+                    .and_then(|assets| assets.world_presets.as_ref())
+                {
+                    self.state.creation.align_preset_index(presets);
+                }
                 match crate::world_creation::FolderProposalWorker::new(
                     self.state.minecraft_dir.join("saves"),
                     name,
@@ -2115,8 +2136,25 @@ impl<'a> Menu<'a> {
             ButtonId::CreationWorldTab => self.state.creation_tab = CreationTab::World,
             ButtonId::CreationMoreTab => self.state.creation_tab = CreationTab::More,
             ButtonId::CreationName | ButtonId::CreationSeed => self.focused = Some(id),
+            ButtonId::CreationPreset => {
+                if let Some(presets) = self
+                    .state
+                    .assets
+                    .as_ref()
+                    .and_then(|assets| assets.world_presets.as_ref())
+                {
+                    self.state.creation.cycle_preset(
+                        presets,
+                        self.modifiers.alt_key(),
+                        self.modifiers.shift_key(),
+                    );
+                }
+            }
             ButtonId::CreationMode => {
                 use crate::world_creation::GameMode;
+                if self.state.creation.is_debug() {
+                    return;
+                }
                 self.state.creation.mode =
                     match (self.state.creation.mode, self.modifiers.shift_key()) {
                         (GameMode::Survival, false) | (GameMode::Creative, true) => {
@@ -2133,7 +2171,7 @@ impl<'a> Menu<'a> {
             ButtonId::CreationDifficulty => {
                 use crate::world_creation::Difficulty;
                 let state = &mut self.state.creation;
-                if state.mode != crate::world_creation::GameMode::Hardcore {
+                if !state.is_hardcore() {
                     state.difficulty = match (state.difficulty, self.modifiers.shift_key()) {
                         (Difficulty::Peaceful, false) | (Difficulty::Normal, true) => {
                             Difficulty::Easy
@@ -2150,13 +2188,17 @@ impl<'a> Menu<'a> {
             }
             ButtonId::CreationCommands => {
                 let state = &mut self.state.creation;
-                if state.mode != crate::world_creation::GameMode::Hardcore {
+                if !state.is_hardcore() && !state.is_debug() {
                     state.allow_commands = Some(!state.effective_allow_commands());
                 }
             }
-            ButtonId::CreationStructures => self.state.creation.generate_structures ^= true,
+            ButtonId::CreationStructures => {
+                if !self.state.creation.is_debug() {
+                    self.state.creation.generate_structures ^= true;
+                }
+            }
             ButtonId::CreationBonusChest => {
-                if self.state.creation.mode != crate::world_creation::GameMode::Hardcore {
+                if !self.state.creation.is_hardcore() && !self.state.creation.is_debug() {
                     self.state.creation.bonus_chest ^= true;
                 }
             }
@@ -3674,6 +3716,32 @@ impl ApplicationHandler for Menu<'_> {
                 self.sprint_window_ui.release();
             }
             WindowEvent::MouseWheel { delta, .. }
+                if self.state.screen == Screen::CreateWorld
+                    && self.state.creation_tab == CreationTab::World
+                    && self.buttons().iter().any(|button| {
+                        button.id == ButtonId::CreationPreset
+                            && button.active
+                            && button.rect.contains(self.cursor.0, self.cursor.1)
+                    }) =>
+            {
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
+                if amount.is_finite() && amount != 0.0 {
+                    if let Some(presets) = self
+                        .state
+                        .assets
+                        .as_ref()
+                        .and_then(|assets| assets.world_presets.as_ref())
+                    {
+                        self.state.creation.cycle_preset(
+                            presets,
+                            self.modifiers.alt_key(),
+                            amount > 0.0,
+                        );
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. }
                 if self.state.screen == Screen::Sound && self.state.asset_load.is_none() =>
             {
                 let amount =
@@ -4508,6 +4576,81 @@ mod tests {
                 .buttons()
                 .iter()
                 .any(|b| b.id == ButtonId::CreationSeed)
+        );
+        menu.state.creation.preset =
+            native_resources::packs::ResourceId::parse("minecraft:debug_all_block_states").unwrap();
+        menu.state.creation_tab = CreationTab::Game;
+        let game = menu.buttons();
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationMode && !b.active)
+        );
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationDifficulty && b.active)
+        );
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationCommands && !b.active)
+        );
+        menu.state.creation_tab = CreationTab::World;
+        let world = menu.buttons();
+        assert!(
+            world
+                .iter()
+                .any(|b| b.id == ButtonId::CreationStructures && !b.active)
+        );
+        assert!(
+            world
+                .iter()
+                .any(|b| b.id == ButtonId::CreationBonusChest && !b.active)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 assets"]
+    fn world_type_control_uses_installed_preset_labels_and_choices() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&game, &[]).unwrap());
+        let presets = assets.world_presets.as_ref().unwrap().clone();
+        let mut state = State::new(PathBuf::new(), Vec::new());
+        state.asset_load = None;
+        state.assets = Some(Arc::clone(&assets));
+        state.screen = Screen::CreateWorld;
+        state.creation_tab = CreationTab::World;
+        state.creation.align_preset_index(&presets);
+        let mut menu = Menu::new(&mut state);
+        menu.size = (800, 600);
+        for id in [
+            "flat",
+            "large_biomes",
+            "amplified",
+            "single_biome_surface",
+            "normal",
+        ] {
+            menu.state.creation.cycle_preset(&presets, false, false);
+            let buttons = menu.buttons();
+            let button = buttons
+                .iter()
+                .find(|button| button.id == ButtonId::CreationPreset)
+                .unwrap();
+            assert!(button.active);
+            let key = format!("generator.minecraft.{id}");
+            assert!(
+                button.label.contains(assets.translate(&key, id)),
+                "{}",
+                button.label
+            );
+            assert_eq!(menu.state.creation.preset.path, id);
+        }
+        menu.state.creation.cycle_preset(&presets, true, true);
+        assert!(menu.state.creation.is_debug());
+        assert!(
+            menu.buttons()
+                .iter()
+                .any(|button| button.id == ButtonId::CreationStructures && !button.active)
         );
     }
 

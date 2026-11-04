@@ -657,6 +657,29 @@ impl FreshTerrainBatch {
         ))
     }
 
+    /// Combine the ordered noise, surface, carver and feature marks. Missing
+    /// earlier history is an error, since reconstructing it from blocks loses
+    /// duplicates and insertion order.
+    pub fn spawned_postprocessing_data(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before encoding postprocessing"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "postprocessing encoding requires a spawn-complete chunk"
+        );
+        self.terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .generated_postprocessing_data(pos)
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

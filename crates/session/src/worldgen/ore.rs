@@ -18229,6 +18229,7 @@ mod tests {
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };
         assert!(terrain.postprocessing_marks_to_date(center).is_none());
+        assert!(terrain.generated_postprocessing_data(center).is_err());
         let mut earlier = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
         earlier.mark(0, 5, 0);
         terrain
@@ -18251,6 +18252,91 @@ mod tests {
                 .sections()[0],
             [0x50, 0x50, 0x51]
         );
+        let encoded = terrain.generated_postprocessing_data(center).unwrap();
+        let decoded = native_persistence::postprocessing::decode(&encoded, 0, 16).unwrap();
+        assert_eq!(decoded.sections()[0], [0x50, 0x50, 0x51]);
+        assert!(
+            terrain
+                .generated_postprocessing_data(ChunkPos { x: 100, z: 100 })
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn combined_postprocessing_nbt_matches_java_protochunk() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("CombinedPostprocessingOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/CombinedPostprocessingOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source));
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: -1, z: 1 };
+        let mut earlier = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
+        for [x, y, z] in [[-16, 0, 16], [-1, 15, 31], [-16, 0, 16]] {
+            earlier.mark(x, y, z);
+        }
+        terrain
+            .carver_postprocessing
+            .insert(center, Arc::new(earlier));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        for pos in [[-1, 15, 31], [-1, 15, 31], [-8, 8, 24], [-8, -1, 24]] {
+            region.mark_postprocessing(pos).unwrap();
+        }
+        region.finish().unwrap();
+        let root = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "PostProcessing".into(),
+                terrain.generated_postprocessing_data(center).unwrap(),
+            )]),
+        };
+        let input = temp.path().join("marks.nbt");
+        std::fs::write(&input, native_persistence::nbt::write(&root).unwrap()).unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("CombinedPostprocessingOracle")
+            .arg(input));
     }
 
     #[test]

@@ -1520,6 +1520,22 @@ impl CarvedTerrainWorld {
         }
         Some(marks)
     }
+
+    /// Encode the complete retained history for this intermediate chunk.
+    /// This does not verify other chunk data or permit writing a world.
+    pub fn generated_postprocessing_data(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "generated chunk is missing"
+        );
+        let marks = self
+            .postprocessing_marks_to_date(pos)
+            .context("generation postprocessing history is missing")?;
+        Ok(native_persistence::postprocessing::encode(&marks))
+    }
 }
 
 /// Resolve supported generated block states without a generated block report.
@@ -3936,6 +3952,7 @@ mod tests {
         assert!(batch.spawned_section_data(center).is_err());
         assert!(batch.spawned_heightmap_data(center).is_err());
         assert!(batch.spawned_tick_data(center).is_err());
+        assert!(batch.spawned_postprocessing_data(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
         assert_eq!(
             batch.schedule().completed(center),
@@ -3951,6 +3968,9 @@ mod tests {
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
         assert!(heightmaps.get("WORLD_SURFACE_WG").is_some());
         assert!(heightmaps.get("OCEAN_FLOOR_WG").is_some());
+        let marks = batch.spawned_postprocessing_data(center).unwrap();
+        let marks = native_persistence::postprocessing::decode(&marks, 0, 16).unwrap();
+        assert_eq!(marks.sections().len(), 1);
         let (block_ticks, fluid_ticks) = batch.spawned_tick_data(center).unwrap();
         let native_persistence::nbt::Tag::List { values: ticks, .. } = block_ticks else {
             panic!("missing block ticks")

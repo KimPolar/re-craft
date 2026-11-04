@@ -263,6 +263,44 @@ mod face_tests {
     }
 
     #[test]
+    fn cauldrons_have_hollow_interiors_and_validate_levels() {
+        for (name, levels) in [
+            ("minecraft:cauldron", vec![None]),
+            ("minecraft:lava_cauldron", vec![None]),
+            (
+                "minecraft:water_cauldron",
+                vec![Some("1"), Some("2"), Some("3")],
+            ),
+            (
+                "minecraft:powder_snow_cauldron",
+                vec![Some("1"), Some("2"), Some("3")],
+            ),
+        ] {
+            for level in levels {
+                let mut state = BlockState {
+                    name: name.into(),
+                    properties: Default::default(),
+                };
+                if let Some(level) = level {
+                    state.properties.insert("level".into(), level.into());
+                }
+                let shape = block_shape(&state).unwrap();
+                assert_eq!(block_outline(&state), Some(shape.clone()));
+                let contains = |point: Vec3| {
+                    shape
+                        .iter()
+                        .any(|b| point.cmpgt(b.min).all() && point.cmplt(b.max).all())
+                };
+                assert!(!contains(Vec3::new(0.5, 0.5, 0.5)));
+                assert!(contains(Vec3::new(0.5, 3.5 / 16.0, 0.5)));
+                assert!(!contains(Vec3::new(0.5, 1.0 / 16.0, 0.5)));
+                state.properties.insert("unexpected".into(), "true".into());
+                assert!(block_shape(&state).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn sculk_sensor_shapes_validate_all_properties() {
         for name in [
             "minecraft:sculk_sensor",
@@ -347,6 +385,46 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if matches!(
+        id,
+        "cauldron" | "lava_cauldron" | "water_cauldron" | "powder_snow_cauldron"
+    ) {
+        let valid = if matches!(id, "water_cauldron" | "powder_snow_cauldron") {
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("level").map(String::as_str),
+                    Some("1" | "2" | "3")
+                )
+        } else {
+            state.properties.is_empty()
+        };
+        return valid.then(cauldron_shape);
+    }
+    if id == "brewing_stand" {
+        let valid = state.properties.len() == 3
+            && ["has_bottle_0", "has_bottle_1", "has_bottle_2"]
+                .iter()
+                .all(|name| {
+                    matches!(
+                        state.properties.get(*name).map(String::as_str),
+                        Some("true" | "false")
+                    )
+                });
+        return valid.then(|| {
+            vec![
+                pixel_box(1.0, 0.0, 1.0, 15.0, 2.0, 15.0),
+                pixel_box(7.0, 2.0, 7.0, 9.0, 14.0, 9.0),
+            ]
+        });
+    }
+    if id == "stonecutter" {
+        let valid = state.properties.len() == 1
+            && matches!(
+                state.properties.get("facing").map(String::as_str),
+                Some("north" | "south" | "east" | "west")
+            );
+        return valid.then(|| vec![pixel_box(0.0, 0.0, 0.0, 16.0, 9.0, 16.0)]);
+    }
     if matches!(id, "sculk_sensor" | "calibrated_sculk_sensor") {
         let calibrated = id == "calibrated_sculk_sensor";
         let power = state.properties.get("power")?;
@@ -1051,7 +1129,41 @@ fn vine(state: &BlockState) -> Option<Vec<Aabb>> {
     }
 }
 
-fn cuboid(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> Aabb {
+const fn pixel_box(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> Aabb {
+    cuboid(
+        x0 / 16.0,
+        y0 / 16.0,
+        z0 / 16.0,
+        x1 / 16.0,
+        y1 / 16.0,
+        z1 / 16.0,
+    )
+}
+
+/// Java's cauldron has corner feet, raised floor and narrow outer walls.
+pub(crate) const CAULDRON_SHAPE: [Aabb; 15] = [
+    pixel_box(0.0, 0.0, 0.0, 2.0, 16.0, 4.0),
+    pixel_box(0.0, 0.0, 12.0, 2.0, 16.0, 16.0),
+    pixel_box(2.0, 0.0, 0.0, 4.0, 16.0, 2.0),
+    pixel_box(2.0, 0.0, 14.0, 4.0, 16.0, 16.0),
+    pixel_box(12.0, 0.0, 0.0, 16.0, 16.0, 2.0),
+    pixel_box(12.0, 0.0, 14.0, 16.0, 16.0, 16.0),
+    pixel_box(14.0, 0.0, 2.0, 16.0, 16.0, 4.0),
+    pixel_box(14.0, 0.0, 12.0, 16.0, 16.0, 14.0),
+    pixel_box(0.0, 3.0, 4.0, 16.0, 4.0, 12.0),
+    pixel_box(2.0, 3.0, 2.0, 14.0, 4.0, 4.0),
+    pixel_box(2.0, 3.0, 12.0, 14.0, 4.0, 14.0),
+    pixel_box(4.0, 3.0, 0.0, 12.0, 16.0, 2.0),
+    pixel_box(4.0, 3.0, 14.0, 12.0, 16.0, 16.0),
+    pixel_box(0.0, 4.0, 4.0, 2.0, 16.0, 12.0),
+    pixel_box(14.0, 4.0, 4.0, 16.0, 16.0, 12.0),
+];
+
+fn cauldron_shape() -> Vec<Aabb> {
+    CAULDRON_SHAPE.to_vec()
+}
+
+const fn cuboid(x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) -> Aabb {
     Aabb {
         min: Vec3::new(x0, y0, z0),
         max: Vec3::new(x1, y1, z1),

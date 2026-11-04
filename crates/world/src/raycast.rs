@@ -263,6 +263,22 @@ mod tests {
     }
 
     #[test]
+    fn cauldron_targeting_reaches_the_inside_floor() {
+        let state = crate::loaded::BlockState {
+            name: "minecraft:water_cauldron".into(),
+            properties: [("level".into(), "2".into())].into(),
+        };
+        let shape = crate::collision::block_outline(&state).unwrap();
+        let hit = raycast_shapes(Vec3::new(0.5, 2.0, 0.5), Vec3::NEG_Y, 3.0, |cell| {
+            Some(if cell == IVec3::ZERO { &shape } else { &[] })
+        })
+        .unwrap();
+        assert_eq!(hit.position, IVec3::ZERO);
+        assert_eq!(hit.face, IVec3::Y);
+        assert_eq!(hit.location.y, 0.25);
+    }
+
+    #[test]
     fn boundary_traversal_uses_vanilla_axis_order() {
         let mut visited = Vec::new();
         let hit = raycast_shapes(Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0), 2.0, |cell| {

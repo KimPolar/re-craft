@@ -302,6 +302,19 @@ fn block_collision_and_step_resolution_match_vanilla_entity() {
             ],
         ),
         state("minecraft:flower_pot", &[]),
+        state("minecraft:cauldron", &[]),
+        state("minecraft:water_cauldron", &[("level", "2")]),
+        state("minecraft:lava_cauldron", &[]),
+        state("minecraft:powder_snow_cauldron", &[("level", "3")]),
+        state(
+            "minecraft:brewing_stand",
+            &[
+                ("has_bottle_0", "true"),
+                ("has_bottle_1", "false"),
+                ("has_bottle_2", "true"),
+            ],
+        ),
+        state("minecraft:stonecutter", &[("facing", "north")]),
         state(
             "minecraft:lantern",
             &[("hanging", "false"), ("waterlogged", "false")],

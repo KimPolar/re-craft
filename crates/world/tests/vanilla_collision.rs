@@ -47,6 +47,8 @@ public class CollisionOracle {
         var lantern = net.minecraft.world.level.block.Blocks.LANTERN.defaultBlockState()
             .setValue(net.minecraft.world.level.block.LanternBlock.HANGING, true)
             .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        var cauldron = net.minecraft.world.level.block.Blocks.CAULDRON.defaultBlockState()
+            .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         JsonArray all = new JsonArray();
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             JsonObject record = new JsonObject();
@@ -79,6 +81,13 @@ public class CollisionOracle {
                     for (var axis : Direction.Axis.values())
                         sameGrid &= collision.getCoords(axis).equals(lantern.getCoords(axis));
                     record.addProperty("hangingLanternGrid", sameGrid);
+                }
+                if (!collision.isEmpty() && !net.minecraft.world.phys.shapes.Shapes.joinIsNotEmpty(
+                    collision, cauldron, net.minecraft.world.phys.shapes.BooleanOp.NOT_SAME)) {
+                    boolean sameGrid = true;
+                    for (var axis : Direction.Axis.values())
+                        sameGrid &= collision.getCoords(axis).equals(cauldron.getCoords(axis));
+                    record.addProperty("cauldronGrid", sameGrid);
                 }
                 {
                     JsonArray sturdy = new JsonArray();
@@ -342,6 +351,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut double_chest_states_checked = 0usize;
     let mut lantern_states_checked = 0usize;
     let mut hanging_grid_checked = 0usize;
+    let mut cauldron_states_checked = 0usize;
+    let mut cauldron_grid_checked = 0usize;
+    let mut brewing_stand_states_checked = 0usize;
+    let mut stonecutter_states_checked = 0usize;
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
@@ -355,6 +368,13 @@ fn implemented_collision_shapes_match_vanilla_states() {
         if let Some(same) = entry["hangingLanternGrid"].as_bool() {
             assert!(same, "same-volume block has a different voxel grid: {id}");
             hanging_grid_checked += 1;
+        }
+        if let Some(same) = entry["cauldronGrid"].as_bool() {
+            assert!(
+                same,
+                "same-volume cauldron block has a different voxel grid: {id}"
+            );
+            cauldron_grid_checked += 1;
         }
         if matches!(id, "minecraft:water" | "minecraft:lava") {
             assert_eq!(entry["fallingFree"].as_bool(), Some(true), "{id}");
@@ -426,6 +446,25 @@ fn implemented_collision_shapes_match_vanilla_states() {
                 "missing lantern outline: {state:?}"
             );
             lantern_states_checked += 1;
+        }
+        if matches!(
+            id,
+            "minecraft:cauldron"
+                | "minecraft:lava_cauldron"
+                | "minecraft:water_cauldron"
+                | "minecraft:powder_snow_cauldron"
+        ) {
+            assert!(
+                block_outline(&state).is_some(),
+                "missing cauldron outline: {state:?}"
+            );
+            cauldron_states_checked += 1;
+        }
+        if id == "minecraft:brewing_stand" {
+            brewing_stand_states_checked += 1;
+        }
+        if id == "minecraft:stonecutter" {
+            stonecutter_states_checked += 1;
         }
         if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
             && state
@@ -599,6 +638,22 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert!(
         hanging_grid_checked >= 8,
         "hanging lantern grid was not checked"
+    );
+    assert_eq!(
+        cauldron_states_checked, 8,
+        "cauldron states missing from Java oracle"
+    );
+    assert_eq!(
+        cauldron_grid_checked, 8,
+        "cauldron voxel grids missing from Java oracle"
+    );
+    assert_eq!(
+        brewing_stand_states_checked, 8,
+        "brewing stand states missing from Java oracle"
+    );
+    assert_eq!(
+        stonecutter_states_checked, 4,
+        "stonecutter states missing from Java oracle"
     );
     assert!(fire_checked >= 2, "fire states missing from Java oracle");
     assert!(plant_checked >= 3, "plant states missing from Java oracle");

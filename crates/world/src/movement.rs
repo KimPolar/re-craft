@@ -176,9 +176,8 @@ impl CollisionShape {
         Self::with_axes(boxes, axes)
     }
 
-    /// Preserve the voxel grid of the 26.3 hanging-lantern shape. Java's
-    /// optimized union retains empty cells that affect clipping when an entity
-    /// already intersects the shape, even though the occupied boxes match.
+    /// Preserve 26.3 voxel grids where a shape's empty cells affect clipping
+    /// when an entity already intersects it, despite identical occupied boxes.
     pub fn from_block(cell: IVec3, boxes: &[crate::collision::Aabb]) -> Self {
         use crate::collision::Aabb;
         use glam::Vec3;
@@ -199,11 +198,21 @@ impl CollisionShape {
                 max: origin + b.max.as_dvec3(),
             })
             .collect();
+        let cuts = |values: &[f64], offset: f64| values.iter().map(|v| offset + v / 16.0).collect();
         if boxes.len() == 2 && boxes.contains(&lower) && boxes.contains(&upper) {
             let horizontal = [0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0, 11.0, 12.0, 14.0, 16.0];
             let vertical = [0.0, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
-            let cuts =
-                |values: &[f64], offset: f64| values.iter().map(|v| offset + v / 16.0).collect();
+            Self::with_axes(
+                boxes_world,
+                [
+                    cuts(&horizontal, origin.x),
+                    cuts(&vertical, origin.y),
+                    cuts(&horizontal, origin.z),
+                ],
+            )
+        } else if boxes == crate::collision::CAULDRON_SHAPE {
+            let horizontal = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
+            let vertical = [0.0, 3.0, 4.0, 8.0, 12.0, 16.0];
             Self::with_axes(
                 boxes_world,
                 [

@@ -15524,12 +15524,14 @@ impl LoadedSession {
                     overlay: BTreeMap::new(),
                     actions: Vec::new(),
                 };
-                let valid_state = match key.kind {
-                    BubbleTickKind::Water => stage.water(current).map(|_| ()),
-                    BubbleTickKind::Column => stage.column(current),
+                let process = match key.kind {
+                    BubbleTickKind::Water => stage.water(current).and_then(|_| {
+                        crate::bubble_column::tick_liquid_block(&mut stage, relative, current, tags)
+                    }),
+                    BubbleTickKind::Column => stage.column(current).and_then(|()| {
+                        crate::bubble_column::update_column(&mut stage, relative, tags)
+                    }),
                 };
-                let process = valid_state
-                    .and_then(|()| crate::bubble_column::update_column(&mut stage, relative, tags));
                 if process.is_err() {
                     deferred_bubble.push((order, key));
                     continue;

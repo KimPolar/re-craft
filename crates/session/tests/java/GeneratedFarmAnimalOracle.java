@@ -15,6 +15,7 @@ import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.animal.pig.Pig;
 import net.minecraft.world.entity.animal.cow.Cow;
 import net.minecraft.world.entity.animal.chicken.Chicken;
+import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.storage.TagValueOutput;
@@ -22,6 +23,15 @@ import sun.misc.Unsafe;
 
 public class GeneratedFarmAnimalOracle {
     static RegistryAccess access;
+    static Unsafe unsafe;
+    static class DummyNavigation extends net.minecraft.world.entity.ai.navigation.GroundPathNavigation {
+        DummyNavigation() { super(null,null); }
+        @Override public void setCanFloat(boolean value) {}
+    }
+    static net.minecraft.world.entity.ai.navigation.PathNavigation dummyNavigation() {
+        try { return (DummyNavigation)unsafe.allocateInstance(DummyNavigation.class); }
+        catch (InstantiationException error) { throw new AssertionError(error); }
+    }
     static class World extends ServerLevel {
         World() { super(null,null,null,null,null,null,false,0L,List.of(),false); }
         @Override public int getNextEntityId() { return 1; }
@@ -41,6 +51,22 @@ public class GeneratedFarmAnimalOracle {
         TestChicken(World world) { super(EntityTypes.CHICKEN,world); }
         @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return null; }
         @Override protected void registerGoals() {}
+    }
+    static class ObserveSheep extends Sheep {
+        ObserveSheep(World world) { super(EntityTypes.SHEEP,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return dummyNavigation(); }
+    }
+    static class ObservePig extends Pig {
+        ObservePig(World world) { super(EntityTypes.PIG,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return dummyNavigation(); }
+    }
+    static class ObserveCow extends Cow {
+        ObserveCow(World world) { super(EntityTypes.COW,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return dummyNavigation(); }
+    }
+    static class ObserveChicken extends Chicken {
+        ObserveChicken(World world) { super(EntityTypes.CHICKEN,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return dummyNavigation(); }
     }
     static Identifier fileKey(Identifier id) {
         return Identifier.fromNamespaceAndPath(id.getNamespace(), "entry/" + id.getPath() + ".json");
@@ -63,7 +89,8 @@ public class GeneratedFarmAnimalOracle {
             registry(Registries.CHICKEN_SOUND_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_SOUND_VARIANT).listElements().toList())
         ));
         var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
-        var world=(World)((Unsafe)unsafeField.get(null)).allocateInstance(World.class);
+        unsafe=(Unsafe)unsafeField.get(null);
+        var world=(World)unsafe.allocateInstance(World.class);
         var eggField=Chicken.class.getDeclaredField("eggTime"); eggField.setAccessible(true);
         var bindTags=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class); bindTags.setAccessible(true);
         var input=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
@@ -108,6 +135,29 @@ public class GeneratedFarmAnimalOracle {
                 if(!javaTag.equals(rustTag)) throw new AssertionError("case="+test+" index="+index+" java="+javaTag+" rust="+rustTag);
                 index++;
             }
+        }
+        if(args.length>1) {
+            var seedField=LegacyRandomSource.class.getDeclaredField("seed"); seedField.setAccessible(true);
+            var results=new JsonArray();
+            for(var type:List.of("sheep","pig","cow","chicken")) for(int i=0;i<32;i++) {
+                var animal=switch(type) {
+                    case "sheep" -> new ObserveSheep(world);
+                    case "pig" -> new ObservePig(world);
+                    case "cow" -> new ObserveCow(world);
+                    case "chicken" -> new ObserveChicken(world);
+                    default -> throw new AssertionError();
+                };
+                var state=((java.util.concurrent.atomic.AtomicLong)seedField.get(animal.getRandom())).get();
+                var uuid=animal.getUUID(); var value=new JsonObject();
+                var words=new JsonArray(); words.add((int)(uuid.getMostSignificantBits()>>>32)); words.add((int)uuid.getMostSignificantBits());
+                words.add((int)(uuid.getLeastSignificantBits()>>>32)); words.add((int)uuid.getLeastSignificantBits());
+                value.addProperty("entity",type); value.add("uuid",words); value.addProperty("state",state);
+                value.addProperty("yaw_bits",Float.floatToRawIntBits(animal.getYRot()));
+                if(animal instanceof Chicken chicken) value.addProperty("egg",eggField.getInt(chicken));
+                else value.add("egg",JsonNull.INSTANCE);
+                results.add(value);
+            }
+            Files.writeString(Path.of(args[1]),results.toString());
         }
     }
 }

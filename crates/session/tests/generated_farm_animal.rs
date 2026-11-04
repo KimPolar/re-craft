@@ -7,7 +7,7 @@ use native_resources::{
     packs::{ResourceId, ResourceStack},
     worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
-use native_session::worldgen::draft_fresh_farm_animal;
+use native_session::worldgen::{FreshCreatureRandom, draft_fresh_farm_animal};
 use serde_json::{Value, json};
 
 #[test]
@@ -117,9 +117,50 @@ fn fresh_farm_animal_drafts_match_java_entities() {
     }
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let constructions = temp.path().join("constructions.json");
     run(Command::new(java.join("java.exe"))
         .arg("-cp")
         .arg(&cp)
         .arg("GeneratedFarmAnimalOracle")
-        .arg(input));
+        .arg(input)
+        .arg(&constructions));
+    let construction_cases: Value =
+        serde_json::from_slice(&std::fs::read(constructions).unwrap()).unwrap();
+    for case in construction_cases.as_array().unwrap() {
+        let name = case["entity"].as_str().unwrap();
+        let id = ResourceId::parse(name).unwrap();
+        let final_state = case["state"].as_u64().unwrap();
+        let uuid: Vec<i32> = case["uuid"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i32)
+            .collect();
+        let mut initial = final_state;
+        let mut matched = None;
+        // nextInt(6000) can reject a draw; account for that rare Java path.
+        for _ in 0..32 {
+            initial = initial.wrapping_sub(11).wrapping_mul(0xdfe05bcb1365) & ((1_u64 << 48) - 1);
+            let random = native_core::random::LegacyRandom::from_state(initial).unwrap();
+            let candidate = FreshCreatureRandom::from_random(&id, random).unwrap();
+            if candidate.construction.uuid.as_slice() == uuid
+                && candidate.random.state() == final_state
+            {
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let actual = matched.unwrap_or_else(|| panic!("constructor RNG mismatch for {name}"));
+        assert_eq!(
+            actual.initial_yaw.to_bits() as i32,
+            case["yaw_bits"].as_i64().unwrap() as i32,
+            "{name}"
+        );
+        assert_eq!(
+            actual.construction.chicken_egg_time.map(i64::from),
+            case["egg"].as_i64(),
+            "{name}"
+        );
+        assert_eq!(actual.random.state(), final_state, "{name}");
+    }
 }

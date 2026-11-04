@@ -655,12 +655,15 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             lava_source_conversion: convert,
             fast_lava: scenario["fast"].as_bool().unwrap(),
         };
-        let changes = fluid_sim::tick(
+        let changes = fluid_sim::try_tick(
             &|pos| blocks.get(&pos).copied().unwrap_or(Cell::Air),
             IVec3::ZERO,
-            kind,
+            blocks[&IVec3::ZERO]
+                .contained_fluid()
+                .expect("fixture has a fluid"),
             settings,
-        );
+        )
+        .expect("fixture cells are complete");
         let actual: Vec<_> = changes
             .iter()
             .map(|change| {

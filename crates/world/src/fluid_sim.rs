@@ -35,6 +35,13 @@ pub enum Cell {
     Unknown,
 }
 
+impl Cell {
+    /// Fluid state represented by this supported block, if any.
+    pub fn contained_fluid(self) -> Option<FluidState> {
+        fluid(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub water_source_conversion: bool,
@@ -145,6 +152,15 @@ pub enum LavaNeighbor {
 pub struct Change {
     pub position: IVec3,
     pub block: ChangedBlock,
+}
+
+/// A plan cannot be made when its starting fluid has changed, a consulted
+/// cell is unavailable, or coordinate arithmetic could overflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncompleteTick {
+    Unknown(IVec3),
+    CoordinateOverflow,
+    FluidChanged,
 }
 
 // EnumMap<Direction, ...> applies side changes in this order.
@@ -622,11 +638,103 @@ pub fn tick(
     changes
 }
 
+/// Plan against a stable snapshot without treating unavailable cells as
+/// definite barriers. The result is discarded if a consulted cell is unknown
+/// or the captured fluid no longer matches. The radius covers slope search and
+/// its neighbors; coordinate overflow is rejected rather than treated as a
+/// wall. Applying the changes still requires the caller to reproduce Java's
+/// live block callbacks, scheduled ticks and random side effects.
+pub fn try_tick(
+    world: &impl Fn(IVec3) -> Cell,
+    position: IVec3,
+    original: FluidState,
+    settings: Settings,
+) -> Result<Vec<Change>, IncompleteTick> {
+    let kind = original.kind;
+    let radius = i32::from(settings.slope_distance(kind)) + 2;
+    if [position.x, position.y, position.z]
+        .into_iter()
+        .any(|coordinate| {
+            coordinate.checked_sub(radius).is_none() || coordinate.checked_add(radius).is_none()
+        })
+    {
+        return Err(IncompleteTick::CoordinateOverflow);
+    }
+    let initial = world(position);
+    if initial == Cell::Unknown {
+        return Err(IncompleteTick::Unknown(position));
+    }
+    if initial.contained_fluid() != Some(original) {
+        return Err(IncompleteTick::FluidChanged);
+    }
+    let unknown = std::cell::Cell::new(None);
+    let changes = tick(
+        &|pos| {
+            let cell = if pos == position { initial } else { world(pos) };
+            if cell == Cell::Unknown && unknown.get().is_none() {
+                unknown.set(Some(pos));
+            }
+            cell
+        },
+        position,
+        kind,
+        settings,
+    );
+    match unknown.get() {
+        Some(pos) => Err(IncompleteTick::Unknown(pos)),
+        None => Ok(changes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collision::{block_shape, merged_face_occludes};
     use crate::loaded::BlockState;
+
+    #[test]
+    fn precise_tick_rejects_consulted_unknown_cells_and_coordinate_overflow() {
+        let water = flowing(FluidKind::Water, 8, false);
+        let world = |pos| match pos {
+            IVec3::ZERO => Cell::Fluid(water),
+            IVec3::NEG_Y => Cell::Solid,
+            IVec3::NEG_Z => Cell::Unknown,
+            _ => Cell::Solid,
+        };
+        assert_eq!(
+            try_tick(&world, IVec3::ZERO, water, Settings::default()),
+            Err(IncompleteTick::Unknown(IVec3::NEG_Z))
+        );
+        assert_eq!(
+            try_tick(
+                &world,
+                IVec3::new(i32::MAX, 0, 0),
+                water,
+                Settings::default()
+            ),
+            Err(IncompleteTick::CoordinateOverflow)
+        );
+        let full = |pos| {
+            if pos == IVec3::ZERO {
+                Cell::Fluid(water)
+            } else {
+                Cell::Solid
+            }
+        };
+        assert_eq!(
+            try_tick(&full, IVec3::ZERO, water, Settings::default()).unwrap(),
+            tick(&full, IVec3::ZERO, FluidKind::Water, Settings::default())
+        );
+        assert_eq!(
+            try_tick(
+                &full,
+                IVec3::ZERO,
+                flowing(FluidKind::Lava, 8, false),
+                Settings::default()
+            ),
+            Err(IncompleteTick::FluidChanged)
+        );
+    }
 
     #[test]
     fn chest_support_allows_water_source_conversion() {

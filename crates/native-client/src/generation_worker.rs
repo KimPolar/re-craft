@@ -1,6 +1,6 @@
 //! Prepare a fresh-generation batch away from the window thread.
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -36,6 +36,8 @@ pub struct GenerationProgress {
     pub phase: GenerationPhase,
     pub completed_steps: u64,
     pub last_step: Option<(ChunkPos, GenerationStage)>,
+    /// Number of times an initial spawn search resumed after chunk expansion.
+    pub spawn_search_resumptions: u64,
 }
 
 pub struct GenerationReady {
@@ -715,6 +717,7 @@ impl GenerationWorker {
             phase: GenerationPhase::Planning,
             completed_steps: 0,
             last_step: None,
+            spawn_search_resumptions: 0,
         }));
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_progress = Arc::clone(&progress);
@@ -863,6 +866,8 @@ fn complete_spawn_search(
     cancelled: &AtomicBool,
     progress: &Mutex<GenerationProgress>,
 ) -> Result<Option<GenerationReady>> {
+    let mut previous_search: Option<native_session::world_spawn::InitialWorldSpawn> = None;
+    let mut checkpoint: Option<InitialSearchCheckpoint> = None;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
@@ -878,7 +883,19 @@ fn complete_spawn_search(
             pose: native_session::PlayerPose::Standing,
         };
         let session = ready.start_session_with_spawn_heightmaps(player, Arc::clone(&tags))?;
-        let mut search = ready.initial_spawn_search_at_origin(&session)?;
+        let fresh_search = ready.initial_spawn_search_at_origin(&session)?;
+        let mut search = match (previous_search.take(), checkpoint.take()) {
+            (Some(search), Some(previous))
+                if search.fallback_position() == fresh_search.fallback_position()
+                    && previous.matches(&ready.batch)? =>
+            {
+                let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+                progress.spawn_search_resumptions =
+                    progress.spawn_search_resumptions.saturating_add(1);
+                search
+            }
+            _ => fresh_search,
+        };
         let target = loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -892,6 +909,8 @@ fn complete_spawn_search(
                 InitialSpawnProgress::NeedsChunk(pos) => break pos,
             }
         };
+        checkpoint = Some(InitialSearchCheckpoint::capture(&ready)?);
+        previous_search = Some(search);
         drop(session);
         let revision = ready
             .mesh
@@ -914,6 +933,89 @@ fn complete_spawn_search(
         };
         ready = expanded;
     }
+}
+
+/// Search results remain valid only while every previously available target's
+/// blocks and the generation-time heightmaps still match. Light-only changes
+/// cannot affect the initial column search. This holds the shared terrain
+/// snapshot rather than copying its section arrays.
+struct InitialSearchCheckpoint {
+    world: Arc<native_world::loaded::World>,
+    heightmaps: BTreeMap<ChunkPos, Option<native_persistence::heightmap::SpawnHeightmaps>>,
+}
+
+impl InitialSearchCheckpoint {
+    fn capture(ready: &GenerationReady) -> Result<Self> {
+        let world = ready
+            .batch
+            .snapshot()
+            .context("search terrain is unavailable")?;
+        let targets = ready
+            .mesh
+            .targets
+            .as_deref()
+            .context("search targets are unavailable")?;
+        let mut heightmaps = BTreeMap::new();
+        for &pos in targets {
+            ensure!(world.chunks.contains_key(&pos), "search target is missing");
+            heightmaps.insert(pos, ready.batch.spawn_heightmaps(pos)?);
+        }
+        Ok(Self { world, heightmaps })
+    }
+
+    fn matches(&self, batch: &FreshTerrainBatch) -> Result<bool> {
+        let current = batch.snapshot().context("search terrain is unavailable")?;
+        self.matches_snapshot(&current, |pos| batch.spawn_heightmaps(pos))
+    }
+
+    fn matches_snapshot(
+        &self,
+        current: &native_world::loaded::World,
+        mut heightmaps: impl FnMut(
+            ChunkPos,
+        )
+            -> Result<Option<native_persistence::heightmap::SpawnHeightmaps>>,
+    ) -> Result<bool> {
+        if self.world.dimension != current.dimension
+            || self.world.dimension_type != current.dimension_type
+            || !self
+                .world
+                .states()
+                .all(|(id, state)| current.state(id) == Some(state))
+        {
+            return Ok(false);
+        }
+        for (pos, maps) in &self.heightmaps {
+            let Some(before) = self.world.chunks.get(pos) else {
+                return Ok(false);
+            };
+            let Some(after) = current.chunks.get(pos) else {
+                return Ok(false);
+            };
+            if !same_spawn_blocks(before, after) || *maps != heightmaps(*pos)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn same_spawn_blocks(
+    before: &Arc<native_world::loaded::Chunk>,
+    after: &Arc<native_world::loaded::Chunk>,
+) -> bool {
+    if Arc::ptr_eq(before, after) {
+        return true;
+    }
+    if before.position != after.position || before.sections.len() != after.sections.len() {
+        return false;
+    }
+    before.sections.iter().all(|(y, old)| {
+        after
+            .sections
+            .get(y)
+            .is_some_and(|new| Arc::ptr_eq(old, new) || old.blocks == new.blocks)
+    })
 }
 
 fn generate_spawn_origin(
@@ -1136,6 +1238,149 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn resuming_unchanged_spawn_search_avoids_repeating_columns() -> Result<()> {
+        use native_session::world_spawn::{
+            InitialWorldSpawn, SharedSpawnWorld, SpawnColumnHeights,
+        };
+        struct SearchWorld {
+            queries: usize,
+        }
+        impl SharedSpawnWorld for SearchWorld {
+            fn min_y(&self) -> i32 {
+                0
+            }
+            fn max_y(&self) -> i32 {
+                15
+            }
+            fn ceiling_spawn_height(&self) -> Option<i32> {
+                None
+            }
+            fn heights(&mut self, _: i32, _: i32) -> Result<SpawnColumnHeights> {
+                self.queries += 1;
+                Ok(SpawnColumnHeights {
+                    motion_blocking: 0,
+                    world_surface: 0,
+                    ocean_floor: 0,
+                })
+            }
+            fn has_fluid(&mut self, _: IVec3) -> Result<bool> {
+                Ok(false)
+            }
+            fn full_top_face(&mut self, pos: IVec3) -> Result<bool> {
+                Ok(pos.x >= 16 && pos.y == 0)
+            }
+            fn clear_player(&mut self, _: IVec3) -> Result<bool> {
+                unreachable!("initial spawn only checks columns")
+            }
+        }
+        let mut resumed_world = SearchWorld { queries: 0 };
+        let mut resumed = InitialWorldSpawn::new(0, 0, 8)?;
+        assert_eq!(resumed.poll(&mut resumed_world, 256)?, None);
+        assert_eq!(resumed.requested_position(), IVec3::new(16, 8, 0));
+        let result = resumed.poll(&mut resumed_world, 256)?;
+        assert_eq!(result, Some(IVec3::new(16, 1, 0)));
+        assert_eq!(resumed_world.queries, 257);
+
+        let mut restart_world = SearchWorld { queries: 0 };
+        let mut before_expansion = InitialWorldSpawn::new(0, 0, 8)?;
+        assert_eq!(before_expansion.poll(&mut restart_world, 256)?, None);
+        let mut restarted = InitialWorldSpawn::new(0, 0, 8)?;
+        assert_eq!(restarted.poll(&mut restart_world, 512)?, result);
+        assert_eq!(restart_world.queries, 513);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_search_checkpoint_detects_changed_blocks_registry_and_heightmaps() -> Result<()> {
+        use native_persistence::heightmap::{HeightBounds, SpawnHeightmaps};
+        use native_world::loaded::{BLOCK_COUNT, Chunk, Section, World};
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        });
+        let stone = world.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: Default::default(),
+        });
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: None,
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([air; BLOCK_COUNT])),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let heights = SpawnHeightmaps::from_first_available(
+            HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            &[0; 256],
+            &[0; 256],
+            &[0; 256],
+        )?;
+        let checkpoint = InitialSearchCheckpoint {
+            world: Arc::new(world.clone()),
+            heightmaps: BTreeMap::from([(pos, Some(heights.clone()))]),
+        };
+        let same = |_: ChunkPos| Ok(Some(heights.clone()));
+        assert!(checkpoint.matches_snapshot(&world, same)?);
+        let mut light_only = world.clone();
+        Arc::make_mut(
+            Arc::make_mut(light_only.chunks.get_mut(&pos).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .block_light = Some(Box::new([15; 2048]));
+        assert!(checkpoint.matches_snapshot(&light_only, same)?);
+        let mut changed = world.clone();
+        Arc::make_mut(
+            Arc::make_mut(changed.chunks.get_mut(&pos).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()[0] = stone;
+        assert!(!checkpoint.matches_snapshot(&changed, same)?);
+        let updated = SpawnHeightmaps::from_first_available(
+            HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            &[1; 256],
+            &[0; 256],
+            &[0; 256],
+        )?;
+        assert!(!checkpoint.matches_snapshot(&world, |_| Ok(Some(updated.clone())))?);
+        assert!(!checkpoint.matches_snapshot(&world, |_| Ok(None))?);
+        let mut wrong_registry = World::new("minecraft:overworld");
+        wrong_registry.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: Default::default(),
+        });
+        wrong_registry.chunks = world.chunks.clone();
+        assert!(!checkpoint.matches_snapshot(&wrong_registry, same)?);
+        let mut missing = world.clone();
+        missing.chunks.clear();
+        assert!(!checkpoint.matches_snapshot(&missing, same)?);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
@@ -1540,6 +1785,7 @@ mod tests {
             phase: GenerationPhase::Planning,
             completed_steps: 0,
             last_step: None,
+            spawn_search_resumptions: 0,
         });
         let ready = complete_spawn_search(
             ready,

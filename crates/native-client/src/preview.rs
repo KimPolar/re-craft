@@ -3778,9 +3778,8 @@ mod tests {
             Some(-1),
         )
         .unwrap();
-        let baseline_steps = generation.progress().completed_steps;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while no_spawn.progress().completed_steps <= baseline_steps {
+        while no_spawn.progress().spawn_search_resumptions == 0 {
             if let Some(result) = no_spawn.try_result().unwrap() {
                 match result {
                     crate::generation_worker::GenerationResult::Failed(error) => {

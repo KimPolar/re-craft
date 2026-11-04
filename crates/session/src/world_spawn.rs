@@ -229,6 +229,11 @@ impl InitialWorldSpawn {
         )
     }
 
+    /// The eventual fallback may depend on the origin chunk's heightmap.
+    pub fn fallback_position(&self) -> IVec3 {
+        self.fallback
+    }
+
     pub fn poll<W: SharedSpawnWorld>(
         &mut self,
         world: &mut W,

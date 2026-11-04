@@ -46,7 +46,7 @@ pub struct BlockHeightFlags {
 /// kept as saved, including stale values: Java copies a correctly sized map
 /// without checking it against the blocks. A missing map must be primed from
 /// the chunk before it can be used.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnHeightmaps {
     min_y: i32,
     max_y: i32,

@@ -91,10 +91,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble")) {
+        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on")) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
-            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off"),null);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off"),null);
             blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
@@ -109,6 +109,20 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
                 if(scenario.equals("convert_bubble"))blocks.put(pos.east().below(),Blocks.DIRT.defaultBlockState());
             }
+            if(scenario.equals("flow_drain")||scenario.equals("flow_drain_sand")) {
+                blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1));
+                if(scenario.equals("flow_drain_sand"))blocks.put(pos.east(),Blocks.SAND.defaultBlockState());
+            }
+            if(List.of("flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on").contains(scenario)) {
+                blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,4));
+                if(scenario.equals("flow_falling"))blocks.put(pos.above(),Blocks.WATER.defaultBlockState());
+                else {
+                    blocks.put(pos.west(),Blocks.WATER.defaultBlockState());
+                    if(scenario.equals("flow_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                    if(scenario.equals("flow_sides"))for(var p:List.of(pos.north(),pos.south(),pos.east()))blocks.put(p,Blocks.AIR.defaultBlockState());
+                    if(scenario.startsWith("origin_source_"))blocks.put(pos.north(),Blocks.WATER.defaultBlockState());
+                }
+            }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
@@ -120,7 +134,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             chunk.postProcessGeneration(level);
             if(random.nextLong()!=RandomSource.create(42).nextLong())throw new AssertionError("unexpected random use");
             out.println("case "+scenario);
-            for(var p:List.of(pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
+            for(var p:List.of(pos,pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
                     BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():"-");
             }

@@ -22,7 +22,7 @@ import net.minecraft.world.level.redstone.*;
 import net.minecraft.world.ticks.*;
 
 public class GeneratedWaterSpreadPostprocessingOracle {
-    static final BlockPos pos = new BlockPos(8,8,8);
+    static BlockPos pos = new BlockPos(8,8,8);
     static final Map<BlockPos, BlockState> blocks = new HashMap<>();
     static LevelTicks<Block> blockAccess;
     static LevelTicks<Fluid> fluidAccess;
@@ -90,21 +90,36 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        for(boolean sand:new boolean[]{false,true}) {
-            blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
-            if(sand)blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
+        for(String scenario:List.of("down","down_sand","sides","mixed","edge")) {
+            pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
+            blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+            if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
+            if(scenario.equals("sides"))for(var p:List.of(pos.north(),pos.south(),pos.west(),pos.east()))blocks.put(p,Blocks.AIR.defaultBlockState());
+            if(scenario.equals("mixed")) {
+                for(var p:List.of(pos.north(),pos.south(),pos.west()))blocks.put(p,Blocks.WATER.defaultBlockState());
+                blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.equals("edge"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(pos));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
             var bt=new LevelChunkTicks<Block>(List.of());var ft=new LevelChunkTicks<Fluid>(List.of());
+            var eastBt=new LevelChunkTicks<Block>(List.of());var eastFt=new LevelChunkTicks<Fluid>(List.of());
             blockAccess=new LevelTicks<Block>(p->true);fluidAccess=new LevelTicks<Fluid>(p->true);
             blockAccess.addContainer(new ChunkPos(0,0),bt);fluidAccess.addContainer(new ChunkPos(0,0),ft);
+            blockAccess.addContainer(new ChunkPos(1,0),eastBt);fluidAccess.addContainer(new ChunkPos(1,0),eastFt);
             counter=2;random=RandomSource.create(42);updater=new CollectingNeighborUpdater(level,100000);
             chunk.postProcessGeneration(level);
             if(random.nextLong()!=RandomSource.create(42).nextLong())throw new AssertionError("unexpected random use");
-            if(get(pos.below()).getBlock()!=Blocks.WATER || get(pos.below()).getValue(LiquidBlock.LEVEL)!=8)throw new AssertionError("unexpected water result");
-            out.println("sand "+sand);
+            out.println("case "+scenario);
+            for(var p:List.of(pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
+                var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
+                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():"-");
+            }
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
+            for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:ft.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
+            for(var tick:eastFt.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             out.println("counter "+counter);
         }
         out.println("END_RESULT");

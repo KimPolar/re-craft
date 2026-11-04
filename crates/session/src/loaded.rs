@@ -6350,20 +6350,25 @@ impl LoadedSession {
                 }
                 match self.entity_chunks.get(&chunk_pos) {
                     Some(SavedEntityData::Empty) => {}
-                    Some(SavedEntityData::Present(chunk)) if chunk.entities().is_empty() => {}
                     Some(SavedEntityData::Present(chunk)) => {
-                        let registry = self
-                            .entity_collision_registry
-                            .as_ref()
-                            .context("entity collision registry is unavailable")?;
                         let cache = self
                             .entity_collision_cache
                             .get(&chunk_pos)
                             .context("entity collision cache is unavailable")?;
                         let result = cache.get_or_init(|| {
-                            crate::spawn_entities::require_noncolliding(chunk.entities(), |id| {
-                                registry.kind(id)
-                            })
+                            (|| -> anyhow::Result<()> {
+                                let entities = crate::spawn_entities::entity_chunk_entries(chunk)?;
+                                if entities.is_empty() {
+                                    return Ok(());
+                                }
+                                let registry = self
+                                    .entity_collision_registry
+                                    .as_ref()
+                                    .context("entity collision registry is unavailable")?;
+                                crate::spawn_entities::require_noncolliding(entities, |id| {
+                                    registry.kind(id)
+                                })
+                            })()
                             .map_err(|error| format!("{error:#}"))
                         });
                         if let Err(error) = result {
@@ -44603,6 +44608,52 @@ pub(crate) mod tests {
         );
 
         use native_persistence::nbt::{NamedTag, Tag, TagType};
+        for invalid in [
+            Tag::Compound(vec![("Entities".into(), Tag::Int(0))]),
+            Tag::Compound(vec![
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        ] {
+            session
+                .set_initial_entity_chunk(
+                    home,
+                    SavedEntityData::Present(Arc::new(
+                        native_persistence::world::SavedEntityChunk {
+                            position: native_persistence::world::ChunkPos {
+                                x: home.x,
+                                z: home.z,
+                            },
+                            document: Arc::new(NamedTag {
+                                name: "".into(),
+                                value: invalid,
+                            }),
+                        },
+                    )),
+                )
+                .unwrap();
+            let mut invalid_search =
+                ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
+            assert!(
+                session
+                    .poll_generated_player_spawn(&mut invalid_search, None, &targets, 1)
+                    .is_err()
+            );
+            assert_eq!(invalid_search.requested_position(), origin);
+            assert!(session.world_spawn_clear(origin).is_err());
+        }
         let document = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![(

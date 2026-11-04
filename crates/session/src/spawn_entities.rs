@@ -10,9 +10,20 @@ pub(crate) fn require_noncolliding(
 ) -> Result<()> {
     let mut pending: Vec<_> = entities.iter().collect();
     while let Some(entity) = pending.pop() {
+        let Tag::Compound(fields) = entity else {
+            bail!("saved entity is not a compound")
+        };
         ensure!(
-            matches!(entity, Tag::Compound(_)),
-            "saved entity is not a compound"
+            fields.iter().filter(|(name, _)| name.matches("id")).count() == 1,
+            "entity type is missing or duplicated"
+        );
+        ensure!(
+            fields
+                .iter()
+                .filter(|(name, _)| name.matches("Passengers"))
+                .count()
+                <= 1,
+            "entity passengers are duplicated"
         );
         let Some(Tag::String(id)) = entity.get("id") else {
             bail!("saved entity type is missing")
@@ -92,6 +103,15 @@ pub(crate) fn require_nonblocking_building(entities: &[Tag]) -> Result<()> {
 pub(crate) fn require_nonblocking_building_chunk(
     chunk: &native_persistence::world::SavedEntityChunk,
 ) -> Result<()> {
+    require_nonblocking_building(entity_chunk_entries(chunk)?)
+}
+
+/// Inspect the document itself before treating an entity region as empty.
+/// `SavedEntityChunk::entities` is intentionally permissive for readers and
+/// cannot distinguish a malformed list from an absent or empty one.
+pub(crate) fn entity_chunk_entries(
+    chunk: &native_persistence::world::SavedEntityChunk,
+) -> Result<&[Tag]> {
     let Tag::Compound(fields) = &chunk.document.value else {
         bail!("entity chunk is not a compound")
     };
@@ -104,15 +124,15 @@ pub(crate) fn require_nonblocking_building_chunk(
         "entity list is duplicated"
     );
     match chunk.document.value.get("Entities") {
-        None => Ok(()),
+        None => Ok(&[]),
         Some(Tag::List {
             element_type: TagType::Compound,
             values,
-        }) => require_nonblocking_building(values),
+        }) if values.iter().all(|value| matches!(value, Tag::Compound(_))) => Ok(values),
         Some(Tag::List {
             element_type: TagType::End,
             values,
-        }) if values.is_empty() => Ok(()),
+        }) if values.is_empty() => Ok(&[]),
         _ => bail!("entity chunk list is invalid"),
     }
 }
@@ -152,6 +172,29 @@ mod tests {
             ("Passengers".into(), Tag::Int(0)),
         ]);
         assert!(require_noncolliding(&[malformed], kind).is_err());
+        let duplicate_id = Tag::Compound(vec![
+            ("id".into(), Tag::String("pig".into())),
+            ("id".into(), Tag::String("minecraft:oak_boat".into())),
+        ]);
+        assert!(require_noncolliding(&[duplicate_id], kind).is_err());
+        let duplicate_passengers = Tag::Compound(vec![
+            ("id".into(), Tag::String("pig".into())),
+            (
+                "Passengers".into(),
+                Tag::List {
+                    element_type: TagType::End,
+                    values: vec![],
+                },
+            ),
+            (
+                "Passengers".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity("minecraft:oak_boat", vec![])],
+                },
+            ),
+        ]);
+        assert!(require_noncolliding(&[duplicate_passengers], kind).is_err());
     }
 
     #[test]
@@ -229,6 +272,48 @@ mod tests {
             .is_err()
         );
         assert!(require_nonblocking_building_chunk(&chunk(Tag::Compound(vec![]))).is_ok());
+        assert!(entity_chunk_entries(&chunk(Tag::Int(0))).is_err());
+        assert!(
+            entity_chunk_entries(&chunk(Tag::Compound(vec![(
+                "Entities".into(),
+                Tag::Int(0)
+            )])))
+            .is_err()
+        );
+        assert!(
+            entity_chunk_entries(&chunk(Tag::Compound(vec![
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![]
+                    }
+                ),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![]
+                    }
+                ),
+            ])))
+            .is_err()
+        );
+        assert!(
+            entity_chunk_entries(&chunk(Tag::Compound(vec![(
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Int(1)]
+                }
+            )])))
+            .is_err()
+        );
+        assert!(
+            entity_chunk_entries(&chunk(Tag::Compound(vec![])))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(target_os = "windows")]

@@ -146,6 +146,7 @@ pub struct WorldClockDraft {
 /// inclusion before this can authorize an actual gameplay save.
 pub struct PartialSessionSaveDraft {
     dimension: native_persistence::world::DimensionId,
+    new_player: Option<([i32; 4], native_persistence::nbt::NamedTag)>,
     player_and_terrain: PlayerWorldDraft,
     entity_chunks: BTreeMap<ChunkPos, crate::saved_falling_block::FallingEntityChunkDraft>,
     clocks: WorldClockDraft,
@@ -211,6 +212,24 @@ impl PartialSessionPoiSaveDraft {
         }
         Ok(plan)
     }
+
+    /// Assemble a new player's partial transaction with the POI drafts.
+    /// Untracked gameplay effects must still be checked by the caller.
+    pub fn into_new_player_save_plan(
+        self,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        clock_source: &native_persistence::nbt::NamedTag,
+        timestamp: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        let dimension = self.session.dimension.clone();
+        let mut plan =
+            self.session
+                .into_new_player_save_plan(entity_sources, clock_source, timestamp)?;
+        for draft in self.poi.values() {
+            draft.add_to_save_plan(&mut plan, dimension.clone(), draft.source(), timestamp)?;
+        }
+        Ok(plan)
+    }
 }
 
 impl PartialSessionSaveDraft {
@@ -236,6 +255,40 @@ impl PartialSessionSaveDraft {
         region_timestamp_seconds: u32,
     ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
         anyhow::ensure!(
+            self.new_player.is_none(),
+            "new player requires a creation transaction"
+        );
+        self.into_plan(
+            Some((uuid, player_source)),
+            entity_sources,
+            clock_source,
+            region_timestamp_seconds,
+        )
+    }
+
+    /// Assemble the new player's identity, captured level time and tracked
+    /// world changes. This remains a partial, not a playable-world save.
+    pub fn into_new_player_save_plan(
+        self,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        clock_source: &native_persistence::nbt::NamedTag,
+        region_timestamp_seconds: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        anyhow::ensure!(
+            self.new_player.is_some(),
+            "new player source is unavailable"
+        );
+        self.into_plan(None, entity_sources, clock_source, region_timestamp_seconds)
+    }
+
+    fn into_plan(
+        self,
+        existing_player: Option<([i32; 4], &native_persistence::nbt::NamedTag)>,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        clock_source: &native_persistence::nbt::NamedTag,
+        region_timestamp_seconds: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        anyhow::ensure!(
             self.entity_chunks.len() == entity_sources.len()
                 && self
                     .entity_chunks
@@ -245,13 +298,33 @@ impl PartialSessionSaveDraft {
         );
         let mut plan = native_persistence::save::WorldSavePlan::new();
         let (player, chunks) = self.player_and_terrain.into_parts();
-        player.add_to_save_plan(&mut plan, uuid, player_source)?;
+        if let Some((uuid, source)) = existing_player {
+            player.add_to_save_plan(&mut plan, uuid, source)?;
+            if let Some(level) = &self.level_time {
+                plan.add_level_time(&level.source, level.time)?;
+            }
+        } else {
+            let (uuid, source) = self
+                .new_player
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+            anyhow::ensure!(
+                player.matches_source(source)?,
+                "new player draft source differs"
+            );
+            let level = self
+                .level_time
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("new player requires captured level time"))?;
+            crate::player_data::NewPlayerStateDraft::from_session(*uuid, player).add_to_save_plan(
+                &mut plan,
+                &level.source,
+                level.time,
+            )?;
+        }
         self.clocks.add_to_save_plan(&mut plan, clock_source)?;
         if let Some(weather) = &self.weather {
             plan.add_weather(weather.source.as_ref(), weather.weather)?;
-        }
-        if let Some(level) = &self.level_time {
-            plan.add_level_time(&level.source, level.time)?;
         }
         if let Some(sequences) = &self.random_sequences {
             plan.add_random_sequences(sequences)?;
@@ -3253,6 +3326,12 @@ impl LoadedSession {
             &native_persistence::palette::BlockState,
         ) -> anyhow::Result<(bool, bool)>,
     ) -> anyhow::Result<PartialSessionSaveDraft> {
+        if let Some((uuid, _)) = &self.new_player_source {
+            anyhow::ensure!(
+                self.player_uuid == Some(*uuid),
+                "new player identity changed"
+            );
+        }
         let player_and_terrain =
             self.draft_player_and_dirty_chunks_inner(player, terrain, tags, air_and_fluid)?;
         if !self.loot_events.is_empty()
@@ -3271,6 +3350,7 @@ impl LoadedSession {
         );
         Ok(PartialSessionSaveDraft {
             dimension: native_persistence::world::DimensionId::parse(&self.world.dimension)?,
+            new_player: self.new_player_source.clone(),
             player_and_terrain,
             entity_chunks,
             clocks,
@@ -3306,6 +3386,55 @@ impl LoadedSession {
                 .filter(|sequences| sequences.data.is_dirty())
                 .map(|sequences| sequences.data.clone()),
         })
+    }
+
+    /// Draft the captured new player with every tracked terrain, entity and
+    /// clock update at this tick. This is not a complete gameplay save.
+    pub fn draft_new_player_terrain_entities_and_clocks(
+        &self,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        clock: &native_persistence::nbt::NamedTag,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PartialSessionSaveDraft> {
+        let (_, source) = self
+            .new_player_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+        self.draft_player_terrain_entities_and_clocks(source, terrain, clock, tags, air_and_fluid)
+    }
+
+    /// Include recorded POI changes in the new player's partial snapshot.
+    pub fn draft_new_player_terrain_entities_clocks_and_poi(
+        &self,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        clock: &native_persistence::nbt::NamedTag,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+        resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
+        let (_, source) = self
+            .new_player_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+        self.draft_player_terrain_entities_clocks_and_poi(
+            source,
+            terrain,
+            clock,
+            tags,
+            air_and_fluid,
+            resolve_saved_state,
+            validate_state,
+            validate_poi_type,
+        )
     }
 
     /// Include POI transitions in the same immutable tick-boundary draft as
@@ -46102,6 +46231,296 @@ pub(crate) mod tests {
             .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
             .unwrap();
         assert_eq!(plan.chunk_count(), 1);
+    }
+
+    #[test]
+    fn new_player_partial_plan_requires_captured_level_source() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.set_new_player_last_death().unwrap();
+        session.initialize_new_player().unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let draft = session
+            .draft_new_player_terrain_entities_and_clocks(
+                &BTreeMap::new(),
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert!(
+            draft
+                .into_new_player_save_plan(&BTreeMap::new(), &clock, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn new_player_partial_save_commits_level_terrain_poi_and_clocks_together() {
+        use flate2::{
+            Compression,
+            write::{GzEncoder, ZlibEncoder},
+        };
+        use native_persistence::{
+            nbt::{self, NamedTag, Tag},
+            palette::BlockState as SavedState,
+            world::{DimensionId, WorldReader},
+        };
+        use std::io::Write;
+
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/session-save-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("world-")
+            .tempdir_in(parent)
+            .unwrap();
+        let gzip = |path: &std::path::Path, tag: &NamedTag| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut out = GzEncoder::new(Vec::new(), Compression::default());
+            out.write_all(&nbt::write(tag).unwrap()).unwrap();
+            std::fs::write(path, out.finish().unwrap()).unwrap();
+        };
+        let level = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("Time".into(), Tag::Long(41)),
+                    ("future".into(), Tag::Int(73)),
+                ]),
+            )]),
+        });
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        gzip(&root.path().join("level.dat"), &level);
+        gzip(&root.path().join("data/minecraft/world_clocks.dat"), &clock);
+
+        let mut session = session();
+        session.set_new_player_last_death().unwrap();
+        let uuid = session.initialize_new_player().unwrap();
+        session.set_initial_game_time(41).unwrap();
+        session
+            .capture_level_time_source(Arc::clone(&level))
+            .unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        let home = session.player_chunk().unwrap();
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Missing)
+            .unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        session.update(TICK);
+        let source = fixture_chunk_document(home);
+        let chunk_nbt = nbt::write(&source).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&chunk_nbt).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let sectors = (compressed.len() + 5).div_ceil(4096);
+        assert!(sectors < 256);
+        let mut region = vec![0u8; (2 + sectors) * 4096];
+        let index = home.x.rem_euclid(32) as usize + 32 * home.z.rem_euclid(32) as usize;
+        region[index * 4..index * 4 + 4]
+            .copy_from_slice(&((2u32 << 8) | sectors as u32).to_be_bytes());
+        region[8192..8196].copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+        region[8196] = 2;
+        region[8197..8197 + compressed.len()].copy_from_slice(&compressed);
+        let region_dir = root.path().join("dimensions/minecraft/overworld/region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        let region_path = region_dir.join(format!(
+            "r.{}.{}.mca",
+            home.x.div_euclid(32),
+            home.z.div_euclid(32)
+        ));
+        std::fs::write(&region_path, &region).unwrap();
+        let lodestone = session.intern_block(state("minecraft:lodestone", &[]));
+        assert!(session.set(IVec3::new(4, 0, 4), lodestone));
+        let dropped =
+            ItemStack::new("minecraft:stone".into(), 3, 64, Tag::Compound(vec![])).unwrap();
+        session.dropped_items.spawn_from_entity(
+            session.origin.as_dvec3() + DVec3::new(4.5, 3.0, 4.5),
+            dropped,
+        );
+        let resolve = |saved: &SavedState| -> anyhow::Result<BlockState> {
+            Ok(BlockState {
+                name: String::from_utf16(&saved.name.0)?,
+                properties: saved
+                    .properties
+                    .iter()
+                    .map(|(k, v)| Ok((String::from_utf16(&k.0)?, String::from_utf16(&v.0)?)))
+                    .collect::<anyhow::Result<_>>()?,
+            })
+        };
+        let validate = |block: &BlockState| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                block.properties.is_empty()
+                    && matches!(
+                        block.name.as_str(),
+                        "minecraft:air" | "minecraft:stone" | "minecraft:lodestone"
+                    )
+            );
+            Ok(())
+        };
+        struct HeightTags;
+        impl native_resources::packs::ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, _: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+                Ok(vec![
+                    br#"{"values":["minecraft:stone","minecraft:lodestone"]}"#.to_vec(),
+                ])
+            }
+        }
+        let registry = BTreeSet::from([
+            "minecraft:air".into(),
+            "minecraft:stone".into(),
+            "minecraft:lodestone".into(),
+        ]);
+        let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
+        let terrain = BTreeMap::from([(home, &source)]);
+        let make = || {
+            session.draft_new_player_terrain_entities_clocks_and_poi(
+                &terrain,
+                &clock,
+                &tags,
+                |state| Ok((state.name.matches("minecraft:air"), false)),
+                resolve,
+                validate,
+                |_| Ok(()),
+            )
+        };
+        let draft = make().unwrap();
+        assert_eq!(draft.poi_chunks().len(), 1);
+        assert_eq!(draft.session().entity_chunks().len(), 1);
+        assert!(
+            make()
+                .unwrap()
+                .into_save_plan(
+                    uuid,
+                    &session.new_player_source.as_ref().unwrap().1,
+                    &BTreeMap::new(),
+                    &clock,
+                    1
+                )
+                .is_err()
+        );
+        let mut changed_clock = clock.clone();
+        let Tag::Compound(clock_fields) = &mut changed_clock.value else {
+            unreachable!()
+        };
+        clock_fields.push(("foreign".into(), Tag::Int(1)));
+        let entity_sources = BTreeMap::from([(home, None)]);
+        assert!(
+            make()
+                .unwrap()
+                .into_new_player_save_plan(&entity_sources, &changed_clock, 1)
+                .is_err()
+        );
+        assert!(
+            make()
+                .unwrap()
+                .into_new_player_save_plan(&BTreeMap::new(), &clock, 1)
+                .is_err()
+        );
+        let stale = make()
+            .unwrap()
+            .into_new_player_save_plan(&entity_sources, &clock, 1)
+            .unwrap();
+        let plan = draft
+            .into_new_player_save_plan(&entity_sources, &clock, 1)
+            .unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+        assert_eq!(plan.poi_chunk_count(), 1);
+        assert!(plan.has_level_time());
+        let mut writer = native_persistence::save::WorldWriteGuard::acquire(root.path()).unwrap();
+        let result = writer
+            .write_plan(plan, |_, change| {
+                anyhow::ensure!(
+                    change.expected.name.matches("minecraft:stone")
+                        && change.replacement.name.matches("minecraft:lodestone")
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            result
+                .backup_directory
+                .join("world-data/level.dat")
+                .exists()
+        );
+        let mut reader =
+            WorldReader::open(root.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+        assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+        let player = reader.read_player().unwrap().unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_position(&player).unwrap(),
+            Some(session.motion.position + session.origin.as_dvec3())
+        );
+        assert_eq!(reader.game_time().unwrap(), 42);
+        assert_eq!(
+            reader.level.value.get("Data").unwrap().get("future"),
+            Some(&Tag::Int(73))
+        );
+        let saved_chunk = reader.read_chunk(home.x, home.z).unwrap().unwrap();
+        let area = reader
+            .read_area(
+                native_persistence::world::ChunkPos {
+                    x: home.x,
+                    z: home.z,
+                },
+                0,
+            )
+            .unwrap();
+        let world = area.materialize(reader.dimension()).unwrap();
+        assert_eq!(
+            world
+                .block(home.x * 16 + 4, 0, home.z * 16 + 4)
+                .unwrap()
+                .name,
+            "minecraft:lodestone"
+        );
+        assert_eq!(saved_chunk.position.x, home.x);
+        let poi = reader.read_poi_chunk(home.x, home.z).unwrap().unwrap();
+        assert!(poi.sections.get(&0).unwrap().valid);
+        assert_eq!(poi.sections.get(&0).unwrap().records.len(), 1);
+        let entity = reader.read_entity_chunk(home.x, home.z).unwrap().unwrap();
+        assert_eq!(entity.entities().len(), 1);
+        assert_eq!(
+            crate::saved_item::read(&entity.entities()[0])
+                .unwrap()
+                .unwrap()
+                .stack
+                .count(),
+            3
+        );
+        drop(reader);
+        let before_level = std::fs::read(root.path().join("level.dat")).unwrap();
+        let before_region = std::fs::read(&region_path).unwrap();
+        assert!(writer.write_plan(stale, |_, _| Ok(())).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("level.dat")).unwrap(),
+            before_level
+        );
+        assert_eq!(std::fs::read(region_path).unwrap(), before_region);
     }
 
     #[test]

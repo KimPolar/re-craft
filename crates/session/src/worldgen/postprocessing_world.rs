@@ -6,7 +6,10 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use native_resources::tree_leaf_update::ShapeEdgeWorld;
-use native_world::loaded::{BlockState, ChunkPos, World};
+use native_world::{
+    generation_light::VisibleLightSnapshot,
+    loaded::{BlockPosition, BlockState, ChunkPos, World},
+};
 
 use super::{
     chunk_ticks::{RegionTicks, ScheduleOutcome, TickRegistry},
@@ -26,6 +29,10 @@ pub struct GeneratedPostprocessing {
     completed: BTreeSet<ChunkPos>,
     active: Option<ChunkPos>,
     failed: bool,
+    light: Option<VisibleLightSnapshot>,
+    mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    edits: Vec<BlockPosition>,
+    light_checks: Vec<BlockPosition>,
 }
 
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
@@ -34,6 +41,10 @@ pub struct PostprocessedGeneratedRegion {
     pub world: Arc<World>,
     pub ticks: RegionTicks,
     pub chunks: BTreeSet<ChunkPos>,
+    /// Block changes must be applied to FULL heightmaps before saving.
+    pub edits: Vec<BlockPosition>,
+    /// These light checks must be processed before publishing the result.
+    pub light_checks: Vec<BlockPosition>,
 }
 
 impl GeneratedPostprocessing {
@@ -42,6 +53,8 @@ impl GeneratedPostprocessing {
         min_y: i32,
         max_y: i32,
         region: ConvertedPostprocessingRegion,
+        light: Option<VisibleLightSnapshot>,
+        mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     ) -> Self {
         Self {
             world,
@@ -51,6 +64,10 @@ impl GeneratedPostprocessing {
             completed: BTreeSet::new(),
             active: None,
             failed: false,
+            light,
+            mushroom_tags,
+            edits: Vec::new(),
+            light_checks: Vec::new(),
         }
     }
 
@@ -74,10 +91,14 @@ impl GeneratedPostprocessing {
         self.active = Some(pos);
         self.failed = true;
         let mut view = GeneratedBlockView {
-            world: &self.world,
+            world: &mut self.world,
             min_y: self.min_y,
             max_y: self.max_y,
             ticks: &mut self.region.ticks,
+            light: self.light.as_ref(),
+            mushroom_tags: self.mushroom_tags.as_deref(),
+            edits: &mut self.edits,
+            light_checks: &mut self.light_checks,
         };
         let done = task.poll(&mut view, budget)?;
         if done {
@@ -98,26 +119,40 @@ impl GeneratedPostprocessing {
             world: self.world,
             ticks: self.region.ticks,
             chunks: self.completed,
+            edits: self.edits,
+            light_checks: self.light_checks,
         })
     }
 }
 
 struct GeneratedBlockView<'a> {
-    world: &'a World,
+    world: &'a mut Arc<World>,
     min_y: i32,
     max_y: i32,
     ticks: &'a mut RegionTicks,
+    light: Option<&'a VisibleLightSnapshot>,
+    mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    edits: &'a mut Vec<BlockPosition>,
+    light_checks: &'a mut Vec<BlockPosition>,
 }
 
-fn supported_dry_block(state: &BlockState) -> Result<bool> {
+#[derive(Clone, Copy)]
+enum DryBlock {
+    Plain,
+    Falling,
+    Mushroom,
+}
+
+fn supported_dry_block(state: &BlockState) -> Result<DryBlock> {
     ensure!(
         state.properties.is_empty(),
         "unsupported generated postprocessing block state"
     );
     match state.name.as_str() {
-        "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => Ok(true),
+        "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => Ok(DryBlock::Falling),
+        "minecraft:brown_mushroom" | "minecraft:red_mushroom" => Ok(DryBlock::Mushroom),
         "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:stone"
-        | "minecraft:dirt" => Ok(false),
+        | "minecraft:dirt" => Ok(DryBlock::Plain),
         _ => bail!("unsupported generated postprocessing block {}", state.name),
     }
 }
@@ -143,6 +178,98 @@ impl GeneratedBlockView<'_> {
             .cloned()
             .context("generated postprocessing block is missing")
     }
+
+    fn mushroom_survives(&self, pos: [i32; 3]) -> Result<bool> {
+        let below = self.read([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+        static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+            std::sync::OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse(
+                "minecraft:overrides_mushroom_light_requirement",
+            )
+            .expect("static tag identifier")
+        });
+        if self
+            .mushroom_tags
+            .context("mushroom support tags unavailable")?
+            .contains(tag, &below.name)?
+        {
+            return Ok(true);
+        }
+        let brightness = self
+            .light
+            .context("mushroom lighting unavailable")?
+            .raw_brightness(pos, 0)
+            .context("mushroom light column unavailable")?;
+        if brightness >= 13 {
+            return Ok(false);
+        }
+        if matches!(
+            below.name.as_str(),
+            "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+        ) {
+            ensure!(
+                below.properties.len() == 1
+                    && matches!(
+                        below.properties.get("snowy").map(String::as_str),
+                        Some("true" | "false")
+                    ),
+                "invalid mushroom support state"
+            );
+            return Ok(true);
+        }
+        if matches!(
+            below.name.as_str(),
+            "minecraft:crimson_nylium" | "minecraft:warped_nylium"
+        ) {
+            ensure!(
+                below.properties.is_empty(),
+                "invalid mushroom support state"
+            );
+            return Ok(true);
+        }
+        Ok(super::ore::monster_block_flags(&below)?.1)
+    }
+
+    fn replace_mushroom(&mut self, pos: [i32; 3], next: &BlockState, flags: i32) -> Result<()> {
+        ensure!(
+            flags == 276 && next.name == "minecraft:air" && next.properties.is_empty(),
+            "unsupported generated postprocessing write"
+        );
+        let old = self.read(pos)?;
+        ensure!(
+            matches!(supported_dry_block(&old)?, DryBlock::Mushroom),
+            "postprocessing source is not a mushroom"
+        );
+        let same_light = native_world::block_light::same_light_behavior(&old, next)
+            .context("mushroom light behavior unavailable")?;
+        if !same_light {
+            let change = native_world::block_light::light_change(&old, next)
+                .context("mushroom light change unavailable")?;
+            ensure!(
+                change.radius() == 0,
+                "mushroom light change requires propagation during postprocessing"
+            );
+        }
+        let world = Arc::make_mut(self.world);
+        let id = world.intern_state(next.clone());
+        ensure!(
+            world
+                .set_block_id(pos[0], pos[1], pos[2], id)
+                .map_err(|error| anyhow::anyhow!("cannot update generated mushroom: {error:?}"))?,
+            "generated mushroom write was unchanged"
+        );
+        let position = BlockPosition {
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+        };
+        self.edits.push(position);
+        if !same_light {
+            self.light_checks.push(position);
+        }
+        Ok(())
+    }
 }
 
 impl ShapeEdgeWorld for GeneratedBlockView<'_> {
@@ -160,19 +287,28 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         _: &BlockState,
     ) -> Result<BlockState> {
-        if supported_dry_block(state)? {
-            ensure!(
-                self.ticks
-                    .schedule(TickRegistry::Block, &state.name, pos, 2, 0)?
-                    != ScheduleOutcome::MissingChunk,
-                "falling block tick container is missing"
-            );
+        match supported_dry_block(state)? {
+            DryBlock::Falling => {
+                ensure!(
+                    self.ticks
+                        .schedule(TickRegistry::Block, &state.name, pos, 2, 0)?
+                        != ScheduleOutcome::MissingChunk,
+                    "falling block tick container is missing"
+                );
+            }
+            DryBlock::Mushroom if !self.mushroom_survives(pos)? => {
+                return Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: Default::default(),
+                });
+            }
+            DryBlock::Plain | DryBlock::Mushroom => {}
         }
         Ok(state.clone())
     }
 
-    fn set_block(&mut self, _: [i32; 3], _: &BlockState, _: i32) -> Result<()> {
-        bail!("generated postprocessing block writes are not implemented")
+    fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
+        self.replace_mushroom(pos, state, flags)
     }
 }
 
@@ -199,8 +335,8 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     fn update_neighbor_shapes(&mut self, pos: [i32; 3], state: &BlockState) -> Result<BlockState> {
         update_from_neighbor_shapes(self, pos, state)
     }
-    fn set_block(&mut self, _: [i32; 3], _: &BlockState, _: i32) -> Result<()> {
-        bail!("generated postprocessing block writes are not implemented")
+    fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
+        self.replace_mushroom(pos, state, flags)
     }
     fn clear_processed_section(&mut self, _: usize) -> Result<()> {
         Ok(())
@@ -293,7 +429,7 @@ mod tests {
             ticks: RegionTicks::new(BTreeMap::from([(pos, ticks)]), 100, 2).unwrap(),
         };
         (
-            GeneratedPostprocessing::new(Arc::clone(&world), 0, 16, region),
+            GeneratedPostprocessing::new(Arc::clone(&world), 0, 16, region, None, None),
             world,
             pos,
         )
@@ -320,6 +456,167 @@ mod tests {
         trace
     }
 
+    fn mushroom_case(mushroom: &str, support: &str, tagged: bool, brightness: u8) -> String {
+        use native_resources::{
+            ore_feature::OreBlockTags,
+            packs::{ResourceId, ResourceProvider},
+        };
+        use native_world::generation_light::VisibleLightColumn;
+        struct TagSource {
+            support: String,
+            tagged: bool,
+        }
+        impl ResourceProvider for TagSource {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path != "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
+                    return Ok(None);
+                }
+                Ok(Some(serde_json::to_vec(
+                    &serde_json::json!({"values": if self.tagged { vec![self.support.clone()] } else { vec![] }}),
+                )?))
+            }
+        }
+        let pos = ChunkPos { x: 0, z: 0 };
+        let id = |name: &str| format!("minecraft:{name}");
+        let registry = BTreeSet::from([id("air"), id("void_air"), id(mushroom), id(support)]);
+        let tags = OreBlockTags::load(
+            &mut TagSource {
+                support: id(support),
+                tagged,
+            },
+            &registry,
+            &BTreeSet::from([
+                ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap(),
+            ]),
+        )
+        .unwrap();
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: id("air"),
+            properties: BTreeMap::new(),
+        });
+        let plant = world.intern_state(BlockState {
+            name: id(mushroom),
+            properties: BTreeMap::new(),
+        });
+        let properties = match support {
+            "grass_block" | "podzol" | "mycelium" => {
+                BTreeMap::from([("snowy".into(), "false".into())])
+            }
+            "water" => BTreeMap::from([("level".into(), "0".into())]),
+            "chest" => BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+            _ => BTreeMap::new(),
+        };
+        let support_id = world.intern_state(BlockState {
+            name: id(support),
+            properties,
+        });
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 + 8 * 16 + 8 * 256] = plant;
+        blocks[8 + 8 * 16 + 7 * 256] = support_id;
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:spawn".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let source = Arc::new(world);
+        let mut light = VisibleLightSnapshot::new(true, false);
+        light.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(
+                BTreeMap::from([(
+                    0,
+                    Arc::new([brightness | brightness << 4; native_world::loaded::LIGHT_BYTES]),
+                )]),
+                BTreeMap::new(),
+            ),
+        );
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        let region = ConvertedPostprocessingRegion {
+            tasks: BTreeMap::from([(pos, PostprocessingTask::new(Arc::new(marks), pos))]),
+            ticks: RegionTicks::new(
+                BTreeMap::from([(
+                    pos,
+                    ConvertedChunkTicks {
+                        blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                        fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                    },
+                )]),
+                100,
+                0,
+            )
+            .unwrap(),
+        };
+        let mut stage = GeneratedPostprocessing::new(
+            Arc::clone(&source),
+            0,
+            16,
+            region,
+            Some(light),
+            Some(Arc::new(tags)),
+        );
+        while !stage.poll(pos, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert_eq!(source.block(8, 8, 8).unwrap().name, id(mushroom));
+        let state = &result.world.block(8, 8, 8).unwrap().name;
+        let removed = state == "minecraft:air";
+        assert_eq!(result.edits.len(), usize::from(removed));
+        assert_eq!(
+            result.light_checks.len(),
+            usize::from(removed && mushroom == "brown_mushroom")
+        );
+        format!(
+            "{} {} {} {} {} {} {}",
+            id(mushroom),
+            id(support),
+            tagged,
+            brightness,
+            state,
+            usize::from(removed),
+            if removed { 276 } else { -1 }
+        )
+    }
+
+    #[test]
+    fn mushroom_removal_preserves_source_and_records_light_and_heightmap_work() {
+        assert_eq!(
+            mushroom_case("brown_mushroom", "stone", false, 12),
+            "minecraft:brown_mushroom minecraft:stone false 12 minecraft:brown_mushroom 0 -1"
+        );
+        assert_eq!(
+            mushroom_case("brown_mushroom", "stone", false, 13),
+            "minecraft:brown_mushroom minecraft:stone false 13 minecraft:air 1 276"
+        );
+        assert_eq!(
+            mushroom_case("red_mushroom", "stone", true, 15),
+            "minecraft:red_mushroom minecraft:stone true 15 minecraft:red_mushroom 0 -1"
+        );
+        assert_eq!(
+            mushroom_case("red_mushroom", "air", false, 0),
+            "minecraft:red_mushroom minecraft:air false 0 minecraft:air 1 276"
+        );
+    }
+
     #[test]
     fn generated_falling_blocks_schedule_real_ticks_and_fail_atomically() {
         let expected = vec![
@@ -340,9 +637,7 @@ mod tests {
         assert!(stage.finish().is_err());
     }
 
-    #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
-    fn generated_falling_postprocessing_matches_java() {
+    fn java_results(class_name: &str, java_source: &str) -> Vec<String> {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -367,14 +662,8 @@ mod tests {
             }
         }
         let classpath = std::env::join_paths(paths).unwrap();
-        let source = temp
-            .path()
-            .join("GeneratedFallingPostprocessingOracle.java");
-        std::fs::write(
-            &source,
-            include_str!("../../tests/java/GeneratedFallingPostprocessingOracle.java"),
-        )
-        .unwrap();
+        let source = temp.path().join(format!("{class_name}.java"));
+        std::fs::write(&source, java_source).unwrap();
         let compile = Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
@@ -389,7 +678,7 @@ mod tests {
         let run = Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(classpath)
-            .arg("GeneratedFallingPostprocessingOracle")
+            .arg(class_name)
             .output()
             .unwrap();
         assert!(
@@ -404,12 +693,52 @@ mod tests {
             .position(|line| *line == "BEGIN_RESULT")
             .unwrap();
         let end = lines.iter().position(|line| *line == "END_RESULT").unwrap();
-        assert_eq!(
-            &lines[start + 1..end],
-            result_trace(1)
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
+        lines[start + 1..end]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_falling_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedFallingPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedFallingPostprocessingOracle.java"),
         );
+        assert_eq!(actual, result_trace(1));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_mushroom_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedMushroomPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedMushroomPostprocessingOracle.java"),
+        );
+        let mut expected = Vec::new();
+        for mushroom in ["brown_mushroom", "red_mushroom"] {
+            for support in [
+                "stone",
+                "dirt",
+                "grass_block",
+                "podzol",
+                "mycelium",
+                "crimson_nylium",
+                "warped_nylium",
+                "water",
+                "air",
+                "chest",
+                "spawner",
+                "deepslate",
+            ] {
+                for tagged in [false, true] {
+                    for brightness in [0, 12, 13, 15] {
+                        expected.push(mushroom_case(mushroom, support, tagged, brightness));
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 }

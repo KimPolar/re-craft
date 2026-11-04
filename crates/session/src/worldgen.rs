@@ -4892,20 +4892,15 @@ mod tests {
         let mut generated = batch
             .begin_generated_postprocessing([center], 42, 10)
             .unwrap();
-        let error = loop {
-            match generated.poll(center, 4) {
-                Ok(false) => {}
-                Ok(true) => panic!("unsupported mushroom callback was accepted"),
-                Err(error) => break error,
-            }
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported generated postprocessing block")
+        while !generated.poll(center, 4).unwrap() {}
+        let processed = generated.finish().unwrap();
+        assert!(Arc::ptr_eq(&original, &processed.world));
+        assert!(processed.edits.is_empty());
+        assert!(processed.light_checks.is_empty());
+        assert_eq!(
+            processed.ticks.chunk(center).unwrap().blocks.pack(42),
+            saved
         );
-        assert!(generated.finish().is_err());
-        assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
         let native_persistence::nbt::Tag::List { values: ticks, .. } = fluid_ticks else {
             panic!("missing fluid ticks")
         };

@@ -3199,7 +3199,7 @@ impl FallenFeatureWorld for DecorationRegion<'_> {
 }
 
 // Only state families independently checked against 26.3 are accepted here.
-fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
+pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     let name = state.name.as_str();
     if is_air(state) {
         return Ok((false, false));

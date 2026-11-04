@@ -67,6 +67,7 @@ struct DecorationConfig {
     has_skylight: bool,
     dimension_type: Option<String>,
     ambient_light: Option<f32>,
+    mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
 }
 
 /// Examine every branch without consuming generation randomness or the block
@@ -787,11 +788,20 @@ impl FreshTerrainBatch {
             features_cannot_spawn_entities(provider, &schedule, placed_features);
         let heightmap_tags =
             native_resources::heightmap_tags::HeightmapTags::load(provider, &block_registry)?;
+        let mushroom_tag = ResourceId::parse("minecraft:overrides_mushroom_light_requirement")?;
+        let mushroom_tags = native_resources::ore_feature::OreBlockTags::load(
+            provider,
+            &block_registry,
+            &BTreeSet::from([mushroom_tag]),
+        )
+        .ok()
+        .map(Arc::new);
         self.decoration = Some(DecorationConfig {
             schedule,
             features_cannot_spawn_entities,
             block_registry,
             heightmap_tags,
+            mushroom_tags,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -1492,13 +1502,35 @@ impl FreshTerrainBatch {
         )?;
         // All generated block entities in this path are materialized live;
         // a missing or unsupported record cannot be treated as no entity.
-        for pos in positions {
+        for &pos in &positions {
             self.spawned_block_entity_data(pos)?;
         }
         let world = self.snapshot().context("generated terrain is missing")?;
+        // Most generated chunks do not contain mushrooms. Avoid preparing a
+        // light snapshot unless this registry can actually reference one.
+        let needs_mushroom_light = world.states().any(|(_, state)| {
+            matches!(
+                state.name.as_str(),
+                "minecraft:brown_mushroom" | "minecraft:red_mushroom"
+            )
+        });
+        let light = if needs_mushroom_light {
+            Some(self.light_snapshot(positions.iter().copied())?)
+        } else {
+            None
+        };
+        let mushroom_tags = self
+            .decoration
+            .as_ref()
+            .and_then(|config| config.mushroom_tags.clone());
         let (min_y, max_y) = self.build_bounds()?;
         Ok(super::GeneratedPostprocessing::new(
-            world, min_y, max_y, region,
+            world,
+            min_y,
+            max_y,
+            region,
+            light,
+            mushroom_tags,
         ))
     }
 

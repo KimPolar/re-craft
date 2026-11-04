@@ -5402,8 +5402,21 @@ impl LoadedSession {
             .map(|(_, state)| FluidState::from_block(state).ok().flatten())
             .collect();
         let unsupported_states = shapes.iter().filter(|shape| shape.is_none()).count();
-        let saved_ticks = world.saved_fluid_ticks.clone();
-        let saved_sand_ticks = world.saved_block_ticks.clone();
+        // A world snapshot can retain metadata for chunks that are not yet
+        // resident. Their ticks must wait for streaming, or they will be
+        // enqueued a second time when that chunk is imported.
+        let saved_ticks: Vec<_> = world
+            .saved_fluid_ticks
+            .iter()
+            .filter(|(pos, _)| world.chunks.contains_key(pos))
+            .map(|(&pos, ticks)| (pos, ticks.clone()))
+            .collect();
+        let saved_sand_ticks: Vec<_> = world
+            .saved_block_ticks
+            .iter()
+            .filter(|(pos, _)| world.chunks.contains_key(pos))
+            .map(|(&pos, ticks)| (pos, ticks.clone()))
+            .collect();
         let fluid_chunks_seen = world.chunks.keys().copied().collect();
         let world = Arc::new(world);
         let inventory = Arc::new(PlayerInventory::demo());
@@ -62483,6 +62496,64 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn initial_session_defers_ticks_for_nonresident_chunks_until_streaming() {
+        let (mut source, origin, player) = fixture();
+        let home = *source.chunks.keys().next().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut chunk = (*source.chunks[&home]).clone();
+        chunk.position = neighbor;
+        source.chunks.insert(neighbor, Arc::new(chunk));
+        for pos in [home, neighbor] {
+            source.saved_block_ticks.insert(
+                pos,
+                vec![SavedBlockTick {
+                    block: "minecraft:sand".into(),
+                    position: [pos.x * 16 + 7, 2, pos.z * 16 + 8],
+                    delay: 100,
+                    priority: -1,
+                }],
+            );
+            source.saved_fluid_ticks.insert(
+                pos,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: [pos.x * 16 + 8, 2, pos.z * 16 + 8],
+                    delay: 100,
+                    priority: 1,
+                }],
+            );
+        }
+        let mut initial = source.clone();
+        initial.chunks.remove(&neighbor);
+        let mut session = LoadedSession::new(
+            initial,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert_eq!(session.sand_ticks.len(), 1);
+        assert_eq!(session.fluid_ticks.len(), 1);
+        session.queue_chunk_window(home, 1);
+        session.queue_loaded_chunk(neighbor, source);
+        session.update(TICK);
+        assert_eq!(session.sand_ticks.len(), 2);
+        assert_eq!(session.fluid_ticks.len(), 2);
+        let saved_blocks = session.draft_block_ticks(neighbor).unwrap();
+        let saved_fluids = session.draft_fluid_ticks(neighbor).unwrap();
+        assert_eq!(saved_blocks.len(), 1);
+        assert_eq!(saved_blocks[0].priority, -1);
+        assert_eq!(saved_fluids.len(), 1);
+        assert_eq!(saved_fluids[0].priority, 1);
     }
 
     #[test]

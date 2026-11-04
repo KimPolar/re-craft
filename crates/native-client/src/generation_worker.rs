@@ -255,8 +255,7 @@ impl GenerationReady {
             targets.contains(&player_chunk),
             "generated player is outside light-complete targets"
         );
-        let mut world = (*self.mesh.world).clone();
-        world.chunks.retain(|pos, _| targets.contains(pos));
+        let mut world = generated_session_world(&self.mesh.world, targets);
         ensure!(
             world.chunks.len() == targets.len(),
             "generated session target is missing"
@@ -339,6 +338,30 @@ impl GenerationReady {
         }
         Ok(session)
     }
+}
+
+/// A generated light snapshot includes neighboring chunks. Its transient
+/// session must not import their ticks or block-entity data before streaming.
+fn generated_session_world(
+    source: &native_world::loaded::World,
+    targets: &BTreeSet<ChunkPos>,
+) -> native_world::loaded::World {
+    let mut world = source.clone();
+    world.chunks.retain(|pos, _| targets.contains(pos));
+    world.missing_chunks.retain(|pos| targets.contains(pos));
+    world
+        .saved_block_ticks
+        .retain(|pos, _| targets.contains(pos));
+    world
+        .saved_fluid_ticks
+        .retain(|pos, _| targets.contains(pos));
+    world
+        .saved_block_entities
+        .retain(|pos, _| targets.contains(pos));
+    world
+        .live_block_entities
+        .retain(|pos, _| targets.contains(pos));
+    world
 }
 
 pub enum GenerationResult {
@@ -1311,6 +1334,83 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn generated_session_retains_only_selected_chunk_metadata() {
+        use native_world::loaded::{
+            Chunk, SavedBlockEntities, SavedBlockTick, SavedFluidTick, World,
+        };
+        let home = ChunkPos { x: 0, z: 0 };
+        let neighbor = ChunkPos { x: -1, z: 0 };
+        let mut source = World::new("minecraft:overworld");
+        for pos in [home, neighbor] {
+            source.chunks.insert(
+                pos,
+                Arc::new(Chunk {
+                    position: pos,
+                    status: None,
+                    block_light_correct: false,
+                    sections: BTreeMap::new(),
+                }),
+            );
+            source.saved_block_ticks.insert(
+                pos,
+                vec![SavedBlockTick {
+                    block: "minecraft:sand".into(),
+                    position: [pos.x * 16, 2, 0],
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            source.saved_fluid_ticks.insert(
+                pos,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: [pos.x * 16, 3, 0],
+                    delay: 0,
+                    priority: 0,
+                }],
+            );
+            source
+                .saved_block_entities
+                .insert(pos, SavedBlockEntities::Empty);
+            source
+                .live_block_entities
+                .insert(pos, SavedBlockEntities::Empty);
+            source.missing_chunks.insert(pos);
+        }
+        let world = generated_session_world(&source, &BTreeSet::from([home]));
+        assert_eq!(world.chunks.len(), 1);
+        assert!(Arc::ptr_eq(&world.chunks[&home], &source.chunks[&home]));
+        assert_eq!(
+            world.saved_block_ticks.keys().copied().collect::<Vec<_>>(),
+            vec![home]
+        );
+        assert_eq!(
+            world.saved_fluid_ticks.keys().copied().collect::<Vec<_>>(),
+            vec![home]
+        );
+        assert_eq!(
+            world
+                .saved_block_entities
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![home]
+        );
+        assert_eq!(
+            world
+                .live_block_entities
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![home]
+        );
+        assert_eq!(world.missing_chunks, BTreeSet::from([home]));
+        assert_eq!(source.saved_block_ticks.len(), 2);
+        assert_eq!(source.saved_fluid_ticks.len(), 2);
+        assert_eq!(source.chunks.len(), 2);
+    }
 
     #[test]
     fn resuming_unchanged_spawn_search_avoids_repeating_columns() -> Result<()> {

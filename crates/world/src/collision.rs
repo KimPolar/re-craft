@@ -91,6 +91,7 @@ pub fn button_support_face(state: &BlockState, direction: IVec3) -> Option<bool>
         || id.starts_with("potted_")
         || id == "glass_pane"
         || id == "iron_bars"
+        || matches!(id, "lantern" | "soul_lantern")
         || id.ends_with("_stained_glass_pane")
         || id.ends_with("_fence")
         || id.ends_with("_leaves")
@@ -203,6 +204,61 @@ mod face_tests {
             assert_eq!(shape[0].min, glam::Vec3::ZERO);
             assert_eq!(shape[0].max, glam::Vec3::new(1.0, 7.0 / 16.0, 1.0));
             assert_eq!(block_outline(&state), Some(shape));
+        }
+    }
+
+    #[test]
+    fn lantern_shapes_validate_state_and_follow_hanging_height() {
+        for name in ["minecraft:lantern", "minecraft:soul_lantern"] {
+            for hanging in [false, true] {
+                for waterlogged in [false, true] {
+                    let mut state = BlockState {
+                        name: name.into(),
+                        properties: [
+                            ("hanging".into(), hanging.to_string()),
+                            ("waterlogged".into(), waterlogged.to_string()),
+                        ]
+                        .into(),
+                    };
+                    let dy = if hanging { 1.0 / 16.0 } else { 0.0 };
+                    let expected = vec![
+                        cuboid(
+                            5.0 / 16.0,
+                            dy,
+                            5.0 / 16.0,
+                            11.0 / 16.0,
+                            7.0 / 16.0 + dy,
+                            11.0 / 16.0,
+                        ),
+                        cuboid(
+                            6.0 / 16.0,
+                            7.0 / 16.0 + dy,
+                            6.0 / 16.0,
+                            10.0 / 16.0,
+                            9.0 / 16.0 + dy,
+                            10.0 / 16.0,
+                        ),
+                    ];
+                    assert_eq!(block_shape(&state), Some(expected.clone()));
+                    assert_eq!(block_outline(&state), Some(expected.clone()));
+                    assert_eq!(spawn_collision_shape(&state), Some(expected));
+                    for direction in [
+                        IVec3::X,
+                        IVec3::NEG_X,
+                        IVec3::Y,
+                        IVec3::NEG_Y,
+                        IVec3::Z,
+                        IVec3::NEG_Z,
+                    ] {
+                        assert_eq!(button_support_face(&state, direction), Some(false));
+                    }
+                    state
+                        .properties
+                        .insert("waterlogged".into(), "invalid".into());
+                    assert!(block_shape(&state).is_none());
+                    assert!(block_outline(&state).is_none());
+                }
+            }
         }
     }
 
@@ -401,6 +457,39 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
             return None;
         }
         return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, 7.0 / 16.0, 1.0)]);
+    }
+    if matches!(id, "lantern" | "soul_lantern") {
+        if state.properties.len() != 2
+            || !matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            )
+        {
+            return None;
+        }
+        let dy = match state.properties.get("hanging").map(String::as_str)? {
+            "true" => 1.0 / 16.0,
+            "false" => 0.0,
+            _ => return None,
+        };
+        return Some(vec![
+            cuboid(
+                5.0 / 16.0,
+                dy,
+                5.0 / 16.0,
+                11.0 / 16.0,
+                7.0 / 16.0 + dy,
+                11.0 / 16.0,
+            ),
+            cuboid(
+                6.0 / 16.0,
+                7.0 / 16.0 + dy,
+                6.0 / 16.0,
+                10.0 / 16.0,
+                9.0 / 16.0 + dy,
+                10.0 / 16.0,
+            ),
+        ]);
     }
     if id == "honey_block" {
         return Some(HONEY.to_vec());

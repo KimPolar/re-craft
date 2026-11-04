@@ -44,6 +44,9 @@ public class CollisionOracle {
         ItemStack button = new ItemStack(Items.STONE_BUTTON);
         var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
         var world = (World)((sun.misc.Unsafe)field.get(null)).allocateInstance(World.class);
+        var lantern = net.minecraft.world.level.block.Blocks.LANTERN.defaultBlockState()
+            .setValue(net.minecraft.world.level.block.LanternBlock.HANGING, true)
+            .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         JsonArray all = new JsonArray();
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             JsonObject record = new JsonObject();
@@ -69,6 +72,14 @@ public class CollisionOracle {
             boolean dynamic = state.getBlock().hasDynamicShape();
             record.addProperty("dynamic", dynamic);
             if (!dynamic) {
+                var collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                if (!collision.isEmpty() && !net.minecraft.world.phys.shapes.Shapes.joinIsNotEmpty(
+                    collision, lantern, net.minecraft.world.phys.shapes.BooleanOp.NOT_SAME)) {
+                    boolean sameGrid = true;
+                    for (var axis : Direction.Axis.values())
+                        sameGrid &= collision.getCoords(axis).equals(lantern.getCoords(axis));
+                    record.addProperty("hangingLanternGrid", sameGrid);
+                }
                 {
                     JsonArray sturdy = new JsonArray();
                     for (var direction : new Direction[]{Direction.DOWN,Direction.UP,Direction.NORTH,Direction.SOUTH,Direction.WEST,Direction.EAST})
@@ -76,7 +87,7 @@ public class CollisionOracle {
                     record.add("sturdy", sturdy);
                 }
                 JsonArray boxes = new JsonArray();
-                for (var box : state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()) {
+                for (var box : collision.toAabbs()) {
                     JsonArray coords = new JsonArray();
                     for (double value : new double[] {box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ}) coords.add(value);
                     boxes.add(coords);
@@ -329,6 +340,8 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut lever_states_checked = 0usize;
     let mut single_chest_states_checked = 0usize;
     let mut double_chest_states_checked = 0usize;
+    let mut lantern_states_checked = 0usize;
+    let mut hanging_grid_checked = 0usize;
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
@@ -339,6 +352,10 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut failures = Vec::new();
     for entry in records.as_array().unwrap() {
         let id = entry["id"].as_str().unwrap();
+        if let Some(same) = entry["hangingLanternGrid"].as_bool() {
+            assert!(same, "same-volume block has a different voxel grid: {id}");
+            hanging_grid_checked += 1;
+        }
         if matches!(id, "minecraft:water" | "minecraft:lava") {
             assert_eq!(entry["fallingFree"].as_bool(), Some(true), "{id}");
             assert_eq!(entry["landingReplaceable"].as_bool(), Some(true), "{id}");
@@ -403,6 +420,13 @@ fn implemented_collision_shapes_match_vanilla_states() {
         let Some(actual) = block_shape(&state) else {
             continue;
         };
+        if matches!(id, "minecraft:lantern" | "minecraft:soul_lantern") {
+            assert!(
+                block_outline(&state).is_some(),
+                "missing lantern outline: {state:?}"
+            );
+            lantern_states_checked += 1;
+        }
         if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
             && state
                 .properties
@@ -567,6 +591,14 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert_eq!(
         double_chest_states_checked, 32,
         "double chest states missing from Java oracle"
+    );
+    assert_eq!(
+        lantern_states_checked, 8,
+        "lantern states missing from Java oracle"
+    );
+    assert!(
+        hanging_grid_checked >= 8,
+        "hanging lantern grid was not checked"
     );
     assert!(fire_checked >= 2, "fire states missing from Java oracle");
     assert!(plant_checked >= 3, "plant states missing from Java oracle");

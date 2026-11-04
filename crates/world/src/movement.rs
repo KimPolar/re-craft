@@ -173,6 +173,51 @@ impl CollisionShape {
             cuts.dedup();
             cuts
         });
+        Self::with_axes(boxes, axes)
+    }
+
+    /// Preserve the voxel grid of the 26.3 hanging-lantern shape. Java's
+    /// optimized union retains empty cells that affect clipping when an entity
+    /// already intersects the shape, even though the occupied boxes match.
+    pub fn from_block(cell: IVec3, boxes: &[crate::collision::Aabb]) -> Self {
+        use crate::collision::Aabb;
+        use glam::Vec3;
+        let unit = 1.0 / 16.0;
+        let lower = Aabb {
+            min: Vec3::new(5.0 * unit, unit, 5.0 * unit),
+            max: Vec3::new(11.0 * unit, 8.0 * unit, 11.0 * unit),
+        };
+        let upper = Aabb {
+            min: Vec3::new(6.0 * unit, 8.0 * unit, 6.0 * unit),
+            max: Vec3::new(10.0 * unit, 10.0 * unit, 10.0 * unit),
+        };
+        let origin = cell.as_dvec3();
+        let boxes_world = boxes
+            .iter()
+            .map(|b| BoundingBox {
+                min: origin + b.min.as_dvec3(),
+                max: origin + b.max.as_dvec3(),
+            })
+            .collect();
+        if boxes.len() == 2 && boxes.contains(&lower) && boxes.contains(&upper) {
+            let horizontal = [0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0, 11.0, 12.0, 14.0, 16.0];
+            let vertical = [0.0, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
+            let cuts =
+                |values: &[f64], offset: f64| values.iter().map(|v| offset + v / 16.0).collect();
+            Self::with_axes(
+                boxes_world,
+                [
+                    cuts(&horizontal, origin.x),
+                    cuts(&vertical, origin.y),
+                    cuts(&horizontal, origin.z),
+                ],
+            )
+        } else {
+            Self::new(boxes_world)
+        }
+    }
+
+    fn with_axes(boxes: Vec<BoundingBox>, axes: [Vec<f64>; 3]) -> Self {
         let sizes = std::array::from_fn(|axis| axes[axis].len().saturating_sub(1));
         let mut cells = vec![false; sizes[0] * sizes[1] * sizes[2]];
         for x in 0..sizes[0] {
@@ -367,6 +412,25 @@ mod tests {
             min: min.into(),
             max: max.into(),
         }
+    }
+
+    #[test]
+    fn hanging_lantern_preserves_java_voxel_grid_when_already_intersecting() {
+        let state = crate::loaded::BlockState {
+            name: "minecraft:lantern".into(),
+            properties: [
+                ("hanging".into(), "true".into()),
+                ("waterlogged".into(), "true".into()),
+            ]
+            .into(),
+        };
+        let shape = CollisionShape::from_block(
+            IVec3::new(1, 1, 1),
+            &crate::collision::block_shape(&state).unwrap(),
+        );
+        let player = box_([1.325, 0.0, 1.575], [1.925, 1.8, 2.175]);
+        let actual = resolve_movement(player, DVec3::new(-0.4, 0.2, -0.8), true, 0.6, &[shape]);
+        assert!((actual - DVec3::new(-0.4, 0.2, -0.075)).abs().max_element() < 1.0e-12);
     }
 
     #[test]

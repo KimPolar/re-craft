@@ -248,16 +248,7 @@ pub(super) fn resolve_box<'a>(
                 if local.is_empty() {
                     continue;
                 }
-                let base = cell.as_dvec3();
-                shapes.push(CollisionShape::new(
-                    local
-                        .iter()
-                        .map(|b| BoundingBox {
-                            min: base + b.min.as_dvec3(),
-                            max: base + b.max.as_dvec3(),
-                        })
-                        .collect(),
-                ));
+                shapes.push(CollisionShape::from_block(cell, local));
             }
         }
     }
@@ -267,6 +258,31 @@ pub(super) fn resolve_box<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_collision_preserves_hanging_lantern_voxel_grid() {
+        let state = native_world::loaded::BlockState {
+            name: "minecraft:lantern".into(),
+            properties: [
+                ("hanging".into(), "true".into()),
+                ("waterlogged".into(), "true".into()),
+            ]
+            .into(),
+        };
+        let lantern = native_world::collision::block_shape(&state).unwrap();
+        let player = BoundingBox {
+            min: DVec3::new(1.325, 0.0, 1.575),
+            max: DVec3::new(1.925, 1.8, 2.175),
+        };
+        let actual = resolve_box(player, DVec3::new(-0.4, 0.2, -0.8), true, 0.6, |cell| {
+            if cell == IVec3::new(1, 1, 1) {
+                &lantern
+            } else {
+                &[]
+            }
+        });
+        assert!((actual - DVec3::new(-0.4, 0.2, -0.075)).abs().max_element() < 1.0e-12);
+    }
 
     #[test]
     fn supporting_block_breaks_ties_and_checks_the_previous_footprint_once() {

@@ -302,6 +302,22 @@ fn block_collision_and_step_resolution_match_vanilla_entity() {
             ],
         ),
         state("minecraft:flower_pot", &[]),
+        state(
+            "minecraft:lantern",
+            &[("hanging", "false"), ("waterlogged", "false")],
+        ),
+        state(
+            "minecraft:lantern",
+            &[("hanging", "true"), ("waterlogged", "true")],
+        ),
+        state(
+            "minecraft:soul_lantern",
+            &[("hanging", "false"), ("waterlogged", "true")],
+        ),
+        state(
+            "minecraft:soul_lantern",
+            &[("hanging", "true"), ("waterlogged", "false")],
+        ),
     ];
     for i in 0..8192 {
         let coordinate = |v: u32| f64::from(v % 25) / 8.0 - 1.0;
@@ -342,17 +358,12 @@ fn block_collision_and_step_resolution_match_vanilla_entity() {
                 shapes.push(CollisionShape::new(boxes));
             } else {
                 let state = &block_states[rand() as usize % block_states.len()];
-                let offset = DVec3::new(x, y, z);
-                let boxes = block_shape(state)
-                    .unwrap()
-                    .iter()
-                    .map(|b| BoundingBox {
-                        min: offset + b.min.as_dvec3(),
-                        max: offset + b.max.as_dvec3(),
-                    })
-                    .collect();
+                let boxes = block_shape(state).unwrap();
                 groups.push(json!({"id":state.name,"properties":state.properties,"pos":[x as i32,y as i32,z as i32]}));
-                shapes.push(CollisionShape::new(boxes));
+                shapes.push(CollisionShape::from_block(
+                    glam::IVec3::new(x as i32, y as i32, z as i32),
+                    &boxes,
+                ));
             }
         }
         input.push(json!({"bounds":values(player),"movement":movement.to_array(),"on_ground":on_ground,"step":step,"shapes":groups }));

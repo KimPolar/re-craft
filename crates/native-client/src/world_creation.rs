@@ -1,5 +1,104 @@
 //! Settings edited on the Java Edition create-world screen.
 
+use std::{path::PathBuf, sync::mpsc};
+
+/// A single I/O worker coalesces name changes and rejects obsolete results.
+/// Dropping the sender lets the worker exit without blocking the window.
+pub struct FolderProposalWorker {
+    requests: mpsc::Sender<(u64, String)>,
+    results: mpsc::Receiver<(u64, Result<String, String>)>,
+    requested_name: Option<String>,
+    revision: u64,
+    pending: bool,
+    result: Option<Result<String, String>>,
+}
+
+impl FolderProposalWorker {
+    pub fn new(saves: PathBuf, default_name: String) -> std::io::Result<Self> {
+        Self::spawn(move |name| {
+            native_persistence::world_creation::propose_world_folder(&saves, name, &default_name)
+                .map_err(|error| format!("{error:#}"))
+        })
+    }
+
+    fn spawn(
+        mut propose: impl FnMut(&str) -> Result<String, String> + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (requests, incoming) = mpsc::channel::<(u64, String)>();
+        let (outgoing, results) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("world-folder-proposal".into())
+            .spawn(move || {
+                while let Ok(mut request) = incoming.recv() {
+                    for newer in incoming.try_iter() {
+                        request = newer;
+                    }
+                    let result = propose(&request.1);
+                    if outgoing.send((request.0, result)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            requests,
+            results,
+            requested_name: None,
+            revision: 0,
+            pending: false,
+            result: None,
+        })
+    }
+
+    pub fn request(&mut self, name: &str) {
+        if self.requested_name.as_deref() == Some(name) {
+            return;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.requested_name = Some(name.to_owned());
+        self.result = None;
+        match self.requests.send((self.revision, name.to_owned())) {
+            Ok(()) => self.pending = true,
+            Err(_) => {
+                self.pending = false;
+                self.result = Some(Err("World folder worker stopped".into()));
+            }
+        }
+    }
+
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.results.try_recv() {
+                Ok((revision, result)) if revision == self.revision => {
+                    self.result = Some(result);
+                    self.pending = false;
+                    changed = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.pending {
+                        self.pending = false;
+                        self.result = Some(Err("World folder worker stopped".into()));
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+    pub fn result_for(&self, name: &str) -> Option<&Result<String, String>> {
+        (self.requested_name.as_deref() == Some(name))
+            .then_some(self.result.as_ref())
+            .flatten()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GameMode {
     Survival,
@@ -70,6 +169,56 @@ impl WorldCreationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_worker_coalesces_requests_and_discards_stale_results() {
+        use std::time::{Duration, Instant};
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut calls = 0;
+        let mut worker = FolderProposalWorker::spawn(move |name| {
+            calls += 1;
+            if calls == 1 {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(format!("{name}-{calls}"))
+        })
+        .unwrap();
+        worker.request("A");
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.request("B");
+        worker.request("A");
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.pending() && Instant::now() < deadline {
+            worker.poll();
+            std::thread::yield_now();
+        }
+        assert!(!worker.pending());
+        assert_eq!(worker.result_for("A"), Some(&Ok("A-2".to_owned())));
+        assert_eq!(worker.result_for("B"), None);
+    }
+
+    #[test]
+    fn folder_worker_checks_real_collisions_without_creating_a_world() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("New World")).unwrap();
+        let mut worker =
+            FolderProposalWorker::new(dir.path().to_owned(), "New World".into()).unwrap();
+        worker.request("New World");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.pending() && Instant::now() < deadline {
+            worker.poll();
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            worker.result_for("New World"),
+            Some(&Ok("New World (1)".to_owned()))
+        );
+        assert!(!dir.path().join("New World (1)").exists());
+    }
 
     #[test]
     fn hardcore_overrides_but_does_not_erase_previous_settings() {

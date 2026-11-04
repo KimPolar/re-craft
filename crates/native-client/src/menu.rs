@@ -246,6 +246,7 @@ struct State {
     world_scroll_remainder: f64,
     creation: crate::world_creation::WorldCreationSettings,
     creation_tab: CreationTab,
+    creation_folder: Option<crate::world_creation::FolderProposalWorker>,
     error: Option<String>,
     asset_load: Option<PendingAssetLoad>,
     world_load: Option<PendingWorldLoad>,
@@ -416,6 +417,7 @@ impl State {
             world_scroll_remainder: 0.0,
             creation: crate::world_creation::WorldCreationSettings::new("New World".into()),
             creation_tab: CreationTab::Game,
+            creation_folder: None,
             error: None,
             asset_load: None,
             world_load: None,
@@ -2091,7 +2093,21 @@ impl<'a> Menu<'a> {
                             .to_owned()
                     },
                 );
-                self.state.creation = crate::world_creation::WorldCreationSettings::new(name);
+                self.state.creation =
+                    crate::world_creation::WorldCreationSettings::new(name.clone());
+                match crate::world_creation::FolderProposalWorker::new(
+                    self.state.minecraft_dir.join("saves"),
+                    name,
+                ) {
+                    Ok(mut worker) => {
+                        worker.request(self.state.creation.name.value());
+                        self.state.creation_folder = Some(worker);
+                    }
+                    Err(error) => {
+                        self.state.creation_folder = None;
+                        self.state.error = Some(format!("Cannot check the world folder: {error}"));
+                    }
+                }
                 self.state.creation_tab = CreationTab::Game;
                 self.state.screen = Screen::CreateWorld;
             }
@@ -2340,7 +2356,10 @@ impl<'a> Menu<'a> {
                 self.fov_ui.keyboard_adjust = false;
                 self.state.screen = match self.state.screen {
                     Screen::Worlds | Screen::Options => Screen::Title,
-                    Screen::CreateWorld => Screen::Worlds,
+                    Screen::CreateWorld => {
+                        self.state.creation_folder = None;
+                        Screen::Worlds
+                    }
                     Screen::RecoverWorld => {
                         self.recovery_world = None;
                         self.recovery_return_screen
@@ -3194,6 +3213,38 @@ impl<'a> Menu<'a> {
                 highlighted,
                 &button.label,
             );
+        }
+        if self.state.screen == Screen::CreateWorld
+            && self.state.creation_tab == CreationTab::Game
+            && let (Some(assets), Some(worker)) = (assets, &self.state.creation_folder)
+            && let Some(Ok(folder)) = worker.result_for(self.state.creation.name.value())
+            && self.buttons().iter().any(|button| {
+                button.id == ButtonId::CreationName
+                    && button.rect.contains(self.cursor.0, self.cursor.1)
+            })
+        {
+            use crate::text_component::{Part, Span, Style};
+            let template = assets.translate("selectWorld.targetFolder", "Save folder: %s");
+            let parts = crate::text_component::format_parts(template)
+                .unwrap_or_else(|| vec![Part::Text(template.to_owned())]);
+            let spans = parts
+                .into_iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(Span {
+                        text,
+                        style: Style::default(),
+                    }),
+                    Part::Argument(0) => Some(Span {
+                        text: folder.clone(),
+                        style: Style {
+                            italic: true,
+                            ..Style::default()
+                        },
+                    }),
+                    Part::Argument(_) => None,
+                })
+                .collect();
+            crate::tooltip::draw_item(&mut canvas, assets, self.cursor, &[spans]);
         }
         if self.state.asset_load.is_some() && self.state.screen != Screen::Loading {
             canvas.text_centered(assets, lw / 2, 4, "Loading resources...", [255, 255, 255]);
@@ -4171,6 +4222,14 @@ impl ApplicationHandler for Menu<'_> {
         {
             self.invalidate();
         }
+        if self.state.screen == Screen::CreateWorld
+            && let Some(worker) = &mut self.state.creation_folder
+        {
+            worker.request(self.state.creation.name.value());
+            if worker.poll() {
+                self.invalidate();
+            }
+        }
         self.poll_launch(event_loop);
         self.poll_recovery();
         if self.action.is_some() {
@@ -4199,6 +4258,11 @@ impl ApplicationHandler for Menu<'_> {
             || self.state.asset_load.is_some()
             || self.state.world_load.is_some()
             || self.state.pack_load.is_some()
+            || self
+                .state
+                .creation_folder
+                .as_ref()
+                .is_some_and(|worker| worker.pending())
             || self.pending_launch.is_some()
             || self.pending_recovery.is_some()
         {

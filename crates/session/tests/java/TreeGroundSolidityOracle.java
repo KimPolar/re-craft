@@ -32,6 +32,15 @@ public class TreeGroundSolidityOracle {
         for(var direction:Direction.values()) out.printf(" %s",state.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
         out.println();
       }
+      if(name.equals("small_amethyst_bud") || name.equals("medium_amethyst_bud") || name.equals("large_amethyst_bud") || name.equals("amethyst_cluster")) {
+        for(var variant:state.getBlock().getStateDefinition().getPossibleStates()) {
+          var properties=new java.util.TreeMap<String,String>(); variant.getValues().forEach(v->properties.put(v.property().getName(),v.valueName()));
+          var pairs=new java.util.ArrayList<String>(); properties.forEach((k,v)->pairs.add(k+"="+v));
+          out.printf("A %s %s %s %s %s",name,String.join(",",pairs),variant.isSolidRender(),variant.isSolid(),variant.liquid());
+          for(var direction:Direction.values()) out.printf(" %s",variant.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,direction));
+          out.println();
+        }
+      }
       if(PLANTS.contains(name)) {
         for(var variant:state.getBlock().getStateDefinition().getPossibleStates()){
           if(variant.isSolidRender())throw new AssertionError("plant renders solid: "+variant);

@@ -119,6 +119,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         var w=new StagedGenerationLightEngineOracle();
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true); var unsafe=(sun.misc.Unsafe)field.get(null);
         var engine=new LevelLightEngine(w,true,true);
+        boolean patchFreshWater=args.length>1 && args[1].equals("patch_fresh_clay_water");
+        boolean freshWaterDripleaf=args.length>1 && args[1].equals("column_fresh_water_dripleaf");
+        boolean freshWaterlogDripleaf=args.length>1 && args[1].equals("patch_fresh_waterlog_dripleaf");
+        boolean freshDripleafSequence=args.length>1 && args[1].equals("patch_fresh_dripleaf_sequence");
         boolean oreActive=args.length>1 && args[1].equals("ore_active");
         boolean ore=args.length>1 && (args[1].equals("ore") || oreActive);
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
@@ -182,6 +186,19 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(treeSparse && x==1 && z==0) fake.section.setBlockState(w.sparseColumn || skyShadow?0:15,skyShadow?11:0,w.sparseColumn || skyShadow?8:0,Blocks.STONE.defaultBlockState());
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
             if(x==1 && z==0 && !blockCase && !magma && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && patchFreshWater) {
+                fake.section.setBlockState(0,10,8,Blocks.CLAY.defaultBlockState());
+                w.edits.put(new BlockPos(16,10,8),Blocks.CLAY.defaultBlockState());
+            }
+            if(x==1 && z==0 && (freshWaterDripleaf || freshDripleafSequence)) {
+                fake.section.setBlockState(0,10,8,Blocks.WATER.defaultBlockState());
+                w.edits.put(new BlockPos(16,10,8),Blocks.WATER.defaultBlockState());
+            }
+            if(x==1 && z==0 && freshWaterlogDripleaf) {
+                var initial=Blocks.BIG_DRIPLEAF.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,net.minecraft.core.Direction.NORTH).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,false);
+                fake.section.setBlockState(0,10,8,initial);
+                w.edits.put(new BlockPos(16,10,8),initial);
+            }
             if(blockCase && x==0 && z==0){ fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState()); fake.section.setBlockState(14,10,8,Blocks.TORCH.defaultBlockState()); }
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
@@ -198,16 +215,24 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
-        if(args.length>1 && args[1].startsWith("tree_fresh_")){
+        if(args.length>1 && (args[1].startsWith("tree_fresh_") || patchFreshWater || freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence)){
             var before=new JsonArray(); before.add(capture(engine,0)); before.add(capture(engine,1)); stages.add(before);
-            var state=(args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=(freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence) ? Blocks.BIG_DRIPLEAF.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,net.minecraft.core.Direction.NORTH).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,freshWaterlogDripleaf) : patchFreshWater ? Blocks.WATER.defaultBlockState() : (args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             var pos=new BlockPos(16,10,8);
             boolean wasEmpty=eastSection.section.hasOnlyAir();
             var old=eastSection.section.setBlockState(0,10,8,state); w.edits.put(pos,state);
             if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
             w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,10,8);
             if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing tree light check");
-            engine.checkBlock(pos); drain(engine);
+            engine.checkBlock(pos);
+            if(freshDripleafSequence) {
+                var wet=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true);
+                var intermediate=eastSection.section.setBlockState(0,10,8,wet); w.edits.put(pos,wet);
+                w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,10,8);
+                if(!LightEngine.hasDifferentLightProperties(intermediate,wet))throw new AssertionError("missing waterlog light check");
+                engine.checkBlock(pos);
+            }
+            drain(engine);
             var checked=new JsonArray(); checked.add(capture(engine,0)); checked.add(capture(engine,1)); stages.add(checked);
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
             var active=new JsonArray(); active.add(capture(engine,0)); active.add(capture(engine,1)); stages.add(active);

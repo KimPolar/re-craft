@@ -75,6 +75,7 @@ pub struct DecorationRegion<'a> {
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
     column_block_write: bool,
+    patch_block_write: bool,
     failed: bool,
 }
 
@@ -1671,6 +1672,7 @@ impl CarvedTerrainWorld {
             light_guard: None,
             tree_block_write: false,
             column_block_write: false,
+            patch_block_write: false,
             failed: false,
         })
     }
@@ -2424,9 +2426,26 @@ fn geode_full_cube(state: &BlockState) -> Result<bool> {
     Ok(false)
 }
 
+fn geode_crystal(state: &BlockState) -> Result<bool> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:small_amethyst_bud"
+            | "minecraft:medium_amethyst_bud"
+            | "minecraft:large_amethyst_bud"
+            | "minecraft:amethyst_cluster"
+    ) {
+        geode_safe_state(state)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
     if geode_full_cube(state)? {
         return Ok(true);
+    }
+    if geode_crystal(state)? {
+        return Ok(false);
     }
     if tree_generated_log(state) {
         return Ok(true);
@@ -2455,6 +2474,9 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
     if geode_full_cube(state)? {
         return Ok(true);
+    }
+    if geode_crystal(state)? {
+        return Ok(false);
     }
     if tree_generated_log(state) {
         return Ok(true);
@@ -2819,7 +2841,10 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
                     || generated_dripleaf(&old)?,
                 "unsupported vegetation patch source effects"
             );
-            self.set_section_block(pos, state)?;
+            self.patch_block_write = true;
+            let write = self.set_section_block(pos, state);
+            self.patch_block_write = false;
+            write?;
             self.update_final_heightmaps(pos, state)?;
             Ok(())
         })();
@@ -4380,7 +4405,8 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
-        if tree_generated_leaf(state)?
+        if geode_crystal(state)?
+            || tree_generated_leaf(state)?
             || tree_generated_log(state)
             || tree_mushroom_block(state)?
             || generated_ore_state(state)?
@@ -4401,6 +4427,9 @@ impl DiskWorld for DecorationRegion<'_> {
     fn is_liquid(&mut self, state: &BlockState) -> Result<bool> {
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             return Ok(true);
+        }
+        if geode_crystal(state)? {
+            return Ok(false);
         }
         ensure!(
             disk_safe_solid(&state.name).is_some()
@@ -5232,6 +5261,33 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && tree_generated_leaf(state)?)
                             || (state.name == "minecraft:dark_oak_log"
                                 && tree_generated_log(state)));
+                    let fresh_patch_water = !guard.require_unchanged_light
+                        && self.patch_block_write
+                        && old.name == "minecraft:clay"
+                        && old.properties.is_empty()
+                        && state.name == "minecraft:water"
+                        && state.properties.len() == 1
+                        && state.properties.get("level").map(String::as_str) == Some("0");
+                    let fresh_water_dripleaf = !guard.require_unchanged_light
+                        && self.column_block_write
+                        && old.name == "minecraft:water"
+                        && old.properties.len() == 1
+                        && old.properties.get("level").map(String::as_str) == Some("0")
+                        && state.name == "minecraft:big_dripleaf"
+                        && generated_dripleaf(state)?
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+                        && state.properties.get("tilt").map(String::as_str) == Some("none");
+                    let fresh_waterlog_dripleaf = !guard.require_unchanged_light
+                        && self.patch_block_write
+                        && old.name == "minecraft:big_dripleaf"
+                        && state.name == old.name
+                        && generated_dripleaf(&old)?
+                        && generated_dripleaf(state)?
+                        && old.properties.get("waterlogged").map(String::as_str) == Some("false")
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                        && old.properties.get("tilt").map(String::as_str) == Some("none")
+                        && old.properties.get("tilt") == state.properties.get("tilt")
+                        && old.properties.get("facing") == state.properties.get("facing");
                     let vine_write = guard.require_unchanged_light
                         && self.column_block_write
                         && tree_cave_vines(state)?
@@ -5258,6 +5314,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // allocation, the checked stored light remains zero.
                     ensure!(
                         tree_light_update
+                            || fresh_patch_water
+                            || fresh_water_dripleaf
+                            || fresh_waterlog_dripleaf
                             || vine_write
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
@@ -5306,7 +5365,13 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             guard.new_nonempty_sections.push((key.0, i32::from(key.1)));
                         }
                     }
-                    if tree_light_update || vine_check || new_section {
+                    if tree_light_update
+                        || fresh_patch_water
+                        || fresh_water_dripleaf
+                        || fresh_waterlog_dripleaf
+                        || vine_check
+                        || new_section
+                    {
                         let guard = self.light_guard.as_mut().unwrap();
                         guard.light_replay_positions.insert(p);
                         if vine_write {
@@ -5516,6 +5581,10 @@ mod tests {
             "smooth_basalt",
             "amethyst_block",
             "budding_amethyst",
+            "small_amethyst_bud",
+            "medium_amethyst_bud",
+            "large_amethyst_bud",
+            "amethyst_cluster",
             "blackstone",
             "ancient_debris",
             "dirt",
@@ -5680,6 +5749,18 @@ mod tests {
         assert_eq!(actual.len(), names.len());
         for (line, name) in actual.iter().zip(names) {
             let mut block = state(name);
+            if matches!(
+                name,
+                "small_amethyst_bud"
+                    | "medium_amethyst_bud"
+                    | "large_amethyst_bud"
+                    | "amethyst_cluster"
+            ) {
+                block.properties = BTreeMap::from([
+                    ("facing".into(), "up".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             if name == "oak_log" {
                 block.properties.insert("axis".into(), "y".into());
             }
@@ -5790,6 +5871,41 @@ mod tests {
                 }
             }
         }
+        let mut crystals = 0;
+        for line in text.lines().filter_map(|line| line.strip_prefix("A ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            let mut block = state(parts[0]);
+            for property in parts[1].split(',') {
+                let (key, value) = property.split_once('=').unwrap();
+                block.properties.insert(key.into(), value.into());
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                parts[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert!(parts[3].parse::<bool>().unwrap(), "{line}");
+            assert!(!parts[4].parse::<bool>().unwrap(), "{line}");
+            for (direction, expected) in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ]
+            .into_iter()
+            .zip(parts[5..].iter())
+            {
+                assert_eq!(
+                    generation_face_sturdy(&block, direction).unwrap(),
+                    expected.parse::<bool>().unwrap(),
+                    "{line}"
+                );
+            }
+            crystals += 1;
+        }
+        assert_eq!(crystals, 48);
         for name in [
             "oak_leaves",
             "dark_oak_leaves",
@@ -6731,6 +6847,10 @@ mod tests {
             "tree_fresh_log",
             "tree_fresh_leaf",
             "tree_fresh_empty",
+            "patch_fresh_clay_water",
+            "column_fresh_water_dripleaf",
+            "patch_fresh_waterlog_dripleaf",
+            "patch_fresh_dripleaf_sequence",
             "log_active_sparse_column",
             "leaf_active",
             "leaf_active_full",
@@ -6804,6 +6924,26 @@ mod tests {
                 let torch = world.intern_state(state("torch"));
                 world.set_block_id(17, 10, 8, torch).unwrap();
             }
+            if mode == "patch_fresh_clay_water" {
+                let clay = world.intern_state(state("clay"));
+                world.set_block_id(16, 10, 8, clay).unwrap();
+            }
+            if mode == "column_fresh_water_dripleaf" || mode == "patch_fresh_dripleaf_sequence" {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let water = world.intern_state(water);
+                world.set_block_id(16, 10, 8, water).unwrap();
+            }
+            if mode == "patch_fresh_waterlog_dripleaf" {
+                let mut dripleaf = state("big_dripleaf");
+                dripleaf.properties = BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("tilt".into(), "none".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+                let dripleaf = world.intern_state(dripleaf);
+                world.set_block_id(16, 10, 8, dripleaf).unwrap();
+            }
             let registered: Vec<_> = if mode != "leaf_active" {
                 (-1..=1)
                     .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
@@ -6856,17 +6996,45 @@ mod tests {
             for &pos in &registered {
                 tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
             }
-            if mode.starts_with("tree_fresh_") {
+            if mode.starts_with("tree_fresh_")
+                || mode == "patch_fresh_clay_water"
+                || mode == "column_fresh_water_dripleaf"
+                || mode == "patch_fresh_waterlog_dripleaf"
+                || mode == "patch_fresh_dripleaf_sequence"
+            {
                 let expected: Vec<Vec<Vec<Vec<u8>>>> = serde_json::from_value(expected).unwrap();
                 let before = tracker
                     .snapshot(&terrain, [center, east], &registry)
                     .unwrap();
-                let mut block = state(if mode.ends_with("log") || mode.ends_with("empty") {
-                    "dark_oak_log"
-                } else {
-                    "dark_oak_leaves"
-                });
-                block.properties = if mode.ends_with("log") || mode.ends_with("empty") {
+                let mut block = state(
+                    if mode == "column_fresh_water_dripleaf"
+                        || mode == "patch_fresh_waterlog_dripleaf"
+                        || mode == "patch_fresh_dripleaf_sequence"
+                    {
+                        "big_dripleaf"
+                    } else if mode == "patch_fresh_clay_water" {
+                        "water"
+                    } else if mode.ends_with("log") || mode.ends_with("empty") {
+                        "dark_oak_log"
+                    } else {
+                        "dark_oak_leaves"
+                    },
+                );
+                block.properties = if mode == "column_fresh_water_dripleaf"
+                    || mode == "patch_fresh_waterlog_dripleaf"
+                    || mode == "patch_fresh_dripleaf_sequence"
+                {
+                    BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        ("tilt".into(), "none".into()),
+                        (
+                            "waterlogged".into(),
+                            (mode == "patch_fresh_waterlog_dripleaf").to_string(),
+                        ),
+                    ])
+                } else if mode == "patch_fresh_clay_water" {
+                    BTreeMap::from([("level".into(), "0".into())])
+                } else if mode.ends_with("log") || mode.ends_with("empty") {
                     BTreeMap::from([("axis".into(), "y".into())])
                 } else {
                     BTreeMap::from([
@@ -6890,7 +7058,20 @@ mod tests {
                     new_nonempty_sections: Vec::new(),
                     non_air_counts: BTreeMap::new(),
                 });
-                draft.set_tree_block([16, 10, 8], &block, 19).unwrap();
+                if mode == "column_fresh_water_dripleaf" || mode == "patch_fresh_dripleaf_sequence"
+                {
+                    assert!(draft.set_column_block([16, 10, 8], &block).unwrap());
+                    if mode == "patch_fresh_dripleaf_sequence" {
+                        block.properties.insert("waterlogged".into(), "true".into());
+                        draft.set_patch_block([16, 10, 8], &block).unwrap();
+                    }
+                } else if mode == "patch_fresh_clay_water"
+                    || mode == "patch_fresh_waterlog_dripleaf"
+                {
+                    draft.set_patch_block([16, 10, 8], &block).unwrap();
+                } else {
+                    draft.set_tree_block([16, 10, 8], &block, 19).unwrap();
+                }
                 let mut tracking = Some(DecorationLightTracking::Fresh(&mut tracker, &registry));
                 finish_decoration_with_light(draft, &mut tracking).unwrap();
                 drop(tracking);

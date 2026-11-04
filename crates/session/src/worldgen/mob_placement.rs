@@ -301,6 +301,52 @@ impl GeneratedCreatureProbe {
         Ok(())
     }
 
+    /// Finalize a constructed sheep and record its serialized traversal.
+    /// `position` must be the entity's actual block position; `serialize` must
+    /// serialize the real constructed entity after applying the supplied
+    /// initialization. It must not commit external side effects. On error,
+    /// this probe, the batch, planner, region RNG and group remain unchanged.
+    pub fn finalize_sheep_and_record(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        batch: &mut FreshTerrainBatch,
+        position: [i32; 3],
+        tags: &native_resources::worldgen_region_random::SheepBiomeTags,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        has_follow_range_bonus: bool,
+        serialize: impl FnOnce(
+            native_resources::worldgen_region_random::SheepInitialization,
+        ) -> Result<Vec<super::GeneratedEntityAddition>>,
+    ) -> Result<native_resources::worldgen_region_random::SheepInitialization> {
+        ensure!(
+            self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "sheep",
+            "pending creature is not a sheep"
+        );
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "sheep is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed sheep is no longer pending"
+        );
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let initialization = batch.initialize_sheep(
+            position,
+            tags,
+            &mut next_random,
+            &mut next_group,
+            has_follow_range_bonus,
+        )?;
+        let additions = serialize(initialization)?;
+        self.record_finalized(planner, batch, additions)?;
+        *random = next_random;
+        *group = next_group;
+        Ok(initialization)
+    }
+
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
     /// advancing the planner. The caller still checks collision and mob rules.

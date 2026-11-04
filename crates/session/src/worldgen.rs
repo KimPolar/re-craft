@@ -3767,7 +3767,7 @@ mod tests {
         }
         let mut mob_spawns = native_resources::mob_spawns::CreatureSpawns::default();
         let attributes = json!({"gameplay/natural_mob_spawns":{
-            "spawns_by_category":{"creature":[{"type":"minecraft:pig","count":2,"weight":1}]},
+            "spawns_by_category":{"creature":[{"type":"minecraft:sheep","count":2,"weight":1}]},
             "spawn_costs":{}
         }});
         mob_spawns.apply(
@@ -4003,7 +4003,7 @@ mod tests {
                     .check_instance_rules(&mut bright_planner, &mut view)
                     .is_err()
             );
-            // The harness's constructed pig has the verified unscaled box;
+            // The harness's constructed sheep has the verified unscaled box;
             // spawn_scale for this type is 1.0.
             let entity_bounds = native_world::movement::BoundingBox {
                 min: glam::DVec3::from_array(geometry.min),
@@ -4131,19 +4131,86 @@ mod tests {
             assert_eq!(bright_planner.created_attempt(), Some(attempt));
             let mut expected_planner = bright_planner.clone();
             expected_planner.finish_entity(true).unwrap();
-            bright
-                .record_finalized(
+            let mut transaction_random = random.clone();
+            let mut transaction_group = group;
+            let mut expected_random = transaction_random.clone();
+            let mut expected_group = transaction_group;
+            assert!(
+                bright
+                    .finalize_sheep_and_record(
+                        &mut bright_planner,
+                        &mut batch,
+                        position,
+                        &tags,
+                        &mut transaction_random,
+                        &mut transaction_group,
+                        false,
+                        |_| anyhow::bail!("serialization failed"),
+                    )
+                    .is_err()
+            );
+            assert!(
+                bright
+                    .finalize_sheep_and_record(
+                        &mut bright_planner,
+                        &mut batch,
+                        position,
+                        &tags,
+                        &mut transaction_random,
+                        &mut transaction_group,
+                        false,
+                        |_| Ok(vec![
+                            saved(),
+                            GeneratedEntityAddition {
+                                block_position: [1_000_000, 0, 0],
+                                record: GeneratedEntityRecord::Passenger,
+                            }
+                        ]),
+                    )
+                    .is_err()
+            );
+            assert!(
+                batch
+                    .recorded_generated_entities(center)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(transaction_group, expected_group);
+            assert_eq!(
+                transaction_random.clone().next_long(),
+                expected_random.clone().next_long()
+            );
+            let expected = native_resources::worldgen_region_random::finalize_sheep(
+                &mut expected_random,
+                &mut expected_group,
+                false,
+                true,
+                false,
+            );
+            let initialized = bright
+                .finalize_sheep_and_record(
                     &mut bright_planner,
                     &mut batch,
-                    vec![
-                        saved(),
-                        GeneratedEntityAddition {
-                            block_position: position,
-                            record: GeneratedEntityRecord::Passenger,
-                        },
-                    ],
+                    position,
+                    &tags,
+                    &mut transaction_random,
+                    &mut transaction_group,
+                    false,
+                    |actual| {
+                        assert_eq!(actual, expected);
+                        Ok(vec![
+                            saved(),
+                            GeneratedEntityAddition {
+                                block_position: position,
+                                record: GeneratedEntityRecord::Passenger,
+                            },
+                        ])
+                    },
                 )
                 .unwrap();
+            assert_eq!(initialized, expected);
+            assert_eq!(transaction_group, expected_group);
+            assert_eq!(transaction_random.next_long(), expected_random.next_long());
             assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
             assert_eq!(
                 bright_planner.next(0).unwrap(),

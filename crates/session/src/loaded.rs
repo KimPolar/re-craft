@@ -840,6 +840,7 @@ pub struct LoadedSession {
     leaf_deferred_revision: Option<u64>,
     leaf_pending: BTreeSet<LeafTickKey>,
     unresolved_leaf_shape: bool,
+    unresolved_leaf_decay: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -1018,6 +1019,11 @@ fn leaf_state_distance(state: &BlockState) -> Option<u8> {
     raw.parse::<u8>()
         .ok()
         .filter(|distance| (1..=7).contains(distance) && distance.to_string() == *raw)
+}
+
+fn leaf_randomly_ticks(state: &BlockState) -> bool {
+    leaf_state_distance(state) == Some(7)
+        && state.properties.get("persistent").map(String::as_str) == Some("false")
 }
 
 type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), ButtonTickKey>;
@@ -1435,6 +1441,7 @@ struct RandomTickCounts {
     snow: Arc<[usize]>,
     farmland: Arc<[usize]>,
     has_farmland: bool,
+    leaves: Arc<[usize]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4060,6 +4067,10 @@ impl LoadedSession {
         anyhow::ensure!(
             !self.unresolved_leaf_shape,
             "leaf shape updates are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
+            !self.unresolved_leaf_decay,
+            "a leaf decay could not be resolved for saving"
         );
         anyhow::ensure!(
             !self.unresolved_player_damage,
@@ -6879,6 +6890,7 @@ impl LoadedSession {
             leaf_deferred_revision: None,
             leaf_pending: BTreeSet::new(),
             unresolved_leaf_shape: false,
+            unresolved_leaf_decay: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -9655,6 +9667,10 @@ impl LoadedSession {
         ensure!(
             !self.unresolved_leaf_shape,
             "leaf shape updates are not yet fully tracked for saving"
+        );
+        ensure!(
+            !self.unresolved_leaf_decay,
+            "a leaf decay could not be resolved for saving"
         );
         ensure!(
             self.commands.is_empty(),
@@ -13380,6 +13396,8 @@ impl LoadedSession {
                     3
                 } else if farmland_moisture(state) == Some(7) {
                     4
+                } else if leaf_randomly_ticks(state) {
+                    5
                 } else {
                     0
                 }
@@ -13410,6 +13428,7 @@ impl LoadedSession {
                 let mut active = RandomTickCounts::default();
                 let mut snow = Vec::new();
                 let mut farmland = Vec::new();
+                let mut leaves = Vec::new();
                 if let Some(blocks) = &section.blocks {
                     for (index, id) in blocks.iter().enumerate() {
                         match kinds.get(id.0 as usize) {
@@ -13419,26 +13438,31 @@ impl LoadedSession {
                                 active.has_farmland = true;
                                 farmland.push(index);
                             }
+                            Some(5) => leaves.push(index),
                             _ => {}
                         }
                     }
                 }
                 active.snow = snow.into();
                 active.farmland = farmland.into();
+                active.leaves = leaves.into();
                 self.random_tick_sections
                     .insert(key, (Arc::downgrade(section), active));
             }
         }
         self.random_tick_sections
             .retain(|key, _| present.contains(key));
-        self.active_random_tick_sections =
-            self.random_tick_sections
-                .iter()
-                .filter_map(|(&(chunk, section), (_, active))| {
-                    (active.lit_ores > 0 || !active.snow.is_empty() || active.has_farmland)
-                        .then_some((chunk, section, active.clone()))
-                })
-                .collect();
+        self.active_random_tick_sections = self
+            .random_tick_sections
+            .iter()
+            .filter_map(|(&(chunk, section), (_, active))| {
+                (active.lit_ores > 0
+                    || !active.snow.is_empty()
+                    || active.has_farmland
+                    || !active.leaves.is_empty())
+                .then_some((chunk, section, active.clone()))
+            })
+            .collect();
         self.random_tick_revision = Some(self.revision);
     }
 
@@ -13462,8 +13486,15 @@ impl LoadedSession {
             let mut farmland_active = !active.farmland.is_empty()
                 && (self.random_tick_speed <= 64
                     || self.farmland_can_change_in_section(chunk, section, &active.farmland));
+            let mut leaves_active = !active.leaves.is_empty();
+            if leaves_active && self.random_tick_speed > 64 {
+                leaves_active = self.leaf_can_decay_in_section(chunk, section, &active.leaves);
+                if !leaves_active {
+                    self.unresolved_leaf_decay = true;
+                }
+            }
             for index in 0..self.random_tick_speed {
-                if active.lit_ores == 0 && !snow_active && !farmland_active {
+                if active.lit_ores == 0 && !snow_active && !farmland_active && !leaves_active {
                     self.random_block_position
                         .skip(self.random_tick_speed - index);
                     break;
@@ -13490,15 +13521,118 @@ impl LoadedSession {
                                 &active.farmland,
                             );
                         true
+                    } else if let Some(decayed) = self.random_tick_leaf_at(relative) {
+                        if self.random_tick_speed > 64 {
+                            leaves_active =
+                                self.leaf_can_decay_in_section(chunk, section, &active.leaves);
+                        }
+                        decayed
                     } else {
                         false
                     };
                     if changed {
                         snow_active = self.snow_can_melt_in_section(chunk, section, &active.snow);
+                        if self.random_tick_speed > 64
+                            && !leaves_active
+                            && !active.leaves.is_empty()
+                        {
+                            leaves_active =
+                                self.leaf_can_decay_in_section(chunk, section, &active.leaves);
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn leaf_decay_replacement(&mut self, state: &BlockState) -> BlockStateId {
+        if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
+            self.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            })
+        } else {
+            self.states[0]
+        }
+    }
+
+    fn leaf_can_decay_in_section(
+        &mut self,
+        chunk: ChunkPos,
+        section: i8,
+        leaves: &[usize],
+    ) -> bool {
+        let Some(x) = chunk.x.checked_mul(16) else {
+            return false;
+        };
+        let Some(z) = chunk.z.checked_mul(16) else {
+            return false;
+        };
+        for &index in leaves {
+            let absolute = IVec3::new(
+                x + (index % 16) as i32,
+                i32::from(section) * 16 + (index / 256) as i32,
+                z + ((index / 16) % 16) as i32,
+            );
+            let Some(relative) = subtract(absolute, self.origin) else {
+                continue;
+            };
+            let Some(state) = self
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .cloned()
+            else {
+                continue;
+            };
+            if !leaf_randomly_ticks(&state) {
+                continue;
+            }
+            let replacement = self.leaf_decay_replacement(&state);
+            if self
+                .check_block_set(relative, replacement, true, false)
+                .is_none()
+            {
+                continue;
+            }
+            if let Ok((_, checkpoint)) = self.stage_block_loot_without_entity(&state) {
+                self.rollback_block_loot(checkpoint);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns `None` when the sampled block is not a decaying leaf.
+    fn random_tick_leaf_at(&mut self, relative: IVec3) -> Option<bool> {
+        let absolute = add(self.origin, relative)?;
+        let state = self
+            .world
+            .block(absolute.x, absolute.y, absolute.z)?
+            .clone();
+        if !leaf_randomly_ticks(&state) {
+            return None;
+        }
+        let replacement = self.leaf_decay_replacement(&state);
+        let Some(checked) = self.check_block_set(relative, replacement, true, false) else {
+            self.unresolved_leaf_decay = true;
+            return Some(false);
+        };
+        let Ok((drops, _)) = self.stage_block_loot_without_entity(&state) else {
+            self.unresolved_leaf_decay = true;
+            return Some(false);
+        };
+        // Java drops resources before removing the leaf and notifying neighbors.
+        self.dropped_items.drop_block_resources(
+            absolute,
+            drops,
+            None,
+            self.block_drops,
+            &mut self.level_random,
+        );
+        assert!(self.apply_block_set(relative, replacement, true, checked));
+        Some(true)
     }
 
     fn farmland_action(&self, relative: IVec3) -> Option<crate::farmland::RandomTick> {
@@ -23384,6 +23518,335 @@ pub(crate) mod tests {
                 ("waterlogged", if wet { "true" } else { "false" }),
             ],
         )
+    }
+
+    fn test_leaf_loot() -> Arc<BlockLootTables> {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path.starts_with("data/minecraft/loot_table/blocks/") && path.ends_with("_leaves.json"))
+                    .then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#.to_vec()))
+            }
+        }
+        Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    #[test]
+    fn leaf_random_tick_respects_persistence_distance_water_and_drop_rule() {
+        let loot = test_leaf_loot();
+        for name in LeafKind::ALL {
+            for distance in [1, 6, 7] {
+                for persistent in [false, true] {
+                    for wet in [false, true] {
+                        for drops in [false, true] {
+                            let mut session = session();
+                            session.set_block_loot(Arc::clone(&loot));
+                            session.set_leaf_support_tags(test_leaf_tags());
+                            session.set_block_drops(drops);
+                            let mut state = test_leaf_state(name, distance, wet);
+                            state
+                                .properties
+                                .insert("persistent".into(), persistent.to_string());
+                            let pos = IVec3::new(8, 8, 8);
+                            let id = session.intern_block(state);
+                            assert!(session.set(pos, id));
+                            let should_decay = distance == 7 && !persistent;
+                            assert_eq!(
+                                session.random_tick_leaf_at(pos),
+                                should_decay.then_some(true)
+                            );
+                            let absolute = session.origin + pos;
+                            let current = session
+                                .world
+                                .block(absolute.x, absolute.y, absolute.z)
+                                .unwrap();
+                            assert_eq!(
+                                current.name,
+                                if should_decay {
+                                    if wet {
+                                        "minecraft:water"
+                                    } else {
+                                        "minecraft:air"
+                                    }
+                                } else {
+                                    name
+                                }
+                            );
+                            if should_decay && wet {
+                                assert_eq!(
+                                    current.properties.get("level").map(String::as_str),
+                                    Some("0")
+                                );
+                            }
+                            assert_eq!(
+                                session.dropped_items.snapshot().len(),
+                                usize::from(should_decay && drops)
+                            );
+                            assert!(!session.unresolved_leaf_decay);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_random_tick_uses_section_sampling_and_skips_after_decay() {
+        let seed = (0..10000)
+            .find(|&seed| {
+                let [x, y, z] =
+                    native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+                (4..=11).contains(&x) && (2..=13).contains(&y) && (4..=11).contains(&z)
+            })
+            .unwrap();
+        let pos = IVec3::from_array(
+            native_core::random::BlockRandomPosition::new(seed).next_section_offset(),
+        );
+        let mut session = session();
+        session.set_block_loot(test_leaf_loot());
+        session.set_leaf_support_tags(test_leaf_tags());
+        let leaf = session.intern_block(test_leaf_state("minecraft:oak_leaves", 7, false));
+        assert!(session.set(pos, leaf));
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(i32::MAX as u32);
+        let mut expected = native_core::random::BlockRandomPosition::new(seed);
+        expected.skip(i32::MAX as u32);
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected.next_section_offset()
+        );
+        let absolute = session.origin + pos;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(session.dropped_items.snapshot().len(), 1);
+        assert!(!session.unresolved_leaf_decay);
+    }
+
+    #[test]
+    fn leaf_random_tick_without_loot_preserves_block_and_rejects_saving() {
+        let mut session = session();
+        let pos = IVec3::new(8, 8, 8);
+        let leaf = session.intern_block(test_leaf_state("minecraft:oak_leaves", 7, true));
+        assert!(session.set(pos, leaf));
+        let before = session.level_random.clone().next_int();
+        assert_eq!(session.random_tick_leaf_at(pos), Some(false));
+        let absolute = session.origin + pos;
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:oak_leaves"
+        );
+        assert_eq!(session.level_random.clone().next_int(), before);
+        assert!(session.unresolved_leaf_decay);
+        let home = *session.world.chunks.keys().next().unwrap();
+        assert!(session.draft_block_ticks(home).is_err());
+
+        let mut high_speed = self::session();
+        let leaf = high_speed.intern_block(test_leaf_state("minecraft:oak_leaves", 7, false));
+        assert!(high_speed.set(pos, leaf));
+        high_speed.set_random_tick_speed(i32::MAX as u32);
+        let mut expected = high_speed.random_block_position;
+        expected.skip(i32::MAX as u32);
+        high_speed.advance_random_block_ticks();
+        assert_eq!(
+            high_speed.random_block_position.next_section_offset(),
+            expected.next_section_offset()
+        );
+        assert!(high_speed.unresolved_leaf_decay);
+        let absolute = high_speed.origin + pos;
+        assert_eq!(
+            high_speed
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:oak_leaves"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn leaf_decay_loot_matches_java_26_3() {
+        use native_resources::packs::{ResourceProvider, ResourceStack};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(metadata["id"], "26.3");
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LeafDecayLootOracle.java");
+        let output = temp.path().join("loot.json");
+        let state_output = temp.path().join("states.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/LeafDecayLootOracle.java"),
+        )
+        .unwrap();
+        let mut resources = ResourceStack::open(&game).unwrap();
+        let paths: Vec<_> = [
+            "data/minecraft/predicate/tool/can_shear.json".to_owned(),
+            "data/minecraft/predicate/tool/can_silk_touch.json".to_owned(),
+        ]
+        .into_iter()
+        .chain(LeafKind::ALL.into_iter().map(|name| {
+            format!(
+                "data/minecraft/loot_table/blocks/{}.json",
+                name.strip_prefix("minecraft:").unwrap()
+            )
+        }))
+        .enumerate()
+        .map(|(index, path)| {
+            let file = temp.path().join(format!("input_{index}.json"));
+            std::fs::write(&file, resources.read_builtin_data(&path).unwrap().unwrap()).unwrap();
+            file
+        })
+        .collect();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("LeafDecayLootOracle")
+            .args(&paths)
+            .arg(&output)
+            .arg(&state_output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let states: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(state_output).unwrap()).unwrap();
+        assert_eq!(states.len(), 11 * 7 * 2 * 2);
+        let mut state_session = session();
+        for row in states {
+            let mut state = test_leaf_state(
+                row["name"].as_str().unwrap(),
+                row["distance"].as_u64().unwrap() as u8,
+                row["wet"].as_bool().unwrap(),
+            );
+            state.properties.insert(
+                "persistent".into(),
+                row["persistent"].as_bool().unwrap().to_string(),
+            );
+            assert_eq!(
+                leaf_randomly_ticks(&state),
+                row["ticks"].as_bool().unwrap(),
+                "{state:?}"
+            );
+            let replacement = state_session.leaf_decay_replacement(&state);
+            assert_eq!(
+                state_session.world.state(replacement).unwrap().name,
+                row["replacement"].as_str().unwrap(),
+                "{state:?}"
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 11 * 5 * 16);
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for group in rows.chunks_exact(16) {
+            let name = group[0]["name"].as_str().unwrap();
+            let seed = group[0]["seed"].as_i64().unwrap();
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session.set_leaf_support_tags(test_leaf_tags());
+            session
+                .set_random_sequences(
+                    seed,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            let leaf =
+                session.intern_block(test_leaf_state(&format!("minecraft:{name}"), 7, false));
+            let pos = IVec3::new(8, 8, 8);
+            let absolute = session.origin + pos;
+            let sequence = format!("minecraft:blocks/{name}");
+            for (step, row) in group.iter().enumerate() {
+                let enabled = step % 2 == 0;
+                session.set_block_drops(enabled);
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(absolute.x, absolute.y, absolute.z, leaf)
+                    .unwrap();
+                let existing = session.dropped_items.snapshot().len();
+                assert_eq!(
+                    session.random_tick_leaf_at(pos),
+                    Some(true),
+                    "{name} {seed} {step}"
+                );
+                let items = session.dropped_items.snapshot();
+                let actual: Vec<_> = items[existing..]
+                    .iter()
+                    .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
+                    .collect();
+                let expected = if enabled {
+                    row["drops"].as_array().unwrap().clone()
+                } else {
+                    vec![]
+                };
+                assert_eq!(actual, expected, "{name} {seed} {step}");
+                assert_eq!(
+                    session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "{name} {seed} {step} level random"
+                );
+                let mut random = session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get(&sequence, seed)
+                    .unwrap();
+                assert_eq!(
+                    random.next_long(),
+                    row["next"].as_i64().unwrap(),
+                    "{name} {seed} {step} loot random"
+                );
+            }
+        }
     }
 
     #[test]

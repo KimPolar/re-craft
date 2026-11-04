@@ -179,6 +179,14 @@ pub struct PostprocessingTask {
     failed: bool,
 }
 
+/// The tick containers belong to the same converted chunk as the ordered
+/// postprocessing task. Callbacks must use them while pending ticks remain
+/// inactive; the caller must keep the generation world isolated.
+pub struct ConvertedChunkPostprocessing {
+    pub task: PostprocessingTask,
+    pub ticks: super::chunk_ticks::ConvertedChunkTicks,
+}
+
 impl PostprocessingTask {
     pub fn new(marks: Arc<PostProcessing>, chunk: ChunkPos) -> Self {
         Self {

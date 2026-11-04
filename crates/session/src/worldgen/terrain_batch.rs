@@ -1340,6 +1340,53 @@ impl FreshTerrainBatch {
         ))
     }
 
+    /// Convert the generated protochunk's block and fluid ticks into separate
+    /// LevelChunk containers. The saved lists remain pending until the caller
+    /// activates the chunk after postprocessing.
+    pub fn convert_spawned_ticks(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<super::chunk_ticks::ConvertedChunkTicks> {
+        use super::chunk_ticks::{ChunkTicks, ConvertedChunkTicks, SavedTick};
+
+        // Check registry identities, uniqueness, coordinates and proto delays
+        // with the same validation as the generation save draft.
+        self.spawned_tick_data(pos)?;
+        let world = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .snapshot();
+        let blocks = world
+            .saved_block_ticks
+            .get(&pos)
+            .into_iter()
+            .flatten()
+            .map(|tick| SavedTick {
+                kind: tick.block.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        let fluids = world
+            .saved_fluid_ticks
+            .get(&pos)
+            .into_iter()
+            .flatten()
+            .map(|tick| SavedTick {
+                kind: tick.fluid.clone(),
+                position: tick.position,
+                delay: tick.delay,
+                priority: tick.priority,
+            })
+            .collect();
+        Ok(ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, blocks)?,
+            fluids: ChunkTicks::from_saved(pos, fluids)?,
+        })
+    }
+
     /// Combine the ordered noise, surface, carver and feature marks. Missing
     /// earlier history is an error, since reconstructing it from blocks loses
     /// duplicates and insertion order.
@@ -1390,6 +1437,18 @@ impl FreshTerrainBatch {
             Arc::new(marks),
             pos,
         ))
+    }
+
+    /// Prepare both the exact postprocessing marks and pending LevelChunk
+    /// ticks from the same unchanged generated batch.
+    pub fn begin_converted_postprocessing(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<super::postprocessing::ConvertedChunkPostprocessing> {
+        Ok(super::postprocessing::ConvertedChunkPostprocessing {
+            task: self.begin_spawned_postprocessing(pos)?,
+            ticks: self.convert_spawned_ticks(pos)?,
+        })
     }
 
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the

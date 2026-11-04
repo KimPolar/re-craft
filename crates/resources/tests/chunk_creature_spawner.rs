@@ -1,6 +1,9 @@
 //! Differential tests using Java's real chunk-generation NaturalSpawner.
 use native_resources::{
     mob_spawns::{CreatureSpawnLayer, CreatureSpawns},
+    worldgen_mob_geometry::{
+        CreatureSpawnDimensions, creature_spawn_geometry, known_creature_spawn_dimensions,
+    },
     worldgen_mob_spawner::{AttemptRejection, ChunkCreatureSpawner, CreatureSpawnProgress},
 };
 use serde_json::{Value, json};
@@ -58,6 +61,24 @@ fn creature_generation_attempts_match_java() {
         json!({"attributes":settings(json!([{"type":"minecraft:pig","weight":1,"count":2}])),
         "seed":42,"x":0,"z":0,"probability":0.75,"enabled":false,"no_collision":false}),
     );
+    let entities = [
+        "cow",
+        "sheep",
+        "chicken",
+        "horse",
+        "goat",
+        "rabbit",
+        "slime",
+        "magma_cube",
+        "sulfur_cube",
+    ];
+    for entity in entities {
+        for (x, z) in [(0, 0), (-13, 17), (29, -7)] {
+            cases.push(json!({"attributes":settings(json!([{"type":format!("minecraft:{entity}"),"weight":1,"count":2}])),
+                "entity":format!("minecraft:{entity}"),"seed":42,"x":x,"z":z,"probability":0.75,
+                "enabled":true,"no_collision":true}));
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
     let version = game.join("versions/26.3");
     let manifest: Value =
@@ -90,6 +111,8 @@ fn creature_generation_attempts_match_java() {
     let results: Vec<Value> = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     assert_eq!(results.len(), cases.len());
     let mut observed = [0_usize; 2];
+    let mut observed_entities = std::collections::BTreeSet::new();
+    let mut observed_scaled = false;
     for (case, expected) in cases.iter().zip(results) {
         let mut spawns = CreatureSpawns::default();
         if let Some(layer) =
@@ -107,6 +130,21 @@ fn creature_generation_attempts_match_java() {
         )
         .unwrap();
         let mut attempts = Vec::new();
+        let mut boxes = Vec::new();
+        let dimensions = CreatureSpawnDimensions {
+            width: expected["dimensions"][0].as_f64().unwrap() as f32,
+            height: expected["dimensions"][1].as_f64().unwrap() as f32,
+            spawn_scale: expected["dimensions"][2].as_f64().unwrap() as f32,
+        };
+        let entity = native_resources::packs::ResourceId::parse(
+            case["entity"].as_str().unwrap_or("minecraft:pig"),
+        )
+        .unwrap();
+        assert_eq!(
+            known_creature_spawn_dimensions(&entity),
+            Some(dimensions),
+            "{entity:?}"
+        );
         loop {
             match planner.next(1).unwrap() {
                 CreatureSpawnProgress::Pending => continue,
@@ -117,6 +155,25 @@ fn creature_generation_attempts_match_java() {
                         CreatureSpawnProgress::Attempt(attempt.clone())
                     );
                     attempts.push(json!([attempt.x, attempt.z]));
+                    if case["no_collision"].as_bool().unwrap() {
+                        let geometry = creature_spawn_geometry(
+                            case["x"].as_i64().unwrap() as i32,
+                            case["z"].as_i64().unwrap() as i32,
+                            attempt.x,
+                            64,
+                            attempt.z,
+                            dimensions,
+                        )
+                        .unwrap();
+                        boxes.push([
+                            geometry.min[0],
+                            geometry.min[1],
+                            geometry.min[2],
+                            geometry.max[0],
+                            geometry.max[1],
+                            geometry.max[2],
+                        ]);
+                    }
                     let reason = if case["no_collision"].as_bool().unwrap() {
                         AttemptRejection::CollisionRuleOrConstruction
                     } else {
@@ -136,14 +193,39 @@ fn creature_generation_attempts_match_java() {
         } else {
             0
         };
+        assert_eq!(json!(attempts), expected["attempts"], "case {case}");
         assert_eq!(
-            json!({"attempts": attempts, "collision_calls":collision_calls, "next": random.next_int()}),
-            expected,
+            json!(collision_calls),
+            expected["collision_calls"],
             "case {case}"
         );
+        assert_eq!(json!(random.next_int()), expected["next"], "case {case}");
+        let expected_boxes = expected["boxes"].as_array().unwrap();
+        assert_eq!(boxes.len(), expected_boxes.len(), "case {case}");
+        if !boxes.is_empty() {
+            if let Some(entity) = case["entity"].as_str() {
+                observed_entities.insert(entity.to_owned());
+            }
+            observed_scaled |= dimensions.spawn_scale != 1.0;
+        }
+        for (actual, expected) in boxes.iter().zip(expected_boxes) {
+            for (actual, expected) in actual.iter().zip(expected.as_array().unwrap()) {
+                assert!(
+                    (actual - expected.as_f64().unwrap()).abs() < 1.0e-10,
+                    "case {case}: {actual} != {expected}"
+                );
+            }
+        }
     }
     assert!(
         observed.into_iter().all(|count| count > 0),
         "both rejection paths must execute"
     );
+    for entity in entities {
+        assert!(
+            observed_entities.contains(&format!("minecraft:{entity}")),
+            "no collision box for {entity}"
+        );
+    }
+    assert!(observed_scaled, "no scaled spawn box was tested");
 }

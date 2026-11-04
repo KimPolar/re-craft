@@ -8,6 +8,10 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.attribute.*;
 import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.level.NaturalSpawner;
 import net.minecraft.world.level.ServerLevelAccessor;
@@ -47,6 +51,7 @@ public final class ChunkCreatureSpawnOracle {
         var border = new WorldBorder();
         var cases = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         var output = new JsonArray();
+        var scaleField = EntityType.class.getDeclaredField("spawnDimensionsScale"); scaleField.setAccessible(true);
         for (var element : cases) {
             var test = element.getAsJsonObject();
             spawnMobs = test.get("enabled").getAsBoolean();
@@ -64,6 +69,8 @@ public final class ChunkCreatureSpawnOracle {
                 public <T> T getValue(EnvironmentAttribute<T> key, Vec3 pos, SpatialAttributeInterpolator interpolator) { return getDimensionValue(key); }
             };
             var attempts = new JsonArray();
+            var collisionBoxes = new JsonArray();
+            var entity = BuiltInRegistries.ENTITY_TYPE.getValue(Identifier.parse(test.has("entity") ? test.get("entity").getAsString() : "minecraft:pig"));
             int[] collisionCalls = {0};
             var world = (ServerLevelAccessor) Proxy.newProxyInstance(ServerLevelAccessor.class.getClassLoader(), new Class<?>[]{ServerLevelAccessor.class}, (obj, method, a) -> {
                 return switch (method.getName()) {
@@ -75,7 +82,12 @@ public final class ChunkCreatureSpawnOracle {
                     case "dimensionType" -> dimension;
                     case "getWorldBorder" -> border;
                     case "getBlockState" -> noCollision && ((BlockPos) a[0]).getY() == 63 ? Blocks.GRASS_BLOCK.defaultBlockState() : Blocks.AIR.defaultBlockState();
-                    case "noCollision" -> { collisionCalls[0]++; yield false; }
+                    case "noCollision" -> {
+                        collisionCalls[0]++;
+                        var box = (AABB) a[0]; var values = new JsonArray();
+                        for (double value : new double[]{box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ}) values.add(value);
+                        collisionBoxes.add(values); yield false;
+                    }
                     default -> throw new AssertionError("unexpected world call " + method);
                 };
             });
@@ -83,7 +95,8 @@ public final class ChunkCreatureSpawnOracle {
             var random = new WorldgenRandom(new LegacyRandomSource(0));
             random.setDecorationSeed(test.get("seed").getAsLong(), cx * 16, cz * 16);
             NaturalSpawner.spawnMobsForChunkGeneration(world, new BlockPos(cx * 16, 319, cz * 16), new ChunkPos(cx, cz), random);
-            var result = new JsonObject(); result.add("attempts", attempts); result.addProperty("collision_calls", collisionCalls[0]); result.addProperty("next", random.nextInt()); output.add(result);
+            var dimensions = new JsonArray(); dimensions.add(entity.getWidth()); dimensions.add(entity.getHeight()); dimensions.add(scaleField.getFloat(entity));
+            var result = new JsonObject(); result.add("attempts", attempts); result.addProperty("collision_calls", collisionCalls[0]); result.addProperty("next", random.nextInt()); result.add("boxes", collisionBoxes); result.add("dimensions", dimensions); output.add(result);
         }
         Files.writeString(Path.of(args[1]), output.toString());
     }

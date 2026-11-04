@@ -3338,6 +3338,7 @@ mod tests {
             )
             .unwrap();
             let mut probe = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
+            assert!(probe.collision_geometry(IVec3::ZERO).is_err());
             let top = loop {
                 match probe.poll(&mut planner, &mut view, 1).unwrap() {
                     GeneratedCreatureProbeProgress::Pending => continue,
@@ -3348,6 +3349,11 @@ mod tests {
                 }
             };
             assert_eq!(top, IVec3::new(attempt.x, 16, attempt.z));
+            let geometry = probe.collision_geometry(top).unwrap();
+            assert!(geometry.position[0] >= f64::from(0.9_f32));
+            assert!(geometry.position[2] >= f64::from(0.9_f32));
+            assert_eq!(geometry.position[1], 16.0);
+            assert!(probe.collision_geometry(top + IVec3::Y).is_err());
             assert_eq!(
                 planner.next(0).unwrap(),
                 CreatureSpawnProgress::Attempt(attempt.clone())

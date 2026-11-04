@@ -31,6 +31,7 @@ pub struct GeneratedCreatureProbe {
     top: Option<IVec3>,
     can_summon: bool,
     rejected: bool,
+    placement_passed: bool,
 }
 
 impl GeneratedCreatureProbe {
@@ -46,7 +47,32 @@ impl GeneratedCreatureProbe {
             top: None,
             can_summon,
             rejected: false,
+            placement_passed: false,
         }
+    }
+
+    /// Resolve the collision position and spawn AABB after placement passes.
+    /// Unknown entity dimensions remain unresolved.
+    pub fn collision_geometry(
+        &self,
+        top: IVec3,
+    ) -> Result<native_resources::worldgen_mob_geometry::CreatureSpawnGeometry> {
+        ensure!(
+            self.placement_passed && !self.rejected && self.top == Some(top),
+            "creature placement is unresolved"
+        );
+        let dimensions = native_resources::worldgen_mob_geometry::known_creature_spawn_dimensions(
+            &self.attempt.entity,
+        )
+        .context("unverified creature spawn dimensions")?;
+        native_resources::worldgen_mob_geometry::creature_spawn_geometry(
+            self.attempt.x.div_euclid(16),
+            self.attempt.z.div_euclid(16),
+            self.attempt.x,
+            top.y,
+            self.attempt.z,
+            dimensions,
+        )
     }
 
     /// Resolve one pending planner attempt against generated blocks. Missing
@@ -79,6 +105,7 @@ impl GeneratedCreatureProbe {
             self.rejected = true;
             return Ok(GeneratedCreatureProbeProgress::Rejected);
         }
+        self.placement_passed = true;
         Ok(GeneratedCreatureProbeProgress::NeedsCollision(top))
     }
 }

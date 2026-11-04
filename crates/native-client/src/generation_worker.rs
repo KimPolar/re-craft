@@ -40,6 +40,8 @@ pub struct GenerationProgress {
 pub struct GenerationReady {
     pub batch: FreshTerrainBatch,
     pub mesh: MeshJob,
+    /// A same-pack generation-settings draft; not yet validated for saving.
+    pub worldgen_settings_draft: Option<native_persistence::nbt::NamedTag>,
     /// Present when the worker chose its target from the generator's spawn origin.
     pub spawn_origin: Option<ChunkPos>,
     /// Initial world-spawn suggestion, not the collision-checked player spawn.
@@ -361,6 +363,7 @@ impl GenerationWorker {
                 C,
                 R,
                 Arc<native_resources::heightmap_tags::HeightmapTags>,
+                native_persistence::nbt::NamedTag,
             )> + Send
             + 'static,
         P: ResourceProvider,
@@ -371,8 +374,9 @@ impl GenerationWorker {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let (batch, mut provider, mut classify, mut resolve, tags) = prepare()?;
-            let Some(ready) = generate_spawn_origin(
+            let (batch, mut provider, mut classify, mut resolve, tags, worldgen_settings) =
+                prepare()?;
+            let Some(mut ready) = generate_spawn_origin(
                 batch,
                 &mut provider,
                 &mut classify,
@@ -385,6 +389,7 @@ impl GenerationWorker {
             else {
                 return Ok(None);
             };
+            ready.worldgen_settings_draft = Some(worldgen_settings);
             complete_spawn_search(
                 ready,
                 &mut provider,
@@ -531,6 +536,7 @@ impl GenerationWorker {
             Ok(Some(GenerationReady {
                 batch,
                 mesh,
+                worldgen_settings_draft: None,
                 spawn_origin: None,
                 suggested_spawn: None,
             }))
@@ -718,6 +724,7 @@ fn generate_spawn_origin(
     Ok(Some(GenerationReady {
         batch,
         mesh,
+        worldgen_settings_draft: None,
         spawn_origin: Some(spawn),
         suggested_spawn: None,
     }))
@@ -739,6 +746,7 @@ fn expand_with_inputs(
         mesh,
         spawn_origin,
         suggested_spawn: _,
+        worldgen_settings_draft,
     } = ready;
     ensure!(
         revision != mesh.revision,
@@ -825,6 +833,7 @@ fn expand_with_inputs(
     Ok(Some(GenerationReady {
         batch,
         mesh,
+        worldgen_settings_draft,
         spawn_origin,
         suggested_spawn: None,
     }))
@@ -962,6 +971,7 @@ mod tests {
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
             seed: 42,
+            bonus_chest: false,
             structures_enabled: false,
             data_packs: None,
         };
@@ -1032,6 +1042,7 @@ mod tests {
                     preset: "minecraft:normal".into(),
                     dimension: "minecraft:overworld".into(),
                     seed: 42,
+                    bonus_chest: false,
                     structures_enabled: false,
                     data_packs: None,
                 })?
@@ -1100,6 +1111,7 @@ mod tests {
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
             seed: 42,
+            bonus_chest: false,
             structures_enabled: false,
             data_packs: None,
         };
@@ -1121,7 +1133,7 @@ mod tests {
         // 256 columns have no candidate in this 26.3 seed, unlike the noise
         // generator's real origin, and exercise the expansion path.
         ready.spawn_origin = Some(origin);
-        let (_, mut provider, mut classify, mut resolve, tags) =
+        let (_, mut provider, mut classify, mut resolve, tags, _) =
             prepare(settings(game))?.into_spawn_worker_inputs()?;
         let cancelled = AtomicBool::new(false);
         let progress = Mutex::new(GenerationProgress {
@@ -1170,6 +1182,7 @@ mod tests {
                     preset: "minecraft:normal".into(),
                     dimension: "minecraft:overworld".into(),
                     seed: 42,
+                    bonus_chest: false,
                     structures_enabled: false,
                     data_packs: None,
                 })?
@@ -1301,6 +1314,7 @@ mod tests {
                     preset: "minecraft:normal".into(),
                     dimension: "minecraft:overworld".into(),
                     seed: 42,
+                    bonus_chest: false,
                     structures_enabled: false,
                     data_packs: None,
                 })?

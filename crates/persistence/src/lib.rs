@@ -14,3 +14,4 @@ mod save_transaction;
 pub mod snbt;
 pub mod world;
 pub mod world_creation;
+pub mod worldgen_settings;

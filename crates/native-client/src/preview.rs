@@ -3324,9 +3324,17 @@ mod tests {
         )
         .unwrap();
         let previous_world = Arc::clone(&job.world);
+        let worldgen_draft = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![(
+                "seed".into(),
+                native_persistence::nbt::Tag::Long(42),
+            )]),
+        };
         let ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
+            worldgen_settings_draft: Some(worldgen_draft.clone()),
             spawn_origin: Some(center),
             suggested_spawn: None,
         };
@@ -3363,6 +3371,10 @@ mod tests {
         assert_eq!(expanded.mesh.targets.as_deref(), Some(&expanded_targets));
         assert_eq!(expanded.mesh.revision, 9);
         assert_eq!(expanded.spawn_origin, Some(center));
+        assert_eq!(
+            expanded.worldgen_settings_draft.as_ref(),
+            Some(&worldgen_draft)
+        );
         assert_eq!(previous_world.light(8, 16, 8, true), Some(15));
         let player = native_session::PlayerState {
             position: glam::Vec3::new(8.5, 16.0, 8.5),
@@ -3459,8 +3471,18 @@ mod tests {
         }
         assert!(!reopened.load(std::sync::atomic::Ordering::Relaxed));
         let search_tags = Arc::clone(&spawn_tags);
+        let search_draft = worldgen_draft.clone();
         let search = crate::generation_worker::GenerationWorker::start_spawn_search(
-            move || Ok((search_batch, Fixture, classify, resolve, search_tags)),
+            move || {
+                Ok((
+                    search_batch,
+                    Fixture,
+                    classify,
+                    resolve,
+                    search_tags,
+                    search_draft,
+                ))
+            },
             20,
             0,
             None,
@@ -3474,6 +3496,10 @@ mod tests {
                         assert_eq!(ready.suggested_spawn, Some(IVec3::new(0, 16, 0)));
                         assert_eq!(ready.mesh.revision, 20);
                         assert_eq!(ready.mesh.targets.as_deref(), Some(&targets));
+                        assert_eq!(
+                            ready.worldgen_settings_draft.as_ref(),
+                            Some(&worldgen_draft)
+                        );
                     }
                     crate::generation_worker::GenerationResult::Failed(error) => {
                         panic!("{error:#}")
@@ -3491,7 +3517,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let no_spawn = crate::generation_worker::GenerationWorker::start_spawn_search(
-            move || Ok((no_spawn_batch, Fixture, classify, resolve, spawn_tags)),
+            move || {
+                Ok((
+                    no_spawn_batch,
+                    Fixture,
+                    classify,
+                    resolve,
+                    spawn_tags,
+                    worldgen_draft,
+                ))
+            },
             30,
             0,
             Some(-1),

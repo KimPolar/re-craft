@@ -19,6 +19,7 @@ pub struct FreshGenerationSettings {
     pub preset: String,
     pub dimension: String,
     pub seed: i64,
+    pub bonus_chest: bool,
     /// Structures and old-world blending are not supported by this batch.
     pub structures_enabled: bool,
     pub data_packs: Option<(PathBuf, DataPackSettings)>,
@@ -29,6 +30,7 @@ type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
 
 pub struct PreparedFreshGeneration {
     pub lighting: GeneratedDimensionLighting,
+    worldgen_settings: native_persistence::nbt::NamedTag,
     batch: FreshTerrainBatch,
     resources: ResourceStack,
     classify: Classifier,
@@ -55,6 +57,7 @@ impl PreparedFreshGeneration {
         Classifier,
         Resolver,
         Arc<native_resources::heightmap_tags::HeightmapTags>,
+        native_persistence::nbt::NamedTag,
     )> {
         let blocks = self.resources.vanilla_block_ids()?;
         let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
@@ -67,6 +70,7 @@ impl PreparedFreshGeneration {
             self.classify,
             self.resolve,
             tags,
+            self.worldgen_settings,
         ))
     }
 }
@@ -78,6 +82,10 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         !settings.structures_enabled,
         "fresh generation with structures is not implemented"
     );
+    ensure!(
+        !settings.bonus_chest,
+        "bonus chest generation is not implemented"
+    );
     let mut resources = ResourceStack::open(&settings.minecraft_dir)?;
     if let Some((world_dir, selection)) = settings.data_packs {
         let warnings = resources.configure_world_data(&world_dir, &selection)?;
@@ -87,6 +95,15 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
             warnings.join("; ")
         );
     }
+    let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
+        &mut resources,
+        &settings.preset,
+        native_persistence::worldgen_settings::NewWorldOptions {
+            seed: settings.seed,
+            generate_structures: settings.structures_enabled,
+            bonus_chest: settings.bonus_chest,
+        },
+    )?;
     let (lighting, definition) = GeneratedDimensionLighting::load_preset_with_generator(
         &mut resources,
         &settings.preset,
@@ -128,6 +145,7 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         Box::new(move |value| resolve_generated_terrain_state(value, &registry));
     Ok(PreparedFreshGeneration {
         lighting,
+        worldgen_settings,
         batch,
         resources,
         classify,
@@ -148,10 +166,57 @@ mod tests {
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
             seed: 1,
+            bonus_chest: false,
             structures_enabled: true,
             data_packs: None,
         });
         assert!(result.err().unwrap().to_string().contains("structures"));
+    }
+
+    #[test]
+    fn bonus_chest_is_rejected_before_reading_files() {
+        let result = prepare(FreshGenerationSettings {
+            minecraft_dir: PathBuf::new(),
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 1,
+            bonus_chest: true,
+            structures_enabled: false,
+            data_packs: None,
+        });
+        assert!(result.err().unwrap().to_string().contains("bonus chest"));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn spawn_worker_inputs_keep_same_preset_and_seed_draft() -> Result<()> {
+        use native_persistence::nbt::Tag;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let prepared = prepare(FreshGenerationSettings {
+            minecraft_dir: game,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: -42,
+            bonus_chest: false,
+            structures_enabled: false,
+            data_packs: None,
+        })?;
+        let (_, _, _, _, _, draft) = prepared.into_spawn_worker_inputs()?;
+        let data = draft.value.get("data").context("worldgen data missing")?;
+        assert_eq!(data.get("seed"), Some(&Tag::Long(-42)));
+        assert_eq!(data.get("generate_structures"), Some(&Tag::Byte(0)));
+        assert_eq!(data.get("bonus_chest"), Some(&Tag::Byte(0)));
+        let dimensions = data.get("dimensions").context("dimensions missing")?;
+        for name in [
+            "minecraft:overworld",
+            "minecraft:the_nether",
+            "minecraft:the_end",
+        ] {
+            assert!(dimensions.get(name).is_some(), "missing {name}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -165,6 +230,7 @@ mod tests {
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
             seed: 42,
+            bonus_chest: false,
             structures_enabled: false,
             data_packs: None,
         })

@@ -68,6 +68,7 @@ struct DecorationConfig {
     dimension_type: Option<String>,
     ambient_light: Option<f32>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
 }
 
 /// Examine every branch without consuming generation randomness or the block
@@ -796,12 +797,21 @@ impl FreshTerrainBatch {
         )
         .ok()
         .map(Arc::new);
+        let leaf_tag = ResourceId::parse("minecraft:prevents_nearby_leaf_decay")?;
+        let leaf_tags = native_resources::ore_feature::OreBlockTags::load(
+            provider,
+            &block_registry,
+            &BTreeSet::from([leaf_tag]),
+        )
+        .ok()
+        .map(Arc::new);
         self.decoration = Some(DecorationConfig {
             schedule,
             features_cannot_spawn_entities,
             block_registry,
             heightmap_tags,
             mushroom_tags,
+            leaf_tags,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -1551,6 +1561,11 @@ impl FreshTerrainBatch {
             Some(heightmap_tags),
         );
         stage.bind_batch_revision(self.schedule.revision());
+        stage.set_leaf_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.leaf_tags.clone()),
+        );
         Ok(stage)
     }
 

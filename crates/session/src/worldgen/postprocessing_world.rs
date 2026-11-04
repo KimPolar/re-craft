@@ -36,6 +36,7 @@ pub struct GeneratedPostprocessing {
     failed: bool,
     light: Option<VisibleLightSnapshot>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     edits: Vec<BlockPosition>,
     light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -110,6 +111,7 @@ impl GeneratedPostprocessing {
             failed: false,
             light,
             mushroom_tags,
+            leaf_tags: None,
             edits: Vec::new(),
             light_checks: Vec::new(),
             heightmaps,
@@ -119,6 +121,13 @@ impl GeneratedPostprocessing {
 
     pub(super) fn bind_batch_revision(&mut self, revision: u64) {
         self.batch_revision = Some(revision);
+    }
+
+    pub(super) fn set_leaf_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    ) {
+        self.leaf_tags = tags;
     }
 
     /// Run a bounded number of callbacks without interleaving another chunk.
@@ -147,6 +156,7 @@ impl GeneratedPostprocessing {
             ticks: &mut self.region.ticks,
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
+            leaf_tags: self.leaf_tags.as_deref(),
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
             heightmaps: &mut self.heightmaps,
@@ -192,6 +202,7 @@ struct GeneratedBlockView<'a> {
     ticks: &'a mut RegionTicks,
     light: Option<&'a VisibleLightSnapshot>,
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
@@ -203,9 +214,58 @@ enum DryBlock {
     Plain,
     Falling,
     Mushroom,
+    Leaves,
+}
+
+fn leaf_distance(state: &BlockState) -> Result<Option<u8>> {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:oak_leaves"
+            | "minecraft:spruce_leaves"
+            | "minecraft:birch_leaves"
+            | "minecraft:jungle_leaves"
+            | "minecraft:acacia_leaves"
+            | "minecraft:dark_oak_leaves"
+            | "minecraft:mangrove_leaves"
+            | "minecraft:cherry_leaves"
+            | "minecraft:pale_oak_leaves"
+            | "minecraft:azalea_leaves"
+            | "minecraft:flowering_azalea_leaves"
+    ) {
+        return Ok(None);
+    }
+    ensure!(
+        state.properties.len() == 3
+            && matches!(
+                state.properties.get("persistent").map(String::as_str),
+                Some("true" | "false")
+            )
+            && matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            ),
+        "invalid generated leaf state"
+    );
+    let raw = state
+        .properties
+        .get("distance")
+        .context("missing leaf distance")?;
+    let distance = raw
+        .parse::<u8>()
+        .ok()
+        .filter(|distance| (1..=7).contains(distance) && distance.to_string() == *raw)
+        .context("invalid leaf distance")?;
+    Ok(Some(distance))
 }
 
 fn supported_dry_block(state: &BlockState) -> Result<DryBlock> {
+    if leaf_distance(state)?.is_some() {
+        ensure!(
+            state.properties["waterlogged"] == "false",
+            "waterlogged leaf fluid tick is unsupported"
+        );
+        return Ok(DryBlock::Leaves);
+    }
     ensure!(
         state.properties.is_empty(),
         "unsupported generated postprocessing block state"
@@ -376,7 +436,7 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         state: &BlockState,
         _: [i32; 3],
         _: [i32; 3],
-        _: &BlockState,
+        neighbor: &BlockState,
     ) -> Result<BlockState> {
         match supported_dry_block(state)? {
             DryBlock::Falling => {
@@ -392,6 +452,30 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                     name: "minecraft:air".into(),
                     properties: Default::default(),
                 });
+            }
+            DryBlock::Leaves => {
+                static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+                    std::sync::OnceLock::new();
+                let tag = TAG.get_or_init(|| {
+                    native_resources::packs::ResourceId::parse(
+                        "minecraft:prevents_nearby_leaf_decay",
+                    )
+                    .expect("static tag identifier")
+                });
+                let tagged = self
+                    .leaf_tags
+                    .context("leaf support tags unavailable")?
+                    .contains(tag, &neighbor.name)?;
+                // A non-tagged neighbor's leaf distance is at least one;
+                // only a tagged neighbor can produce distance zero.
+                if !tagged || state.properties["distance"] != "1" {
+                    ensure!(
+                        self.ticks
+                            .schedule(TickRegistry::Block, &state.name, pos, 1, 0)?
+                            != ScheduleOutcome::MissingChunk,
+                        "leaf tick container is missing"
+                    );
+                }
             }
             DryBlock::Plain | DryBlock::Mushroom => {}
         }
@@ -783,6 +867,151 @@ mod tests {
             mushroom_case("red_mushroom", "air", false, 0),
             "minecraft:red_mushroom minecraft:air false 0 minecraft:air 1 276"
         );
+    }
+
+    fn leaf_case(name: &str, distance: u8, tagged: bool, budget: usize) -> String {
+        use native_resources::{
+            ore_feature::OreBlockTags,
+            packs::{ResourceId, ResourceProvider},
+        };
+        struct TagSource(bool);
+        impl ResourceProvider for TagSource {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" {
+                    return Ok(Some(serde_json::to_vec(&serde_json::json!({
+                        "values": if self.0 { vec!["minecraft:stone"] } else { vec![] }
+                    }))?));
+                }
+                Ok(None)
+            }
+        }
+        let (mut stage, _, pos) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        let leaf = world.intern_state(BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::from([
+                ("distance".into(), distance.to_string()),
+                ("persistent".into(), "false".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&pos).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap().fill(stone);
+        world.set_block_id(8, 8, 8, leaf).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        marks.mark(8, 8, 8);
+        stage.region.tasks = BTreeMap::from([(pos, PostprocessingTask::new(Arc::new(marks), pos))]);
+        stage.region.ticks = RegionTicks::new(
+            BTreeMap::from([(
+                pos,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                },
+            )]),
+            100,
+            2,
+        )
+        .unwrap();
+        let tag = ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap();
+        let registry = BTreeSet::from(["minecraft:stone".to_owned(), format!("minecraft:{name}")]);
+        stage.set_leaf_tags(Some(Arc::new(
+            OreBlockTags::load(&mut TagSource(tagged), &registry, &BTreeSet::from([tag])).unwrap(),
+        )));
+        while !stage.poll(pos, budget).unwrap() {}
+        let result = stage.finish().unwrap();
+        let ticks = result.ticks.chunk(pos).unwrap().blocks.pack(100);
+        assert!(result.edits.is_empty());
+        assert_eq!(
+            result.world.block(8, 8, 8).unwrap().name,
+            format!("minecraft:{name}")
+        );
+        format!(
+            "minecraft:{name} {distance} {tagged} {} {} {}",
+            ticks.len(),
+            ticks.first().map_or(-1, |tick| tick.delay),
+            result.ticks.next_sub_tick()
+        )
+    }
+
+    #[test]
+    fn leaf_postprocessing_schedules_once_and_accounts_for_each_attempt() {
+        assert_eq!(
+            leaf_case("oak_leaves", 1, true, 1),
+            "minecraft:oak_leaves 1 true 0 -1 2"
+        );
+        assert_eq!(
+            leaf_case("oak_leaves", 1, false, 1),
+            "minecraft:oak_leaves 1 false 1 1 14"
+        );
+        assert_eq!(
+            leaf_case("cherry_leaves", 7, true, 100),
+            "minecraft:cherry_leaves 7 true 1 1 14"
+        );
+    }
+
+    #[test]
+    fn leaves_reject_missing_tags_and_unimplemented_waterlogged_ticks() {
+        let state = |distance: &str, waterlogged: &str| BlockState {
+            name: "minecraft:oak_leaves".into(),
+            properties: BTreeMap::from([
+                ("distance".into(), distance.into()),
+                ("persistent".into(), "true".into()),
+                ("waterlogged".into(), waterlogged.into()),
+            ]),
+        };
+        assert!(supported_dry_block(&state("1", "true")).is_err());
+        assert!(supported_dry_block(&state("01", "false")).is_err());
+        assert!(supported_dry_block(&state("8", "false")).is_err());
+        let (mut stage, _, pos) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let leaf = world.intern_state(state("1", "false"));
+        world.set_block_id(8, 8, 8, leaf).unwrap();
+        let before = Arc::clone(&stage.world);
+        assert!(stage.poll(pos, 1).is_err());
+        assert!(stage.finish().is_err());
+        assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:oak_leaves");
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_leaf_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedLeafPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedLeafPostprocessingOracle.java"),
+        );
+        let mut expected = Vec::new();
+        for name in [
+            "oak_leaves",
+            "spruce_leaves",
+            "birch_leaves",
+            "jungle_leaves",
+            "acacia_leaves",
+            "dark_oak_leaves",
+            "mangrove_leaves",
+            "cherry_leaves",
+            "pale_oak_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
+        ] {
+            for distance in [1, 4, 7] {
+                for tagged in [false, true] {
+                    expected.push(leaf_case(name, distance, tagged, 1));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -26,11 +26,11 @@ pub enum GeneratedCreatureProbeProgress {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GeneratedCreatureBlockCollisionProgress {
+pub enum GeneratedCreatureCollisionProgress {
     Rejected,
-    /// Block collision passed. Existing entities and the world border still
-    /// need Java's null-entity collision checks before checking mob rules.
-    NeedsEntityAndBorderCollision(native_resources::worldgen_mob_geometry::CreatureSpawnGeometry),
+    /// WorldGenRegion's null-entity collision query passed; check the
+    /// entity type's spawn rules before attempting construction.
+    NeedsSpawnRules(native_resources::worldgen_mob_geometry::CreatureSpawnGeometry),
 }
 
 pub struct GeneratedCreatureProbe {
@@ -83,13 +83,14 @@ impl GeneratedCreatureProbe {
         )
     }
 
-    /// Test block collisions only. A definite collision skips the random walk,
-    /// as in Java; missing data leaves the pending attempt unchanged.
-    pub fn check_block_collision(
+    /// Test the WorldGenRegion null-entity collision query. Its entity query
+    /// is always empty and its border check accepts a null entity. A block
+    /// collision skips the random walk; missing data leaves the attempt pending.
+    pub fn check_collision(
         &mut self,
         planner: &mut ChunkCreatureSpawner,
         world: &GeneratedMobPlacementView<'_>,
-    ) -> Result<GeneratedCreatureBlockCollisionProgress> {
+    ) -> Result<GeneratedCreatureCollisionProgress> {
         ensure!(
             planner.next(0)? == CreatureSpawnProgress::Attempt(self.attempt.clone()),
             "creature planner attempt changed"
@@ -99,14 +100,16 @@ impl GeneratedCreatureProbe {
         if !super::mob_collision::no_block_collision(geometry, |pos| world.block(pos))? {
             planner.reject(AttemptRejection::CollisionRuleOrConstruction)?;
             self.rejected = true;
-            return Ok(GeneratedCreatureBlockCollisionProgress::Rejected);
+            return Ok(GeneratedCreatureCollisionProgress::Rejected);
         }
-        Ok(GeneratedCreatureBlockCollisionProgress::NeedsEntityAndBorderCollision(geometry))
+        Ok(GeneratedCreatureCollisionProgress::NeedsSpawnRules(
+            geometry,
+        ))
     }
 
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
-    /// advancing the planner. The caller still performs entity collision.
+    /// advancing the planner. The caller still checks collision and mob rules.
     pub fn poll(
         &mut self,
         planner: &mut ChunkCreatureSpawner,

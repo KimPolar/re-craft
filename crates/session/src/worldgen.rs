@@ -42,8 +42,8 @@ pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
-    GeneratedCreatureBlockCollisionProgress, GeneratedCreatureProbe,
-    GeneratedCreatureProbeProgress, GeneratedMobPlacementView,
+    GeneratedCreatureCollisionProgress, GeneratedCreatureProbe, GeneratedCreatureProbeProgress,
+    GeneratedMobPlacementView,
 };
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
@@ -3357,8 +3357,8 @@ mod tests {
             assert_eq!(geometry.position[1], 16.0);
             assert!(probe.collision_geometry(top + IVec3::Y).is_err());
             assert_eq!(
-                probe.check_block_collision(&mut planner, &view).unwrap(),
-                GeneratedCreatureBlockCollisionProgress::NeedsEntityAndBorderCollision(geometry)
+                probe.check_collision(&mut planner, &view).unwrap(),
+                GeneratedCreatureCollisionProgress::NeedsSpawnRules(geometry)
             );
             assert_eq!(
                 planner.next(0).unwrap(),

@@ -448,6 +448,52 @@ fn encode(values: &[u32; 256], height: u32, original: Option<&[i64]>) -> Result<
     Ok(words)
 }
 
+/// Generation's existing first-available Y values, including values made
+/// stale by direct section writes. A missing map has not yet been primed.
+#[derive(Default)]
+pub struct GeneratedHeightmaps<'a> {
+    pub world_surface: Option<&'a [i32; 256]>,
+    pub ocean_floor: Option<&'a [i32; 256]>,
+    pub motion_blocking: Option<&'a [i32; 256]>,
+    pub motion_blocking_no_leaves: Option<&'a [i32; 256]>,
+    pub world_surface_wg: Option<&'a [i32; 256]>,
+    pub ocean_floor_wg: Option<&'a [i32; 256]>,
+}
+
+/// Encode only the heightmaps that exist, as SerializableChunkData.copyOf
+/// does for a protochunk. This is a component of a future chunk save.
+pub fn encode_generated_heightmaps(
+    bounds: HeightBounds,
+    maps: &GeneratedHeightmaps<'_>,
+) -> Result<Tag> {
+    let height = bounds.height()?;
+    let entries = [
+        ("WORLD_SURFACE", maps.world_surface),
+        ("OCEAN_FLOOR", maps.ocean_floor),
+        ("MOTION_BLOCKING", maps.motion_blocking),
+        ("MOTION_BLOCKING_NO_LEAVES", maps.motion_blocking_no_leaves),
+        ("WORLD_SURFACE_WG", maps.world_surface_wg),
+        ("OCEAN_FLOOR_WG", maps.ocean_floor_wg),
+    ];
+    let mut output = Vec::new();
+    for (name, values) in entries {
+        let Some(values) = values else { continue };
+        let mut relative = [0u32; 256];
+        for (dst, &value) in relative.iter_mut().zip(values) {
+            ensure!(
+                (bounds.min_y..=bounds.max_y).contains(&value),
+                "{name} height is outside dimension bounds"
+            );
+            *dst = (value - bounds.min_y) as u32;
+        }
+        output.push((
+            name.into(),
+            Tag::LongArray(encode(&relative, height, None)?),
+        ));
+    }
+    Ok(Tag::Compound(output))
+}
+
 /// Rebuild a draft while verifying any original known heightmaps against its
 /// original blocks. Unknown NBT and unused bits are retained byte-for-byte.
 pub(crate) fn rebuild(

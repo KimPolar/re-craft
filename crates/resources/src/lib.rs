@@ -83,6 +83,7 @@ pub mod vegetation_patch;
 pub mod vines_feature;
 pub mod world_clock;
 pub mod worldgen_mob_geometry;
+pub mod worldgen_mob_rules;
 pub mod worldgen_mob_spawner;
 
 pub const TARGET_VERSION: &str = "26.3";

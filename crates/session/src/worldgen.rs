@@ -43,7 +43,7 @@ pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
     GeneratedCreatureCollisionProgress, GeneratedCreatureProbe, GeneratedCreatureProbeProgress,
-    GeneratedMobPlacementView,
+    GeneratedCreatureRuleProgress, GeneratedMobPlacementView,
 };
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
@@ -2953,6 +2953,16 @@ mod tests {
                 if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
                     return Ok(Some(br#"{"values":[]}"#.to_vec()));
                 }
+                if matches!(
+                    path,
+                    "data/minecraft/tags/block/animals_spawnable_on.json"
+                        | "data/minecraft/tags/block/goats_spawnable_on.json"
+                        | "data/minecraft/tags/block/rabbits_spawnable_on.json"
+                ) {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec(),
+                    ));
+                }
                 Data.read_data(path)
             }
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
@@ -3127,6 +3137,9 @@ mod tests {
         let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
         let mob_height_tags =
             native_resources::heightmap_tags::HeightmapTags::load(&mut data, &block_registry)
+                .unwrap();
+        let ground_spawn_tags =
+            native_resources::worldgen_mob_rules::GroundSpawnTags::load(&mut data, &block_registry)
                 .unwrap();
         let mut spawn_settings = definition();
         spawn_settings["settings"]["disable_mob_generation"] = json!(false);
@@ -3313,7 +3326,7 @@ mod tests {
             .unwrap(),
         );
         let mut planner = batch
-            .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns)
+            .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns.clone())
             .unwrap();
         let native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(attempt) =
             planner.next(1).unwrap()
@@ -3363,6 +3376,109 @@ mod tests {
             assert_eq!(
                 planner.next(0).unwrap(),
                 CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            let mut rule_planner = batch
+                .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns.clone())
+                .unwrap();
+            assert_eq!(
+                rule_planner.next(1).unwrap(),
+                CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            let mut rule_probe = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
+            assert!(
+                rule_probe
+                    .check_spawn_rules(&mut rule_planner, &mut view, &ground_spawn_tags)
+                    .is_err()
+            );
+            loop {
+                match rule_probe.poll(&mut rule_planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::NeedsCollision(_) => break,
+                    GeneratedCreatureProbeProgress::Rejected => {
+                        panic!("unexpected rule probe placement rejection")
+                    }
+                }
+            }
+            assert_eq!(
+                rule_probe
+                    .check_collision(&mut rule_planner, &view)
+                    .unwrap(),
+                GeneratedCreatureCollisionProgress::NeedsSpawnRules(geometry)
+            );
+            let light_pos = [
+                geometry.position[0].floor() as i32,
+                geometry.position[1].floor() as i32,
+                geometry.position[2].floor() as i32,
+            ];
+            assert!(
+                batch
+                    .light_snapshot([center])
+                    .unwrap()
+                    .raw_brightness(light_pos, 0)
+                    .unwrap()
+                    <= 8
+            );
+            assert_eq!(
+                rule_probe
+                    .check_spawn_rules(&mut rule_planner, &mut view, &ground_spawn_tags)
+                    .unwrap(),
+                GeneratedCreatureRuleProgress::Rejected
+            );
+            let CreatureSpawnProgress::Attempt(next) = rule_planner.next(0).unwrap() else {
+                panic!("expected retry");
+            };
+            assert_eq!(
+                (next.x, next.z, next.attempt),
+                (attempt.x, attempt.z, attempt.attempt + 1)
+            );
+            // Exercise the successful boundary of the same generated-ground
+            // path with a controlled visible light layer at brightness nine.
+            let mut light = native_world::generation_light::VisibleLightSnapshot::new(true, false);
+            light.insert_complete_column(
+                center,
+                native_world::generation_light::VisibleLightColumn::new(
+                    BTreeMap::from([(1, Arc::new([0x99; native_world::loaded::LIGHT_BYTES]))]),
+                    BTreeMap::new(),
+                ),
+            );
+            view.set_rule_light_for_test(center, light);
+            let mut accepted_planner = batch
+                .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns)
+                .unwrap();
+            assert_eq!(
+                accepted_planner.next(1).unwrap(),
+                CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            let mut accepted = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
+            loop {
+                match accepted.poll(&mut accepted_planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::NeedsCollision(_) => break,
+                    GeneratedCreatureProbeProgress::Rejected => {
+                        panic!("unexpected accepted probe placement rejection")
+                    }
+                }
+            }
+            assert_eq!(
+                accepted
+                    .check_collision(&mut accepted_planner, &view)
+                    .unwrap(),
+                GeneratedCreatureCollisionProgress::NeedsSpawnRules(geometry)
+            );
+            assert_eq!(
+                accepted
+                    .check_spawn_rules(&mut accepted_planner, &mut view, &ground_spawn_tags)
+                    .unwrap(),
+                GeneratedCreatureRuleProgress::NeedsConstruction(geometry)
+            );
+            assert_eq!(
+                accepted_planner.next(0).unwrap(),
+                CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            assert!(
+                accepted
+                    .check_spawn_rules(&mut accepted_planner, &mut view, &ground_spawn_tags)
+                    .is_err()
             );
             let tag = BTreeSet::from(["minecraft:void_air".into()]);
             let mut view = GeneratedMobPlacementView::new(

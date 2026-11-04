@@ -1017,6 +1017,17 @@ struct BubbleTickKey {
     kind: BubbleTickKind,
 }
 
+#[derive(Clone, Copy)]
+enum CollectedBlockTick {
+    Sand(SandTickKey),
+    Button(ButtonTickKey),
+    Soil(IVec3, SoilKind),
+    Lamp((i32, i32, i32)),
+    Ice((i32, i32, i32)),
+    Bubble(BubbleTickKey),
+    Sensor((i32, i32, i32, bool)),
+}
+
 /// Transient, ordered presentation events emitted by completed game ticks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ButtonSoundEvent {
@@ -15261,8 +15272,9 @@ impl LoadedSession {
         let mut deferred_ice = Vec::new();
         let mut deferred_bubble = Vec::new();
         let mut deferred_sensors = Vec::new();
-        let mut executed = 0;
-        while executed < 65_536 {
+        let mut collected = Vec::new();
+        let mut ready = 0;
+        while ready < 65_536 {
             let sand_order = process_sand
                 .then(|| self.sand_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
@@ -15301,12 +15313,109 @@ impl LoadedSession {
             if order.0 > i128::from(self.tick) {
                 break;
             }
-            if kind == 0 {
-                let (order, key) = self
-                    .sand_ticks
-                    .pop_first()
-                    .expect("selected sand tick remains queued");
+            let absolute = match kind {
+                0 => {
+                    let key = self.sand_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
+                }
+                1 => {
+                    let key = self.button_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
+                }
+                2 => self.soil_ticks[&order].0,
+                3 => {
+                    let key = self.lamp_ticks[&order];
+                    IVec3::new(key.0, key.1, key.2)
+                }
+                4 => {
+                    let key = self.ice_ticks[&order];
+                    IVec3::new(key.0, key.1, key.2)
+                }
+                5 => {
+                    let key = self.bubble_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
+                }
+                6 => {
+                    let key = self.sensor_ticks[&order];
+                    IVec3::new(key.0, key.1, key.2)
+                }
+                _ => unreachable!(),
+            };
+            let available = subtract(absolute, self.origin).is_some_and(|relative| {
+                matches!(
+                    cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        relative,
+                        self.states[0]
+                    ),
+                    Cell::State(_)
+                )
+            });
+            if available {
+                ready += 1;
+            }
+            let entry = match kind {
+                0 => {
+                    let key = self.sand_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.sand_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Sand(key)
+                }
+                1 => {
+                    let key = self.button_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.button_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Button(key)
+                }
+                2 => {
+                    let key = self.soil_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.soil_pending
+                            .remove(&(key.0.x, key.0.y, key.0.z, key.1));
+                    }
+                    CollectedBlockTick::Soil(key.0, key.1)
+                }
+                3 => {
+                    let key = self.lamp_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.lamp_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Lamp(key)
+                }
+                4 => {
+                    let key = self.ice_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.ice_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Ice(key)
+                }
+                5 => {
+                    let key = self.bubble_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.bubble_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Bubble(key)
+                }
+                6 => {
+                    let key = self.sensor_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.sensor_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Sensor(key)
+                }
+                _ => unreachable!(),
+            };
+            collected.push((order, entry));
+        }
+        // Java removes every collected identity before the first callback.
+        for (order, entry) in collected {
+            if let CollectedBlockTick::Sand(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
@@ -15317,6 +15426,7 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
@@ -15326,15 +15436,15 @@ impl LoadedSession {
                     .state(id)
                     .is_none_or(|state| state.name != key.kind.id())
                 {
-                    self.sand_pending.remove(&key);
-                    executed += 1;
                     continue;
                 }
                 let Some(below) = add(relative, IVec3::NEG_Y) else {
+                    self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
                 let Some(free) = self.falling_support_is_free(below) else {
+                    self.sand_pending.insert(key);
                     deferred_sand.push((order, key));
                     continue;
                 };
@@ -15345,6 +15455,7 @@ impl LoadedSession {
                     if !self.banner_support_neighbors_available(relative)
                         || !self.set(relative, self.states[0])
                     {
+                        self.sand_pending.insert(key);
                         deferred_sand.push((order, key));
                         continue;
                     }
@@ -15367,14 +15478,9 @@ impl LoadedSession {
                         )),
                     });
                 }
-                self.sand_pending.remove(&key);
-                executed += 1;
-            } else if kind == 1 {
-                let (order, key) = self
-                    .button_ticks
-                    .pop_first()
-                    .expect("selected button tick remains queued");
+            } else if let CollectedBlockTick::Button(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    self.button_pending.insert(key);
                     deferred_buttons.push((order, key));
                     continue;
                 };
@@ -15388,22 +15494,19 @@ impl LoadedSession {
                     ),
                     Cell::Missing
                 ) {
+                    self.button_pending.insert(key);
                     deferred_buttons.push((order, key));
                     continue;
                 }
                 self.mark_tick_chunk_dirty(key.x, key.z);
-                self.button_pending.remove(&key);
-                executed += 1;
+
                 if self.set_button_power(relative, key.kind, false) {
                     self.push_button_sound(relative, key.kind, false);
                     self.block_action_vibration(relative, false, false);
                 }
-            } else if kind == 3 {
-                let (order, key) = self
-                    .lamp_ticks
-                    .pop_first()
-                    .expect("selected lamp tick remains queued");
+            } else if let CollectedBlockTick::Lamp(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    self.lamp_pending.insert(key);
                     deferred_lamps.push((order, key));
                     continue;
                 };
@@ -15414,6 +15517,7 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.lamp_pending.insert(key);
                     deferred_lamps.push((order, key));
                     continue;
                 };
@@ -15424,28 +15528,26 @@ impl LoadedSession {
                     Some(false)
                 };
                 let Some(power) = power else {
+                    self.lamp_pending.insert(key);
                     deferred_lamps.push((order, key));
                     continue;
                 };
-                self.lamp_pending.remove(&key);
+
                 self.mark_tick_chunk_dirty(key.0, key.2);
-                executed += 1;
+
                 if lit == Some(true) && !power {
                     let mut next = self.world.state(id).expect("lamp state exists").clone();
                     next.properties.insert("lit".into(), "false".into());
                     let next = self.intern_block(next);
                     self.set_with_notify(relative, next, false);
                 }
-            } else if kind == 4 {
+            } else if let CollectedBlockTick::Ice(key) = entry {
                 // Until all lighting and neighbor effects are supported,
                 // gameplay can advance only the verified cases and must not
                 // authorize a world save after a frosted-ice tick became due.
                 self.unresolved_ice_tick = true;
-                let (order, key) = self
-                    .ice_ticks
-                    .pop_first()
-                    .expect("selected ice tick remains queued");
                 let Some(relative) = subtract(IVec3::new(key.0, key.1, key.2), self.origin) else {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 };
@@ -15456,17 +15558,18 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 };
                 let Some(current) = self.world.state(id) else {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 };
                 if current.name != "minecraft:frosted_ice" {
-                    self.ice_pending.remove(&key);
                     self.mark_tick_chunk_dirty(key.0, key.2);
-                    executed += 1;
+
                     continue;
                 }
                 let age = if current.properties.len() == 1 {
@@ -15484,6 +15587,7 @@ impl LoadedSession {
                     None
                 };
                 let Some(age) = age else {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 };
@@ -15496,6 +15600,7 @@ impl LoadedSession {
                     melted_to_water: BTreeSet::new(),
                 };
                 if crate::frosted_ice::tick(&mut stage, relative, age, &mut random).is_err() {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 }
@@ -15535,11 +15640,12 @@ impl LoadedSession {
                     }
                 }
                 if !valid {
+                    self.ice_pending.insert(key);
                     deferred_ice.push((order, key));
                     continue;
                 }
                 let previous_random = std::mem::replace(&mut self.level_random, random);
-                self.ice_pending.remove(&key);
+
                 self.mark_tick_chunk_dirty(key.0, key.2);
                 let mut applied = 0;
                 let mut failed = false;
@@ -15579,6 +15685,7 @@ impl LoadedSession {
                     if applied == 0 {
                         self.level_random = previous_random;
                         self.ice_pending.insert(key);
+                        self.ice_pending.insert(key);
                         deferred_ice.push((order, key));
                     } else {
                         self.stream_errors
@@ -15586,14 +15693,10 @@ impl LoadedSession {
                     }
                     continue;
                 }
-                executed += 1;
-            } else if kind == 6 {
-                let (order, key) = self
-                    .sensor_ticks
-                    .pop_first()
-                    .expect("selected sensor tick remains queued");
+            } else if let CollectedBlockTick::Sensor(key) = entry {
                 let absolute = IVec3::new(key.0, key.1, key.2);
                 let Some(relative) = subtract(absolute, self.origin) else {
+                    self.sensor_pending.insert(key);
                     deferred_sensors.push((order, key));
                     continue;
                 };
@@ -15604,10 +15707,12 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.sensor_pending.insert(key);
                     deferred_sensors.push((order, key));
                     continue;
                 };
                 let Some(current) = self.world.state(id) else {
+                    self.sensor_pending.insert(key);
                     deferred_sensors.push((order, key));
                     continue;
                 };
@@ -15617,12 +15722,12 @@ impl LoadedSession {
                     "minecraft:sculk_sensor"
                 };
                 if current.name != expected {
-                    self.sensor_pending.remove(&key);
                     self.mark_tick_chunk_dirty(key.0, key.2);
-                    executed += 1;
+
                     continue;
                 }
                 let Some(sensor) = crate::sculk_sensor::Sensor::from_block(current) else {
+                    self.sensor_pending.insert(key);
                     deferred_sensors.push((order, key));
                     continue;
                 };
@@ -15633,10 +15738,11 @@ impl LoadedSession {
                     if self.check_block_set(relative, next, false, false).is_none()
                         || !self.set_with_notify(relative, next, false)
                     {
+                        self.sensor_pending.insert(key);
                         deferred_sensors.push((order, key));
                         continue;
                     }
-                    self.sensor_pending.remove(&key);
+
                     if let Some(delay) = change.tick_after {
                         self.schedule_sensor(absolute, key.3, delay);
                     }
@@ -15674,18 +15780,12 @@ impl LoadedSession {
                             },
                         });
                     }
-                } else {
-                    self.sensor_pending.remove(&key);
                 }
                 self.mark_tick_chunk_dirty(key.0, key.2);
-                executed += 1;
-            } else if kind == 5 {
-                let (order, key) = self
-                    .bubble_ticks
-                    .pop_first()
-                    .expect("selected bubble tick remains queued");
+            } else if let CollectedBlockTick::Bubble(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
                     self.unresolved_bubble_tick = true;
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 };
@@ -15697,11 +15797,13 @@ impl LoadedSession {
                     self.states[0],
                 ) else {
                     self.unresolved_bubble_tick = true;
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 };
                 let Some(current) = self.world.state(id) else {
                     self.unresolved_bubble_tick = true;
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 };
@@ -15710,15 +15812,15 @@ impl LoadedSession {
                     BubbleTickKind::Column => "minecraft:bubble_column",
                 };
                 if current.name != expected {
-                    self.bubble_pending.remove(&key);
                     self.mark_tick_chunk_dirty(key.x, key.z);
-                    executed += 1;
+
                     continue;
                 }
                 // A stale tick has no callback. Matching ticks may change blocks,
                 // fluids, and other effects that are not fully saved yet.
                 self.unresolved_bubble_tick = true;
                 let Some(tags) = self.bubble_column_tags.as_ref() else {
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 };
@@ -15737,6 +15839,7 @@ impl LoadedSession {
                     }),
                 };
                 if process.is_err() {
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 }
@@ -15756,10 +15859,11 @@ impl LoadedSession {
                     }
                 }
                 if !valid {
+                    self.bubble_pending.insert(key);
                     deferred_bubble.push((order, key));
                     continue;
                 }
-                self.bubble_pending.remove(&key);
+
                 self.mark_tick_chunk_dirty(key.x, key.z);
                 for (action, replacement) in actions.into_iter().zip(prepared) {
                     if let Some((position, id)) = replacement {
@@ -15782,13 +15886,13 @@ impl LoadedSession {
                         }
                     }
                 }
-                executed += 1;
             } else {
-                let (order, (absolute, soil)) = self
-                    .soil_ticks
-                    .pop_first()
-                    .expect("selected soil tick remains queued");
+                let CollectedBlockTick::Soil(absolute, soil) = entry else {
+                    unreachable!("all block tick kinds are handled");
+                };
                 let Some(relative) = subtract(absolute, self.origin) else {
+                    self.soil_pending
+                        .insert((absolute.x, absolute.y, absolute.z, soil));
                     deferred_soil.push((order, (absolute, soil)));
                     continue;
                 };
@@ -15799,6 +15903,8 @@ impl LoadedSession {
                     relative,
                     self.states[0],
                 ) else {
+                    self.soil_pending
+                        .insert((absolute.x, absolute.y, absolute.z, soil));
                     deferred_soil.push((order, (absolute, soil)));
                     continue;
                 };
@@ -15809,14 +15915,13 @@ impl LoadedSession {
                     == Some(soil);
                 let blocked = if matches_soil && soil == SoilKind::Farmland {
                     let Some(above) = add(relative, IVec3::Y) else {
-                        self.soil_pending
-                            .remove(&(absolute.x, absolute.y, absolute.z, soil));
-                        executed += 1;
                         continue;
                     };
                     let Cell::State(above) =
                         cell(&self.world, self.origin, self.bounds, above, self.states[0])
                     else {
+                        self.soil_pending
+                            .insert((absolute.x, absolute.y, absolute.z, soil));
                         deferred_soil.push((order, (absolute, soil)));
                         continue;
                     };
@@ -15825,6 +15930,8 @@ impl LoadedSession {
                         .state(above)
                         .and_then(|state| self.soil_cover_state(SoilKind::Farmland, state))
                     else {
+                        self.soil_pending
+                            .insert((absolute.x, absolute.y, absolute.z, soil));
                         deferred_soil.push((order, (absolute, soil)));
                         continue;
                     };
@@ -15832,10 +15939,9 @@ impl LoadedSession {
                 } else {
                     false
                 };
-                self.soil_pending
-                    .remove(&(absolute.x, absolute.y, absolute.z, soil));
+
                 self.mark_tick_chunk_dirty(absolute.x, absolute.z);
-                executed += 1;
+
                 if matches_soil && (soil == SoilKind::Path || blocked) {
                     self.push_entities_from_soil(relative, absolute);
                     self.set(relative, self.states[2]);
@@ -63109,6 +63215,38 @@ pub(crate) mod tests {
             vec![2, 7]
         );
         assert_eq!(session.sand_pending.len(), 1);
+    }
+
+    #[test]
+    fn falling_callback_keeps_new_tick_for_an_already_collected_neighbor() {
+        let mut session = session();
+        let lower = IVec3::new(8, 2, 8);
+        let upper = lower + IVec3::Y;
+        let sand = session.intern_block(state("minecraft:sand", &[]));
+        assert!(session.set(lower, sand));
+        assert!(session.set(upper, sand));
+        session.sand_ticks.clear();
+        session.sand_pending.clear();
+        let origin = session.origin;
+        let saved = |relative: IVec3| SavedBlockTick {
+            block: "minecraft:sand".into(),
+            position: (origin + relative).to_array(),
+            delay: 0,
+            priority: 0,
+        };
+        session.enqueue_saved_sand(&[saved(lower), saved(upper)]);
+        session.advance_block_ticks();
+        let upper_absolute = session.origin + upper;
+        assert_eq!(session.falling_sand.len(), 2);
+        assert!(session.sand_ticks.iter().any(|(order, key)| {
+            order.0 == 2
+                && key.x == upper_absolute.x
+                && key.y == upper_absolute.y
+                && key.z == upper_absolute.z
+        }));
+        assert!(session.sand_pending.iter().any(|key| {
+            key.x == upper_absolute.x && key.y == upper_absolute.y && key.z == upper_absolute.z
+        }));
     }
 
     #[test]

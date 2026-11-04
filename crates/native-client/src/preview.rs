@@ -3626,6 +3626,7 @@ mod tests {
             42,
             7,
             true,
+            100,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3654,6 +3655,29 @@ mod tests {
         assert_eq!(postprocessor.progress().completed_steps, 1);
         let output = ready.postprocessed.as_ref().unwrap();
         assert_eq!(output.region.chunks, BTreeSet::from([center]));
+        let postprocessed_mesh = output.mesh.as_ref().expect("postprocessed mesh missing");
+        assert_eq!(postprocessed_mesh.revision, 100);
+        assert_eq!(postprocessed_mesh.targets.as_deref(), Some(&targets));
+        assert!(!Arc::ptr_eq(&postprocessed_mesh.world, &ready.mesh.world));
+        assert_eq!(
+            postprocessed_mesh.world.block(8, 15, 8),
+            output.region.world.block(8, 15, 8)
+        );
+        worker.submit(postprocessed_mesh.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mesh_result = loop {
+            if let Some(result) = worker.try_result().unwrap() {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "postprocessed mesh timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(mesh_result.revision, 100);
+        assert_eq!(mesh_result.targets.as_deref(), Some(&targets));
+        assert!(mesh_result.scene.unwrap().opaque_len() > 0);
         assert_eq!(
             output.chunks[&center].chunk.value.get("Status"),
             Some(&native_persistence::nbt::Tag::String(

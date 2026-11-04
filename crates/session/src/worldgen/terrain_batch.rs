@@ -1697,6 +1697,14 @@ impl FreshTerrainBatch {
         &self,
         processed: &super::PostprocessedGeneratedRegion,
     ) -> Result<VisibleLightSnapshot> {
+        self.postprocessed_light_snapshot_covering(processed, BTreeSet::new())
+    }
+
+    fn postprocessed_light_snapshot_covering(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        mut covered: BTreeSet<ChunkPos>,
+    ) -> Result<VisibleLightSnapshot> {
         self.validate_postprocessing(processed)?;
         let (min_y, max_y) = self.build_bounds()?;
         let bounds = native_world::block_light::LightBounds::new(min_y, max_y)
@@ -1705,7 +1713,7 @@ impl FreshTerrainBatch {
             .light_engine
             .as_ref()
             .context("light propagation is not sealed")?;
-        let mut covered = processed.chunks.clone();
+        covered.extend(processed.chunks.iter().copied());
         let mut checks = Vec::with_capacity(processed.sealed_checks.len());
         for pos in &processed.sealed_checks {
             let p = [pos.x, pos.y, pos.z];
@@ -1751,8 +1759,6 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, native_persistence::nbt::Tag>> {
-        use native_world::loaded::Section;
-
         let mut selected = BTreeSet::new();
         for pos in positions {
             ensure!(selected.insert(pos), "duplicate postprocessed chunk");
@@ -1763,6 +1769,7 @@ impl FreshTerrainBatch {
         }
         ensure!(!selected.is_empty(), "no postprocessed chunks selected");
         let light = self.postprocessed_light_snapshot(processed)?;
+        let world = self.materialize_postprocessed_light(processed, &light, &selected)?;
         let has_skylight = self
             .decoration
             .as_ref()
@@ -1772,39 +1779,7 @@ impl FreshTerrainBatch {
             light.has_block_channel() && light.has_sky_channel() == has_skylight,
             "postprocessing light channels differ from the dimension"
         );
-        let (min_y, max_y) = self.build_bounds()?;
-        let first = min_y.div_euclid(16);
-        let end = max_y.div_euclid(16);
-        let mut world = (*processed.world).clone();
-        for &pos in &selected {
-            let chunk = Arc::make_mut(
-                world
-                    .chunks
-                    .get_mut(&pos)
-                    .context("postprocessed chunk is missing")?,
-            );
-            ensure!(
-                chunk.position == pos,
-                "postprocessed chunk position differs"
-            );
-            for sy in first - 1..end + 1 {
-                let key = i8::try_from(sy).context("postprocessed light section out of range")?;
-                let (block, sky) = light
-                    .expanded_section(pos, sy)
-                    .context("postprocessed light column was not captured")?;
-                let section = chunk.sections.entry(key).or_insert_with(|| {
-                    Arc::new(Section {
-                        blocks: None,
-                        biomes: None,
-                        block_light: None,
-                        sky_light: None,
-                    })
-                });
-                let section = Arc::make_mut(section);
-                section.block_light = Some(block);
-                section.sky_light = Some(sky);
-            }
-        }
+        let (min_y, _) = self.build_bounds()?;
         let registry = self
             .light_registry
             .as_ref()
@@ -1829,6 +1804,96 @@ impl FreshTerrainBatch {
                 Ok((pos, sections))
             })
             .collect()
+    }
+
+    fn materialize_postprocessed_light(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        light: &VisibleLightSnapshot,
+        covered: &BTreeSet<ChunkPos>,
+    ) -> Result<Arc<World>> {
+        use native_world::loaded::Section;
+        let has_skylight = self
+            .decoration
+            .as_ref()
+            .context("generation lighting is missing")?
+            .has_skylight;
+        ensure!(
+            light.has_block_channel() && light.has_sky_channel() == has_skylight,
+            "postprocessing light channels differ from the dimension"
+        );
+        let (min_y, max_y) = self.build_bounds()?;
+        let first = min_y.div_euclid(16);
+        let end = max_y.div_euclid(16);
+        let mut world = (*processed.world).clone();
+        for &pos in covered {
+            let chunk = Arc::make_mut(
+                world
+                    .chunks
+                    .get_mut(&pos)
+                    .context("postprocessed chunk is missing")?,
+            );
+            ensure!(
+                chunk.position == pos,
+                "postprocessed chunk position differs"
+            );
+            for sy in first..end {
+                let section = chunk
+                    .sections
+                    .get(&i8::try_from(sy)?)
+                    .context("postprocessed block section is missing")?;
+                ensure!(
+                    section.blocks.is_some(),
+                    "postprocessed block data is missing"
+                );
+            }
+            for sy in first - 1..end + 1 {
+                let key = i8::try_from(sy).context("postprocessed light section out of range")?;
+                let (block, sky) = light
+                    .expanded_section(pos, sy)
+                    .context("postprocessed light column was not captured")?;
+                let section = chunk.sections.entry(key).or_insert_with(|| {
+                    Arc::new(Section {
+                        blocks: None,
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    })
+                });
+                let section = Arc::make_mut(section);
+                section.block_light = Some(block);
+                section.sky_light = Some(sky);
+            }
+        }
+        Ok(Arc::new(world))
+    }
+
+    /// Capture postprocessed blocks and light for targets and their 3x3
+    /// neighborhoods. This snapshot is intermediate and does not authorize saving.
+    pub fn postprocessed_render_snapshot(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        targets: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<Arc<World>> {
+        let targets: BTreeSet<_> = targets.into_iter().collect();
+        ensure!(!targets.is_empty(), "no postprocessed render targets");
+        let mut covered = BTreeSet::new();
+        for pos in targets {
+            ensure!(
+                processed.chunks.contains(&pos),
+                "render target was not postprocessed"
+            );
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    covered.insert(ChunkPos {
+                        x: pos.x.checked_add(dx).context("render X overflow")?,
+                        z: pos.z.checked_add(dz).context("render Z overflow")?,
+                    });
+                }
+            }
+        }
+        let light = self.postprocessed_light_snapshot_covering(processed, covered.clone())?;
+        self.materialize_postprocessed_light(processed, &light, &covered)
     }
 
     /// Prepare section, heightmap and tick data from the same completed pass.

@@ -5053,6 +5053,20 @@ mod tests {
         )
         .unwrap();
         let updated_light = batch.postprocessed_light_snapshot(&processed).unwrap();
+        let rendered = batch
+            .postprocessed_render_snapshot(&processed, [center])
+            .unwrap();
+        assert_eq!(rendered.block(8, 8, 8).unwrap().name, "minecraft:air");
+        assert_eq!(
+            rendered.light(8, 8, 8, false),
+            updated_light.block_light([8, 8, 8])
+        );
+        assert!(rendered.chunks.contains_key(&ChunkPos { x: -1, z: -1 }));
+        assert!(
+            batch
+                .postprocessed_render_snapshot(&processed, [distant])
+                .is_err()
+        );
         let section_light = changed
             .iter()
             .find(|section| section.y == 0)
@@ -5122,6 +5136,11 @@ mod tests {
             .light_checks
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
         assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        assert!(
+            batch
+                .postprocessed_render_snapshot(&processed, [center])
+                .is_err()
+        );
         assert!(
             batch
                 .postprocessed_missing_poi_snapshot(&processed, [center])

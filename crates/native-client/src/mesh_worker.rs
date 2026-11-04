@@ -14,6 +14,7 @@ use std::{
     thread,
 };
 
+#[derive(Clone)]
 pub struct MeshJob {
     pub revision: u64,
     pub biome_blend: u8,
@@ -25,6 +26,25 @@ pub struct MeshJob {
 }
 
 impl MeshJob {
+    /// Capture a postprocessing revision for exactly the selected render targets.
+    pub fn for_postprocessed(
+        batch: &native_session::worldgen::FreshTerrainBatch,
+        processed: &native_session::worldgen::PostprocessedGeneratedRegion,
+        targets: BTreeSet<ChunkPos>,
+        revision: u64,
+        biome_blend: u8,
+        origin: IVec3,
+    ) -> Result<Self> {
+        let world = batch.postprocessed_render_snapshot(processed, targets.iter().copied())?;
+        Ok(Self {
+            revision,
+            biome_blend,
+            origin,
+            world,
+            targets: Some(Arc::new(targets)),
+        })
+    }
+
     /// Build on the generation thread: taking a lit snapshot can be expensive.
     /// Callers must assign a new revision when the selected targets change.
     pub fn for_generated(

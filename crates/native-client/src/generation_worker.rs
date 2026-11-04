@@ -67,6 +67,8 @@ pub struct GenerationReady {
 pub struct PostprocessedGeneration {
     pub region: native_session::worldgen::PostprocessedGeneratedRegion,
     pub chunks: BTreeMap<ChunkPos, native_session::worldgen::PostprocessedChunkDraft>,
+    /// A fresh mesh snapshot for the postprocessed subset of the old targets.
+    pub mesh: Option<MeshJob>,
 }
 
 #[derive(Clone)]
@@ -683,6 +685,7 @@ impl GenerationWorker {
         game_time: i64,
         next_sub_tick: i64,
         water_source_conversion: bool,
+        mesh_revision: u64,
     ) -> Result<Self> {
         ensure!(!positions.is_empty(), "no postprocessing chunks");
         let unique: BTreeSet<_> = positions.iter().copied().collect();
@@ -693,6 +696,10 @@ impl GenerationWorker {
         ensure!(
             ready.postprocessed.is_none(),
             "generation was already postprocessed"
+        );
+        ensure!(
+            mesh_revision != ready.mesh.revision,
+            "postprocessed mesh needs a new revision"
         );
         Self::spawn(move |cancelled, progress| {
             if cancelled.load(Ordering::Relaxed) {
@@ -722,10 +729,34 @@ impl GenerationWorker {
             }
             let region = stage.finish()?;
             let chunks = ready.batch.postprocessed_chunk_drafts(&region, positions)?;
+            let targets: BTreeSet<_> = ready
+                .mesh
+                .targets
+                .as_deref()
+                .context("generated session targets missing")?
+                .intersection(&region.chunks)
+                .copied()
+                .collect();
+            let mesh = if targets.is_empty() {
+                None
+            } else {
+                Some(MeshJob::for_postprocessed(
+                    &ready.batch,
+                    &region,
+                    targets,
+                    mesh_revision,
+                    ready.mesh.biome_blend,
+                    ready.mesh.origin,
+                )?)
+            };
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            ready.postprocessed = Some(PostprocessedGeneration { region, chunks });
+            ready.postprocessed = Some(PostprocessedGeneration {
+                region,
+                chunks,
+                mesh,
+            });
             Ok(Some(ready))
         })
     }

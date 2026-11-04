@@ -59,6 +59,52 @@ pub struct PreparedInitialWorld {
 pub struct InitialWorldClocks {
     pub ticks: BTreeMap<ResourceId, i64>,
     pub advance_time: bool,
+    pub command_data: InitialClockCommandData,
+}
+
+/// Command registries are optional independently, matching existing-world
+/// loading when one unsupported data-pack definition cannot be decoded.
+#[derive(Default)]
+pub struct InitialClockCommandData {
+    pub default_clock: Option<(Arc<str>, Option<ResourceId>)>,
+    pub timelines:
+        Option<Arc<BTreeMap<ResourceId, native_resources::world_clock::TimelineDefinition>>>,
+    pub markers:
+        Option<Arc<BTreeMap<(ResourceId, ResourceId), native_resources::world_clock::TimeMarker>>>,
+}
+
+impl InitialClockCommandData {
+    fn load(resources: &mut ResourceStack, lighting: &GeneratedDimensionLighting) -> Self {
+        let default_clock = lighting.dimension_type.as_ref().and_then(|id| {
+            let name = format!("{}:{}", id.namespace, id.path);
+            match native_resources::world_clock::dimension_default_clock(resources, &name) {
+                Ok(clock) => Some((Arc::from(name), clock)),
+                Err(error) => {
+                    eprintln!("Dimension clock is unavailable: {error:#}");
+                    None
+                }
+            }
+        });
+        let timelines = match native_resources::world_clock::timelines(resources) {
+            Ok(timelines) => Some(Arc::new(timelines)),
+            Err(error) => {
+                eprintln!("Timelines are unavailable: {error:#}");
+                None
+            }
+        };
+        let markers = match native_resources::world_clock::time_markers(resources) {
+            Ok(markers) => Some(Arc::new(markers)),
+            Err(error) => {
+                eprintln!("Time markers are unavailable: {error:#}");
+                None
+            }
+        };
+        Self {
+            default_clock,
+            timelines,
+            markers,
+        }
+    }
 }
 
 /// All inputs for world-generation creatures, resolved from the same active
@@ -218,6 +264,7 @@ impl PreparedFreshGeneration {
         let initial_clocks = Arc::new(InitialWorldClocks {
             ticks: clocks.clone(),
             advance_time,
+            command_data: InitialClockCommandData::load(&mut self.resources, &self.lighting),
         });
         let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
             Some(PreparedCreatureSpawning::load(

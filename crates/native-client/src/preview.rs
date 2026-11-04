@@ -3580,6 +3580,7 @@ mod tests {
         let initial_clocks = Arc::new(crate::fresh_generation::InitialWorldClocks {
             ticks: BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), 0_i64)]),
             advance_time: true,
+            command_data: Default::default(),
         });
         let ready = crate::generation_worker::GenerationReady {
             batch,
@@ -3659,6 +3660,7 @@ mod tests {
         expanded.initial_clocks = Some(Arc::new(crate::fresh_generation::InitialWorldClocks {
             ticks: initial_clocks.ticks.clone(),
             advance_time: false,
+            command_data: Default::default(),
         }));
         let mut stopped = expanded.start_session(player).unwrap();
         stopped.update(std::time::Duration::from_millis(150));

@@ -303,6 +303,19 @@ impl GenerationReady {
                 .collect::<Result<BTreeMap<_, _>>>()?;
             session.set_registered_clocks(Arc::new(clocks.keys().cloned().collect()));
             session.set_world_clocks(clocks, initial.advance_time);
+            if let Some((dimension_type, clock)) = &initial.command_data.default_clock {
+                let clock = clock.as_ref().map(|id| DimensionId {
+                    namespace: id.namespace.clone(),
+                    path: id.path.clone(),
+                });
+                session.set_default_clock(Arc::clone(dimension_type), clock);
+            }
+            if let Some(timelines) = &initial.command_data.timelines {
+                session.set_timelines(Arc::clone(timelines));
+            }
+            if let Some(markers) = &initial.command_data.markers {
+                session.set_time_markers(Arc::clone(markers));
+            }
         }
         Ok(session)
     }
@@ -1453,13 +1466,13 @@ mod tests {
             pack.join("data/example/worldgen/world_preset/compact_disabled.json"),
             serde_json::to_vec(&disabled_preset)?,
         )?;
-        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0,"timelines":["example:creatures"]});
+        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0,"default_clock":"example:creatures","timelines":["example:creatures"]});
         std::fs::write(
             pack.join("data/example/dimension_type/compact.json"),
             serde_json::to_vec(&dimension)?,
         )?;
         std::fs::write(pack.join("data/example/world_clock/creatures.json"), b"{}")?;
-        let timeline = json!({"clock":"example:creatures","period_ticks":20,"tracks":{
+        let timeline = json!({"clock":"example:creatures","period_ticks":20,"time_markers":{"example:wake":7},"tracks":{
             "minecraft:gameplay/creature_world_gen_spawn_probability":{
                 "modifier":"override","keyframes":[{"ticks":0,"value":0.75},{"ticks":10,"value":0.0}]
             }
@@ -1539,7 +1552,7 @@ mod tests {
                 0,
                 None,
             )?;
-            let ready = match worker.result.recv_timeout(Duration::from_secs(60))? {
+            let mut ready = match worker.result.recv_timeout(Duration::from_secs(60))? {
                 GenerationResult::Ready(ready) => ready,
                 GenerationResult::Failed(error) => return Err(error),
                 GenerationResult::Cancelled => anyhow::bail!("initial world cancelled"),
@@ -1573,6 +1586,50 @@ mod tests {
                 }
             } else {
                 assert_eq!(count, 0);
+            }
+            if !spawn_mobs {
+                use native_session::{GameSession, PlayerCommand, SystemMessageKind};
+                let target = *targets.iter().next().unwrap();
+                let origin = ready.mesh.origin;
+                let player = native_session::PlayerState {
+                    position: glam::Vec3::new(
+                        (target.x * 16 + 8 - origin.x) as f32 + 0.5,
+                        (16 - origin.y) as f32,
+                        (target.z * 16 + 8 - origin.z) as f32 + 0.5,
+                    ),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: true,
+                    pose: native_session::PlayerPose::Standing,
+                };
+                let mut session = ready.start_session(player)?;
+                session.set_game_master_permission(true);
+                session.update(Duration::from_millis(150));
+                for text in [
+                    "/time query time",
+                    "/time query example:creatures",
+                    "/time set example:wake",
+                ] {
+                    session.submit_command(PlayerCommand::WorldTime(Arc::new(
+                        native_session::time_command::parse(text).unwrap(),
+                    )));
+                }
+                session.update(Duration::from_millis(50));
+                let snapshot = session.snapshot();
+                let messages = &snapshot.system_messages;
+                assert!(messages.iter().any(|message| matches!(
+                    &message.kind,
+                    SystemMessageKind::TimeClock { name, ticks } if name.as_ref() == "example:creatures" && (3..=4).contains(ticks)
+                )));
+                assert!(messages.iter().any(|message| matches!(
+                    &message.kind,
+                    SystemMessageKind::TimeTimeline { name, ticks, repetitions: false } if name.as_ref() == "example:creatures" && (3..=4).contains(ticks)
+                )));
+                assert!(matches!(
+                    messages.last().unwrap().kind,
+                    SystemMessageKind::TimeSaveUnavailable
+                ));
             }
             assert_eq!(worker.progress().phase, GenerationPhase::Ready);
         }

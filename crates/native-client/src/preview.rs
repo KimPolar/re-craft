@@ -3607,6 +3607,7 @@ mod tests {
             batch,
             mesh: job,
             worldgen_settings_draft: Some(worldgen_draft.clone()),
+            pack_snapshot: None,
             spawn_origin: Some(center),
             suggested_spawn: None,
             player_spawn: None,

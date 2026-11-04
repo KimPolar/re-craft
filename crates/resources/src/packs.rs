@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -129,6 +130,7 @@ pub struct ResourceStack {
     base: ZipArchive<File>,
     packs: Vec<Pack>,
     world_data: Option<crate::datapacks::DataPackStack>,
+    world_snapshot: Option<Arc<crate::datapack_snapshot::DataPackSnapshot>>,
 }
 
 impl ResourceStack {
@@ -137,6 +139,7 @@ impl ResourceStack {
             base: open_verified_client(minecraft_dir)?,
             packs: Vec::new(),
             world_data: None,
+            world_snapshot: None,
         })
     }
 
@@ -256,7 +259,26 @@ impl ResourceStack {
         let (stack, warnings) =
             crate::datapacks::DataPackStack::open(world_dir, settings, &mut self.base)?;
         self.world_data = Some(stack);
+        self.world_snapshot = None;
         Ok(warnings)
+    }
+
+    /// Resolve packs from a private snapshot retained for this stack's lifetime.
+    pub fn configure_snapshot_data(
+        &mut self,
+        snapshot: Arc<crate::datapack_snapshot::DataPackSnapshot>,
+        settings: &crate::datapacks::DataPackSettings,
+    ) -> Result<Vec<String>> {
+        snapshot.verify()?;
+        let (stack, warnings) =
+            crate::datapacks::DataPackStack::open(snapshot.world_path(), settings, &mut self.base)?;
+        self.world_data = Some(stack);
+        self.world_snapshot = Some(snapshot);
+        Ok(warnings)
+    }
+
+    pub fn data_pack_snapshot(&self) -> Option<Arc<crate::datapack_snapshot::DataPackSnapshot>> {
+        self.world_snapshot.clone()
     }
 
     pub fn selected_data_pack_ids(&self) -> Option<Vec<&str>> {

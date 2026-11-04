@@ -445,7 +445,9 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         .as_ref()
         .map(|(_, selection)| selection.clone());
     if let Some((world_dir, selection)) = settings.data_packs {
-        let warnings = resources.configure_world_data(&world_dir, &selection)?;
+        let snapshot =
+            Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(&world_dir)?);
+        let warnings = resources.configure_snapshot_data(snapshot, &selection)?;
         ensure!(
             warnings.is_empty(),
             "data pack selection needs attention: {}",
@@ -618,6 +620,12 @@ mod tests {
                 },
             )),
         })?;
+        // Later source edits must not change data read by generation workers.
+        std::fs::write(dimension_dir.join("overworld.json"), b"{}")?;
+        std::fs::write(
+            tag_dir.join("blocks_motion_in_heightmap.json"),
+            br#"{"replace":true,"values":["minecraft:stone"]}"#,
+        )?;
         let border = native_session::respawn::RespawnBorder {
             min_x: -100.0,
             max_x: 100.0,

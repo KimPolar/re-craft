@@ -59,6 +59,7 @@ pub struct GenerationReady {
     pub entity_collision_registry:
         Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
+    pub(crate) pack_snapshot: Option<Arc<native_resources::datapack_snapshot::DataPackSnapshot>>,
     pub(crate) initial_respawn: Option<InitialRespawnSettings>,
     /// Isolated postprocessing output; it is not yet a playable world.
     pub postprocessed: Option<PostprocessedGeneration>,
@@ -212,6 +213,11 @@ impl GenerationReady {
             draft.add_region(dimension.clone(), region)?;
         }
         let stage = draft.stage(parent)?;
+        match (&settings.packs, &self.pack_snapshot) {
+            (Some(_), Some(snapshot)) => snapshot.copy_into(stage.path())?,
+            (None, None) => {}
+            _ => anyhow::bail!("generation data pack snapshot does not match level settings"),
+        }
         Ok(StagedInitialWorld { initial, stage })
     }
 
@@ -1015,6 +1021,7 @@ impl GenerationWorker {
                 level_settings,
                 ..
             } = prepare()?;
+            let pack_snapshot = resources.data_pack_snapshot();
             let Some(mut ready) = generate_spawn_origin(
                 batch,
                 &mut resources,
@@ -1032,6 +1039,7 @@ impl GenerationWorker {
             ready.initial_clocks = Some(initial_clocks);
             ready.entity_collision_registry = entity_collision_registry;
             ready.level_settings = level_settings;
+            ready.pack_snapshot = pack_snapshot;
             let Some(mut ready) = complete_spawn_search(
                 ready,
                 &mut resources,
@@ -1111,7 +1119,13 @@ impl GenerationWorker {
                     return Ok(None);
                 };
                 ready.initial_respawn = initial_respawn;
+                if let Some(snapshot) = &ready.pack_snapshot {
+                    snapshot.verify()?;
+                }
                 return Ok(Some(ready));
+            }
+            if let Some(snapshot) = &ready.pack_snapshot {
+                snapshot.verify()?;
             }
             Ok(Some(ready))
         })
@@ -1426,6 +1440,7 @@ impl GenerationWorker {
                 batch,
                 mesh,
                 worldgen_settings_draft: None,
+                pack_snapshot: None,
                 spawn_origin: None,
                 suggested_spawn: None,
                 player_spawn: None,
@@ -2014,6 +2029,7 @@ fn generate_spawn_origin(
         batch,
         mesh,
         worldgen_settings_draft: None,
+        pack_snapshot: None,
         spawn_origin: Some(spawn),
         suggested_spawn: None,
         player_spawn: None,
@@ -2043,6 +2059,7 @@ fn expand_with_inputs(
         suggested_spawn: _,
         player_spawn: _,
         worldgen_settings_draft,
+        pack_snapshot,
         initial_clocks,
         entity_collision_registry,
         level_settings,
@@ -2139,6 +2156,7 @@ fn expand_with_inputs(
         batch,
         mesh,
         worldgen_settings_draft,
+        pack_snapshot,
         spawn_origin,
         suggested_spawn: None,
         player_spawn: None,
@@ -3239,7 +3257,16 @@ mod tests {
                     GenerationResult::Failed(error) => return Err(error),
                     GenerationResult::Cancelled => anyhow::bail!("postprocessing cancelled"),
                 };
+                let source_biome = pack.join("data/example/worldgen/biome/flat.json");
+                let expected_biome = std::fs::read(&source_biome)?;
+                std::fs::write(&source_biome, br#"{"changed_after_generation":true}"#)?;
                 let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+                let staged_biome = staged
+                    .stage
+                    .path()
+                    .join("datapacks/compact/data/example/worldgen/biome/flat.json");
+                assert_eq!(std::fs::read(staged_biome)?, expected_biome);
+                std::fs::write(&source_biome, &expected_biome)?;
                 let mut reader = native_persistence::world::WorldReader::open(
                     staged.stage.path(),
                     native_persistence::world::DimensionId::parse("overworld")?,
@@ -3260,6 +3287,36 @@ mod tests {
                     Some(&native_persistence::nbt::Tag::IntArray(
                         staged.initial.uuid.to_vec()
                     ))
+                );
+                let mut staged_resources = native_resources::packs::ResourceStack::open(
+                    &std::env::var_os("MINECRAFT_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap()),
+                )?;
+                let saved_packs = reader.data_pack_settings()?;
+                assert!(
+                    staged_resources
+                        .configure_world_data(
+                            staged.stage.path(),
+                            &native_resources::datapacks::DataPackSettings {
+                                enabled: saved_packs.enabled,
+                                disabled: saved_packs.disabled,
+                                enabled_features: saved_packs.enabled_features,
+                            }
+                        )?
+                        .is_empty()
+                );
+                assert!(
+                    staged_resources
+                        .selected_data_pack_ids()
+                        .unwrap()
+                        .contains(&"file/compact")
+                );
+                assert_eq!(
+                    staged_resources
+                        .read_data("data/example/worldgen/biome/flat.json")?
+                        .unwrap(),
+                    expected_biome
                 );
             }
         }

@@ -1,0 +1,273 @@
+//! Freeze world data packs before generation, without changing the source.
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Eq, PartialEq)]
+enum Entry {
+    Directory,
+    File { len: u64, hash: [u8; 32] },
+}
+
+/// A private copy of every world data pack, including disabled packs. The
+/// original may change after capture; generation reads only this snapshot.
+pub struct DataPackSnapshot {
+    directory: tempfile::TempDir,
+    present: bool,
+    manifest: BTreeMap<PathBuf, Entry>,
+}
+
+impl DataPackSnapshot {
+    pub fn capture(world: &Path) -> Result<Self> {
+        let world = world
+            .canonicalize()
+            .context("cannot open data pack source world")?;
+        ensure!(world.is_dir(), "data pack source is not a directory");
+        let source = world.join("datapacks");
+        let present = match fs::symlink_metadata(&source) {
+            Ok(metadata) => {
+                ensure!(
+                    ordinary(&metadata) && metadata.is_dir(),
+                    "data pack directory must be an ordinary directory"
+                );
+                ensure!(
+                    source.canonicalize()?.starts_with(&world),
+                    "data pack directory is outside the source world"
+                );
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).context("cannot inspect data pack directory"),
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("re-craft-packs-")
+            .tempdir()?;
+        let target = directory.path().join("datapacks");
+        let manifest = if present {
+            fs::create_dir(&target)?;
+            let copied = scan(&source, Some(&target))?;
+            ensure!(
+                scan(&source, None)? == copied,
+                "data packs changed while being copied"
+            );
+            ensure!(
+                scan(&target, None)? == copied,
+                "data pack snapshot did not round-trip"
+            );
+            copied
+        } else {
+            BTreeMap::new()
+        };
+        Ok(Self {
+            directory,
+            present,
+            manifest,
+        })
+    }
+
+    /// Root used by the resource stack; callers must not modify its files.
+    pub(crate) fn world_path(&self) -> &Path {
+        self.directory.path()
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let root = self.directory.path().join("datapacks");
+        if self.present {
+            let metadata = fs::symlink_metadata(&root).context("data pack snapshot is missing")?;
+            ensure!(
+                ordinary(&metadata) && metadata.is_dir(),
+                "data pack snapshot is not an ordinary directory"
+            );
+            ensure!(
+                scan(&root, None)? == self.manifest,
+                "data pack snapshot changed during generation"
+            );
+        } else {
+            ensure!(
+                matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "unexpected data pack snapshot directory"
+            );
+        }
+        Ok(())
+    }
+
+    /// Copy into a new staged world; on failure the caller must discard it.
+    pub fn copy_into(&self, world: &Path) -> Result<()> {
+        self.verify()?;
+        let target = world.join("datapacks");
+        ensure!(
+            matches!(fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "staged data pack directory already exists"
+        );
+        if self.present {
+            fs::create_dir(&target)?;
+            let copied = scan(&self.directory.path().join("datapacks"), Some(&target))?;
+            ensure!(
+                copied == self.manifest && scan(&target, None)? == self.manifest,
+                "staged data packs differ from the generation snapshot"
+            );
+            self.verify()?;
+        }
+        Ok(())
+    }
+}
+
+fn ordinary(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn scan(root: &Path, target: Option<&Path>) -> Result<BTreeMap<PathBuf, Entry>> {
+    let root = root.canonicalize()?;
+    let mut pending = vec![PathBuf::new()];
+    let mut manifest = BTreeMap::new();
+    while let Some(relative) = pending.pop() {
+        for item in fs::read_dir(root.join(&relative))? {
+            let item = item?;
+            let path = relative.join(item.file_name());
+            let source = root.join(&path);
+            let metadata = fs::symlink_metadata(&source)?;
+            ensure!(
+                ordinary(&metadata),
+                "data pack contains a symbolic link or reparse point: {}",
+                source.display()
+            );
+            ensure!(
+                source.canonicalize()?.starts_with(&root),
+                "data pack entry is outside its root"
+            );
+            let entry = if metadata.is_dir() {
+                if let Some(target) = target {
+                    fs::create_dir(target.join(&path))?;
+                }
+                pending.push(path.clone());
+                Entry::Directory
+            } else {
+                ensure!(metadata.is_file(), "data pack contains a non-file entry");
+                let mut input = File::open(&source)?;
+                let mut output = target
+                    .map(|target| {
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(target.join(&path))
+                    })
+                    .transpose()?;
+                let mut hash = Sha256::new();
+                let mut size = 0u64;
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let count = input.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..count]);
+                    if let Some(output) = &mut output {
+                        output.write_all(&buffer[..count])?;
+                    }
+                    size = size
+                        .checked_add(count as u64)
+                        .context("data pack size overflow")?;
+                }
+                if let Some(output) = &mut output {
+                    output.flush()?;
+                }
+                Entry::File {
+                    len: size,
+                    hash: hash.finalize().into(),
+                }
+            };
+            ensure!(
+                manifest.insert(path, entry).is_none(),
+                "duplicate data pack entry"
+            );
+            ensure!(manifest.len() <= 1_000_000, "too many data pack files");
+        }
+    }
+    Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_preserves_all_packs_and_is_independent_of_later_source_edits() {
+        let source = tempfile::tempdir().unwrap();
+        let packs = source.path().join("datapacks");
+        fs::create_dir_all(packs.join("active/data/example")).unwrap();
+        fs::create_dir_all(packs.join("disabled/empty")).unwrap();
+        fs::write(packs.join("active/pack.mcmeta"), b"metadata").unwrap();
+        fs::write(packs.join("active/data/example/value.json"), b"original").unwrap();
+        fs::write(packs.join("disabled.zip"), b"archive bytes").unwrap();
+        let snapshot = DataPackSnapshot::capture(source.path()).unwrap();
+        fs::write(packs.join("active/data/example/value.json"), b"modified").unwrap();
+        fs::write(packs.join("later.zip"), b"new").unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        snapshot.copy_into(stage.path()).unwrap();
+        let staged = stage.path().join("datapacks");
+        assert_eq!(
+            fs::read(staged.join("active/data/example/value.json")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(staged.join("disabled.zip")).unwrap(),
+            b"archive bytes"
+        );
+        assert!(staged.join("disabled/empty").is_dir());
+        assert!(!staged.join("later.zip").exists());
+        assert!(snapshot.copy_into(stage.path()).is_err());
+        assert_eq!(
+            fs::read(packs.join("active/data/example/value.json")).unwrap(),
+            b"modified"
+        );
+    }
+
+    #[test]
+    fn snapshot_detects_tampering_and_missing_directories() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("datapacks")).unwrap();
+        fs::write(source.path().join("datapacks/pack.zip"), b"original").unwrap();
+        let snapshot = DataPackSnapshot::capture(source.path()).unwrap();
+        fs::write(
+            snapshot.world_path().join("datapacks/pack.zip"),
+            b"different",
+        )
+        .unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        assert!(snapshot.verify().is_err());
+        assert!(snapshot.copy_into(stage.path()).is_err());
+        assert!(!stage.path().join("datapacks").exists());
+        let empty_source = tempfile::tempdir().unwrap();
+        let empty = DataPackSnapshot::capture(empty_source.path()).unwrap();
+        empty.copy_into(stage.path()).unwrap();
+        assert!(!stage.path().join("datapacks").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_rejects_directory_links_when_supported() {
+        let source = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("datapacks")).unwrap();
+        let link = source.path().join("datapacks/link");
+        if std::os::windows::fs::symlink_dir(other.path(), &link).is_ok() {
+            assert!(DataPackSnapshot::capture(source.path()).is_err());
+        }
+    }
+}

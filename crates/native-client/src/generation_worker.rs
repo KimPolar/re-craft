@@ -51,7 +51,7 @@ pub struct GenerationReady {
     pub suggested_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
     pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
-    pub session_settings: Option<crate::world_creation::InitialSessionSettings>,
+    pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,7 +286,8 @@ impl GenerationReady {
         )
         .map_err(anyhow::Error::msg)?;
         session.set_player_inventory(PlayerInventory::default());
-        if let Some(settings) = self.session_settings {
+        if let Some(level) = &self.level_settings {
+            let settings = level.session;
             session.set_game_mode(settings.mode);
             session.set_game_master_permission(settings.allow_commands);
             session.set_world_seed(Some(settings.seed));
@@ -382,7 +383,8 @@ impl GenerationWorker {
                 creatures,
                 spawn_mobs,
                 initial_clocks,
-                session_settings,
+                level_settings,
+                ..
             } = prepare()?;
             let Some(mut ready) = generate_spawn_origin(
                 batch,
@@ -399,7 +401,7 @@ impl GenerationWorker {
             };
             ready.worldgen_settings_draft = Some(worldgen_settings);
             ready.initial_clocks = Some(initial_clocks);
-            ready.session_settings = session_settings;
+            ready.level_settings = level_settings;
             let Some(mut ready) = complete_spawn_search(
                 ready,
                 &mut resources,
@@ -756,7 +758,7 @@ impl GenerationWorker {
                 spawn_origin: None,
                 suggested_spawn: None,
                 initial_clocks: None,
-                session_settings: None,
+                level_settings: None,
             }))
         })
     }
@@ -1134,7 +1136,7 @@ fn generate_spawn_origin(
         spawn_origin: Some(spawn),
         suggested_spawn: None,
         initial_clocks: None,
-        session_settings: None,
+        level_settings: None,
     }))
 }
 
@@ -1156,7 +1158,7 @@ fn expand_with_inputs(
         suggested_spawn: _,
         worldgen_settings_draft,
         initial_clocks,
-        session_settings,
+        level_settings,
     } = ready;
     ensure!(
         revision != mesh.revision,
@@ -1247,7 +1249,7 @@ fn expand_with_inputs(
         spawn_origin,
         suggested_spawn: None,
         initial_clocks,
-        session_settings,
+        level_settings,
     }))
 }
 
@@ -1561,10 +1563,13 @@ mod tests {
                         max_z: 100.0,
                     };
                     let mut inputs = prepared.into_new_world_inputs(border, spawn_mobs, true)?;
-                    let mut wrong_seed = frozen.session;
-                    wrong_seed.seed += 1;
-                    assert!(inputs.set_session_settings(wrong_seed).is_err());
-                    inputs.set_session_settings(frozen.session)?;
+                    let mut wrong_seed = frozen.level.clone();
+                    wrong_seed.session.seed += 1;
+                    assert!(inputs.set_level_settings(wrong_seed).is_err());
+                    let mut wrong_packs = frozen.level.clone();
+                    wrong_packs.packs.as_mut().unwrap().enabled.clear();
+                    assert!(inputs.set_level_settings(wrong_packs).is_err());
+                    inputs.set_level_settings(frozen.level)?;
                     assert_eq!(inputs.creatures.is_some(), spawn_mobs && !disabled);
                     assert_eq!(
                         inputs.initial_clocks.ticks.get(
@@ -1583,6 +1588,22 @@ mod tests {
                 GenerationResult::Failed(error) => return Err(error),
                 GenerationResult::Cancelled => anyhow::bail!("initial world cancelled"),
             };
+            let level = ready
+                .level_settings
+                .as_ref()
+                .context("level settings missing")?;
+            let level_draft = level.draft_level_data(
+                &native_persistence::world::RespawnData::default(),
+                123,
+                None,
+                false,
+            )?;
+            let level_data = level_draft.value.get("Data").unwrap();
+            assert_eq!(
+                level_data.get("GameType"),
+                Some(&native_persistence::nbt::Tag::Int(1))
+            );
+            assert!(level_data.get("DataPacks").is_some());
             let targets = ready.mesh.targets.as_deref().context("targets missing")?;
             assert_eq!(
                 ready.initial_clocks.as_ref().unwrap().ticks.get(

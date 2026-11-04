@@ -126,7 +126,61 @@ pub struct InitialSessionSettings {
 
 pub struct FrozenWorldCreation {
     pub generation: crate::fresh_generation::FreshGenerationSettings,
+    pub level: FrozenLevelSettings,
+}
+
+/// Metadata retained after the generator is moved to a background worker.
+#[derive(Clone, Debug)]
+pub struct FrozenLevelSettings {
+    pub name: String,
     pub session: InitialSessionSettings,
+    pub packs: Option<native_resources::datapacks::DataPackSettings>,
+}
+
+impl FrozenLevelSettings {
+    /// Create an in-memory draft only; this does not create a playable world.
+    pub fn draft_level_data(
+        &self,
+        spawn: &native_persistence::world::RespawnData,
+        last_played_ms: i64,
+        singleplayer_uuid: Option<[i32; 4]>,
+        initialized: bool,
+    ) -> anyhow::Result<native_persistence::nbt::NamedTag> {
+        use native_persistence::{
+            level_data::{
+                NewLevelData, NewWorldDifficulty, NewWorldGameType, draft_new_level_data,
+            },
+            world::Difficulty as SessionDifficulty,
+        };
+        let game_type = match self.session.mode {
+            native_session::GameMode::Survival => NewWorldGameType::Survival,
+            native_session::GameMode::Creative => NewWorldGameType::Creative,
+            native_session::GameMode::Adventure => NewWorldGameType::Adventure,
+            native_session::GameMode::Spectator => NewWorldGameType::Spectator,
+        };
+        let difficulty = match self.session.difficulty {
+            SessionDifficulty::Peaceful => NewWorldDifficulty::Peaceful,
+            SessionDifficulty::Easy => NewWorldDifficulty::Easy,
+            SessionDifficulty::Normal => NewWorldDifficulty::Normal,
+            SessionDifficulty::Hard => NewWorldDifficulty::Hard,
+        };
+        draft_new_level_data(&NewLevelData {
+            name: &self.name,
+            game_type,
+            difficulty,
+            hardcore: self.session.hardcore,
+            difficulty_locked: false,
+            allow_commands: self.session.allow_commands,
+            spawn,
+            game_time: 0,
+            initialized,
+            last_played_ms,
+            singleplayer_uuid,
+            packs: self.packs.as_ref(),
+            server_brands: &[],
+            was_modded: false,
+        })
+    }
 }
 
 /// Keep the chosen values even while hardcore temporarily overrides them.
@@ -270,6 +324,7 @@ impl WorldCreationSettings {
             Difficulty::Normal => SessionDifficulty::Normal,
             Difficulty::Hard => SessionDifficulty::Hard,
         };
+        let packs = data_packs.as_ref().map(|(_, packs)| packs.clone());
         let generation = crate::fresh_generation::FreshGenerationSettings {
             minecraft_dir,
             preset: format!("{}:{}", self.preset.namespace, self.preset.path),
@@ -288,53 +343,12 @@ impl WorldCreationSettings {
         };
         FrozenWorldCreation {
             generation,
-            session,
+            level: FrozenLevelSettings {
+                name: self.name.value().to_owned(),
+                session,
+                packs,
+            },
         }
-    }
-
-    /// Prepare initial metadata only after the caller has resolved the pack stack
-    /// and spawn. Other world files and chunks still need to be created.
-    pub fn draft_level_data(
-        &self,
-        spawn: &native_persistence::world::RespawnData,
-        last_played_ms: i64,
-        singleplayer_uuid: Option<[i32; 4]>,
-        packs: Option<&native_resources::datapacks::DataPackSettings>,
-        initialized: bool,
-    ) -> anyhow::Result<native_persistence::nbt::NamedTag> {
-        use native_persistence::level_data::{
-            NewLevelData, NewWorldDifficulty, NewWorldGameType, draft_new_level_data,
-        };
-        let game_type = if self.is_debug() {
-            NewWorldGameType::Spectator
-        } else {
-            match self.mode {
-                GameMode::Survival | GameMode::Hardcore => NewWorldGameType::Survival,
-                GameMode::Creative => NewWorldGameType::Creative,
-            }
-        };
-        let difficulty = match self.effective_difficulty() {
-            Difficulty::Peaceful => NewWorldDifficulty::Peaceful,
-            Difficulty::Easy => NewWorldDifficulty::Easy,
-            Difficulty::Normal => NewWorldDifficulty::Normal,
-            Difficulty::Hard => NewWorldDifficulty::Hard,
-        };
-        draft_new_level_data(&NewLevelData {
-            name: self.name.value(),
-            game_type,
-            difficulty,
-            hardcore: self.is_hardcore(),
-            difficulty_locked: false,
-            allow_commands: self.effective_allow_commands(),
-            spawn,
-            game_time: 0,
-            initialized,
-            last_played_ms,
-            singleplayer_uuid,
-            packs,
-            server_brands: &[],
-            was_modded: false,
-        })
     }
 }
 
@@ -388,10 +402,11 @@ mod tests {
         assert!(!state.effective_bonus_chest());
         assert!(!state.effective_generate_structures());
         let data = state
+            .freeze(PathBuf::from("game"), None)
+            .level
             .draft_level_data(
                 &native_persistence::world::RespawnData::default(),
                 0,
-                None,
                 None,
                 false,
             )
@@ -432,18 +447,69 @@ mod tests {
         settings.difficulty = Difficulty::Easy;
         settings.allow_commands = Some(true);
         let frozen = settings.freeze(PathBuf::from("game"), None);
-        assert_eq!(frozen.generation.seed, frozen.session.seed);
-        assert_eq!(frozen.session.mode, native_session::GameMode::Survival);
-        assert_eq!(frozen.session.difficulty, SessionDifficulty::Hard);
-        assert!(frozen.session.hardcore);
-        assert!(!frozen.session.allow_commands);
+        assert_eq!(frozen.generation.seed, frozen.level.session.seed);
+        assert_eq!(
+            frozen.level.session.mode,
+            native_session::GameMode::Survival
+        );
+        assert_eq!(frozen.level.session.difficulty, SessionDifficulty::Hard);
+        assert!(frozen.level.session.hardcore);
+        assert!(!frozen.level.session.allow_commands);
         settings.mode = GameMode::Creative;
-        assert!(frozen.session.hardcore);
+        assert!(frozen.level.session.hardcore);
         let frozen = settings.freeze(PathBuf::from("game"), None);
-        assert_eq!(frozen.session.mode, native_session::GameMode::Creative);
-        assert_eq!(frozen.session.difficulty, SessionDifficulty::Easy);
-        assert!(!frozen.session.hardcore);
-        assert!(frozen.session.allow_commands);
+        assert_eq!(
+            frozen.level.session.mode,
+            native_session::GameMode::Creative
+        );
+        assert_eq!(frozen.level.session.difficulty, SessionDifficulty::Easy);
+        assert!(!frozen.level.session.hardcore);
+        assert!(frozen.level.session.allow_commands);
+    }
+
+    #[test]
+    fn frozen_level_keeps_original_screen_and_pack_selection() {
+        use native_persistence::{nbt::Tag, world::RespawnData};
+        use native_resources::datapacks::DataPackSettings;
+        let mut settings = WorldCreationSettings::new(" First World ".into());
+        settings.mode = GameMode::Creative;
+        settings.difficulty = Difficulty::Easy;
+        let packs = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/custom".into()],
+            disabled: vec!["file/disabled".into()],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        let frozen = settings.freeze(PathBuf::from("game"), Some((PathBuf::from("world"), packs)));
+        settings.name = crate::chat_input::ChatInput::field("Changed");
+        settings.mode = GameMode::Hardcore;
+        settings.difficulty = Difficulty::Hard;
+        let document = frozen
+            .level
+            .draft_level_data(&RespawnData::default(), 123, None, true)
+            .unwrap();
+        let data = document.value.get("Data").unwrap();
+        assert_eq!(
+            data.get("LevelName"),
+            Some(&Tag::String("First World".into()))
+        );
+        assert_eq!(data.get("GameType"), Some(&Tag::Int(1)));
+        assert_eq!(data.get("allowCommands"), Some(&Tag::Byte(1)));
+        assert_eq!(
+            data.get("difficulty_settings").unwrap().get("difficulty"),
+            Some(&Tag::String("easy".into()))
+        );
+        let data_packs = data.get("DataPacks").unwrap();
+        assert!(
+            matches!(data_packs.get("Enabled"), Some(Tag::List { values, .. }) if values == &vec![Tag::String("vanilla".into()), Tag::String("file/custom".into())])
+        );
+        assert!(
+            matches!(data_packs.get("Disabled"), Some(Tag::List { values, .. }) if values == &vec![Tag::String("file/disabled".into())])
+        );
+        assert_eq!(
+            native_persistence::nbt::read(&native_persistence::nbt::write(&document).unwrap())
+                .unwrap(),
+            document
+        );
     }
 
     #[test]
@@ -455,7 +521,9 @@ mod tests {
         state.allow_commands = Some(true);
         let spawn = RespawnData::default();
         let metadata = state
-            .draft_level_data(&spawn, 123, None, None, false)
+            .freeze(PathBuf::from("game"), None)
+            .level
+            .draft_level_data(&spawn, 123, None, false)
             .unwrap();
         let data = metadata.value.get("Data").unwrap();
         assert_eq!(data.get("LevelName"), Some(&Tag::String("Test".into())));
@@ -471,7 +539,9 @@ mod tests {
         state.mode = GameMode::Creative;
         state.allow_commands = None;
         let metadata = state
-            .draft_level_data(&spawn, 123, None, None, true)
+            .freeze(PathBuf::from("game"), None)
+            .level
+            .draft_level_data(&spawn, 123, None, true)
             .unwrap();
         let data = metadata.value.get("Data").unwrap();
         assert_eq!(data.get("GameType"), Some(&Tag::Int(1)));

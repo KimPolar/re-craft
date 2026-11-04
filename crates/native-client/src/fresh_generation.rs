@@ -35,6 +35,7 @@ type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
 pub struct PreparedFreshGeneration {
     pub lighting: GeneratedDimensionLighting,
     worldgen_settings: native_persistence::nbt::NamedTag,
+    pack_selection: Option<DataPackSettings>,
     batch: FreshTerrainBatch,
     resources: ResourceStack,
     classify: Classifier,
@@ -52,24 +53,38 @@ pub struct PreparedInitialWorld {
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
     pub initial_clocks: Arc<InitialWorldClocks>,
-    pub session_settings: Option<crate::world_creation::InitialSessionSettings>,
+    pack_selection: Option<DataPackSettings>,
+    pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
 }
 
 impl PreparedInitialWorld {
     /// Tie the frozen screen settings to the exact seed used for this batch.
-    pub fn set_session_settings(
+    pub fn set_level_settings(
         &mut self,
-        settings: crate::world_creation::InitialSessionSettings,
+        settings: crate::world_creation::FrozenLevelSettings,
     ) -> Result<()> {
         ensure!(
             self.worldgen_settings
                 .value
                 .get("data")
                 .and_then(|data| data.get("seed"))
-                == Some(&native_persistence::nbt::Tag::Long(settings.seed)),
+                == Some(&native_persistence::nbt::Tag::Long(settings.session.seed)),
             "session seed differs from the prepared generator"
         );
-        self.session_settings = Some(settings);
+        let same_packs = match (&self.pack_selection, &settings.packs) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.enabled == b.enabled
+                    && a.disabled == b.disabled
+                    && a.enabled_features == b.enabled_features
+            }
+            _ => false,
+        };
+        ensure!(
+            same_packs,
+            "level data packs differ from the prepared generator"
+        );
+        self.level_settings = Some(settings);
         Ok(())
     }
 }
@@ -315,7 +330,8 @@ impl PreparedFreshGeneration {
             creatures,
             spawn_mobs,
             initial_clocks,
-            session_settings: None,
+            pack_selection: self.pack_selection,
+            level_settings: None,
         })
     }
 
@@ -368,6 +384,10 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         "bonus chest generation is not implemented"
     );
     let mut resources = ResourceStack::open(&settings.minecraft_dir)?;
+    let pack_selection = settings
+        .data_packs
+        .as_ref()
+        .map(|(_, selection)| selection.clone());
     if let Some((world_dir, selection)) = settings.data_packs {
         let warnings = resources.configure_world_data(&world_dir, &selection)?;
         ensure!(
@@ -427,6 +447,7 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
     Ok(PreparedFreshGeneration {
         lighting,
         worldgen_settings,
+        pack_selection,
         batch,
         resources,
         classify,

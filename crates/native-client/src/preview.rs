@@ -3596,7 +3596,11 @@ mod tests {
             spawn_origin: Some(center),
             suggested_spawn: None,
             initial_clocks: Some(Arc::clone(&initial_clocks)),
-            session_settings: Some(session_settings),
+            level_settings: Some(crate::world_creation::FrozenLevelSettings {
+                name: "World".into(),
+                session: session_settings,
+                packs: None,
+            }),
         };
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
@@ -3635,7 +3639,10 @@ mod tests {
             expanded.initial_clocks.as_ref().unwrap(),
             &initial_clocks
         ));
-        assert_eq!(expanded.session_settings, Some(session_settings));
+        assert_eq!(
+            expanded.level_settings.as_ref().unwrap().session,
+            session_settings
+        );
         assert_eq!(
             expanded.worldgen_settings_draft.as_ref(),
             Some(&worldgen_draft)

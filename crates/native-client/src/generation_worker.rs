@@ -527,6 +527,9 @@ impl GenerationReady {
         let mut session =
             LoadedSession::new(world, mesh.origin, BuildBounds { min_y, max_y }, player)
                 .map_err(anyhow::Error::msg)?;
+        if let Some(tags) = self.batch.leaf_support_tags() {
+            session.set_leaf_support_tags(tags);
+        }
         if let Some(processed) = &self.postprocessed {
             let mut selected = native_session::worldgen::chunk_ticks::ActivatedRegionTicks {
                 game_time: processed.activated_ticks.game_time,

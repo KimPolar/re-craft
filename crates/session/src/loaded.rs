@@ -834,6 +834,12 @@ pub struct LoadedSession {
     fluid_sequence: u64,
     generated_fluid_order: Option<GeneratedTickOrder>,
     generated_block_order: Option<GeneratedTickOrder>,
+    leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    leaf_ticks: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
+    leaf_deferred: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
+    leaf_deferred_revision: Option<u64>,
+    leaf_pending: BTreeSet<LeafTickKey>,
+    unresolved_leaf_shape: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -956,6 +962,64 @@ struct ButtonTickKey {
     kind: native_core::button::Button,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LeafKind(&'static str);
+
+impl LeafKind {
+    const ALL: [&'static str; 11] = [
+        "minecraft:oak_leaves",
+        "minecraft:spruce_leaves",
+        "minecraft:birch_leaves",
+        "minecraft:jungle_leaves",
+        "minecraft:acacia_leaves",
+        "minecraft:dark_oak_leaves",
+        "minecraft:mangrove_leaves",
+        "minecraft:cherry_leaves",
+        "minecraft:pale_oak_leaves",
+        "minecraft:azalea_leaves",
+        "minecraft:flowering_azalea_leaves",
+    ];
+
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|name| *name == id || name.strip_prefix("minecraft:") == Some(id))
+            .map(Self)
+    }
+
+    fn id(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LeafTickKey {
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: LeafKind,
+}
+
+fn leaf_state_distance(state: &BlockState) -> Option<u8> {
+    LeafKind::from_id(&state.name)?;
+    if state.properties.len() != 3
+        || !matches!(
+            state.properties.get("persistent").map(String::as_str),
+            Some("true" | "false")
+        )
+        || !matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    let raw = state.properties.get("distance")?;
+    raw.parse::<u8>()
+        .ok()
+        .filter(|distance| (1..=7).contains(distance) && distance.to_string() == *raw)
+}
+
 type ButtonTickQueue = BTreeMap<(i128, i32, i64, u64), ButtonTickKey>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -973,6 +1037,7 @@ enum GeneratedBlockTickKind {
     Sensor(bool),
     Bubble(BubbleTickKind),
     Soil(SoilKind),
+    Leaf(LeafKind),
 }
 
 impl GeneratedBlockTickKind {
@@ -982,6 +1047,9 @@ impl GeneratedBlockTickKind {
         }
         if let Some(kind) = native_core::button::Button::from_id(id) {
             return Some(Self::Button(kind));
+        }
+        if let Some(kind) = LeafKind::from_id(id) {
+            return Some(Self::Leaf(kind));
         }
         match id {
             "minecraft:redstone_lamp" => Some(Self::Lamp),
@@ -1029,6 +1097,7 @@ enum CollectedBlockTick {
     Ice((i32, i32, i32)),
     Bubble(BubbleTickKey),
     Sensor((i32, i32, i32, bool)),
+    Leaf(LeafTickKey),
 }
 
 impl CollectedBlockTick {
@@ -1040,6 +1109,7 @@ impl CollectedBlockTick {
             Self::Lamp((x, y, z)) => ("minecraft:redstone_lamp", [x, y, z]),
             Self::Ice((x, y, z)) => ("minecraft:frosted_ice", [x, y, z]),
             Self::Bubble(k) => (k.kind.id(), [k.x, k.y, k.z]),
+            Self::Leaf(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Sensor((x, y, z, calibrated)) => (
                 if calibrated {
                     "minecraft:calibrated_sculk_sensor"
@@ -1068,6 +1138,9 @@ fn generated_block_key(
         GeneratedBlockTickKind::Ice => CollectedBlockTick::Ice((x, y, z)),
         GeneratedBlockTickKind::Bubble(kind) => {
             CollectedBlockTick::Bubble(BubbleTickKey { x, y, z, kind })
+        }
+        GeneratedBlockTickKind::Leaf(kind) => {
+            CollectedBlockTick::Leaf(LeafTickKey { x, y, z, kind })
         }
         GeneratedBlockTickKind::Sensor(calibrated) => {
             CollectedBlockTick::Sensor((x, y, z, calibrated))
@@ -3985,6 +4058,10 @@ impl LoadedSession {
             "bubble column effects are not yet fully tracked for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_leaf_shape,
+            "leaf shape updates are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
         );
@@ -5632,6 +5709,14 @@ impl LoadedSession {
         self.snowy_tag = Some(tag);
     }
 
+    pub fn set_leaf_support_tags(
+        &mut self,
+        tags: Arc<native_resources::ore_feature::OreBlockTags>,
+    ) {
+        self.leaf_tags = Some(tags);
+        self.leaf_deferred_revision = None;
+    }
+
     pub fn set_bubble_column_tags(
         &mut self,
         tags: Arc<native_resources::fluid_tags::BubbleColumnTags>,
@@ -6055,6 +6140,11 @@ impl LoadedSession {
                     self.soil_pending.insert((x, y, z, kind));
                     self.soil_ticks.insert(order, (IVec3::new(x, y, z), kind));
                 }
+                GeneratedBlockTickKind::Leaf(kind) => {
+                    let key = LeafTickKey { x, y, z, kind };
+                    self.leaf_pending.insert(key);
+                    self.leaf_ticks.insert(order, key);
+                }
             }
         }
         for (chunk, tick, kind, source) in fluids {
@@ -6153,6 +6243,7 @@ impl LoadedSession {
         count_ticks!(self.ice_ticks, CollectedBlockTick::Ice);
         count_ticks!(self.bubble_ticks, CollectedBlockTick::Bubble);
         count_ticks!(self.sensor_ticks, CollectedBlockTick::Sensor);
+        count_ticks!(self.leaf_ticks, CollectedBlockTick::Leaf);
         ensure!(
             actual == expected,
             "session block ticks changed before ordering was installed"
@@ -6782,6 +6873,12 @@ impl LoadedSession {
             fluid_sequence: 0,
             generated_fluid_order: None,
             generated_block_order: None,
+            leaf_tags: None,
+            leaf_ticks: BTreeMap::new(),
+            leaf_deferred: BTreeMap::new(),
+            leaf_deferred_revision: None,
+            leaf_pending: BTreeSet::new(),
+            unresolved_leaf_shape: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -6866,6 +6963,7 @@ impl LoadedSession {
             session.enqueue_saved_sensors(&ticks);
             session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
+            session.enqueue_saved_leaves(&ticks);
         }
         let resident: Vec<_> = session.world.chunks.keys().copied().collect();
         for chunk in resident {
@@ -9555,6 +9653,10 @@ impl LoadedSession {
             "bubble column effects are not yet fully tracked for saving"
         );
         ensure!(
+            !self.unresolved_leaf_shape,
+            "leaf shape updates are not yet fully tracked for saving"
+        );
+        ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
         );
@@ -9575,6 +9677,7 @@ impl LoadedSession {
                 original.iter().all(|tick| {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
+                        || LeafKind::from_id(&tick.block).is_some()
                         || native_core::button::Button::from_id(&tick.block).is_some()
                         || BubbleTickKind::from_id(&tick.block).is_some()
                         || matches!(
@@ -9718,6 +9821,34 @@ impl LoadedSession {
                 .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
                 .all(|key| queued_bubbles.contains(key)),
             "bubble tick is missing its scheduled order"
+        );
+        let mut queued_leaves = BTreeSet::new();
+        for (order, &key) in self
+            .leaf_ticks
+            .iter()
+            .chain(&self.leaf_deferred)
+            .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+        {
+            queued_leaves.insert(key);
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
+                .context("leaf tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: key.kind.id().into(),
+                    position: [key.x, key.y, key.z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.leaf_pending
+                .iter()
+                .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+                .all(|key| queued_leaves.contains(key)),
+            "leaf tick is missing its scheduled order"
         );
         // Java packs saved ticks by sub-tick order, independently of target
         // time and priority. The shared sequence breaks new-tick ties.
@@ -14961,6 +15092,9 @@ impl LoadedSession {
         if bubble_column_drag(state).is_some() {
             return Some(fluid);
         }
+        if leaf_state_distance(state).is_some() {
+            return Some(fluid);
+        }
         if self.slab_top(state).is_none()
             && self.stair_voxels(id).is_none()
             && !(matches!(
@@ -15103,6 +15237,7 @@ impl LoadedSession {
         self.enqueue_saved_sensors(blocks);
         self.enqueue_saved_bubble(blocks);
         self.enqueue_saved_soil(blocks);
+        self.enqueue_saved_leaves(blocks);
         if let Some(order) = &mut fluid_order {
             let supported = fluids.iter().all(|tick| {
                 matches!(
@@ -15668,6 +15803,106 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_leaves(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
+        for (index, tick) in ticks.iter().enumerate() {
+            let Some(kind) = LeafKind::from_id(&tick.block) else {
+                continue;
+            };
+            let [x, y, z] = tick.position;
+            let key = LeafTickKey { x, y, z, kind };
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            self.leaf_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.leaf_ticks.insert(
+                (
+                    self.scheduled_tick() + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
+    fn schedule_leaf(&mut self, relative: IVec3, kind: LeafKind) {
+        let Some(absolute) = add(self.origin, relative) else {
+            return;
+        };
+        let key = LeafTickKey {
+            x: absolute.x,
+            y: absolute.y,
+            z: absolute.z,
+            kind,
+        };
+        let subtick = self.next_scheduled_sub_tick();
+        let duplicate = !self.leaf_pending.insert(key);
+        self.mirror_generated_block_tick(kind.id(), absolute, 1, subtick, duplicate);
+        if duplicate {
+            return;
+        }
+        self.mark_tick_chunk_dirty(key.x, key.z);
+        let sequence = self.block_tick_sequence;
+        self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+        self.leaf_ticks
+            .insert((self.scheduled_tick() + 1, 0, subtick, sequence), key);
+    }
+
+    fn leaf_neighbor_distance(&self, id: BlockStateId) -> Option<u8> {
+        static TAG: OnceLock<native_resources::packs::ResourceId> = OnceLock::new();
+        let tag = TAG.get_or_init(|| {
+            native_resources::packs::ResourceId::parse("minecraft:prevents_nearby_leaf_decay")
+                .expect("static leaf tag")
+        });
+        let state = self.world.state(id)?;
+        if self.leaf_tags.as_ref()?.contains(tag, &state.name).ok()? {
+            return Some(0);
+        }
+        if LeafKind::from_id(&state.name).is_some() {
+            leaf_state_distance(state)
+        } else if state.properties.contains_key("distance") {
+            None
+        } else {
+            Some(7)
+        }
+    }
+
+    fn updated_leaf_distance(&self, relative: IVec3) -> Option<u8> {
+        let mut distance = 7;
+        // Java Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
+        for direction in [
+            IVec3::NEG_Y,
+            IVec3::Y,
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+        ] {
+            let neighbor = add(relative, direction)?;
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                neighbor,
+                self.states[0],
+            ) else {
+                return None;
+            };
+            distance = distance.min(self.leaf_neighbor_distance(id)?.saturating_add(1));
+            if distance == 1 {
+                break;
+            }
+        }
+        Some(distance)
+    }
+
     fn schedule_button(&mut self, relative: IVec3, kind: native_core::button::Button) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -15870,6 +16105,7 @@ impl LoadedSession {
             self.sensor_ticks
                 .first_key_value()
                 .map(|(order, _)| order.0),
+            self.leaf_ticks.first_key_value().map(|(order, _)| order.0),
         ];
         if next
             .into_iter()
@@ -15931,6 +16167,9 @@ impl LoadedSession {
                 CollectedBlockTick::Sensor(_) => {
                     find_order!(self.sensor_ticks, CollectedBlockTick::Sensor, 6)
                 }
+                CollectedBlockTick::Leaf(_) => {
+                    find_order!(self.leaf_ticks, CollectedBlockTick::Leaf, 7)
+                }
             };
             let (_, position) = entry.identity();
             let relative = subtract(IVec3::from_array(position), self.origin)?;
@@ -15978,6 +16217,10 @@ impl LoadedSession {
                     self.sensor_ticks.remove(order);
                     self.sensor_pending.remove(&key);
                 }
+                CollectedBlockTick::Leaf(key) => {
+                    self.leaf_ticks.remove(order);
+                    self.leaf_pending.remove(&key);
+                }
             }
         }
         self.generated_block_order = Some(indexed);
@@ -15995,6 +16238,13 @@ impl LoadedSession {
         process_sensor: bool,
     ) {
         let revision = self.revision;
+        let process_leaves = process_sand
+            && process_buttons
+            && process_soil
+            && process_lamps
+            && process_ice
+            && process_bubble
+            && process_sensor;
         let ice_state = (
             revision,
             self.pending_light.len(),
@@ -16021,6 +16271,9 @@ impl LoadedSession {
         if process_sensor && self.sensor_deferred_revision != Some(revision) {
             self.sensor_ticks.append(&mut self.sensor_deferred);
         }
+        if process_leaves && self.leaf_deferred_revision != Some(revision) {
+            self.leaf_ticks.append(&mut self.leaf_deferred);
+        }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
@@ -16028,6 +16281,7 @@ impl LoadedSession {
         let mut deferred_ice = Vec::new();
         let mut deferred_bubble = Vec::new();
         let mut deferred_sensors = Vec::new();
+        let mut deferred_leaves = Vec::new();
         let indexed = if process_sand
             && process_buttons
             && process_soil
@@ -16066,6 +16320,9 @@ impl LoadedSession {
             let sensor_order = process_sensor
                 .then(|| self.sensor_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let leaf_order = process_leaves
+                .then(|| self.leaf_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
             let Some((order, kind)) = [
                 (sand_order, 0),
                 (button_order, 1),
@@ -16074,6 +16331,7 @@ impl LoadedSession {
                 (ice_order, 4),
                 (bubble_order, 5),
                 (sensor_order, 6),
+                (leaf_order, 7),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -16108,6 +16366,10 @@ impl LoadedSession {
                 6 => {
                     let key = self.sensor_ticks[&order];
                     IVec3::new(key.0, key.1, key.2)
+                }
+                7 => {
+                    let key = self.leaf_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
                 }
                 _ => unreachable!(),
             };
@@ -16176,6 +16438,13 @@ impl LoadedSession {
                         self.sensor_pending.remove(&key);
                     }
                     CollectedBlockTick::Sensor(key)
+                }
+                7 => {
+                    let key = self.leaf_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.leaf_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Leaf(key)
                 }
                 _ => unreachable!(),
             };
@@ -16656,6 +16925,54 @@ impl LoadedSession {
                         }
                     }
                 }
+            } else if let CollectedBlockTick::Leaf(key) = entry {
+                let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
+                    self.leaf_pending.insert(key);
+                    deferred_leaves.push((order, key));
+                    continue;
+                };
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    relative,
+                    self.states[0],
+                ) else {
+                    self.leaf_pending.insert(key);
+                    deferred_leaves.push((order, key));
+                    continue;
+                };
+                let Some(current) = self.world.state(id).cloned() else {
+                    self.leaf_pending.insert(key);
+                    deferred_leaves.push((order, key));
+                    continue;
+                };
+                if current.name != key.kind.id() {
+                    self.mark_tick_chunk_dirty(key.x, key.z);
+                    continue;
+                }
+                let Some(old_distance) = leaf_state_distance(&current) else {
+                    self.leaf_pending.insert(key);
+                    deferred_leaves.push((order, key));
+                    continue;
+                };
+                let Some(distance) = self.updated_leaf_distance(relative) else {
+                    self.leaf_pending.insert(key);
+                    deferred_leaves.push((order, key));
+                    continue;
+                };
+                if distance != old_distance {
+                    let mut next = current;
+                    next.properties
+                        .insert("distance".into(), distance.to_string());
+                    let next = self.intern_block(next);
+                    if !self.set(relative, next) {
+                        self.leaf_pending.insert(key);
+                        deferred_leaves.push((order, key));
+                        continue;
+                    }
+                }
+                self.mark_tick_chunk_dirty(key.x, key.z);
             } else {
                 let CollectedBlockTick::Soil(absolute, soil) = entry else {
                     unreachable!("all block tick kinds are handled");
@@ -16725,6 +17042,7 @@ impl LoadedSession {
             || !deferred_ice.is_empty()
             || !deferred_bubble.is_empty()
             || !deferred_sensors.is_empty()
+            || !deferred_leaves.is_empty()
         {
             self.generated_block_order = None;
         }
@@ -16757,6 +17075,10 @@ impl LoadedSession {
         if process_sensor {
             self.sensor_deferred.extend(deferred_sensors);
             self.sensor_deferred_revision = Some(revision);
+        }
+        if process_leaves {
+            self.leaf_deferred.extend(deferred_leaves);
+            self.leaf_deferred_revision = Some(revision);
         }
     }
 
@@ -17493,6 +17815,39 @@ impl LoadedSession {
             if let Some(kind) = sand {
                 self.schedule_sand(neighbor, kind);
             }
+            if let Some(kind) = self
+                .world
+                .state(id)
+                .and_then(|state| LeafKind::from_id(&state.name))
+            {
+                let Some(distance) = self.world.state(id).and_then(leaf_state_distance) else {
+                    self.unresolved_leaf_shape = true;
+                    continue;
+                };
+                if let Some(fluid) = self.simulated_fluid(id) {
+                    self.schedule_fluid(neighbor, fluid, settings.delay(fluid.kind));
+                }
+                if distance != 1 {
+                    self.schedule_leaf(neighbor, kind);
+                } else {
+                    let source = match cell(
+                        &self.world,
+                        self.origin,
+                        self.bounds,
+                        position,
+                        self.states[0],
+                    ) {
+                        Cell::State(source) => self.leaf_neighbor_distance(source),
+                        Cell::Missing => None,
+                    };
+                    match source {
+                        Some(0) => {}
+                        Some(_) => self.schedule_leaf(neighbor, kind),
+                        None => self.unresolved_leaf_shape = true,
+                    }
+                }
+                continue;
+            }
             self.schedule_column_shape_check(neighbor, direction, id, new);
             if let Some(fluid) = self.simulated_fluid(id)
                 && !(fluid.kind == FluidKind::Lava && self.react_lava(neighbor))
@@ -17769,6 +18124,11 @@ impl LoadedSession {
             return fluid_sim::Cell::BubbleWater(fluid);
         }
         if native_world::fluid::is_copper_grate(&state.name)
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::GrateWater(fluid);
+        }
+        if leaf_state_distance(state).is_some()
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
             return fluid_sim::Cell::GrateWater(fluid);
@@ -22985,6 +23345,292 @@ fn move_axis(
 pub(crate) mod tests {
     use super::*;
 
+    fn test_leaf_tags() -> Arc<native_resources::ore_feature::OreBlockTags> {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(
+                    (path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json")
+                        .then(|| br#"{"values":["minecraft:oak_log"]}"#.to_vec()),
+                )
+            }
+        }
+        let registry = LeafKind::ALL
+            .into_iter()
+            .chain(["minecraft:air", "minecraft:stone", "minecraft:oak_log"])
+            .map(str::to_owned)
+            .collect();
+        let tag = ResourceId::parse("minecraft:prevents_nearby_leaf_decay").unwrap();
+        Arc::new(
+            native_resources::ore_feature::OreBlockTags::load(
+                &mut Tags,
+                &registry,
+                &BTreeSet::from([tag]),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_leaf_state(name: &str, distance: u8, wet: bool) -> BlockState {
+        state(
+            name,
+            &[
+                ("distance", &distance.to_string()),
+                ("persistent", "false"),
+                ("waterlogged", if wet { "true" } else { "false" }),
+            ],
+        )
+    }
+
+    #[test]
+    fn saved_leaf_tick_defers_without_tags_and_resumes_with_order_preserved() {
+        for indexed in [false, true] {
+            let (mut world, origin, player) = fixture();
+            let home = *world.chunks.keys().next().unwrap();
+            let pos = origin + IVec3::new(8, 8, 8);
+            let leaf = world.intern_state(test_leaf_state("minecraft:oak_leaves", 7, false));
+            let log = world.intern_state(state("minecraft:oak_log", &[("axis", "y")]));
+            world.set_block_id(pos.x, pos.y, pos.z, leaf).unwrap();
+            world.set_block_id(pos.x, pos.y - 1, pos.z, log).unwrap();
+            world.saved_block_ticks.insert(
+                home,
+                vec![SavedBlockTick {
+                    block: "minecraft:oak_leaves".into(),
+                    position: pos.to_array(),
+                    delay: 1,
+                    priority: 0,
+                }],
+            );
+            let mut session = LoadedSession::new(
+                world,
+                origin,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session.set_random_tick_speed(0);
+            session.set_initial_game_time(42).unwrap();
+            if indexed {
+                assert_eq!(
+                    session.install_saved_tick_orders(&[home]).unwrap(),
+                    (true, true)
+                );
+            }
+            let before = session.snapshot();
+            session.update(TICK);
+            assert_eq!(session.leaf_deferred.len(), 1);
+            assert_eq!(session.draft_block_ticks(home).unwrap().len(), 1);
+            assert_eq!(
+                leaf_state_distance(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+                Some(7)
+            );
+            session.set_leaf_support_tags(test_leaf_tags());
+            session.update(TICK);
+            assert_eq!(
+                leaf_state_distance(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+                Some(1)
+            );
+            assert!(session.leaf_deferred.is_empty());
+            assert!(session.leaf_pending.is_empty());
+            assert_eq!(
+                leaf_state_distance(
+                    before
+                        .world
+                        .loaded()
+                        .unwrap()
+                        .block(pos.x, pos.y, pos.z)
+                        .unwrap()
+                ),
+                Some(7)
+            );
+            assert!(session.draft_block_ticks(home).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn wet_leaf_shape_schedules_water_before_leaf_only_when_needed() {
+        let mut session = session();
+        session.set_leaf_support_tags(test_leaf_tags());
+        let leaf_pos = IVec3::new(8, 8, 8);
+        let source_pos = leaf_pos + IVec3::NEG_Y;
+        let leaf = session.intern_block(test_leaf_state("minecraft:oak_leaves", 1, true));
+        let log = session.intern_block(state("minecraft:oak_log", &[("axis", "y")]));
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        let absolute = session.origin + leaf_pos;
+        Arc::make_mut(&mut session.world)
+            .set_block_id(absolute.x, absolute.y, absolute.z, leaf)
+            .unwrap();
+        assert!(session.set(source_pos, log));
+        assert_eq!(session.fluid_ticks.len(), 1);
+        assert!(session.leaf_ticks.is_empty());
+        assert!(session.set(source_pos, stone));
+        assert_eq!(session.fluid_ticks.len(), 1);
+        assert_eq!(session.leaf_ticks.len(), 1);
+        assert!(
+            session.fluid_ticks.keys().next().unwrap().2
+                < session.leaf_ticks.keys().next().unwrap().2
+        );
+    }
+
+    #[test]
+    fn generated_leaf_tick_executes_with_the_indexed_order() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let mut session = session();
+        session.set_leaf_support_tags(test_leaf_tags());
+        session.set_random_tick_speed(0);
+        let home = *session.world.chunks.keys().next().unwrap();
+        let pos = session.origin + IVec3::new(8, 8, 8);
+        let leaf = session.intern_block(test_leaf_state("minecraft:cherry_leaves", 7, false));
+        let log = session.intern_block(state("minecraft:oak_log", &[("axis", "y")]));
+        let world = Arc::make_mut(&mut session.world);
+        world.set_block_id(pos.x, pos.y, pos.z, leaf).unwrap();
+        world.set_block_id(pos.x, pos.y - 1, pos.z, log).unwrap();
+        let saved = SavedTick {
+            kind: "minecraft:cherry_leaves".into(),
+            position: pos.to_array(),
+            delay: 1,
+            priority: 0,
+        };
+        let region = RegionTicks::new(
+            BTreeMap::from([(
+                home,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(home, vec![saved]).unwrap(),
+                    fluids: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                },
+            )]),
+            42,
+            0,
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        session.install_generated_ticks(&snapshot).unwrap();
+        session
+            .install_generated_block_order(
+                &snapshot,
+                region
+                    .captured_indexed_queue(TickRegistry::Block, &[home])
+                    .unwrap(),
+            )
+            .unwrap();
+        session.update(TICK);
+        assert_eq!(
+            leaf_state_distance(session.world.block(pos.x, pos.y, pos.z).unwrap()),
+            Some(1)
+        );
+        assert!(session.leaf_pending.is_empty());
+        assert!(session.generated_block_order.is_some());
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn scheduled_leaf_distance_matches_java_26_3() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("LeafTickOracle.java");
+        std::fs::write(&source, include_str!("../tests/java/LeafTickOracle.java")).unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("LeafTickOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let actual: Vec<_> = stdout
+            .lines()
+            .skip_while(|line| *line != "BEGIN_RESULT")
+            .skip(1)
+            .take_while(|line| *line != "END_RESULT")
+            .collect();
+
+        let mut session = session();
+        session.set_leaf_support_tags(test_leaf_tags());
+        let stone = session.intern_block(state("minecraft:stone", &[]));
+        let log = session.intern_block(state("minecraft:oak_log", &[("axis", "y")]));
+        let leaf2 = session.intern_block(test_leaf_state("minecraft:oak_leaves", 2, false));
+        let leaf6 = session.intern_block(test_leaf_state("minecraft:oak_leaves", 6, false));
+        let directions = [
+            ("down", IVec3::NEG_Y),
+            ("up", IVec3::Y),
+            ("north", IVec3::NEG_Z),
+            ("south", IVec3::Z),
+            ("west", IVec3::NEG_X),
+            ("east", IVec3::X),
+        ];
+        let center = IVec3::new(8, 8, 8);
+        let mut expected = Vec::new();
+        for block in LeafKind::ALL {
+            for distance in [1, 4, 7] {
+                for wet in [false, true] {
+                    for (neighbor_index, neighbor) in
+                        [stone, log, leaf2, leaf6].into_iter().enumerate()
+                    {
+                        for (name, direction) in directions {
+                            let world = Arc::make_mut(&mut session.world);
+                            for (_, reset) in directions {
+                                let p = session.origin + center + reset;
+                                world.set_block_id(p.x, p.y, p.z, stone).unwrap();
+                            }
+                            let p = session.origin + center + direction;
+                            world.set_block_id(p.x, p.y, p.z, neighbor).unwrap();
+                            expected.push(format!(
+                                "{block} {distance} {wet} {neighbor_index} {name} {} {wet}",
+                                session.updated_leaf_distance(center).unwrap()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn gamemode_command_respects_permission_flight_and_save_guard() {
         let mut session = session();
@@ -23797,7 +24443,7 @@ pub(crate) mod tests {
                 z: -1_000_000,
             })
             .unwrap();
-        chunk.blocks.last_mut().unwrap().kind = "minecraft:oak_leaves".into();
+        chunk.blocks.last_mut().unwrap().kind = "minecraft:oak_sapling".into();
         assert!(session.install_generated_ticks(&ticks).is_err());
         assert_eq!(session.game_time, 0);
         assert!(!session.initial_game_time_set);
@@ -24197,7 +24843,7 @@ pub(crate) mod tests {
         world.saved_block_ticks.insert(
             home,
             vec![SavedBlockTick {
-                block: "minecraft:oak_leaves".into(),
+                block: "minecraft:oak_sapling".into(),
                 position: at,
                 delay: 5,
                 priority: 0,
@@ -24505,7 +25151,7 @@ pub(crate) mod tests {
             far,
             vec![
                 SavedBlockTick {
-                    block: "minecraft:oak_leaves".into(),
+                    block: "minecraft:oak_sapling".into(),
                     position: at,
                     delay: 10,
                     priority: 0,

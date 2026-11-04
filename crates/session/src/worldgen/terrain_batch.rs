@@ -456,6 +456,11 @@ impl GeneratedEntitySources {
 }
 
 impl FreshTerrainBatch {
+    /// The data-pack tag used for leaf distance checks in this batch.
+    pub fn leaf_support_tags(&self) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
+        self.decoration.as_ref()?.leaf_tags.clone()
+    }
+
     pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
         ensure!(self.is_complete(), "generation batch has pending work");
         let terrain = self

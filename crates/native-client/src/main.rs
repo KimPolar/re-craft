@@ -1453,6 +1453,17 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_falling_fire_tag(Arc::new(tag)),
                     Err(error) => eprintln!("Falling-block fire tag is unavailable: {error:#}"),
                 }
+                let leaf_tag = native_resources::packs::ResourceId::parse(
+                    "minecraft:prevents_nearby_leaf_decay",
+                )?;
+                match native_resources::ore_feature::OreBlockTags::load(
+                    &mut resources,
+                    &registry,
+                    &std::collections::BTreeSet::from([leaf_tag]),
+                ) {
+                    Ok(tags) => session.set_leaf_support_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Leaf support tag is unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::load_bounce_suppression_tag(
                     &mut resources,
                     &registry,

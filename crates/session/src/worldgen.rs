@@ -4126,6 +4126,7 @@ mod tests {
         }
         let original = batch.snapshot().unwrap();
         assert!(batch.spawned_section_data(center).is_err());
+        assert!(batch.spawned_chunk_draft(center, 42, vec![]).is_err());
         assert!(batch.spawned_heightmap_data(center).is_err());
         assert!(batch.spawned_block_entity_data(center).is_err());
         assert!(batch.spawned_tick_data(center).is_err());
@@ -4143,6 +4144,18 @@ mod tests {
         assert!(batch.is_complete());
         assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
+        let draft = batch.spawned_chunk_draft(center, 42, vec![]).unwrap();
+        assert_eq!(
+            draft.value.get("Status"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:spawn".into()
+            ))
+        );
+        assert_eq!(
+            draft.value.get("LastUpdate"),
+            Some(&native_persistence::nbt::Tag::Long(42))
+        );
+        assert!(draft.value.get("isLightOn").is_none());
         let native_persistence::nbt::Tag::List {
             values: entities, ..
         } = batch.spawned_block_entity_data(center).unwrap()

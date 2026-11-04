@@ -704,6 +704,37 @@ impl FreshTerrainBatch {
             .generated_postprocessing_data(pos)
     }
 
+    /// Assemble an intermediate SPAWN protochunk. The caller must provide the
+    /// complete feature-generated entity list and the world's current tick.
+    /// This is not a FULL chunk and must not be written as a playable world.
+    pub fn spawned_chunk_draft(
+        &mut self,
+        pos: ChunkPos,
+        last_update: i64,
+        entities: Vec<native_persistence::nbt::Tag>,
+    ) -> Result<native_persistence::nbt::NamedTag> {
+        let sections = self.spawned_section_data(pos)?;
+        let heightmaps = self.spawned_heightmap_data(pos)?;
+        let block_entities = self.spawned_block_entity_data(pos)?;
+        let (block_ticks, fluid_ticks) = self.spawned_tick_data(pos)?;
+        let postprocessing = self.spawned_postprocessing_data(pos)?;
+        native_persistence::generated_chunk::assemble_spawn_chunk(
+            native_persistence::generated_chunk::SpawnChunkComponents {
+                position: pos,
+                min_y: self.generator.min_y,
+                height: self.generator.height,
+                last_update,
+                sections,
+                heightmaps,
+                block_ticks,
+                fluid_ticks,
+                postprocessing,
+                block_entities,
+                entities,
+            },
+        )
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

@@ -165,7 +165,50 @@ fn trace() -> Vec<String> {
     );
     out.extend(collection_trace());
     out.extend(indexed_collection_trace());
+    out.extend(callback_reschedule_trace());
     out
+}
+
+fn callback_reschedule_trace() -> Vec<String> {
+    let pos = ChunkPos { x: 0, z: 0 };
+    let mut fluids = ChunkTicks::from_saved(pos, vec![]).unwrap();
+    fluids
+        .schedule(scheduled("water", [0, 0, 0], 0, 0, 0))
+        .unwrap();
+    fluids
+        .schedule(scheduled("water", [1, 0, 0], 0, 0, 1))
+        .unwrap();
+    let region = RegionTicks::new(
+        std::collections::BTreeMap::from([(
+            pos,
+            ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                fluids,
+            },
+        )]),
+        0,
+        2,
+    )
+    .unwrap();
+    let mut queue = region
+        .activated_indexed_queue(TickRegistry::Fluid, &[pos])
+        .unwrap();
+    let mut output = Vec::new();
+    for tick in queue.collect_due(0, 10, |_| true) {
+        output.push(format!("D1 {}", tick.position[0]));
+        if tick.position[0] == 0 {
+            assert_eq!(
+                queue
+                    .schedule(scheduled("water", [1, 0, 0], 0, 0, 2))
+                    .unwrap(),
+                ScheduleOutcome::Added
+            );
+        }
+    }
+    for tick in queue.collect_due(0, 10, |_| true) {
+        output.push(format!("D2 {}", tick.position[0]));
+    }
+    output
 }
 
 fn indexed_collection_trace() -> Vec<String> {
@@ -282,7 +325,12 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 146);
+    assert_eq!(lines.len(), 149);
+}
+
+#[test]
+fn collected_ticks_can_be_scheduled_again_during_callbacks() {
+    assert_eq!(callback_reschedule_trace(), ["D1 0", "D1 1", "D2 1"]);
 }
 
 #[test]

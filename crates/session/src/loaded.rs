@@ -17110,39 +17110,21 @@ impl LoadedSession {
         true
     }
 
-    fn advance_fluid_ticks(&mut self) {
-        let settings = self.fluid_settings();
-        let mut unloaded = Vec::new();
-        let mut executed = 0;
+    /// Collect before invoking fluid callbacks, as LevelTicks does. Unsupported
+    /// or unavailable cells remain queued until their state can be inspected.
+    fn collect_due_fluid_ticks(&mut self) -> Vec<((i128, i32, i64, u64), ScheduledFluid)> {
+        let mut collected = Vec::new();
+        let mut deferred = Vec::new();
         while let Some((&order, &scheduled)) = self.fluid_ticks.first_key_value() {
-            if order.0 > i128::from(self.tick) || executed >= 65_536 {
+            if order.0 > i128::from(self.tick) || collected.len() >= 65_536 {
                 break;
             }
             self.fluid_ticks.pop_first();
             let absolute = IVec3::new(scheduled.key.x, scheduled.key.y, scheduled.key.z);
-            let relative = IVec3::new(
-                match absolute.x.checked_sub(self.origin.x) {
-                    Some(x) => x,
-                    None => {
-                        unloaded.push((order, scheduled));
-                        continue;
-                    }
-                },
-                match absolute.y.checked_sub(self.origin.y) {
-                    Some(y) => y,
-                    None => {
-                        unloaded.push((order, scheduled));
-                        continue;
-                    }
-                },
-                match absolute.z.checked_sub(self.origin.z) {
-                    Some(z) => z,
-                    None => {
-                        unloaded.push((order, scheduled));
-                        continue;
-                    }
-                },
-            );
+            let Some(relative) = subtract(absolute, self.origin) else {
+                deferred.push((order, scheduled));
+                continue;
+            };
             let Cell::State(id) = cell(
                 &self.world,
                 self.origin,
@@ -17150,7 +17132,7 @@ impl LoadedSession {
                 relative,
                 self.states[0],
             ) else {
-                unloaded.push((order, scheduled));
+                deferred.push((order, scheduled));
                 continue;
             };
             // Preserve ticks for malformed bubble states rather than losing them.
@@ -17160,6 +17142,45 @@ impl LoadedSession {
                     state.name == "minecraft:bubble_column" && bubble_column_drag(state).is_none()
                 })
             {
+                deferred.push((order, scheduled));
+                continue;
+            }
+            self.fluid_pending.remove(&scheduled.key);
+            collected.push((order, scheduled));
+        }
+        self.fluid_ticks.extend(deferred);
+        collected
+    }
+
+    fn advance_fluid_ticks(&mut self) {
+        let settings = self.fluid_settings();
+        let mut unloaded = Vec::new();
+        let collected = self.collect_due_fluid_ticks();
+        for (order, scheduled) in collected {
+            let absolute = IVec3::new(scheduled.key.x, scheduled.key.y, scheduled.key.z);
+            let Some(relative) = subtract(absolute, self.origin) else {
+                self.fluid_pending.insert(scheduled.key);
+                unloaded.push((order, scheduled));
+                continue;
+            };
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                relative,
+                self.states[0],
+            ) else {
+                self.fluid_pending.insert(scheduled.key);
+                unloaded.push((order, scheduled));
+                continue;
+            };
+            if scheduled.key.kind == FluidKind::Water
+                && scheduled.key.source
+                && self.world.state(id).is_some_and(|state| {
+                    state.name == "minecraft:bubble_column" && bubble_column_drag(state).is_none()
+                })
+            {
+                self.fluid_pending.insert(scheduled.key);
                 unloaded.push((order, scheduled));
                 continue;
             }
@@ -17171,8 +17192,6 @@ impl LoadedSession {
                 self.unresolved_bubble_tick = true;
             }
             self.mark_tick_chunk_dirty(absolute.x, absolute.z);
-            self.fluid_pending.remove(&scheduled.key);
-            executed += 1;
             let Some(fluid) = self.simulated_fluid(id) else {
                 continue;
             };
@@ -62935,6 +62954,87 @@ pub(crate) mod tests {
         assert_eq!(session.fluid_ticks.len(), 2);
         let order: Vec<_> = session.fluid_ticks.keys().map(|key| key.2).collect();
         assert_eq!(order, vec![-2, -1]);
+    }
+
+    #[test]
+    fn fluid_collection_releases_all_due_identities_before_callbacks() {
+        let mut session = session();
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let a = IVec3::new(2, 2, 2);
+        let b = IVec3::new(3, 2, 2);
+        let absent = IVec3::new(16, 2, 2);
+        session.schedule_fluid(a, water, 0);
+        session.schedule_fluid(b, water, 0);
+        session.schedule_fluid(absent, water, 0);
+        let collected = session.collect_due_fluid_ticks();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(session.fluid_pending.len(), 1);
+        session.schedule_fluid(b, water, 0);
+        let b_absolute = session.origin + b;
+        assert!(
+            session
+                .fluid_ticks
+                .values()
+                .any(|tick| tick.key.x == b_absolute.x && tick.key.z == b_absolute.z)
+        );
+        assert_eq!(session.fluid_ticks.len(), 2);
+        assert_eq!(session.fluid_pending.len(), 2);
+    }
+
+    #[test]
+    fn fluid_callback_keeps_new_tick_for_an_already_collected_neighbor() {
+        let mut session = fluid_flow_session(FluidKind::Water, false);
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        let source = IVec3::new(8, 2, 8);
+        let middle = IVec3::new(9, 2, 8);
+        let neighbor = IVec3::new(10, 2, 8);
+        let water_id = session.intern_liquid(water);
+        assert!(session.set(middle, session.states[0]));
+        assert!(session.set(neighbor, water_id));
+        for wall in [
+            source + IVec3::NEG_X,
+            source + IVec3::NEG_Z,
+            source + IVec3::Z,
+            middle + IVec3::NEG_Y,
+            neighbor + IVec3::X,
+            neighbor + IVec3::NEG_Z,
+            neighbor + IVec3::Z,
+            neighbor + IVec3::NEG_Y,
+        ] {
+            assert!(session.set(wall, session.states[3]));
+        }
+        session.fluid_ticks.clear();
+        session.fluid_pending.clear();
+        session.schedule_fluid(source, water, 0);
+        session.schedule_fluid(neighbor, water, 0);
+        session.advance_fluid_ticks();
+        assert!(matches!(
+            session.simulation_cell(middle),
+            fluid_sim::Cell::Fluid(_)
+        ));
+        let absolute = session.origin + neighbor;
+        assert!(session.fluid_ticks.iter().any(|(order, tick)| {
+            tick.key.x == absolute.x
+                && tick.key.y == absolute.y
+                && tick.key.z == absolute.z
+                && order.0 == 5
+        }));
+        assert!(
+            session
+                .fluid_pending
+                .iter()
+                .any(|key| key.x == absolute.x && key.y == absolute.y && key.z == absolute.z)
+        );
     }
 
     #[test]

@@ -113,5 +113,17 @@ public class GeneratedChunkTicksOracle {
                 }
             });
         }
+        var collectBeforeRun = new LevelTicks<String>(p -> true);
+        var water = new LevelChunkTicks<String>();
+        water.schedule(tick("minecraft:water", new BlockPos(0, 0, 0), 0, TickPriority.NORMAL, 0));
+        water.schedule(tick("minecraft:water", new BlockPos(1, 0, 0), 0, TickPriority.NORMAL, 1));
+        collectBeforeRun.addContainer(new ChunkPos(0, 0), water);
+        collectBeforeRun.tick(0, 10, (p, type) -> {
+            System.out.println("D1 " + p.getX());
+            if (p.getX() == 0) {
+                collectBeforeRun.schedule(tick("minecraft:water", new BlockPos(1, 0, 0), 0, TickPriority.NORMAL, 2));
+            }
+        });
+        collectBeforeRun.tick(0, 10, (p, type) -> System.out.println("D2 " + p.getX()));
     }
 }

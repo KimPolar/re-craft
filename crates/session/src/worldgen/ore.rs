@@ -1708,30 +1708,14 @@ impl DecorationRegion<'_> {
         block_position: [i32; 3],
         record: super::GeneratedEntityRecord,
     ) -> Result<()> {
-        let result = (|| {
-            let target = chunk(block_position);
-            ensure!(
-                self.world.chunks.contains_key(&target),
-                "generated entity destination chunk is missing"
-            );
-            if let super::GeneratedEntityRecord::Saved(data) = record {
-                ensure!(
-                    matches!(data, native_persistence::nbt::Tag::Compound(_)),
-                    "generated entity data must be a compound"
-                );
-                native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
-                    name: "".into(),
-                    value: data.clone(),
-                })?;
-                Arc::make_mut(
-                    Arc::make_mut(&mut self.generated_entities)
-                        .entry(target)
-                        .or_default(),
-                )
-                .push(data);
-            }
-            Ok(())
-        })();
+        let result = super::stage_generated_entity(
+            &self.world,
+            &mut self.generated_entities,
+            super::GeneratedEntityAddition {
+                block_position,
+                record,
+            },
+        );
         if result.is_err() {
             self.failed = true;
         }

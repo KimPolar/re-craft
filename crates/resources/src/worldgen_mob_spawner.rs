@@ -51,6 +51,7 @@ struct Group {
     start_z: i32,
 }
 
+#[derive(Clone)]
 pub struct ChunkCreatureSpawner {
     random: LegacyRandom,
     spawns: CreatureSpawns,

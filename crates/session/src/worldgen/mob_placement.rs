@@ -72,6 +72,7 @@ pub struct GeneratedCreatureProbe {
     constructed_yaw: Option<f32>,
     instance_rules_passed: bool,
     obstruction_passed: bool,
+    finalized: bool,
 }
 
 impl GeneratedCreatureProbe {
@@ -93,6 +94,7 @@ impl GeneratedCreatureProbe {
             constructed_yaw: None,
             instance_rules_passed: false,
             obstruction_passed: false,
+            finalized: false,
         }
     }
 
@@ -271,6 +273,32 @@ impl GeneratedCreatureProbe {
         Ok(GeneratedCreatureObstructionProgress::NeedsFinalization(
             GeneratedCreaturePose { geometry, yaw },
         ))
+    }
+
+    /// Record a genuinely constructed and finalized entity and its passenger
+    /// traversal. The caller supplies the real final block positions and
+    /// serialized results in Java traversal order, after all species-specific
+    /// initialization. Failure leaves both planner and batch unchanged.
+    pub fn record_finalized(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        batch: &mut FreshTerrainBatch,
+        additions: Vec<super::GeneratedEntityAddition>,
+    ) -> Result<()> {
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "creature is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed creature is no longer pending"
+        );
+        let mut next = planner.clone();
+        next.finish_entity(true)?;
+        batch.record_finalized_creature(&self.attempt, additions)?;
+        *planner = next;
+        self.finalized = true;
+        Ok(())
     }
 
     /// Resolve one pending planner attempt against generated blocks. Missing

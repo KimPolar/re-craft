@@ -132,6 +132,53 @@ impl FreshTerrainBatch {
         )
     }
 
+    /// Records captured so far; unimplemented entity sources may be missing.
+    pub fn recorded_generated_entities(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<&[native_persistence::nbt::Tag]> {
+        ensure!(!self.failed, "generation batch failed");
+        self.terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .recorded_generated_entities(pos)
+    }
+
+    /// Stage all addFreshEntityWithPassengers visits and publish only after
+    /// every destination and compound has been validated.
+    pub(super) fn record_finalized_creature(
+        &mut self,
+        attempt: &native_resources::worldgen_mob_spawner::CreatureAttempt,
+        additions: Vec<super::GeneratedEntityAddition>,
+    ) -> Result<()> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before recording a creature"
+        );
+        let center = ChunkPos {
+            x: attempt.x.div_euclid(16),
+            z: attempt.z.div_euclid(16),
+        };
+        ensure!(
+            self.schedule.completed(center) == Some(GenerationStage::Light),
+            "creature requires a light-complete chunk"
+        );
+        ensure!(
+            !additions.is_empty(),
+            "finalized creature traversal is missing"
+        );
+        let terrain = self
+            .terrain
+            .as_mut()
+            .context("generated terrain is missing")?;
+        let mut staged = Arc::clone(&terrain.generated_entities);
+        for addition in additions {
+            super::stage_generated_entity(&terrain.world, &mut staged, addition)?;
+        }
+        terrain.generated_entities = staged;
+        Ok(())
+    }
+
     /// The supplied generator must have been constructed without structure
     /// adjustment and for a new world with structures explicitly disabled.
     pub fn new_without_structures(

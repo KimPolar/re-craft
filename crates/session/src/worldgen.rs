@@ -67,6 +67,42 @@ pub enum GeneratedEntityRecord {
     Saved(native_persistence::nbt::Tag),
 }
 
+/// One runtime entity visited by Java's addFreshEntityWithPassengers.
+pub struct GeneratedEntityAddition {
+    pub block_position: [i32; 3],
+    pub record: GeneratedEntityRecord,
+}
+
+fn stage_generated_entity(
+    world: &native_world::loaded::World,
+    records: &mut Arc<
+        BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>,
+    >,
+    addition: GeneratedEntityAddition,
+) -> Result<()> {
+    let [x, _, z] = addition.block_position;
+    let target = native_world::loaded::ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    };
+    ensure!(
+        world.chunks.contains_key(&target),
+        "generated entity destination chunk is missing"
+    );
+    if let GeneratedEntityRecord::Saved(data) = addition.record {
+        ensure!(
+            matches!(data, native_persistence::nbt::Tag::Compound(_)),
+            "generated entity data must be a compound"
+        );
+        native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: data.clone(),
+        })?;
+        Arc::make_mut(Arc::make_mut(records).entry(target).or_default()).push(data);
+    }
+    Ok(())
+}
+
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
     chunk: [i32; 2],
@@ -4008,7 +4044,7 @@ mod tests {
                 &mob_height_tags,
             )
             .unwrap();
-            let mut denied = GeneratedCreatureProbe::new(attempt, 0, false, true);
+            let mut denied = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
             loop {
                 match denied.poll(&mut planner, &mut view, 1).unwrap() {
                     GeneratedCreatureProbeProgress::Pending => continue,
@@ -4019,6 +4055,69 @@ mod tests {
                 }
             }
             assert!(denied.poll(&mut planner, &mut view, 1).is_err());
+            drop(view);
+
+            let position = geometry
+                .position
+                .map(|coordinate| coordinate.floor() as i32);
+            let saved = || GeneratedEntityAddition {
+                block_position: position,
+                record: GeneratedEntityRecord::Saved(native_persistence::nbt::Tag::Compound(vec![
+                    ("test".into(), native_persistence::nbt::Tag::Int(7)),
+                ])),
+            };
+            assert!(
+                bright
+                    .record_finalized(&mut bright_planner, &mut batch, vec![])
+                    .is_err()
+            );
+            assert!(
+                bright
+                    .record_finalized(
+                        &mut bright_planner,
+                        &mut batch,
+                        vec![
+                            saved(),
+                            GeneratedEntityAddition {
+                                block_position: [1_000_000, 0, 0],
+                                record: GeneratedEntityRecord::Passenger,
+                            },
+                        ]
+                    )
+                    .is_err()
+            );
+            assert!(
+                batch
+                    .recorded_generated_entities(center)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(bright_planner.created_attempt(), Some(attempt));
+            let mut expected_planner = bright_planner.clone();
+            expected_planner.finish_entity(true).unwrap();
+            bright
+                .record_finalized(
+                    &mut bright_planner,
+                    &mut batch,
+                    vec![
+                        saved(),
+                        GeneratedEntityAddition {
+                            block_position: position,
+                            record: GeneratedEntityRecord::Passenger,
+                        },
+                    ],
+                )
+                .unwrap();
+            assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+            assert_eq!(
+                bright_planner.next(0).unwrap(),
+                expected_planner.next(0).unwrap()
+            );
+            assert!(
+                bright
+                    .record_finalized(&mut bright_planner, &mut batch, vec![saved()])
+                    .is_err()
+            );
         }
         assert_eq!(
             batch.schedule().completed(center),
@@ -4173,7 +4272,19 @@ mod tests {
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
         let draft = batch.spawned_chunk_draft(center, 42, vec![]).unwrap();
         let recorded_draft = batch.spawned_recorded_chunk_draft(center, 42).unwrap();
-        assert_eq!(draft, recorded_draft);
+        let native_persistence::nbt::Tag::List { values, .. } =
+            recorded_draft.value.get("entities").unwrap()
+        else {
+            panic!("missing generated entities")
+        };
+        assert_eq!(
+            values,
+            &vec![native_persistence::nbt::Tag::Compound(vec![(
+                "test".into(),
+                native_persistence::nbt::Tag::Int(7)
+            ),])]
+        );
+        assert_ne!(draft, recorded_draft);
         assert_eq!(
             draft.value.get("Status"),
             Some(&native_persistence::nbt::Tag::String(

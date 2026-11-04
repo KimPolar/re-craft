@@ -237,6 +237,12 @@ pub struct ActiveRegionQueue {
     chunks: BTreeMap<ChunkPos, ChunkTicks>,
 }
 
+/// Activated containers and the stateful Java-order index of their next ticks.
+pub struct IndexedRegionQueue {
+    queue: ActiveRegionQueue,
+    index: super::tick_index::LevelTickIndex,
+}
+
 impl ActiveRegionQueue {
     fn compare_heads(&self, left: ChunkPos, right: ChunkPos) -> Ordering {
         let a = self.chunks[&left]
@@ -303,6 +309,15 @@ impl ActiveRegionQueue {
             ensure!(self.chunks.contains_key(pos), "unknown tick container");
             ensure!(seen.insert(*pos), "duplicate tick container");
         }
+        Ok(self.collect_validated(traversal, time, limit).0)
+    }
+
+    fn collect_validated(
+        &mut self,
+        traversal: &[ChunkPos],
+        time: i64,
+        limit: usize,
+    ) -> (Vec<ScheduledTick>, Vec<(ChunkPos, i64)>) {
         let mut heap = Vec::new();
         for &pos in traversal {
             if self.chunks[&pos]
@@ -313,6 +328,7 @@ impl ActiveRegionQueue {
             }
         }
         let mut collected = Vec::new();
+        let mut reschedule = Vec::new();
         while collected.len() < limit {
             let Some(pos) = self.pop_container(&mut heap) else {
                 break;
@@ -333,15 +349,20 @@ impl ActiveRegionQueue {
                 }
                 collected.push(self.chunks.get_mut(&pos).unwrap().poll().unwrap());
             }
-            if collected.len() < limit
-                && self.chunks[&pos]
-                    .peek()
-                    .is_some_and(|tick| tick.trigger <= time)
-            {
-                self.push_container(&mut heap, pos);
+            if let Some(next) = self.chunks[&pos].peek() {
+                if collected.len() < limit && next.trigger <= time {
+                    self.push_container(&mut heap, pos);
+                } else {
+                    reschedule.push((pos, next.trigger));
+                }
             }
         }
-        Ok(collected)
+        // Java iterates PriorityQueue's backing array here; it does not poll
+        // the heap. This order affects the hash index on the next game tick.
+        for pos in heap {
+            reschedule.push((pos, self.chunks[&pos].peek().unwrap().trigger));
+        }
+        (collected, reschedule)
     }
 
     /// Schedule after collection or execution, as with LevelTicks.schedule.
@@ -358,6 +379,46 @@ impl ActiveRegionQueue {
         } else {
             ScheduleOutcome::Duplicate
         })
+    }
+}
+
+impl IndexedRegionQueue {
+    /// Collect due ticks in Java's container-map and intra-tick order.
+    pub fn collect_due(
+        &mut self,
+        time: i64,
+        limit: usize,
+        tickable: impl FnMut(ChunkPos) -> bool,
+    ) -> Vec<ScheduledTick> {
+        let traversal = self.index.take_due(time, tickable);
+        let (ticks, reschedule) = self.queue.collect_validated(&traversal, time, limit);
+        for (pos, trigger) in reschedule {
+            self.index.insert(pos, trigger);
+        }
+        ticks
+    }
+
+    /// Update the index only when scheduling changes a container's head.
+    pub fn schedule(&mut self, tick: ScheduledTick) -> Result<ScheduleOutcome> {
+        let pos = ChunkPos {
+            x: tick.position[0].div_euclid(16),
+            z: tick.position[2].div_euclid(16),
+        };
+        let before = self
+            .queue
+            .chunks
+            .get(&pos)
+            .and_then(ChunkTicks::peek)
+            .cloned();
+        let outcome = self.queue.schedule(tick)?;
+        if outcome == ScheduleOutcome::Added {
+            let after = self.queue.chunks[&pos].peek();
+            if after != before.as_ref() {
+                self.index
+                    .insert(pos, after.expect("added tick has a head").trigger);
+            }
+        }
+        Ok(outcome)
     }
 }
 
@@ -435,6 +496,34 @@ impl RegionTicks {
                 })
                 .collect(),
         }
+    }
+
+    /// Activate registered containers in their actual registration order.
+    /// Callers must supply every container exactly once, since Java's map
+    /// layout depends on insertion and removal history.
+    pub fn activated_indexed_queue(
+        &self,
+        registry: TickRegistry,
+        registration: &[ChunkPos],
+    ) -> Result<IndexedRegionQueue> {
+        let queue = self.activated_queue(registry);
+        let mut seen = BTreeSet::new();
+        let mut index = super::tick_index::LevelTickIndex::default();
+        for &pos in registration {
+            ensure!(seen.insert(pos), "duplicate tick container registration");
+            let ticks = queue
+                .chunks
+                .get(&pos)
+                .ok_or_else(|| anyhow::anyhow!("unknown tick container registration"))?;
+            if let Some(tick) = ticks.peek() {
+                index.insert(pos, tick.trigger);
+            }
+        }
+        ensure!(
+            seen.len() == queue.chunks.len(),
+            "missing tick container registration"
+        );
+        Ok(IndexedRegionQueue { queue, index })
     }
 
     /// Match LevelAccessor.createTick followed by LevelTicks.schedule. A

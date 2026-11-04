@@ -96,5 +96,22 @@ public class GeneratedChunkTicksOracle {
         });
         collector.tick(42, 100, (p, type) -> System.out.println("R2 " + type));
         collector.tick(50, 100, (p, type) -> System.out.println("R3 " + type));
+        var ties = new LevelTicks<String>(p -> true);
+        for (int i = 0; i < 20; i++) {
+            int x = i - 10, z = (i * 7) % 5 - 2;
+            var container = new LevelChunkTicks<String>();
+            container.schedule(tick("minecraft:t" + i + "a", new BlockPos(x * 16, 0, z * 16), 5, TickPriority.NORMAL, 0));
+            container.schedule(tick("minecraft:t" + i + "b", new BlockPos(x * 16, 1, z * 16), 5, TickPriority.NORMAL, 0));
+            ties.addContainer(new ChunkPos(x, z), container);
+        }
+        for (int round = 0; round < 14; round++) {
+            int current = round;
+            ties.tick(5, 3, (p, type) -> {
+                System.out.println("E" + current + " " + type);
+                if (type.equals("minecraft:t0a")) {
+                    ties.schedule(tick("minecraft:callback", new BlockPos(-160, 2, -32), 5, TickPriority.HIGH, -1));
+                }
+            });
+        }
     }
 }

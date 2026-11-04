@@ -47,6 +47,7 @@ pub mod postprocessing;
 mod postprocessing_world;
 pub mod schedule;
 mod terrain_batch;
+pub mod tick_index;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;

@@ -164,7 +164,59 @@ fn trace() -> Vec<String> {
         saved("minecraft:stone", a, 0, 0)
     );
     out.extend(collection_trace());
+    out.extend(indexed_collection_trace());
     out
+}
+
+fn indexed_collection_trace() -> Vec<String> {
+    let positions: Vec<_> = (0..20)
+        .map(|i| ChunkPos {
+            x: i - 10,
+            z: (i * 7) % 5 - 2,
+        })
+        .collect();
+    let chunks = positions
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, pos)| {
+            let mut blocks = ChunkTicks::from_saved(pos, vec![]).unwrap();
+            for (suffix, y) in [("a", 0), ("b", 1)] {
+                blocks
+                    .schedule(scheduled(
+                        &format!("minecraft:t{i}{suffix}"),
+                        [pos.x * 16, y, pos.z * 16],
+                        5,
+                        0,
+                        0,
+                    ))
+                    .unwrap();
+            }
+            (
+                pos,
+                ConvertedChunkTicks {
+                    blocks,
+                    fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                },
+            )
+        })
+        .collect();
+    let region = RegionTicks::new(chunks, 5, 1).unwrap();
+    let mut queue = region
+        .activated_indexed_queue(TickRegistry::Block, &positions)
+        .unwrap();
+    let mut output = Vec::new();
+    for round in 0..14 {
+        for tick in queue.collect_due(5, 3, |_| true) {
+            output.push(format!("E{round} {}", tick.kind));
+            if tick.kind == "minecraft:t0a" {
+                queue
+                    .schedule(scheduled("callback", [-160, 2, -32], 5, -1, -1))
+                    .unwrap();
+            }
+        }
+    }
+    output
 }
 
 fn collection_trace() -> Vec<String> {
@@ -230,7 +282,20 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 105);
+    assert_eq!(lines.len(), 146);
+}
+
+#[test]
+fn indexed_collection_requeues_ties_and_callback_ticks() {
+    let trace = indexed_collection_trace();
+    assert_eq!(trace.len(), 41);
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|line| line.ends_with("minecraft:callback"))
+            .count(),
+        1
+    );
 }
 
 #[test]

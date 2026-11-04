@@ -301,6 +301,32 @@ mod face_tests {
     }
 
     #[test]
+    fn anvils_rotate_the_same_shape_across_damage_states() {
+        for name in [
+            "minecraft:anvil",
+            "minecraft:chipped_anvil",
+            "minecraft:damaged_anvil",
+        ] {
+            for facing in ["north", "south", "east", "west"] {
+                let mut state = BlockState {
+                    name: name.into(),
+                    properties: [("facing".into(), facing.into())].into(),
+                };
+                let expected = if matches!(facing, "north" | "south") {
+                    &ANVIL_NORTH_SOUTH
+                } else {
+                    &ANVIL_EAST_WEST
+                };
+                assert_eq!(block_shape(&state), Some(expected.to_vec()));
+                assert_eq!(block_outline(&state), Some(expected.to_vec()));
+                assert_eq!(spawn_collision_shape(&state), Some(expected.to_vec()));
+                state.properties.insert("facing".into(), "up".into());
+                assert!(block_shape(&state).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn sculk_sensor_shapes_validate_all_properties() {
         for name in [
             "minecraft:sculk_sensor",
@@ -385,6 +411,16 @@ mod face_tests {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if matches!(id, "anvil" | "chipped_anvil" | "damaged_anvil") {
+        if state.properties.len() != 1 {
+            return None;
+        }
+        return match state.properties.get("facing").map(String::as_str)? {
+            "north" | "south" => Some(ANVIL_NORTH_SOUTH.to_vec()),
+            "east" | "west" => Some(ANVIL_EAST_WEST.to_vec()),
+            _ => None,
+        };
+    }
     if matches!(
         id,
         "cauldron" | "lava_cauldron" | "water_cauldron" | "powder_snow_cauldron"
@@ -1157,6 +1193,26 @@ pub(crate) const CAULDRON_SHAPE: [Aabb; 15] = [
     pixel_box(4.0, 3.0, 14.0, 12.0, 16.0, 16.0),
     pixel_box(0.0, 4.0, 4.0, 2.0, 16.0, 12.0),
     pixel_box(14.0, 4.0, 4.0, 16.0, 16.0, 12.0),
+];
+
+pub(crate) const ANVIL_NORTH_SOUTH: [Aabb; 7] = [
+    pixel_box(2.0, 0.0, 2.0, 14.0, 4.0, 14.0),
+    pixel_box(4.0, 4.0, 3.0, 12.0, 5.0, 13.0),
+    pixel_box(6.0, 5.0, 4.0, 10.0, 16.0, 12.0),
+    pixel_box(3.0, 10.0, 0.0, 6.0, 16.0, 16.0),
+    pixel_box(6.0, 10.0, 0.0, 13.0, 16.0, 4.0),
+    pixel_box(6.0, 10.0, 12.0, 13.0, 16.0, 16.0),
+    pixel_box(10.0, 10.0, 4.0, 13.0, 16.0, 12.0),
+];
+
+pub(crate) const ANVIL_EAST_WEST: [Aabb; 7] = [
+    pixel_box(2.0, 0.0, 2.0, 14.0, 4.0, 14.0),
+    pixel_box(3.0, 4.0, 4.0, 13.0, 5.0, 12.0),
+    pixel_box(4.0, 5.0, 6.0, 12.0, 16.0, 10.0),
+    pixel_box(0.0, 10.0, 3.0, 4.0, 16.0, 13.0),
+    pixel_box(4.0, 10.0, 3.0, 16.0, 16.0, 6.0),
+    pixel_box(4.0, 10.0, 10.0, 16.0, 16.0, 13.0),
+    pixel_box(12.0, 10.0, 6.0, 16.0, 16.0, 10.0),
 ];
 
 fn cauldron_shape() -> Vec<Aabb> {

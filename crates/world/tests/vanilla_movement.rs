@@ -315,6 +315,10 @@ fn block_collision_and_step_resolution_match_vanilla_entity() {
             ],
         ),
         state("minecraft:stonecutter", &[("facing", "north")]),
+        state("minecraft:anvil", &[("facing", "north")]),
+        state("minecraft:anvil", &[("facing", "east")]),
+        state("minecraft:chipped_anvil", &[("facing", "south")]),
+        state("minecraft:damaged_anvil", &[("facing", "west")]),
         state(
             "minecraft:lantern",
             &[("hanging", "false"), ("waterlogged", "false")],

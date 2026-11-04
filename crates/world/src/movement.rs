@@ -4,8 +4,15 @@
 //! world borders and effects still need their own simulation.
 
 use glam::{DVec3, IVec3};
+use std::sync::OnceLock;
 
 const EPSILON: f64 = 1.0e-7;
+// These fixed shapes share occupancy across translations; their world-space
+// box and axis coordinates are still constructed for each queried block.
+static HANGING_LANTERN_CELLS: OnceLock<Vec<bool>> = OnceLock::new();
+static CAULDRON_CELLS: OnceLock<Vec<bool>> = OnceLock::new();
+static ANVIL_NORTH_SOUTH_CELLS: OnceLock<Vec<bool>> = OnceLock::new();
+static ANVIL_EAST_WEST_CELLS: OnceLock<Vec<bool>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoundingBox {
@@ -202,27 +209,65 @@ impl CollisionShape {
         if boxes.len() == 2 && boxes.contains(&lower) && boxes.contains(&upper) {
             let horizontal = [0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0, 11.0, 12.0, 14.0, 16.0];
             let vertical = [0.0, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
-            Self::with_axes(
+            Self::with_cached_axes(
                 boxes_world,
                 [
                     cuts(&horizontal, origin.x),
                     cuts(&vertical, origin.y),
                     cuts(&horizontal, origin.z),
                 ],
+                &HANGING_LANTERN_CELLS,
             )
         } else if boxes == crate::collision::CAULDRON_SHAPE {
             let horizontal = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0];
             let vertical = [0.0, 3.0, 4.0, 8.0, 12.0, 16.0];
-            Self::with_axes(
+            Self::with_cached_axes(
                 boxes_world,
                 [
                     cuts(&horizontal, origin.x),
                     cuts(&vertical, origin.y),
                     cuts(&horizontal, origin.z),
                 ],
+                &CAULDRON_CELLS,
+            )
+        } else if boxes == crate::collision::ANVIL_NORTH_SOUTH
+            || boxes == crate::collision::ANVIL_EAST_WEST
+        {
+            let horizontal = [0.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 13.0, 14.0, 16.0];
+            let vertical = [0.0, 4.0, 5.0, 8.0, 10.0, 12.0, 16.0];
+            let cache = if boxes == crate::collision::ANVIL_NORTH_SOUTH {
+                &ANVIL_NORTH_SOUTH_CELLS
+            } else {
+                &ANVIL_EAST_WEST_CELLS
+            };
+            Self::with_cached_axes(
+                boxes_world,
+                [
+                    cuts(&horizontal, origin.x),
+                    cuts(&vertical, origin.y),
+                    cuts(&horizontal, origin.z),
+                ],
+                cache,
             )
         } else {
             Self::new(boxes_world)
+        }
+    }
+
+    fn with_cached_axes(
+        boxes: Vec<BoundingBox>,
+        axes: [Vec<f64>; 3],
+        cache: &'static OnceLock<Vec<bool>>,
+    ) -> Self {
+        let sizes = std::array::from_fn(|axis| axes[axis].len().saturating_sub(1));
+        let cells = cache
+            .get_or_init(|| Self::with_axes(boxes.clone(), axes.clone()).cells)
+            .clone();
+        Self {
+            boxes,
+            axes,
+            cells,
+            sizes,
         }
     }
 
@@ -440,6 +485,36 @@ mod tests {
         let player = box_([1.325, 0.0, 1.575], [1.925, 1.8, 2.175]);
         let actual = resolve_movement(player, DVec3::new(-0.4, 0.2, -0.8), true, 0.6, &[shape]);
         assert!((actual - DVec3::new(-0.4, 0.2, -0.075)).abs().max_element() < 1.0e-12);
+    }
+
+    #[test]
+    fn cached_voxel_cells_match_fresh_grids_at_large_and_negative_coordinates() {
+        let lantern = crate::loaded::BlockState {
+            name: "minecraft:lantern".into(),
+            properties: [
+                ("hanging".into(), "true".into()),
+                ("waterlogged".into(), "false".into()),
+            ]
+            .into(),
+        };
+        let shapes = [
+            crate::collision::block_shape(&lantern).unwrap(),
+            crate::collision::CAULDRON_SHAPE.to_vec(),
+            crate::collision::ANVIL_NORTH_SOUTH.to_vec(),
+            crate::collision::ANVIL_EAST_WEST.to_vec(),
+        ];
+        for local in &shapes {
+            for cell in [
+                IVec3::ZERO,
+                IVec3::new(-17, -64, 35),
+                IVec3::new(30_000_000, 320, -30_000_000),
+            ] {
+                let cached = CollisionShape::from_block(cell, local);
+                let fresh = CollisionShape::with_axes(cached.boxes.clone(), cached.axes.clone());
+                assert_eq!(cached.cells, fresh.cells, "cell {cell:?}");
+                assert_eq!(cached.sizes, fresh.sizes);
+            }
+        }
     }
 
     #[test]

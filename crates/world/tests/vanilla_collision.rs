@@ -49,6 +49,12 @@ public class CollisionOracle {
             .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         var cauldron = net.minecraft.world.level.block.Blocks.CAULDRON.defaultBlockState()
             .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        var anvilNorth = net.minecraft.world.level.block.Blocks.ANVIL.defaultBlockState()
+            .setValue(net.minecraft.world.level.block.AnvilBlock.FACING, Direction.NORTH)
+            .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        var anvilEast = net.minecraft.world.level.block.Blocks.ANVIL.defaultBlockState()
+            .setValue(net.minecraft.world.level.block.AnvilBlock.FACING, Direction.EAST)
+            .getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         JsonArray all = new JsonArray();
         for (var state : Block.BLOCK_STATE_REGISTRY) {
             JsonObject record = new JsonObject();
@@ -88,6 +94,14 @@ public class CollisionOracle {
                     for (var axis : Direction.Axis.values())
                         sameGrid &= collision.getCoords(axis).equals(cauldron.getCoords(axis));
                     record.addProperty("cauldronGrid", sameGrid);
+                }
+                if (!collision.isEmpty() && (
+                    !net.minecraft.world.phys.shapes.Shapes.joinIsNotEmpty(collision, anvilNorth, net.minecraft.world.phys.shapes.BooleanOp.NOT_SAME)
+                    || !net.minecraft.world.phys.shapes.Shapes.joinIsNotEmpty(collision, anvilEast, net.minecraft.world.phys.shapes.BooleanOp.NOT_SAME))) {
+                    boolean sameGrid = true;
+                    for (var axis : Direction.Axis.values())
+                        sameGrid &= collision.getCoords(axis).equals(anvilNorth.getCoords(axis));
+                    record.addProperty("anvilGrid", sameGrid);
                 }
                 {
                     JsonArray sturdy = new JsonArray();
@@ -355,6 +369,8 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut cauldron_grid_checked = 0usize;
     let mut brewing_stand_states_checked = 0usize;
     let mut stonecutter_states_checked = 0usize;
+    let mut anvil_states_checked = 0usize;
+    let mut anvil_grid_checked = 0usize;
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
@@ -375,6 +391,13 @@ fn implemented_collision_shapes_match_vanilla_states() {
                 "same-volume cauldron block has a different voxel grid: {id}"
             );
             cauldron_grid_checked += 1;
+        }
+        if let Some(same) = entry["anvilGrid"].as_bool() {
+            assert!(
+                same,
+                "same-volume anvil block has a different voxel grid: {id}"
+            );
+            anvil_grid_checked += 1;
         }
         if matches!(id, "minecraft:water" | "minecraft:lava") {
             assert_eq!(entry["fallingFree"].as_bool(), Some(true), "{id}");
@@ -465,6 +488,16 @@ fn implemented_collision_shapes_match_vanilla_states() {
         }
         if id == "minecraft:stonecutter" {
             stonecutter_states_checked += 1;
+        }
+        if matches!(
+            id,
+            "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil"
+        ) {
+            assert!(
+                block_outline(&state).is_some(),
+                "missing anvil outline: {state:?}"
+            );
+            anvil_states_checked += 1;
         }
         if matches!(id, "minecraft:chest" | "minecraft:trapped_chest")
             && state
@@ -654,6 +687,14 @@ fn implemented_collision_shapes_match_vanilla_states() {
     assert_eq!(
         stonecutter_states_checked, 4,
         "stonecutter states missing from Java oracle"
+    );
+    assert_eq!(
+        anvil_states_checked, 12,
+        "anvil states missing from Java oracle"
+    );
+    assert_eq!(
+        anvil_grid_checked, 12,
+        "anvil voxel grids missing from Java oracle"
     );
     assert!(fire_checked >= 2, "fire states missing from Java oracle");
     assert!(plant_checked >= 3, "plant states missing from Java oracle");

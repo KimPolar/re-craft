@@ -496,6 +496,36 @@ fn captured_index_rejects_incomplete_activation_and_untracked_mutation() {
 }
 
 #[test]
+fn captured_index_can_activate_only_resident_containers() {
+    let home = ChunkPos { x: 0, z: 0 };
+    let neighbor = ChunkPos { x: 1, z: 0 };
+    let make = |pos: ChunkPos| ConvertedChunkTicks {
+        blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        fluids: ChunkTicks::from_saved(pos, vec![saved("water", [pos.x * 16, 0, 0], 0, 0)])
+            .unwrap(),
+    };
+    let region = RegionTicks::new_ordered(
+        std::collections::BTreeMap::from([(home, make(home)), (neighbor, make(neighbor))]),
+        42,
+        0,
+        &[home, neighbor],
+    )
+    .unwrap();
+    let mut queue = region
+        .captured_indexed_queue_for(TickRegistry::Fluid, &[home])
+        .unwrap();
+    assert_eq!(queue.collect_due(42, 100, |_| true)[0].position, [0, 0, 0]);
+    assert!(queue.collect_due(42, 100, |_| true).is_empty());
+    queue.unpack_container(neighbor, 42).unwrap();
+    assert_eq!(queue.collect_due(42, 100, |_| true)[0].position, [16, 0, 0]);
+    assert!(
+        region
+            .captured_indexed_queue_for(TickRegistry::Fluid, &[home, home])
+            .is_err()
+    );
+}
+
+#[test]
 fn streamed_containers_keep_ticks_and_reconcile_replacements() {
     let trace = streamed_containers_trace();
     assert_eq!(trace.len(), 22);

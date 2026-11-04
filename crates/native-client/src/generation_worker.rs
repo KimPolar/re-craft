@@ -394,9 +394,9 @@ impl GenerationReady {
     }
 
     /// Construct an experimental transient session from fully lit targets.
-    /// Postprocessed ticks use the existing session scheduler, whose cross-chunk
-    /// execution order is not yet Java-compatible. This does not create or save
-    /// a Java world; the caller must choose and validate the player spawn.
+    /// Block ticks and streamed fluid ticks do not yet use the captured
+    /// cross-chunk order. This does not create or save a Java world; the caller
+    /// must choose and validate the player spawn.
     pub fn start_session(
         &mut self,
         player: native_session::PlayerState,
@@ -545,6 +545,18 @@ impl GenerationReady {
                 );
             }
             session.install_generated_ticks(&selected)?;
+            let region_ticks = processed.region.ticks();
+            let activation: Vec<_> = region_ticks
+                .registration_order()
+                .iter()
+                .copied()
+                .filter(|pos| targets.contains(pos))
+                .collect();
+            let fluid_order = region_ticks.captured_indexed_queue_for(
+                native_session::worldgen::chunk_ticks::TickRegistry::Fluid,
+                &activation,
+            )?;
+            session.install_generated_fluid_order(&selected, fluid_order)?;
             let water = processed
                 .region
                 .water_source_conversion()

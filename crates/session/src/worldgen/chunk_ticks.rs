@@ -655,6 +655,20 @@ impl RegionTicks {
         registry: TickRegistry,
         activation: &[ChunkPos],
     ) -> Result<IndexedRegionQueue> {
+        ensure!(
+            activation.len() == self.chunks.len(),
+            "missing tick container activation"
+        );
+        self.captured_indexed_queue_for(registry, activation)
+    }
+
+    /// Retain the recorded index while activating only currently resident
+    /// chunks. Other registered containers keep their pending ticks untouched.
+    pub fn captured_indexed_queue_for(
+        &self,
+        registry: TickRegistry,
+        activation: &[ChunkPos],
+    ) -> Result<IndexedRegionQueue> {
         let indexes = self
             .indexes
             .as_ref()
@@ -667,10 +681,6 @@ impl RegionTicks {
             );
             ensure!(seen.insert(*pos), "duplicate tick container activation");
         }
-        ensure!(
-            seen.len() == self.chunks.len(),
-            "missing tick container activation"
-        );
         let chunks = self
             .chunks
             .iter()

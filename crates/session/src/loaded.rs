@@ -831,6 +831,7 @@ pub struct LoadedSession {
     fluid_ticks: BTreeMap<(i128, i32, i64, u64), ScheduledFluid>,
     fluid_pending: BTreeSet<FluidTickKey>,
     fluid_sequence: u64,
+    generated_fluid_order: Option<GeneratedFluidOrder>,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -1320,6 +1321,28 @@ struct RandomTickCounts {
 #[derive(Clone, Copy, Debug)]
 struct ScheduledFluid {
     key: FluidTickKey,
+}
+
+struct GeneratedFluidOrder {
+    base_time: i64,
+    queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+}
+
+fn generated_fluid_key(tick: &crate::worldgen::chunk_ticks::ScheduledTick) -> Option<FluidTickKey> {
+    let (kind, source) = match tick.kind.as_str() {
+        "minecraft:water" => (FluidKind::Water, true),
+        "minecraft:flowing_water" => (FluidKind::Water, false),
+        "minecraft:lava" => (FluidKind::Lava, true),
+        "minecraft:flowing_lava" => (FluidKind::Lava, false),
+        _ => return None,
+    };
+    Some(FluidTickKey {
+        x: tick.position[0],
+        y: tick.position[1],
+        z: tick.position[2],
+        kind,
+        source,
+    })
 }
 
 fn state(name: &str, properties: &[(&str, &str)]) -> BlockState {
@@ -5650,6 +5673,13 @@ impl LoadedSession {
         if self.tick != 0 || self.accumulated != Duration::ZERO {
             return Err("game time must be restored before simulation begins");
         }
+        if self
+            .generated_fluid_order
+            .as_ref()
+            .is_some_and(|order| order.base_time != value)
+        {
+            self.generated_fluid_order = None;
+        }
         self.game_time = value;
         self.initial_game_time_set = true;
         self.level_time_source = None;
@@ -5810,6 +5840,63 @@ impl LoadedSession {
         }
         self.next_sub_tick = ticks.next_sub_tick;
         self.generated_ticks_installed = true;
+        Ok(())
+    }
+
+    /// Use a captured generated fluid index while its queues and resident
+    /// chunks remain synchronized with this unadvanced session.
+    pub fn install_generated_fluid_order(
+        &mut self,
+        ticks: &crate::worldgen::chunk_ticks::ActivatedRegionTicks,
+        queue: crate::worldgen::chunk_ticks::IndexedRegionQueue,
+    ) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "generated fluid ordering must be installed before simulation begins"
+        );
+        ensure!(
+            self.generated_ticks_installed && self.generated_fluid_order.is_none(),
+            "generated fluid ticks are not ready or ordering is already installed"
+        );
+        ensure!(
+            self.game_time == ticks.game_time && self.world.chunks.keys().eq(ticks.chunks.keys()),
+            "generated fluid ordering belongs to a different session"
+        );
+        let mut expected = BTreeMap::new();
+        for (&pos, chunk) in &ticks.chunks {
+            let captured = queue
+                .container(pos)
+                .context("generated fluid container is missing")?;
+            ensure!(
+                captured.activated(0) == chunk.fluids,
+                "generated fluid container differs from the activated snapshot"
+            );
+            for tick in &chunk.fluids {
+                let key = generated_fluid_key(tick).context("unsupported generated fluid tick")?;
+                let order = (
+                    i128::from(tick.trigger) - i128::from(ticks.game_time),
+                    tick.priority,
+                    tick.sub_tick,
+                    key,
+                );
+                *expected.entry(order).or_insert(0usize) += 1;
+            }
+        }
+        let mut actual = BTreeMap::new();
+        for (order, tick) in &self.fluid_ticks {
+            *actual
+                .entry((order.0, order.1, order.2, tick.key))
+                .or_insert(0usize) += 1;
+        }
+        ensure!(
+            actual == expected,
+            "session fluid ticks changed before ordering was installed"
+        );
+        self.generated_fluid_order = Some(GeneratedFluidOrder {
+            base_time: ticks.game_time,
+            queue,
+        });
         Ok(())
     }
 
@@ -6357,6 +6444,7 @@ impl LoadedSession {
             fluid_ticks: BTreeMap::new(),
             fluid_pending: BTreeSet::new(),
             fluid_sequence: 0,
+            generated_fluid_order: None,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -10258,6 +10346,9 @@ impl LoadedSession {
     }
 
     fn apply_streaming(&mut self) {
+        if !self.incoming.is_empty() {
+            self.generated_fluid_order = None;
+        }
         let mut changed = false;
         let mut respawn_changed = false;
         if let Some(window) = self.pending_respawn_window.take()
@@ -10307,6 +10398,7 @@ impl LoadedSession {
                 .iter()
                 .any(|pos| !within_window(*pos, window));
             if !outside.is_empty() || !restore.is_empty() || old_missing {
+                self.generated_fluid_order = None;
                 let mut restored_ticks = Vec::new();
                 let unsaved: BTreeSet<_> = outside
                     .iter()
@@ -14557,10 +14649,42 @@ impl LoadedSession {
             source: state.source,
         };
         let subtick = self.next_scheduled_sub_tick();
-        if !self.fluid_pending.contains(&key) {
+        let duplicate = self.fluid_pending.contains(&key);
+        if !duplicate {
             self.mark_tick_chunk_dirty(key.x, key.z);
         }
         self.insert_fluid_tick(key, i128::from(self.tick) + i128::from(delay), 0, subtick);
+        if let Some(indexed) = &mut self.generated_fluid_order {
+            use crate::worldgen::chunk_ticks::{ScheduleOutcome, ScheduledTick};
+            let trigger = i64::try_from(
+                i128::from(indexed.base_time) + i128::from(self.tick) + i128::from(delay),
+            );
+            let kind = match (key.kind, key.source) {
+                (FluidKind::Water, true) => "minecraft:water",
+                (FluidKind::Water, false) => "minecraft:flowing_water",
+                (FluidKind::Lava, true) => "minecraft:lava",
+                (FluidKind::Lava, false) => "minecraft:flowing_lava",
+            };
+            let synchronized = trigger.ok().and_then(|trigger| {
+                indexed
+                    .queue
+                    .schedule(ScheduledTick {
+                        kind: kind.into(),
+                        position: [key.x, key.y, key.z],
+                        trigger,
+                        priority: 0,
+                        sub_tick: subtick,
+                    })
+                    .ok()
+            }) == Some(if duplicate {
+                ScheduleOutcome::Duplicate
+            } else {
+                ScheduleOutcome::Added
+            });
+            if !synchronized {
+                self.generated_fluid_order = None;
+            }
+        }
     }
 
     fn next_scheduled_sub_tick(&mut self) -> i64 {
@@ -14589,6 +14713,7 @@ impl LoadedSession {
     }
 
     fn enqueue_saved_fluids(&mut self, chunk: ChunkPos, ticks: &[SavedFluidTick]) {
+        self.generated_fluid_order = None;
         let mut unsupported = 0;
         for (index, tick) in ticks.iter().enumerate() {
             let (kind, source) = match tick.fluid.as_str() {
@@ -17216,9 +17341,76 @@ impl LoadedSession {
         true
     }
 
+    fn collect_generated_fluid_ticks(
+        &mut self,
+    ) -> Option<Vec<((i128, i32, i64, u64), ScheduledFluid)>> {
+        let mut indexed = self.generated_fluid_order.take()?;
+        if self
+            .fluid_ticks
+            .first_key_value()
+            .is_none_or(|(order, _)| order.0 > i128::from(self.tick))
+        {
+            self.generated_fluid_order = Some(indexed);
+            return Some(Vec::new());
+        }
+        let time = i64::try_from(i128::from(indexed.base_time) + i128::from(self.tick)).ok()?;
+        let world = &self.world;
+        let selected = indexed.queue.collect_due(time, 65_536, |pos| {
+            world
+                .chunks
+                .get(&pos)
+                .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+        });
+        let mut orders = BTreeSet::new();
+        let mut entries = Vec::with_capacity(selected.len());
+        for tick in selected {
+            let key = generated_fluid_key(&tick)?;
+            let due = i128::from(tick.trigger) - i128::from(indexed.base_time);
+            if due > i128::from(self.tick) {
+                return None;
+            }
+            let start = (due, tick.priority, tick.sub_tick, 0);
+            let end = (due, tick.priority, tick.sub_tick, u64::MAX);
+            let (&order, &scheduled) = self
+                .fluid_ticks
+                .range(start..=end)
+                .find(|(order, scheduled)| scheduled.key == key && !orders.contains(*order))?;
+            let absolute = IVec3::new(key.x, key.y, key.z);
+            let relative = subtract(absolute, self.origin)?;
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                relative,
+                self.states[0],
+            ) else {
+                return None;
+            };
+            if key.kind == FluidKind::Water
+                && key.source
+                && self.world.state(id).is_some_and(|state| {
+                    state.name == "minecraft:bubble_column" && bubble_column_drag(state).is_none()
+                })
+            {
+                return None;
+            }
+            orders.insert(order);
+            entries.push((order, scheduled));
+        }
+        for (order, scheduled) in &entries {
+            self.fluid_ticks.remove(order);
+            self.fluid_pending.remove(&scheduled.key);
+        }
+        self.generated_fluid_order = Some(indexed);
+        Some(entries)
+    }
+
     /// Collect before invoking fluid callbacks, as LevelTicks does. Unsupported
     /// or unavailable cells remain queued until their state can be inspected.
     fn collect_due_fluid_ticks(&mut self) -> Vec<((i128, i32, i64, u64), ScheduledFluid)> {
+        if let Some(collected) = self.collect_generated_fluid_ticks() {
+            return collected;
+        }
         let mut collected = Vec::new();
         let mut deferred = Vec::new();
         while let Some((&order, &scheduled)) = self.fluid_ticks.first_key_value() {
@@ -17340,6 +17532,9 @@ impl LoadedSession {
             {
                 self.schedule_fluid(relative, current, settings.delay(current.kind));
             }
+        }
+        if !unloaded.is_empty() {
+            self.generated_fluid_order = None;
         }
         self.fluid_ticks.extend(unloaded);
     }
@@ -23059,6 +23254,150 @@ pub(crate) mod tests {
         assert_eq!(session.sand_ticks.first_key_value().unwrap().0.2, i64::MAX);
         assert_eq!(session.ice_ticks.first_key_value().unwrap().0.2, i64::MIN);
         assert_eq!(session.next_sub_tick, i64::MIN + 1);
+    }
+
+    #[test]
+    fn generated_session_orders_fluid_ticks_by_chunk_priority_and_tracks_new_schedules() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let neighbor = ChunkPos {
+            x: home.x + 1,
+            z: home.z,
+        };
+        let mut other = world.chunks[&home].as_ref().clone();
+        other.position = neighbor;
+        world.chunks.insert(neighbor, Arc::new(other));
+        let a = [origin.x + 1, 2, origin.z + 1];
+        let b = [origin.x + 17, 2, origin.z + 1];
+        let make = |pos, position, delay, priority| ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            fluids: ChunkTicks::from_saved(
+                pos,
+                vec![SavedTick {
+                    kind: "minecraft:water".into(),
+                    position,
+                    delay,
+                    priority,
+                }],
+            )
+            .unwrap(),
+        };
+        let region = RegionTicks::new_ordered(
+            BTreeMap::from([
+                (home, make(home, a, -2, 0)),
+                (neighbor, make(neighbor, b, 0, -1)),
+            ]),
+            42,
+            0,
+            &[home, neighbor],
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.install_generated_ticks(&snapshot).unwrap();
+        let mut wrong = snapshot.clone();
+        wrong.chunks.get_mut(&home).unwrap().fluids[0].trigger += 1;
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Fluid, &[home, neighbor])
+            .unwrap();
+        assert!(
+            session
+                .install_generated_fluid_order(&wrong, queue)
+                .is_err()
+        );
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Fluid, &[home, neighbor])
+            .unwrap();
+        session
+            .install_generated_fluid_order(&snapshot, queue)
+            .unwrap();
+        let selected = session.collect_due_fluid_ticks();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(_, tick)| tick.key.x)
+                .collect::<Vec<_>>(),
+            [b[0], a[0]]
+        );
+        assert!(session.generated_fluid_order.is_some());
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        session.schedule_fluid(IVec3::new(1, 2, 1), water, 5);
+        session.schedule_fluid(IVec3::new(1, 2, 1), water, 5);
+        assert!(session.generated_fluid_order.is_some());
+        session.tick = 5;
+        let selected = session.collect_due_fluid_ticks();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].1.key.x, a[0]);
+        session.schedule_fluid(IVec3::new(1, 2, 1), water, 10);
+        session.queue_chunk_window(home, 0);
+        session.apply_streaming();
+        assert!(session.generated_fluid_order.is_none());
+        assert_eq!(session.fluid_ticks.len(), 1);
+    }
+
+    #[test]
+    fn mismatched_generated_fluid_order_falls_back_without_losing_ticks() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        let mut session = session();
+        let home = *session.world.chunks.keys().next().unwrap();
+        let position = (session.origin + IVec3::new(1, 2, 1)).to_array();
+        let region = RegionTicks::new(
+            BTreeMap::from([(
+                home,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(
+                        home,
+                        vec![SavedTick {
+                            kind: "minecraft:water".into(),
+                            position,
+                            delay: 0,
+                            priority: 0,
+                        }],
+                    )
+                    .unwrap(),
+                },
+            )]),
+            42,
+            0,
+        )
+        .unwrap();
+        let snapshot = region.activated_snapshot();
+        session.install_generated_ticks(&snapshot).unwrap();
+        let queue = region
+            .captured_indexed_queue(TickRegistry::Fluid, &[home])
+            .unwrap();
+        session
+            .install_generated_fluid_order(&snapshot, queue)
+            .unwrap();
+        let (order, tick) = session.fluid_ticks.pop_first().unwrap();
+        session
+            .fluid_ticks
+            .insert((order.0, 1, order.2, order.3), tick);
+        let selected = session.collect_due_fluid_ticks();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.1, 1);
+        assert!(session.generated_fluid_order.is_none());
+        assert!(session.fluid_ticks.is_empty());
     }
 
     struct SplashTestPacks;

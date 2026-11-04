@@ -6254,6 +6254,66 @@ mod tests {
     }
 
     #[test]
+    fn terrain_heightmaps_survive_feature_section_writes_before_first_query() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        terrain
+            .initialize_worldgen_heightmaps(center, &motion)
+            .unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region
+            .set_section_block([3, 12, 4], &state("stone"))
+            .unwrap();
+        // Java retained the terrain-stage maps before this direct section write.
+        assert_eq!(region.ocean_floor_height(3, 4).unwrap(), 8);
+        assert_eq!(region.world_surface_height(3, 4).unwrap(), 8);
+        region.finish().unwrap();
+        assert!(
+            terrain
+                .initialize_worldgen_heightmaps(center, &motion)
+                .is_err()
+        );
+        assert_eq!(
+            terrain.snapshot().block(3, 12, 4).unwrap().name,
+            "minecraft:stone"
+        );
+    }
+
+    #[test]
+    fn unsupported_air_motion_tag_does_not_publish_partial_heightmaps() {
+        struct BadTags;
+        impl ResourceProvider for BadTags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    || path == "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:air","minecraft:stone"]}"#.to_vec(),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+        let registry = ["minecraft:air".to_owned(), "minecraft:stone".to_owned()]
+            .into_iter()
+            .collect();
+        let tags = HeightmapTags::load(&mut BadTags, &registry).unwrap();
+        let (mut terrain, _, _, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        assert!(
+            terrain
+                .initialize_worldgen_heightmaps(center, &tags)
+                .is_err()
+        );
+        assert!(terrain.worldgen_heightmaps(center).is_none());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn inactive_sky_check_matches_java_queue() {
         use native_world::generation_light::{VisibleLightColumn, VisibleLightSnapshot};

@@ -51,6 +51,7 @@ pub enum FreshBatchLight {
 struct DecorationConfig {
     schedule: FeatureSchedule,
     block_registry: BTreeSet<String>,
+    heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
     dimension_type: Option<String>,
     ambient_light: Option<f32>,
@@ -193,9 +194,12 @@ impl FreshTerrainBatch {
             "invalid dimension ambient light"
         );
         let schedule = self.generator.feature_schedule(provider, placed_features)?;
+        let heightmap_tags =
+            native_resources::heightmap_tags::HeightmapTags::load(provider, &block_registry)?;
         self.decoration = Some(DecorationConfig {
             schedule,
             block_registry,
+            heightmap_tags,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -740,6 +744,7 @@ impl FreshTerrainBatch {
                     resolve,
                 )?;
                 if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
+                    terrain.initialize_worldgen_heightmaps(pos, &config.heightmap_tags)?;
                     if terrain.world.dimension_type != config.dimension_type {
                         Arc::make_mut(&mut terrain.world).dimension_type =
                             config.dimension_type.clone();

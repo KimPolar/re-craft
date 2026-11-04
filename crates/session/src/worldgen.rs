@@ -1000,6 +1000,120 @@ impl StagedGenerationLightEngine {
 }
 
 impl CarvedTerrainWorld {
+    /// Capture the two world-generation maps immediately after the terrain
+    /// stage, before any neighboring feature can write into this chunk.
+    /// Direct section writes during later features must leave them unchanged.
+    pub fn initialize_worldgen_heightmaps(
+        &mut self,
+        pos: native_world::loaded::ChunkPos,
+        tags: &native_resources::heightmap_tags::HeightmapTags,
+    ) -> Result<()> {
+        use native_world::loaded::BlockStateId;
+        ensure!(
+            !self.ore_ocean_floor_heights.contains_key(&pos)
+                && !self.feature_world_surface_heights.contains_key(&pos),
+            "generation heightmaps were already initialized"
+        );
+        let base_x = pos.x.checked_mul(16).context("chunk X overflow")?;
+        let base_z = pos.z.checked_mul(16).context("chunk Z overflow")?;
+        base_x.checked_add(15).context("chunk X overflow")?;
+        base_z.checked_add(15).context("chunk Z overflow")?;
+        let max_y = self
+            .min_y
+            .checked_add(self.height)
+            .context("generation height overflow")?;
+        ensure!(
+            self.min_y.rem_euclid(16) == 0 && self.height > 0 && self.height.rem_euclid(16) == 0,
+            "invalid generation height"
+        );
+        let chunk = self
+            .world
+            .chunks
+            .get(&pos)
+            .context("generation chunk is missing")?;
+        let mut ocean = [self.min_y; 256];
+        let mut surface = [self.min_y; 256];
+        let mut need_surface = [true; 256];
+        let mut need_ocean = [true; 256];
+        let mut remaining = 512;
+        let mut cache = BTreeMap::<BlockStateId, (bool, bool)>::new();
+        let mut classify = |id: BlockStateId| -> Result<(bool, bool)> {
+            if let Some(flags) = cache.get(&id) {
+                return Ok(*flags);
+            }
+            let state = self
+                .world
+                .state(id)
+                .context("generation block state is missing")?;
+            let air = matches!(
+                state.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            );
+            let motion = tags.for_block(&state.name)?.blocks_motion;
+            ensure!(
+                !air || !motion,
+                "air in the heightmap motion tag is unsupported"
+            );
+            cache.insert(id, (air, motion));
+            Ok((air, motion))
+        };
+        for section_y in (self.min_y.div_euclid(16)..max_y.div_euclid(16)).rev() {
+            let section = chunk
+                .sections
+                .get(&i8::try_from(section_y)?)
+                .context("generation section is missing")?;
+            let blocks = section
+                .blocks
+                .as_ref()
+                .context("generation section blocks are missing")?;
+            let first = blocks[0];
+            if classify(first)?.0 && blocks.iter().all(|&id| id == first) {
+                continue;
+            }
+            for column in 0..256 {
+                if !need_surface[column] && !need_ocean[column] {
+                    continue;
+                }
+                for local_y in (0..16usize).rev() {
+                    let (is_air, blocks_motion) = classify(blocks[column + local_y * 256])?;
+                    let first_available = section_y * 16 + local_y as i32 + 1;
+                    if need_surface[column] && !is_air {
+                        surface[column] = first_available;
+                        need_surface[column] = false;
+                        remaining -= 1;
+                    }
+                    if need_ocean[column] && blocks_motion {
+                        ocean[column] = first_available;
+                        need_ocean[column] = false;
+                        remaining -= 1;
+                    }
+                    if !need_surface[column] && !need_ocean[column] {
+                        break;
+                    }
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        self.ore_ocean_floor_heights.insert(pos, Arc::new(ocean));
+        self.feature_world_surface_heights
+            .insert(pos, Arc::new(surface));
+        Ok(())
+    }
+
+    /// Current generation-only values, including intentionally stale values
+    /// after a direct feature section write. They are not final heightmaps.
+    pub fn worldgen_heightmaps(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Option<(&[i32; 256], &[i32; 256])> {
+        Some((
+            self.feature_world_surface_heights.get(&pos)?.as_ref(),
+            self.ore_ocean_floor_heights.get(&pos)?.as_ref(),
+        ))
+    }
+
     /// Start with a generated chunk without copying its block sections.
     pub fn new(first: MaterializedTerrain) -> Self {
         let MaterializedTerrain {

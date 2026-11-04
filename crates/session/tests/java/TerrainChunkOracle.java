@@ -40,6 +40,14 @@ public class TerrainChunkOracle {
   }
   static void dump(String stage,ProtoChunk chunk,int min,int height) {
     output.println("S "+stage);
+    if (Boolean.getBoolean("recraft.heightmaps")) {
+      for (var entry:chunk.getHeightmaps()) {
+        var line=new StringBuilder("H ").append(entry.getKey());
+        for(int z=0;z<16;z++)for(int x=0;x<16;x++)line.append(' ').append(entry.getValue().getFirstAvailable(x,z));
+        output.println(line);
+      }
+      return;
+    }
     var pos=new BlockPos.MutableBlockPos();
     for(int z=0;z<16;z++)for(int x=0;x<16;x++) {
       var row=new StringBuilder();
@@ -64,6 +72,15 @@ public class TerrainChunkOracle {
   public static void main(String[] args)throws Exception {
     var out=System.out;output=out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);bind.invoke(Blocks.BEDROCK.builtInRegistryHolder(),List.of(BlockTags.UNCARVABLE));
+    String tagsPath=System.getProperty("recraft.heightmapTags");
+    if(tagsPath!=null) for(String line:java.nio.file.Files.readAllLines(java.nio.file.Path.of(tagsPath))) {
+      String[] f=line.split(" ");var block=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse(f[0]));
+      var tags=new ArrayList<net.minecraft.tags.TagKey<Block>>();
+      if(f[1].equals("1"))tags.add(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP);
+      if(f[2].equals("1"))tags.add(BlockTags.BLOCKS_MOTION_IN_HEIGHTMAP_NO_LEAVES);
+      if(block==Blocks.BEDROCK)tags.add(BlockTags.UNCARVABLE);
+      bind.invoke(block.builtInRegistryHolder(),tags);
+    }
     var registries=VanillaRegistries.createWorldLookup();
     var dimensions=WorldPresets.createNormalWorldDimensions(registries);
     for(int arg=0;arg<args.length;arg+=4){

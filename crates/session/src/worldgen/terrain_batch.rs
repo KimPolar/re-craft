@@ -5,7 +5,7 @@ use native_resources::{
     carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
     dimension_lighting::GeneratedDimensionLighting,
-    feature_order::{FeatureKey, FeatureSchedule},
+    feature_order::{FeatureKey, FeatureSchedule, FeatureTags},
     packs::{ResourceId, ResourceProvider},
     placed_feature::PlacedFeature,
 };
@@ -69,69 +69,239 @@ struct DecorationConfig {
     ambient_light: Option<f32>,
 }
 
-/// Only vanilla feature types whose generation paths have been checked for
-/// entity creation may certify a complete generated entity list. Missing,
-/// malformed, custom and nested feature types remain unknown.
-fn feature_cannot_spawn_entities(
-    provider: &mut impl ResourceProvider,
-    schedule: &FeatureSchedule,
-    key: &FeatureKey,
-) -> Result<bool> {
-    let placed = match key {
-        FeatureKey::Registered(id) => PlacedFeature::load(provider, id)?,
-        FeatureKey::Inline { biome, .. } => {
-            let value = schedule
-                .biome(biome)
-                .and_then(|biome| biome.inline.get(key))
-                .context("inline placed feature is missing")?;
-            PlacedFeature::decode(value)?
+/// Examine every branch without consuming generation randomness or the block
+/// resolver. Unknown types, missing resources and cycles remain unverified.
+struct EntityFeatureClassifier<'a, P> {
+    provider: &'a mut P,
+    registry: &'a BTreeSet<ResourceId>,
+    tags: FeatureTags,
+    active: BTreeSet<String>,
+    cache: BTreeMap<String, bool>,
+    nodes: usize,
+}
+
+impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
+    fn named(&mut self, id: &ResourceId, placed: bool, depth: usize) -> Result<bool> {
+        if placed {
+            ensure!(
+                self.registry.contains(id),
+                "placed feature is not registered"
+            );
         }
-    };
-    let configured = if let Some(name) = placed.feature.as_str() {
-        let id = ResourceId::parse(name)?;
-        let path = format!("data/{}/worldgen/feature/{}.json", id.namespace, id.path);
-        let bytes = provider
-            .read_data(&path)?
-            .context("configured feature is missing")?;
-        serde_json::from_slice::<Value>(&bytes)?
-    } else {
-        placed.feature
-    };
-    let name = configured
-        .get("type")
-        .and_then(Value::as_str)
-        .context("feature type is missing")?;
-    let id = ResourceId::parse(name)?;
-    Ok(id.namespace == "minecraft"
-        && matches!(
-            id.path.as_str(),
+        let folder = if placed { "placed_feature" } else { "feature" };
+        let path = format!("data/{}/worldgen/{folder}/{}.json", id.namespace, id.path);
+        if let Some(&cached) = self.cache.get(&path) {
+            return Ok(cached);
+        }
+        ensure!(self.active.insert(path.clone()), "cyclic feature reference");
+        let result = (|| {
+            let bytes = self
+                .provider
+                .read_data(&path)?
+                .context("feature is missing")?;
+            let value: Value = serde_json::from_slice(&bytes)?;
+            if placed {
+                self.placed(&value, depth + 1)
+            } else {
+                self.configured(&value, depth + 1)
+            }
+        })();
+        self.active.remove(&path);
+        if let Ok(value) = result {
+            self.cache.insert(path, value);
+        }
+        result
+    }
+
+    fn placed(&mut self, value: &Value, depth: usize) -> Result<bool> {
+        ensure!(
+            depth < 64 && self.nodes < 32768,
+            "feature graph limit exceeded"
+        );
+        self.nodes += 1;
+        if let Some(name) = value.as_str() {
+            ensure!(!name.starts_with('#'), "tag is not a single placed feature");
+            return self.named(&ResourceId::parse(name)?, true, depth);
+        }
+        let placed = PlacedFeature::decode(value)?;
+        self.configured(&placed.feature, depth + 1)
+    }
+
+    fn placed_set(&mut self, value: &Value, depth: usize) -> Result<bool> {
+        if let Some(tag) = value.as_str().and_then(|name| name.strip_prefix('#')) {
+            let ids = self
+                .tags
+                .resolve_tag(self.provider, self.registry, &ResourceId::parse(tag)?)?
+                .context("placed feature tag is missing")?;
+            ensure!(
+                !ids.is_empty() && ids.len() <= 4096,
+                "invalid selector holder set"
+            );
+            for id in ids {
+                if !self.named(&id, true, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        if let Some(values) = value.as_array() {
+            ensure!(
+                !values.is_empty() && values.len() <= 4096,
+                "invalid selector holder set"
+            );
+            for value in values {
+                if !self.placed(value, depth + 1)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            self.placed(value, depth + 1)
+        }
+    }
+
+    fn configured(&mut self, value: &Value, depth: usize) -> Result<bool> {
+        ensure!(
+            depth < 64 && self.nodes < 32768,
+            "feature graph limit exceeded"
+        );
+        self.nodes += 1;
+        if let Some(name) = value.as_str() {
+            return self.named(&ResourceId::parse(name)?, false, depth);
+        }
+        let id = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("feature type is missing")?,
+        )?;
+        if id.namespace != "minecraft" {
+            return Ok(false);
+        }
+        match id.path.as_str() {
             "simple_block"
-                | "ore"
-                | "scattered_ore"
-                | "disk"
-                | "spring_feature"
-                | "underwater_magma"
-                | "block_column"
-                | "lake"
-                | "freeze_top_layer"
-                | "monster_room"
-                | "geode"
-                | "multiface_growth"
-                | "vines"
-                | "huge_brown_mushroom"
-                | "huge_red_mushroom"
-        ))
+            | "ore"
+            | "scattered_ore"
+            | "disk"
+            | "spring_feature"
+            | "underwater_magma"
+            | "block_column"
+            | "lake"
+            | "freeze_top_layer"
+            | "monster_room"
+            | "geode"
+            | "multiface_growth"
+            | "vines"
+            | "huge_brown_mushroom"
+            | "huge_red_mushroom" => Ok(true),
+            "simple_random_selector" => self.placed_set(
+                value
+                    .get("features")
+                    .context("selector features are missing")?,
+                depth + 1,
+            ),
+            "random_boolean_selector" => Ok(self.placed(
+                value
+                    .get("feature_true")
+                    .context("true feature is missing")?,
+                depth + 1,
+            )? && self.placed(
+                value
+                    .get("feature_false")
+                    .context("false feature is missing")?,
+                depth + 1,
+            )?),
+            "random_selector" | "weighted_random_selector" => {
+                let entries = value
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .context("selector features are missing")?;
+                ensure!(entries.len() <= 4096, "too many selector features");
+                let mut total = 0i32;
+                for entry in entries {
+                    let field = if id.path == "random_selector" {
+                        "feature"
+                    } else {
+                        "data"
+                    };
+                    if id.path == "random_selector" {
+                        let chance = entry
+                            .get("chance")
+                            .and_then(Value::as_f64)
+                            .context("selector chance is missing")?
+                            as f32;
+                        ensure!(
+                            chance.is_finite() && (0.0..=1.0).contains(&chance),
+                            "invalid selector chance"
+                        );
+                    } else {
+                        let weight = entry
+                            .get("weight")
+                            .and_then(Value::as_i64)
+                            .and_then(|v| i32::try_from(v).ok())
+                            .context("invalid selector weight")?;
+                        ensure!(weight >= 0, "invalid selector weight");
+                        total = total
+                            .checked_add(weight)
+                            .context("selector weight overflow")?;
+                    }
+                    if !self.placed(
+                        entry.get(field).context("selector entry is missing")?,
+                        depth + 1,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                if id.path == "random_selector" {
+                    self.placed(
+                        value
+                            .get("default")
+                            .context("selector default is missing")?,
+                        depth + 1,
+                    )
+                } else {
+                    Ok(true)
+                }
+            }
+            "vegetation_patch" | "waterlogged_vegetation_patch" => self.placed(
+                value
+                    .get("vegetation_feature")
+                    .context("patch vegetation is missing")?,
+                depth + 1,
+            ),
+            "root_system" => self.placed(
+                value.get("feature").context("root feature is missing")?,
+                depth + 1,
+            ),
+            _ => Ok(false),
+        }
+    }
 }
 
 fn features_cannot_spawn_entities(
     provider: &mut impl ResourceProvider,
     schedule: &FeatureSchedule,
+    registry: &BTreeSet<ResourceId>,
 ) -> bool {
-    schedule
-        .steps()
-        .iter()
-        .flatten()
-        .all(|key| feature_cannot_spawn_entities(provider, schedule, key).unwrap_or(false))
+    let mut classifier = EntityFeatureClassifier {
+        provider,
+        registry,
+        tags: FeatureTags::default(),
+        active: BTreeSet::new(),
+        cache: BTreeMap::new(),
+        nodes: 0,
+    };
+    schedule.steps().iter().flatten().all(|key| {
+        match key {
+            FeatureKey::Registered(id) => classifier.named(id, true, 0),
+            FeatureKey::Inline { biome, .. } => schedule
+                .biome(biome)
+                .and_then(|biome| biome.inline.get(key))
+                .context("inline placed feature is missing")
+                .and_then(|value| classifier.placed(value, 0)),
+        }
+        .unwrap_or(false)
+    })
 }
 
 #[derive(Default)]
@@ -528,7 +698,8 @@ impl FreshTerrainBatch {
             "invalid dimension ambient light"
         );
         let schedule = self.generator.feature_schedule(provider, placed_features)?;
-        let features_cannot_spawn_entities = features_cannot_spawn_entities(provider, &schedule);
+        let features_cannot_spawn_entities =
+            features_cannot_spawn_entities(provider, &schedule, placed_features);
         let heightmap_tags =
             native_resources::heightmap_tags::HeightmapTags::load(provider, &block_registry)?;
         self.decoration = Some(DecorationConfig {
@@ -1515,23 +1686,104 @@ mod entity_source_tests {
         );
         let biome = ResourceId::parse("test:plain").unwrap();
         let placed = ResourceId::parse("test:placed").unwrap();
-        let schedule =
-            FeatureSchedule::load(&mut data, &[biome], &BTreeSet::from([placed])).unwrap();
-        assert!(features_cannot_spawn_entities(&mut data, &schedule));
+        let registry = BTreeSet::from([placed]);
+        let schedule = FeatureSchedule::load(&mut data, &[biome], &registry).unwrap();
+        assert!(features_cannot_spawn_entities(
+            &mut data, &schedule, &registry
+        ));
         put(
             &mut data,
             "data/test/worldgen/feature/configured.json",
             json!({"type":"minecraft:random_boolean_selector"}),
         );
-        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+        assert!(!features_cannot_spawn_entities(
+            &mut data, &schedule, &registry
+        ));
         put(
             &mut data,
             "data/test/worldgen/feature/configured.json",
             json!({"type":"test:ore"}),
         );
-        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+        assert!(!features_cannot_spawn_entities(
+            &mut data, &schedule, &registry
+        ));
         data.0.remove("data/test/worldgen/feature/configured.json");
-        assert!(!features_cannot_spawn_entities(&mut data, &schedule));
+        assert!(!features_cannot_spawn_entities(
+            &mut data, &schedule, &registry
+        ));
+    }
+
+    #[test]
+    fn nested_selectors_require_every_branch_and_resolve_tags() {
+        let mut data = Data::default();
+        let put = |data: &mut Data, path: &str, value: Value| {
+            data.0
+                .insert(path.into(), serde_json::to_vec(&value).unwrap());
+        };
+        put(
+            &mut data,
+            "data/test/worldgen/biome/plain.json",
+            json!({"features":[["test:root"]]}),
+        );
+        put(
+            &mut data,
+            "data/test/worldgen/placed_feature/root.json",
+            json!({"feature":"test:root","placement":[]}),
+        );
+        put(
+            &mut data,
+            "data/test/worldgen/placed_feature/leaf.json",
+            json!({"feature":{"type":"minecraft:ore"},"placement":[]}),
+        );
+        put(
+            &mut data,
+            "data/test/tags/worldgen/placed_feature/plants.json",
+            json!({"values":["test:leaf"]}),
+        );
+        let registry = BTreeSet::from([
+            ResourceId::parse("test:root").unwrap(),
+            ResourceId::parse("test:leaf").unwrap(),
+        ]);
+        let schedule = FeatureSchedule::load(
+            &mut data,
+            &[ResourceId::parse("test:plain").unwrap()],
+            &registry,
+        )
+        .unwrap();
+        let inline = json!({"feature":{"type":"minecraft:simple_block"},"placement":[]});
+        for configured in [
+            json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":"test:leaf"}),
+            json!({"type":"minecraft:simple_random_selector","features":"#test:plants"}),
+            json!({"type":"minecraft:random_selector","features":[{"chance":0.5,"feature":"test:leaf"}],"default":inline}),
+            json!({"type":"minecraft:weighted_random_selector","features":[{"weight":1,"data":"test:leaf"}]}),
+            json!({"type":"minecraft:vegetation_patch","vegetation_feature":inline}),
+            json!({"type":"minecraft:root_system","feature":inline}),
+        ] {
+            put(
+                &mut data,
+                "data/test/worldgen/feature/root.json",
+                configured,
+            );
+            assert!(features_cannot_spawn_entities(
+                &mut data, &schedule, &registry
+            ));
+        }
+        for configured in [
+            json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":{"feature":{"type":"example:spawner"},"placement":[]}}),
+            json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":"test:root"}),
+            json!({"type":"minecraft:simple_random_selector","features":"#test:missing"}),
+            json!({"type":"minecraft:random_selector","features":[{"chance":2,"feature":"test:leaf"}],"default":inline}),
+            json!({"type":"minecraft:weighted_random_selector","features":[{"weight":-1,"data":"test:leaf"}]}),
+        ] {
+            put(
+                &mut data,
+                "data/test/worldgen/feature/root.json",
+                configured,
+            );
+            assert!(!features_cannot_spawn_entities(
+                &mut data, &schedule, &registry
+            ));
+        }
     }
 
     #[test]

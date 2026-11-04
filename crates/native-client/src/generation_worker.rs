@@ -1775,6 +1775,7 @@ mod tests {
             (true, true, "minecraft:sheep", 2),
             (true, false, "minecraft:sheep", 0),
             (true, false, "minecraft:sheep", 1),
+            (true, false, "minecraft:sheep", 2),
             (true, false, "minecraft:horse", 0),
             (true, false, "minecraft:donkey", 0),
         ] {
@@ -1788,7 +1789,7 @@ mod tests {
                 };
                 selected_biome["features"] = json!([[{
                     "feature": configured,
-                    "placement": if feature_kind == 1 {json!([{"type":"minecraft:offset","x":8,"y":8,"z":8}])} else {json!([{"type":"minecraft:count","count":0}])}
+                    "placement": [{"type":"minecraft:offset","x":8,"y":8,"z":8}]
                 }]]);
             }
             selected_biome["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]
@@ -1918,7 +1919,7 @@ mod tests {
                         .batch
                         .complete_generated_entity_records(pos)?
                         .is_some(),
-                    feature_kind != 2
+                    true
                 );
                 let source = ready.batch.spawned_heightmap_data(pos)?;
                 let full = ready.batch.converted_full_heightmap_data(pos)?;
@@ -2001,20 +2002,11 @@ mod tests {
                 session.set_spawn_heightmap_tags(Arc::clone(
                     collision_height_tags.as_ref().unwrap(),
                 ))?;
-                if feature_kind == 2 {
-                    assert!(
-                        targets
-                            .iter()
-                            .all(|&pos| session.saved_entity_chunk(pos).is_none())
-                    );
-                    assert!(session.generated_spawn_clear(position, &targets).is_err());
-                } else {
-                    assert!(targets.iter().all(|&pos| matches!(
-                        session.saved_entity_chunk(pos),
-                        Some(SavedEntityData::Empty)
-                    )));
-                    assert!(session.generated_spawn_clear(position, &targets)?);
-                }
+                assert!(targets.iter().all(|&pos| matches!(
+                    session.saved_entity_chunk(pos),
+                    Some(SavedEntityData::Empty)
+                )));
+                assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if spawn_mobs && !disabled && species == "minecraft:sheep" {
                 use native_session::loaded::SavedEntityData;

@@ -28,6 +28,7 @@ use native_world::biome_zoom::{obfuscate_seed, quart_position};
 use serde_json::Value;
 
 mod carving;
+mod entity_order;
 mod generated_beehive;
 mod generated_chest;
 mod generated_spawner;
@@ -111,6 +112,8 @@ pub struct CarvedTerrainWorld {
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_core::postprocessing::PostProcessing>>,
     generated_bee_nests: Arc<BTreeMap<[i32; 3], GeneratedBeeNest>>,
     generated_monster_entities: Arc<BTreeMap<[i32; 3], Option<GeneratedMonsterRoomEntity>>>,
+    generated_entity_order:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<entity_order::LivePositions>>,
 }
 
 /// Registration history for a newly created generation light engine. The
@@ -1194,6 +1197,7 @@ impl CarvedTerrainWorld {
             feature_postprocessing: BTreeMap::new(),
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
+            generated_entity_order: BTreeMap::new(),
         }
     }
 
@@ -1438,8 +1442,7 @@ impl CarvedTerrainWorld {
     }
 
     /// Prepare known block entities after checking every block in this chunk.
-    /// This intermediate list does not establish Java's iteration order or
-    /// authorize saving the rest of the generated chunk.
+    /// This intermediate list does not authorize saving the rest of the chunk.
     pub fn generated_block_entity_data(
         &self,
         pos: native_world::loaded::ChunkPos,
@@ -1544,7 +1547,7 @@ impl CarvedTerrainWorld {
             );
         }
         let mut resolved = vec![None; self.world.state_count()];
-        let mut values = Vec::with_capacity(entities.len());
+        let mut values = BTreeMap::new();
         for sy in (self.min_y / 16)..(end_y / 16) {
             let section = chunk
                 .sections
@@ -1578,7 +1581,7 @@ impl CarvedTerrainWorld {
                         .remove(&p)
                         .context("generated block entity data is missing")?;
                     ensure!(&expected == state, "generated block entity state mismatch");
-                    values.push(data);
+                    values.insert(p, data);
                 }
             }
         }
@@ -1586,9 +1589,27 @@ impl CarvedTerrainWorld {
             entities.is_empty(),
             "generated block entity has no matching block"
         );
+        let order = self
+            .generated_entity_order
+            .get(&pos)
+            .map(|history| history.saving_order())
+            .transpose()?
+            .unwrap_or_default();
+        let ordered = order
+            .into_iter()
+            .map(|p| {
+                values
+                    .remove(&p)
+                    .context("generated block entity order has an unknown position")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            values.is_empty(),
+            "generated block entity order is missing positions"
+        );
         Ok(Tag::List {
             element_type: TagType::Compound,
-            values,
+            values: ordered,
         })
     }
 

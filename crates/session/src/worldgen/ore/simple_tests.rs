@@ -147,6 +147,7 @@ fn terrain() -> CarvedTerrainWorld {
         feature_postprocessing: BTreeMap::new(),
         generated_bee_nests: Arc::new(BTreeMap::new()),
         generated_monster_entities: Arc::new(BTreeMap::new()),
+        generated_entity_order: BTreeMap::new(),
     }
 }
 struct Data;

@@ -73,6 +73,7 @@ pub struct DecorationRegion<'a> {
     tree_decorations: Vec<[i32; 3]>,
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
+    entity_order: BTreeMap<ChunkPos, Arc<super::entity_order::LivePositions>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
@@ -1658,6 +1659,7 @@ impl CarvedTerrainWorld {
         let feature_marks = self.feature_postprocessing.clone();
         let bee_nests = self.generated_bee_nests.clone();
         let monster_entities = self.generated_monster_entities.clone();
+        let entity_order = self.generated_entity_order.clone();
         Ok(DecorationRegion {
             target: self,
             world,
@@ -1683,6 +1685,7 @@ impl CarvedTerrainWorld {
             tree_decorations: Vec::new(),
             bee_nests,
             monster_entities,
+            entity_order,
             pending_monster_spawners: 0,
             light_guard: None,
             tree_block_write: false,
@@ -1927,6 +1930,7 @@ impl DecorationRegion<'_> {
         self.target.feature_postprocessing = self.feature_marks;
         self.target.generated_bee_nests = self.bee_nests;
         self.target.generated_monster_entities = self.monster_entities;
+        self.target.generated_entity_order = self.entity_order;
         Ok(Arc::clone(&self.target.world))
     }
 
@@ -3061,6 +3065,7 @@ impl BeehiveWorld for DecorationRegion<'_> {
                 .is_none(),
             "duplicate generated bee nest"
         );
+        Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         Ok(())
     }
 }
@@ -3378,6 +3383,9 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         }
         if self.monster_entities.contains_key(&pos) {
             Arc::make_mut(&mut self.monster_entities).remove(&pos);
+            if let Some(order) = self.entity_order.get_mut(&chunk(pos)) {
+                Arc::make_mut(order).remove(pos);
+            }
         }
         self.set_proto_block(pos, &state)?;
         match kind {
@@ -3404,7 +3412,10 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
             return Ok(false);
         }
         match self.monster_entities.get(&pos) {
-            Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => Ok(true),
+            Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => {
+                Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
+                Ok(true)
+            }
             _ => bail!("chest block entity is unavailable"),
         }
     }
@@ -3429,7 +3440,10 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
             return Ok(false);
         }
         match self.monster_entities.get(&pos) {
-            Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_))) => Ok(true),
+            Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_))) => {
+                Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
+                Ok(true)
+            }
             _ => bail!("spawner block entity is unavailable"),
         }
     }
@@ -6249,6 +6263,7 @@ mod tests {
             feature_postprocessing: BTreeMap::new(),
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
+            generated_entity_order: BTreeMap::new(),
         };
         (result, tags, motion, feature)
     }
@@ -14337,6 +14352,13 @@ mod tests {
                 chest_data.sort();
                 assert_eq!(chest_data.join(";"), java_chests);
                 assert_eq!(mob, java_mob);
+                let native_persistence::nbt::Tag::List { values, .. } = terrain
+                    .generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &generated)
+                    .unwrap()
+                else {
+                    panic!("missing generated block entity list")
+                };
+                assert_eq!(values.len(), chest_data.len() + usize::from(mob != "-"));
             }
         }
         assert!(
@@ -15778,6 +15800,18 @@ mod tests {
                 "minecraft:bee_nest" | "minecraft:chest" | "minecraft:spawner"
             ))
         };
+        assert!(
+            terrain
+                .generated_block_entity_data_with(center, classify)
+                .is_err()
+        );
+        let mut order = super::super::entity_order::LivePositions::default();
+        for p in [nest.position, chest.position, spawner.position] {
+            order.insert(p);
+        }
+        terrain
+            .generated_entity_order
+            .insert(center, Arc::new(order));
         let encoded = terrain
             .generated_block_entity_data_with(center, classify)
             .unwrap();

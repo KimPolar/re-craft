@@ -95,6 +95,43 @@ impl FreshTerrainBatch {
         Ok(self.biomes.biome_at_block(x, max_y - 1, z)?.clone())
     }
 
+    /// Initialize a sheep using the biome at its actual entity block position.
+    /// The tags, region random source and group must belong to this world and
+    /// spawn operation. This does not construct, serialize or store the entity.
+    pub fn initialize_sheep(
+        &self,
+        position: [i32; 3],
+        tags: &native_resources::worldgen_region_random::SheepBiomeTags,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        has_follow_range_bonus: bool,
+    ) -> Result<native_resources::worldgen_region_random::SheepInitialization> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before initializing a sheep"
+        );
+        let [x, y, z] = position;
+        let chunk = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        ensure!(
+            self.schedule
+                .completed(chunk)
+                .is_some_and(|stage| stage >= GenerationStage::Light),
+            "sheep initialization requires a light-complete chunk"
+        );
+        let biome = self.biomes.biome_at_block(x, y, z)?;
+        let (warm, cold) = tags.membership(biome)?;
+        Ok(native_resources::worldgen_region_random::finalize_sheep(
+            random,
+            group,
+            has_follow_range_bonus,
+            warm,
+            cold,
+        ))
+    }
+
     /// Start the random ordering for one light-complete chunk. The supplied
     /// list and probability must be resolved from the same data-pack stack
     /// and all applicable environment layers. This only plans attempts; it

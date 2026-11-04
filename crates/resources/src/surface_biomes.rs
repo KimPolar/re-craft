@@ -106,7 +106,7 @@ impl SurfaceBiomes {
     }
 }
 
-fn resolve_tag(
+pub(crate) fn resolve_tag(
     provider: &mut impl ResourceProvider,
     id: &ResourceId,
     registry: &BTreeSet<ResourceId>,

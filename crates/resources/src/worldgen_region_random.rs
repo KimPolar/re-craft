@@ -3,12 +3,61 @@
 //! Species-specific initialization precedes `finalize_animal_base`.
 //! These functions do not construct or store an entity.
 
+use anyhow::{Context, Result, ensure};
 use native_core::{
     normal_noise::{NoiseSeedFactory, NoiseSeedSource},
     random::{LegacyRandom, XoroshiroRandom},
 };
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::density::WorldgenRandom;
+use crate::{
+    density::WorldgenRandom,
+    packs::{ResourceId, ResourceProvider},
+    surface_biomes,
+};
+
+/// The active world's farm-animal variant biome tags, including pack overrides.
+pub struct SheepBiomeTags {
+    registry: BTreeSet<ResourceId>,
+    warm: BTreeSet<ResourceId>,
+    cold: BTreeSet<ResourceId>,
+}
+
+impl SheepBiomeTags {
+    pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
+        let registry: BTreeSet<_> = provider.list_data("worldgen/biome")?.into_iter().collect();
+        ensure!(!registry.is_empty(), "biome registry is empty");
+        let mut cache = BTreeMap::new();
+        let mut resolve = |name: &str| -> Result<BTreeSet<ResourceId>> {
+            let id = ResourceId::parse(name)?;
+            Ok(surface_biomes::resolve_tag(
+                provider,
+                &id,
+                &registry,
+                &mut cache,
+                &mut BTreeSet::new(),
+            )?
+            .unwrap_or_default())
+        };
+        let warm = resolve("minecraft:spawns_warm_variant_farm_animals")
+            .context("cannot resolve warm farm-animal biome tag")?;
+        let cold = resolve("minecraft:spawns_cold_variant_farm_animals")
+            .context("cannot resolve cold farm-animal biome tag")?;
+        Ok(Self {
+            registry,
+            warm,
+            cold,
+        })
+    }
+
+    pub fn membership(&self, biome: &ResourceId) -> Result<(bool, bool)> {
+        ensure!(
+            self.registry.contains(biome),
+            "biome is absent from the active registry"
+        );
+        Ok((self.warm.contains(biome), self.cold.contains(biome)))
+    }
+}
 
 /// The independent random source owned by one Java WorldGenRegion instance.
 /// Keep it alive for every operation in that region; do not recreate it for
@@ -203,6 +252,65 @@ pub fn finalize_animal_base(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sheep_biome_tags_follow_layering_nested_tags_and_registry() {
+        #[derive(Default)]
+        struct Data(BTreeMap<String, Vec<Vec<u8>>>);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(self.0.get(path).cloned().unwrap_or_default())
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                ["minecraft:plains", "example:warm", "example:cold"]
+                    .into_iter()
+                    .map(ResourceId::parse)
+                    .collect()
+            }
+        }
+        let mut data = Data::default();
+        data.0.insert("data/minecraft/tags/worldgen/biome/spawns_warm_variant_farm_animals.json".into(), vec![
+            br#"{"values":["minecraft:plains"]}"#.to_vec(),
+            br##"{"replace":true,"values":["#example:nested",{"id":"example:missing","required":false}]}"##.to_vec(),
+        ]);
+        data.0.insert(
+            "data/example/tags/worldgen/biome/nested.json".into(),
+            vec![br#"{"values":["example:warm"]}"#.to_vec()],
+        );
+        data.0.insert(
+            "data/minecraft/tags/worldgen/biome/spawns_cold_variant_farm_animals.json".into(),
+            vec![br#"{"values":["example:cold","example:warm"]}"#.to_vec()],
+        );
+        let tags = SheepBiomeTags::load(&mut data).unwrap();
+        assert_eq!(
+            tags.membership(&ResourceId::parse("minecraft:plains").unwrap())
+                .unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            tags.membership(&ResourceId::parse("example:warm").unwrap())
+                .unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            tags.membership(&ResourceId::parse("example:cold").unwrap())
+                .unwrap(),
+            (false, true)
+        );
+        assert!(
+            tags.membership(&ResourceId::parse("example:missing").unwrap())
+                .is_err()
+        );
+        data.0.insert(
+            "data/example/tags/worldgen/biome/nested.json".into(),
+            vec![br##"{"values":["#example:nested"]}"##.to_vec()],
+        );
+        assert!(SheepBiomeTags::load(&mut data).is_err());
+    }
 
     #[test]
     fn first_animal_skips_baby_draw_and_existing_bonus_skips_double_draws() {

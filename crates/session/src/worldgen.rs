@@ -3398,6 +3398,11 @@ mod tests {
                 if path == "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
                     return Ok(Some(br#"{"values":[]}"#.to_vec()));
                 }
+                if path
+                    == "data/minecraft/tags/worldgen/biome/spawns_warm_variant_farm_animals.json"
+                {
+                    return Ok(Some(br#"{"values":["minecraft:plains"]}"#.to_vec()));
+                }
                 if matches!(
                     path,
                     "data/minecraft/tags/block/animals_spawnable_on.json"
@@ -4060,6 +4065,37 @@ mod tests {
             let position = geometry
                 .position
                 .map(|coordinate| coordinate.floor() as i32);
+            let tags =
+                native_resources::worldgen_region_random::SheepBiomeTags::load(&mut data).unwrap();
+            let mut random = native_resources::worldgen_region_random::RegionRandom::new(
+                42,
+                native_resources::density::WorldgenRandom::Legacy,
+                0,
+                0,
+            );
+            let mut expected_random = random.clone();
+            let mut group = native_resources::worldgen_region_random::AnimalGroupData::default();
+            let mut expected_group = group;
+            assert!(
+                batch
+                    .initialize_sheep([1_000_000, 0, 0], &tags, &mut random, &mut group, false)
+                    .is_err()
+            );
+            let expected = native_resources::worldgen_region_random::finalize_sheep(
+                &mut expected_random,
+                &mut expected_group,
+                false,
+                true,
+                false,
+            );
+            assert_eq!(
+                batch
+                    .initialize_sheep(position, &tags, &mut random, &mut group, false)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(group, expected_group);
+            assert_eq!(random.next_long(), expected_random.next_long());
             let saved = || GeneratedEntityAddition {
                 block_position: position,
                 record: GeneratedEntityRecord::Saved(native_persistence::nbt::Tag::Compound(vec![

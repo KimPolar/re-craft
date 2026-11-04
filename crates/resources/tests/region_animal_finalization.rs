@@ -1,10 +1,35 @@
 //! Compare sheep color and common animal finalization against installed 26.3.
 use native_resources::{
     density::WorldgenRandom,
-    worldgen_region_random::{AnimalGroupData, RegionRandom, finalize_sheep},
+    worldgen_region_random::{AnimalGroupData, RegionRandom, SheepBiomeTags, finalize_sheep},
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
+
+#[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn sheep_biome_tags_resolve_installed_data() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let tags = SheepBiomeTags::load(&mut resources).unwrap();
+    for (name, expected) in [
+        ("minecraft:plains", (false, false)),
+        ("minecraft:snowy_plains", (false, true)),
+        ("minecraft:the_end", (false, true)),
+        ("minecraft:desert", (true, false)),
+        ("minecraft:jungle", (true, false)),
+        ("minecraft:nether_wastes", (true, false)),
+    ] {
+        assert_eq!(
+            tags.membership(&native_resources::packs::ResourceId::parse(name).unwrap())
+                .unwrap(),
+            expected,
+            "{name}"
+        );
+    }
+}
 
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]

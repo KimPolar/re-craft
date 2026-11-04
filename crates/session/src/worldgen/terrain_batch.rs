@@ -42,6 +42,7 @@ pub struct FreshTerrainBatch {
     light_engine: Option<StagedGenerationLightEngine>,
     lit_cache: Option<(BTreeSet<ChunkPos>, Arc<World>)>,
     spawn_ready: BTreeSet<ChunkPos>,
+    entity_sources: GeneratedEntitySources,
     failed: bool,
 }
 
@@ -64,6 +65,29 @@ struct DecorationConfig {
     has_skylight: bool,
     dimension_type: Option<String>,
     ambient_light: Option<f32>,
+}
+
+#[derive(Default)]
+struct GeneratedEntitySources {
+    complete_spawns: BTreeSet<ChunkPos>,
+    untracked: bool,
+}
+
+impl GeneratedEntitySources {
+    fn complete_spawn(&mut self, pos: ChunkPos, additions: &[super::GeneratedEntityAddition]) {
+        if additions.iter().all(|addition| {
+            addition.block_position[0].div_euclid(16) == pos.x
+                && addition.block_position[2].div_euclid(16) == pos.z
+        }) {
+            self.complete_spawns.insert(pos);
+        } else {
+            self.untracked = true;
+        }
+    }
+
+    fn contains_complete_spawn(&self, pos: ChunkPos) -> bool {
+        !self.untracked && self.complete_spawns.contains(&pos)
+    }
 }
 
 impl FreshTerrainBatch {
@@ -309,10 +333,13 @@ impl FreshTerrainBatch {
             .recorded_generated_entities(pos)
     }
 
-    /// Prove an entity chunk empty for a generator without structures,
-    /// biome features, or world-generation mobs. Other configurations may
-    /// still have unrecorded entity sources and must remain unavailable.
-    pub fn generated_entity_chunk_is_known_empty(&self, pos: ChunkPos) -> Result<bool> {
+    /// Return complete records only when this no-structures batch has no
+    /// biome features and the chunk's own spawn operation was fully recorded.
+    /// Unsupported or cross-chunk entity sources keep the result unknown.
+    pub fn complete_generated_entity_records(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<&[native_persistence::nbt::Tag]>> {
         ensure!(self.is_complete(), "generation batch has pending work");
         ensure!(
             self.schedule
@@ -321,16 +348,22 @@ impl FreshTerrainBatch {
             "entity completeness requires a spawn-complete chunk"
         );
         let decoration = self.decoration.as_ref().context("decoration is missing")?;
-        if !self.mob_generation_disabled()?
+        if !self.entity_sources.contains_complete_spawn(pos)
             || decoration
                 .schedule
                 .steps()
                 .iter()
                 .any(|step| !step.is_empty())
         {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(self.recorded_generated_entities(pos)?.is_empty())
+        Ok(Some(self.recorded_generated_entities(pos)?))
+    }
+
+    pub fn generated_entity_chunk_is_known_empty(&self, pos: ChunkPos) -> Result<bool> {
+        Ok(self
+            .complete_generated_entity_records(pos)?
+            .is_some_and(<[_]>::is_empty))
     }
 
     /// Stage all addFreshEntityWithPassengers visits and publish only after
@@ -365,6 +398,7 @@ impl FreshTerrainBatch {
             super::stage_generated_entity(&terrain.world, &mut staged, addition)?;
         }
         terrain.generated_entities = staged;
+        self.entity_sources.untracked = true;
         Ok(())
     }
 
@@ -396,6 +430,7 @@ impl FreshTerrainBatch {
             light_engine: None,
             lit_cache: None,
             spawn_ready: BTreeSet::new(),
+            entity_sources: GeneratedEntitySources::default(),
             failed: false,
         })
     }
@@ -617,7 +652,9 @@ impl FreshTerrainBatch {
             disabled || !spawn_mobs,
             "world-generation mob spawning is not implemented"
         );
-        self.request_completed_spawn(pos)
+        self.request_completed_spawn(pos)?;
+        self.entity_sources.complete_spawn(pos, &[]);
+        Ok(())
     }
 
     /// The generator's `disable_mob_generation` setting. Incomplete
@@ -688,6 +725,7 @@ impl FreshTerrainBatch {
             .as_mut()
             .expect("validated generated terrain")
             .generated_entities = staged;
+        self.entity_sources.complete_spawn(pos, additions);
         Ok(())
     }
 
@@ -1365,5 +1403,37 @@ impl FreshTerrainBatch {
             _ => bail!("invalid light registration history"),
         };
         Ok((self.schedule, self.biomes, self.terrain, light))
+    }
+}
+
+#[cfg(test)]
+mod entity_source_tests {
+    use super::*;
+    use crate::worldgen::{GeneratedEntityAddition, GeneratedEntityRecord};
+
+    #[test]
+    fn cross_chunk_and_untracked_sources_invalidate_spawn_evidence() {
+        let chunk = ChunkPos { x: -1, z: 0 };
+        let local = GeneratedEntityAddition {
+            block_position: [-1, 64, 15],
+            record: GeneratedEntityRecord::Passenger,
+        };
+        let neighbor = GeneratedEntityAddition {
+            block_position: [0, 64, 15],
+            record: GeneratedEntityRecord::Passenger,
+        };
+        let mut evidence = GeneratedEntitySources::default();
+        assert!(!evidence.contains_complete_spawn(chunk));
+        evidence.complete_spawn(chunk, &[local]);
+        assert!(evidence.contains_complete_spawn(chunk));
+        evidence.complete_spawn(ChunkPos { x: 1, z: 0 }, &[neighbor]);
+        assert!(!evidence.contains_complete_spawn(chunk));
+        evidence.complete_spawn(chunk, &[]);
+        assert!(!evidence.contains_complete_spawn(chunk));
+
+        let mut external = GeneratedEntitySources::default();
+        external.complete_spawn(chunk, &[]);
+        external.untracked = true;
+        assert!(!external.contains_complete_spawn(chunk));
     }
 }

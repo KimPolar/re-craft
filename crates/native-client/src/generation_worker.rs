@@ -299,12 +299,11 @@ impl GenerationReady {
                 .schedule()
                 .completed(pos)
                 .is_some_and(|stage| stage >= GenerationStage::Spawn)
-                && self.batch.generated_entity_chunk_is_known_empty(pos)?
             {
-                session.set_initial_entity_chunk(
-                    pos,
-                    native_session::loaded::SavedEntityData::Empty,
-                )?;
+                if let Some(records) = self.batch.complete_generated_entity_records(pos)? {
+                    session
+                        .set_initial_entity_chunk(pos, generated_session_entities(pos, records))?;
+                }
             }
         }
         session.set_player_inventory(PlayerInventory::default());
@@ -359,6 +358,36 @@ impl GenerationReady {
         }
         Ok(session)
     }
+}
+
+/// Build a transient session input; this is not a complete entity-region
+/// document and must not be used to save a Java world.
+fn generated_session_entities(
+    pos: ChunkPos,
+    records: &[native_persistence::nbt::Tag],
+) -> native_session::loaded::SavedEntityData {
+    use native_persistence::{
+        nbt::{NamedTag, Tag, TagType},
+        world::{ChunkPos as SavedChunkPos, SavedEntityChunk},
+    };
+    use native_session::loaded::SavedEntityData;
+
+    if records.is_empty() {
+        return SavedEntityData::Empty;
+    }
+    SavedEntityData::Present(Arc::new(SavedEntityChunk {
+        position: SavedChunkPos { x: pos.x, z: pos.z },
+        document: Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: records.to_vec(),
+                },
+            )]),
+        }),
+    }))
 }
 
 /// A lit protochunk may still change during generation. Only publish block
@@ -1877,8 +1906,11 @@ mod tests {
             for &pos in &targets {
                 use native_persistence::nbt::Tag;
                 assert_eq!(
-                    ready.batch.generated_entity_chunk_is_known_empty(pos)?,
-                    disabled && !has_features
+                    ready
+                        .batch
+                        .complete_generated_entity_records(pos)?
+                        .is_some(),
+                    !has_features
                 );
                 let source = ready.batch.spawned_heightmap_data(pos)?;
                 let full = ready.batch.converted_full_heightmap_data(pos)?;
@@ -1911,6 +1943,36 @@ mod tests {
                         );
                     }
                 }
+                let target = *targets
+                    .iter()
+                    .find(|&&pos| {
+                        !ready
+                            .batch
+                            .recorded_generated_entities(pos)
+                            .unwrap()
+                            .is_empty()
+                    })
+                    .unwrap();
+                let position = IVec3::new(target.x * 16 + 8, 16, target.z * 16 + 8);
+                let player = native_session::PlayerState {
+                    position: (position - ready.mesh.origin).as_vec3()
+                        + glam::Vec3::new(0.5, 0.0, 0.5),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: true,
+                    pose: native_session::PlayerPose::Standing,
+                };
+                let session = ready.start_session(player)?;
+                let Some(native_session::loaded::SavedEntityData::Present(chunk)) =
+                    session.saved_entity_chunk(target)
+                else {
+                    panic!("generated {species} entity chunk is missing");
+                };
+                assert_eq!(
+                    chunk.entities(),
+                    ready.batch.recorded_generated_entities(target)?
+                );
             } else {
                 assert_eq!(count, 0);
             }
@@ -1938,10 +2000,6 @@ mod tests {
                 assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if spawn_mobs && !disabled && species == "minecraft:sheep" {
-                use native_persistence::{
-                    nbt::{NamedTag, Tag, TagType},
-                    world::{ChunkPos as SavedChunkPos, SavedEntityChunk},
-                };
                 use native_session::loaded::SavedEntityData;
                 let target = *targets
                     .iter()
@@ -1954,23 +2012,6 @@ mod tests {
                     })
                     .unwrap();
                 let entities = ready.batch.recorded_generated_entities(target)?.to_vec();
-                let document = NamedTag {
-                    name: "".into(),
-                    value: Tag::Compound(vec![(
-                        "Entities".into(),
-                        Tag::List {
-                            element_type: TagType::Compound,
-                            values: entities,
-                        },
-                    )]),
-                };
-                let entity_chunk = SavedEntityData::Present(Arc::new(SavedEntityChunk {
-                    position: SavedChunkPos {
-                        x: target.x,
-                        z: target.z,
-                    },
-                    document: Arc::new(document),
-                }));
                 let origin = ready.mesh.origin;
                 let position = IVec3::new(target.x * 16 + 8, 16, target.z * 16 + 8);
                 let player = native_session::PlayerState {
@@ -1989,7 +2030,12 @@ mod tests {
                 without_registry.set_spawn_heightmap_tags(Arc::clone(
                     collision_height_tags.as_ref().unwrap(),
                 ))?;
-                without_registry.set_initial_entity_chunk(target, entity_chunk.clone())?;
+                let Some(SavedEntityData::Present(chunk)) =
+                    without_registry.saved_entity_chunk(target)
+                else {
+                    panic!("generated sheep entity chunk is missing");
+                };
+                assert_eq!(chunk.entities(), entities);
                 assert!(
                     without_registry
                         .generated_spawn_clear(position, &targets)
@@ -1998,7 +2044,6 @@ mod tests {
                 ready.entity_collision_registry = Some(registry);
                 let mut session = ready.start_session(player)?;
                 session.set_spawn_heightmap_tags(collision_height_tags.unwrap())?;
-                session.set_initial_entity_chunk(target, entity_chunk)?;
                 assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if !spawn_mobs {

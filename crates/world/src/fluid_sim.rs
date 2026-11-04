@@ -15,7 +15,8 @@ pub enum Cell {
     Fluid(FluidState),
     /// A bubble column contains source water but its block is not ordinary water.
     BubbleWater(FluidState),
-    /// Source water inside a copper grate; its block must not be replaced.
+    /// Source water inside a full-face block, such as a copper grate or leaves.
+    /// The containing block must not be replaced.
     GrateWater(FluidState),
     /// A half slab, optionally holding source water.
     Slab {

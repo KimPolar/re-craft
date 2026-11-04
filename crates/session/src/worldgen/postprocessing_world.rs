@@ -322,12 +322,8 @@ fn leaf_distance(state: &BlockState) -> Result<Option<u8>> {
     Ok(Some(distance))
 }
 
-fn supported_dry_block(state: &BlockState) -> Result<DryBlock> {
+fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     if leaf_distance(state)?.is_some() {
-        ensure!(
-            state.properties["waterlogged"] == "false",
-            "waterlogged leaf fluid tick is unsupported"
-        );
         return Ok(DryBlock::Leaves);
     }
     ensure!(
@@ -407,6 +403,19 @@ impl GeneratedBlockView<'_> {
         };
         if let Some((top, waterlogged)) = self.slab(&state) {
             return Cell::Slab { top, waterlogged };
+        }
+        if leaf_distance(&state).ok().flatten().is_some()
+            && state
+                .properties
+                .get("waterlogged")
+                .is_some_and(|value| value == "true")
+        {
+            return Cell::GrateWater(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            });
         }
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             return liquid_state(&state)
@@ -932,7 +941,7 @@ impl GeneratedBlockView<'_> {
         );
         let old = self.read(pos)?;
         ensure!(
-            matches!(supported_dry_block(&old)?, DryBlock::Mushroom),
+            matches!(supported_postprocessing_block(&old)?, DryBlock::Mushroom),
             "postprocessing source is not a mushroom"
         );
         let same_light = native_world::block_light::same_light_behavior(&old, next)
@@ -1146,7 +1155,7 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
             }
             return Ok(state.clone());
         }
-        match supported_dry_block(state)? {
+        match supported_postprocessing_block(state)? {
             DryBlock::Falling => {
                 ensure!(
                     self.ticks
@@ -1162,6 +1171,9 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 });
             }
             DryBlock::Leaves => {
+                if state.properties["waterlogged"] == "true" {
+                    self.schedule_contained_water(pos)?;
+                }
                 static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
                     std::sync::OnceLock::new();
                 let tag = TAG.get_or_init(|| {
@@ -1209,7 +1221,15 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         if let Some((top, waterlogged)) = self.slab(state) {
             return Ok(native_world::fluid_sim::Cell::Slab { top, waterlogged }.contained_fluid());
         }
-        supported_dry_block(state)?;
+        if leaf_distance(state)?.is_some() && state.properties["waterlogged"] == "true" {
+            return Ok(Some(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            }));
+        }
+        supported_postprocessing_block(state)?;
         Ok(None)
     }
     fn tick_fluid(&mut self, pos: [i32; 3], _: &BlockState, fluid: &Self::Fluid) -> Result<()> {
@@ -1691,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_reject_missing_tags_and_unimplemented_waterlogged_ticks() {
+    fn leaves_reject_missing_tags_and_invalid_states() {
         let state = |distance: &str, waterlogged: &str| BlockState {
             name: "minecraft:oak_leaves".into(),
             properties: BTreeMap::from([
@@ -1700,9 +1720,12 @@ mod tests {
                 ("waterlogged".into(), waterlogged.into()),
             ]),
         };
-        assert!(supported_dry_block(&state("1", "true")).is_err());
-        assert!(supported_dry_block(&state("01", "false")).is_err());
-        assert!(supported_dry_block(&state("8", "false")).is_err());
+        assert!(matches!(
+            supported_postprocessing_block(&state("1", "true")),
+            Ok(DryBlock::Leaves)
+        ));
+        assert!(supported_postprocessing_block(&state("01", "false")).is_err());
+        assert!(supported_postprocessing_block(&state("8", "false")).is_err());
         let (mut stage, _, pos) = fixture(false);
         let world = Arc::make_mut(&mut stage.world);
         let leaf = world.intern_state(state("1", "false"));
@@ -1850,6 +1873,9 @@ mod tests {
                         br#"{"values":["minecraft:stone","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab"]}"#.to_vec(),
                     ));
                 }
+                if path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
                 Ok(None)
             }
         }
@@ -1980,6 +2006,30 @@ mod tests {
                     world.set_block_id(8, 7, 8, air).unwrap();
                 }
             }
+            case if case.starts_with("marked_leaf_") => {
+                let leaf = world.intern_state(BlockState {
+                    name: format!(
+                        "minecraft:{}",
+                        case.strip_prefix("marked_leaf_type_")
+                            .unwrap_or("oak_leaves")
+                    ),
+                    properties: BTreeMap::from([
+                        ("distance".into(), "7".into()),
+                        ("persistent".into(), "false".into()),
+                        (
+                            "waterlogged".into(),
+                            (case != "marked_leaf_dry").to_string(),
+                        ),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, leaf).unwrap();
+                if case == "marked_leaf_side" {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if case == "marked_leaf_down" {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+            }
             "flow_drain" | "flow_drain_sand" => {
                 let flowing = world.intern_state(BlockState {
                     name: "minecraft:water".into(),
@@ -2044,7 +2094,7 @@ mod tests {
             );
         }
         stage.region.ticks = RegionTicks::new(chunks, 100, 2).unwrap();
-        let registry = [
+        let mut registry: BTreeSet<String> = [
             "air",
             "water",
             "stone",
@@ -2052,11 +2102,26 @@ mod tests {
             "dirt",
             "stone_slab",
             "oak_slab",
+            "oak_leaves",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
         .collect();
+        if let Some(name) = case.strip_prefix("marked_leaf_type_") {
+            registry.insert(format!("minecraft:{name}"));
+        }
         stage.heightmap_tags = Some(Arc::new(HeightmapTags::load(&mut Tags, &registry).unwrap()));
+        let leaf_tag =
+            native_resources::packs::ResourceId::parse("minecraft:prevents_nearby_leaf_decay")
+                .unwrap();
+        stage.set_leaf_tags(Some(Arc::new(
+            native_resources::ore_feature::OreBlockTags::load(
+                &mut Tags,
+                &registry,
+                &BTreeSet::from([leaf_tag]),
+            )
+            .unwrap(),
+        )));
         stage.heightmaps.insert(chunk, fixture_maps(16));
         if case == "edge" {
             stage.heightmaps.insert(east_chunk, fixture_maps(16));
@@ -2383,6 +2448,45 @@ mod tests {
     }
 
     #[test]
+    fn marked_waterlogged_leaves_schedule_fluid_and_leaf_ticks_without_spreading() {
+        let dry = water_spread_trace("marked_leaf_dry");
+        assert!(!dry.iter().any(|line| line.starts_with("fluid ")));
+        assert!(
+            dry.iter()
+                .any(|line| line == "block minecraft:oak_leaves 8,8,8 1")
+        );
+        assert_eq!(dry.last().unwrap(), "counter 8");
+        for case in ["marked_leaf_wet", "marked_leaf_side", "marked_leaf_down"] {
+            let trace = water_spread_trace(case);
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line == "fluid minecraft:water 8,8,8 5")
+            );
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line == "block minecraft:oak_leaves 8,8,8 1")
+            );
+            assert_eq!(trace.last().unwrap(), "counter 14");
+            if case == "marked_leaf_side" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "state 9,8,8 minecraft:air -")
+                );
+            }
+            if case == "marked_leaf_down" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "state 8,7,8 minecraft:air -")
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn water_source_postprocessing_matches_java() {
         let actual = java_results(
@@ -2416,8 +2520,27 @@ mod tests {
             "marked_slab_wet",
             "marked_slab_side",
             "marked_slab_down",
+            "marked_leaf_dry",
+            "marked_leaf_wet",
+            "marked_leaf_side",
+            "marked_leaf_down",
         ] {
             expected.extend(water_spread_trace(case));
+        }
+        for name in [
+            "oak_leaves",
+            "spruce_leaves",
+            "birch_leaves",
+            "jungle_leaves",
+            "acacia_leaves",
+            "dark_oak_leaves",
+            "mangrove_leaves",
+            "cherry_leaves",
+            "pale_oak_leaves",
+            "azalea_leaves",
+            "flowering_azalea_leaves",
+        ] {
+            expected.extend(water_spread_trace(&format!("marked_leaf_type_{name}")));
         }
         assert_eq!(actual, expected);
     }

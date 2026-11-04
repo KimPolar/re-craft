@@ -93,7 +93,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down")) {
+        var leafTypes = new LinkedHashMap<String,Block>();
+        leafTypes.put("oak_leaves",Blocks.OAK_LEAVES); leafTypes.put("spruce_leaves",Blocks.SPRUCE_LEAVES);
+        leafTypes.put("birch_leaves",Blocks.BIRCH_LEAVES); leafTypes.put("jungle_leaves",Blocks.JUNGLE_LEAVES);
+        leafTypes.put("acacia_leaves",Blocks.ACACIA_LEAVES); leafTypes.put("dark_oak_leaves",Blocks.DARK_OAK_LEAVES);
+        leafTypes.put("mangrove_leaves",Blocks.MANGROVE_LEAVES); leafTypes.put("cherry_leaves",Blocks.CHERRY_LEAVES);
+        leafTypes.put("pale_oak_leaves",Blocks.PALE_OAK_LEAVES); leafTypes.put("azalea_leaves",Blocks.AZALEA_LEAVES);
+        leafTypes.put("flowering_azalea_leaves",Blocks.FLOWERING_AZALEA_LEAVES);
+        var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
+        for(var name:leafTypes.keySet()) scenarios.add("marked_leaf_type_"+name);
+        for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off"),null);
@@ -123,6 +132,14 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(scenario.equals("marked_slab_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
                 if(scenario.equals("marked_slab_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             }
+            if(scenario.startsWith("marked_leaf_")) {
+                var block=scenario.startsWith("marked_leaf_type_")?leafTypes.get(scenario.substring("marked_leaf_type_".length())):Blocks.OAK_LEAVES;
+                blocks.put(pos,block.defaultBlockState()
+                    .setValue(LeavesBlock.DISTANCE,7)
+                    .setValue(BlockStateProperties.WATERLOGGED,!scenario.equals("marked_leaf_dry")));
+                if(scenario.equals("marked_leaf_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("marked_leaf_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+            }
             if(scenario.equals("flow_drain")||scenario.equals("flow_drain_sand")) {
                 blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1));
                 if(scenario.equals("flow_drain_sand"))blocks.put(pos.east(),Blocks.SAND.defaultBlockState());
@@ -150,7 +167,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             out.println("case "+scenario);
             for(var p:List.of(pos,pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
-                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():state.getBlock() instanceof SlabBlock?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
+                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof LeavesBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
             }
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}

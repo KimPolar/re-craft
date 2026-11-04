@@ -394,9 +394,9 @@ impl GenerationReady {
     }
 
     /// Construct an experimental transient session from fully lit targets.
-    /// Block ticks and streamed fluid ticks do not yet use the captured
-    /// cross-chunk order. This does not create or save a Java world; the caller
-    /// must choose and validate the player spawn.
+    /// Supported block and fluid ticks use the captured cross-chunk order
+    /// while their indexes remain synchronized. This does not create or save
+    /// a Java world; the caller must choose and validate the player spawn.
     pub fn start_session(
         &mut self,
         player: native_session::PlayerState,

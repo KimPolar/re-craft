@@ -463,7 +463,10 @@ impl GeneratedBlockView<'_> {
             && pos
                 .iter()
                 .all(|value| value.checked_sub(6).is_some() && value.checked_add(6).is_some())
-            && self.fluid_cell(glam::IVec3::from_array(pos)) == Cell::Fluid(fluid)
+            && self
+                .fluid_cell(glam::IVec3::from_array(pos))
+                .contained_fluid()
+                == Some(fluid)
             && [[0, -1, 0], [-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]]
                 .into_iter()
                 .all(|delta| {
@@ -1125,6 +1128,12 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if let Some((_, waterlogged)) = self.slab(state) {
+            if waterlogged {
+                self.schedule_contained_water(pos)?;
+            }
+            return Ok(state.clone());
+        }
         match supported_dry_block(state)? {
             DryBlock::Falling => {
                 ensure!(
@@ -1184,6 +1193,9 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
         if let Some(fluid) = liquid_state(state)? {
             return Ok(Some(fluid));
+        }
+        if let Some((top, waterlogged)) = self.slab(state) {
+            return Ok(native_world::fluid_sim::Cell::Slab { top, waterlogged }.contained_fluid());
         }
         supported_dry_block(state)?;
         Ok(None)
@@ -1924,6 +1936,38 @@ mod tests {
                 world.set_block_id(9, 8, 8, slab).unwrap();
                 world.set_block_id(9, 8, 7, water).unwrap();
             }
+            "marked_slab_dry" | "marked_slab_wet" | "marked_slab_side" | "marked_slab_down" => {
+                let slab = world.intern_state(BlockState {
+                    name: "minecraft:stone_slab".into(),
+                    properties: BTreeMap::from([
+                        (
+                            "type".into(),
+                            if case == "marked_slab_down" {
+                                "top"
+                            } else {
+                                "bottom"
+                            }
+                            .into(),
+                        ),
+                        (
+                            "waterlogged".into(),
+                            if case == "marked_slab_dry" {
+                                "false"
+                            } else {
+                                "true"
+                            }
+                            .into(),
+                        ),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, slab).unwrap();
+                if case == "marked_slab_side" {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if case == "marked_slab_down" {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+            }
             "flow_drain" | "flow_drain_sand" => {
                 let flowing = world.intern_state(BlockState {
                     name: "minecraft:water".into(),
@@ -2306,6 +2350,27 @@ mod tests {
     }
 
     #[test]
+    fn marked_waterlogged_slabs_tick_and_update_neighbor_shapes() {
+        let dry = water_spread_trace("marked_slab_dry");
+        assert!(!dry.iter().any(|line| line.starts_with("fluid ")));
+        let wet = water_spread_trace("marked_slab_wet");
+        assert!(
+            wet.iter()
+                .any(|line| line == "fluid minecraft:water 8,8,8 5")
+        );
+        let side = water_spread_trace("marked_slab_side");
+        assert!(
+            side.iter()
+                .any(|line| line == "state 9,8,8 minecraft:water 1")
+        );
+        let down = water_spread_trace("marked_slab_down");
+        assert!(
+            down.iter()
+                .any(|line| line == "state 8,7,8 minecraft:water 8")
+        );
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn water_source_postprocessing_matches_java() {
         let actual = java_results(
@@ -2335,6 +2400,10 @@ mod tests {
             "slab_bottom_off",
             "slab_oak",
             "down_wet_slab",
+            "marked_slab_dry",
+            "marked_slab_wet",
+            "marked_slab_side",
+            "marked_slab_down",
         ] {
             expected.extend(water_spread_trace(case));
         }

@@ -93,7 +93,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
         attributes=EnvironmentAttributeSystem.builder().build();rules=new GameRules(FeatureFlags.DEFAULT_FLAGS);
         out.println("BEGIN_RESULT");
-        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab")) {
+        for(String scenario:List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down")) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off"),null);
@@ -115,6 +115,13 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             if(scenario.startsWith("slab_")) {
                 blocks.put(pos.east(),(scenario.equals("slab_oak")?Blocks.OAK_SLAB:Blocks.STONE_SLAB).defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE,scenario.equals("slab_top")?SlabType.TOP:SlabType.BOTTOM));
                 blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
+            }
+            if(scenario.startsWith("marked_slab_")) {
+                blocks.put(pos,Blocks.STONE_SLAB.defaultBlockState()
+                    .setValue(BlockStateProperties.SLAB_TYPE,scenario.equals("marked_slab_down")?SlabType.TOP:SlabType.BOTTOM)
+                    .setValue(BlockStateProperties.WATERLOGGED,!scenario.equals("marked_slab_dry")));
+                if(scenario.equals("marked_slab_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("marked_slab_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             }
             if(scenario.equals("flow_drain")||scenario.equals("flow_drain_sand")) {
                 blocks.put(pos,Blocks.WATER.defaultBlockState().setValue(LiquidBlock.LEVEL,1));

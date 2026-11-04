@@ -41,6 +41,7 @@ enum State {
 
 #[derive(Clone, Debug)]
 struct Group {
+    id: u64,
     entity: ResourceId,
     remaining: i32,
     member: i32,
@@ -61,6 +62,7 @@ pub struct ChunkCreatureSpawner {
     max_x: i32,
     max_z: i32,
     group: Option<Group>,
+    next_group_id: u64,
     state: State,
 }
 
@@ -110,6 +112,7 @@ impl ChunkCreatureSpawner {
             max_x,
             max_z,
             group: None,
+            next_group_id: 0,
             state,
         })
     }
@@ -136,7 +139,10 @@ impl ChunkCreatureSpawner {
                     let x = self.min_x + self.random.next_int_bound(16).unwrap();
                     let z = self.min_z + self.random.next_int_bound(16).unwrap();
                     if count > 0 {
+                        let id = self.next_group_id;
+                        self.next_group_id = self.next_group_id.wrapping_add(1);
                         self.group = Some(Group {
+                            id,
                             entity,
                             remaining: count,
                             member: 0,
@@ -194,6 +200,11 @@ impl ChunkCreatureSpawner {
     /// reports its post-construction checks and finalization outcome.
     pub fn created_attempt(&self) -> Option<CreatureAttempt> {
         (self.state == State::FinishEntity).then(|| self.attempt())
+    }
+
+    /// Identity of the current spawn group, stable across its attempts.
+    pub fn group_id(&self) -> Option<u64> {
+        self.group.as_ref().map(|group| group.id)
     }
 
     pub fn finish_entity(&mut self, accepted: bool) -> Result<()> {
@@ -323,6 +334,7 @@ mod tests {
         let CreatureSpawnProgress::Attempt(first) = planner.next(1).unwrap() else {
             panic!("expected attempt")
         };
+        let group = planner.group_id().unwrap();
         assert_eq!((first.member, first.attempt), (0, 0));
         planner.entity_created().unwrap();
         planner.finish_entity(false).unwrap();
@@ -330,12 +342,14 @@ mod tests {
             panic!("expected retry")
         };
         assert_eq!((second.member, second.attempt), (0, 1));
+        assert_eq!(planner.group_id(), Some(group));
         planner.entity_created().unwrap();
         planner.finish_entity(true).unwrap();
         let CreatureSpawnProgress::Attempt(third) = planner.next(0).unwrap() else {
             panic!("expected next member")
         };
         assert_eq!((third.member, third.attempt), (1, 0));
+        assert_eq!(planner.group_id(), Some(group));
         for n in 0..4 {
             let CreatureSpawnProgress::Attempt(attempt) = planner.next(0).unwrap() else {
                 panic!("expected retry")
@@ -346,5 +360,11 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(planner.state, State::Group);
+        assert_eq!(planner.group_id(), None);
+        assert!(matches!(
+            planner.next(1).unwrap(),
+            CreatureSpawnProgress::Attempt(_)
+        ));
+        assert_ne!(planner.group_id(), Some(group));
     }
 }

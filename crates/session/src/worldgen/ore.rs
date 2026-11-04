@@ -15932,6 +15932,67 @@ mod tests {
     }
 
     #[test]
+    fn generated_block_entities_stay_within_chunk_at_boundaries() {
+        use super::super::{GeneratedBeeNest, entity_order::LivePositions};
+        use native_persistence::nbt::Tag;
+        let (mut terrain, _, _, _) = fixture();
+        let positions = [
+            [0, 8, 0],
+            [15, 15, 15],
+            [-1, 8, 0],
+            [16, 8, 0],
+            [0, 8, -1],
+            [0, 8, 16],
+        ];
+        let nest_state = BlockState {
+            name: "minecraft:bee_nest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("honey_level".into(), "0".into()),
+            ]),
+        };
+        let mut expected = BTreeMap::<ChunkPos, Vec<Tag>>::new();
+        for position in positions {
+            let nest = GeneratedBeeNest::new(position, vec![1, 2]).unwrap();
+            let pos = ChunkPos {
+                x: position[0].div_euclid(16),
+                z: position[2].div_euclid(16),
+            };
+            let world = Arc::make_mut(&mut terrain.world);
+            let id = world.intern_state(nest_state.clone());
+            world
+                .set_block_id(position[0], position[1], position[2], id)
+                .unwrap();
+            expected.entry(pos).or_default().push(nest.block_entity());
+            Arc::make_mut(&mut terrain.generated_bee_nests).insert(position, nest);
+            Arc::make_mut(
+                terrain
+                    .generated_entity_order
+                    .entry(pos)
+                    .or_insert_with(|| Arc::new(LivePositions::default())),
+            )
+            .insert(position);
+        }
+        for (pos, mut wanted) in expected {
+            let Tag::List { mut values, .. } = terrain
+                .generated_block_entity_data_with(pos, |state| {
+                    Some(state.name == "minecraft:bee_nest")
+                })
+                .unwrap()
+            else {
+                panic!("expected block entity list");
+            };
+            let key = |tag: &Tag| match (tag.get("x"), tag.get("y"), tag.get("z")) {
+                (Some(Tag::Int(x)), Some(Tag::Int(y)), Some(Tag::Int(z))) => (*x, *y, *z),
+                _ => panic!("missing block entity coordinates"),
+            };
+            wanted.sort_by_key(key);
+            values.sort_by_key(key);
+            assert_eq!(values, wanted);
+        }
+    }
+
+    #[test]
     fn generated_block_entity_data_checks_blocks_and_complete_records() {
         use super::super::{
             GeneratedBeeNest, GeneratedLootChest, GeneratedMonsterRoomEntity,

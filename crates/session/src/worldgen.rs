@@ -1565,12 +1565,15 @@ impl CarvedTerrainWorld {
             .z
             .checked_mul(16)
             .context("generated chunk Z overflow")?;
-        let belongs = |p: [i32; 3]| p[0].div_euclid(16) == pos.x && p[2].div_euclid(16) == pos.z;
+        // Positions are ordered by X, then Y and Z. Restrict iteration to
+        // this chunk's X columns before checking its Z coordinate.
+        let x_range = [origin_x, i32::MIN, i32::MIN]..=[origin_x + 15, i32::MAX, i32::MAX];
+        let belongs_z = |p: [i32; 3]| p[2].div_euclid(16) == pos.z;
         let mut entities = BTreeMap::<[i32; 3], (BlockState, Tag)>::new();
         for (&p, nest) in self
             .generated_bee_nests
-            .iter()
-            .filter(|(p, _)| belongs(**p))
+            .range(x_range.clone())
+            .filter(|(p, _)| belongs_z(**p))
         {
             ensure!(p == nest.position, "generated nest position mismatch");
             let state = self
@@ -1590,8 +1593,8 @@ impl CarvedTerrainWorld {
         }
         for (&p, entity) in self
             .generated_monster_entities
-            .iter()
-            .filter(|(p, _)| belongs(**p))
+            .range(x_range)
+            .filter(|(p, _)| belongs_z(**p))
         {
             let (state, data) = match entity.as_ref().context("generated spawner is unfinished")? {
                 GeneratedMonsterRoomEntity::Chest(chest) => {

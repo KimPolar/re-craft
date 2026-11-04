@@ -2982,8 +2982,6 @@ mod tests {
             })
         };
         let center = ChunkPos { x: 0, z: 0 };
-        let computed_origin = batch.spawn_origin(&mut data).unwrap();
-        assert_eq!(computed_origin, center);
         let targets = BTreeSet::from([center]);
         let mut renderer = IncrementalPreview::default();
         assert!(
@@ -3002,15 +3000,13 @@ mod tests {
             .is_err()
         );
         let caller_thread = std::thread::current().id();
-        let generation = crate::generation_worker::GenerationWorker::start(
+        let generation = crate::generation_worker::GenerationWorker::start_at_spawn(
             move || {
                 assert_ne!(std::thread::current().id(), caller_thread);
                 Ok((batch, data, classify, resolve))
             },
-            targets.clone(),
             7,
             0,
-            IVec3::ZERO,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -3027,6 +3023,8 @@ mod tests {
         let crate::generation_worker::GenerationResult::Ready(mut generated) = generated else {
             panic!("expected generated terrain")
         };
+        assert_eq!(generated.spawn_origin, Some(center));
+        assert_eq!(generated.mesh.origin, IVec3::ZERO);
         assert_eq!(
             generation.progress().phase,
             crate::generation_worker::GenerationPhase::Ready
@@ -3097,9 +3095,7 @@ mod tests {
                     .generated_spawn_blocks_clear(IVec3::new(0, 16, 8), &targets)
                     .is_err()
             );
-            let mut initial = generated
-                .initial_spawn_search(&session, computed_origin)
-                .unwrap();
+            let mut initial = generated.initial_spawn_search_at_origin(&session).unwrap();
             assert_eq!(initial.requested_position().y, 64);
             assert_eq!(
                 session

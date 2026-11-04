@@ -1,4 +1,4 @@
-//! Prepare a fixed fresh-generation batch away from the window thread.
+//! Prepare a fresh-generation batch away from the window thread.
 use std::{
     collections::BTreeSet,
     sync::{
@@ -39,9 +39,22 @@ pub struct GenerationProgress {
 pub struct GenerationReady {
     pub batch: FreshTerrainBatch,
     pub mesh: MeshJob,
+    /// Present when the worker chose its target from the generator's spawn origin.
+    pub spawn_origin: Option<ChunkPos>,
 }
 
 impl GenerationReady {
+    pub fn initial_spawn_search_at_origin(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+    ) -> Result<native_session::world_spawn::InitialWorldSpawn> {
+        self.initial_spawn_search(
+            session,
+            self.spawn_origin
+                .context("worker has no computed spawn origin")?,
+        )
+    }
+
     /// Start the initial spawn suggestion search at the origin calculated
     /// from this batch's unchanged generator and data-pack stack.
     pub fn initial_spawn_search(
@@ -184,6 +197,14 @@ pub struct GenerationWorker {
     result: Receiver<GenerationResult>,
 }
 
+enum GenerationTargets {
+    Explicit {
+        targets: BTreeSet<ChunkPos>,
+        origin: IVec3,
+    },
+    SpawnOrigin,
+}
+
 impl GenerationWorker {
     /// Construct the batch and its resources on the worker thread. They must
     /// use the same immutable pack stack and have decoration/light configured.
@@ -201,22 +222,55 @@ impl GenerationWorker {
         C: FnMut(&Value) -> Result<CarverBlockState>,
         R: FnMut(&Value) -> Result<BlockState>,
     {
+        Self::start_with_targets(
+            prepare,
+            GenerationTargets::Explicit { targets, origin },
+            revision,
+            biome_blend,
+        )
+    }
+
+    /// Compute the generator's spawn origin on the worker and generate its
+    /// first LIGHT-complete chunk. More chunks can be required to find spawn.
+    pub fn start_at_spawn<P, C, R, F>(prepare: F, revision: u64, biome_blend: u8) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(FreshTerrainBatch, P, C, R)> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
+        Self::start_with_targets(
+            prepare,
+            GenerationTargets::SpawnOrigin,
+            revision,
+            biome_blend,
+        )
+    }
+
+    fn start_with_targets<P, C, R, F>(
+        prepare: F,
+        selection: GenerationTargets,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(FreshTerrainBatch, P, C, R)> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
         Self::spawn(move |cancelled, progress| {
-            ensure!(!targets.is_empty(), "no generation targets");
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let mut initialized = BTreeSet::new();
-            for pos in &targets {
-                for dz in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        initialized.insert(ChunkPos {
-                            x: pos.x.checked_add(dx).context("generation X overflow")?,
-                            z: pos.z.checked_add(dz).context("generation Z overflow")?,
-                        });
-                    }
+            // Preserve early validation for explicit targets before opening resources.
+            let explicit = match selection {
+                GenerationTargets::Explicit { targets, origin } => {
+                    let initialized = initialized_neighbors(&targets)?;
+                    Some((targets, origin, initialized))
                 }
-            }
+                GenerationTargets::SpawnOrigin => None,
+            };
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -225,6 +279,20 @@ impl GenerationWorker {
                 batch.is_complete() && batch.schedule().requested_chunks() == 0,
                 "generation batch must be fresh"
             );
+            let (targets, origin, initialized, spawn_origin) =
+                if let Some((targets, origin, initialized)) = explicit {
+                    (targets, origin, initialized, None)
+                } else {
+                    let pos = batch.spawn_origin(&mut provider)?;
+                    let targets = BTreeSet::from([pos]);
+                    let initialized = initialized_neighbors(&targets)?;
+                    let origin = IVec3::new(
+                        pos.x.checked_mul(16).context("spawn origin X overflow")?,
+                        0,
+                        pos.z.checked_mul(16).context("spawn origin Z overflow")?,
+                    );
+                    (targets, origin, initialized, Some(pos))
+                };
             for pos in initialized {
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(None);
@@ -261,7 +329,11 @@ impl GenerationWorker {
             }
             set_phase(progress, GenerationPhase::PreparingMesh);
             let mesh = MeshJob::for_generated(&mut batch, targets, revision, biome_blend, origin)?;
-            Ok(Some(GenerationReady { batch, mesh }))
+            Ok(Some(GenerationReady {
+                batch,
+                mesh,
+                spawn_origin,
+            }))
         })
     }
 
@@ -322,6 +394,22 @@ impl GenerationWorker {
             }
         }
     }
+}
+
+fn initialized_neighbors(targets: &BTreeSet<ChunkPos>) -> Result<BTreeSet<ChunkPos>> {
+    ensure!(!targets.is_empty(), "no generation targets");
+    let mut initialized = BTreeSet::new();
+    for pos in targets {
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                initialized.insert(ChunkPos {
+                    x: pos.x.checked_add(dx).context("generation X overflow")?,
+                    z: pos.z.checked_add(dz).context("generation Z overflow")?,
+                });
+            }
+        }
+    }
+    Ok(initialized)
 }
 
 fn generation_step(
@@ -425,6 +513,73 @@ mod tests {
     #[ignore = "requires installed Minecraft Java Edition 26.3 and a full generation batch"]
     fn installed_overworld_generates_a_lit_mesh_job() -> Result<()> {
         installed_overworld_generation(false)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and a full generation batch"]
+    fn installed_overworld_generates_computed_spawn_origin() -> Result<()> {
+        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+        use native_session::{PlayerPose, PlayerState};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let settings = |minecraft_dir| FreshGenerationSettings {
+            minecraft_dir,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            structures_enabled: false,
+            data_packs: None,
+        };
+        let expected = prepare(settings(game.clone()))?.spawn_origin()?;
+        let worker_game = game.clone();
+        let worker = GenerationWorker::start_at_spawn(
+            move || Ok(prepare(settings(worker_game))?.into_worker_inputs()),
+            13,
+            0,
+        )?;
+        let mut ready = match worker.result.recv_timeout(Duration::from_secs(300))? {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("generation was cancelled"),
+        };
+        let targets = BTreeSet::from([expected]);
+        assert_eq!(ready.spawn_origin, Some(expected));
+        assert_eq!(ready.mesh.targets.as_deref(), Some(&targets));
+        assert_eq!(
+            ready.mesh.origin,
+            IVec3::new(expected.x * 16, 0, expected.z * 16)
+        );
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_block_ids()?;
+        let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+            &mut resources,
+            &registry,
+        )?);
+        let player = PlayerState {
+            position: glam::Vec3::new(8.5, 150.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: PlayerPose::Standing,
+        };
+        let session = ready.start_session_with_spawn_heightmaps(player, tags)?;
+        let mut search = ready.initial_spawn_search_at_origin(&session)?;
+        let found = session.poll_generated_initial_spawn(&mut search, None, &targets, 256)?;
+        if let Some(pos) = found {
+            assert_eq!(
+                (pos.x.div_euclid(16), pos.z.div_euclid(16)),
+                (expected.x, expected.z)
+            );
+        } else {
+            let next = search.requested_position();
+            assert_ne!(
+                (next.x.div_euclid(16), next.z.div_euclid(16)),
+                (expected.x, expected.z)
+            );
+        }
+        Ok(())
     }
 
     #[test]

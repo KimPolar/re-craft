@@ -38,6 +38,113 @@ const HEADER_SIZE: u64 = 2 * SECTOR_SIZE;
 const REGION_SIDE: i32 = 32;
 const MAX_OFFSET: u64 = 0x00ff_ffff;
 
+/// The registry that owns a newly generated region's chunk documents.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FreshRegionKind {
+    Terrain,
+    Entities,
+    Poi,
+}
+
+/// Complete region data prepared in memory; this does not publish a world.
+/// The caller must separately prove generation, lighting, entities, POIs,
+/// and world metadata are complete before committing the staged files.
+pub struct FreshRegionDraft {
+    kind: FreshRegionKind,
+    region_x: i32,
+    region_z: i32,
+    chunks: BTreeMap<crate::world::ChunkPos, (Vec<u8>, u32)>,
+}
+
+/// A compressed external chunk to publish with its staged region file.
+pub struct FreshExternalChunk {
+    pub position: crate::world::ChunkPos,
+    pub compressed: Vec<u8>,
+}
+
+impl FreshRegionDraft {
+    pub fn new(kind: FreshRegionKind, region_x: i32, region_z: i32) -> Self {
+        Self {
+            kind,
+            region_x,
+            region_z,
+            chunks: BTreeMap::new(),
+        }
+    }
+
+    /// Add one validated document. Empty entity and POI storage actions must
+    /// be determined by the caller; this method never silently discards one.
+    pub fn add(
+        &mut self,
+        position: crate::world::ChunkPos,
+        document: &nbt::NamedTag,
+        timestamp_seconds: u32,
+    ) -> Result<()> {
+        ensure!(
+            position.x.div_euclid(REGION_SIDE) == self.region_x
+                && position.z.div_euclid(REGION_SIDE) == self.region_z,
+            "generated chunk is outside its region"
+        );
+        ensure!(
+            !self.chunks.contains_key(&position),
+            "duplicate generated region chunk"
+        );
+        match self.kind {
+            FreshRegionKind::Terrain => validate_chunk(&document.value, position.x, position.z)?,
+            FreshRegionKind::Entities => {
+                validate_entity_document(document, position)?;
+            }
+            FreshRegionKind::Poi => {
+                crate::world::decode_poi_chunk(document.clone(), position)?;
+            }
+        }
+        let bytes = nbt::write(document).context("cannot encode generated region chunk")?;
+        ensure!(
+            bytes.len() <= nbt::MAX_NBT_BYTES,
+            "generated chunk exceeds NBT limit"
+        );
+        self.chunks.insert(position, (bytes, timestamp_seconds));
+        Ok(())
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Write to an empty read/write staging file. On any error the caller must discard
+    /// it; returned external payloads belong to the same eventual transaction.
+    pub fn write_staged(&self, file: &mut File) -> Result<Vec<FreshExternalChunk>> {
+        ensure!(
+            !self.chunks.is_empty(),
+            "cannot stage an empty generated region"
+        );
+        ensure!(
+            file.metadata()?.len() == 0,
+            "generated region staging file is not empty"
+        );
+        file.set_len(HEADER_SIZE)?;
+        let mut external = Vec::new();
+        for (position, (bytes, timestamp)) in &self.chunks {
+            if let Some(compressed) =
+                write_staged_chunk(file, position.x, position.z, bytes, Some(*timestamp), false)
+                    .with_context(|| {
+                        format!(
+                            "cannot stage generated chunk ({}, {})",
+                            position.x, position.z
+                        )
+                    })?
+            {
+                external.push(FreshExternalChunk {
+                    position: *position,
+                    compressed,
+                });
+            }
+        }
+        file.flush()?;
+        Ok(external)
+    }
+}
+
 fn ordinary(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return false;
@@ -2918,6 +3025,116 @@ mod tests {
                 ),
             ])],
         )
+    }
+
+    #[test]
+    fn fresh_regions_validate_and_round_trip_negative_chunks_and_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.-1.0.mca");
+        let mut draft = FreshRegionDraft::new(FreshRegionKind::Terrain, -1, 0);
+        let first = chunk(-1, "first");
+        let second = chunk(-32, "second");
+        let p1 = crate::world::ChunkPos { x: -1, z: 0 };
+        let p2 = crate::world::ChunkPos { x: -32, z: 0 };
+        draft.add(p1, &first, 123).unwrap();
+        draft.add(p2, &second, 456).unwrap();
+        assert!(draft.add(p1, &first, 999).is_err());
+        assert!(
+            draft
+                .add(crate::world::ChunkPos { x: 0, z: 0 }, &first, 0)
+                .is_err()
+        );
+        let mut invalid = second.clone();
+        let Tag::Compound(fields) = &mut invalid.value else {
+            unreachable!()
+        };
+        fields.push(("xPos".into(), Tag::Int(-31)));
+        assert!(
+            draft
+                .add(crate::world::ChunkPos { x: -31, z: 0 }, &invalid, 0)
+                .is_err()
+        );
+        assert_eq!(draft.chunk_count(), 2);
+        let mut stage = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        assert!(draft.write_staged(&mut stage).unwrap().is_empty());
+        assert!(draft.write_staged(&mut stage).is_err());
+        drop(stage);
+        let mut reader = RegionReader::open(&path).unwrap();
+        assert_eq!(reader.read_chunk(-1, 0).unwrap(), Some(first));
+        assert_eq!(reader.read_chunk(-32, 0).unwrap(), Some(second));
+        assert_eq!(reader.read_chunk(-31, 0).unwrap(), None);
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(bytes[4096 + 31 * 4..4096 + 32 * 4].try_into().unwrap()),
+            123
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[4096..4100].try_into().unwrap()),
+            456
+        );
+    }
+
+    #[test]
+    fn fresh_entity_regions_return_external_payload_and_preserve_empty_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.0.0.mca");
+        let position = crate::world::ChunkPos { x: 0, z: 0 };
+        let mut draft = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+        let large = large_entity_chunk();
+        draft.add(position, &large, 10).unwrap();
+        let empty = entity_chunk(1, vec![]);
+        let empty_position = crate::world::ChunkPos { x: 1, z: 0 };
+        draft.add(empty_position, &empty, 11).unwrap();
+        let mut stage = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let external = draft.write_staged(&mut stage).unwrap();
+        drop(stage);
+        assert_eq!(external.len(), 1);
+        assert_eq!(external[0].position, position);
+        fs::write(dir.path().join("c.0.0.mcc"), &external[0].compressed).unwrap();
+        let mut reader = RegionReader::open(&path).unwrap();
+        assert_eq!(reader.read_chunk(0, 0).unwrap(), Some(large));
+        assert_eq!(reader.read_chunk(1, 0).unwrap(), Some(empty));
+        assert_eq!(reader.read_chunk(2, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn fresh_regions_reject_wrong_kind_or_nonempty_staging_without_writes() {
+        let position = crate::world::ChunkPos { x: 0, z: 0 };
+        let mut draft = FreshRegionDraft::new(FreshRegionKind::Poi, 0, 0);
+        assert!(draft.add(position, &entity_chunk(0, vec![]), 0).is_err());
+        assert_eq!(draft.chunk_count(), 0);
+        let poi = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        draft.add(position, &poi, 0).unwrap();
+        let mut stage = tempfile::tempfile().unwrap();
+        stage.write_all(b"unchanged").unwrap();
+        assert!(draft.write_staged(&mut stage).is_err());
+        stage.seek(SeekFrom::Start(0)).unwrap();
+        let mut content = Vec::new();
+        stage.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"unchanged");
+        let mut empty = tempfile::tempfile().unwrap();
+        assert!(
+            FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0)
+                .write_staged(&mut empty)
+                .is_err()
+        );
+        assert_eq!(empty.metadata().unwrap().len(), 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use native_persistence::{
     heightmap::{BlockHeightFlags, HeightBounds},
     nbt,
     palette::BlockState,
-    save::{WorldSavePlan, WorldWriteGuard},
+    save::{FreshRegionDraft, FreshRegionKind, WorldSavePlan, WorldWriteGuard},
     world::{ChunkPos, DimensionId, WorldReader},
 };
 use serde_json::Value;
@@ -1724,6 +1724,81 @@ fn exercise_entity_chunk_drafts(new_region: bool) {
         .lines()
         .any(|line| line == "OK")
     );
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn fresh_region_staging_is_readable_by_java_26_3() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-fresh-region-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let original = temp.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    let invoke = |action: &str, world: &Path| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(world))
+    };
+    assert!(invoke("seed", &original).lines().any(|line| line == "OK"));
+    let staged = temp.path().join("staged");
+    let input_dir = original.join("dimensions/minecraft/overworld/region");
+    let output_dir = staged.join("dimensions/minecraft/overworld/region");
+    std::fs::create_dir_all(&output_dir).unwrap();
+    for (region, chunks) in [
+        (-1, vec![-32]),
+        (0, vec![0, 1, 2, 3]),
+        (1, vec![32]),
+        (2, vec![64]),
+    ] {
+        let name = format!("r.{region}.0.mca");
+        let mut reader = RegionReader::open(&input_dir.join(&name)).unwrap();
+        let mut draft = FreshRegionDraft::new(FreshRegionKind::Terrain, region, 0);
+        for x in chunks {
+            draft
+                .add(
+                    ChunkPos { x, z: 0 },
+                    &reader.read_chunk(x, 0).unwrap().unwrap(),
+                    42,
+                )
+                .unwrap();
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(output_dir.join(name))
+            .unwrap();
+        for external in draft.write_staged(&mut file).unwrap() {
+            std::fs::write(
+                output_dir.join(format!(
+                    "c.{}.{}.mcc",
+                    external.position.x, external.position.z
+                )),
+                external.compressed,
+            )
+            .unwrap();
+        }
+    }
+    assert!(invoke("verify", &staged).lines().any(|line| line == "OK"));
 }
 
 #[test]

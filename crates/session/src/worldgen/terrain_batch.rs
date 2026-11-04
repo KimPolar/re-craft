@@ -70,6 +70,58 @@ pub struct PostprocessedChunkDraft {
     pub entity_chunk: Option<native_persistence::nbt::NamedTag>,
 }
 
+/// Group components from one completed pass; this does not authorize a save.
+fn group_fresh_regions(
+    chunks: BTreeMap<ChunkPos, PostprocessedChunkDraft>,
+    mut poi: BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>,
+    timestamp: u32,
+) -> Result<
+    BTreeMap<
+        (native_persistence::save::FreshRegionKind, i32, i32),
+        native_persistence::save::FreshRegionDraft,
+    >,
+> {
+    use native_persistence::save::{FreshRegionDraft, FreshRegionKind};
+    ensure!(!chunks.is_empty(), "no generated chunks selected");
+    ensure!(
+        chunks.len() == poi.len() && chunks.keys().eq(poi.keys()),
+        "generated POI coverage differs from terrain"
+    );
+    let mut regions = BTreeMap::new();
+    for (pos, chunk) in chunks {
+        let records = chunk
+            .entity_records
+            .as_ref()
+            .context("generated entity coverage is incomplete")?;
+        let entity = chunk
+            .entity_chunk
+            .as_ref()
+            .context("generated entity document is missing")?;
+        let absolute = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+        let mut add =
+            |kind: FreshRegionKind, document: &native_persistence::nbt::NamedTag| -> Result<()> {
+                let rx = pos.x.div_euclid(32);
+                let rz = pos.z.div_euclid(32);
+                regions
+                    .entry((kind, rx, rz))
+                    .or_insert_with(|| FreshRegionDraft::new(kind, rx, rz))
+                    .add(absolute, document, timestamp)
+            };
+        add(FreshRegionKind::Terrain, &chunk.chunk)?;
+        // A never-stored empty entity chunk has no region entry in Java.
+        if !records.is_empty() {
+            add(FreshRegionKind::Entities, entity)?;
+        }
+        if let Some(document) = poi
+            .remove(&pos)
+            .context("generated POI coverage is incomplete")?
+        {
+            add(FreshRegionKind::Poi, &document)?;
+        }
+    }
+    Ok(regions)
+}
+
 pub(super) fn updated_postprocessing_sky_sources(
     before: &World,
     after: &World,
@@ -2092,6 +2144,25 @@ impl FreshTerrainBatch {
         Ok(output)
     }
 
+    /// Prepare terrain, nonempty entity and POI regions from the same sealed
+    /// postprocessing pass. No filesystem writes or world publication occur.
+    pub fn postprocessed_region_drafts(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        timestamp: u32,
+    ) -> Result<
+        BTreeMap<
+            (native_persistence::save::FreshRegionKind, i32, i32),
+            native_persistence::save::FreshRegionDraft,
+        >,
+    > {
+        let positions: Vec<_> = positions.into_iter().collect();
+        let chunks = self.postprocessed_chunk_drafts(processed, positions.iter().copied())?;
+        let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
+        group_fresh_regions(chunks, poi, timestamp)
+    }
+
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the
     /// complete feature-generated entity list and the world's current tick.
     /// This is not a FULL chunk and must not be written as a playable world.
@@ -2462,6 +2533,92 @@ impl FreshTerrainBatch {
             _ => bail!("invalid light registration history"),
         };
         Ok((self.schedule, self.biomes, self.terrain, light))
+    }
+}
+
+#[cfg(test)]
+mod region_draft_tests {
+    use super::*;
+    use native_persistence::{
+        nbt::{NamedTag, Tag, TagType},
+        save::FreshRegionKind,
+    };
+
+    fn chunk(pos: ChunkPos, entities: Option<Vec<Tag>>) -> PostprocessedChunkDraft {
+        let entity_chunk = entities.as_ref().map(|records| {
+            native_persistence::generated_chunk::assemble_entity_chunk(pos, records).unwrap()
+        });
+        PostprocessedChunkDraft {
+            chunk: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("xPos".into(), Tag::Int(pos.x)),
+                    ("zPos".into(), Tag::Int(pos.z)),
+                    ("Status".into(), Tag::String("minecraft:full".into())),
+                    (
+                        "sections".into(),
+                        Tag::List {
+                            element_type: TagType::End,
+                            values: vec![],
+                        },
+                    ),
+                ]),
+            },
+            entity_records: entities.map(Arc::new),
+            entity_chunk,
+        }
+    }
+
+    #[test]
+    fn generated_region_grouping_requires_complete_coverage_and_keeps_storage_separate() {
+        let west = ChunkPos { x: -1, z: 0 };
+        let east = ChunkPos { x: 0, z: 0 };
+        let poi = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let item = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:item".into())),
+            ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+        ]);
+        let chunks = || {
+            BTreeMap::from([
+                (west, chunk(west, Some(vec![]))),
+                (east, chunk(east, Some(vec![item.clone()]))),
+            ])
+        };
+        assert!(group_fresh_regions(chunks(), BTreeMap::from([(east, None)]), 7).is_err());
+        assert!(
+            group_fresh_regions(
+                BTreeMap::from([(west, chunk(west, None))]),
+                BTreeMap::from([(west, None)]),
+                7
+            )
+            .is_err()
+        );
+        let regions = group_fresh_regions(
+            chunks(),
+            BTreeMap::from([(west, None), (east, Some(poi))]),
+            7,
+        )
+        .unwrap();
+        assert_eq!(regions.len(), 4);
+        for key in [
+            (FreshRegionKind::Terrain, -1, 0),
+            (FreshRegionKind::Terrain, 0, 0),
+            (FreshRegionKind::Entities, 0, 0),
+            (FreshRegionKind::Poi, 0, 0),
+        ] {
+            let draft = regions.get(&key).unwrap();
+            assert_eq!(draft.chunk_count(), 1);
+            let mut stage = tempfile::tempfile().unwrap();
+            assert!(draft.write_staged(&mut stage).unwrap().is_empty());
+        }
+        assert!(!regions.contains_key(&(FreshRegionKind::Entities, -1, 0)));
     }
 }
 

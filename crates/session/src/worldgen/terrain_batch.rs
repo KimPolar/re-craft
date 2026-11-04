@@ -656,6 +656,28 @@ impl FreshTerrainBatch {
         Ok(Some(self.recorded_generated_entities(pos)?))
     }
 
+    /// Share the complete per-chunk records across generation checkpoints.
+    /// A missing result still means completeness could not be established.
+    pub fn complete_generated_entity_records_shared(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<Arc<Vec<native_persistence::nbt::Tag>>>> {
+        if self.complete_generated_entity_records(pos)?.is_none() {
+            return Ok(None);
+        }
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        Ok(Some(
+            terrain
+                .generated_entities
+                .get(&pos)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
     pub fn generated_entity_chunk_is_known_empty(&self, pos: ChunkPos) -> Result<bool> {
         Ok(self
             .complete_generated_entity_records(pos)?

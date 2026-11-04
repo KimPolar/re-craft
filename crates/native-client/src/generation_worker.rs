@@ -38,6 +38,8 @@ pub struct GenerationProgress {
     pub last_step: Option<(ChunkPos, GenerationStage)>,
     /// Number of times an initial spawn search resumed after chunk expansion.
     pub spawn_search_resumptions: u64,
+    /// Number of times player spawn search resumed after unchanged inputs.
+    pub player_spawn_search_resumptions: u64,
 }
 
 pub struct GenerationReady {
@@ -958,6 +960,7 @@ impl GenerationWorker {
             completed_steps: 0,
             last_step: None,
             spawn_search_resumptions: 0,
+            player_spawn_search_resumptions: 0,
         }));
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_progress = Arc::clone(&progress);
@@ -1095,8 +1098,8 @@ where
     Ok(true)
 }
 
-/// Resolve the player after spawn-stage entity generation. Expansion may
-/// alter previously examined chunks, so restart with the same random offset.
+/// Resolve the player after spawn-stage entity generation. Resume after
+/// expansion only if previously examined terrain and entities still match.
 fn complete_player_spawn<P, C, R, M, K>(
     mut ready: GenerationReady,
     provider: &mut P,
@@ -1158,6 +1161,8 @@ where
             offset,
         )?)
     };
+    let mut previous_search = None;
+    let mut checkpoint: Option<PlayerSearchCheckpoint> = None;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
@@ -1171,12 +1176,21 @@ where
             on_ground: false,
             pose: native_session::PlayerPose::Standing,
         };
-        let (session, mut search) = ready.start_player_spawn_search(
+        let (session, fresh_search) = ready.start_player_spawn_search(
             player,
             Arc::clone(&tags),
             std::iter::empty(),
             candidates.clone(),
         )?;
+        let mut search = match (previous_search.take(), checkpoint.take()) {
+            (Some(search), Some(previous)) if previous.matches(&ready.batch)? => {
+                let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+                progress.player_spawn_search_resumptions =
+                    progress.player_spawn_search_resumptions.saturating_add(1);
+                search
+            }
+            _ => fresh_search,
+        };
         let needed = loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -1195,6 +1209,8 @@ where
                 ),
             }
         };
+        checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
+        previous_search = Some(search);
         drop(session);
         let revision = ready
             .mesh
@@ -1322,6 +1338,54 @@ fn complete_spawn_search(
 struct InitialSearchCheckpoint {
     world: Arc<native_world::loaded::World>,
     heightmaps: BTreeMap<ChunkPos, Option<native_persistence::heightmap::SpawnHeightmaps>>,
+}
+
+/// Player collisions also depend on generated entities. Keep the existing
+/// immutable entity records shared and compare their completeness and content.
+struct PlayerSearchCheckpoint {
+    terrain: InitialSearchCheckpoint,
+    entities: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
+}
+
+impl PlayerSearchCheckpoint {
+    fn capture(ready: &GenerationReady) -> Result<Self> {
+        let terrain = InitialSearchCheckpoint::capture(ready)?;
+        let mut entities = BTreeMap::new();
+        for &pos in terrain.heightmaps.keys() {
+            entities.insert(
+                pos,
+                ready.batch.complete_generated_entity_records_shared(pos)?,
+            );
+        }
+        Ok(Self { terrain, entities })
+    }
+
+    fn matches(&self, batch: &FreshTerrainBatch) -> Result<bool> {
+        if !self.terrain.matches(batch)? {
+            return Ok(false);
+        }
+        self.entities_match(|pos| batch.complete_generated_entity_records_shared(pos))
+    }
+
+    fn entities_match(
+        &self,
+        mut entities: impl FnMut(ChunkPos) -> Result<Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
+    ) -> Result<bool> {
+        for (&pos, before) in &self.entities {
+            let after = entities(pos)?;
+            let equal = match (before, &after) {
+                (None, None) => true,
+                (Some(before), Some(after)) => {
+                    Arc::ptr_eq(before, after) || before.as_ref() == after.as_ref()
+                }
+                _ => false,
+            };
+            if !equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 impl InitialSearchCheckpoint {
@@ -1822,6 +1886,116 @@ mod tests {
     }
 
     #[test]
+    fn resuming_player_search_avoids_rechecking_failed_candidates() -> Result<()> {
+        use native_session::world_spawn::{
+            ResumableWorldSpawn, SharedSpawnWorld, SpawnColumnHeights, WorldSpawnCandidates,
+        };
+        struct SearchWorld {
+            target: (i32, i32),
+            loaded: bool,
+            queries: usize,
+        }
+        impl SharedSpawnWorld for SearchWorld {
+            fn min_y(&self) -> i32 {
+                0
+            }
+            fn max_y(&self) -> i32 {
+                15
+            }
+            fn ceiling_spawn_height(&self) -> Option<i32> {
+                None
+            }
+            fn heights(&mut self, x: i32, z: i32) -> Result<SpawnColumnHeights> {
+                self.queries += 1;
+                if (x, z) == self.target && !self.loaded {
+                    anyhow::bail!("target chunk not loaded");
+                }
+                Ok(SpawnColumnHeights {
+                    motion_blocking: 0,
+                    world_surface: 0,
+                    ocean_floor: 0,
+                })
+            }
+            fn has_fluid(&mut self, _: IVec3) -> Result<bool> {
+                Ok(false)
+            }
+            fn full_top_face(&mut self, pos: IVec3) -> Result<bool> {
+                Ok((pos.x, pos.z) == self.target && pos.y == 0)
+            }
+            fn clear_player(&mut self, _: IVec3) -> Result<bool> {
+                Ok(true)
+            }
+        }
+        let origin = IVec3::new(8, 8, 8);
+        let candidates = WorldSpawnCandidates::new(origin, 10, 100.0, 0)?;
+        let target = candidates.clone().nth(32).unwrap();
+        let mut world = SearchWorld {
+            target,
+            loaded: false,
+            queries: 0,
+        };
+        let mut search = ResumableWorldSpawn::new(origin, Some(candidates.clone()))?;
+        assert!(search.poll(&mut world, 64).is_err());
+        assert_eq!(
+            (search.requested_position().x, search.requested_position().z),
+            target
+        );
+        world.loaded = true;
+        let resumed = search.poll(&mut world, 64)?;
+        assert_eq!(resumed, Some(IVec3::new(target.0, 1, target.1)));
+        assert_eq!(world.queries, 34);
+        let mut restart_world = SearchWorld {
+            target,
+            loaded: false,
+            queries: 0,
+        };
+        let mut previous = ResumableWorldSpawn::new(origin, Some(candidates.clone()))?;
+        assert!(previous.poll(&mut restart_world, 64).is_err());
+        restart_world.loaded = true;
+        let mut restarted = ResumableWorldSpawn::new(origin, Some(candidates))?;
+        assert_eq!(restarted.poll(&mut restart_world, 64)?, resumed);
+        assert_eq!(restart_world.queries, 66);
+        Ok(())
+    }
+
+    #[test]
+    fn player_search_checkpoint_detects_changed_or_unknown_entities() -> Result<()> {
+        use native_persistence::nbt::Tag;
+        use native_world::loaded::World;
+        let home = ChunkPos { x: 0, z: 0 };
+        let unknown = ChunkPos { x: 1, z: 0 };
+        let records = Arc::new(vec![Tag::Compound(vec![(
+            "id".into(),
+            Tag::String("minecraft:pig".into()),
+        )])]);
+        let checkpoint = PlayerSearchCheckpoint {
+            terrain: InitialSearchCheckpoint {
+                world: Arc::new(World::new("minecraft:overworld")),
+                heightmaps: BTreeMap::new(),
+            },
+            entities: BTreeMap::from([(home, Some(Arc::clone(&records))), (unknown, None)]),
+        };
+        assert!(checkpoint.entities_match(|pos| Ok((pos == home).then(|| Arc::clone(&records))))?);
+        assert!(
+            checkpoint.entities_match(|pos| Ok(
+                (pos == home).then(|| Arc::new(records.as_ref().clone()))
+            ))?
+        );
+        assert!(!checkpoint.entities_match(|pos| Ok((pos == home).then(|| Arc::new(Vec::new()))))?);
+        assert!(!checkpoint.entities_match(|pos| Ok(
+            (pos == home).then(|| Arc::new(vec![Tag::Compound(vec![])]))
+        ))?);
+        assert!(!checkpoint.entities_match(|_| Ok(None))?);
+        assert!(!checkpoint.entities_match(|_| Ok(Some(Arc::clone(&records))))?);
+        assert!(
+            checkpoint
+                .entities_match(|_| anyhow::bail!("entity records unavailable"))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn initial_search_checkpoint_detects_changed_blocks_registry_and_heightmaps() -> Result<()> {
         use native_persistence::heightmap::{HeightBounds, SpawnHeightmaps};
         use native_world::loaded::{BLOCK_COUNT, Chunk, Section, World};
@@ -2112,6 +2286,9 @@ mod tests {
                 GenerationResult::Failed(error) => return Err(error),
                 GenerationResult::Cancelled => anyhow::bail!("initial world cancelled"),
             };
+            if !spawn_mobs {
+                assert!(worker.progress().player_spawn_search_resumptions > 0);
+            }
             let level = ready
                 .level_settings
                 .as_ref()
@@ -2647,6 +2824,7 @@ mod tests {
             completed_steps: 0,
             last_step: None,
             spawn_search_resumptions: 0,
+            player_spawn_search_resumptions: 0,
         });
         let ready = complete_spawn_search(
             ready,

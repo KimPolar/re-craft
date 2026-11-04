@@ -105,7 +105,7 @@ struct RegionChange {
 
 struct PlannedPlayerData {
     uuid_words: [i32; 4],
-    source_nbt: Vec<u8>,
+    source_nbt: Option<Vec<u8>>,
     document: crate::nbt::NamedTag,
 }
 
@@ -304,8 +304,79 @@ impl WorldSavePlan {
         validate_player_document(document)?;
         self.players.push(PlannedPlayerData {
             uuid_words,
-            source_nbt: nbt::write(source)?,
+            source_nbt: Some(nbt::write(source)?),
             document: document.clone(),
+        });
+        Ok(())
+    }
+
+    /// Stage a first local player and its level.dat identity together. This
+    /// only coordinates these files; it does not authorize a gameplay save.
+    pub fn add_new_singleplayer(
+        &mut self,
+        uuid_words: [i32; 4],
+        level_source: &nbt::NamedTag,
+        game_time: i64,
+        player: &nbt::NamedTag,
+        mut validate: impl FnMut(&nbt::NamedTag) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.level_time.is_none(),
+            "world save plan contains duplicate level data"
+        );
+        ensure!(
+            !self
+                .players
+                .iter()
+                .any(|entry| entry.uuid_words == uuid_words),
+            "world save plan contains duplicate player data"
+        );
+        validate_player_document(player)?;
+        let Tag::Compound(player_fields) = &player.value else {
+            unreachable!()
+        };
+        let uuids: Vec<_> = player_fields
+            .iter()
+            .filter(|(name, _)| name.matches("UUID"))
+            .collect();
+        ensure!(
+            matches!(uuids.as_slice(), [(_, Tag::IntArray(words))] if words.as_slice() == uuid_words),
+            "new player UUID does not match its filename"
+        );
+        validate(player)?;
+
+        let mut level = crate::world::WorldReader::update_level_game_time(level_source, game_time)?;
+        let Tag::Compound(root) = &mut level.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root
+            .iter_mut()
+            .find(|(name, _)| name.matches("Data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        ensure!(
+            !data
+                .iter()
+                .any(|(name, _)| name.matches("singleplayer_uuid")),
+            "level already contains a singleplayer UUID"
+        );
+        data.push((
+            "singleplayer_uuid".into(),
+            Tag::IntArray(uuid_words.to_vec()),
+        ));
+        let source_nbt = nbt::write(level_source)?;
+        nbt::write(&level)?;
+        self.level_time = Some(PlannedLevelTime {
+            source_nbt,
+            document: level,
+        });
+        self.players.push(PlannedPlayerData {
+            uuid_words,
+            source_nbt: None,
+            document: player.clone(),
         });
         Ok(())
     }
@@ -792,7 +863,12 @@ impl WorldWriteGuard {
                 "chest inventory changes require exactly one player"
             );
             let player = &plan.players[0];
-            let source = nbt::read(&player.source_nbt)?;
+            let source = nbt::read(
+                player
+                    .source_nbt
+                    .as_ref()
+                    .context("chest inventory changes require an existing player source")?,
+            )?;
             crate::chest_transfer::validate(
                 &source,
                 &player.document,
@@ -1192,12 +1268,20 @@ impl WorldWriteGuard {
             let mut player_directory = self.root.clone();
             for component in ["players", "data"] {
                 player_directory.push(component);
-                let player_dir_metadata = fs::symlink_metadata(&player_directory)
-                    .context("cannot inspect player data directory")?;
-                ensure!(
-                    player_dir_metadata.is_dir() && ordinary(&player_dir_metadata),
-                    "player data path must contain ordinary directories"
-                );
+                let (_, exists) =
+                    crate::save_transaction::checked_directory(&self.root, &player_directory)?;
+                if !exists {
+                    ensure!(
+                        planned.source_nbt.is_none(),
+                        "player data directory changed after its draft was created"
+                    );
+                    fs::create_dir(&player_directory)?;
+                    ensure!(
+                        crate::save_transaction::checked_directory(&self.root, &player_directory)?
+                            .1,
+                        "player data directory disappeared"
+                    );
+                }
             }
             let player_directory = player_directory.canonicalize()?;
             ensure!(
@@ -1206,29 +1290,44 @@ impl WorldWriteGuard {
             );
             let filename = player_data_filename(planned.uuid_words);
             let player_path = player_directory.join(&filename);
-            let metadata = fs::symlink_metadata(&player_path)
-                .context("cannot inspect existing player data")?;
-            ensure!(
-                metadata.is_file() && ordinary(&metadata),
-                "player data must be an ordinary file"
-            );
-            let canonical = player_path.canonicalize()?;
-            ensure!(
-                canonical.parent() == Some(player_directory.as_path()),
-                "player data resolves outside its directory"
-            );
-            let original_bytes = nbt::decompress_limited(File::open(&canonical)?)?;
-            let current = nbt::read_gzip(original_bytes.as_slice())
-                .context("cannot decode current player data")?;
-            ensure!(
-                nbt::write(&current)? == planned.source_nbt,
-                "player data changed after its draft was created"
-            );
-            let original_hash: [u8; 32] = Sha256::digest(&original_bytes).into();
-            let player_backup_dir = backup.path().join("players");
-            fs::create_dir_all(&player_backup_dir)?;
-            let player_backup = player_backup_dir.join(&filename);
-            copy_sync(&canonical, &player_backup)?;
+            let (target, player_backup, original_hash) = match fs::symlink_metadata(&player_path) {
+                Ok(metadata) => {
+                    let source = planned
+                        .source_nbt
+                        .as_ref()
+                        .context("new player data already exists")?;
+                    ensure!(
+                        metadata.is_file() && ordinary(&metadata),
+                        "player data must be an ordinary file"
+                    );
+                    let canonical = player_path.canonicalize()?;
+                    ensure!(
+                        canonical.parent() == Some(player_directory.as_path()),
+                        "player data resolves outside its directory"
+                    );
+                    let original_bytes = nbt::decompress_limited(File::open(&canonical)?)?;
+                    let current = nbt::read_gzip(original_bytes.as_slice())
+                        .context("cannot decode current player data")?;
+                    ensure!(
+                        nbt::write(&current)? == *source,
+                        "player data changed after its draft was created"
+                    );
+                    let original_hash: [u8; 32] = Sha256::digest(&original_bytes).into();
+                    let player_backup_dir = backup.path().join("players");
+                    fs::create_dir_all(&player_backup_dir)?;
+                    let player_backup = player_backup_dir.join(&filename);
+                    copy_sync(&canonical, &player_backup)?;
+                    (canonical, Some(player_backup), Some(original_hash))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(
+                        planned.source_nbt.is_none(),
+                        "player data disappeared after its draft was created"
+                    );
+                    (player_path, None, None)
+                }
+                Err(error) => return Err(error).context("cannot inspect player data"),
+            };
 
             let replacement = nbt::write(&planned.document)?;
             let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
@@ -1246,12 +1345,12 @@ impl WorldWriteGuard {
                 "staged player data failed the NBT round-trip check"
             );
             replacements.push(crate::save_transaction::Replacement {
-                target: canonical.clone(),
-                backup: Some(player_backup),
+                target: target.clone(),
+                backup: player_backup,
                 stage,
-                original_hash: Some(original_hash),
+                original_hash,
             });
-            player_paths.push(canonical);
+            player_paths.push(target);
         }
 
         if let Some(planned) = &plan.world_clocks {
@@ -2199,6 +2298,158 @@ mod tests {
             .prefix("world-")
             .tempdir_in(root)
             .unwrap()
+    }
+
+    #[test]
+    fn new_singleplayer_is_created_with_level_identity_and_rejects_stale_sources() {
+        let world = test_world();
+        fixture(world.path());
+        let level_path = world.path().join("level.dat");
+        let original_level = fs::read(&level_path).unwrap();
+        let (_, source) = anvil::read_level_document(world.path()).unwrap();
+        let uuid = [1, -2, 3, 4];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                ("future_player".into(), Tag::String("keep".into())),
+            ]),
+        };
+        let mut plan = WorldSavePlan::new();
+        plan.add_new_singleplayer(uuid, &source, 123, &player, |_| Ok(()))
+            .unwrap();
+        assert!(plan.add_level_time(&source, 1).is_err());
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let player_path = world
+            .path()
+            .join("players/data")
+            .join(player_data_filename(uuid));
+        assert_eq!(
+            result.player_paths,
+            vec![player_path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            nbt::read_gzip(File::open(&player_path).unwrap()).unwrap(),
+            player
+        );
+        let saved_level = nbt::read_gzip(File::open(&level_path).unwrap()).unwrap();
+        assert_eq!(
+            saved_level
+                .value
+                .get("Data")
+                .unwrap()
+                .get("singleplayer_uuid"),
+            Some(&Tag::IntArray(uuid.to_vec()))
+        );
+        assert_eq!(
+            crate::world::WorldReader::validate_level_game_time(&saved_level).unwrap(),
+            123
+        );
+        let reader = crate::world::WorldReader::open(
+            world.path(),
+            DimensionId::parse("minecraft:overworld").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reader.singleplayer_uuid_words().unwrap(), Some(uuid));
+        assert_eq!(reader.read_player().unwrap(), Some(player.clone()));
+        assert_eq!(
+            fs::read(world.path().join("level.dat_old")).unwrap(),
+            original_level
+        );
+        assert_eq!(
+            fs::read(result.backup_directory.join("world-data/level.dat")).unwrap(),
+            original_level
+        );
+        let player_bytes = fs::read(&player_path).unwrap();
+        let level_bytes = fs::read(&level_path).unwrap();
+        let mut stale = WorldSavePlan::new();
+        stale
+            .add_new_singleplayer(uuid, &source, 124, &player, |_| Ok(()))
+            .unwrap();
+        assert!(guard.write_plan(stale, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(player_path).unwrap(), player_bytes);
+        assert_eq!(fs::read(level_path).unwrap(), level_bytes);
+    }
+
+    #[test]
+    fn new_singleplayer_rejects_conflicts_without_changing_existing_files() {
+        let world = test_world();
+        fixture(world.path());
+        let (_, source) = anvil::read_level_document(world.path()).unwrap();
+        let level_path = world.path().join("level.dat");
+        let original = fs::read(&level_path).unwrap();
+        let uuid = [0, 0, 0, 1];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        let mut invalid = WorldSavePlan::new();
+        assert!(
+            invalid
+                .add_new_singleplayer([0, 0, 0, 2], &source, 0, &player, |_| Ok(()))
+                .is_err()
+        );
+        assert!(!invalid.has_level_time());
+        assert!(
+            invalid
+                .add_new_singleplayer(uuid, &source, 0, &player, |_| anyhow::bail!(
+                    "unsupported player data"
+                ))
+                .is_err()
+        );
+        assert!(!invalid.has_level_time());
+        let dir = world.path().join("players/data");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(player_data_filename(uuid));
+        fs::write(&path, b"existing data").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_new_singleplayer(uuid, &source, 0, &player, |_| Ok(()))
+            .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"existing data");
+        assert_eq!(fs::read(level_path).unwrap(), original);
+        assert!(!world.path().join("level.dat_old").exists());
+    }
+
+    #[test]
+    fn new_singleplayer_does_not_create_player_when_level_changed() {
+        let world = test_world();
+        fixture(world.path());
+        let (_, source) = anvil::read_level_document(world.path()).unwrap();
+        let uuid = [0, 0, 0, 1];
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            ]),
+        };
+        let mut plan = WorldSavePlan::new();
+        plan.add_new_singleplayer(uuid, &source, 5, &player, |_| Ok(()))
+            .unwrap();
+        let changed = crate::world::WorldReader::update_level_game_time(&source, 2).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&nbt::write(&changed).unwrap()).unwrap();
+        let changed_bytes = encoder.finish().unwrap();
+        let level_path = world.path().join("level.dat");
+        fs::write(&level_path, &changed_bytes).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(level_path).unwrap(), changed_bytes);
+        assert!(
+            !world
+                .path()
+                .join("players/data")
+                .join(player_data_filename(uuid))
+                .exists()
+        );
+        assert!(!world.path().join("level.dat_old").exists());
     }
 
     #[test]

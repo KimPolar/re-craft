@@ -362,6 +362,39 @@ fn valid_created_target(value: &str, version: u32) -> bool {
         || (version >= 6 && value == "level.dat_old")
         || (version >= 7 && valid_created_random_sequences(value))
         || (version >= 8 && external_chunk_region(value).is_some())
+        || (version >= 10 && valid_created_player(value))
+}
+
+/// Limit recovery of a newly created player to canonical UUID filenames.
+fn valid_created_player(value: &str) -> bool {
+    let parts: Vec<_> = Path::new(value).components().collect();
+    let [
+        Component::Normal(players),
+        Component::Normal(data),
+        Component::Normal(file),
+    ] = parts.as_slice()
+    else {
+        return false;
+    };
+    if *players != "players" || *data != "data" {
+        return false;
+    }
+    let Some(name) = file.to_str() else {
+        return false;
+    };
+    let Some(uuid) = name.strip_suffix(".dat") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+        && ["players", "data", name].join(std::path::MAIN_SEPARATOR_STR)
+            == value.replace('/', std::path::MAIN_SEPARATOR_STR)
 }
 
 fn valid_created_random_sequences(value: &str) -> bool {
@@ -389,7 +422,7 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9),
+        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10),
         "unsupported transaction version"
     );
     ensure!(
@@ -440,6 +473,15 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             ensure!(
                 file_targets.contains(&relative_path_key(&region)?),
                 "created external chunk requires its region in the same transaction"
+            );
+        }
+        if record.original.is_none() && valid_created_player(&record.target) {
+            ensure!(
+                manifest
+                    .files
+                    .iter()
+                    .any(|level| level.target == "level.dat" && level.original.is_some()),
+                "created player requires level.dat in the same transaction"
             );
         }
     }
@@ -694,7 +736,12 @@ fn prepare_with_deletions(
         });
     }
     let manifest = Manifest {
-        version: if !deleted_records.is_empty() {
+        version: if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_player(&record.target))
+        {
+            10
+        } else if !deleted_records.is_empty() {
             9
         } else if records.iter().any(|record| {
             record.original.is_none() && external_chunk_region(&record.target).is_some()
@@ -1282,6 +1329,73 @@ mod tests {
         assert!(prepare(&root, &backup, files, dependencies).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"outside writer");
         assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
+    fn created_player_recovery_requires_canonical_uuid_and_level_transaction() {
+        let player = "players/data/00000001-ffff-fffe-0000-000300000004.dat";
+        assert!(!valid_created_target(player, 9));
+        assert!(valid_created_target(player, 10));
+        for invalid in [
+            "players/data/player.dat",
+            "players/data/00000001-FFFF-fffe-0000-000300000004.dat",
+            "players/data/00000001-ffff-fffe-0000-000300000004.dat.old",
+            "players/data/../00000001-ffff-fffe-0000-000300000004.dat",
+            "players/other/00000001-ffff-fffe-0000-000300000004.dat",
+        ] {
+            assert!(!valid_created_target(invalid, 10), "{invalid}");
+        }
+        for replace_level in [false, true] {
+            let dir = fixture();
+            let root = dir.path().canonicalize().unwrap();
+            let backup = root.join(".minecraft-native-backups/transaction-fixture");
+            let level = root.join("level.dat");
+            fs::write(&level, b"original level").unwrap();
+            let level_backup = backup.join("level-original");
+            fs::copy(&level, &level_backup).unwrap();
+            let target = root.join(player);
+            let mut player_stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(target.parent().unwrap())
+                .unwrap();
+            player_stage.write_all(b"new player").unwrap();
+            let mut level_stage = tempfile::Builder::new()
+                .prefix(".native-stage-")
+                .tempfile_in(&root)
+                .unwrap();
+            level_stage.write_all(b"new level").unwrap();
+            let files = vec![
+                Replacement {
+                    target: target.clone(),
+                    backup: None,
+                    stage: player_stage,
+                    original_hash: None,
+                },
+                Replacement {
+                    target: level.clone(),
+                    backup: Some(level_backup),
+                    stage: level_stage,
+                    original_hash: Some(hash_file(&level).unwrap()),
+                },
+            ];
+            let mut prepared = prepare(&root, &backup, files, vec![]).unwrap();
+            assert_eq!(prepared.manifest.version, 10);
+            let level_record = prepared.manifest.files.pop().unwrap();
+            assert!(validate_manifest(&prepared.manifest).is_err());
+            prepared.manifest.files.push(level_record);
+            replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+            if replace_level {
+                replace_one(&root, &prepared.manifest.files[1], prepared.files.remove(0)).unwrap();
+            }
+            drop(prepared);
+            fs::write(&target, b"outside writer").unwrap();
+            assert!(recover(&root).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+            fs::write(&target, b"new player").unwrap();
+            assert!(recover(&root).unwrap());
+            assert!(!target.exists());
+            assert_eq!(fs::read(&level).unwrap(), b"original level");
+        }
     }
 
     #[test]

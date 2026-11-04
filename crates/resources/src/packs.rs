@@ -84,6 +84,23 @@ pub trait ResourceProvider {
         bail!("this resource provider cannot enumerate data")
     }
 
+    /// Java's resource-backed registry loader sorts the complete JSON file
+    /// identifiers by path first, then namespace, before registration. The
+    /// `.json` suffix matters when one ID is a prefix of another.
+    fn list_registry_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+        let mut ids = self.list_data(folder)?;
+        for id in &ids {
+            let validated = ResourceId::parse(&format!("{}:{}", id.namespace, id.path))?;
+            ensure!(&validated == id, "invalid registry resource ID");
+        }
+        ids.sort_by_cached_key(|id| (format!("{}.json", id.path), id.namespace.clone()));
+        ensure!(
+            ids.windows(2).all(|pair| pair[0] != pair[1]),
+            "duplicate registry resource ID"
+        );
+        Ok(ids)
+    }
+
     /// All visible versions of one resource, in increasing pack priority.
     fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
         Ok(self.read_data(path)?.into_iter().collect())

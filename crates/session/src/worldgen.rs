@@ -3388,6 +3388,12 @@ mod tests {
                 Ok(None)
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/pig_variant/temperate.json" {
+                    return Ok(Some(br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec()));
+                }
+                if path == "data/minecraft/pig_sound_variant/classic.json" {
+                    return Ok(Some(b"{}".to_vec()));
+                }
                 if path == "data/minecraft/worldgen/biome/plains.json" {
                     let mushroom = if self.brown {
                         "minecraft:brown_mushroom"
@@ -3433,6 +3439,12 @@ mod tests {
                 Data.read_data(path)
             }
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "pig_variant" {
+                    return Ok(vec![ResourceId::parse("minecraft:temperate")?]);
+                }
+                if folder == "pig_sound_variant" {
+                    return Ok(vec![ResourceId::parse("minecraft:classic")?]);
+                }
                 Data.list_data(folder)
             }
         }
@@ -4108,6 +4120,47 @@ mod tests {
             assert_eq!(
                 batch
                     .initialize_sheep(position, &tags, &mut random, &mut group, false)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(group, expected_group);
+            assert_eq!(random.next_long(), expected_random.next_long());
+            let variants = native_resources::animal_variants::FarmAnimalSpawnVariants::load_active(
+                &mut data,
+                native_resources::animal_variants::FarmAnimal::Pig,
+            )
+            .unwrap();
+            let mut random = native_resources::worldgen_region_random::RegionRandom::new(
+                91,
+                native_resources::density::WorldgenRandom::Legacy,
+                0,
+                0,
+            );
+            let mut expected_random = random.clone();
+            let mut group = native_resources::worldgen_region_random::AnimalGroupData::default();
+            let mut expected_group = group;
+            assert!(
+                batch
+                    .initialize_farm_animal(
+                        [1_000_000, 0, 0],
+                        &variants,
+                        &mut random,
+                        &mut group,
+                        false
+                    )
+                    .is_err()
+            );
+            let expected = variants
+                .finalize(
+                    &ResourceId::parse("minecraft:plains").unwrap(),
+                    &mut expected_random,
+                    &mut expected_group,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                batch
+                    .initialize_farm_animal(position, &variants, &mut random, &mut group, false)
                     .unwrap(),
                 expected
             );

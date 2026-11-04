@@ -231,6 +231,35 @@ impl FreshTerrainBatch {
         ))
     }
 
+    /// Finalize a farm animal using its actual full-resolution biome. The
+    /// caller must still create, serialize and publish the entity itself.
+    pub fn initialize_farm_animal(
+        &self,
+        position: [i32; 3],
+        variants: &native_resources::animal_variants::FarmAnimalSpawnVariants,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        has_follow_range_bonus: bool,
+    ) -> Result<native_resources::animal_variants::FarmAnimalInitialization> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before initializing an animal"
+        );
+        let [x, y, z] = position;
+        let chunk = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        ensure!(
+            self.schedule
+                .completed(chunk)
+                .is_some_and(|stage| stage >= GenerationStage::Light),
+            "animal initialization requires a light-complete chunk"
+        );
+        let biome = self.biomes.biome_at_block(x, y, z)?;
+        variants.finalize(biome, random, group, has_follow_range_bonus)
+    }
+
     /// Start the random ordering for one light-complete chunk. The supplied
     /// list and probability must be resolved from the same data-pack stack
     /// and all applicable environment layers. This only plans attempts; it

@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
 use anyhow::Result;
 use native_resources::{
-    animal_variants::{FarmAnimal, FarmAnimalVariants},
+    animal_variants::{FarmAnimal, FarmAnimalSpawnVariants, FarmAnimalVariants},
     density::WorldgenRandom,
     packs::{ResourceId, ResourceProvider, ResourceStack},
-    worldgen_region_random::RegionRandom,
+    worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
 use serde_json::{Value, json};
 
@@ -31,6 +31,89 @@ impl ResourceProvider for Data {
 
 fn id(s: &str) -> ResourceId {
     ResourceId::parse(s).unwrap()
+}
+
+struct UnorderedRegistry(Vec<ResourceId>);
+
+impl ResourceProvider for UnorderedRegistry {
+    fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+        Ok(self.0.clone())
+    }
+}
+
+fn synthetic_registry() -> UnorderedRegistry {
+    UnorderedRegistry(
+        [
+            "z:a",
+            "a:b",
+            "a:a",
+            "z:a-foo",
+            "a:a/child",
+            "a:a_foo",
+            "a:a.foo",
+            "a:a-foo",
+        ]
+        .iter()
+        .map(|name| id(name))
+        .collect(),
+    )
+}
+
+#[test]
+fn registry_order_sorts_json_path_before_namespace() {
+    let mut provider = synthetic_registry();
+    let expected: Vec<_> = [
+        "a:a-foo",
+        "z:a-foo",
+        "a:a.foo",
+        "a:a",
+        "z:a",
+        "a:a/child",
+        "a:a_foo",
+        "a:b",
+    ]
+    .iter()
+    .map(|name| id(name))
+    .collect();
+    assert_eq!(
+        provider.list_registry_data("pig_variant").unwrap(),
+        expected
+    );
+    provider.0.push(id("a:a"));
+    assert!(provider.list_registry_data("pig_variant").is_err());
+}
+
+#[test]
+fn animal_initialization_preserves_random_and_group_on_unknown_biome() {
+    let mut data = Data::default();
+    data.0.insert(
+        "data/minecraft/worldgen/biome/plains.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/pig_variant/temperate.json".into(),
+        br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec(),
+    );
+    assert!(FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).is_err());
+    data.0.insert(
+        "data/minecraft/pig_sound_variant/classic.json".into(),
+        b"{}".to_vec(),
+    );
+    let variants = FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).unwrap();
+    let mut random = RegionRandom::new(5, WorldgenRandom::Xoroshiro, 0, 0);
+    let mut expected_random = random.clone();
+    let mut group = AnimalGroupData::default();
+    let expected_group = group;
+    assert!(
+        variants
+            .finalize(&id("desert"), &mut random, &mut group, false)
+            .is_err()
+    );
+    assert_eq!(group, expected_group);
+    assert_eq!(random.next_long(), expected_random.next_long());
 }
 
 #[test]
@@ -169,9 +252,11 @@ fn installed_variants_match_java_selection_and_random_state() {
         ] {
             for legacy in [true, false] {
                 for seed in [0_i64, 1, -1, 42, i64::MIN, i64::MAX] {
-                    cases.push(
-                        json!({"animal":animal, "biome":biome, "legacy":legacy, "seed":seed}),
-                    );
+                    for size in [0, 2] {
+                        for existing in [false, true] {
+                            cases.push(json!({"animal":animal, "biome":biome, "legacy":legacy, "seed":seed, "size":size, "existing":existing}));
+                        }
+                    }
                 }
             }
         }
@@ -187,6 +272,18 @@ fn installed_variants_match_java_selection_and_random_state() {
         .arg(&output));
     let expected: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
     let mut provider = ResourceStack::open(&game).unwrap();
+    let java_order: Vec<_> = expected["synthetic_order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| id(value.as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        synthetic_registry()
+            .list_registry_data("pig_variant")
+            .unwrap(),
+        java_order
+    );
     for (name, animal) in [
         ("pig", FarmAnimal::Pig),
         ("cow", FarmAnimal::Cow),
@@ -198,7 +295,13 @@ fn installed_variants_match_java_selection_and_random_state() {
             .iter()
             .map(|v| id(v.as_str().unwrap()))
             .collect();
-        let table = FarmAnimalVariants::load(&mut provider, animal, &order).unwrap();
+        assert_eq!(
+            provider
+                .list_registry_data(&format!("{name}_variant"))
+                .unwrap(),
+            order
+        );
+        let table = FarmAnimalSpawnVariants::load_active(&mut provider, animal).unwrap();
         for (case, expected) in cases.iter().zip(expected["results"].as_array().unwrap()) {
             if case["animal"] != name {
                 continue;
@@ -209,15 +312,60 @@ fn installed_variants_match_java_selection_and_random_state() {
                 WorldgenRandom::Xoroshiro
             };
             let mut random = RegionRandom::new(case["seed"].as_i64().unwrap(), algorithm, -13, 17);
-            let selected = table
-                .choose(&id(case["biome"].as_str().unwrap()), &mut random)
-                .unwrap()
+            let mut group = AnimalGroupData {
+                size: case["size"].as_i64().unwrap() as i32,
+                ..Default::default()
+            };
+            let existing = case["existing"].as_bool().unwrap();
+            let actual = table
+                .finalize(
+                    &id(case["biome"].as_str().unwrap()),
+                    &mut random,
+                    &mut group,
+                    existing,
+                )
+                .unwrap();
+            let selected = actual
+                .variant
+                .as_ref()
                 .map(|id| format!("{}:{}", id.namespace, id.path));
             assert_eq!(
                 selected.as_deref(),
                 expected["selected"].as_str(),
                 "case {case}"
             );
+            assert_eq!(
+                format!(
+                    "{}:{}",
+                    actual.sound_variant.namespace, actual.sound_variant.path
+                ),
+                expected["sound"].as_str().unwrap(),
+                "case {case}"
+            );
+            assert_eq!(
+                actual.animal.set_baby_age,
+                expected["baby"].as_bool().unwrap(),
+                "case {case}"
+            );
+            assert_eq!(
+                actual.animal.left_handed,
+                expected["left"].as_bool().unwrap(),
+                "case {case}"
+            );
+            assert_eq!(
+                group.size as i64,
+                expected["size"].as_i64().unwrap(),
+                "case {case}"
+            );
+            if existing {
+                assert_eq!(actual.animal.follow_range_bonus, None);
+            } else {
+                assert_eq!(
+                    actual.animal.follow_range_bonus.unwrap().to_bits() as i64,
+                    expected["bonus_bits"].as_i64().unwrap(),
+                    "case {case}"
+                );
+            }
             assert_eq!(
                 random.next_long(),
                 expected["next"].as_i64().unwrap(),

@@ -1,7 +1,7 @@
 //! Data-pack spawn selectors for pig, cow, and chicken variants.
 //!
-//! Registry order must come from the active world's registry, not from the
-//! resource provider's sorted list: ties consume a random index in that order.
+//! The active registry is registered in Java's resource-file order; ties
+//! consume a random index in that order.
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
@@ -13,7 +13,9 @@ use serde_json::Value;
 use crate::{
     packs::{ResourceId, ResourceProvider},
     surface_biomes::resolve_tag,
-    worldgen_region_random::RegionRandom,
+    worldgen_region_random::{
+        AnimalBaseInitialization, AnimalGroupData, RegionRandom, finalize_animal_base,
+    },
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +33,14 @@ impl FarmAnimal {
             Self::Chicken => "chicken_variant",
         }
     }
+
+    fn sound_registry(self) -> &'static str {
+        match self {
+            Self::Pig => "pig_sound_variant",
+            Self::Cow => "cow_sound_variant",
+            Self::Chicken => "chicken_sound_variant",
+        }
+    }
 }
 
 struct Selector {
@@ -46,7 +56,73 @@ pub struct FarmAnimalVariants {
     selectors: Vec<Selector>,
 }
 
+/// The values applied by a fresh pig, cow or chicken's spawn finalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FarmAnimalInitialization {
+    /// No match leaves the entity's construction default unchanged.
+    pub variant: Option<ResourceId>,
+    pub sound_variant: ResourceId,
+    pub animal: AnimalBaseInitialization,
+}
+
+/// Visual and sound registries from the same active data-pack stack.
+pub struct FarmAnimalSpawnVariants {
+    visual: FarmAnimalVariants,
+    sounds: Vec<ResourceId>,
+}
+
+impl FarmAnimalSpawnVariants {
+    /// The caller must still validate the complete registries as Java does.
+    pub fn load_active(provider: &mut impl ResourceProvider, animal: FarmAnimal) -> Result<Self> {
+        let visual = FarmAnimalVariants::load_active(provider, animal)?;
+        let sounds = provider.list_registry_data(animal.sound_registry())?;
+        ensure!(
+            !sounds.is_empty(),
+            "farm animal sound variant registry is empty"
+        );
+        ensure!(
+            i32::try_from(sounds.len()).is_ok(),
+            "too many sound variants"
+        );
+        Ok(Self { visual, sounds })
+    }
+
+    /// Match Java's variant, sound, AgeableMob and Mob random draw order.
+    /// Validation failures leave the caller's random source and group intact.
+    pub fn finalize(
+        &self,
+        biome: &ResourceId,
+        random: &mut RegionRandom,
+        group: &mut AnimalGroupData,
+        has_follow_range_bonus: bool,
+    ) -> Result<FarmAnimalInitialization> {
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let variant = self.visual.choose(biome, &mut next_random)?.cloned();
+        let count = i32::try_from(self.sounds.len()).context("too many sound variants")?;
+        let index = next_random
+            .next_int_bound(count)
+            .context("empty sound registry")? as usize;
+        let animal =
+            finalize_animal_base(&mut next_random, &mut next_group, has_follow_range_bonus);
+        let result = FarmAnimalInitialization {
+            variant,
+            sound_variant: self.sounds[index].clone(),
+            animal,
+        };
+        *random = next_random;
+        *group = next_group;
+        Ok(result)
+    }
+}
+
 impl FarmAnimalVariants {
+    /// Load the active resource-backed registry in Java's registration order.
+    pub fn load_active(provider: &mut impl ResourceProvider, animal: FarmAnimal) -> Result<Self> {
+        let ordered = provider.list_registry_data(animal.registry())?;
+        Self::load_ordered(provider, animal, &ordered)
+    }
+
     /// `ordered_variants` must be the full, ordered active registry. Loading
     /// stops on unsupported conditions instead of silently choosing wrongly.
     pub fn load(
@@ -61,6 +137,15 @@ impl FarmAnimalVariants {
             supplied.len() == ordered_variants.len() && supplied == visible,
             "{registry} order must contain every active variant exactly once"
         );
+        Self::load_ordered(provider, animal, ordered_variants)
+    }
+
+    fn load_ordered(
+        provider: &mut impl ResourceProvider,
+        animal: FarmAnimal,
+        ordered_variants: &[ResourceId],
+    ) -> Result<Self> {
+        let registry = animal.registry();
         let biome_registry: BTreeSet<_> =
             provider.list_data("worldgen/biome")?.into_iter().collect();
         ensure!(!biome_registry.is_empty(), "biome registry is empty");

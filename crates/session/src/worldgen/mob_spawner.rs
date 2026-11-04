@@ -84,6 +84,29 @@ pub struct GeneratedSheepSpawner {
 }
 
 impl GeneratedSheepSpawner {
+    /// Load the dimension's already-resolved timeline definitions using the
+    /// supplied world clock values before starting this spawn operation.
+    pub fn from_timed_environment(
+        batch: &FreshTerrainBatch,
+        provider: &mut impl native_resources::packs::ResourceProvider,
+        center: ChunkPos,
+        environment: &native_resources::creature_timeline::CreatureSpawnEnvironment,
+        clock_ticks: impl FnMut(&native_resources::packs::ResourceId) -> Option<i64>,
+        entity_is_misc: impl FnMut(&native_resources::packs::ResourceId) -> Option<bool>,
+        inputs: SheepSpawnInputs<'_>,
+    ) -> Result<Self> {
+        let later_layers = environment.sample_layers(clock_ticks)?;
+        Self::from_environment(
+            batch,
+            provider,
+            center,
+            environment.dimension_attributes(),
+            &later_layers,
+            entity_is_misc,
+            inputs,
+        )
+    }
+
     /// Resolve the biome-dependent attributes before creating the spawn job.
     /// The caller supplies dimension and already-sampled later layers.
     pub fn from_environment(

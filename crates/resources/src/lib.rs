@@ -19,6 +19,7 @@ pub mod block_registry;
 pub mod blockstates;
 pub mod carver;
 pub mod chest_loot;
+pub mod creature_timeline;
 pub mod datapacks;
 pub mod density;
 pub mod dimension_lighting;

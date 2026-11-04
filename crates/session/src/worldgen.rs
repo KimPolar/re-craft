@@ -4446,14 +4446,61 @@ mod tests {
                 )
             })
             .expect("seed must produce a sheep group");
-        let mut dimension_attributes = attributes.clone();
-        dimension_attributes["gameplay/creature_world_gen_spawn_probability"] = json!(probability);
-        let mut driver = GeneratedSheepSpawner::from_environment(
+        struct TimedData<'a> {
+            base: &'a mut FeatureData,
+            dimension: Value,
+            timeline: Value,
+        }
+        impl ResourceProvider for TimedData<'_> {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.base.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/example/dimension_type/test.json" => {
+                        Ok(Some(serde_json::to_vec(&self.dimension)?))
+                    }
+                    "data/example/timeline/test.json" => {
+                        Ok(Some(serde_json::to_vec(&self.timeline)?))
+                    }
+                    _ => self.base.read_data(path),
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                self.base.list_data(folder)
+            }
+        }
+        let mut timed = TimedData {
+            base: &mut data,
+            dimension: json!({"attributes":attributes,"timelines":["example:test"]}),
+            timeline: json!({"clock":"example:clock","period_ticks":20,"tracks":{
+                "gameplay/creature_world_gen_spawn_probability":{"keyframes":[{"ticks":0,"value":probability}]}
+            }}),
+        };
+        let environment = native_resources::creature_timeline::CreatureSpawnEnvironment::load(
+            &mut timed,
+            "example:test",
+            |_| Some(false),
+        )
+        .unwrap();
+        assert!(
+            GeneratedSheepSpawner::from_timed_environment(
+                &batch,
+                &mut timed,
+                center,
+                &environment,
+                |_| None,
+                |_| Some(false),
+                inputs,
+            )
+            .is_err()
+        );
+        let mut driver = GeneratedSheepSpawner::from_timed_environment(
             &batch,
-            &mut data,
+            &mut timed,
             center,
-            &dimension_attributes,
-            &[],
+            &environment,
+            |_| Some(7),
             |_| Some(false),
             inputs,
         )

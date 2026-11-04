@@ -4923,6 +4923,17 @@ mod tests {
             component.heightmaps,
             processed.heightmaps[&center].to_tag().unwrap()
         );
+        assert_eq!(
+            component.block_entities,
+            batch.spawned_block_entity_data(center).unwrap()
+        );
+        assert_eq!(
+            component.entity_records.as_deref(),
+            batch
+                .complete_generated_entity_records_shared(center)
+                .unwrap()
+                .as_deref()
+        );
         let native_persistence::nbt::Tag::List {
             values: saved_blocks,
             ..
@@ -4981,6 +4992,17 @@ mod tests {
             .light_checks
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
         processed.sealed_checks = processed.light_checks.clone();
+        processed
+            .edits
+            .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
+        processed.sealed_edits = processed.edits.clone();
+        let changed_components = batch
+            .postprocessed_chunk_components(&processed, [center])
+            .unwrap();
+        assert_eq!(
+            changed_components[&center].block_entities,
+            batch.spawned_block_entity_data(center).unwrap()
+        );
         let changed_sections = batch
             .postprocessed_sections_data(&processed, [center])
             .unwrap()
@@ -5023,10 +5045,39 @@ mod tests {
             original.block(8, 8, 8).unwrap().name,
             "minecraft:brown_mushroom"
         );
+        let mut chest_world = (*processed.world).clone();
+        let chest = native_world::loaded::BlockState {
+            name: "minecraft:chest".into(),
+            properties: resources
+                .vanilla_generated_block_registry()
+                .unwrap()
+                .default_properties("minecraft:chest")
+                .unwrap(),
+        };
+        let chest_id = chest_world.intern_state(chest);
+        assert!(chest_world.set_block_id(8, 8, 8, chest_id).unwrap());
+        processed.world = Arc::new(chest_world);
+        processed.sealed_world = Arc::clone(&processed.world);
+        let error = batch
+            .postprocessed_chunk_components(&processed, [center])
+            .err()
+            .expect("changed block entity must be rejected");
+        assert!(format!("{error:#}").contains("postprocessing changed a block entity"));
         processed.world = Arc::clone(&original);
         processed.sealed_world = Arc::clone(&original);
         processed.light_checks.clear();
         processed.sealed_checks.clear();
+        processed.edits.clear();
+        processed.sealed_edits.clear();
+        processed
+            .edits
+            .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
+        assert!(
+            batch
+                .postprocessed_chunk_components(&processed, [center])
+                .is_err()
+        );
+        processed.edits.clear();
         processed
             .light_checks
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });

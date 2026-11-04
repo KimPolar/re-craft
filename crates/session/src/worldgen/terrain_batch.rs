@@ -54,6 +54,10 @@ pub struct PostprocessedChunkComponents {
     pub heightmaps: native_persistence::nbt::Tag,
     pub block_ticks: native_persistence::nbt::Tag,
     pub fluid_ticks: native_persistence::nbt::Tag,
+    /// Generated block entities whose blocks remain unchanged after processing.
+    pub block_entities: native_persistence::nbt::Tag,
+    /// Complete entity records, or `None` if an entity source is unverified.
+    pub entity_records: Option<Arc<Vec<native_persistence::nbt::Tag>>>,
 }
 
 pub(super) fn updated_postprocessing_sky_sources(
@@ -1666,6 +1670,7 @@ impl FreshTerrainBatch {
         );
         ensure!(
             Arc::ptr_eq(&processed.world, &processed.sealed_world)
+                && processed.edits == processed.sealed_edits
                 && processed.light_checks == processed.sealed_checks
                 && processed.chunks == processed.sealed_chunks,
             "postprocessing result was modified"
@@ -1822,6 +1827,36 @@ impl FreshTerrainBatch {
             .as_ref()
             .context("generation registry is missing")?
             .block_registry;
+        let block_entity_registry = self
+            .light_registry
+            .as_ref()
+            .context("block registry is missing")?;
+        for edit in &processed.sealed_edits {
+            if !sections.contains_key(&edit.chunk()) {
+                continue;
+            }
+            let old = processed
+                .source
+                .block(edit.x, edit.y, edit.z)
+                .context("original edited block is missing")?;
+            let new = processed
+                .world
+                .block(edit.x, edit.y, edit.z)
+                .context("postprocessed edited block is missing")?;
+            if old != new {
+                let has_entity = |state: &BlockState| {
+                    block_entity_registry
+                        .is_canonical_state(&state.name, &state.properties)
+                        .then(|| block_entity_registry.has_block_entity(&state.name))
+                        .flatten()
+                        .context("edited block entity classification is unavailable")
+                };
+                ensure!(
+                    !has_entity(old)? && !has_entity(new)?,
+                    "postprocessing changed a block entity"
+                );
+            }
+        }
         let time = processed.ticks.game_time();
         sections
             .into_iter()
@@ -1869,6 +1904,8 @@ impl FreshTerrainBatch {
                         fluid_ticks: native_persistence::generated_ticks::encode_level_fluid_ticks(
                             pos, &fluids,
                         )?,
+                        block_entities: self.spawned_block_entity_data(pos)?,
+                        entity_records: self.complete_generated_entity_records_shared(pos)?,
                     },
                 ))
             })

@@ -289,6 +289,71 @@ pub fn generated_block_light_from_active_chunks(
     calculate_generated_block_light(world, bounds, center, Some(active), Some(fresh_storage))
 }
 
+/// Explain missing inputs only after a generated block-light calculation fails.
+pub fn generated_block_light_issue(
+    world: &World,
+    bounds: LightBounds,
+    center: ChunkPos,
+    storage: &VisibleLightSnapshot,
+) -> String {
+    let mut checked = std::collections::HashSet::new();
+    let mut unsupported = std::collections::BTreeSet::new();
+    for dz in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let Some((x, z)) = center.x.checked_add(dx).zip(center.z.checked_add(dz)) else {
+                return "light chunk coordinates overflow".into();
+            };
+            let pos = ChunkPos { x, z };
+            let Some(chunk) = world.chunks.get(&pos) else {
+                return format!("missing chunk {pos:?}");
+            };
+            if chunk.position != pos {
+                return format!("mismatched chunk {pos:?}");
+            }
+            for sy in
+                bounds.light_range().start.div_euclid(16)..bounds.light_range().end.div_euclid(16)
+            {
+                if storage.block_section_allocated(pos, sy).is_none() {
+                    return format!("missing light storage {pos:?} section {sy}");
+                }
+            }
+            for sy in
+                bounds.build_range().start.div_euclid(16)..bounds.build_range().end.div_euclid(16)
+            {
+                let Ok(key) = i8::try_from(sy) else {
+                    return format!("section out of range {sy}");
+                };
+                let Some(blocks) = chunk
+                    .sections
+                    .get(&key)
+                    .and_then(|section| section.blocks.as_ref())
+                else {
+                    return format!("missing block section {pos:?} section {sy}");
+                };
+                for &id in blocks.iter() {
+                    if !checked.insert(id.0) {
+                        continue;
+                    }
+                    let Some(state) = world.state(id) else {
+                        return format!("unknown block state {id:?}");
+                    };
+                    if light_properties(state).is_none() {
+                        unsupported.insert(format!("{state:?}"));
+                    }
+                }
+            }
+        }
+    }
+    if unsupported.is_empty() {
+        "light propagation has unsupported bounds or storage".into()
+    } else {
+        format!(
+            "unsupported block light states: {}",
+            unsupported.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 fn calculate_generated_block_light(
     world: &World,
     bounds: LightBounds,
@@ -561,6 +626,25 @@ mod tests {
         });
         world.set_block_id(4, 8, 4, unknown).unwrap();
         assert!(initialize_generated_block_light(&world, bounds, center).is_none());
+    }
+
+    #[test]
+    fn failed_generation_identifies_unknown_light_state() {
+        let mut world = fixture();
+        let bounds = LightBounds::new(0, 32).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+        let storage =
+            VisibleLightSnapshot::fresh_after_section_updates(true, false, [], covered).unwrap();
+        let unknown = world.intern_state(BlockState {
+            name: "example:unknown".into(),
+            properties: Default::default(),
+        });
+        world.set_block_id(4, 8, 4, unknown).unwrap();
+        assert!(
+            generated_block_light_issue(&world, bounds, center, &storage)
+                .contains("example:unknown")
+        );
     }
 
     #[test]

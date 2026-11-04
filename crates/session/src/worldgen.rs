@@ -430,7 +430,17 @@ impl FreshGenerationLightTracker {
             active,
             &storage,
         )
-        .context("active generated block-light inputs are incomplete or unsupported")
+        .with_context(|| {
+            format!(
+                "active generated block-light inputs are incomplete or unsupported: {}",
+                native_world::generation_block_light::generated_block_light_issue(
+                    light_world,
+                    bounds,
+                    center,
+                    &storage
+                )
+            )
+        })
     }
 
     /// Preview sky light for activated chunks in a fresh engine. Registered

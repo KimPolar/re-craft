@@ -1212,14 +1212,6 @@ fn finish_decoration_with_light(
                 sources.insert(pos, Arc::from(heights));
             }
             if needs_incremental {
-                ensure!(
-                    !tracker.has_skylight
-                        || guard
-                            .light_check_order
-                            .iter()
-                            .all(|p| !active.contains(&chunk(*p))),
-                    "incremental active feature lighting is not supported"
-                );
                 let mut covered = BTreeSet::new();
                 for &p in &guard.light_replay_positions {
                     let pos = chunk(p);
@@ -1250,12 +1242,32 @@ fn finish_decoration_with_light(
                         "incremental feature block light inputs are incomplete or unsupported",
                     )?;
                 let after = if tracker.has_skylight {
-                    native_world::generation_sky_light::check_inactive_sky_blocks(
+                    // Only an active check's own and adjacent columns can
+                    // influence its source update. Do not clone the entire
+                    // batch's source map for every decoration transaction.
+                    let mut current_sources = sources.clone();
+                    for &p in &guard.light_check_order {
+                        if !active.contains(&chunk(p)) {
+                            continue;
+                        }
+                        for (dx, dz) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                            let x = p[0].checked_add(dx).context("sky source X overflow")?;
+                            let z = p[2].checked_add(dz).context("sky source Z overflow")?;
+                            let pos = chunk([x, p[1], z]);
+                            if let Some(heights) = tracker.sky_sources.get(&pos) {
+                                current_sources
+                                    .entry(pos)
+                                    .or_insert_with(|| Arc::clone(heights));
+                            }
+                        }
+                    }
+                    native_world::generation_sky_light::check_generated_sky_blocks(
                         &world,
                         bounds,
                         &after_block,
                         active,
                         &guard.light_check_order,
+                        &current_sources,
                     )
                     .context("incremental feature sky light inputs are incomplete or unsupported")?
                 } else {
@@ -6733,6 +6745,7 @@ mod tests {
         for mode in [
             "tree_empty",
             "tree_empty_full",
+            "tree_empty_leaf_active",
             "tree_empty_no_sky",
             "tree_empty_vine_no_sky",
         ] {
@@ -6803,7 +6816,6 @@ mod tests {
             let before = engine
                 .activate(&terrain, active, [center], &registry)
                 .unwrap();
-            let previous_world = Arc::clone(&terrain.world);
             // Java retains its existing light engine and drains the section
             // and block updates. Rebuilding a fresh engine loses that history.
             let mut draft = terrain
@@ -6825,6 +6837,14 @@ mod tests {
                 let mut vine = state("cave_vines_plant");
                 vine.properties.insert("berries".into(), "true".into());
                 assert!(draft.set_column_block([16, 10, 8], &vine).unwrap());
+            } else if mode == "tree_empty_leaf_active" {
+                let mut leaf = state("dark_oak_leaves");
+                leaf.properties = BTreeMap::from([
+                    ("distance".into(), "7".into()),
+                    ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+                draft.set_tree_block([16, 10, 8], &leaf, 19).unwrap();
             } else {
                 let mut log = state("dark_oak_log");
                 log.properties.insert("axis".into(), "y".into());
@@ -6833,16 +6853,6 @@ mod tests {
             let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
             let result = finish_decoration_with_light(draft, &mut tracking);
             drop(tracking);
-            if mode == "tree_empty" {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("incremental active feature lighting")
-                );
-                assert!(Arc::ptr_eq(&previous_world, &terrain.world));
-                continue;
-            }
             result.unwrap();
             let after = engine.snapshot(&terrain, [center], &registry).unwrap();
             if mode == "tree_empty_vine_no_sky" {
@@ -7391,6 +7401,7 @@ mod tests {
             "tree_empty_partial_register",
             "tree_empty_partial_register_empty",
             "tree_empty_full_activate",
+            "tree_empty_active_wide",
         ] {
             let path = temp.path().join("staged-wide.json");
             let output = Command::new(java.join("java.exe"))
@@ -7416,8 +7427,13 @@ mod tests {
             let east = ChunkPos { x: 1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
             let template = Arc::clone(world.chunks.get(&center).unwrap());
-            for z in -2..=2 {
-                for x in -2..=2 {
+            let halo = if mode == "tree_empty_active_wide" {
+                3
+            } else {
+                2
+            };
+            for z in -halo..=halo {
+                for x in -halo..=halo {
                     let pos = ChunkPos { x, z };
                     world.chunks.entry(pos).or_insert_with(|| {
                         let mut chunk = (*template).clone();
@@ -7448,17 +7464,18 @@ mod tests {
                 let stone = world.intern_state(state("stone"));
                 world.set_block_id(31, 0, 0, stone).unwrap();
             }
-            let registered: Vec<_> = if mode == "tree_empty_full_activate" {
-                (-2..=2)
-                    .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
-                    .collect()
-            } else if mode.starts_with("tree_empty_partial_") {
-                vec![center, east]
-            } else {
-                (-1..=1)
-                    .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
-                    .collect()
-            };
+            let registered: Vec<_> =
+                if mode == "tree_empty_full_activate" || mode == "tree_empty_active_wide" {
+                    (-2..=2)
+                        .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+                        .collect()
+                } else if mode.starts_with("tree_empty_partial_") {
+                    vec![center, east]
+                } else {
+                    (-1..=1)
+                        .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+                        .collect()
+                };
             terrain
                 .completed_decoration
                 .extend(registered.iter().copied());
@@ -7471,7 +7488,16 @@ mod tests {
                 .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
                 .collect();
             let before = engine
-                .activate(&terrain, center, covered.iter().copied(), &registry)
+                .activate(
+                    &terrain,
+                    if mode == "tree_empty_active_wide" {
+                        east
+                    } else {
+                        center
+                    },
+                    covered.iter().copied(),
+                    &registry,
+                )
                 .unwrap();
             let mut draft = terrain
                 .decoration_region(&tags, &motion, BTreeSet::from([east]))

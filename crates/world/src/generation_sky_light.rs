@@ -95,7 +95,29 @@ pub fn check_inactive_sky_blocks(
     active: &BTreeSet<ChunkPos>,
     positions: &[[i32; 3]],
 ) -> Option<VisibleLightSnapshot> {
-    apply_sky_updates(world, bounds, before, active, positions, None)
+    apply_sky_updates(world, bounds, before, active, positions, None, None)
+}
+
+/// Drain checks in active and inactive chunks with current source heights.
+/// Unlisted chunks retain the never-initialized source heightmap. Sparse
+/// vertical storage in an affected active chunk remains unsupported.
+pub fn check_generated_sky_blocks(
+    world: &World,
+    bounds: LightBounds,
+    before: &VisibleLightSnapshot,
+    active: &BTreeSet<ChunkPos>,
+    positions: &[[i32; 3]],
+    sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+) -> Option<VisibleLightSnapshot> {
+    apply_sky_updates(
+        world,
+        bounds,
+        before,
+        active,
+        positions,
+        None,
+        Some(sources),
+    )
 }
 
 /// Enable direct sky sources over an existing, fully allocated light revision.
@@ -115,6 +137,7 @@ pub fn activate_generated_sky_light(
         &BTreeSet::new(),
         &[],
         Some((pos, sources)),
+        None,
     )
 }
 
@@ -125,6 +148,7 @@ fn apply_sky_updates(
     active: &BTreeSet<ChunkPos>,
     positions: &[[i32; 3]],
     activation: Option<(ChunkPos, &BTreeMap<ChunkPos, Arc<[i32; 256]>>)>,
+    current_sources: Option<&BTreeMap<ChunkPos, Arc<[i32; 256]>>>,
 ) -> Option<VisibleLightSnapshot> {
     #[derive(Clone, Copy)]
     struct Entry {
@@ -142,14 +166,117 @@ fn apply_sky_updates(
     let mut draft = before.clone();
     let mut decreases = VecDeque::new();
     let mut increases = VecDeque::new();
+    let mut checked_active = BTreeSet::new();
     let ordered = order_pending_light_checks(positions.iter().copied())?;
     for position in ordered {
         let chunk = ChunkPos {
             x: position[0].div_euclid(16),
             z: position[2].div_euclid(16),
         };
-        if active.contains(&chunk) || !bounds.build_range().contains(&position[1]) {
+        if !bounds.build_range().contains(&position[1]) {
             return None;
+        }
+        if active.contains(&chunk) {
+            if checked_active.insert(chunk) {
+                let sections = bounds.light_range();
+                let mut found = false;
+                let mut gap = false;
+                for sy in sections.start.div_euclid(16)..sections.end.div_euclid(16) {
+                    if draft.sky_section_allocated(chunk, sy)? {
+                        if gap {
+                            return None;
+                        }
+                        found = true;
+                    } else if found {
+                        gap = true;
+                    }
+                }
+                if !found {
+                    return None;
+                }
+            }
+            let sources = current_sources?;
+            let source_height = |x: i32, z: i32| -> Option<i32> {
+                let pos = ChunkPos {
+                    x: x.div_euclid(16),
+                    z: z.div_euclid(16),
+                };
+                if !world.chunks.contains_key(&pos) {
+                    return None;
+                }
+                Some(sources.get(&pos).map_or(i32::MIN, |h| {
+                    h[(x.rem_euclid(16) + 16 * z.rem_euclid(16)) as usize]
+                }))
+            };
+            let lowest = *sources
+                .get(&chunk)?
+                .get((position[0].rem_euclid(16) + 16 * position[2].rem_euclid(16)) as usize)?;
+            let light = bounds.light_range();
+            let mut y = lowest.saturating_sub(1).min(light.end - 1);
+            if lowest > light.start {
+                while y >= light.start {
+                    let p = [position[0], y, position[2]];
+                    if let Some(value) = draft.stored_sky(p)? {
+                        if value != 15 {
+                            break;
+                        }
+                        draft.set_stored_sky(p, 0)?;
+                        decreases.push_back(Entry {
+                            pos: p,
+                            level: 15,
+                            directions: if y == lowest - 1 {
+                                ALL
+                            } else {
+                                ALL & !(1 << 2)
+                            },
+                            source: false,
+                        });
+                    }
+                    y -= 1;
+                }
+            }
+            let x = position[0];
+            let z = position[2];
+            let neighbor_height = [
+                source_height(x.checked_sub(1)?, z)?,
+                source_height(x.checked_add(1)?, z)?,
+                source_height(x, z.checked_sub(1)?)?,
+                source_height(x, z.checked_add(1)?)?,
+            ]
+            .into_iter()
+            .max()?;
+            for y in lowest.max(light.start)..light.end {
+                let p = [x, y, z];
+                if let Some(value) = draft.stored_sky(p)? {
+                    if value == 15 {
+                        break;
+                    }
+                    draft.set_stored_sky(p, 15)?;
+                    if y < neighbor_height || y == lowest {
+                        increases.push_back(Entry {
+                            pos: p,
+                            level: 15,
+                            directions: ALL & !(1 << 2),
+                            source: false,
+                        });
+                    }
+                }
+            }
+            if draft.stored_sky(position)?.is_some() && position[1] >= lowest {
+                decreases.push_back(Entry {
+                    pos: position,
+                    level: 15,
+                    directions: ALL & !(1 << 2),
+                    source: false,
+                });
+                increases.push_back(Entry {
+                    pos: position,
+                    level: 15,
+                    directions: ALL & !(1 << 2),
+                    source: false,
+                });
+                continue;
+            }
         }
         let Some(old) = draft.stored_sky(position)? else {
             continue;
@@ -641,4 +768,35 @@ fn calculate_generated_sky_light(
         output.insert(sy, Arc::new(layer));
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generation_light::VisibleLightColumn;
+
+    #[test]
+    fn active_sky_update_rejects_sparse_storage_without_mutating_snapshot() {
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let mut before = VisibleLightSnapshot::new(false, true);
+        let layers = BTreeMap::from([
+            (-1, Arc::new([0x44; LIGHT_BYTES])),
+            (1, Arc::new([0xff; LIGHT_BYTES])),
+        ]);
+        before.insert_complete_column(chunk, VisibleLightColumn::new(BTreeMap::new(), layers));
+        let world = World::new("minecraft:overworld");
+        let bounds = LightBounds::new(0, 16).unwrap();
+        let sources = BTreeMap::from([(chunk, Arc::new([1; 256]))]);
+        let result = check_generated_sky_blocks(
+            &world,
+            bounds,
+            &before,
+            &BTreeSet::from([chunk]),
+            &[[1, 1, 1]],
+            &sources,
+        );
+        assert!(result.is_none());
+        assert_eq!(before.sky_light([1, -1, 1]), Some(4));
+        assert_eq!(before.sky_light([1, 16, 1]), Some(15));
+    }
 }

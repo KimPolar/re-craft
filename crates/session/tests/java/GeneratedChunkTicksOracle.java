@@ -153,5 +153,27 @@ public class GeneratedChunkTicksOracle {
         replaced.tick(2, 100, (p, type) -> System.out.println("X1 " + type));
         replaced.schedule(tick("minecraft:new", new BlockPos(0, 1, 16), 3, TickPriority.NORMAL, 2));
         replaced.tick(3, 100, (p, type) -> System.out.println("X2 " + type));
+        var history = new LevelTicks<String>(p -> true);
+        @SuppressWarnings("unchecked")
+        LevelChunkTicks<String>[] historyChunks = new LevelChunkTicks[30];
+        int[] historyX = new int[30];
+        for (int x = 1, count = 0; count < 30; x++) {
+            if ((it.unimi.dsi.fastutil.HashCommon.mix(ChunkPos.pack(x, 0)) & 31) == 31) historyX[count++] = x;
+        }
+        for (int i = 0; i < 30; i++) {
+            int x = historyX[i];
+            var pending = new SavedTick<String>("minecraft:hp" + i, new BlockPos(x * 16, 0, 0), 0, TickPriority.NORMAL);
+            historyChunks[i] = new LevelChunkTicks<String>(List.of(pending));
+            history.addContainer(new ChunkPos(x, 0), historyChunks[i]);
+        }
+        for (int j = 0; j < 30; j++) {
+            int i = (j * 17) % 30, x = historyX[i];
+            history.schedule(tick("minecraft:hq" + i, new BlockPos(x * 16, 1, 0), 101, TickPriority.NORMAL, j));
+        }
+        for (int i = 29; i >= 0; i--) historyChunks[i].unpack(100);
+        for (int round = 0; round < 10; round++) {
+            history.tick(100, 3, (p, type) -> System.out.println("H1 " + type));
+        }
+        history.tick(101, 100, (p, type) -> System.out.println("H2 " + type));
     }
 }

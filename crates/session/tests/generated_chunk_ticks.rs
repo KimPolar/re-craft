@@ -167,7 +167,73 @@ fn trace() -> Vec<String> {
     out.extend(indexed_collection_trace());
     out.extend(callback_reschedule_trace());
     out.extend(streamed_containers_trace());
+    out.extend(captured_index_history_trace());
     out
+}
+
+fn captured_index_history_trace() -> Vec<String> {
+    let positions: Vec<_> = (1..)
+        .filter(|&x| {
+            let h = (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let h = h ^ (h >> 32);
+            (h ^ (h >> 16)) & 31 == 31
+        })
+        .take(30)
+        .map(|x| ChunkPos { x, z: 0 })
+        .collect();
+    let chunks = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let pending = saved(&format!("minecraft:hp{i}"), [pos.x * 16, 0, 0], 0, 0);
+            (
+                pos,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(pos, vec![pending]).unwrap(),
+                    fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                },
+            )
+        })
+        .collect();
+    let mut region = RegionTicks::new_ordered(chunks, 100, 0, &positions).unwrap();
+    for j in 0..30 {
+        let i = (j * 17) % 30;
+        region
+            .schedule(
+                TickRegistry::Block,
+                &format!("minecraft:hq{i}"),
+                [positions[i].x * 16, 1, 0],
+                1,
+                0,
+            )
+            .unwrap();
+    }
+    let activation: Vec<_> = positions.iter().rev().copied().collect();
+    let mut captured = region
+        .captured_indexed_queue(TickRegistry::Block, &activation)
+        .unwrap();
+    let mut rebuilt = region
+        .activated_indexed_queue(TickRegistry::Block, &positions)
+        .unwrap();
+    let first = captured.collect_due(100, 3, |_| true);
+    let reconstructed_first = rebuilt.collect_due(100, 3, |_| true);
+    assert_ne!(
+        first, reconstructed_first,
+        "registration history must affect this fixture"
+    );
+    let mut output: Vec<_> = first
+        .into_iter()
+        .map(|tick| format!("H1 {}", tick.kind))
+        .collect();
+    for _ in 1..10 {
+        for tick in captured.collect_due(100, 3, |_| true) {
+            output.push(format!("H1 {}", tick.kind));
+        }
+    }
+    for tick in captured.collect_due(101, 100, |_| true) {
+        output.push(format!("H2 {}", tick.kind));
+    }
+    output
 }
 
 fn streamed_containers_trace() -> Vec<String> {
@@ -395,7 +461,38 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 171);
+    assert_eq!(lines.len(), 231);
+}
+
+#[test]
+fn captured_index_rejects_incomplete_activation_and_untracked_mutation() {
+    let pos = ChunkPos { x: 0, z: 0 };
+    let chunks = std::collections::BTreeMap::from([(
+        pos,
+        ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        },
+    )]);
+    let mut region = RegionTicks::new(chunks, 0, 0).unwrap();
+    assert_eq!(region.registration_order(), &[pos]);
+    assert!(
+        region
+            .captured_indexed_queue(TickRegistry::Block, &[])
+            .is_err()
+    );
+    assert!(
+        region
+            .captured_indexed_queue(TickRegistry::Block, &[pos, pos])
+            .is_err()
+    );
+    assert!(region.chunk_mut(pos).is_some());
+    assert!(
+        region
+            .captured_indexed_queue(TickRegistry::Block, &[pos])
+            .is_err()
+    );
+    assert_eq!(captured_index_history_trace().len(), 60);
 }
 
 #[test]

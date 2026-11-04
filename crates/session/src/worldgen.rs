@@ -4900,6 +4900,15 @@ mod tests {
         assert!(Arc::ptr_eq(&original, &processed.world));
         assert!(processed.edits.is_empty());
         assert!(processed.light_checks.is_empty());
+        assert_eq!(processed.ticks().registration_order(), &[center]);
+        let mut captured = processed
+            .ticks()
+            .captured_indexed_queue(chunk_ticks::TickRegistry::Block, &[center])
+            .unwrap();
+        let due = captured.collect_due(42, 65_536, |_| true);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].kind, "minecraft:brown_mushroom");
+        assert_eq!(due[0].position, saved[0].position);
         let light = batch.postprocessed_light_snapshot(&processed).unwrap();
         let spawn_light = batch.light_snapshot([center]).unwrap();
         assert_eq!(

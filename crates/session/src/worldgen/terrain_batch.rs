@@ -1559,16 +1559,23 @@ impl FreshTerrainBatch {
     ) -> Result<super::postprocessing::ConvertedPostprocessingRegion> {
         let mut tasks = BTreeMap::new();
         let mut ticks = BTreeMap::new();
+        let mut registration = Vec::new();
         for pos in positions {
             ensure!(!tasks.contains_key(&pos), "duplicate converted chunk");
             let converted = self.begin_converted_postprocessing(pos)?;
             tasks.insert(pos, converted.task);
             ticks.insert(pos, converted.ticks);
+            registration.push(pos);
         }
         ensure!(!tasks.is_empty(), "no converted chunks");
         Ok(super::postprocessing::ConvertedPostprocessingRegion {
             tasks,
-            ticks: super::chunk_ticks::RegionTicks::new(ticks, game_time, next_sub_tick)?,
+            ticks: super::chunk_ticks::RegionTicks::new_ordered(
+                ticks,
+                game_time,
+                next_sub_tick,
+                &registration,
+            )?,
         })
     }
 

@@ -217,6 +217,13 @@ pub struct RegionTicks {
     chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
     game_time: i64,
     next_sub_tick: i64,
+    registration: Vec<ChunkPos>,
+    indexes: Option<RegionTickIndexes>,
+}
+
+struct RegionTickIndexes {
+    blocks: super::tick_index::LevelTickIndex,
+    fluids: super::tick_index::LevelTickIndex,
 }
 
 /// The activated queues of one converted chunk in Java's poll order.
@@ -501,16 +508,50 @@ impl RegionTicks {
         game_time: i64,
         next_sub_tick: i64,
     ) -> Result<Self> {
+        let registration: Vec<_> = chunks.keys().copied().collect();
+        Self::new_ordered(chunks, game_time, next_sub_tick, &registration)
+    }
+
+    /// Register converted containers in the supplied level registration order.
+    pub fn new_ordered(
+        chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
+        game_time: i64,
+        next_sub_tick: i64,
+        registration: &[ChunkPos],
+    ) -> Result<Self> {
         for (pos, ticks) in &chunks {
             ensure!(
                 ticks.blocks.chunk == *pos && ticks.fluids.chunk == *pos,
                 "tick container belongs to another chunk"
             );
         }
+        let mut seen = BTreeSet::new();
+        let mut indexes = RegionTickIndexes {
+            blocks: super::tick_index::LevelTickIndex::default(),
+            fluids: super::tick_index::LevelTickIndex::default(),
+        };
+        for &pos in registration {
+            ensure!(seen.insert(pos), "duplicate tick container registration");
+            let ticks = chunks
+                .get(&pos)
+                .ok_or_else(|| anyhow::anyhow!("unknown tick container registration"))?;
+            if let Some(head) = ticks.blocks.peek() {
+                indexes.blocks.insert(pos, head.trigger);
+            }
+            if let Some(head) = ticks.fluids.peek() {
+                indexes.fluids.insert(pos, head.trigger);
+            }
+        }
+        ensure!(
+            seen.len() == chunks.len(),
+            "missing tick container registration"
+        );
         Ok(Self {
             chunks,
             game_time,
             next_sub_tick,
+            registration: registration.to_vec(),
+            indexes: Some(indexes),
         })
     }
 
@@ -519,7 +560,15 @@ impl RegionTicks {
     }
 
     pub fn chunk_mut(&mut self, pos: ChunkPos) -> Option<&mut ConvertedChunkTicks> {
+        if self.chunks.contains_key(&pos) {
+            // Direct edits bypass LevelTicks' onTickAdded callback.
+            self.indexes = None;
+        }
         self.chunks.get_mut(&pos)
+    }
+
+    pub fn registration_order(&self) -> &[ChunkPos] {
+        &self.registration
     }
 
     pub fn next_sub_tick(&self) -> i64 {
@@ -571,9 +620,9 @@ impl RegionTicks {
         }
     }
 
-    /// Activate registered containers in their actual registration order.
-    /// Callers must supply every container exactly once, since Java's map
-    /// layout depends on insertion and removal history.
+    /// Rebuild an index from the current activated heads in this order. This
+    /// discards earlier insertion history; use `captured_indexed_queue` when
+    /// reproducing a live level whose registration history was recorded.
     pub fn activated_indexed_queue(
         &self,
         registry: TickRegistry,
@@ -597,6 +646,56 @@ impl RegionTicks {
             "missing tick container registration"
         );
         Ok(IndexedRegionQueue { queue, index })
+    }
+
+    /// Activate a clone while retaining the actual recorded index mutations.
+    /// The order is the caller's real sequence of chunk activation events.
+    pub fn captured_indexed_queue(
+        &self,
+        registry: TickRegistry,
+        activation: &[ChunkPos],
+    ) -> Result<IndexedRegionQueue> {
+        let indexes = self
+            .indexes
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tick index history was invalidated by direct edits"))?;
+        let mut seen = BTreeSet::new();
+        for pos in activation {
+            ensure!(
+                self.chunks.contains_key(pos),
+                "unknown tick container activation"
+            );
+            ensure!(seen.insert(*pos), "duplicate tick container activation");
+        }
+        ensure!(
+            seen.len() == self.chunks.len(),
+            "missing tick container activation"
+        );
+        let chunks = self
+            .chunks
+            .iter()
+            .map(|(&pos, ticks)| {
+                (
+                    pos,
+                    match registry {
+                        TickRegistry::Block => ticks.blocks.clone(),
+                        TickRegistry::Fluid => ticks.fluids.clone(),
+                    },
+                )
+            })
+            .collect();
+        let index = match registry {
+            TickRegistry::Block => indexes.blocks.clone(),
+            TickRegistry::Fluid => indexes.fluids.clone(),
+        };
+        let mut queue = IndexedRegionQueue {
+            queue: ActiveRegionQueue { chunks },
+            index,
+        };
+        for &pos in activation {
+            queue.unpack_container(pos, self.game_time)?;
+        }
+        Ok(queue)
     }
 
     /// Match LevelAccessor.createTick followed by LevelTicks.schedule. A
@@ -625,6 +724,7 @@ impl RegionTicks {
             TickRegistry::Block => &mut chunk.blocks,
             TickRegistry::Fluid => &mut chunk.fluids,
         };
+        let before = ticks.peek().map(tick_order);
         let added = ticks.schedule(ScheduledTick {
             kind,
             position,
@@ -632,6 +732,17 @@ impl RegionTicks {
             priority,
             sub_tick,
         })?;
+        let after = ticks.peek().map(tick_order);
+        if added
+            && after != before
+            && let Some(head) = after
+            && let Some(indexes) = &mut self.indexes
+        {
+            match registry {
+                TickRegistry::Block => indexes.blocks.insert(pos, head.0),
+                TickRegistry::Fluid => indexes.fluids.insert(pos, head.0),
+            }
+        }
         Ok(if added {
             ScheduleOutcome::Added
         } else {

@@ -1475,6 +1475,33 @@ impl FreshTerrainBatch {
         })
     }
 
+    /// Start an isolated pass against the generated blocks and their actual
+    /// pending ticks. Unsupported block or fluid callbacks fail the attempt.
+    /// The result is intermediate and cannot yet be opened or saved.
+    pub fn begin_generated_postprocessing(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<super::GeneratedPostprocessing> {
+        let positions: Vec<_> = positions.into_iter().collect();
+        let region = self.begin_converted_postprocessing_region(
+            positions.iter().copied(),
+            game_time,
+            next_sub_tick,
+        )?;
+        // All generated block entities in this path are materialized live;
+        // a missing or unsupported record cannot be treated as no entity.
+        for pos in positions {
+            self.spawned_block_entity_data(pos)?;
+        }
+        let world = self.snapshot().context("generated terrain is missing")?;
+        let (min_y, max_y) = self.build_bounds()?;
+        Ok(super::GeneratedPostprocessing::new(
+            world, min_y, max_y, region,
+        ))
+    }
+
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the
     /// complete feature-generated entity list and the world's current tick.
     /// This is not a FULL chunk and must not be written as a playable world.

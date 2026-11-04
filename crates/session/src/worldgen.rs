@@ -44,6 +44,7 @@ mod mob_placement;
 mod mob_spawner;
 mod ore;
 pub mod postprocessing;
+mod postprocessing_world;
 pub mod schedule;
 mod terrain_batch;
 pub use carving::CarverBlockState;
@@ -66,6 +67,7 @@ pub use mob_spawner::{
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
+pub use postprocessing_world::{GeneratedPostprocessing, PostprocessedGeneratedRegion};
 pub use terrain_batch::{FreshBatchLight, FreshTerrainBatch};
 
 /// Block entities created by a monster-room feature in intermediate terrain.
@@ -4886,6 +4888,24 @@ mod tests {
         assert_eq!(activated.trigger, 42);
         assert_eq!(activated.sub_tick, -1);
         assert!(blocks.poll().is_none());
+        let original = batch.snapshot().unwrap();
+        let mut generated = batch
+            .begin_generated_postprocessing([center], 42, 10)
+            .unwrap();
+        let error = loop {
+            match generated.poll(center, 4) {
+                Ok(false) => {}
+                Ok(true) => panic!("unsupported mushroom callback was accepted"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported generated postprocessing block")
+        );
+        assert!(generated.finish().is_err());
+        assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
         let native_persistence::nbt::Tag::List { values: ticks, .. } = fluid_ticks else {
             panic!("missing fluid ticks")
         };

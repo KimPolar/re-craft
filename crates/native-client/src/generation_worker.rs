@@ -67,6 +67,8 @@ pub struct GenerationReady {
 pub struct PostprocessedGeneration {
     pub region: native_session::worldgen::PostprocessedGeneratedRegion,
     pub chunks: BTreeMap<ChunkPos, native_session::worldgen::PostprocessedChunkDraft>,
+    /// Exact queues after activation, including their absolute sub-tick order.
+    pub activated_ticks: native_session::worldgen::chunk_ticks::ActivatedRegionTicks,
     /// A fresh mesh snapshot for the postprocessed subset of the old targets.
     pub mesh: Option<MeshJob>,
 }
@@ -728,6 +730,7 @@ impl GenerationWorker {
                 return Ok(None);
             }
             let region = stage.finish()?;
+            let activated_ticks = region.ticks().activated_snapshot();
             let chunks = ready.batch.postprocessed_chunk_drafts(&region, positions)?;
             let targets: BTreeSet<_> = ready
                 .mesh
@@ -755,6 +758,7 @@ impl GenerationWorker {
             ready.postprocessed = Some(PostprocessedGeneration {
                 region,
                 chunks,
+                activated_ticks,
                 mesh,
             });
             Ok(Some(ready))

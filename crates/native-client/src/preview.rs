@@ -3655,6 +3655,16 @@ mod tests {
         assert_eq!(postprocessor.progress().completed_steps, 1);
         let output = ready.postprocessed.as_ref().unwrap();
         assert_eq!(output.region.chunks, BTreeSet::from([center]));
+        assert_eq!(output.activated_ticks.game_time, 42);
+        assert_eq!(
+            output.activated_ticks.next_sub_tick,
+            output.region.ticks().next_sub_tick()
+        );
+        assert_eq!(
+            output.activated_ticks,
+            output.region.ticks().activated_snapshot()
+        );
+        assert!(output.activated_ticks.chunks.contains_key(&center));
         let postprocessed_mesh = output.mesh.as_ref().expect("postprocessed mesh missing");
         assert_eq!(postprocessed_mesh.revision, 100);
         assert_eq!(postprocessed_mesh.targets.as_deref(), Some(&targets));

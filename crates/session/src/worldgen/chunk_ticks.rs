@@ -40,6 +40,7 @@ fn canonical(kind: &str) -> Result<String> {
 /// Models Java's pending list, uniqueness set and PriorityQueue. Construct
 /// one separately for blocks and fluids; type IDs must be from the active
 /// registry. This alone does not make a generated chunk playable or saveable.
+#[derive(Clone)]
 pub struct ChunkTicks {
     chunk: ChunkPos,
     pending: Option<Vec<SavedTick>>,
@@ -159,6 +160,19 @@ impl ChunkTicks {
         saved
     }
 
+    /// Snapshot Java's queue after pending entries are unpacked at `time`.
+    /// Draining a clone preserves the queue's tie behavior without changing
+    /// the original container or collapsing duplicate saved entries.
+    pub fn activated(&self, time: i64) -> Vec<ScheduledTick> {
+        let mut copy = self.clone();
+        copy.unpack(time);
+        let mut result = Vec::with_capacity(copy.heap.len());
+        while let Some(tick) = copy.poll() {
+            result.push(tick);
+        }
+        result
+    }
+
     fn push(&mut self, tick: ScheduledTick) {
         self.heap.push(tick);
         let mut child = self.heap.len() - 1;
@@ -201,6 +215,21 @@ pub struct RegionTicks {
     next_sub_tick: i64,
 }
 
+/// The activated queues of one converted chunk in Java's poll order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivatedChunkTicks {
+    pub blocks: Vec<ScheduledTick>,
+    pub fluids: Vec<ScheduledTick>,
+}
+
+/// A detached view retaining absolute triggers and the shared sub-tick counter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivatedRegionTicks {
+    pub game_time: i64,
+    pub next_sub_tick: i64,
+    pub chunks: BTreeMap<ChunkPos, ActivatedChunkTicks>,
+}
+
 impl RegionTicks {
     pub fn new(
         chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
@@ -235,6 +264,28 @@ impl RegionTicks {
     /// World time shared by all schedules in this isolated pass.
     pub fn game_time(&self) -> i64 {
         self.game_time
+    }
+
+    /// Capture every converted queue as it would look after activation at the
+    /// pass's game time. The original pending lists remain untouched.
+    pub fn activated_snapshot(&self) -> ActivatedRegionTicks {
+        ActivatedRegionTicks {
+            game_time: self.game_time,
+            next_sub_tick: self.next_sub_tick,
+            chunks: self
+                .chunks
+                .iter()
+                .map(|(&pos, ticks)| {
+                    (
+                        pos,
+                        ActivatedChunkTicks {
+                            blocks: ticks.blocks.activated(self.game_time),
+                            fluids: ticks.fluids.activated(self.game_time),
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// Match LevelAccessor.createTick followed by LevelTicks.schedule. A

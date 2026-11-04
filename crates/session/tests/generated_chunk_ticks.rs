@@ -149,16 +149,20 @@ fn trace() -> Vec<String> {
         region.chunk(second).unwrap().fluids.pack(i64::MAX),
     ));
     out.push(format!("counter {}", region.next_sub_tick()));
-    let first = &mut region.chunk_mut(pos).unwrap().blocks;
-    first.unpack(i64::MAX);
-    while first.peek().is_some() {
-        out.push(format_tick(first.poll()));
+    let activated = region.activated_snapshot();
+    assert_eq!(activated.game_time, i64::MAX);
+    assert_eq!(activated.next_sub_tick, region.next_sub_tick());
+    for tick in &activated.chunks[&pos].blocks {
+        out.push(format_tick(Some(tick.clone())));
     }
-    let fluids = &mut region.chunk_mut(second).unwrap().fluids;
-    fluids.unpack(i64::MAX);
-    while fluids.peek().is_some() {
-        out.push(format_tick(fluids.poll()));
+    for tick in &activated.chunks[&second].fluids {
+        out.push(format_tick(Some(tick.clone())));
     }
+    assert_eq!(region.activated_snapshot(), activated);
+    assert_eq!(
+        region.chunk(pos).unwrap().blocks.pack(i64::MAX)[0],
+        saved("minecraft:stone", a, 0, 0)
+    );
     out
 }
 
@@ -170,6 +174,26 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
     assert_eq!(lines.len(), 99);
+}
+
+#[test]
+fn activation_snapshot_keeps_pending_duplicates_and_new_subtick_order() {
+    let pos = ChunkPos { x: 0, z: 0 };
+    let repeated = saved("water", [1, 0, 1], 5, 0);
+    let mut ticks = ChunkTicks::from_saved(pos, vec![repeated.clone(), repeated]).unwrap();
+    assert!(
+        ticks
+            .schedule(scheduled("lava", [2, 0, 1], 105, 0, 7))
+            .unwrap()
+    );
+    let before = ticks.pack(100);
+    let active = ticks.activated(100);
+    assert_eq!(
+        active.iter().map(|tick| tick.sub_tick).collect::<Vec<_>>(),
+        [-2, -1, 7]
+    );
+    assert_eq!(ticks.pack(100), before);
+    assert_eq!(ticks.activated(100), active);
 }
 
 #[test]

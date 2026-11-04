@@ -18,7 +18,7 @@ pub struct MotionTags {
 
 /// The registry must be the world's complete, canonical block registry. The
 /// caller must separately resolve each state's `isAir` and fluid state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeightmapTags {
     registry: BTreeSet<String>,
     motion: BTreeSet<String>,

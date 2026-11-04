@@ -3616,6 +3616,7 @@ mod tests {
                 session: session_settings,
                 packs: None,
             }),
+            initial_respawn: None,
         };
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
@@ -3665,6 +3666,13 @@ mod tests {
         assert_eq!(previous_world.light(8, 16, 8, true), Some(15));
         assert!(expanded.draft_initial_level_data(123, None, false).is_err());
         expanded.suggested_spawn = Some(IVec3::new(8, 16, 8));
+        expanded.initial_respawn = Some(crate::generation_worker::InitialRespawnSettings {
+            border: native_persistence::world::SavedWorldBorder::default(),
+            radius: 0,
+            adventure: false,
+            ceiling_spawn_height: None,
+            height_tags: Arc::clone(&spawn_tags),
+        });
         let draft = expanded.draft_initial_level_data(123, None, false).unwrap();
         assert_eq!(
             draft
@@ -3687,7 +3695,7 @@ mod tests {
             on_ground: true,
             pose: native_session::PlayerPose::Standing,
         };
-        let session = expanded
+        let mut session = expanded
             .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
             .unwrap();
         use native_session::GameSession;
@@ -3699,6 +3707,11 @@ mod tests {
         assert_eq!(
             session.snapshot().last_death,
             native_session::LastDeathLocation::Absent
+        );
+        let error = session.find_initial_player_spawn().unwrap_err();
+        assert!(
+            error.to_string().contains("respawn chunk is not complete"),
+            "{error:#}"
         );
         let clock_id = native_persistence::world::DimensionId::parse("example:clock").unwrap();
         assert_eq!(session.world_clock(&clock_id).unwrap().total_ticks, 0);
@@ -3773,6 +3786,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert_eq!(expanded.mesh.targets.as_deref(), Some(&expanded_targets));
+        assert!(expanded.initial_respawn.is_some());
         assert_eq!(reselection.progress().completed_steps, 0);
         let reopened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reopened_worker = Arc::clone(&reopened);

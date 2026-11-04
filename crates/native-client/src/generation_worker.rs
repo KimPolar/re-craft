@@ -58,6 +58,32 @@ pub struct GenerationReady {
     pub entity_collision_registry:
         Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
+    pub(crate) initial_respawn: Option<InitialRespawnSettings>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InitialRespawnSettings {
+    pub border: native_persistence::world::SavedWorldBorder,
+    pub radius: i32,
+    pub adventure: bool,
+    pub ceiling_spawn_height: Option<i32>,
+    pub height_tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+}
+
+/// A border snapshot cannot reveal whether the border is moving. Retain the
+/// original saved settings only when they match the checked initial bounds.
+fn validated_initial_border(
+    border: native_session::respawn::RespawnBorder,
+    saved: Option<native_persistence::world::SavedWorldBorder>,
+) -> Result<Option<native_persistence::world::SavedWorldBorder>> {
+    ensure!(border.is_valid(), "initial spawn border is invalid");
+    if let Some(saved) = saved {
+        ensure!(
+            native_session::respawn::RespawnBorder::from_saved(saved, 0)? == border,
+            "saved world border differs from initial spawn bounds"
+        );
+    }
+    Ok(saved)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +99,9 @@ pub struct InitialPlayerSpawnOptions {
     pub radius: i32,
     pub adventure: bool,
     pub random_seed: i64,
+    /// Original settings, including border movement; absent means respawn
+    /// cannot yet be configured from the evaluated initial edges alone.
+    pub saved_border: Option<native_persistence::world::SavedWorldBorder>,
 }
 
 impl GenerationReady {
@@ -247,7 +276,22 @@ impl GenerationReady {
         player: native_session::PlayerState,
         tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
     ) -> Result<native_session::loaded::LoadedSession> {
-        let mut session = self.start_session(player)?;
+        if let Some(initial) = &self.initial_respawn {
+            ensure!(
+                *initial.height_tags == *tags,
+                "spawn heightmap tags differ from initial world generation"
+            );
+        }
+        let mut session = self.start_session_inner(player)?;
+        self.install_spawn_heightmaps(&mut session, tags)?;
+        Ok(session)
+    }
+
+    fn install_spawn_heightmaps(
+        &mut self,
+        session: &mut native_session::loaded::LoadedSession,
+        tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    ) -> Result<()> {
         session.set_spawn_heightmap_tags(tags)?;
         let targets = self
             .mesh
@@ -261,13 +305,25 @@ impl GenerationReady {
                 session.prime_generated_spawn_heightmaps(pos)?;
             }
         }
-        Ok(session)
+        Ok(())
     }
 
     /// Construct a transient session from fully lit targets. The caller must
     /// choose and validate the player spawn, and keep the batch for generation;
     /// this does not create or save a Java world.
     pub fn start_session(
+        &mut self,
+        player: native_session::PlayerState,
+    ) -> Result<native_session::loaded::LoadedSession> {
+        let mut session = self.start_session_inner(player)?;
+        if let Some(initial) = &self.initial_respawn {
+            let tags = Arc::clone(&initial.height_tags);
+            self.install_spawn_heightmaps(&mut session, tags)?;
+        }
+        Ok(session)
+    }
+
+    fn start_session_inner(
         &mut self,
         player: native_session::PlayerState,
     ) -> Result<native_session::loaded::LoadedSession> {
@@ -352,9 +408,20 @@ impl GenerationReady {
         )
         .map_err(anyhow::Error::msg)?;
         if let Some(spawn) = self.initial_world_spawn()? {
-            session.set_world_spawn(spawn)?;
+            session.set_world_spawn(spawn.clone())?;
+            if let Some(initial) = &self.initial_respawn {
+                session.set_world_respawn_support(native_session::loaded::WorldRespawnSupport {
+                    spawn,
+                    border: initial.border,
+                    max_health: 20.0,
+                    radius: initial.radius,
+                    adventure: initial.adventure,
+                    ceiling_spawn_height: initial.ceiling_spawn_height,
+                })?;
+            }
         }
         session.set_new_player_last_death()?;
+        session.set_saved_respawn_absent()?;
         for &pos in targets.iter() {
             if self
                 .batch
@@ -652,6 +719,7 @@ impl GenerationWorker {
                 return Ok(None);
             }
             if let Some(player) = player {
+                ensure!(player.radius >= 0, "player spawn radius is invalid");
                 if let Some(level) = &ready.level_settings {
                     ensure!(
                         player.adventure
@@ -659,7 +727,17 @@ impl GenerationWorker {
                         "player spawn game mode differs from the frozen world settings"
                     );
                 }
-                return complete_player_spawn(
+                let initial_respawn =
+                    validated_initial_border(border, player.saved_border)?.map(|border| {
+                        InitialRespawnSettings {
+                            border,
+                            radius: player.radius,
+                            adventure: player.adventure,
+                            ceiling_spawn_height,
+                            height_tags: Arc::clone(&height_tags),
+                        }
+                    });
+                let Some(mut ready) = complete_player_spawn(
                     ready,
                     &mut resources,
                     &mut classify,
@@ -674,7 +752,12 @@ impl GenerationWorker {
                     player,
                     cancelled,
                     progress,
-                );
+                )?
+                else {
+                    return Ok(None);
+                };
+                ready.initial_respawn = initial_respawn;
+                return Ok(Some(ready));
             }
             Ok(Some(ready))
         })
@@ -995,6 +1078,7 @@ impl GenerationWorker {
                 initial_clocks: None,
                 entity_collision_registry: None,
                 level_settings: None,
+                initial_respawn: None,
             }))
         })
     }
@@ -1577,6 +1661,7 @@ fn generate_spawn_origin(
         initial_clocks: None,
         entity_collision_registry: None,
         level_settings: None,
+        initial_respawn: None,
     }))
 }
 
@@ -1601,6 +1686,7 @@ fn expand_with_inputs(
         initial_clocks,
         entity_collision_registry,
         level_settings,
+        initial_respawn,
     } = ready;
     ensure!(
         revision != mesh.revision,
@@ -1694,6 +1780,7 @@ fn expand_with_inputs(
         initial_clocks,
         entity_collision_registry,
         level_settings,
+        initial_respawn,
     }))
 }
 
@@ -1744,6 +1831,66 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn initial_respawn_preserves_original_border_and_rejects_mismatched_edges() {
+        use native_persistence::world::SavedWorldBorder;
+        use native_session::respawn::RespawnBorder;
+        for saved in [
+            SavedWorldBorder::default(),
+            SavedWorldBorder {
+                center_x: 13.0,
+                center_z: -8.0,
+                size: 200.0,
+                lerp_target: 200.0,
+                ..Default::default()
+            },
+            SavedWorldBorder {
+                center_x: 29_999_900.0,
+                center_z: 0.0,
+                size: 400.0,
+                lerp_target: 400.0,
+                ..Default::default()
+            },
+            SavedWorldBorder {
+                size: 200.0,
+                lerp_target: 400.0,
+                lerp_time: 100,
+                ..Default::default()
+            },
+        ] {
+            let bounds = RespawnBorder::from_saved(saved, 0).unwrap();
+            assert_eq!(
+                validated_initial_border(bounds, Some(saved)).unwrap(),
+                Some(saved)
+            );
+            assert_eq!(validated_initial_border(bounds, None).unwrap(), None);
+        }
+        assert!(
+            validated_initial_border(
+                RespawnBorder {
+                    min_x: -10.0,
+                    max_x: 10.0,
+                    min_z: -20.0,
+                    max_z: 20.0
+                },
+                Some(SavedWorldBorder::default())
+            )
+            .is_err()
+        );
+        assert!(
+            validated_initial_border(
+                RespawnBorder {
+                    min_x: f64::NAN,
+                    max_x: 1.0,
+                    min_z: -1.0,
+                    max_z: 1.0
+                },
+                None
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn generated_session_block_entities_preserve_verified_data() {
@@ -2326,6 +2473,11 @@ mod tests {
                         radius: 10,
                         adventure: false,
                         random_seed: 1234,
+                        saved_border: Some(native_persistence::world::SavedWorldBorder {
+                            size: 200.0,
+                            lerp_target: 200.0,
+                            ..Default::default()
+                        }),
                     },
                 )?
             } else {
@@ -2366,6 +2518,20 @@ mod tests {
             );
             assert!(ready.suggested_spawn.is_some());
             if resolve_player {
+                let initial = ready
+                    .initial_respawn
+                    .as_ref()
+                    .context("initial respawn settings missing")?;
+                assert_eq!(initial.radius, 10);
+                assert_eq!(
+                    native_session::respawn::RespawnBorder::from_saved(initial.border, 0)?,
+                    native_session::respawn::RespawnBorder {
+                        min_x: -100.0,
+                        max_x: 100.0,
+                        min_z: -100.0,
+                        max_z: 100.0
+                    }
+                );
                 let spawn = ready.player_spawn.context("player spawn missing")?;
                 assert!(
                     targets.len() > 1,
@@ -2507,9 +2673,11 @@ mod tests {
                     pose: native_session::PlayerPose::Standing,
                 };
                 let mut session = ready.start_session(player)?;
-                session.set_spawn_heightmap_tags(Arc::clone(
-                    collision_height_tags.as_ref().unwrap(),
-                ))?;
+                if ready.initial_respawn.is_none() {
+                    session.set_spawn_heightmap_tags(Arc::clone(
+                        collision_height_tags.as_ref().unwrap(),
+                    ))?;
+                }
                 assert!(targets.iter().all(|&pos| matches!(
                     session.saved_entity_chunk(pos),
                     Some(SavedEntityData::Empty)
@@ -2544,9 +2712,11 @@ mod tests {
                     .take()
                     .context("collision registry missing")?;
                 let mut without_registry = ready.start_session(player)?;
-                without_registry.set_spawn_heightmap_tags(Arc::clone(
-                    collision_height_tags.as_ref().unwrap(),
-                ))?;
+                if ready.initial_respawn.is_none() {
+                    without_registry.set_spawn_heightmap_tags(Arc::clone(
+                        collision_height_tags.as_ref().unwrap(),
+                    ))?;
+                }
                 let Some(SavedEntityData::Present(chunk)) =
                     without_registry.saved_entity_chunk(target)
                 else {
@@ -2560,7 +2730,9 @@ mod tests {
                 );
                 ready.entity_collision_registry = Some(registry);
                 let mut session = ready.start_session(player)?;
-                session.set_spawn_heightmap_tags(collision_height_tags.unwrap())?;
+                if ready.initial_respawn.is_none() {
+                    session.set_spawn_heightmap_tags(collision_height_tags.unwrap())?;
+                }
                 assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if !spawn_mobs {

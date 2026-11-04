@@ -711,11 +711,45 @@ fn prepare_existing_world(
         }
         Err(error) => return Err(error),
     };
-    let player = player_data
+    let mut player = player_data
         .as_ref()
         .map(saved_camera)
         .transpose()?
         .flatten();
+    // A world can legitimately have no local player yet. Start in the saved
+    // shared-spawn dimension and resolve the actual position after loading its
+    // terrain, heightmaps and entities.
+    let initial_spawn = if play && chunk.is_none() && player_data.is_none() {
+        let spawn = reader.world_spawn().context("cannot read world spawn")?;
+        if dimension.is_none() {
+            reader.set_dimension(spawn.dimension.clone());
+        }
+        anyhow::ensure!(
+            spawn.dimension == *reader.dimension(),
+            "world spawn is in another dimension"
+        );
+        let border = reader.world_border().context("cannot read world border")?;
+        let bounds = native_session::respawn::RespawnBorder::from_saved(border, 0)?;
+        let (x, z, _) = native_session::world_spawn::border_adjusted_column(
+            IVec3::from_array(spawn.position),
+            bounds,
+            border.center_x,
+            border.center_z,
+        )?;
+        player = Some(SavedCamera {
+            position: [
+                f64::from(x) + 0.5,
+                f64::from(spawn.position[1]),
+                f64::from(z) + 0.5,
+            ],
+            yaw: spawn.yaw,
+            pitch: spawn.pitch,
+            dimension: None,
+        });
+        Some((spawn, border))
+    } else {
+        None
+    };
     if dimension.is_none()
         && let Some(saved) = &player
         && let Some(id) = &saved.dimension
@@ -747,7 +781,37 @@ fn prepare_existing_world(
     };
     // Load only the immediate playable area before opening the window; the
     // streamer fills the configured render distance in the background.
-    let area = reader.read_area(center, if play { radius.min(1) } else { radius })?;
+    let initial_radius = if let Some((spawn, border)) = &initial_spawn {
+        let bounds = native_session::respawn::RespawnBorder::from_saved(*border, 0)?;
+        let origin = IVec3::new(center.x * 16, spawn.position[1], center.z * 16);
+        let camera = player.as_ref().expect("initial spawn has a camera");
+        let x = camera.position[0].floor();
+        let z = camera.position[2].floor();
+        let distance = (x - bounds.min_x)
+            .min(bounds.max_x - x)
+            .min(z - bounds.min_z)
+            .min(bounds.max_z - z);
+        let spawn_radius =
+            if native_session::GameMode::from_legacy_id(reader.default_game_type_id()?)
+                == native_session::GameMode::Adventure
+            {
+                0
+            } else {
+                native_session::world_spawn::WorldSpawnCandidates::new(
+                    origin,
+                    reader.fluid_game_rules()?.respawn_radius,
+                    distance,
+                    0,
+                )?
+                .radius() as u32
+            };
+        (spawn_radius.saturating_add(17) / 16).max(1)
+    } else if play {
+        radius.min(1)
+    } else {
+        radius
+    };
+    let area = reader.read_area(center, initial_radius)?;
     if area.chunks.is_empty() {
         bail!("no saved chunks found in the selected area");
     }
@@ -1192,7 +1256,38 @@ fn prepare_existing_world(
         session
             .publish_initial_weather_terrain()
             .map_err(anyhow::Error::msg)?;
-        if chunk.is_none() {
+        if let Some((spawn, border)) = &initial_spawn {
+            let default_mode =
+                native_session::GameMode::from_legacy_id(reader.default_game_type_id()?);
+            anyhow::ensure!(
+                default_mode == native_session::GameMode::Adventure
+                    || profile.has_ceiling == Some(false),
+                "cannot determine the world spawn in this dimension yet"
+            );
+            session.set_world_respawn_support(native_session::loaded::WorldRespawnSupport {
+                spawn: spawn.clone(),
+                border: *border,
+                max_health: 20.0,
+                radius: rules.respawn_radius,
+                adventure: default_mode == native_session::GameMode::Adventure,
+                ceiling_spawn_height: None,
+            })?;
+            session.set_saved_respawn_absent()?;
+            let spawn = session
+                .find_initial_player_spawn()
+                .context("cannot determine a safe initial player spawn")?;
+            session
+                .restore_saved_motion(
+                    spawn.position - origin.as_dvec3(),
+                    native_session::player_data::SavedPlayerMotion {
+                        velocity: DVec3::ZERO,
+                        on_ground: false,
+                        fall_distance: 0.0,
+                    },
+                )
+                .map_err(anyhow::Error::msg)?;
+            session.set_player_inventory(native_session::inventory::PlayerInventory::default());
+        } else if chunk.is_none() {
             let saved = player_data
                 .as_ref()
                 .context("world has no saved player data")?;
@@ -3148,23 +3243,32 @@ mod world_open_tests {
             std::fs::write(path, &bytes).unwrap();
             bytes
         }
-        for (index, name, expected_type) in [
-            (0, "minecraft:overworld", "minecraft:overworld"),
-            (1, "minecraft:the_nether", "minecraft:the_nether"),
-            (2, "minecraft:the_end", "minecraft:the_end"),
-            (3, "example:custom/nested", "minecraft:the_nether"),
+        for (index, name, expected_type, new_player) in [
+            (0, "minecraft:overworld", "minecraft:overworld", false),
+            (1, "minecraft:the_nether", "minecraft:the_nether", false),
+            (2, "minecraft:the_end", "minecraft:the_end", false),
+            (3, "example:custom/nested", "minecraft:the_nether", false),
+            (4, "minecraft:overworld", "minecraft:overworld", true),
         ] {
             let root = parent.path().join(format!("world-{index}"));
             std::fs::create_dir_all(&root).unwrap();
+            let mut level_data = vec![("DataVersion".into(), Tag::Int(5023))];
+            if new_player {
+                level_data.push((
+                    "spawn".into(),
+                    Tag::Compound(vec![
+                        ("dimension".into(), Tag::String(name.into())),
+                        ("pos".into(), Tag::IntArray(vec![8, 65, 8])),
+                        ("yaw".into(), Tag::Float(90.0)),
+                        ("pitch".into(), Tag::Float(20.0)),
+                    ]),
+                ));
+            } else {
+                level_data.push(("singleplayer_uuid".into(), Tag::IntArray(vec![0, 0, 0, 1])));
+            }
             let level = NamedTag {
                 name: "".into(),
-                value: Tag::Compound(vec![(
-                    "Data".into(),
-                    Tag::Compound(vec![
-                        ("DataVersion".into(), Tag::Int(5023)),
-                        ("singleplayer_uuid".into(), Tag::IntArray(vec![0, 0, 0, 1])),
-                    ]),
-                )]),
+                value: Tag::Compound(vec![("Data".into(), Tag::Compound(level_data))]),
             };
             let level_path = root.join("level.dat");
             let level_bytes = gzip(&level_path, &level);
@@ -3190,7 +3294,20 @@ mod world_open_tests {
                 ]),
             };
             let player_path = root.join("players/data/00000000-0000-0000-0000-000000000001.dat");
-            let player_bytes = gzip(&player_path, &player);
+            let player_bytes = (!new_player).then(|| gzip(&player_path, &player));
+            if new_player {
+                let rules = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![
+                        ("DataVersion".into(), Tag::Int(5023)),
+                        (
+                            "data".into(),
+                            Tag::Compound(vec![("minecraft:respawn_radius".into(), Tag::Int(0))]),
+                        ),
+                    ]),
+                };
+                gzip(&root.join("data/minecraft/game_rules.dat"), &rules);
+            }
             let settings_path = root.join("data/minecraft/world_gen_settings.dat");
             let settings = NamedTag {
                 name: "".into(),
@@ -3279,9 +3396,22 @@ mod world_open_tests {
             assert_eq!(loaded.dimension, name);
             assert_eq!(loaded.dimension_type.as_deref(), Some(expected_type));
             assert_eq!(loaded.block(0, 0, 0).unwrap().name, "minecraft:stone");
-            assert_eq!(snapshot.player.position.y, 65.0);
+            assert_eq!(
+                snapshot.player.position.y,
+                if new_player { 16.0 } else { 65.0 }
+            );
+            if new_player {
+                assert_eq!(snapshot.player.position.x, 8.5);
+                assert_eq!(snapshot.player.position.z, 8.5);
+                assert_eq!(snapshot.player.yaw, 270_f32.to_radians());
+                assert_eq!(snapshot.player.pitch, (-20_f32).to_radians());
+            }
             assert_eq!(std::fs::read(level_path).unwrap(), level_bytes);
-            assert_eq!(std::fs::read(player_path).unwrap(), player_bytes);
+            if let Some(player_bytes) = player_bytes {
+                assert_eq!(std::fs::read(player_path).unwrap(), player_bytes);
+            } else {
+                assert!(!player_path.exists());
+            }
             assert_eq!(std::fs::read(settings_path).unwrap(), settings_bytes);
             assert_eq!(std::fs::read(region_path).unwrap(), region);
         }

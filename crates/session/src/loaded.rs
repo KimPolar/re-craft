@@ -1783,6 +1783,25 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Resolve the first player's shared spawn using the same search as respawn.
+    /// Callers must prepare the required terrain, heightmaps and entities first.
+    pub fn find_initial_player_spawn(
+        &mut self,
+    ) -> anyhow::Result<crate::respawn::SavedSpawnResult> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "initial player spawn must be resolved before the first tick"
+        );
+        self.world_respawn_search = None;
+        loop {
+            if let Some(spawn) = self.advance_world_respawn()? {
+                // A later death must evaluate the then-current border and terrain.
+                self.world_respawn_search = None;
+                return Ok(spawn);
+            }
+        }
+    }
+
     /// Expose the saved shared spawn to clients even when respawn search is unavailable.
     pub fn set_world_spawn(
         &mut self,
@@ -48806,6 +48825,49 @@ pub(crate) mod tests {
                 .find_loaded_world_spawn(suggestion, Some(candidates()), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn initial_player_spawn_uses_shared_spawn_and_requires_entity_data() {
+        use native_persistence::world::{DimensionId, RespawnData, SavedWorldBorder};
+
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        let origin = session.origin;
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(home, None))
+            .unwrap();
+        session
+            .set_world_respawn_support(WorldRespawnSupport {
+                spawn: RespawnData {
+                    dimension: DimensionId::parse("overworld").unwrap(),
+                    position: (origin + IVec3::new(8, 4, 6)).to_array(),
+                    yaw: 90.0,
+                    pitch: 20.0,
+                },
+                border: SavedWorldBorder::default(),
+                max_health: 20.0,
+                radius: 0,
+                adventure: false,
+                ceiling_spawn_height: None,
+            })
+            .unwrap();
+
+        // Unknown entity collisions must not be treated as empty terrain.
+        assert!(session.find_initial_player_spawn().is_err());
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Empty)
+            .unwrap();
+        let spawn = session.find_initial_player_spawn().unwrap();
+        assert_eq!(
+            spawn.position,
+            (origin + IVec3::new(8, 3, 6)).as_dvec3() + DVec3::new(0.5, 0.0, 0.5)
+        );
+        assert_eq!((spawn.yaw, spawn.pitch), (90.0, 20.0));
+        assert!(session.world_respawn_search.is_none());
     }
 
     #[test]

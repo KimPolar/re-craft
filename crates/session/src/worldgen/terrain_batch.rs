@@ -47,6 +47,15 @@ pub struct FreshTerrainBatch {
     failed: bool,
 }
 
+/// Coordinated postprocessing output for one chunk. Block entities, entity
+/// regions, structures and other world-save requirements remain separate.
+pub struct PostprocessedChunkComponents {
+    pub sections: native_persistence::nbt::Tag,
+    pub heightmaps: native_persistence::nbt::Tag,
+    pub block_ticks: native_persistence::nbt::Tag,
+    pub fluid_ticks: native_persistence::nbt::Tag,
+}
+
 pub(super) fn updated_postprocessing_sky_sources(
     before: &World,
     after: &World,
@@ -1794,6 +1803,74 @@ impl FreshTerrainBatch {
                     },
                 )?;
                 Ok((pos, sections))
+            })
+            .collect()
+    }
+
+    /// Prepare section, heightmap and tick data from the same completed pass.
+    /// This is intermediate data and does not authorize saving a world.
+    pub fn postprocessed_chunk_components(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
+        use native_world::loaded::{SavedBlockTick, SavedFluidTick};
+
+        let sections = self.postprocessed_sections_data(processed, positions)?;
+        let registry = &self
+            .decoration
+            .as_ref()
+            .context("generation registry is missing")?
+            .block_registry;
+        let time = processed.ticks.game_time();
+        sections
+            .into_iter()
+            .map(|(pos, sections)| {
+                let ticks = processed
+                    .ticks
+                    .chunk(pos)
+                    .context("postprocessed tick container is missing")?;
+                let blocks: Vec<_> = ticks
+                    .blocks
+                    .pack(time)
+                    .into_iter()
+                    .map(|tick| SavedBlockTick {
+                        block: tick.kind,
+                        position: tick.position,
+                        delay: tick.delay,
+                        priority: tick.priority,
+                    })
+                    .collect();
+                let fluids: Vec<_> = ticks
+                    .fluids
+                    .pack(time)
+                    .into_iter()
+                    .map(|tick| SavedFluidTick {
+                        fluid: tick.kind,
+                        position: tick.position,
+                        delay: tick.delay,
+                        priority: tick.priority,
+                    })
+                    .collect();
+                Ok((
+                    pos,
+                    PostprocessedChunkComponents {
+                        sections,
+                        heightmaps: processed
+                            .heightmaps
+                            .get(&pos)
+                            .context("postprocessed heightmaps are missing")?
+                            .to_tag()?,
+                        block_ticks: native_persistence::generated_ticks::encode_level_block_ticks(
+                            pos,
+                            &blocks,
+                            |id| registry.contains(id),
+                        )?,
+                        fluid_ticks: native_persistence::generated_ticks::encode_level_fluid_ticks(
+                            pos, &fluids,
+                        )?,
+                    },
+                ))
             })
             .collect()
     }

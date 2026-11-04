@@ -11,6 +11,7 @@ fn encode<'a>(
     pos: ChunkPos,
     ticks: impl IntoIterator<Item = (&'a str, [i32; 3], i32, i32)>,
     mut known: impl FnMut(&str) -> bool,
+    proto: bool,
 ) -> Result<Tag> {
     let mut keys = BTreeSet::new();
     let mut output = Vec::new();
@@ -22,13 +23,16 @@ fn encode<'a>(
             position[0].div_euclid(16) == pos.x && position[2].div_euclid(16) == pos.z,
             "generated tick is outside its chunk"
         );
-        ensure!(delay == 0, "generated protochunk tick has a nonzero delay");
+        ensure!(
+            !proto || delay == 0,
+            "generated protochunk tick has a nonzero delay"
+        );
         ensure!(
             (-3..=3).contains(&priority),
             "generated tick priority is invalid"
         );
         ensure!(
-            keys.insert((name.clone(), position)),
+            !proto || keys.insert((name.clone(), position)),
             "duplicate generated tick"
         );
         output.push(Tag::Compound(vec![
@@ -69,6 +73,7 @@ pub fn encode_block_ticks(
             )
         }),
         known_block,
+        true,
     )
 }
 
@@ -84,16 +89,58 @@ pub fn encode_fluid_ticks(pos: ChunkPos, ticks: &[SavedFluidTick]) -> Result<Tag
                 tick.priority,
             )
         }),
-        |name| {
-            matches!(
-                name,
-                "minecraft:empty"
-                    | "minecraft:water"
-                    | "minecraft:flowing_water"
-                    | "minecraft:lava"
-                    | "minecraft:flowing_lava"
+        known_fluid,
+        true,
+    )
+}
+
+fn known_fluid(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:empty"
+            | "minecraft:water"
+            | "minecraft:flowing_water"
+            | "minecraft:lava"
+            | "minecraft:flowing_lava"
+    )
+}
+
+/// Encode LevelChunkTicks.pack output in its supplied order. Unlike protochunk
+/// ticks, delayed entries and duplicate pending identities are valid.
+pub fn encode_level_block_ticks(
+    pos: ChunkPos,
+    ticks: &[SavedBlockTick],
+    known_block: impl FnMut(&str) -> bool,
+) -> Result<Tag> {
+    encode(
+        pos,
+        ticks.iter().map(|tick| {
+            (
+                tick.block.as_str(),
+                tick.position,
+                tick.delay,
+                tick.priority,
             )
-        },
+        }),
+        known_block,
+        false,
+    )
+}
+
+/// Encode LevelChunk fluid ticks without discarding saved pending entries.
+pub fn encode_level_fluid_ticks(pos: ChunkPos, ticks: &[SavedFluidTick]) -> Result<Tag> {
+    encode(
+        pos,
+        ticks.iter().map(|tick| {
+            (
+                tick.fluid.as_str(),
+                tick.position,
+                tick.delay,
+                tick.priority,
+            )
+        }),
+        known_fluid,
+        false,
     )
 }
 
@@ -159,5 +206,29 @@ mod tests {
             priority: 0,
         };
         assert!(encode_fluid_ticks(pos, &[fluid]).is_err());
+    }
+
+    #[test]
+    fn level_ticks_preserve_delays_and_pending_duplicates() {
+        let pos = ChunkPos { x: -2, z: 3 };
+        let first = SavedBlockTick {
+            block: "sand".into(),
+            position: [-31, 15, 48],
+            delay: -3,
+            priority: -1,
+        };
+        let second = SavedBlockTick {
+            delay: 9,
+            priority: 3,
+            ..first.clone()
+        };
+        let tag =
+            encode_level_block_ticks(pos, &[first, second], |id| id == "minecraft:sand").unwrap();
+        let Tag::List { values, .. } = tag else {
+            panic!("missing ticks")
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("t"), Some(&Tag::Int(-3)));
+        assert_eq!(values[1].get("t"), Some(&Tag::Int(9)));
     }
 }

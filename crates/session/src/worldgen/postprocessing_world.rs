@@ -51,14 +51,14 @@ pub struct GeneratedPostprocessing {
 /// entity and world-save requirements must still be validated.
 pub struct PostprocessedGeneratedRegion {
     pub world: Arc<World>,
-    pub ticks: RegionTicks,
+    pub(super) ticks: RegionTicks,
     pub chunks: BTreeSet<ChunkPos>,
     /// Ordered block changes performed during postprocessing.
     pub edits: Vec<BlockPosition>,
     /// These light checks must be processed before publishing the result.
     pub light_checks: Vec<BlockPosition>,
     /// Updated FULL maps; other chunk and world validation remains necessary.
-    pub heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+    pub(super) heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     pub(super) source: Arc<World>,
     pub(super) sealed_world: Arc<World>,
     pub(super) sealed_checks: Vec<BlockPosition>,
@@ -70,6 +70,16 @@ pub struct PostprocessedGeneratedRegion {
 }
 
 impl PostprocessedGeneratedRegion {
+    /// Read the completed tick containers without changing their snapshot.
+    pub fn ticks(&self) -> &RegionTicks {
+        &self.ticks
+    }
+
+    /// Read the heightmaps produced by the same postprocessing pass.
+    pub fn heightmaps(&self) -> &BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps> {
+        &self.heightmaps
+    }
+
     /// The explicit rule used for this pass, if supplied by its caller.
     pub fn water_source_conversion(&self) -> Option<bool> {
         self.water_source_conversion

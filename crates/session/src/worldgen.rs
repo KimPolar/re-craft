@@ -68,7 +68,7 @@ pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{GeneratedPostprocessing, PostprocessedGeneratedRegion};
-pub use terrain_batch::{FreshBatchLight, FreshTerrainBatch};
+pub use terrain_batch::{FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents};
 
 /// Block entities created by a monster-room feature in intermediate terrain.
 #[derive(Clone, Debug)]
@@ -4913,6 +4913,42 @@ mod tests {
             postprocessed_sections,
             batch.spawned_section_data(center).unwrap()
         );
+        let mut components = batch
+            .postprocessed_chunk_components(&processed, [center])
+            .unwrap();
+        let component = components.remove(&center).unwrap();
+        assert!(components.is_empty());
+        assert_eq!(component.sections, postprocessed_sections);
+        assert_eq!(
+            component.heightmaps,
+            processed.heightmaps[&center].to_tag().unwrap()
+        );
+        let native_persistence::nbt::Tag::List {
+            values: saved_blocks,
+            ..
+        } = component.block_ticks
+        else {
+            panic!("missing level block ticks")
+        };
+        assert_eq!(saved_blocks.len(), 1);
+        assert_eq!(
+            saved_blocks[0].get("i"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:brown_mushroom".into()
+            ))
+        );
+        assert_eq!(
+            saved_blocks[0].get("t"),
+            Some(&native_persistence::nbt::Tag::Int(0))
+        );
+        let native_persistence::nbt::Tag::List {
+            values: saved_fluids,
+            ..
+        } = component.fluid_ticks
+        else {
+            panic!("missing level fluid ticks")
+        };
+        assert!(saved_fluids.is_empty());
         assert!(
             batch
                 .postprocessed_sections_data(&processed, [distant])

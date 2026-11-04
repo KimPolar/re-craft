@@ -232,6 +232,11 @@ impl RegionTicks {
         self.next_sub_tick
     }
 
+    /// World time shared by all schedules in this isolated pass.
+    pub fn game_time(&self) -> i64 {
+        self.game_time
+    }
+
     /// Match LevelAccessor.createTick followed by LevelTicks.schedule. A
     /// missing container discards the tick in Java; the outcome lets callers
     /// track that event while retaining the consumed sub-tick number.

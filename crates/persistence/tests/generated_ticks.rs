@@ -1,5 +1,7 @@
 use native_persistence::{
-    generated_ticks::{encode_block_ticks, encode_fluid_ticks},
+    generated_ticks::{
+        encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks, encode_level_fluid_ticks,
+    },
     nbt::{self, NamedTag, Tag},
 };
 use native_world::loaded::{ChunkPos, SavedBlockTick, SavedFluidTick};
@@ -123,12 +125,71 @@ fn generated_ticks_match_java_protochunk_packing() {
     };
     let input = temp.path().join("ticks.nbt");
     let empty = temp.path().join("empty.nbt");
+    let level = temp.path().join("level.nbt");
     write(&input, &blocks, &fluids);
     write(&empty, &[], &[]);
+    let level_blocks = [
+        SavedBlockTick {
+            block: "sand".into(),
+            position: [-31, 15, 48],
+            delay: -3,
+            priority: -1,
+        },
+        SavedBlockTick {
+            block: "sand".into(),
+            position: [-31, 15, 48],
+            delay: 9,
+            priority: 3,
+        },
+        SavedBlockTick {
+            block: "water".into(),
+            position: [-30, 15, 48],
+            delay: 0,
+            priority: 0,
+        },
+        SavedBlockTick {
+            block: "dirt".into(),
+            position: [-17, 0, 48],
+            delay: 5,
+            priority: -2,
+        },
+    ];
+    let level_fluids = [
+        SavedFluidTick {
+            fluid: "water".into(),
+            position: [-30, 1, 52],
+            delay: -2,
+            priority: 0,
+        },
+        SavedFluidTick {
+            fluid: "flowing_lava".into(),
+            position: [-17, 0, 48],
+            delay: 16,
+            priority: 1,
+        },
+    ];
+    let doc = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            (
+                "block_ticks".into(),
+                encode_level_block_ticks(pos, &level_blocks, |id| {
+                    matches!(id, "minecraft:sand" | "minecraft:water" | "minecraft:dirt")
+                })
+                .unwrap(),
+            ),
+            (
+                "fluid_ticks".into(),
+                encode_level_fluid_ticks(pos, &level_fluids).unwrap(),
+            ),
+        ]),
+    };
+    std::fs::write(&level, nbt::write(&doc).unwrap()).unwrap();
     run(Command::new(java.join("java.exe"))
         .arg("-cp")
         .arg(cp)
         .arg("GeneratedTicksOracle")
         .arg(input)
-        .arg(empty));
+        .arg(empty)
+        .arg(level));
 }

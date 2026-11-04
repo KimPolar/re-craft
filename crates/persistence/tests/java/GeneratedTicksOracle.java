@@ -40,5 +40,18 @@ public class GeneratedTicksOracle {
         if (!empty.get("block_ticks").equals(blockCodec.encodeStart(NbtOps.INSTANCE,java.util.List.of()).getOrThrow()) ||
             !empty.get("fluid_ticks").equals(fluidCodec.encodeStart(NbtOps.INSTANCE,java.util.List.of()).getOrThrow()))
             throw new AssertionError("empty tick lists differ");
+        var levelBlocks = new LevelChunkTicks<Block>(java.util.List.of(
+            new SavedTick<>(Blocks.SAND,new BlockPos(-31,15,48),-3,TickPriority.HIGH),
+            new SavedTick<>(Blocks.SAND,new BlockPos(-31,15,48),9,TickPriority.EXTREMELY_LOW)));
+        levelBlocks.schedule(new ScheduledTick<>(Blocks.DIRT,new BlockPos(-17,0,48),105,TickPriority.VERY_HIGH,9));
+        levelBlocks.schedule(new ScheduledTick<>(Blocks.WATER,new BlockPos(-30,15,48),100,TickPriority.NORMAL,1));
+        var levelFluids = new LevelChunkTicks<Fluid>(java.util.List.of(
+            new SavedTick<>(Fluids.WATER,new BlockPos(-30,1,52),-2,TickPriority.NORMAL)));
+        levelFluids.schedule(new ScheduledTick<>(Fluids.FLOWING_LAVA,new BlockPos(-17,0,48),116,TickPriority.LOW,2));
+        var level = NbtIo.read(Path.of(args[2]));
+        var expectedLevelBlocks = blockCodec.encodeStart(NbtOps.INSTANCE,levelBlocks.pack(100)).getOrThrow();
+        var expectedLevelFluids = fluidCodec.encodeStart(NbtOps.INSTANCE,levelFluids.pack(100)).getOrThrow();
+        if (!level.get("block_ticks").equals(expectedLevelBlocks) || !level.get("fluid_ticks").equals(expectedLevelFluids))
+            throw new AssertionError("level ticks differ: " + level + " expected " + expectedLevelBlocks + " / " + expectedLevelFluids);
     }
 }

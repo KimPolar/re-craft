@@ -2,10 +2,14 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 
 use native_core::postprocessing::PostProcessing;
 use native_persistence::{
-    generated_chunk::{SpawnChunkComponents, assemble_spawn_chunk},
+    generated_chunk::{
+        FullChunkComponents, SpawnChunkComponents, assemble_full_chunk, assemble_spawn_chunk,
+    },
     generated_section::encode_generated_sections,
-    generated_ticks::{encode_block_ticks, encode_fluid_ticks},
-    heightmap::{GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps},
+    generated_ticks::{encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks},
+    heightmap::{
+        GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps, generated_full_heightmaps,
+    },
     nbt::{self, Tag, TagType},
     postprocessing,
 };
@@ -129,6 +133,63 @@ fn fixture(min_y: i32) -> SpawnChunkComponents {
     }
 }
 
+fn full_fixture(min_y: i32) -> FullChunkComponents {
+    let spawn = fixture(min_y);
+    let heightmaps = generated_full_heightmaps(
+        HeightBounds {
+            min_y,
+            max_y: min_y + 16,
+        },
+        &spawn.heightmaps,
+    )
+    .unwrap();
+    let block_ticks = encode_level_block_ticks(
+        spawn.position,
+        &[
+            SavedBlockTick {
+                block: "minecraft:stone".into(),
+                position: [-15, min_y + 4, 34],
+                delay: -3,
+                priority: -1,
+            },
+            SavedBlockTick {
+                block: "minecraft:stone".into(),
+                position: [-15, min_y + 4, 34],
+                delay: 7,
+                priority: 1,
+            },
+        ],
+        |id| id == "minecraft:stone",
+    )
+    .unwrap();
+    FullChunkComponents {
+        position: spawn.position,
+        min_y,
+        height: spawn.height,
+        last_update: spawn.last_update,
+        sections: spawn.sections,
+        heightmaps,
+        block_ticks,
+        fluid_ticks: spawn.fluid_ticks,
+        block_entities: spawn.block_entities,
+    }
+}
+
+#[test]
+fn assembles_full_chunk_without_embedding_entities() {
+    let result = assemble_full_chunk(full_fixture(0)).unwrap();
+    assert_eq!(
+        result.value.get("Status"),
+        Some(&Tag::String("minecraft:full".into()))
+    );
+    assert_eq!(result.value.get("isLightOn"), Some(&Tag::Byte(1)));
+    assert!(result.value.get("entities").is_none());
+    assert_eq!(nbt::read(&nbt::write(&result).unwrap()).unwrap(), result);
+    let mut missing = full_fixture(0);
+    missing.heightmaps = Tag::Compound(vec![]);
+    assert!(assemble_full_chunk(missing).is_err());
+}
+
 #[test]
 fn assembles_spawn_chunk_and_rejects_incomplete_components() {
     let draft = assemble_spawn_chunk(fixture(0)).unwrap();
@@ -214,7 +275,18 @@ fn assembled_spawn_chunk_roundtrips_java_serializable_chunk_data() {
             .arg("-cp")
             .arg(&cp)
             .arg("GeneratedChunkOracle")
-            .arg(input)
+            .arg(&input)
+            .arg(min_y.to_string()));
+        std::fs::write(
+            &input,
+            nbt::write(&assemble_full_chunk(full_fixture(min_y)).unwrap()).unwrap(),
+        )
+        .unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedChunkOracle")
+            .arg(&input)
             .arg(min_y.to_string()));
     }
 }

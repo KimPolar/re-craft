@@ -60,6 +60,13 @@ pub struct PostprocessedChunkComponents {
     pub entity_records: Option<Arc<Vec<native_persistence::nbt::Tag>>>,
 }
 
+/// An in-memory FULL chunk and any complete entity records for the same pass.
+/// Neither this draft nor its entity records authorize a world save.
+pub struct PostprocessedChunkDraft {
+    pub chunk: native_persistence::nbt::NamedTag,
+    pub entity_records: Option<Arc<Vec<native_persistence::nbt::Tag>>>,
+}
+
 pub(super) fn updated_postprocessing_sky_sources(
     before: &World,
     after: &World,
@@ -1906,6 +1913,41 @@ impl FreshTerrainBatch {
                         )?,
                         block_entities: self.spawned_block_entity_data(pos)?,
                         entity_records: self.complete_generated_entity_records_shared(pos)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Assemble FULL chunk drafts using the isolated pass's exact game time.
+    /// Entity records stay separate and can remain unknown.
+    pub fn postprocessed_chunk_drafts(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
+        let time = processed.ticks.game_time();
+        self.postprocessed_chunk_components(processed, positions)?
+            .into_iter()
+            .map(|(pos, components)| {
+                let chunk = native_persistence::generated_chunk::assemble_full_chunk(
+                    native_persistence::generated_chunk::FullChunkComponents {
+                        position: pos,
+                        min_y: self.generator.min_y,
+                        height: self.generator.height,
+                        last_update: time,
+                        sections: components.sections,
+                        heightmaps: components.heightmaps,
+                        block_ticks: components.block_ticks,
+                        fluid_ticks: components.fluid_ticks,
+                        block_entities: components.block_entities,
+                    },
+                )?;
+                Ok((
+                    pos,
+                    PostprocessedChunkDraft {
+                        chunk,
+                        entity_records: components.entity_records,
                     },
                 ))
             })

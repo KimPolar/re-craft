@@ -68,7 +68,9 @@ pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{GeneratedPostprocessing, PostprocessedGeneratedRegion};
-pub use terrain_batch::{FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents};
+pub use terrain_batch::{
+    FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,
+};
 
 /// Block entities created by a monster-room feature in intermediate terrain.
 #[derive(Clone, Debug)]
@@ -4918,6 +4920,26 @@ mod tests {
             .unwrap();
         let component = components.remove(&center).unwrap();
         assert!(components.is_empty());
+        let mut drafts = batch
+            .postprocessed_chunk_drafts(&processed, [center])
+            .unwrap();
+        let full = drafts.remove(&center).unwrap();
+        assert_eq!(
+            full.chunk.value.get("Status"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:full".into()
+            ))
+        );
+        assert_eq!(
+            full.chunk.value.get("LastUpdate"),
+            Some(&native_persistence::nbt::Tag::Long(42))
+        );
+        assert_eq!(
+            full.chunk.value.get("isLightOn"),
+            Some(&native_persistence::nbt::Tag::Byte(1))
+        );
+        assert!(full.chunk.value.get("entities").is_none());
+        assert_eq!(full.entity_records, component.entity_records);
         assert_eq!(component.sections, postprocessed_sections);
         assert_eq!(
             component.heightmaps,

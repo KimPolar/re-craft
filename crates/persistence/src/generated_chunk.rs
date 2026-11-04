@@ -28,6 +28,20 @@ pub struct SpawnChunkComponents {
     pub entities: Vec<Tag>,
 }
 
+/// Complete LevelChunk components prepared from a single generation pass.
+/// Entity-region data and world-level save validation remain separate.
+pub struct FullChunkComponents {
+    pub position: ChunkPos,
+    pub min_y: i32,
+    pub height: i32,
+    pub last_update: i64,
+    pub sections: Tag,
+    pub heightmaps: Tag,
+    pub block_ticks: Tag,
+    pub fluid_ticks: Tag,
+    pub block_entities: Tag,
+}
+
 fn compound_list(tag: Tag, label: &str) -> Result<Tag> {
     let Tag::List {
         element_type,
@@ -60,6 +74,7 @@ fn validate_positioned(
     label: &str,
     position: ChunkPos,
     bounds: Option<(i32, i32)>,
+    full: bool,
 ) -> Result<()> {
     let Tag::List { values, .. } = tag else {
         unreachable!("validated compound list")
@@ -109,10 +124,13 @@ fn validate_positioned(
                 "duplicate block entity position"
             );
         } else {
-            ensure!(seen.insert((p, id)), "duplicate generated tick");
+            ensure!(full || seen.insert((p, id)), "duplicate generated tick");
             ensure!(
-                matches!(one("t")?, Tag::Int(0))
-                    && matches!(one("p")?, Tag::Int(priority) if (-3..=3).contains(priority)),
+                (if full {
+                    matches!(one("t")?, Tag::Int(_))
+                } else {
+                    matches!(one("t")?, Tag::Int(0))
+                }) && matches!(one("p")?, Tag::Int(priority) if (-3..=3).contains(priority)),
                 "invalid generated tick timing"
             );
         }
@@ -123,6 +141,33 @@ fn validate_positioned(
 /// Assemble only the metadata and previously prepared components for a fresh
 /// chunk with structures disabled. Lighting is not declared fully correct.
 pub fn assemble_spawn_chunk(parts: SpawnChunkComponents) -> Result<NamedTag> {
+    assemble_chunk(parts, false)
+}
+
+/// Assemble an in-memory FULL chunk without writing any world files. The
+/// caller must independently establish lighting, entity and structure coverage.
+pub fn assemble_full_chunk(parts: FullChunkComponents) -> Result<NamedTag> {
+    let marks = native_core::postprocessing::PostProcessing::new(parts.min_y, parts.height)
+        .context("invalid generated postprocessing bounds")?;
+    assemble_chunk(
+        SpawnChunkComponents {
+            position: parts.position,
+            min_y: parts.min_y,
+            height: parts.height,
+            last_update: parts.last_update,
+            sections: parts.sections,
+            heightmaps: parts.heightmaps,
+            block_ticks: parts.block_ticks,
+            fluid_ticks: parts.fluid_ticks,
+            postprocessing: postprocessing::encode(&marks),
+            block_entities: parts.block_entities,
+            entities: Vec::new(),
+        },
+        true,
+    )
+}
+
+fn assemble_chunk(parts: SpawnChunkComponents, full: bool) -> Result<NamedTag> {
     let SpawnChunkComponents {
         position,
         min_y,
@@ -206,17 +251,33 @@ pub fn assemble_spawn_chunk(parts: SpawnChunkComponents) -> Result<NamedTag> {
             );
         }
     }
+    if full {
+        ensure!(
+            names
+                == [
+                    "WORLD_SURFACE",
+                    "OCEAN_FLOOR",
+                    "MOTION_BLOCKING",
+                    "MOTION_BLOCKING_NO_LEAVES"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            "FULL chunk must contain exactly four heightmaps"
+        );
+    }
     postprocessing::decode(&postprocessing, min_y, height)?;
     let block_ticks = compound_list(block_ticks, "block ticks")?;
     let fluid_ticks = compound_list(fluid_ticks, "fluid ticks")?;
     let block_entities = compound_list(block_entities, "block entities")?;
-    validate_positioned(&block_ticks, "block tick", position, None)?;
-    validate_positioned(&fluid_ticks, "fluid tick", position, None)?;
+    validate_positioned(&block_ticks, "block tick", position, None, full)?;
+    validate_positioned(&fluid_ticks, "fluid tick", position, None, full)?;
     validate_positioned(
         &block_entities,
         "block entity",
         position,
         Some((min_y, max_y)),
+        full,
     )?;
     let entities = compound_list(
         Tag::List {
@@ -225,31 +286,48 @@ pub fn assemble_spawn_chunk(parts: SpawnChunkComponents) -> Result<NamedTag> {
         },
         "entities",
     )?;
+    let mut fields = vec![
+        ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+        ("xPos".into(), Tag::Int(position.x)),
+        ("yPos".into(), Tag::Int(first)),
+        ("zPos".into(), Tag::Int(position.z)),
+        ("LastUpdate".into(), Tag::Long(last_update)),
+        ("InhabitedTime".into(), Tag::Long(0)),
+        (
+            "Status".into(),
+            Tag::String(
+                if full {
+                    "minecraft:full"
+                } else {
+                    "minecraft:spawn"
+                }
+                .into(),
+            ),
+        ),
+        ("sections".into(), sections),
+        ("block_entities".into(), block_entities),
+    ];
+    if full {
+        fields.push(("isLightOn".into(), Tag::Byte(1)));
+    } else {
+        fields.push(("entities".into(), entities));
+    }
+    fields.extend(vec![
+        ("block_ticks".into(), block_ticks),
+        ("fluid_ticks".into(), fluid_ticks),
+        ("PostProcessing".into(), postprocessing),
+        ("Heightmaps".into(), heightmaps),
+        (
+            "structures".into(),
+            Tag::Compound(vec![
+                ("starts".into(), Tag::Compound(vec![])),
+                ("References".into(), Tag::Compound(vec![])),
+            ]),
+        ),
+    ]);
     let result = NamedTag {
         name: "".into(),
-        value: Tag::Compound(vec![
-            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
-            ("xPos".into(), Tag::Int(position.x)),
-            ("yPos".into(), Tag::Int(first)),
-            ("zPos".into(), Tag::Int(position.z)),
-            ("LastUpdate".into(), Tag::Long(last_update)),
-            ("InhabitedTime".into(), Tag::Long(0)),
-            ("Status".into(), Tag::String("minecraft:spawn".into())),
-            ("sections".into(), sections),
-            ("block_entities".into(), block_entities),
-            ("entities".into(), entities),
-            ("block_ticks".into(), block_ticks),
-            ("fluid_ticks".into(), fluid_ticks),
-            ("PostProcessing".into(), postprocessing),
-            ("Heightmaps".into(), heightmaps),
-            (
-                "structures".into(),
-                Tag::Compound(vec![
-                    ("starts".into(), Tag::Compound(vec![])),
-                    ("References".into(), Tag::Compound(vec![])),
-                ]),
-            ),
-        ]),
+        value: Tag::Compound(fields),
     };
     // Check NBT representability and size before exposing the draft.
     nbt::write(&result)?;

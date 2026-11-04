@@ -32,6 +32,10 @@ fn compare(a: &ScheduledTick, b: &ScheduledTick) -> Ordering {
     (a.trigger, a.priority, a.sub_tick).cmp(&(b.trigger, b.priority, b.sub_tick))
 }
 
+fn tick_order(tick: &ScheduledTick) -> (i64, i32, i64) {
+    (tick.trigger, tick.priority, tick.sub_tick)
+}
+
 fn canonical(kind: &str) -> Result<String> {
     let id = ResourceId::parse(kind)?;
     Ok(format!("{}:{}", id.namespace, id.path))
@@ -243,6 +247,17 @@ pub struct IndexedRegionQueue {
     index: super::tick_index::LevelTickIndex,
 }
 
+impl Default for IndexedRegionQueue {
+    fn default() -> Self {
+        Self {
+            queue: ActiveRegionQueue {
+                chunks: BTreeMap::new(),
+            },
+            index: super::tick_index::LevelTickIndex::default(),
+        }
+    }
+}
+
 impl ActiveRegionQueue {
     fn compare_heads(&self, left: ChunkPos, right: ChunkPos) -> Ordering {
         let a = self.chunks[&left]
@@ -383,14 +398,72 @@ impl ActiveRegionQueue {
 }
 
 impl IndexedRegionQueue {
+    /// Register or replace a chunk's container, retaining the Java index's
+    /// registration history. Pending saved ticks are activated separately.
+    pub fn add_container(
+        &mut self,
+        pos: ChunkPos,
+        ticks: ChunkTicks,
+    ) -> Result<Option<ChunkTicks>> {
+        ensure!(
+            ticks.chunk == pos,
+            "tick container belongs to another chunk"
+        );
+        if let Some(head) = ticks.peek() {
+            self.index.insert(pos, head.trigger);
+        }
+        Ok(self.queue.chunks.insert(pos, ticks))
+    }
+
+    /// Unpack the registered container's pending ticks at level time.
+    pub fn unpack_container(&mut self, pos: ChunkPos, time: i64) -> Result<()> {
+        let ticks = self
+            .queue
+            .chunks
+            .get_mut(&pos)
+            .ok_or_else(|| anyhow::anyhow!("tick container is not registered"))?;
+        let before = ticks.peek().map(tick_order);
+        ticks.unpack(time);
+        let after = ticks.peek().map(tick_order);
+        if after != before
+            && let Some(head) = after
+        {
+            self.index.insert(pos, head.0);
+        }
+        Ok(())
+    }
+
+    /// Detach a container and its index entry when a chunk leaves the level.
+    pub fn remove_container(&mut self, pos: ChunkPos) -> Option<ChunkTicks> {
+        self.index.remove(pos);
+        self.queue.chunks.remove(&pos)
+    }
+
+    pub fn container(&self, pos: ChunkPos) -> Option<&ChunkTicks> {
+        self.queue.chunks.get(&pos)
+    }
+
     /// Collect due ticks in Java's container-map and intra-tick order.
     pub fn collect_due(
         &mut self,
         time: i64,
         limit: usize,
-        tickable: impl FnMut(ChunkPos) -> bool,
+        mut tickable: impl FnMut(ChunkPos) -> bool,
     ) -> Vec<ScheduledTick> {
-        let traversal = self.index.take_due(time, tickable);
+        use super::tick_index::DueEntryAction;
+        let queue = &self.queue;
+        let traversal = self.index.inspect_due(time, |pos| {
+            let Some(head) = queue.chunks.get(&pos).and_then(ChunkTicks::peek) else {
+                return DueEntryAction::Remove;
+            };
+            if head.trigger > time {
+                DueEntryAction::Update(head.trigger)
+            } else if tickable(pos) {
+                DueEntryAction::Take
+            } else {
+                DueEntryAction::Keep
+            }
+        });
         let (ticks, reschedule) = self.queue.collect_validated(&traversal, time, limit);
         for (pos, trigger) in reschedule {
             self.index.insert(pos, trigger);
@@ -409,13 +482,13 @@ impl IndexedRegionQueue {
             .chunks
             .get(&pos)
             .and_then(ChunkTicks::peek)
-            .cloned();
+            .map(tick_order);
         let outcome = self.queue.schedule(tick)?;
         if outcome == ScheduleOutcome::Added {
-            let after = self.queue.chunks[&pos].peek();
-            if after != before.as_ref() {
+            let after = self.queue.chunks[&pos].peek().map(tick_order);
+            if after != before {
                 self.index
-                    .insert(pos, after.expect("added tick has a head").trigger);
+                    .insert(pos, after.expect("added tick has a head").0);
             }
         }
         Ok(outcome)

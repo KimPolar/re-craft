@@ -125,5 +125,33 @@ public class GeneratedChunkTicksOracle {
             }
         });
         collectBeforeRun.tick(0, 10, (p, type) -> System.out.println("D2 " + p.getX()));
+        var streamed = new LevelTicks<String>(p -> true);
+        @SuppressWarnings("unchecked")
+        LevelChunkTicks<String>[] containers = new LevelChunkTicks[10];
+        for (int i = 0; i < containers.length; i++) {
+            var at = new BlockPos(i * 16, 0, 0);
+            var pending = new SavedTick<String>("minecraft:p" + i, at, 0, TickPriority.NORMAL);
+            var container = new LevelChunkTicks<String>(List.of(pending));
+            container.schedule(tick("minecraft:q" + i, at.above(), 100, TickPriority.NORMAL, 0));
+            containers[i] = container;
+            streamed.addContainer(new ChunkPos(i, 0), container);
+            container.unpack(100);
+        }
+        streamed.tick(100, 3, (p, type) -> System.out.println("U1 " + type));
+        for (int i : new int[]{1, 4, 7}) streamed.removeContainer(new ChunkPos(i, 0));
+        streamed.tick(100, 4, (p, type) -> System.out.println("U2 " + type));
+        for (int i : new int[]{7, 1, 4}) streamed.addContainer(new ChunkPos(i, 0), containers[i]);
+        streamed.tick(100, 100, (p, type) -> System.out.println("U3 " + type));
+        var replaced = new LevelTicks<String>(p -> true);
+        var original = new LevelChunkTicks<String>();
+        original.schedule(tick("minecraft:old", new BlockPos(0, 0, 16), 2, TickPriority.NORMAL, 0));
+        var other = new LevelChunkTicks<String>();
+        other.schedule(tick("minecraft:other", new BlockPos(16, 0, 16), 2, TickPriority.NORMAL, 0));
+        replaced.addContainer(new ChunkPos(0, 1), original);
+        replaced.addContainer(new ChunkPos(1, 1), other);
+        replaced.addContainer(new ChunkPos(0, 1), new LevelChunkTicks<String>());
+        replaced.tick(2, 100, (p, type) -> System.out.println("X1 " + type));
+        replaced.schedule(tick("minecraft:new", new BlockPos(0, 1, 16), 3, TickPriority.NORMAL, 2));
+        replaced.tick(3, 100, (p, type) -> System.out.println("X2 " + type));
     }
 }

@@ -1,6 +1,6 @@
 use native_session::worldgen::chunk_ticks::{
-    ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, ScheduleOutcome, ScheduledTick,
-    TickRegistry,
+    ChunkTicks, ConvertedChunkTicks, IndexedRegionQueue, RegionTicks, SavedTick, ScheduleOutcome,
+    ScheduledTick, TickRegistry,
 };
 use native_world::loaded::ChunkPos;
 
@@ -166,7 +166,77 @@ fn trace() -> Vec<String> {
     out.extend(collection_trace());
     out.extend(indexed_collection_trace());
     out.extend(callback_reschedule_trace());
+    out.extend(streamed_containers_trace());
     out
+}
+
+fn streamed_containers_trace() -> Vec<String> {
+    let mut queue = IndexedRegionQueue::default();
+    let position = |i| ChunkPos { x: i, z: 0 };
+    for i in 0..10 {
+        let pos = position(i);
+        let mut ticks = ChunkTicks::from_saved(
+            pos,
+            vec![saved(&format!("minecraft:p{i}"), [i * 16, 0, 0], 0, 0)],
+        )
+        .unwrap();
+        ticks
+            .schedule(scheduled(
+                &format!("minecraft:q{i}"),
+                [i * 16, 1, 0],
+                100,
+                0,
+                0,
+            ))
+            .unwrap();
+        assert!(queue.add_container(pos, ticks).unwrap().is_none());
+        queue.unpack_container(pos, 100).unwrap();
+    }
+    let mut output = Vec::new();
+    for tick in queue.collect_due(100, 3, |_| true) {
+        output.push(format!("U1 {}", tick.kind));
+    }
+    let mut removed = std::collections::BTreeMap::new();
+    for i in [1, 4, 7] {
+        removed.insert(i, queue.remove_container(position(i)).unwrap());
+    }
+    for tick in queue.collect_due(100, 4, |_| true) {
+        output.push(format!("U2 {}", tick.kind));
+    }
+    for i in [7, 1, 4] {
+        queue
+            .add_container(position(i), removed.remove(&i).unwrap())
+            .unwrap();
+    }
+    for tick in queue.collect_due(100, 100, |_| true) {
+        output.push(format!("U3 {}", tick.kind));
+    }
+    let mut replaced = IndexedRegionQueue::default();
+    let first = ChunkPos { x: 0, z: 1 };
+    let second = ChunkPos { x: 1, z: 1 };
+    let mut original = ChunkTicks::from_saved(first, vec![]).unwrap();
+    original
+        .schedule(scheduled("old", [0, 0, 16], 2, 0, 0))
+        .unwrap();
+    let mut other = ChunkTicks::from_saved(second, vec![]).unwrap();
+    other
+        .schedule(scheduled("other", [16, 0, 16], 2, 0, 0))
+        .unwrap();
+    replaced.add_container(first, original).unwrap();
+    replaced.add_container(second, other).unwrap();
+    replaced
+        .add_container(first, ChunkTicks::from_saved(first, vec![]).unwrap())
+        .unwrap();
+    for tick in replaced.collect_due(2, 100, |_| true) {
+        output.push(format!("X1 {}", tick.kind));
+    }
+    replaced
+        .schedule(scheduled("new", [0, 1, 16], 3, 0, 2))
+        .unwrap();
+    for tick in replaced.collect_due(3, 100, |_| true) {
+        output.push(format!("X2 {}", tick.kind));
+    }
+    output
 }
 
 fn callback_reschedule_trace() -> Vec<String> {
@@ -325,7 +395,34 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 149);
+    assert_eq!(lines.len(), 171);
+}
+
+#[test]
+fn streamed_containers_keep_ticks_and_reconcile_replacements() {
+    let trace = streamed_containers_trace();
+    assert_eq!(trace.len(), 22);
+    assert_eq!(&trace[20..], ["X1 minecraft:other", "X2 minecraft:new"]);
+    let mut queue = IndexedRegionQueue::default();
+    let first = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 1, z: 0 };
+    queue
+        .add_container(first, ChunkTicks::from_saved(first, vec![]).unwrap())
+        .unwrap();
+    assert!(
+        queue
+            .add_container(first, ChunkTicks::from_saved(second, vec![]).unwrap())
+            .is_err()
+    );
+    assert!(queue.container(first).is_some());
+    assert!(queue.unpack_container(second, 0).is_err());
+    assert!(queue.remove_container(second).is_none());
+    assert_eq!(
+        queue
+            .schedule(scheduled("water", [16, 0, 0], 0, 0, 0))
+            .unwrap(),
+        ScheduleOutcome::MissingChunk
+    );
 }
 
 #[test]

@@ -2277,6 +2277,7 @@ fn tree_generated_leaf(state: &BlockState) -> Result<bool> {
         state.name.as_str(),
         "minecraft:oak_leaves"
             | "minecraft:dark_oak_leaves"
+            | "minecraft:birch_leaves"
             | "minecraft:azalea_leaves"
             | "minecraft:flowering_azalea_leaves"
     ) {
@@ -2318,7 +2319,7 @@ fn tree_oak_log(state: &BlockState) -> bool {
 fn tree_generated_log(state: &BlockState) -> bool {
     matches!(
         state.name.as_str(),
-        "minecraft:oak_log" | "minecraft:dark_oak_log"
+        "minecraft:oak_log" | "minecraft:dark_oak_log" | "minecraft:birch_log"
     ) && state.properties.len() == 1
         && matches!(
             state.properties.get("axis").map(String::as_str),
@@ -2645,7 +2646,10 @@ impl DecorationRegion<'_> {
                 state.name.as_str(),
                 "minecraft:dirt" | "minecraft:rooted_dirt"
             ) && state.properties.is_empty());
-        ensure!(allowed, "unsupported tree replacement effects");
+        ensure!(
+            allowed,
+            "unsupported tree replacement effects at {pos:?}, flags {flags}: {state:?}"
+        );
         if self.is_outside(pos[1]) {
             return Ok(());
         }
@@ -5255,12 +5259,21 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         .context("registered light new state is unknown")?;
                     let tree_light_update = self.tree_block_write
                         && old_air
-                        && ((state.name == "minecraft:dark_oak_leaves"
-                            && state.properties.get("waterlogged").map(String::as_str)
-                                == Some("false")
+                        && (!guard.require_unchanged_light
+                            || !matches!(
+                                state.name.as_str(),
+                                "minecraft:birch_log" | "minecraft:birch_leaves"
+                            ))
+                        && ((matches!(
+                            state.name.as_str(),
+                            "minecraft:dark_oak_leaves" | "minecraft:birch_leaves"
+                        ) && state.properties.get("waterlogged").map(String::as_str)
+                            == Some("false")
                             && tree_generated_leaf(state)?)
-                            || (state.name == "minecraft:dark_oak_log"
-                                && tree_generated_log(state)));
+                            || (matches!(
+                                state.name.as_str(),
+                                "minecraft:dark_oak_log" | "minecraft:birch_log"
+                            ) && tree_generated_log(state)));
                     let fresh_patch_water = !guard.require_unchanged_light
                         && self.patch_block_write
                         && old.name == "minecraft:clay"
@@ -5608,7 +5621,9 @@ mod tests {
             "moss_block",
             "magma_block",
             "oak_log",
+            "birch_log",
             "oak_leaves",
+            "birch_leaves",
             "dark_oak_leaves",
             "azalea_leaves",
             "flowering_azalea_leaves",
@@ -5761,7 +5776,7 @@ mod tests {
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
-            if name == "oak_log" {
+            if name == "oak_log" || name == "birch_log" {
                 block.properties.insert("axis".into(), "y".into());
             }
             if name.ends_with("_leaves") {
@@ -5908,6 +5923,7 @@ mod tests {
         assert_eq!(crystals, 48);
         for name in [
             "oak_leaves",
+            "birch_leaves",
             "dark_oak_leaves",
             "azalea_leaves",
             "flowering_azalea_leaves",
@@ -6846,6 +6862,8 @@ mod tests {
         for mode in [
             "tree_fresh_log",
             "tree_fresh_leaf",
+            "tree_fresh_birch_log",
+            "tree_fresh_birch_leaf",
             "tree_fresh_empty",
             "patch_fresh_clay_water",
             "column_fresh_water_dripleaf",
@@ -7014,6 +7032,10 @@ mod tests {
                         "big_dripleaf"
                     } else if mode == "patch_fresh_clay_water" {
                         "water"
+                    } else if mode == "tree_fresh_birch_log" {
+                        "birch_log"
+                    } else if mode == "tree_fresh_birch_leaf" {
+                        "birch_leaves"
                     } else if mode.ends_with("log") || mode.ends_with("empty") {
                         "dark_oak_log"
                     } else {

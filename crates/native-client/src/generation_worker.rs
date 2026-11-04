@@ -51,6 +51,7 @@ pub struct GenerationReady {
     pub suggested_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
     pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
+    pub session_settings: Option<crate::world_creation::InitialSessionSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +286,19 @@ impl GenerationReady {
         )
         .map_err(anyhow::Error::msg)?;
         session.set_player_inventory(PlayerInventory::default());
+        if let Some(settings) = self.session_settings {
+            session.set_game_mode(settings.mode);
+            session.set_game_master_permission(settings.allow_commands);
+            session.set_world_seed(Some(settings.seed));
+            session.set_survival_rules(native_session::survival::SurvivalRules {
+                difficulty: settings.difficulty,
+                ..Default::default()
+            });
+            session.set_player_vitals(native_session::survival::PlayerVitals {
+                hardcore: settings.hardcore,
+                ..Default::default()
+            });
+        }
         if let Some(initial) = &self.initial_clocks {
             use native_persistence::world::{DimensionId, SavedClock};
             let clocks = initial
@@ -368,6 +382,7 @@ impl GenerationWorker {
                 creatures,
                 spawn_mobs,
                 initial_clocks,
+                session_settings,
             } = prepare()?;
             let Some(mut ready) = generate_spawn_origin(
                 batch,
@@ -384,6 +399,7 @@ impl GenerationWorker {
             };
             ready.worldgen_settings_draft = Some(worldgen_settings);
             ready.initial_clocks = Some(initial_clocks);
+            ready.session_settings = session_settings;
             let Some(mut ready) = complete_spawn_search(
                 ready,
                 &mut resources,
@@ -740,6 +756,7 @@ impl GenerationWorker {
                 spawn_origin: None,
                 suggested_spawn: None,
                 initial_clocks: None,
+                session_settings: None,
             }))
         })
     }
@@ -1117,6 +1134,7 @@ fn generate_spawn_origin(
         spawn_origin: Some(spawn),
         suggested_spawn: None,
         initial_clocks: None,
+        session_settings: None,
     }))
 }
 
@@ -1138,6 +1156,7 @@ fn expand_with_inputs(
         suggested_spawn: _,
         worldgen_settings_draft,
         initial_clocks,
+        session_settings,
     } = ready;
     ensure!(
         revision != mesh.revision,
@@ -1228,6 +1247,7 @@ fn expand_with_inputs(
         spawn_origin,
         suggested_spawn: None,
         initial_clocks,
+        session_settings,
     }))
 }
 
@@ -1425,7 +1445,7 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn initial_world_worker_keeps_selected_pack_through_creature_spawning() -> Result<()> {
-        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+        use crate::fresh_generation::prepare;
         use native_resources::datapacks::DataPackSettings;
         use serde_json::json;
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -1511,19 +1531,20 @@ mod tests {
             let world = world.clone();
             let worker = GenerationWorker::start_initial_world(
                 move || {
-                    let prepared = prepare(FreshGenerationSettings {
-                        minecraft_dir: game,
-                        preset: if disabled {
-                            "example:compact_disabled"
-                        } else {
-                            "example:compact"
-                        }
-                        .into(),
-                        dimension: "minecraft:overworld".into(),
-                        seed: 42,
-                        bonus_chest: false,
-                        structures_enabled: false,
-                        data_packs: Some((
+                    let mut settings =
+                        crate::world_creation::WorldCreationSettings::new("Test".into());
+                    settings.seed = crate::chat_input::ChatInput::field("42");
+                    settings.mode = crate::world_creation::GameMode::Creative;
+                    settings.difficulty = crate::world_creation::Difficulty::Easy;
+                    settings.generate_structures = false;
+                    settings.preset = native_resources::packs::ResourceId::parse(if disabled {
+                        "example:compact_disabled"
+                    } else {
+                        "example:compact"
+                    })?;
+                    let frozen = settings.freeze(
+                        game,
+                        Some((
                             world,
                             DataPackSettings {
                                 enabled: vec!["vanilla".into(), "file/compact".into()],
@@ -1531,14 +1552,19 @@ mod tests {
                                 enabled_features: vec!["minecraft:vanilla".into()],
                             },
                         )),
-                    })?;
+                    );
+                    let prepared = prepare(frozen.generation)?;
                     let border = native_session::respawn::RespawnBorder {
                         min_x: -100.0,
                         max_x: 100.0,
                         min_z: -100.0,
                         max_z: 100.0,
                     };
-                    let inputs = prepared.into_new_world_inputs(border, spawn_mobs, true)?;
+                    let mut inputs = prepared.into_new_world_inputs(border, spawn_mobs, true)?;
+                    let mut wrong_seed = frozen.session;
+                    wrong_seed.seed += 1;
+                    assert!(inputs.set_session_settings(wrong_seed).is_err());
+                    inputs.set_session_settings(frozen.session)?;
                     assert_eq!(inputs.creatures.is_some(), spawn_mobs && !disabled);
                     assert_eq!(
                         inputs.initial_clocks.ticks.get(
@@ -1604,8 +1630,12 @@ mod tests {
                     pose: native_session::PlayerPose::Standing,
                 };
                 let mut session = ready.start_session(player)?;
-                session.set_game_master_permission(true);
+                assert_eq!(
+                    session.snapshot().game_mode,
+                    native_session::GameMode::Creative
+                );
                 session.update(Duration::from_millis(150));
+                session.submit_command(PlayerCommand::QueryWorldSeed);
                 for text in [
                     "/time query time",
                     "/time query example:creatures",
@@ -1618,6 +1648,11 @@ mod tests {
                 session.update(Duration::from_millis(50));
                 let snapshot = session.snapshot();
                 let messages = &snapshot.system_messages;
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| matches!(message.kind, SystemMessageKind::WorldSeed(42)))
+                );
                 assert!(messages.iter().any(|message| matches!(
                     &message.kind,
                     SystemMessageKind::TimeClock { name, ticks } if name.as_ref() == "example:creatures" && (3..=4).contains(ticks)

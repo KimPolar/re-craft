@@ -52,6 +52,26 @@ pub struct PreparedInitialWorld {
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
     pub initial_clocks: Arc<InitialWorldClocks>,
+    pub session_settings: Option<crate::world_creation::InitialSessionSettings>,
+}
+
+impl PreparedInitialWorld {
+    /// Tie the frozen screen settings to the exact seed used for this batch.
+    pub fn set_session_settings(
+        &mut self,
+        settings: crate::world_creation::InitialSessionSettings,
+    ) -> Result<()> {
+        ensure!(
+            self.worldgen_settings
+                .value
+                .get("data")
+                .and_then(|data| data.get("seed"))
+                == Some(&native_persistence::nbt::Tag::Long(settings.seed)),
+            "session seed differs from the prepared generator"
+        );
+        self.session_settings = Some(settings);
+        Ok(())
+    }
 }
 
 /// Clock ticks sampled during generation and the selected time game rule.
@@ -295,6 +315,7 @@ impl PreparedFreshGeneration {
             creatures,
             spawn_mobs,
             initial_clocks,
+            session_settings: None,
         })
     }
 

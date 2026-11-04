@@ -114,6 +114,21 @@ pub enum Difficulty {
     Hard,
 }
 
+/// Values fixed when world creation starts and carried into its first session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialSessionSettings {
+    pub seed: i64,
+    pub mode: native_session::GameMode,
+    pub difficulty: native_persistence::world::Difficulty,
+    pub hardcore: bool,
+    pub allow_commands: bool,
+}
+
+pub struct FrozenWorldCreation {
+    pub generation: crate::fresh_generation::FreshGenerationSettings,
+    pub session: InitialSessionSettings,
+}
+
 /// Keep the chosen values even while hardcore temporarily overrides them.
 /// This state does not create or save a world.
 #[derive(Debug)]
@@ -229,14 +244,51 @@ impl WorldCreationSettings {
         minecraft_dir: PathBuf,
         data_packs: Option<(PathBuf, native_resources::datapacks::DataPackSettings)>,
     ) -> crate::fresh_generation::FreshGenerationSettings {
-        crate::fresh_generation::FreshGenerationSettings {
+        self.freeze(minecraft_dir, data_packs).generation
+    }
+
+    /// Resolve a random seed exactly once and preserve the effective screen
+    /// settings even if the screen is subsequently edited or closed.
+    pub fn freeze(
+        &self,
+        minecraft_dir: PathBuf,
+        data_packs: Option<(PathBuf, native_resources::datapacks::DataPackSettings)>,
+    ) -> FrozenWorldCreation {
+        use native_persistence::world::Difficulty as SessionDifficulty;
+        let seed = self.resolve_seed();
+        let mode = if self.is_debug() {
+            native_session::GameMode::Spectator
+        } else {
+            match self.mode {
+                GameMode::Survival | GameMode::Hardcore => native_session::GameMode::Survival,
+                GameMode::Creative => native_session::GameMode::Creative,
+            }
+        };
+        let difficulty = match self.effective_difficulty() {
+            Difficulty::Peaceful => SessionDifficulty::Peaceful,
+            Difficulty::Easy => SessionDifficulty::Easy,
+            Difficulty::Normal => SessionDifficulty::Normal,
+            Difficulty::Hard => SessionDifficulty::Hard,
+        };
+        let generation = crate::fresh_generation::FreshGenerationSettings {
             minecraft_dir,
             preset: format!("{}:{}", self.preset.namespace, self.preset.path),
             dimension: "minecraft:overworld".into(),
-            seed: self.resolve_seed(),
+            seed,
             bonus_chest: self.effective_bonus_chest(),
             structures_enabled: self.effective_generate_structures(),
             data_packs,
+        };
+        let session = InitialSessionSettings {
+            seed,
+            mode,
+            difficulty,
+            hardcore: self.is_hardcore(),
+            allow_commands: self.effective_allow_commands(),
+        };
+        FrozenWorldCreation {
+            generation,
+            session,
         }
     }
 
@@ -370,6 +422,28 @@ mod tests {
         assert_eq!(settings.resolve_seed(), -123);
         settings.seed = crate::chat_input::ChatInput::field("abc");
         assert_eq!(settings.resolve_seed(), 96354);
+    }
+
+    #[test]
+    fn frozen_session_and_generator_share_seed_and_effective_settings() {
+        use native_persistence::world::Difficulty as SessionDifficulty;
+        let mut settings = WorldCreationSettings::new("World".into());
+        settings.mode = GameMode::Hardcore;
+        settings.difficulty = Difficulty::Easy;
+        settings.allow_commands = Some(true);
+        let frozen = settings.freeze(PathBuf::from("game"), None);
+        assert_eq!(frozen.generation.seed, frozen.session.seed);
+        assert_eq!(frozen.session.mode, native_session::GameMode::Survival);
+        assert_eq!(frozen.session.difficulty, SessionDifficulty::Hard);
+        assert!(frozen.session.hardcore);
+        assert!(!frozen.session.allow_commands);
+        settings.mode = GameMode::Creative;
+        assert!(frozen.session.hardcore);
+        let frozen = settings.freeze(PathBuf::from("game"), None);
+        assert_eq!(frozen.session.mode, native_session::GameMode::Creative);
+        assert_eq!(frozen.session.difficulty, SessionDifficulty::Easy);
+        assert!(!frozen.session.hardcore);
+        assert!(frozen.session.allow_commands);
     }
 
     #[test]

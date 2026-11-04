@@ -3582,6 +3582,13 @@ mod tests {
             advance_time: true,
             command_data: Default::default(),
         });
+        let session_settings = crate::world_creation::InitialSessionSettings {
+            seed: 42,
+            mode: native_session::GameMode::Survival,
+            difficulty: native_persistence::world::Difficulty::Hard,
+            hardcore: true,
+            allow_commands: false,
+        };
         let ready = crate::generation_worker::GenerationReady {
             batch,
             mesh: job,
@@ -3589,6 +3596,7 @@ mod tests {
             spawn_origin: Some(center),
             suggested_spawn: None,
             initial_clocks: Some(Arc::clone(&initial_clocks)),
+            session_settings: Some(session_settings),
         };
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
@@ -3627,6 +3635,7 @@ mod tests {
             expanded.initial_clocks.as_ref().unwrap(),
             &initial_clocks
         ));
+        assert_eq!(expanded.session_settings, Some(session_settings));
         assert_eq!(
             expanded.worldgen_settings_draft.as_ref(),
             Some(&worldgen_draft)
@@ -3644,6 +3653,7 @@ mod tests {
             .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
             .unwrap();
         use native_session::GameSession;
+        assert!(session.snapshot().vitals.hardcore);
         let clock_id = native_persistence::world::DimensionId::parse("example:clock").unwrap();
         assert_eq!(session.world_clock(&clock_id).unwrap().total_ticks, 0);
         let mut running = expanded.start_session(player).unwrap();

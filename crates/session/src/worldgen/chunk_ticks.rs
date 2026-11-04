@@ -230,6 +230,137 @@ pub struct ActivatedRegionTicks {
     pub chunks: BTreeMap<ChunkPos, ActivatedChunkTicks>,
 }
 
+/// Detached, activated containers for one registry. The caller supplies the
+/// level scheduler's container traversal order on every collection; that order
+/// matters when two container heads compare equal.
+pub struct ActiveRegionQueue {
+    chunks: BTreeMap<ChunkPos, ChunkTicks>,
+}
+
+impl ActiveRegionQueue {
+    fn compare_heads(&self, left: ChunkPos, right: ChunkPos) -> Ordering {
+        let a = self.chunks[&left]
+            .peek()
+            .expect("queued container has a head");
+        let b = self.chunks[&right]
+            .peek()
+            .expect("queued container has a head");
+        (a.priority, a.sub_tick).cmp(&(b.priority, b.sub_tick))
+    }
+
+    fn push_container(&self, heap: &mut Vec<ChunkPos>, chunk: ChunkPos) {
+        heap.push(chunk);
+        let mut child = heap.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if !self.compare_heads(heap[child], heap[parent]).is_lt() {
+                break;
+            }
+            heap.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn pop_container(&self, heap: &mut Vec<ChunkPos>) -> Option<ChunkPos> {
+        let last = heap.pop()?;
+        if heap.is_empty() {
+            return Some(last);
+        }
+        let result = std::mem::replace(&mut heap[0], last);
+        let mut parent = 0;
+        loop {
+            let left = parent * 2 + 1;
+            if left >= heap.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < heap.len() && self.compare_heads(heap[right], heap[left]).is_lt()
+            {
+                right
+            } else {
+                left
+            };
+            if !self.compare_heads(heap[child], heap[parent]).is_lt() {
+                break;
+            }
+            heap.swap(parent, child);
+            parent = child;
+        }
+        Some(result)
+    }
+
+    /// Collect at most `limit` due ticks before executing any callbacks.
+    /// `traversal` lists tickable containers in the scheduler's map iteration
+    /// order. Omitted chunks are not tickable and keep their queued ticks.
+    pub fn collect_due(
+        &mut self,
+        traversal: &[ChunkPos],
+        time: i64,
+        limit: usize,
+    ) -> Result<Vec<ScheduledTick>> {
+        let mut seen = BTreeSet::new();
+        for pos in traversal {
+            ensure!(self.chunks.contains_key(pos), "unknown tick container");
+            ensure!(seen.insert(*pos), "duplicate tick container");
+        }
+        let mut heap = Vec::new();
+        for &pos in traversal {
+            if self.chunks[&pos]
+                .peek()
+                .is_some_and(|tick| tick.trigger <= time)
+            {
+                self.push_container(&mut heap, pos);
+            }
+        }
+        let mut collected = Vec::new();
+        while collected.len() < limit {
+            let Some(pos) = self.pop_container(&mut heap) else {
+                break;
+            };
+            collected.push(self.chunks.get_mut(&pos).unwrap().poll().unwrap());
+            while collected.len() < limit {
+                let Some(next) = self.chunks[&pos].peek() else {
+                    break;
+                };
+                if next.trigger > time {
+                    break;
+                }
+                if let Some(&other) = heap.first() {
+                    let other = self.chunks[&other].peek().unwrap();
+                    if (next.priority, next.sub_tick) > (other.priority, other.sub_tick) {
+                        break;
+                    }
+                }
+                collected.push(self.chunks.get_mut(&pos).unwrap().poll().unwrap());
+            }
+            if collected.len() < limit
+                && self.chunks[&pos]
+                    .peek()
+                    .is_some_and(|tick| tick.trigger <= time)
+            {
+                self.push_container(&mut heap, pos);
+            }
+        }
+        Ok(collected)
+    }
+
+    /// Schedule after collection or execution, as with LevelTicks.schedule.
+    pub fn schedule(&mut self, tick: ScheduledTick) -> Result<ScheduleOutcome> {
+        let pos = ChunkPos {
+            x: tick.position[0].div_euclid(16),
+            z: tick.position[2].div_euclid(16),
+        };
+        let Some(chunk) = self.chunks.get_mut(&pos) else {
+            return Ok(ScheduleOutcome::MissingChunk);
+        };
+        Ok(if chunk.schedule(tick)? {
+            ScheduleOutcome::Added
+        } else {
+            ScheduleOutcome::Duplicate
+        })
+    }
+}
+
 impl RegionTicks {
     pub fn new(
         chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
@@ -283,6 +414,24 @@ impl RegionTicks {
                             fluids: ticks.fluids.activated(self.game_time),
                         },
                     )
+                })
+                .collect(),
+        }
+    }
+
+    /// Clone one registry and unpack its pending ticks at this region's time.
+    pub fn activated_queue(&self, registry: TickRegistry) -> ActiveRegionQueue {
+        ActiveRegionQueue {
+            chunks: self
+                .chunks
+                .iter()
+                .map(|(&pos, ticks)| {
+                    let mut ticks = match registry {
+                        TickRegistry::Block => ticks.blocks.clone(),
+                        TickRegistry::Fluid => ticks.fluids.clone(),
+                    };
+                    ticks.unpack(self.game_time);
+                    (pos, ticks)
                 })
                 .collect(),
         }

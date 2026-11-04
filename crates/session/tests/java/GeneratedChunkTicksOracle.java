@@ -76,5 +76,25 @@ public class GeneratedChunkTicksOracle {
         secondFluid.unpack(Long.MAX_VALUE);
         while (firstBlock.peek()!=null) polled(firstBlock.poll());
         while (secondFluid.peek()!=null) polled(secondFluid.poll());
+        var collector = new LevelTicks<String>(p -> true);
+        var c0 = new LevelChunkTicks<String>();
+        var c1 = new LevelChunkTicks<String>();
+        var c2 = new LevelChunkTicks<String>();
+        collector.addContainer(new ChunkPos(0, 0), c0);
+        collector.addContainer(new ChunkPos(1, 0), c1);
+        collector.addContainer(new ChunkPos(2, 0), c2);
+        c0.schedule(tick("minecraft:a0", new BlockPos(0, 0, 0), 40, TickPriority.NORMAL, 0));
+        c0.schedule(tick("minecraft:a1", new BlockPos(1, 0, 0), 41, TickPriority.EXTREMELY_HIGH, 4));
+        c1.schedule(tick("minecraft:b0", new BlockPos(16, 0, 0), 42, TickPriority.HIGH, 1));
+        c2.schedule(tick("minecraft:c0", new BlockPos(32, 0, 0), 41, TickPriority.LOW, 2));
+        c2.schedule(tick("minecraft:future", new BlockPos(33, 0, 0), 50, TickPriority.NORMAL, 7));
+        collector.tick(42, 2, (p, type) -> {
+            System.out.println("R1 " + type);
+            if (type.equals("minecraft:b0")) {
+                collector.schedule(tick("minecraft:new", new BlockPos(17, 0, 0), 42, TickPriority.EXTREMELY_HIGH, 5));
+            }
+        });
+        collector.tick(42, 100, (p, type) -> System.out.println("R2 " + type));
+        collector.tick(50, 100, (p, type) -> System.out.println("R3 " + type));
     }
 }

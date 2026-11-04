@@ -163,7 +163,64 @@ fn trace() -> Vec<String> {
         region.chunk(pos).unwrap().blocks.pack(i64::MAX)[0],
         saved("minecraft:stone", a, 0, 0)
     );
+    out.extend(collection_trace());
     out
+}
+
+fn collection_trace() -> Vec<String> {
+    let positions = [
+        ChunkPos { x: 0, z: 0 },
+        ChunkPos { x: 1, z: 0 },
+        ChunkPos { x: 2, z: 0 },
+    ];
+    let chunks = positions
+        .into_iter()
+        .map(|pos| {
+            (
+                pos,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                },
+            )
+        })
+        .collect();
+    let mut region = RegionTicks::new(chunks, 42, 8).unwrap();
+    for tick in [
+        scheduled("a0", [0, 0, 0], 40, 0, 0),
+        scheduled("a1", [1, 0, 0], 41, -3, 4),
+        scheduled("b0", [16, 0, 0], 42, -1, 1),
+        scheduled("c0", [32, 0, 0], 41, 1, 2),
+        scheduled("future", [33, 0, 0], 50, 0, 7),
+    ] {
+        let pos = ChunkPos {
+            x: tick.position[0].div_euclid(16),
+            z: 0,
+        };
+        region
+            .chunk_mut(pos)
+            .unwrap()
+            .blocks
+            .schedule(tick)
+            .unwrap();
+    }
+    let mut active = region.activated_queue(TickRegistry::Block);
+    let mut output = Vec::new();
+    for tick in active.collect_due(&positions, 42, 2).unwrap() {
+        output.push(format!("R1 {}", tick.kind));
+        if tick.kind == "minecraft:b0" {
+            active
+                .schedule(scheduled("new", [17, 0, 0], 42, -3, 5))
+                .unwrap();
+        }
+    }
+    for tick in active.collect_due(&positions, 42, 100).unwrap() {
+        output.push(format!("R2 {}", tick.kind));
+    }
+    for tick in active.collect_due(&positions, 50, 100).unwrap() {
+        output.push(format!("R3 {}", tick.kind));
+    }
+    output
 }
 
 #[test]
@@ -173,7 +230,72 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 99);
+    assert_eq!(lines.len(), 105);
+}
+
+#[test]
+fn collecting_ticks_respects_chunk_heads_limits_and_callback_boundary() {
+    assert_eq!(
+        collection_trace(),
+        [
+            "R1 minecraft:b0",
+            "R1 minecraft:a0",
+            "R2 minecraft:a1",
+            "R2 minecraft:new",
+            "R2 minecraft:c0",
+            "R3 minecraft:future",
+        ]
+    );
+}
+
+#[test]
+fn collection_validates_traversal_and_preserves_java_heap_ties() {
+    let positions = [
+        ChunkPos { x: 0, z: 0 },
+        ChunkPos { x: 1, z: 0 },
+        ChunkPos { x: 2, z: 0 },
+    ];
+    let chunks = positions
+        .into_iter()
+        .map(|pos| {
+            let mut blocks = ChunkTicks::from_saved(pos, vec![]).unwrap();
+            blocks
+                .schedule(scheduled("stone", [pos.x * 16, 0, 0], 0, 0, 0))
+                .unwrap();
+            (
+                pos,
+                ConvertedChunkTicks {
+                    blocks,
+                    fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                },
+            )
+        })
+        .collect();
+    let region = RegionTicks::new(chunks, 0, 1).unwrap();
+    let mut queue = region.activated_queue(TickRegistry::Block);
+    assert!(
+        queue
+            .collect_due(&[positions[0], positions[0]], 0, 10)
+            .is_err()
+    );
+    assert!(
+        queue
+            .collect_due(&[ChunkPos { x: 3, z: 0 }], 0, 10)
+            .is_err()
+    );
+    assert!(queue.collect_due(&positions, 0, 0).unwrap().is_empty());
+    assert_eq!(
+        queue
+            .collect_due(&positions, 0, 10)
+            .unwrap()
+            .iter()
+            .map(|t| t.position[0])
+            .collect::<Vec<_>>(),
+        [0, 32, 16]
+    );
+    let mut queue = region.activated_queue(TickRegistry::Block);
+    assert_eq!(queue.collect_due(&positions[..1], 0, 10).unwrap().len(), 1);
+    assert_eq!(queue.collect_due(&positions[1..], 0, 10).unwrap().len(), 2);
 }
 
 #[test]

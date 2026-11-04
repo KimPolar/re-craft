@@ -3777,6 +3777,7 @@ mod tests {
             }
         }
         let original = batch.snapshot().unwrap();
+        assert!(batch.spawned_section_data(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
         assert_eq!(
             batch.schedule().completed(center),
@@ -3789,6 +3790,35 @@ mod tests {
         );
         assert!(batch.is_complete());
         assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
+        let sections = batch.spawned_section_data(center).unwrap();
+        let decoded = native_persistence::palette::decode_sections(
+            &native_persistence::nbt::Tag::Compound(vec![("sections".into(), sections)]),
+        )
+        .unwrap();
+        let build = decoded.iter().find(|section| section.y == 0).unwrap();
+        assert_eq!(
+            build
+                .blocks
+                .as_ref()
+                .unwrap()
+                .block(8, 8, 8)
+                .unwrap()
+                .name
+                .to_string_lossy(),
+            "minecraft:brown_mushroom"
+        );
+        assert_eq!(
+            build
+                .biomes
+                .as_ref()
+                .unwrap()
+                .biome(0, 0, 0)
+                .unwrap()
+                .to_string_lossy(),
+            "minecraft:plains"
+        );
+        assert!(build.block_light.is_some());
+        assert!(decoded.iter().all(|section| section.sky_light.is_none()));
         let spawn_light = batch.light_snapshot([center]).unwrap();
         for y in -16..32 {
             for z in 0..16 {

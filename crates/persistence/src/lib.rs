@@ -2,6 +2,7 @@ pub mod anvil;
 pub mod chest_loot;
 mod chest_transfer;
 pub mod edit;
+pub mod generated_section;
 pub mod heightmap;
 pub mod nbt;
 pub mod palette;

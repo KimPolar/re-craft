@@ -539,6 +539,48 @@ impl FreshTerrainBatch {
         Ok(world)
     }
 
+    /// Encode the block, biome and light sections of a completed SPAWN-stage
+    /// chunk. This is only one component of a future save, not a FULL chunk:
+    /// heightmaps, ticks, block entities, structures and entities remain separate.
+    pub fn spawned_section_data(&mut self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before encoding sections"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "section encoding requires a spawn-complete chunk"
+        );
+        let has_skylight = self
+            .decoration
+            .as_ref()
+            .context("generation lighting is missing")?
+            .has_skylight;
+        let min_y = self.generator.min_y;
+        let height = self.generator.height;
+        let world = self.lit_snapshot([pos])?;
+        let registry = self
+            .light_registry
+            .as_ref()
+            .context("block registry is missing")?;
+        let biomes = self.generator.possible_biomes();
+        native_persistence::generated_section::encode_generated_sections(
+            &world,
+            pos,
+            min_y,
+            height,
+            has_skylight,
+            |state| registry.is_canonical_state(&state.name, &state.properties),
+            |name| {
+                ResourceId::parse(name)
+                    .ok()
+                    .is_some_and(|id| biomes.contains(&id))
+            },
+        )
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

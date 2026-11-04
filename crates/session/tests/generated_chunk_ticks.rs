@@ -1,4 +1,7 @@
-use native_session::worldgen::chunk_ticks::{ChunkTicks, SavedTick, ScheduledTick};
+use native_session::worldgen::chunk_ticks::{
+    ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, ScheduleOutcome, ScheduledTick,
+    TickRegistry,
+};
 use native_world::loaded::ChunkPos;
 
 fn saved(kind: &str, position: [i32; 3], delay: i32, priority: i32) -> SavedTick {
@@ -95,6 +98,67 @@ fn trace() -> Vec<String> {
     while many.peek().is_some() {
         out.push(format_tick(many.poll()));
     }
+    let second = ChunkPos { x: -1, z: 3 };
+    let chunks = std::collections::BTreeMap::from([
+        (
+            pos,
+            ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(pos, vec![saved("stone", a, 0, 0)]).unwrap(),
+                fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            },
+        ),
+        (
+            second,
+            ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(second, vec![]).unwrap(),
+                fluids: ChunkTicks::from_saved(second, vec![]).unwrap(),
+            },
+        ),
+    ]);
+    let mut region = RegionTicks::new(chunks, i64::MAX, i64::MAX - 1).unwrap();
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Block, "stone", a, 1, -1)
+            .unwrap(),
+        ScheduleOutcome::Duplicate
+    );
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Fluid, "water", [-16, 3, 50], 3, 1)
+            .unwrap(),
+        ScheduleOutcome::Added
+    );
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Block, "stone", [0, 0, 50], 0, 0)
+            .unwrap(),
+        ScheduleOutcome::MissingChunk
+    );
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Block, "sand", b, -1, -1)
+            .unwrap(),
+        ScheduleOutcome::Added
+    );
+    out.push(format_saved(
+        "region-block",
+        region.chunk(pos).unwrap().blocks.pack(i64::MAX),
+    ));
+    out.push(format_saved(
+        "region-fluid",
+        region.chunk(second).unwrap().fluids.pack(i64::MAX),
+    ));
+    out.push(format!("counter {}", region.next_sub_tick()));
+    let first = &mut region.chunk_mut(pos).unwrap().blocks;
+    first.unpack(i64::MAX);
+    while first.peek().is_some() {
+        out.push(format_tick(first.poll()));
+    }
+    let fluids = &mut region.chunk_mut(second).unwrap().fluids;
+    fluids.unpack(i64::MAX);
+    while fluids.peek().is_some() {
+        out.push(format_tick(fluids.poll()));
+    }
     out
 }
 
@@ -105,7 +169,88 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 93);
+    assert_eq!(lines.len(), 99);
+}
+
+#[test]
+fn postprocessing_callback_schedules_into_neighbor_chunk() {
+    use anyhow::Result;
+    use native_core::postprocessing::PostProcessing;
+    use native_session::worldgen::postprocessing::{
+        PostprocessingChunk, PostprocessingTask, PostprocessingWorld,
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+
+    struct Callback<'a>(&'a mut RegionTicks);
+    impl PostprocessingWorld for Callback<'_> {
+        type State = ();
+        type Fluid = ();
+        fn block(&mut self, _: [i32; 3]) -> Result<()> {
+            Ok(())
+        }
+        fn fluid(&mut self, _: &()) -> Result<Option<()>> {
+            Ok(None)
+        }
+        fn tick_fluid(&mut self, _: [i32; 3], _: &(), _: &()) -> Result<()> {
+            unreachable!()
+        }
+        fn is_liquid_block(&mut self, _: &()) -> Result<bool> {
+            Ok(false)
+        }
+        fn tick_liquid_block(&mut self, _: [i32; 3], _: &()) -> Result<()> {
+            unreachable!()
+        }
+        fn update_neighbor_shapes(&mut self, _: [i32; 3], _: &()) -> Result<()> {
+            assert_eq!(
+                self.0
+                    .schedule(TickRegistry::Block, "sand", [-16, 0, 50], 2, 0)?,
+                ScheduleOutcome::Added
+            );
+            assert_eq!(
+                self.0
+                    .schedule(TickRegistry::Fluid, "water", [-16, 0, 50], 5, 0)?,
+                ScheduleOutcome::Added
+            );
+            Ok(())
+        }
+        fn set_block(&mut self, _: [i32; 3], _: &(), _: i32) -> Result<()> {
+            unreachable!()
+        }
+        fn clear_processed_section(&mut self, _: usize) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl PostprocessingChunk for Callback<'_> {
+        fn pending_block_entity_positions(&mut self) -> Result<Vec<[i32; 3]>> {
+            Ok(vec![])
+        }
+        fn promote_pending_block_entity(&mut self, _: [i32; 3]) -> Result<()> {
+            unreachable!()
+        }
+        fn clear_pending_block_entities(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn apply_upgrade_data(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let a = ChunkPos { x: -2, z: 3 };
+    let b = ChunkPos { x: -1, z: 3 };
+    let empty = |pos| ConvertedChunkTicks {
+        blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+    };
+    let mut ticks =
+        RegionTicks::new(BTreeMap::from([(a, empty(a)), (b, empty(b))]), 100, 8).unwrap();
+    let mut marks = PostProcessing::new(-16, 32).unwrap();
+    marks.mark(-17, 0, 50);
+    let mut task = PostprocessingTask::new(Arc::new(marks), a);
+    while !task.poll(&mut Callback(&mut ticks), 1).unwrap() {}
+    let neighbor = ticks.chunk(b).unwrap();
+    assert_eq!(neighbor.blocks.peek().unwrap().trigger, 102);
+    assert_eq!(neighbor.blocks.peek().unwrap().sub_tick, 8);
+    assert_eq!(neighbor.fluids.peek().unwrap().trigger, 105);
+    assert_eq!(neighbor.fluids.peek().unwrap().sub_tick, 9);
 }
 
 #[test]
@@ -157,8 +302,25 @@ fn converted_tick_queue_matches_java_26_3() {
         String::from_utf8_lossy(&output.stderr)
     );
     let actual = String::from_utf8(output.stdout).unwrap();
+    let expected = trace();
+    let diagnostic = "Trying to schedule tick in not loaded position BlockPos{x=0, y=0, z=50}";
     assert_eq!(
-        actual.lines().collect::<Vec<_>>(),
-        trace().iter().map(String::as_str).collect::<Vec<_>>()
+        actual
+            .lines()
+            .filter(|line| line.contains(diagnostic))
+            .count(),
+        1
     );
+    let actual = actual
+        .lines()
+        .filter(|line| !line.contains(diagnostic))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "unexpected Java output length"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(*actual, expected, "trace line {index}");
+    }
 }

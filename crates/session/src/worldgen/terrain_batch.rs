@@ -1451,6 +1451,30 @@ impl FreshTerrainBatch {
         })
     }
 
+    /// Prepare the FULL-stage tick containers and postprocessing tasks for a
+    /// set of converted neighbors using one world time and sub-tick counter.
+    /// This remains isolated intermediate data, not a playable world.
+    pub fn begin_converted_postprocessing_region(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<super::postprocessing::ConvertedPostprocessingRegion> {
+        let mut tasks = BTreeMap::new();
+        let mut ticks = BTreeMap::new();
+        for pos in positions {
+            ensure!(!tasks.contains_key(&pos), "duplicate converted chunk");
+            let converted = self.begin_converted_postprocessing(pos)?;
+            tasks.insert(pos, converted.task);
+            ticks.insert(pos, converted.ticks);
+        }
+        ensure!(!tasks.is_empty(), "no converted chunks");
+        Ok(super::postprocessing::ConvertedPostprocessingRegion {
+            tasks,
+            ticks: super::chunk_ticks::RegionTicks::new(ticks, game_time, next_sub_tick)?,
+        })
+    }
+
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the
     /// complete feature-generated entity list and the world's current tick.
     /// This is not a FULL chunk and must not be written as a playable world.

@@ -2,7 +2,10 @@
 //!
 //! Saved proto ticks remain pending during postprocessing. New ticks can be
 //! scheduled meanwhile, but must not duplicate the pending identities.
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use anyhow::{Result, ensure};
 use native_resources::packs::ResourceId;
@@ -174,4 +177,98 @@ impl ChunkTicks {
 pub struct ConvertedChunkTicks {
     pub blocks: ChunkTicks,
     pub fluids: ChunkTicks,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TickRegistry {
+    Block,
+    Fluid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleOutcome {
+    Added,
+    Duplicate,
+    MissingChunk,
+}
+
+/// Tick access for an isolated converted region. All block and fluid
+/// callbacks share the level's sub-tick counter, including schedules rejected
+/// as duplicates or sent to a chunk without a registered tick container.
+pub struct RegionTicks {
+    chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
+    game_time: i64,
+    next_sub_tick: i64,
+}
+
+impl RegionTicks {
+    pub fn new(
+        chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<Self> {
+        for (pos, ticks) in &chunks {
+            ensure!(
+                ticks.blocks.chunk == *pos && ticks.fluids.chunk == *pos,
+                "tick container belongs to another chunk"
+            );
+        }
+        Ok(Self {
+            chunks,
+            game_time,
+            next_sub_tick,
+        })
+    }
+
+    pub fn chunk(&self, pos: ChunkPos) -> Option<&ConvertedChunkTicks> {
+        self.chunks.get(&pos)
+    }
+
+    pub fn chunk_mut(&mut self, pos: ChunkPos) -> Option<&mut ConvertedChunkTicks> {
+        self.chunks.get_mut(&pos)
+    }
+
+    pub fn next_sub_tick(&self) -> i64 {
+        self.next_sub_tick
+    }
+
+    /// Match LevelAccessor.createTick followed by LevelTicks.schedule. A
+    /// missing container discards the tick in Java; the outcome lets callers
+    /// track that event while retaining the consumed sub-tick number.
+    pub fn schedule(
+        &mut self,
+        registry: TickRegistry,
+        kind: &str,
+        position: [i32; 3],
+        delay: i32,
+        priority: i32,
+    ) -> Result<ScheduleOutcome> {
+        let kind = canonical(kind)?;
+        ensure!((-3..=3).contains(&priority), "invalid tick priority");
+        let sub_tick = self.next_sub_tick;
+        self.next_sub_tick = self.next_sub_tick.wrapping_add(1);
+        let pos = ChunkPos {
+            x: position[0].div_euclid(16),
+            z: position[2].div_euclid(16),
+        };
+        let Some(chunk) = self.chunks.get_mut(&pos) else {
+            return Ok(ScheduleOutcome::MissingChunk);
+        };
+        let ticks = match registry {
+            TickRegistry::Block => &mut chunk.blocks,
+            TickRegistry::Fluid => &mut chunk.fluids,
+        };
+        let added = ticks.schedule(ScheduledTick {
+            kind,
+            position,
+            trigger: self.game_time.wrapping_add(i64::from(delay)),
+            priority,
+            sub_tick,
+        })?;
+        Ok(if added {
+            ScheduleOutcome::Added
+        } else {
+            ScheduleOutcome::Duplicate
+        })
+    }
 }

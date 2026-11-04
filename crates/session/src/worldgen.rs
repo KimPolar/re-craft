@@ -4814,11 +4814,29 @@ mod tests {
             .flat_map(|(section, values)| values.iter().map(move |&packed| (section, packed)))
             .map(|(section, packed)| marks.unpack(section, packed, center.x, center.z).unwrap())
             .collect();
-        let mut converted = batch.begin_converted_postprocessing(center).unwrap();
+        let mut converted = batch
+            .begin_converted_postprocessing_region([center], 42, 10)
+            .unwrap();
         let mut trace = TracePostprocessing(Vec::new());
-        while !converted.task.poll(&mut trace, 1).unwrap() {}
+        while !converted
+            .tasks
+            .get_mut(&center)
+            .unwrap()
+            .poll(&mut trace, 1)
+            .unwrap()
+        {}
         assert_eq!(trace.0, expected);
         assert!(batch.begin_spawned_postprocessing(distant).is_err());
+        assert!(
+            batch
+                .begin_converted_postprocessing_region([center, center], 42, 10)
+                .is_err()
+        );
+        assert!(
+            batch
+                .begin_converted_postprocessing_region([center, distant], 42, 10)
+                .is_err()
+        );
         let (block_ticks, fluid_ticks) = batch.spawned_tick_data(center).unwrap();
         let native_persistence::nbt::Tag::List { values: ticks, .. } = block_ticks else {
             panic!("missing block ticks")
@@ -4834,25 +4852,40 @@ mod tests {
             ticks[0].get("t"),
             Some(&native_persistence::nbt::Tag::Int(0))
         );
-        let saved = converted.ticks.blocks.pack(42);
+        let saved = converted.ticks.chunk(center).unwrap().blocks.pack(42);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].kind, "minecraft:brown_mushroom");
         assert_eq!(saved[0].delay, 0);
-        assert!(converted.ticks.blocks.peek().is_none());
-        let duplicate = chunk_ticks::ScheduledTick {
-            kind: saved[0].kind.clone(),
-            position: saved[0].position,
-            trigger: 43,
-            priority: 0,
-            sub_tick: 0,
-        };
-        assert!(!converted.ticks.blocks.schedule(duplicate).unwrap());
-        converted.ticks.blocks.unpack(42);
-        let activated = converted.ticks.blocks.poll().unwrap();
+        assert!(
+            converted
+                .ticks
+                .chunk(center)
+                .unwrap()
+                .blocks
+                .peek()
+                .is_none()
+        );
+        assert_eq!(
+            converted
+                .ticks
+                .schedule(
+                    chunk_ticks::TickRegistry::Block,
+                    &saved[0].kind,
+                    saved[0].position,
+                    1,
+                    0
+                )
+                .unwrap(),
+            chunk_ticks::ScheduleOutcome::Duplicate
+        );
+        assert_eq!(converted.ticks.next_sub_tick(), 11);
+        let blocks = &mut converted.ticks.chunk_mut(center).unwrap().blocks;
+        blocks.unpack(42);
+        let activated = blocks.poll().unwrap();
         assert_eq!(activated.position, saved[0].position);
         assert_eq!(activated.trigger, 42);
         assert_eq!(activated.sub_tick, -1);
-        assert!(converted.ticks.blocks.poll().is_none());
+        assert!(blocks.poll().is_none());
         let native_persistence::nbt::Tag::List { values: ticks, .. } = fluid_ticks else {
             panic!("missing fluid ticks")
         };

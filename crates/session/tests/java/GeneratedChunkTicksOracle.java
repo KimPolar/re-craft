@@ -1,6 +1,10 @@
 import java.util.List;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.ticks.*;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.ChunkPos;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 
 public class GeneratedChunkTicksOracle {
     static final BlockPos A = new BlockPos(-31, 0, 50);
@@ -47,5 +51,30 @@ public class GeneratedChunkTicksOracle {
         }
         saved("many",many.pack(100));
         while (many.peek()!=null) polled(many.poll());
+        long[] counter={Long.MAX_VALUE-1};
+        var level=(LevelAccessor)Proxy.newProxyInstance(LevelAccessor.class.getClassLoader(),new Class[]{LevelAccessor.class},(proxy,method,arguments)->{
+            return switch(method.getName()) {
+                case "getGameTime" -> Long.MAX_VALUE;
+                case "nextSubTickCount" -> counter[0]++;
+                default -> InvocationHandler.invokeDefault(proxy,method,arguments);
+            };
+        });
+        var blockTicks=new LevelTicks<String>(p->true);
+        var fluidTicks=new LevelTicks<String>(p->true);
+        var firstBlock=new LevelChunkTicks<String>(List.of(new SavedTick<>("minecraft:stone",A,0,TickPriority.NORMAL)));
+        var secondFluid=new LevelChunkTicks<String>();
+        blockTicks.addContainer(new ChunkPos(-2,3),firstBlock);
+        fluidTicks.addContainer(new ChunkPos(-1,3),secondFluid);
+        blockTicks.schedule(level.createTick(A,"minecraft:stone",1,TickPriority.HIGH));
+        fluidTicks.schedule(level.createTick(new BlockPos(-16,3,50),"minecraft:water",3,TickPriority.LOW));
+        blockTicks.schedule(level.createTick(new BlockPos(0,0,50),"minecraft:stone",0,TickPriority.NORMAL));
+        blockTicks.schedule(level.createTick(B,"minecraft:sand",-1,TickPriority.HIGH));
+        saved("region-block",firstBlock.pack(Long.MAX_VALUE));
+        saved("region-fluid",secondFluid.pack(Long.MAX_VALUE));
+        System.out.println("counter "+counter[0]);
+        firstBlock.unpack(Long.MAX_VALUE);
+        secondFluid.unpack(Long.MAX_VALUE);
+        while (firstBlock.peek()!=null) polled(firstBlock.poll());
+        while (secondFluid.peek()!=null) polled(secondFluid.poll());
     }
 }

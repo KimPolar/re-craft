@@ -187,6 +187,13 @@ pub struct ConvertedChunkPostprocessing {
     pub ticks: super::chunk_ticks::ConvertedChunkTicks,
 }
 
+/// Converted chunks that share the server-level tick access. Each task uses
+/// the same tick containers, including those belonging to adjacent chunks.
+pub struct ConvertedPostprocessingRegion {
+    pub tasks: std::collections::BTreeMap<ChunkPos, PostprocessingTask>,
+    pub ticks: super::chunk_ticks::RegionTicks,
+}
+
 impl PostprocessingTask {
     pub fn new(marks: Arc<PostProcessing>, chunk: ChunkPos) -> Self {
         Self {

@@ -1,5 +1,8 @@
 //! Position ordering used by a fresh protochunk's materialized block entities.
-use anyhow::{Result, ensure};
+use anyhow::Result;
+
+mod tree;
+use tree::TreeBin;
 
 type Pos = [i32; 3];
 
@@ -92,42 +95,101 @@ impl LivePositions {
     /// ChunkAccess copies the empty pending key set to a Java HashSet, then
     /// adds this fastutil map's keys in descending slot order.
     pub(super) fn saving_order(&self) -> Result<Vec<Pos>> {
-        let mut buckets: Vec<Vec<Pos>> = vec![Vec::new(); 16];
+        let mut buckets = vec![Bin::default(); 16];
         let mut size = 0;
         for pos in self.slots.iter().rev().flatten().copied() {
             let h = hash(pos);
             let spread = h ^ (h >> 16);
             let index = spread as usize & (buckets.len() - 1);
-            let chain = &mut buckets[index];
-            if chain.contains(&pos) {
-                continue;
+            let capacity = buckets.len();
+            let mut grow = false;
+            match &mut buckets[index] {
+                Bin::Empty => buckets[index] = Bin::List(vec![pos]),
+                Bin::List(chain) => {
+                    if chain.contains(&pos) {
+                        continue;
+                    }
+                    let treeify = chain.len() >= 8;
+                    chain.push(pos);
+                    if treeify {
+                        if capacity < 64 {
+                            grow = true;
+                        } else {
+                            buckets[index] = Bin::Tree(TreeBin::from_chain(std::mem::take(chain))?);
+                        }
+                    }
+                }
+                Bin::Tree(tree) => tree.insert(pos)?,
             }
-            let treeify = chain.len() >= 8;
-            chain.push(pos);
             size += 1;
-            if treeify {
-                ensure!(
-                    buckets.len() < 64,
-                    "Java block entity hash tree ordering is unsupported"
-                );
-                resize_set(&mut buckets);
+            if grow {
+                resize_set(&mut buckets)?;
             }
             if size > buckets.len() * 3 / 4 {
-                resize_set(&mut buckets);
+                resize_set(&mut buckets)?;
             }
         }
-        Ok(buckets.into_iter().flatten().collect())
+        let mut result = Vec::with_capacity(size);
+        for bucket in buckets {
+            match bucket {
+                Bin::Empty => {}
+                Bin::List(chain) => result.extend(chain),
+                Bin::Tree(tree) => result.extend(tree.positions()),
+            }
+        }
+        Ok(result)
     }
 }
 
-fn resize_set(buckets: &mut Vec<Vec<Pos>>) {
-    let old = std::mem::replace(buckets, vec![Vec::new(); buckets.len() * 2]);
-    let mask = buckets.len() - 1;
-    for chain in old {
-        for pos in chain {
-            let h = hash(pos);
-            buckets[(h ^ (h >> 16)) as usize & mask].push(pos);
+#[derive(Clone, Debug, Default)]
+enum Bin {
+    #[default]
+    Empty,
+    List(Vec<Pos>),
+    Tree(TreeBin),
+}
+
+fn resize_set(buckets: &mut Vec<Bin>) -> Result<()> {
+    let old_len = buckets.len();
+    let old = std::mem::replace(buckets, vec![Bin::default(); old_len * 2]);
+    for (index, bucket) in old.into_iter().enumerate() {
+        match bucket {
+            Bin::Empty => {}
+            Bin::List(chain) => {
+                for pos in chain {
+                    let h = hash(pos);
+                    let target = (h ^ (h >> 16)) as usize & (buckets.len() - 1);
+                    match &mut buckets[target] {
+                        Bin::Empty => buckets[target] = Bin::List(vec![pos]),
+                        Bin::List(chain) => chain.push(pos),
+                        Bin::Tree(_) => unreachable!(),
+                    }
+                }
+            }
+            Bin::Tree(tree) => {
+                let (low, high): (Vec<_>, Vec<_>) = tree.positions().partition(|&pos| {
+                    let h = hash(pos);
+                    ((h ^ (h >> 16)) as usize & old_len) == 0
+                });
+                if low.is_empty() {
+                    buckets[index + old_len] = Bin::Tree(tree);
+                } else if high.is_empty() {
+                    buckets[index] = Bin::Tree(tree);
+                } else {
+                    buckets[index] = split_tree(low)?;
+                    buckets[index + old_len] = split_tree(high)?;
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn split_tree(chain: Vec<Pos>) -> Result<Bin> {
+    if chain.len() <= 6 {
+        Ok(Bin::List(chain))
+    } else {
+        Ok(Bin::Tree(TreeBin::from_chain(chain)?))
     }
 }
 
@@ -136,21 +198,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_java_hash_tree_bins_until_their_order_is_supported() {
+    fn rejects_identity_dependent_java_hash_tree_collisions() {
         let mut positions = LivePositions::default();
-        let mut inserted = 0;
-        for y in -10000..10000 {
-            let p = [0, y, 0];
-            let h = hash(p);
-            if (h ^ (h >> 16)) & 63 == 0 {
-                positions.insert(p);
-                inserted += 1;
-                if inserted == 11 {
-                    break;
-                }
-            }
+        for z in 0..11 {
+            positions.insert([0, -31 * z, z]);
         }
-        assert_eq!(inserted, 11);
         assert!(positions.saving_order().is_err());
     }
 
@@ -215,6 +267,43 @@ mod tests {
                 false,
                 [(i * 7 % 16) - 16, (i * 71 % 384) - 64, (i * 11 % 16) + 32],
             ));
+        }
+        // Force long collision bins, treeification, subsequent insertions,
+        // and splitting on several later HashSet resizes.
+        let mut collision_positions = Vec::new();
+        for y in -10000..10000 {
+            let p = [0, y, 0];
+            let h = hash(p);
+            if (h ^ (h >> 16)) & 63 == 0 {
+                collision_positions.push(p);
+                if collision_positions.len() == 100 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(collision_positions.len(), 100);
+        for &p in &collision_positions {
+            ops.push((true, p));
+        }
+        for &p in collision_positions.iter().step_by(2) {
+            ops.push((false, p));
+        }
+        for &p in collision_positions.iter().skip(1).step_by(2) {
+            ops.push((false, p));
+        }
+        let mut mixed = Vec::new();
+        for y in -10000i32..10000 {
+            let p = [-11, y, 39];
+            let h = hash(p);
+            if (h ^ (h >> 16)) & 63 == 13 {
+                mixed.push(p);
+            }
+        }
+        // Alternate widely separated positive and negative hashes.
+        let chosen = mixed.iter().take(55).zip(mixed.iter().rev().take(55));
+        for (&a, &b) in chosen {
+            ops.push((true, a));
+            ops.push((true, b));
         }
         let input = temp.path().join("operations.txt");
         std::fs::write(

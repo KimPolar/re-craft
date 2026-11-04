@@ -610,7 +610,7 @@ impl FreshTerrainBatch {
     }
 
     /// Prepare the known block entities of a spawn-complete chunk. Other
-    /// chunk data remains separate. Unsupported Java hash-tree ordering is rejected.
+    /// chunk data remains separate. Identity-dependent Java hash ties are rejected.
     pub fn spawned_block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
         ensure!(
             self.is_complete(),

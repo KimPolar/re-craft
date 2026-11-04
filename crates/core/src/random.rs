@@ -133,6 +133,19 @@ impl LegacyRandom {
         let value = ((u64::from(self.bits(26))) << 27) | u64::from(self.bits(27));
         value as f64 * (1.0 / 9_007_199_254_740_992.0)
     }
+
+    /// `WorldgenRandom.setDecorationSeed` when backed by LegacyRandomSource.
+    pub fn set_decoration_seed(&mut self, world_seed: i64, block_x: i32, block_z: i32) -> i64 {
+        *self = Self::new(world_seed);
+        let x_scale = self.next_long() | 1;
+        let z_scale = self.next_long() | 1;
+        let seed = i64::from(block_x)
+            .wrapping_mul(x_scale)
+            .wrapping_add(i64::from(block_z).wrapping_mul(z_scale))
+            ^ world_seed;
+        *self = Self::new(seed);
+        seed
+    }
 }
 
 #[derive(Clone, Debug)]

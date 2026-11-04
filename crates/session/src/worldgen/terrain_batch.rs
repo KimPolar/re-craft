@@ -93,6 +93,43 @@ impl FreshTerrainBatch {
         Ok(self.biomes.biome_at_block(x, max_y - 1, z)?.clone())
     }
 
+    /// Start the random ordering for one light-complete chunk. The supplied
+    /// list and probability must be resolved from the same data-pack stack
+    /// and all applicable environment layers. This only plans attempts; it
+    /// neither creates entities nor marks SPAWN complete.
+    pub fn plan_creature_spawning(
+        &self,
+        pos: ChunkPos,
+        spawn_mobs: bool,
+        probability: f32,
+        spawns: native_resources::mob_spawns::CreatureSpawns,
+    ) -> Result<native_resources::worldgen_mob_spawner::ChunkCreatureSpawner> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before mob spawning"
+        );
+        ensure!(
+            self.schedule.completed(pos) == Some(GenerationStage::Light),
+            "mob spawning requires a light-complete chunk"
+        );
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        ensure!(
+            !disabled,
+            "generator disables mob generation; use the no-mob spawn stage"
+        );
+        native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            self.generator.seed,
+            pos.x,
+            pos.z,
+            spawn_mobs,
+            probability,
+            spawns,
+        )
+    }
+
     /// The supplied generator must have been constructed without structure
     /// adjustment and for a new world with structures explicitly disabled.
     pub fn new_without_structures(

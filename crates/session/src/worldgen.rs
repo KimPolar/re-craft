@@ -3192,6 +3192,31 @@ mod tests {
             batch.mob_spawn_biome(center).unwrap(),
             ResourceId::parse("minecraft:plains").unwrap()
         );
+        let mut mob_spawns = native_resources::mob_spawns::CreatureSpawns::default();
+        let attributes = json!({"gameplay/natural_mob_spawns":{
+            "spawns_by_category":{"creature":[{"type":"minecraft:pig","count":2,"weight":1}]},
+            "spawn_costs":{}
+        }});
+        mob_spawns.apply(
+            native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(&attributes, |_| {
+                Some(false)
+            })
+            .unwrap()
+            .unwrap(),
+        );
+        let mut planner = batch
+            .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns)
+            .unwrap();
+        let native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(attempt) =
+            planner.next(1).unwrap()
+        else {
+            panic!("expected creature attempt")
+        };
+        assert!((0..16).contains(&attempt.x) && (0..16).contains(&attempt.z));
+        assert_eq!(
+            batch.schedule().completed(center),
+            Some(schedule::GenerationStage::Light)
+        );
         let after = batch.light_snapshot([center]).unwrap();
         let after_view = batch.lit_snapshot([center]).unwrap();
         assert!(!Arc::ptr_eq(&before_view, &after_view));

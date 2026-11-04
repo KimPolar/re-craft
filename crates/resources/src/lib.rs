@@ -81,6 +81,7 @@ pub mod vanilla_stitcher;
 pub mod vegetation_patch;
 pub mod vines_feature;
 pub mod world_clock;
+pub mod worldgen_mob_spawner;
 
 pub const TARGET_VERSION: &str = "26.3";
 pub const DEMO_PLANKS_TILE_START: u32 = 5;

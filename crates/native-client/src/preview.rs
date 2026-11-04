@@ -3583,8 +3583,11 @@ mod tests {
         let worldgen_draft = native_persistence::nbt::NamedTag {
             name: "".into(),
             value: native_persistence::nbt::Tag::Compound(vec![(
-                "seed".into(),
-                native_persistence::nbt::Tag::Long(42),
+                "data".into(),
+                native_persistence::nbt::Tag::Compound(vec![(
+                    "seed".into(),
+                    native_persistence::nbt::Tag::Long(42),
+                )]),
             )]),
         };
         let initial_clocks = Arc::new(crate::fresh_generation::InitialWorldClocks {
@@ -3660,6 +3663,22 @@ mod tests {
             Some(&worldgen_draft)
         );
         assert_eq!(previous_world.light(8, 16, 8, true), Some(15));
+        assert!(expanded.draft_initial_level_data(123, None, false).is_err());
+        expanded.suggested_spawn = Some(IVec3::new(8, 16, 8));
+        let draft = expanded.draft_initial_level_data(123, None, false).unwrap();
+        assert_eq!(
+            draft
+                .value
+                .get("Data")
+                .unwrap()
+                .get("spawn")
+                .unwrap()
+                .get("pos"),
+            Some(&native_persistence::nbt::Tag::IntArray(vec![8, 16, 8]))
+        );
+        expanded.level_settings.as_mut().unwrap().session.seed = 43;
+        assert!(expanded.draft_initial_level_data(123, None, false).is_err());
+        expanded.level_settings.as_mut().unwrap().session.seed = 42;
         let player = native_session::PlayerState {
             position: glam::Vec3::new(8.5, 16.0, 8.5),
             yaw: 0.0,
@@ -3673,6 +3692,14 @@ mod tests {
             .unwrap();
         use native_session::GameSession;
         assert!(session.snapshot().vitals.hardcore);
+        assert_eq!(
+            session.snapshot().world_spawn.as_ref().unwrap().position,
+            [8, 16, 8]
+        );
+        assert_eq!(
+            session.snapshot().last_death,
+            native_session::LastDeathLocation::Absent
+        );
         let clock_id = native_persistence::world::DimensionId::parse("example:clock").unwrap();
         assert_eq!(session.world_clock(&clock_id).unwrap().total_ticks, 0);
         let mut running = expanded.start_session(player).unwrap();

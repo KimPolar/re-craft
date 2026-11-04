@@ -76,6 +76,52 @@ pub struct InitialPlayerSpawnOptions {
 }
 
 impl GenerationReady {
+    /// The shared world spawn is chosen in the overworld. A preview of another
+    /// dimension does not establish or replace the overworld's spawn.
+    pub fn initial_world_spawn(&self) -> Result<Option<native_persistence::world::RespawnData>> {
+        let Some(position) = self.suggested_spawn else {
+            return Ok(None);
+        };
+        let dimension = native_persistence::world::DimensionId::parse(&self.mesh.world.dimension)?;
+        if dimension.namespace != "minecraft" || dimension.path != "overworld" {
+            return Ok(None);
+        }
+        Ok(Some(native_persistence::world::RespawnData {
+            dimension,
+            position: position.to_array(),
+            yaw: 0.0,
+            pitch: 0.0,
+        }))
+    }
+
+    /// Draft metadata using the world spawn actually selected by this batch.
+    /// Other world files and FULL chunk conversion remain prerequisites for saving.
+    pub fn draft_initial_level_data(
+        &self,
+        last_played_ms: i64,
+        singleplayer_uuid: Option<[i32; 4]>,
+        initialized: bool,
+    ) -> Result<native_persistence::nbt::NamedTag> {
+        use native_persistence::nbt::Tag;
+        let settings = self
+            .level_settings
+            .as_ref()
+            .context("initial level settings missing")?;
+        let spawn = self
+            .initial_world_spawn()?
+            .context("initial overworld spawn missing")?;
+        let worldgen = self
+            .worldgen_settings_draft
+            .as_ref()
+            .context("world generation settings missing")?;
+        ensure!(
+            worldgen.value.get("data").and_then(|data| data.get("seed"))
+                == Some(&Tag::Long(settings.session.seed)),
+            "world generation seed differs from initial level settings"
+        );
+        settings.draft_level_data(&spawn, last_played_ms, singleplayer_uuid, initialized)
+    }
+
     /// Prepare the separate player-spawn search using explicitly supplied
     /// entity data. Missing entity chunks remain unknown rather than empty.
     pub fn start_player_spawn_search(
@@ -305,6 +351,10 @@ impl GenerationReady {
             player,
         )
         .map_err(anyhow::Error::msg)?;
+        if let Some(spawn) = self.initial_world_spawn()? {
+            session.set_world_spawn(spawn)?;
+        }
+        session.set_new_player_last_death()?;
         for &pos in targets.iter() {
             if self
                 .batch
@@ -2289,17 +2339,14 @@ mod tests {
             if !spawn_mobs {
                 assert!(worker.progress().player_spawn_search_resumptions > 0);
             }
-            let level = ready
-                .level_settings
-                .as_ref()
-                .context("level settings missing")?;
-            let level_draft = level.draft_level_data(
-                &native_persistence::world::RespawnData::default(),
-                123,
-                None,
-                false,
-            )?;
+            let level_draft = ready.draft_initial_level_data(123, None, false)?;
             let level_data = level_draft.value.get("Data").unwrap();
+            assert_eq!(
+                level_data.get("spawn").and_then(|spawn| spawn.get("pos")),
+                Some(&native_persistence::nbt::Tag::IntArray(
+                    ready.suggested_spawn.unwrap().to_array().to_vec()
+                ))
+            );
             assert_eq!(
                 level_data.get("GameType"),
                 Some(&native_persistence::nbt::Tag::Int(1))
@@ -2425,6 +2472,15 @@ mod tests {
                     pose: native_session::PlayerPose::Standing,
                 };
                 let session = ready.start_session(player)?;
+                use native_session::GameSession;
+                assert_eq!(
+                    session.snapshot().world_spawn.as_ref().unwrap().position,
+                    ready.suggested_spawn.unwrap().to_array()
+                );
+                assert_eq!(
+                    session.snapshot().last_death,
+                    native_session::LastDeathLocation::Absent
+                );
                 let Some(native_session::loaded::SavedEntityData::Present(chunk)) =
                     session.saved_entity_chunk(target)
                 else {

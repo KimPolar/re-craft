@@ -63,6 +63,7 @@ public class FluidTickOracle {
   static class TestLevel extends ServerLevel {
     Map<BlockPos,BlockState> blocks; JsonArray changes; GameRules rules;
     EnvironmentAttributeSystem attrs; RandomSource random; boolean lava;
+    BlockPos trigger, mutation; BlockState replacement;
     TestLevel() { super(null,null,null,null,null,null,false,0L,null,false); }
     @Override public BlockState getBlockState(BlockPos p) { return blocks.getOrDefault(p,Blocks.AIR.defaultBlockState()); }
     @Override public FluidState getFluidState(BlockPos p) { return getBlockState(p).getFluidState(); }
@@ -82,7 +83,9 @@ public class FluidTickOracle {
       else if (s.is(Blocks.OAK_STAIRS)) a.add(stairsCode(s));
       else if (s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST)) a.add(chestCode(s));
       else a.add(s.getValue(LiquidBlock.LEVEL) + (s.is(lava ? Blocks.WATER : Blocks.LAVA) ? 20 : 0));
-      changes.add(a); return true;
+      changes.add(a);
+      if (trigger != null && p.equals(trigger)) { blocks.put(mutation,replacement); trigger=null; }
+      return true;
     }
   }
   public static void main(String[] args) throws Exception {
@@ -104,6 +107,7 @@ public class FluidTickOracle {
       var map=EnvironmentAttributeMap.builder().set(EnvironmentAttributes.FAST_LAVA,fast).build();
       world.attrs=EnvironmentAttributeSystem.builder().addConstantLayer(map).build();
       world.blocks=new HashMap<>(); world.changes=new JsonArray(); world.lava=lava;
+      world.trigger=null; world.mutation=null; world.replacement=null;
       for(var item:s.getAsJsonArray("blocks")) { var a=item.getAsJsonArray(); int code=a.get(3).getAsInt();
         Block liquid = code >= 20 ? (lava ? Blocks.WATER : Blocks.LAVA) : (lava ? Blocks.LAVA : Blocks.WATER);
         Block grate = switch (code) {
@@ -119,6 +123,12 @@ public class FluidTickOracle {
         };
         BlockState state=code == -18 ? Blocks.SHORT_GRASS.defaultBlockState() : code == -19 ? Blocks.FERN.defaultBlockState() : code == -20 ? Blocks.DEAD_BUSH.defaultBlockState() : code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -200 && code >= -247 ? chest(code) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
+      }
+      if (s.has("mutation")) {
+        var m=s.getAsJsonArray("mutation");
+        world.trigger=new BlockPos(m.get(0).getAsInt(),m.get(1).getAsInt(),m.get(2).getAsInt());
+        world.mutation=new BlockPos(m.get(3).getAsInt(),m.get(4).getAsInt(),m.get(5).getAsInt());
+        world.replacement=m.get(6).getAsInt()==-2?Blocks.STONE.defaultBlockState():Blocks.WATER.defaultBlockState();
       }
       BlockPos p=BlockPos.ZERO; var block=world.getBlockState(p); var fluid=block.getFluidState();
       if(s.has("reaction")) reaction.invoke(Blocks.LAVA,world,p,block);
@@ -210,6 +220,92 @@ fn stair_cell(code: i64) -> Cell {
     Cell::Stairs {
         voxels: fluid_sim::octants(&shape).unwrap(),
         waterlogged,
+    }
+}
+
+struct LiveFixture {
+    blocks: HashMap<IVec3, Cell>,
+    changes: Vec<fluid_sim::Change>,
+    mutation: Option<(IVec3, IVec3, Cell)>,
+    settings: Settings,
+}
+
+impl LiveFixture {
+    fn set(&mut self, position: IVec3, block: ChangedBlock) {
+        let next = match block {
+            ChangedBlock::Air => Cell::Air,
+            ChangedBlock::Fluid(fluid) => Cell::Fluid(fluid),
+            ChangedBlock::Solid(_) => Cell::Solid,
+            ChangedBlock::WaterloggedSlab { top } => Cell::Slab {
+                top,
+                waterlogged: true,
+            },
+            ChangedBlock::WaterloggedStairs { voxels } => Cell::Stairs {
+                voxels,
+                waterlogged: true,
+            },
+            ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
+        };
+        self.blocks.insert(position, next);
+        self.changes.push(fluid_sim::Change { position, block });
+        if let Some((trigger, target, replacement)) = self.mutation
+            && trigger == position
+        {
+            self.blocks.insert(target, replacement);
+            self.mutation = None;
+        }
+    }
+}
+
+impl fluid_sim::LiveFluidWorld for LiveFixture {
+    type Error = std::convert::Infallible;
+    fn cell(&self, position: IVec3) -> Cell {
+        self.blocks.get(&position).copied().unwrap_or(Cell::Air)
+    }
+    fn delay(
+        &mut self,
+        _: IVec3,
+        old: FluidState,
+        _: Option<FluidState>,
+    ) -> Result<u64, Self::Error> {
+        Ok(self.settings.delay(old.kind))
+    }
+    fn update_origin(
+        &mut self,
+        position: IVec3,
+        next: Option<FluidState>,
+    ) -> Result<(), Self::Error> {
+        self.set(
+            position,
+            next.map_or(ChangedBlock::Air, ChangedBlock::Fluid),
+        );
+        Ok(())
+    }
+    fn schedule(&mut self, _: IVec3, _: FluidState, _: u64) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn spread_to(
+        &mut self,
+        position: IVec3,
+        old: Cell,
+        fluid: FluidState,
+        direction: IVec3,
+    ) -> Result<(), Self::Error> {
+        let block = match old {
+            Cell::Fluid(other)
+                if fluid.kind == FluidKind::Lava
+                    && other.kind == FluidKind::Water
+                    && direction == IVec3::NEG_Y =>
+            {
+                ChangedBlock::Solid(Solidified::Stone)
+            }
+            Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
+            Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
+            Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
+            _ => ChangedBlock::Fluid(fluid),
+        };
+        self.set(position, block);
+        Ok(())
     }
 }
 
@@ -540,6 +636,9 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             scenarios.push(json!({"blocks": [[0,0,0,0],[0,-1,0,-2],[-1,0,0,-2],[0,0,-1,-2],[0,0,1,-2],[1,0,0,plant],[1,-1,0,-2]], "lava": true, "fast": fast, "convert": false}));
         }
     }
+    // A downward write can trigger neighbor callbacks before source counting.
+    scenarios.push(json!({"blocks": [[0,0,0,0],[0,0,-1,0],[0,0,1,0],[-1,0,0,0]], "lava": false, "fast": false, "convert": true, "mutation": [0,-1,0,0,0,-1,-2]}));
+    scenarios.push(json!({"blocks": [[0,0,0,0],[0,0,-1,-2],[0,0,1,0],[-1,0,0,0]], "lava": false, "fast": false, "convert": true, "mutation": [0,-1,0,0,0,-1,0]}));
     let input = temp.path().join("input.json");
     let output = temp.path().join("output.json");
     std::fs::write(&input, serde_json::to_vec(&scenarios).unwrap()).unwrap();
@@ -655,16 +754,45 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
             lava_source_conversion: convert,
             fast_lava: scenario["fast"].as_bool().unwrap(),
         };
-        let changes = fluid_sim::try_tick(
+        let original = blocks[&IVec3::ZERO]
+            .contained_fluid()
+            .expect("fixture has a fluid");
+        let planned = fluid_sim::try_tick(
             &|pos| blocks.get(&pos).copied().unwrap_or(Cell::Air),
             IVec3::ZERO,
-            blocks[&IVec3::ZERO]
-                .contained_fluid()
-                .expect("fixture has a fluid"),
+            original,
             settings,
         )
         .expect("fixture cells are complete");
-        let actual: Vec<_> = changes
+        let mutation = scenario.get("mutation").map(|m| {
+            let coord = |i: usize| m[i].as_i64().unwrap() as i32;
+            (
+                IVec3::new(coord(0), coord(1), coord(2)),
+                IVec3::new(coord(3), coord(4), coord(5)),
+                if coord(6) == -2 {
+                    Cell::Solid
+                } else {
+                    Cell::Fluid(liquid(FluidKind::Water, 0))
+                },
+            )
+        });
+        let mut live = LiveFixture {
+            blocks,
+            changes: Vec::new(),
+            mutation,
+            settings,
+        };
+        fluid_sim::tick_live(&mut live, IVec3::ZERO, original, settings).unwrap();
+        if scenario.get("mutation").is_none() {
+            assert_eq!(live.changes, planned, "case {index}: {scenario}");
+        } else {
+            assert_ne!(
+                live.changes, planned,
+                "callback did not affect case {index}: {scenario}"
+            );
+        }
+        let actual: Vec<_> = live
+            .changes
             .iter()
             .map(|change| {
                 let level = match change.block {

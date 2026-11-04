@@ -473,6 +473,16 @@ fn side_changes(
     state: FluidState,
     settings: Settings,
 ) -> Vec<Change> {
+    side_changes_from(world, pos, world(pos), state, settings)
+}
+
+fn side_changes_from(
+    world: &impl Fn(IVec3) -> Cell,
+    pos: IVec3,
+    current: Cell,
+    state: FluidState,
+    settings: Settings,
+) -> Vec<Change> {
     let outgoing = if state.falling {
         7
     } else {
@@ -483,7 +493,6 @@ fn side_changes(
     }
     let mut best = 1000;
     let mut changes = Vec::new();
-    let current = world(pos);
     for direction in SIDES {
         let Some(next) = offset(pos, direction) else {
             continue;
@@ -686,11 +695,300 @@ pub fn try_tick(
     }
 }
 
+/// Operations whose effects must be visible before the fluid tick continues.
+/// Implementations must preserve Java's block callbacks and scheduled ticks.
+pub trait LiveFluidWorld {
+    type Error;
+
+    fn cell(&self, position: IVec3) -> Cell;
+    fn delay(
+        &mut self,
+        position: IVec3,
+        old: FluidState,
+        next: Option<FluidState>,
+    ) -> Result<u64, Self::Error>;
+    fn update_origin(
+        &mut self,
+        position: IVec3,
+        next: Option<FluidState>,
+    ) -> Result<(), Self::Error>;
+    fn schedule(
+        &mut self,
+        position: IVec3,
+        fluid: FluidState,
+        delay: u64,
+    ) -> Result<(), Self::Error>;
+    fn spread_to(
+        &mut self,
+        position: IVec3,
+        old: Cell,
+        fluid: FluidState,
+        direction: IVec3,
+    ) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LiveTickError<E> {
+    Incomplete(IncompleteTick),
+    World(E),
+}
+
+fn inspect_live<W: LiveFluidWorld, T>(
+    world: &W,
+    inspect: impl FnOnce(&dyn Fn(IVec3) -> Cell) -> T,
+) -> Result<T, LiveTickError<W::Error>> {
+    let unknown = std::cell::Cell::new(None);
+    let read = |pos| {
+        let cell = world.cell(pos);
+        if cell == Cell::Unknown && unknown.get().is_none() {
+            unknown.set(Some(pos));
+        }
+        cell
+    };
+    let value = inspect(&read);
+    match unknown.get() {
+        Some(pos) => Err(LiveTickError::Incomplete(IncompleteTick::Unknown(pos))),
+        None => Ok(value),
+    }
+}
+
+/// Run a fluid tick in Java's mutation order. The caller must isolate or stage
+/// the world: an error may occur after earlier callbacks have already changed
+/// blocks, random state or scheduled ticks. `original` is the captured fluid
+/// state at the start of the tick, as passed by postprocessing.
+pub fn tick_live<W: LiveFluidWorld>(
+    world: &mut W,
+    position: IVec3,
+    original: FluidState,
+    settings: Settings,
+) -> Result<(), LiveTickError<W::Error>> {
+    let radius = i32::from(settings.slope_distance(original.kind)) + 2;
+    if [position.x, position.y, position.z]
+        .into_iter()
+        .any(|coordinate| {
+            coordinate.checked_sub(radius).is_none() || coordinate.checked_add(radius).is_none()
+        })
+    {
+        return Err(LiveTickError::Incomplete(
+            IncompleteTick::CoordinateOverflow,
+        ));
+    }
+    let mut origin = inspect_live(world, |read| read(position))?;
+    if origin.contained_fluid() != Some(original) {
+        return Err(LiveTickError::Incomplete(IncompleteTick::FluidChanged));
+    }
+    if matches!(origin, Cell::GrateWater(_)) {
+        return Ok(());
+    }
+    let mut current = original;
+    if !original.source {
+        let next = inspect_live(world, |read| {
+            new_liquid(&|pos| read(pos), position, original.kind, settings)
+        })?;
+        let delay = world
+            .delay(position, original, next)
+            .map_err(LiveTickError::World)?;
+        if next != Some(original) {
+            world
+                .update_origin(position, next)
+                .map_err(LiveTickError::World)?;
+            let Some(next) = next else {
+                return Ok(());
+            };
+            world
+                .schedule(position, next, delay)
+                .map_err(LiveTickError::World)?;
+            current = next;
+            origin = Cell::Fluid(next);
+        }
+    }
+    let below = offset(position, IVec3::NEG_Y).expect("coordinate range was checked");
+    let next_below = inspect_live(world, |read| {
+        let below_cell = read(below);
+        let candidate = (can_search(below_cell, current.kind)
+            && can_pass(origin, below_cell, IVec3::NEG_Y))
+        .then(|| new_liquid(&|pos| read(pos), below, current.kind, settings))
+        .flatten()
+        .filter(|next| can_replace(&|pos| read(pos), below, *next, true));
+        candidate.map(|next| (below_cell, next))
+    })?;
+    if let Some((below_cell, next)) = next_below {
+        world
+            .spread_to(below, below_cell, next, IVec3::NEG_Y)
+            .map_err(LiveTickError::World)?;
+        let count = inspect_live(world, |read| {
+            SIDES
+                .iter()
+                .filter(|direction| {
+                    source(
+                        read(offset(position, **direction).expect("coordinate range was checked")),
+                        current.kind,
+                    )
+                })
+                .count()
+        })?;
+        if count < 3 {
+            return Ok(());
+        }
+    } else if !current.source {
+        let hole = inspect_live(world, |read| {
+            is_hole(
+                &|pos| if pos == position { origin } else { read(pos) },
+                position,
+                current.kind,
+            )
+        })?;
+        if hole {
+            return Ok(());
+        }
+    }
+    let sides = inspect_live(world, |read| {
+        side_changes_from(&|pos| read(pos), position, origin, current, settings)
+    })?;
+    for change in sides {
+        let fluid = match change.block {
+            ChangedBlock::Fluid(fluid) => fluid,
+            ChangedBlock::WaterloggedSlab { .. }
+            | ChangedBlock::WaterloggedStairs { .. }
+            | ChangedBlock::WaterloggedChest => flowing(FluidKind::Water, 8, false),
+            ChangedBlock::Air | ChangedBlock::Solid(_) => {
+                unreachable!("side planning only emits fluid")
+            }
+        };
+        let old = inspect_live(world, |read| read(change.position))?;
+        world
+            .spread_to(change.position, old, fluid, change.position - position)
+            .map_err(LiveTickError::World)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collision::{block_shape, merged_face_occludes};
     use crate::loaded::BlockState;
+
+    #[test]
+    fn live_tick_observes_neighbor_changes_after_downward_spread() {
+        use std::collections::HashMap;
+        struct World {
+            cells: HashMap<IVec3, Cell>,
+            writes: Vec<IVec3>,
+            mutation: Option<Cell>,
+        }
+        impl LiveFluidWorld for World {
+            type Error = ();
+            fn cell(&self, pos: IVec3) -> Cell {
+                self.cells.get(&pos).copied().unwrap_or(Cell::Air)
+            }
+            fn delay(&mut self, _: IVec3, _: FluidState, _: Option<FluidState>) -> Result<u64, ()> {
+                Ok(5)
+            }
+            fn update_origin(&mut self, _: IVec3, _: Option<FluidState>) -> Result<(), ()> {
+                unreachable!()
+            }
+            fn schedule(&mut self, _: IVec3, _: FluidState, _: u64) -> Result<(), ()> {
+                unreachable!()
+            }
+            fn spread_to(
+                &mut self,
+                pos: IVec3,
+                _: Cell,
+                fluid: FluidState,
+                _: IVec3,
+            ) -> Result<(), ()> {
+                self.writes.push(pos);
+                self.cells.insert(pos, Cell::Fluid(fluid));
+                if pos == IVec3::NEG_Y
+                    && let Some(next) = self.mutation.take()
+                {
+                    self.cells.insert(IVec3::NEG_Z, next);
+                }
+                Ok(())
+            }
+        }
+        let water = flowing(FluidKind::Water, 8, false);
+        let cells = HashMap::from([
+            (IVec3::ZERO, Cell::Fluid(water)),
+            (IVec3::NEG_Z, Cell::Fluid(water)),
+            (IVec3::Z, Cell::Fluid(water)),
+            (IVec3::NEG_X, Cell::Fluid(water)),
+        ]);
+        let mut world = World {
+            cells: cells.clone(),
+            writes: Vec::new(),
+            mutation: Some(Cell::Solid),
+        };
+        tick_live(&mut world, IVec3::ZERO, water, Settings::default()).unwrap();
+        assert_eq!(world.writes, [IVec3::NEG_Y]);
+        let mut incomplete = World {
+            cells,
+            writes: Vec::new(),
+            mutation: Some(Cell::Unknown),
+        };
+        assert_eq!(
+            tick_live(&mut incomplete, IVec3::ZERO, water, Settings::default()),
+            Err(LiveTickError::Incomplete(IncompleteTick::Unknown(
+                IVec3::NEG_Z
+            )))
+        );
+        assert_eq!(incomplete.writes, [IVec3::NEG_Y]);
+    }
+
+    #[test]
+    fn live_tick_updates_origin_before_scheduling_recalculated_fluid() {
+        struct World {
+            current: FluidState,
+            source: FluidState,
+            actions: Vec<&'static str>,
+        }
+        impl LiveFluidWorld for World {
+            type Error = ();
+            fn cell(&self, pos: IVec3) -> Cell {
+                if pos == IVec3::ZERO {
+                    Cell::Fluid(self.current)
+                } else if pos == IVec3::NEG_X {
+                    Cell::Fluid(self.source)
+                } else {
+                    Cell::Solid
+                }
+            }
+            fn delay(
+                &mut self,
+                _: IVec3,
+                old: FluidState,
+                next: Option<FluidState>,
+            ) -> Result<u64, ()> {
+                assert_eq!(old.amount, 3);
+                assert_eq!(next.unwrap().amount, 7);
+                self.actions.push("delay");
+                Ok(5)
+            }
+            fn update_origin(&mut self, _: IVec3, next: Option<FluidState>) -> Result<(), ()> {
+                self.current = next.unwrap();
+                self.actions.push("update");
+                Ok(())
+            }
+            fn schedule(&mut self, _: IVec3, fluid: FluidState, delay: u64) -> Result<(), ()> {
+                assert_eq!(self.current, fluid);
+                assert_eq!(delay, 5);
+                self.actions.push("schedule");
+                Ok(())
+            }
+            fn spread_to(&mut self, _: IVec3, _: Cell, _: FluidState, _: IVec3) -> Result<(), ()> {
+                unreachable!()
+            }
+        }
+        let original = flowing(FluidKind::Water, 3, false);
+        let mut world = World {
+            current: original,
+            source: flowing(FluidKind::Water, 8, false),
+            actions: Vec::new(),
+        };
+        tick_live(&mut world, IVec3::ZERO, original, Settings::default()).unwrap();
+        assert_eq!(world.actions, ["delay", "update", "schedule"]);
+    }
 
     #[test]
     fn precise_tick_rejects_consulted_unknown_cells_and_coordinate_overflow() {

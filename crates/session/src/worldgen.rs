@@ -42,7 +42,8 @@ pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
-    GeneratedCreatureCollisionProgress, GeneratedCreatureProbe, GeneratedCreatureProbeProgress,
+    GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
+    GeneratedCreaturePose, GeneratedCreatureProbe, GeneratedCreatureProbeProgress,
     GeneratedCreatureRuleProgress, GeneratedMobPlacementView,
 };
 pub use ore::{
@@ -3010,6 +3011,7 @@ mod tests {
                 min_y: 0,
                 height: 16,
                 has_skylight: true,
+                ambient_light: Some(0.0),
             };
             let center = ChunkPos { x: 0, z: 0 };
             let east = ChunkPos { x: 1, z: 0 };
@@ -3155,6 +3157,7 @@ mod tests {
             min_y: 0,
             height: 16,
             has_skylight: false,
+            ambient_light: Some(0.0),
         };
         batch
             .enable_decoration(&mut data, &BTreeSet::new(), block_registry, &lighting)
@@ -3443,7 +3446,7 @@ mod tests {
             );
             view.set_rule_light_for_test(center, light);
             let mut accepted_planner = batch
-                .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns)
+                .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns.clone())
                 .unwrap();
             assert_eq!(
                 accepted_planner.next(1).unwrap(),
@@ -3478,6 +3481,77 @@ mod tests {
             assert!(
                 accepted
                     .check_spawn_rules(&mut accepted_planner, &mut view, &ground_spawn_tags)
+                    .is_err()
+            );
+            // The harness represents a successful external constructor. The
+            // entity itself is not yet implemented by this generation path.
+            let pose = accepted.mark_constructed(&mut accepted_planner).unwrap();
+            assert_eq!(pose.geometry, geometry);
+            assert!((0.0..360.0).contains(&pose.yaw));
+            assert_eq!(accepted_planner.created_attempt(), Some(attempt.clone()));
+            assert!(accepted_planner.next(0).is_err());
+            assert_eq!(
+                accepted
+                    .check_instance_rules(&mut accepted_planner, &mut view)
+                    .unwrap(),
+                GeneratedCreatureInstanceRuleProgress::Rejected
+            );
+            let CreatureSpawnProgress::Attempt(next) = accepted_planner.next(0).unwrap() else {
+                panic!("expected post-construction retry");
+            };
+            assert_eq!(
+                (next.member, next.attempt),
+                (attempt.member, attempt.attempt + 1)
+            );
+            assert!(accepted.mark_constructed(&mut accepted_planner).is_err());
+
+            let mut light = native_world::generation_light::VisibleLightSnapshot::new(true, false);
+            light.insert_complete_column(
+                center,
+                native_world::generation_light::VisibleLightColumn::new(
+                    BTreeMap::from([(1, Arc::new([0xff; native_world::loaded::LIGHT_BYTES]))]),
+                    BTreeMap::new(),
+                ),
+            );
+            view.set_rule_light_for_test(center, light);
+            let mut bright_planner = batch
+                .plan_creature_spawning(center, true, 0.999_999_9, mob_spawns)
+                .unwrap();
+            assert_eq!(
+                bright_planner.next(1).unwrap(),
+                CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            let mut bright = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
+            loop {
+                match bright.poll(&mut bright_planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::NeedsCollision(_) => break,
+                    GeneratedCreatureProbeProgress::Rejected => {
+                        panic!("unexpected bright probe rejection")
+                    }
+                }
+            }
+            assert_eq!(
+                bright.check_collision(&mut bright_planner, &view).unwrap(),
+                GeneratedCreatureCollisionProgress::NeedsSpawnRules(geometry)
+            );
+            assert_eq!(
+                bright
+                    .check_spawn_rules(&mut bright_planner, &mut view, &ground_spawn_tags)
+                    .unwrap(),
+                GeneratedCreatureRuleProgress::NeedsConstruction(geometry)
+            );
+            let bright_pose = bright.mark_constructed(&mut bright_planner).unwrap();
+            assert_eq!(
+                bright
+                    .check_instance_rules(&mut bright_planner, &mut view)
+                    .unwrap(),
+                GeneratedCreatureInstanceRuleProgress::NeedsObstruction(bright_pose)
+            );
+            assert_eq!(bright_planner.created_attempt(), Some(attempt.clone()));
+            assert!(
+                bright
+                    .check_instance_rules(&mut bright_planner, &mut view)
                     .is_err()
             );
             let tag = BTreeSet::from(["minecraft:void_air".into()]);
@@ -3749,6 +3823,7 @@ mod tests {
                 min_y: 0,
                 height: 16,
                 has_skylight: has_sky,
+                ambient_light: Some(0.0),
             };
             let mut invalid = lighting.clone();
             invalid.height = 32;

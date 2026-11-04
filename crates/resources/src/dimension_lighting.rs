@@ -4,13 +4,16 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
 /// Cache this together with the generation settings from the same pack revision.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GeneratedDimensionLighting {
     pub dimension: ResourceId,
     pub dimension_type: Option<ResourceId>,
     pub min_y: i32,
     pub height: i32,
     pub has_skylight: bool,
+    /// Missing in incomplete synthetic definitions; gameplay checks that
+    /// require ambient light must wait for a complete dimension type.
+    pub ambient_light: Option<f32>,
 }
 
 impl GeneratedDimensionLighting {
@@ -111,6 +114,17 @@ impl GeneratedDimensionLighting {
             .get("has_skylight")
             .and_then(Value::as_bool)
             .context("dimension has_skylight is missing or invalid")?;
+        let ambient_light = definition
+            .get("ambient_light")
+            .map(|value| -> Result<f32> {
+                let ambient = value
+                    .as_f64()
+                    .context("dimension ambient_light is invalid")?
+                    as f32;
+                ensure!(ambient.is_finite(), "dimension ambient_light is invalid");
+                Ok(ambient)
+            })
+            .transpose()?;
         Ok((
             Self {
                 dimension,
@@ -118,6 +132,7 @@ impl GeneratedDimensionLighting {
                 min_y,
                 height,
                 has_skylight,
+                ambient_light,
             },
             generator,
         ))
@@ -141,8 +156,8 @@ mod tests {
     fn packs() -> Packs {
         Packs(BTreeMap::from([
             ("data/example/worldgen/world_preset/test.json".into(),br#"{"dimensions":{"example:world":{"type":"example:base","generator":{"type":"minecraft:noise"}}}}"#.to_vec()),
-            ("data/example/dimension_type/base.json".into(),br#"{"min_y":-64,"height":384,"has_skylight":true}"#.to_vec()),
-            ("data/example/dimension_type/override.json".into(),br#"{"min_y":0,"height":256,"has_skylight":false}"#.to_vec()),
+            ("data/example/dimension_type/base.json".into(),br#"{"min_y":-64,"height":384,"has_skylight":true,"ambient_light":0.1}"#.to_vec()),
+            ("data/example/dimension_type/override.json".into(),br#"{"min_y":0,"height":256,"has_skylight":false,"ambient_light":0.25}"#.to_vec()),
         ]))
     }
     #[test]
@@ -155,6 +170,7 @@ mod tests {
             (original.min_y, original.height, original.has_skylight),
             (-64, 384, true)
         );
+        assert_eq!(original.ambient_light, Some(0.1));
         p.0.insert(
             "data/example/dimension/world.json".into(),
             br#"{"type":"example:override","generator":{"type":"example:override"}}"#.to_vec(),
@@ -170,15 +186,17 @@ mod tests {
             (selected.min_y, selected.height, selected.has_skylight),
             (0, 256, false)
         );
+        assert_eq!(selected.ambient_light, Some(0.25));
         assert_eq!(
             selected.dimension_type.unwrap(),
             ResourceId::parse("example:override").unwrap()
         );
-        p.0.insert("data/example/dimension/world.json".into(),br#"{"type":{"min_y":0,"height":16,"has_skylight":true},"generator":{"type":"minecraft:noise"}}"#.to_vec());
+        p.0.insert("data/example/dimension/world.json".into(),br#"{"type":{"min_y":0,"height":16,"has_skylight":true,"ambient_light":0.5},"generator":{"type":"minecraft:noise"}}"#.to_vec());
         let inline =
             GeneratedDimensionLighting::load_preset(&mut p, "example:test", "example:world")
                 .unwrap();
         assert_eq!(inline.dimension_type, None);
+        assert_eq!(inline.ambient_light, Some(0.5));
         assert_eq!(
             (inline.min_y, inline.height, inline.has_skylight),
             (0, 16, true)
@@ -195,6 +213,8 @@ mod tests {
             br#"{"min_y":-64,"height":384}"#.as_slice(),
             br#"{"min_y":-63,"height":384,"has_skylight":true}"#,
             br#"{"min_y":0,"height":16,"has_skylight":1}"#,
+            br#"{"min_y":0,"height":16,"has_skylight":true,"ambient_light":true}"#,
+            br#"{"min_y":0,"height":16,"has_skylight":true,"ambient_light":1e100}"#,
         ] {
             p.0.insert(
                 "data/example/dimension_type/base.json".into(),
@@ -213,10 +233,10 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
         let mut packs = crate::packs::ResourceStack::open(&game).unwrap();
-        for (dimension, min_y, height, sky) in [
-            ("minecraft:overworld", -64, 384, true),
-            ("minecraft:the_nether", 0, 256, false),
-            ("minecraft:the_end", 0, 256, true),
+        for (dimension, min_y, height, sky, ambient) in [
+            ("minecraft:overworld", -64, 384, true, 0.0),
+            ("minecraft:the_nether", 0, 256, false, 0.1),
+            ("minecraft:the_end", 0, 256, true, 0.25),
         ] {
             let result =
                 GeneratedDimensionLighting::load_preset(&mut packs, "minecraft:normal", dimension)
@@ -229,6 +249,7 @@ mod tests {
                 result.dimension_type,
                 Some(ResourceId::parse(dimension).unwrap())
             );
+            assert_eq!(result.ambient_light, Some(ambient));
         }
     }
 }

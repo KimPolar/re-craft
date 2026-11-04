@@ -189,6 +189,12 @@ impl ChunkCreatureSpawner {
         Ok(self.random.next_float() * 360.0_f32)
     }
 
+    /// The current constructed entity remains pending until the caller
+    /// reports its post-construction checks and finalization outcome.
+    pub fn created_attempt(&self) -> Option<CreatureAttempt> {
+        (self.state == State::FinishEntity).then(|| self.attempt())
+    }
+
     pub fn finish_entity(&mut self, accepted: bool) -> Result<()> {
         ensure!(
             self.state == State::FinishEntity,

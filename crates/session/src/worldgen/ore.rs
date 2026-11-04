@@ -8384,6 +8384,7 @@ mod tests {
             min_y: 0,
             height: 32,
             has_skylight: true,
+            ambient_light: Some(0.0),
         };
         let before = terrain.snapshot();
         assert!(

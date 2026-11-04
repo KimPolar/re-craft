@@ -41,6 +41,18 @@ pub enum GeneratedCreatureRuleProgress {
     NeedsConstruction(native_resources::worldgen_mob_geometry::CreatureSpawnGeometry),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeneratedCreaturePose {
+    pub geometry: native_resources::worldgen_mob_geometry::CreatureSpawnGeometry,
+    pub yaw: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GeneratedCreatureInstanceRuleProgress {
+    Rejected,
+    NeedsObstruction(GeneratedCreaturePose),
+}
+
 pub struct GeneratedCreatureProbe {
     attempt: CreatureAttempt,
     top_search: native_resources::mob_spawn_placement::TopMobSpawnPosition,
@@ -50,6 +62,8 @@ pub struct GeneratedCreatureProbe {
     placement_passed: bool,
     collision_passed: bool,
     rules_passed: bool,
+    constructed_yaw: Option<f32>,
+    instance_rules_passed: bool,
 }
 
 impl GeneratedCreatureProbe {
@@ -68,6 +82,8 @@ impl GeneratedCreatureProbe {
             placement_passed: false,
             collision_passed: false,
             rules_passed: false,
+            constructed_yaw: None,
+            instance_rules_passed: false,
         }
     }
 
@@ -139,18 +155,7 @@ impl GeneratedCreatureProbe {
         );
         let geometry =
             self.collision_geometry(self.top.context("creature position is missing")?)?;
-        let coords = geometry.position;
-        ensure!(
-            coords.iter().all(|v| v.is_finite()
-                && v.floor() >= f64::from(i32::MIN)
-                && v.floor() <= f64::from(i32::MAX)),
-            "creature rule position overflow"
-        );
-        let pos = IVec3::new(
-            coords[0].floor() as i32,
-            coords[1].floor() as i32,
-            coords[2].floor() as i32,
-        );
+        let pos = geometry_block_position(geometry)?;
         let mut inputs = GeneratedGroundRuleWorld { view: world, tags };
         if !native_resources::worldgen_mob_rules::check_ground_creature_spawn(
             &self.attempt.entity,
@@ -163,6 +168,62 @@ impl GeneratedCreatureProbe {
         }
         self.rules_passed = true;
         Ok(GeneratedCreatureRuleProgress::NeedsConstruction(geometry))
+    }
+
+    /// Call only after the selected entity's real constructor succeeds. Java
+    /// draws the yaw from the chunk-generation RNG before its instance rules.
+    /// This does not construct or persist an entity.
+    pub fn mark_constructed(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+    ) -> Result<GeneratedCreaturePose> {
+        ensure!(
+            self.rules_passed && !self.rejected && self.constructed_yaw.is_none(),
+            "creature is not ready for construction"
+        );
+        ensure!(
+            planner.next(0)? == CreatureSpawnProgress::Attempt(self.attempt.clone()),
+            "creature planner attempt changed"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = planner.entity_created()?;
+        self.constructed_yaw = Some(yaw);
+        Ok(GeneratedCreaturePose { geometry, yaw })
+    }
+
+    /// Check the constructed animal's instance rule before obstruction and
+    /// finalization. A rejection performs Java's post-construction walk.
+    pub fn check_instance_rules(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        world: &mut GeneratedMobPlacementView<'_>,
+    ) -> Result<GeneratedCreatureInstanceRuleProgress> {
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        ensure!(
+            !self.rejected
+                && !self.instance_rules_passed
+                && planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed creature is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let pos = geometry_block_position(geometry)?;
+        if !native_resources::worldgen_mob_rules::check_animal_instance_spawn(
+            &self.attempt.entity,
+            pos,
+            world,
+        )? {
+            planner.finish_entity(false)?;
+            self.rejected = true;
+            return Ok(GeneratedCreatureInstanceRuleProgress::Rejected);
+        }
+        self.instance_rules_passed = true;
+        Ok(GeneratedCreatureInstanceRuleProgress::NeedsObstruction(
+            GeneratedCreaturePose { geometry, yaw },
+        ))
     }
 
     /// Resolve one pending planner attempt against generated blocks. Missing
@@ -198,6 +259,23 @@ impl GeneratedCreatureProbe {
         self.placement_passed = true;
         Ok(GeneratedCreatureProbeProgress::NeedsCollision(top))
     }
+}
+
+fn geometry_block_position(
+    geometry: native_resources::worldgen_mob_geometry::CreatureSpawnGeometry,
+) -> Result<IVec3> {
+    let coords = geometry.position;
+    ensure!(
+        coords.iter().all(|v| v.is_finite()
+            && v.floor() >= f64::from(i32::MIN)
+            && v.floor() <= f64::from(i32::MAX)),
+        "creature rule position overflow"
+    );
+    Ok(IVec3::new(
+        coords[0].floor() as i32,
+        coords[1].floor() as i32,
+        coords[2].floor() as i32,
+    ))
 }
 
 pub struct GeneratedMobPlacementView<'a> {
@@ -278,6 +356,20 @@ impl<'a> GeneratedMobPlacementView<'a> {
         Ok(facts)
     }
 
+    fn rule_raw_brightness(&mut self, position: IVec3) -> Result<u8> {
+        let chunk = ChunkPos {
+            x: position.x.div_euclid(16),
+            z: position.z.div_euclid(16),
+        };
+        if !self.rule_light.contains_key(&chunk) {
+            let snapshot = self.batch.light_snapshot([chunk])?;
+            self.rule_light.insert(chunk, snapshot);
+        }
+        self.rule_light[&chunk]
+            .raw_brightness(position.to_array(), 0)
+            .context("creature spawn light is unavailable")
+    }
+
     #[cfg(test)]
     pub(super) fn set_rule_light_for_test(
         &mut self,
@@ -297,17 +389,7 @@ impl native_resources::worldgen_mob_rules::GroundCreatureSpawnWorld
     for GeneratedGroundRuleWorld<'_, '_>
 {
     fn raw_brightness(&mut self, position: IVec3) -> Result<u8> {
-        let chunk = ChunkPos {
-            x: position.x.div_euclid(16),
-            z: position.z.div_euclid(16),
-        };
-        if !self.view.rule_light.contains_key(&chunk) {
-            let snapshot = self.view.batch.light_snapshot([chunk])?;
-            self.view.rule_light.insert(chunk, snapshot);
-        }
-        self.view.rule_light[&chunk]
-            .raw_brightness(position.to_array(), 0)
-            .context("creature spawn light is unavailable")
+        self.view.rule_raw_brightness(position)
     }
     fn tagged_ground(
         &mut self,
@@ -315,6 +397,20 @@ impl native_resources::worldgen_mob_rules::GroundCreatureSpawnWorld
         tag: native_resources::worldgen_mob_rules::GroundSpawnTag,
     ) -> Result<bool> {
         Ok(self.tags.contains(tag, &self.view.block(position)?.name))
+    }
+}
+
+impl native_resources::worldgen_mob_rules::AnimalInstanceSpawnWorld
+    for GeneratedMobPlacementView<'_>
+{
+    fn is_grass_block(&mut self, position: IVec3) -> Result<bool> {
+        Ok(self.block(position)?.name == "minecraft:grass_block")
+    }
+    fn raw_brightness(&mut self, position: IVec3) -> Result<u8> {
+        self.rule_raw_brightness(position)
+    }
+    fn ambient_light(&mut self) -> Result<f32> {
+        self.batch.ambient_light()
     }
 }
 

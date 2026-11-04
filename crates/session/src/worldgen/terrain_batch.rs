@@ -53,6 +53,7 @@ struct DecorationConfig {
     block_registry: BTreeSet<String>,
     has_skylight: bool,
     dimension_type: Option<String>,
+    ambient_light: Option<f32>,
 }
 
 impl FreshTerrainBatch {
@@ -187,17 +188,29 @@ impl FreshTerrainBatch {
             "lighting settings differ from generation dimension"
         );
         ensure!(!block_registry.is_empty(), "block registry is empty");
+        ensure!(
+            lighting.ambient_light.is_none_or(f32::is_finite),
+            "invalid dimension ambient light"
+        );
         let schedule = self.generator.feature_schedule(provider, placed_features)?;
         self.decoration = Some(DecorationConfig {
             schedule,
             block_registry,
             has_skylight: lighting.has_skylight,
+            ambient_light: lighting.ambient_light,
             dimension_type: lighting
                 .dimension_type
                 .as_ref()
                 .map(|id| format!("{}:{}", id.namespace, id.path)),
         });
         Ok(())
+    }
+
+    pub(super) fn ambient_light(&self) -> Result<f32> {
+        self.decoration
+            .as_ref()
+            .and_then(|config| config.ambient_light)
+            .context("dimension ambient light is unavailable")
     }
 
     /// Enable INITIALIZE_LIGHT before requesting work. The validated block

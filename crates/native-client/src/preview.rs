@@ -2971,6 +2971,7 @@ mod tests {
             min_y: 0,
             height: 16,
             has_skylight: true,
+            ambient_light: Some(0.0),
         };
         batch
             .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)

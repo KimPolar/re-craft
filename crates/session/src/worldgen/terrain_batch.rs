@@ -1523,7 +1523,23 @@ impl FreshTerrainBatch {
             .decoration
             .as_ref()
             .and_then(|config| config.mushroom_tags.clone());
+        let heightmap_tags = Arc::new(
+            self.decoration
+                .as_ref()
+                .context("generation heightmap tags are missing")?
+                .heightmap_tags
+                .clone(),
+        );
         let (min_y, max_y) = self.build_bounds()?;
+        let bounds = native_persistence::heightmap::HeightBounds { min_y, max_y };
+        let mut heightmaps = BTreeMap::new();
+        for &pos in &positions {
+            let raw = self.converted_full_heightmap_data(pos)?;
+            heightmaps.insert(
+                pos,
+                native_persistence::heightmap::FullHeightmaps::from_converted(bounds, &raw)?,
+            );
+        }
         Ok(super::GeneratedPostprocessing::new(
             world,
             min_y,
@@ -1531,6 +1547,8 @@ impl FreshTerrainBatch {
             region,
             light,
             mushroom_tags,
+            heightmaps,
+            Some(heightmap_tags),
         ))
     }
 

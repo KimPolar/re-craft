@@ -4898,6 +4898,10 @@ mod tests {
         assert!(processed.edits.is_empty());
         assert!(processed.light_checks.is_empty());
         assert_eq!(
+            processed.heightmaps[&center].to_tag().unwrap(),
+            batch.converted_full_heightmap_data(center).unwrap()
+        );
+        assert_eq!(
             processed.ticks.chunk(center).unwrap().blocks.pack(42),
             saved
         );

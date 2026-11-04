@@ -2,7 +2,10 @@
 //!
 //! More block and fluid callbacks are needed before this can produce a
 //! playable or saveable chunk. Unknown callbacks fail the entire attempt.
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use native_resources::tree_leaf_update::ShapeEdgeWorld;
@@ -33,6 +36,8 @@ pub struct GeneratedPostprocessing {
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     edits: Vec<BlockPosition>,
     light_checks: Vec<BlockPosition>,
+    heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+    heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
 }
 
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
@@ -41,10 +46,12 @@ pub struct PostprocessedGeneratedRegion {
     pub world: Arc<World>,
     pub ticks: RegionTicks,
     pub chunks: BTreeSet<ChunkPos>,
-    /// Block changes must be applied to FULL heightmaps before saving.
+    /// Ordered block changes performed during postprocessing.
     pub edits: Vec<BlockPosition>,
     /// These light checks must be processed before publishing the result.
     pub light_checks: Vec<BlockPosition>,
+    /// Updated FULL maps; other chunk and world validation remains necessary.
+    pub heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
 }
 
 impl GeneratedPostprocessing {
@@ -55,6 +62,8 @@ impl GeneratedPostprocessing {
         region: ConvertedPostprocessingRegion,
         light: Option<VisibleLightSnapshot>,
         mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+        heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+        heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     ) -> Self {
         Self {
             world,
@@ -68,6 +77,8 @@ impl GeneratedPostprocessing {
             mushroom_tags,
             edits: Vec::new(),
             light_checks: Vec::new(),
+            heightmaps,
+            heightmap_tags,
         }
     }
 
@@ -99,6 +110,8 @@ impl GeneratedPostprocessing {
             mushroom_tags: self.mushroom_tags.as_deref(),
             edits: &mut self.edits,
             light_checks: &mut self.light_checks,
+            heightmaps: &mut self.heightmaps,
+            heightmap_tags: self.heightmap_tags.as_deref(),
         };
         let done = task.poll(&mut view, budget)?;
         if done {
@@ -121,6 +134,7 @@ impl GeneratedPostprocessing {
             chunks: self.completed,
             edits: self.edits,
             light_checks: self.light_checks,
+            heightmaps: self.heightmaps,
         })
     }
 }
@@ -134,6 +148,8 @@ struct GeneratedBlockView<'a> {
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     edits: &'a mut Vec<BlockPosition>,
     light_checks: &'a mut Vec<BlockPosition>,
+    heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
+    heightmap_tags: Option<&'a native_resources::heightmap_tags::HeightmapTags>,
 }
 
 #[derive(Clone, Copy)]
@@ -259,6 +275,31 @@ impl GeneratedBlockView<'_> {
                 .map_err(|error| anyhow::anyhow!("cannot update generated mushroom: {error:?}"))?,
             "generated mushroom write was unchanged"
         );
+        let tags = self
+            .heightmap_tags
+            .context("generated heightmap tags unavailable")?;
+        let chunk = ChunkPos {
+            x: pos[0].div_euclid(16),
+            z: pos[2].div_euclid(16),
+        };
+        let maps = self
+            .heightmaps
+            .get_mut(&chunk)
+            .context("generated FULL heightmaps unavailable")?;
+        let base_x = pos[0] - pos[0].rem_euclid(16);
+        let base_z = pos[2] - pos[2].rem_euclid(16);
+        maps.update_after_change(
+            pos[0],
+            pos[1],
+            pos[2],
+            crate::spawn_heightmaps::classify(next, tags)?,
+            |x, y, z| {
+                let block = world
+                    .block(base_x + x, y, base_z + z)
+                    .context("heightmap scan block unavailable")?;
+                crate::spawn_heightmaps::classify(block, tags)
+            },
+        )?;
         let position = BlockPosition {
             x: pos[0],
             y: pos[1],
@@ -371,6 +412,29 @@ mod tests {
     use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
     use std::collections::BTreeMap;
 
+    fn fixture_maps(surface: i32) -> native_persistence::heightmap::FullHeightmaps {
+        use native_persistence::heightmap::{
+            FullHeightmaps, GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps,
+            generated_full_heightmaps,
+        };
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 16,
+        };
+        let mut heights = [0; 256];
+        heights[8 + 8 * 16] = surface;
+        let source = encode_generated_heightmaps(
+            bounds,
+            &GeneratedHeightmaps {
+                world_surface: Some(&heights),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        FullHeightmaps::from_converted(bounds, &generated_full_heightmaps(bounds, &source).unwrap())
+            .unwrap()
+    }
+
     fn fixture(unsupported: bool) -> (GeneratedPostprocessing, Arc<World>, ChunkPos) {
         let pos = ChunkPos { x: 0, z: 0 };
         let mut world = World::new("minecraft:overworld");
@@ -429,7 +493,16 @@ mod tests {
             ticks: RegionTicks::new(BTreeMap::from([(pos, ticks)]), 100, 2).unwrap(),
         };
         (
-            GeneratedPostprocessing::new(Arc::clone(&world), 0, 16, region, None, None),
+            GeneratedPostprocessing::new(
+                Arc::clone(&world),
+                0,
+                16,
+                region,
+                None,
+                None,
+                BTreeMap::from([(pos, fixture_maps(0))]),
+                None,
+            ),
             world,
             pos,
         )
@@ -471,6 +544,13 @@ mod tests {
                 Ok(None)
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if matches!(
+                    path,
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                        | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
+                ) {
+                    return Ok(Some(br#"{"values":[]}"#.to_vec()));
+                }
                 if path != "data/minecraft/tags/block/overrides_mushroom_light_requirement.json" {
                     return Ok(None);
                 }
@@ -491,6 +571,14 @@ mod tests {
             &BTreeSet::from([
                 ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap(),
             ]),
+        )
+        .unwrap();
+        let heightmap_tags = native_resources::heightmap_tags::HeightmapTags::load(
+            &mut TagSource {
+                support: id(support),
+                tagged,
+            },
+            &registry,
         )
         .unwrap();
         let mut world = World::new("minecraft:overworld");
@@ -574,6 +662,8 @@ mod tests {
             region,
             Some(light),
             Some(Arc::new(tags)),
+            BTreeMap::from([(pos, fixture_maps(9))]),
+            Some(Arc::new(heightmap_tags)),
         );
         while !stage.poll(pos, 1).unwrap() {}
         let result = stage.finish().unwrap();
@@ -584,6 +674,34 @@ mod tests {
         assert_eq!(
             result.light_checks.len(),
             usize::from(removed && mushroom == "brown_mushroom")
+        );
+        let maps = result.heightmaps[&pos].to_tag().unwrap();
+        let document = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![("Heightmaps".into(), maps)]),
+        };
+        let heights = native_persistence::heightmap::SpawnHeightmaps::read(
+            &document,
+            native_persistence::heightmap::HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            heights
+                .highest(
+                    native_persistence::heightmap::SpawnHeightmapKind::WorldSurface,
+                    8,
+                    8
+                )
+                .unwrap()
+                + 1,
+            if removed {
+                if support == "air" { 0 } else { 8 }
+            } else {
+                9
+            }
         );
         format!(
             "{} {} {} {} {} {} {}",

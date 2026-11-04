@@ -553,6 +553,124 @@ pub fn generated_full_heightmaps(bounds: HeightBounds, source: &Tag) -> Result<T
     Ok(Tag::Compound(result))
 }
 
+/// The four maps copied into a newly converted LevelChunk. Raw padding bits
+/// are retained, and existing (possibly stale) heights are never re-primed.
+#[derive(Clone, Debug)]
+pub struct FullHeightmaps {
+    bounds: HeightBounds,
+    values: [Box<[u32; 256]>; 4],
+    raw: [Vec<i64>; 4],
+}
+
+const FULL_NAMES: [&str; 4] = [
+    "WORLD_SURFACE",
+    "OCEAN_FLOOR",
+    "MOTION_BLOCKING",
+    "MOTION_BLOCKING_NO_LEAVES",
+];
+
+fn full_predicates(flags: BlockHeightFlags) -> [bool; 4] {
+    [
+        !flags.is_air,
+        flags.blocks_motion,
+        flags.blocks_motion || flags.has_fluid,
+        flags.blocks_motion_no_leaves || flags.has_fluid,
+    ]
+}
+
+impl FullHeightmaps {
+    /// Read the exact four maps output by `generated_full_heightmaps`.
+    pub fn from_converted(bounds: HeightBounds, source: &Tag) -> Result<Self> {
+        let height = bounds.height()?;
+        let Tag::Compound(entries) = source else {
+            bail!("FULL heightmaps must be a compound")
+        };
+        ensure!(
+            entries.len() == FULL_NAMES.len(),
+            "FULL heightmaps must contain four maps"
+        );
+        let mut values = std::array::from_fn(|_| Box::new([0; 256]));
+        let mut raw: [Vec<i64>; 4] = std::array::from_fn(|_| Vec::new());
+        for (index, name) in FULL_NAMES.iter().enumerate() {
+            let Some(Tag::LongArray(words)) = unique(source, name)? else {
+                bail!("FULL heightmap {name} is missing or invalid")
+            };
+            values[index] = Box::new(raw_values(words, height)?);
+            raw[index] = words.clone();
+        }
+        Ok(Self {
+            bounds,
+            values,
+            raw,
+        })
+    }
+
+    /// Apply Java's incremental update after the block has changed. Reads
+    /// below the edit are shared by maps, and an error leaves all maps intact.
+    /// The callback must read one unchanged world without observable effects.
+    pub fn update_after_change(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        new_block: BlockHeightFlags,
+        mut block: impl FnMut(i32, i32, i32) -> Result<BlockHeightFlags>,
+    ) -> Result<()> {
+        ensure!(
+            (self.bounds.min_y..self.bounds.max_y).contains(&y),
+            "heightmap edit lies outside the dimension"
+        );
+        let x = x.rem_euclid(16);
+        let z = z.rem_euclid(16);
+        let column = (x + z * 16) as usize;
+        let matches = full_predicates(new_block);
+        let mut updated: [u32; 4] = std::array::from_fn(|kind| self.values[kind][column]);
+        let mut pending = 0u8;
+        for kind in 0..4 {
+            let first = self.bounds.min_y + updated[kind] as i32;
+            if y <= first - 2 {
+                continue;
+            }
+            if matches[kind] && y >= first {
+                updated[kind] = (y + 1 - self.bounds.min_y) as u32;
+            } else if !matches[kind] && y == first - 1 {
+                updated[kind] = 0;
+                pending |= 1 << kind;
+            }
+        }
+        if pending != 0 {
+            for below in (self.bounds.min_y..y).rev() {
+                let matches = full_predicates(block(x, below, z)?);
+                for kind in 0..4 {
+                    if pending & (1 << kind) != 0 && matches[kind] {
+                        updated[kind] = (below + 1 - self.bounds.min_y) as u32;
+                        pending &= !(1 << kind);
+                    }
+                }
+                if pending == 0 {
+                    break;
+                }
+            }
+        }
+        for (map, value) in self.values.iter_mut().zip(updated) {
+            map[column] = value;
+        }
+        Ok(())
+    }
+
+    pub fn to_tag(&self) -> Result<Tag> {
+        let height = self.bounds.height()?;
+        let mut entries = Vec::with_capacity(4);
+        for (index, name) in FULL_NAMES.iter().enumerate() {
+            entries.push((
+                (*name).into(),
+                Tag::LongArray(encode(&self.values[index], height, Some(&self.raw[index]))?),
+            ));
+        }
+        Ok(Tag::Compound(entries))
+    }
+}
+
 /// Rebuild a draft while verifying any original known heightmaps against its
 /// original blocks. Unknown NBT and unused bits are retained byte-for-byte.
 pub(crate) fn rebuild(

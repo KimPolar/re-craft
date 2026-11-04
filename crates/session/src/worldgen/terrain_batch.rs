@@ -735,6 +735,22 @@ impl FreshTerrainBatch {
         )
     }
 
+    /// Use records captured by implemented generation paths. Other feature or
+    /// mob sources may still be missing, so this draft is not saveable.
+    pub fn spawned_recorded_chunk_draft(
+        &mut self,
+        pos: ChunkPos,
+        last_update: i64,
+    ) -> Result<native_persistence::nbt::NamedTag> {
+        let entities = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .recorded_generated_entities(pos)?
+            .to_vec();
+        self.spawned_chunk_draft(pos, last_update, entities)
+    }
+
     /// Capture the 3x3 light and block neighborhood of each render target.
     /// Targets must have completed LIGHT; callers must draw only the targets,
     /// because farther chunks in the returned world are not light-covered.

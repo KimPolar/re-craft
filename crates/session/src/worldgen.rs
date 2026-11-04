@@ -60,6 +60,13 @@ pub enum GeneratedMonsterRoomEntity {
     Spawner(GeneratedMonsterSpawner),
 }
 
+/// Result of serializing one generation-time entity. Java does not add a
+/// passenger as a separate protochunk entry; a saved compound can be empty.
+pub enum GeneratedEntityRecord {
+    Passenger,
+    Saved(native_persistence::nbt::Tag),
+}
+
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
 pub struct QuartBiomeChunk {
     chunk: [i32; 2],
@@ -114,6 +121,8 @@ pub struct CarvedTerrainWorld {
     generated_monster_entities: Arc<BTreeMap<[i32; 3], Option<GeneratedMonsterRoomEntity>>>,
     generated_entity_order:
         BTreeMap<native_world::loaded::ChunkPos, Arc<entity_order::LivePositions>>,
+    generated_entities:
+        Arc<BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
 }
 
 /// Registration history for a newly created generation light engine. The
@@ -1198,6 +1207,7 @@ impl CarvedTerrainWorld {
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
             generated_entity_order: BTreeMap::new(),
+            generated_entities: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -1439,6 +1449,23 @@ impl CarvedTerrainWorld {
         self.generated_monster_entities
             .values()
             .filter_map(Option::as_ref)
+    }
+
+    /// Records captured by the generation path for this chunk, in insertion
+    /// order. Other unimplemented feature and mob sources may still be missing.
+    pub fn recorded_generated_entities(
+        &self,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<&[native_persistence::nbt::Tag]> {
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "generated entity chunk is missing"
+        );
+        Ok(self
+            .generated_entities
+            .get(&pos)
+            .map(|values| values.as_slice())
+            .unwrap_or_default())
     }
 
     /// Prepare known block entities after checking every block in this chunk.
@@ -4145,6 +4172,8 @@ mod tests {
         assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
         let heightmaps = batch.spawned_heightmap_data(center).unwrap();
         let draft = batch.spawned_chunk_draft(center, 42, vec![]).unwrap();
+        let recorded_draft = batch.spawned_recorded_chunk_draft(center, 42).unwrap();
+        assert_eq!(draft, recorded_draft);
         assert_eq!(
             draft.value.get("Status"),
             Some(&native_persistence::nbt::Tag::String(

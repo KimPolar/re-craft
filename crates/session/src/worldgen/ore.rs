@@ -74,6 +74,7 @@ pub struct DecorationRegion<'a> {
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
     entity_order: BTreeMap<ChunkPos, Arc<super::entity_order::LivePositions>>,
+    generated_entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
@@ -1660,6 +1661,7 @@ impl CarvedTerrainWorld {
         let bee_nests = self.generated_bee_nests.clone();
         let monster_entities = self.generated_monster_entities.clone();
         let entity_order = self.generated_entity_order.clone();
+        let generated_entities = self.generated_entities.clone();
         Ok(DecorationRegion {
             target: self,
             world,
@@ -1686,6 +1688,7 @@ impl CarvedTerrainWorld {
             bee_nests,
             monster_entities,
             entity_order,
+            generated_entities,
             pending_monster_spawners: 0,
             light_guard: None,
             tree_block_write: false,
@@ -1697,6 +1700,44 @@ impl CarvedTerrainWorld {
 }
 
 impl DecorationRegion<'_> {
+    /// Mirror WorldGenRegion.addFreshEntity after entity serialization. The
+    /// position is the entity's block position at insertion, not one inferred
+    /// from the serialized data. A failed save can still yield a compound.
+    pub fn record_generated_entity(
+        &mut self,
+        block_position: [i32; 3],
+        record: super::GeneratedEntityRecord,
+    ) -> Result<()> {
+        let result = (|| {
+            let target = chunk(block_position);
+            ensure!(
+                self.world.chunks.contains_key(&target),
+                "generated entity destination chunk is missing"
+            );
+            if let super::GeneratedEntityRecord::Saved(data) = record {
+                ensure!(
+                    matches!(data, native_persistence::nbt::Tag::Compound(_)),
+                    "generated entity data must be a compound"
+                );
+                native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
+                    name: "".into(),
+                    value: data.clone(),
+                })?;
+                Arc::make_mut(
+                    Arc::make_mut(&mut self.generated_entities)
+                        .entry(target)
+                        .or_default(),
+                )
+                .push(data);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
     fn place_nested(
         &mut self,
         placed: &PlacedDecorationFeature,
@@ -1931,6 +1972,7 @@ impl DecorationRegion<'_> {
         self.target.generated_bee_nests = self.bee_nests;
         self.target.generated_monster_entities = self.monster_entities;
         self.target.generated_entity_order = self.entity_order;
+        self.target.generated_entities = self.generated_entities;
         Ok(Arc::clone(&self.target.world))
     }
 
@@ -6264,8 +6306,174 @@ mod tests {
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
             generated_entity_order: BTreeMap::new(),
+            generated_entities: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
+    }
+
+    #[test]
+    fn generated_entity_records_preserve_chunk_order_and_rollback() {
+        use super::super::GeneratedEntityRecord;
+        use native_persistence::nbt::Tag;
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let negative = ChunkPos { x: -1, z: -1 };
+        let one = Tag::Compound(vec![("n".into(), Tag::Int(1))]);
+        let two = Tag::Compound(vec![("n".into(), Tag::Int(2))]);
+        let empty = Tag::Compound(vec![]);
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        region
+            .record_generated_entity([0, 5, 0], GeneratedEntityRecord::Saved(one.clone()))
+            .unwrap();
+        region
+            .record_generated_entity([-1, 5, -1], GeneratedEntityRecord::Saved(two.clone()))
+            .unwrap();
+        region
+            .record_generated_entity([15, 5, 15], GeneratedEntityRecord::Passenger)
+            .unwrap();
+        region
+            .record_generated_entity([15, 5, 15], GeneratedEntityRecord::Saved(empty.clone()))
+            .unwrap();
+        region
+            .record_generated_entity([0, 5, 0], GeneratedEntityRecord::Saved(one.clone()))
+            .unwrap();
+        region.finish().unwrap();
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap(),
+            &[one.clone(), empty, one.clone()]
+        );
+        assert_eq!(
+            terrain.recorded_generated_entities(negative).unwrap(),
+            &[two]
+        );
+        assert!(
+            terrain
+                .recorded_generated_entities(ChunkPos { x: 5, z: 5 })
+                .is_err()
+        );
+        let shared_records = Arc::clone(&terrain.generated_entities);
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut failed = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        assert!(Arc::ptr_eq(&shared_records, &failed.generated_entities));
+        failed
+            .record_generated_entity([0, 5, 0], GeneratedEntityRecord::Passenger)
+            .unwrap();
+        assert!(Arc::ptr_eq(&shared_records, &failed.generated_entities));
+        failed
+            .record_generated_entity([0, 5, 0], GeneratedEntityRecord::Saved(one.clone()))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&shared_records, &failed.generated_entities));
+        assert!(
+            failed
+                .record_generated_entity([32, 5, 0], GeneratedEntityRecord::Passenger)
+                .is_err()
+        );
+        assert!(failed.finish().is_err());
+        assert!(Arc::ptr_eq(&shared_records, &terrain.generated_entities));
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap(),
+            &[one.clone(), Tag::Compound(vec![]), one]
+        );
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut invalid = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        assert!(
+            invalid
+                .record_generated_entity([0, 5, 0], GeneratedEntityRecord::Saved(Tag::Int(9)))
+                .is_err()
+        );
+        assert!(invalid.finish().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_entity_records_match_java_protochunk() {
+        use super::super::GeneratedEntityRecord;
+        use native_persistence::nbt::Tag;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("GeneratedEntityRecordOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GeneratedEntityRecordOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        let expected = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedEntityRecordOracle"));
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let marker =
+            |n| GeneratedEntityRecord::Saved(Tag::Compound(vec![("n".into(), Tag::Int(n))]));
+        for (p, record) in [
+            ([0, 5, 0], marker(1)),
+            ([-1, 5, -1], marker(2)),
+            ([15, 5, 15], GeneratedEntityRecord::Passenger),
+            (
+                [15, 5, 15],
+                GeneratedEntityRecord::Saved(Tag::Compound(vec![])),
+            ),
+            ([0, 5, 0], marker(1)),
+        ] {
+            region.record_generated_entity(p, record).unwrap();
+        }
+        region.finish().unwrap();
+        for pos in [
+            ChunkPos { x: 0, z: 0 },
+            ChunkPos { x: -1, z: -1 },
+            ChunkPos { x: 1, z: 0 },
+        ] {
+            let values = terrain
+                .recorded_generated_entities(pos)
+                .unwrap()
+                .iter()
+                .map(|tag| match tag.get("n") {
+                    Some(Tag::Int(n)) => n.to_string(),
+                    None => "empty".to_owned(),
+                    _ => panic!("invalid marker"),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let line = format!("E {} {} {}", pos.x, pos.z, values);
+            assert!(
+                expected.lines().any(|actual| actual == line),
+                "missing Java line {line:?} in {expected}"
+            );
+        }
     }
 
     #[test]

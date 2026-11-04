@@ -441,6 +441,19 @@ impl GeneratedBlockRegistry {
     pub fn contains(&self, id: &str) -> bool {
         self.states.contains_key(id)
     }
+    /// Check a fully materialized state without applying codec defaults or
+    /// silently dropping unknown/invalid property values.
+    pub fn is_canonical_state(&self, id: &str, properties: &BTreeMap<String, String>) -> bool {
+        let Some(schema) = self.states.get(id).copied() else {
+            return false;
+        };
+        let defaults = schema.default_properties();
+        properties.len() == defaults.len()
+            && properties.iter().all(|(key, value)| {
+                defaults.contains_key(key)
+                    && schema.parse_property(key, value).as_deref() == Some(value.as_str())
+            })
+    }
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.states.keys().map(String::as_str)
     }
@@ -658,6 +671,31 @@ mod tests {
     fn stateless_registry_rejects_missing_and_malformed_classes() {
         assert!(GeneratedBlockRegistry::load(|_| Ok(None)).is_err());
         assert!(GeneratedBlockRegistry::load(|_| Ok(Some(vec![0xca, 0xfe, 0xba, 0xbe]))).is_err());
+    }
+
+    #[test]
+    fn canonical_state_requires_every_valid_property() {
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([
+                ("minecraft:stone".into(), StateSchema::Stateless),
+                ("minecraft:water".into(), StateSchema::Liquid),
+            ]),
+        };
+        assert!(registry.is_canonical_state("minecraft:stone", &BTreeMap::new()));
+        assert!(!registry.is_canonical_state("minecraft:water", &BTreeMap::new()));
+        assert!(registry.is_canonical_state(
+            "minecraft:water",
+            &BTreeMap::from([("level".into(), "15".into())])
+        ));
+        assert!(!registry.is_canonical_state(
+            "minecraft:water",
+            &BTreeMap::from([("level".into(), "16".into())])
+        ));
+        assert!(!registry.is_canonical_state(
+            "minecraft:water",
+            &BTreeMap::from([("level".into(), "01".into())])
+        ));
+        assert!(!registry.is_canonical_state("example:stone", &BTreeMap::new()));
     }
 
     #[test]

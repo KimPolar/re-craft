@@ -53,6 +53,13 @@ pub enum GeneratedCreatureInstanceRuleProgress {
     NeedsObstruction(GeneratedCreaturePose),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GeneratedCreatureObstructionProgress {
+    Rejected,
+    /// The constructed entity still needs finalizeSpawn and chunk storage.
+    NeedsFinalization(GeneratedCreaturePose),
+}
+
 pub struct GeneratedCreatureProbe {
     attempt: CreatureAttempt,
     top_search: native_resources::mob_spawn_placement::TopMobSpawnPosition,
@@ -64,6 +71,7 @@ pub struct GeneratedCreatureProbe {
     rules_passed: bool,
     constructed_yaw: Option<f32>,
     instance_rules_passed: bool,
+    obstruction_passed: bool,
 }
 
 impl GeneratedCreatureProbe {
@@ -84,6 +92,7 @@ impl GeneratedCreatureProbe {
             rules_passed: false,
             constructed_yaw: None,
             instance_rules_passed: false,
+            obstruction_passed: false,
         }
     }
 
@@ -226,6 +235,44 @@ impl GeneratedCreatureProbe {
         ))
     }
 
+    /// Check the constructed entity's actual bounding box. WorldGenRegion's
+    /// entity obstruction query is empty; fluids are checked first by Java.
+    /// The caller must supply the constructed entity's current box, not the
+    /// earlier entity-type spawn box.
+    pub fn check_obstruction(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        world: &mut GeneratedMobPlacementView<'_>,
+        entity_bounds: native_world::movement::BoundingBox,
+    ) -> Result<GeneratedCreatureObstructionProgress> {
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        ensure!(
+            self.instance_rules_passed
+                && !self.obstruction_passed
+                && !self.rejected
+                && planner.created_attempt() == Some(self.attempt.clone()),
+            "creature instance rules have not passed or entity is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        if super::mob_obstruction::contains_any_liquid(
+            entity_bounds,
+            world.min_y,
+            world.max_y,
+            world,
+        )? {
+            planner.finish_entity(false)?;
+            self.rejected = true;
+            return Ok(GeneratedCreatureObstructionProgress::Rejected);
+        }
+        self.obstruction_passed = true;
+        Ok(GeneratedCreatureObstructionProgress::NeedsFinalization(
+            GeneratedCreaturePose { geometry, yaw },
+        ))
+    }
+
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
     /// advancing the planner. The caller still checks collision and mob rules.
@@ -291,6 +338,7 @@ pub struct GeneratedMobPlacementView<'a> {
     last_facts: Option<(IVec3, MobSpawnBlockFacts)>,
     computed_heights: BTreeMap<(i32, i32), i32>,
     rule_light: BTreeMap<ChunkPos, native_world::generation_light::VisibleLightSnapshot>,
+    fluid_states: BTreeMap<native_world::loaded::BlockStateId, bool>,
 }
 
 impl<'a> GeneratedMobPlacementView<'a> {
@@ -325,6 +373,7 @@ impl<'a> GeneratedMobPlacementView<'a> {
             last_facts: None,
             computed_heights: BTreeMap::new(),
             rule_light: BTreeMap::new(),
+            fluid_states: BTreeMap::new(),
         })
     }
     fn block(&self, pos: IVec3) -> Result<&BlockState> {
@@ -377,6 +426,40 @@ impl<'a> GeneratedMobPlacementView<'a> {
         light: native_world::generation_light::VisibleLightSnapshot,
     ) {
         self.rule_light.insert(pos, light);
+    }
+}
+
+impl super::mob_obstruction::FluidScanWorld for GeneratedMobPlacementView<'_> {
+    fn require_chunk(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "creature obstruction chunk is missing"
+        );
+        Ok(())
+    }
+    fn has_fluid(&mut self, pos: IVec3) -> Result<bool> {
+        let id = self
+            .world
+            .block_id(pos.x, pos.y, pos.z)
+            .context("creature obstruction block is missing")?;
+        if let Some(&fluid) = self.fluid_states.get(&id) {
+            return Ok(fluid);
+        }
+        let state = self
+            .world
+            .state(id)
+            .context("creature obstruction block state is missing")?;
+        ensure!(
+            self.batch
+                .generated_block_registry()?
+                .is_canonical_state(&state.name, &state.properties),
+            "unverified creature obstruction block state {state:?}"
+        );
+        let fluid = native_world::fluid::FluidState::from_block(state)
+            .map_err(anyhow::Error::msg)?
+            .is_some();
+        self.fluid_states.insert(id, fluid);
+        Ok(fluid)
     }
 }
 

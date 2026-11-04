@@ -32,6 +32,7 @@ mod generated_beehive;
 mod generated_chest;
 mod generated_spawner;
 mod mob_collision;
+mod mob_obstruction;
 mod mob_placement;
 mod ore;
 pub mod postprocessing;
@@ -43,8 +44,8 @@ pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
     GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
-    GeneratedCreaturePose, GeneratedCreatureProbe, GeneratedCreatureProbeProgress,
-    GeneratedCreatureRuleProgress, GeneratedMobPlacementView,
+    GeneratedCreatureObstructionProgress, GeneratedCreaturePose, GeneratedCreatureProbe,
+    GeneratedCreatureProbeProgress, GeneratedCreatureRuleProgress, GeneratedMobPlacementView,
 };
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
@@ -3552,6 +3553,43 @@ mod tests {
             assert!(
                 bright
                     .check_instance_rules(&mut bright_planner, &mut view)
+                    .is_err()
+            );
+            // The harness's constructed pig has the verified unscaled box;
+            // spawn_scale for this type is 1.0.
+            let entity_bounds = native_world::movement::BoundingBox {
+                min: glam::DVec3::from_array(geometry.min),
+                max: glam::DVec3::from_array(geometry.max),
+            };
+            // Exercise the generated registry and repeated-state fluid cache
+            // on a real in-bounds section before the out-of-height box scan.
+            use super::mob_obstruction::FluidScanWorld;
+            let ground = IVec3::new(
+                geometry.position[0].floor() as i32,
+                15,
+                geometry.position[2].floor() as i32,
+            );
+            assert!(!view.has_fluid(ground).unwrap());
+            assert!(!view.has_fluid(ground).unwrap());
+            let missing_bounds = native_world::movement::BoundingBox {
+                min: entity_bounds.min + glam::DVec3::new(1000.0, 0.0, 0.0),
+                max: entity_bounds.max + glam::DVec3::new(1000.0, 0.0, 0.0),
+            };
+            assert!(
+                bright
+                    .check_obstruction(&mut bright_planner, &mut view, missing_bounds)
+                    .is_err()
+            );
+            assert_eq!(bright_planner.created_attempt(), Some(attempt.clone()));
+            assert_eq!(
+                bright
+                    .check_obstruction(&mut bright_planner, &mut view, entity_bounds)
+                    .unwrap(),
+                GeneratedCreatureObstructionProgress::NeedsFinalization(bright_pose)
+            );
+            assert!(
+                bright
+                    .check_obstruction(&mut bright_planner, &mut view, entity_bounds)
                     .is_err()
             );
             let tag = BTreeSet::from(["minecraft:void_air".into()]);

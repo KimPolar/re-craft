@@ -213,6 +213,12 @@ impl FreshTerrainBatch {
             .context("dimension ambient light is unavailable")
     }
 
+    pub(super) fn generated_block_registry(&self) -> Result<&GeneratedBlockRegistry> {
+        self.light_registry
+            .as_ref()
+            .context("generated block registry is unavailable")
+    }
+
     /// Enable INITIALIZE_LIGHT before requesting work. The validated block
     /// registry must come from the same client and pack stack as decoration.
     pub fn enable_light_initialization(&mut self, registry: GeneratedBlockRegistry) -> Result<()> {

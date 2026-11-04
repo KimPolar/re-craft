@@ -31,6 +31,7 @@ mod carving;
 mod entity_order;
 mod generated_beehive;
 mod generated_chest;
+mod generated_farm_animal;
 mod generated_sheep;
 mod generated_spawner;
 mod mob_collision;
@@ -44,6 +45,7 @@ mod terrain_batch;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
+pub use generated_farm_animal::draft_fresh_farm_animal;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
@@ -51,7 +53,9 @@ pub use mob_placement::{
     GeneratedCreatureObstructionProgress, GeneratedCreaturePose, GeneratedCreatureProbe,
     GeneratedCreatureProbeProgress, GeneratedCreatureRuleProgress, GeneratedMobPlacementView,
 };
-pub use mob_spawner::{GeneratedSheepSpawner, SheepSpawnInputs, SheepSpawnProgress};
+pub use mob_spawner::{
+    FreshCreatureConstruction, GeneratedSheepSpawner, SheepSpawnInputs, SheepSpawnProgress,
+};
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
@@ -4573,6 +4577,83 @@ mod tests {
             ),
         );
         driver.set_rule_light_for_test(center, light.clone());
+        for (name, species) in [
+            ("pig", native_resources::animal_variants::FarmAnimal::Pig),
+            ("cow", native_resources::animal_variants::FarmAnimal::Cow),
+            (
+                "chicken",
+                native_resources::animal_variants::FarmAnimal::Chicken,
+            ),
+        ] {
+            let mut spawns = native_resources::mob_spawns::CreatureSpawns::default();
+            spawns.apply(native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(
+                &json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":format!("minecraft:{name}"),"count":1,"weight":1}]},"spawn_costs":{}}}), |_| Some(false),
+            ).unwrap().unwrap());
+            let mut farm =
+                GeneratedSheepSpawner::new(&batch, center, 0.999_999_9, spawns, inputs).unwrap();
+            let variants = Arc::new(
+                native_resources::animal_variants::FarmAnimalSpawnVariants::load_active(
+                    &mut resources,
+                    species,
+                )
+                .unwrap(),
+            );
+            farm.enable_farm_animal(variants).unwrap();
+            farm.set_rule_light_for_test(center, light.clone());
+            let mut constructed = 0;
+            let mut construct = |id: &ResourceId| {
+                assert_eq!(id.path, name);
+                constructed += 1;
+                Ok(FreshCreatureConstruction {
+                    uuid: [0, 2, 0, constructed],
+                    chicken_egg_time: (name == "chicken").then_some(if constructed == 1 {
+                        5999
+                    } else {
+                        6000
+                    }),
+                })
+            };
+            let mut prepared = false;
+            let mut invalid_timer_rejected = false;
+            for _ in 0..10_000 {
+                match farm.advance_with_construction(&mut batch, &mut construct) {
+                    Err(error) if name == "chicken" && !invalid_timer_rejected => {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("invalid constructed chicken egg timer")
+                        );
+                        invalid_timer_rejected = true;
+                    }
+                    Err(error) => panic!("unexpected {name} spawn error: {error:#}"),
+                    Ok(SheepSpawnProgress::Prepared(_)) => {
+                        prepared = true;
+                        break;
+                    }
+                    Ok(SheepSpawnProgress::Finished) => break,
+                    Ok(SheepSpawnProgress::Pending | SheepSpawnProgress::Rejected) => {}
+                }
+            }
+            assert!(prepared, "no {name} was prepared");
+            assert_eq!(invalid_timer_rejected, name == "chicken");
+            let [addition] = farm.prepared_additions() else {
+                panic!("unexpected pending animal count")
+            };
+            let GeneratedEntityRecord::Saved(tag) = &addition.record else {
+                panic!("animal was not saved")
+            };
+            assert!(
+                matches!(tag.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(&format!("minecraft:{name}")))
+            );
+            if name == "chicken" {
+                assert_eq!(
+                    tag.get("EggLayTime"),
+                    Some(&native_persistence::nbt::Tag::Int(6000))
+                );
+            }
+            drop(farm);
+            assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+        }
         let mut abandoned =
             GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
                 .unwrap();

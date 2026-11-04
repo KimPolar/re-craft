@@ -1,6 +1,7 @@
-//! Incrementally execute the verified sheep path for one generation region.
+//! Incrementally execute verified farm-animal paths for one generation region.
 use anyhow::{Context, Result, ensure};
 use native_resources::{
+    animal_variants::{FarmAnimal, FarmAnimalSpawnVariants},
     heightmap_tags::HeightmapTags,
     mob_spawn_placement::MobSpawnHeightmap,
     worldgen_mob_rules::GroundSpawnTags,
@@ -46,6 +47,26 @@ pub enum SheepSpawnProgress {
     Finished,
 }
 
+/// Values supplied by an independently constructed entity. A chicken's egg
+/// timer must come from that entity's RNG, not from the world-generation RNG.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FreshCreatureConstruction {
+    pub uuid: [i32; 4],
+    pub chicken_egg_time: Option<i32>,
+}
+
+fn farm_index(id: &native_resources::packs::ResourceId) -> Option<usize> {
+    if id.namespace != "minecraft" {
+        return None;
+    }
+    match id.path.as_str() {
+        "pig" => Some(0),
+        "cow" => Some(1),
+        "chicken" => Some(2),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Stage {
     Begin,
@@ -61,8 +82,8 @@ enum Stage {
 }
 
 /// Owns the region RNG and group state across resumable candidate checks.
-/// An unsupported creature stops
-/// with its attempt unresolved; this does not mark SPAWN complete or save.
+/// Sheep are enabled by default. Pigs, cows, and chickens require their active
+/// variant registries; unsupported creatures remain unresolved.
 pub struct GeneratedSheepSpawner {
     planner: ChunkCreatureSpawner,
     random: RegionRandom,
@@ -74,7 +95,8 @@ pub struct GeneratedSheepSpawner {
     stage: Stage,
     probe: Option<GeneratedCreatureProbe>,
     pose: Option<GeneratedCreaturePose>,
-    uuid: Option<[i32; 4]>,
+    construction: Option<FreshCreatureConstruction>,
+    farm_variants: [Option<Arc<FarmAnimalSpawnVariants>>; 3],
     additions: Vec<super::GeneratedEntityAddition>,
     #[cfg(test)]
     rule_light: Option<(
@@ -178,7 +200,8 @@ impl GeneratedSheepSpawner {
             stage: Stage::Begin,
             probe: None,
             pose: None,
-            uuid: None,
+            construction: None,
+            farm_variants: [None, None, None],
             additions: Vec::new(),
             #[cfg(test)]
             rule_light: None,
@@ -188,7 +211,7 @@ impl GeneratedSheepSpawner {
     fn rejected(&mut self) -> SheepSpawnProgress {
         self.probe = None;
         self.pose = None;
-        self.uuid = None;
+        self.construction = None;
         self.stage = Stage::Begin;
         SheepSpawnProgress::Rejected
     }
@@ -200,6 +223,47 @@ impl GeneratedSheepSpawner {
         &mut self,
         batch: &mut FreshTerrainBatch,
         new_uuid: &mut impl FnMut() -> Result<[i32; 4]>,
+    ) -> Result<SheepSpawnProgress> {
+        self.advance_with_construction(batch, &mut |id| {
+            ensure!(
+                id.path != "chicken" || id.namespace != "minecraft",
+                "chicken construction requires its own egg timer"
+            );
+            Ok(FreshCreatureConstruction {
+                uuid: new_uuid()?,
+                chicken_egg_time: None,
+            })
+        })
+    }
+
+    /// Enable one farm-animal species with registries from this batch's
+    /// unchanged data-pack stack. Unsupported species stay unresolved.
+    pub fn enable_farm_animal(&mut self, variants: Arc<FarmAnimalSpawnVariants>) -> Result<()> {
+        ensure!(
+            matches!(self.stage, Stage::Begin),
+            "cannot change animal registries during a candidate"
+        );
+        let index = match variants.species() {
+            FarmAnimal::Pig => 0,
+            FarmAnimal::Cow => 1,
+            FarmAnimal::Chicken => 2,
+        };
+        ensure!(
+            self.farm_variants[index].is_none(),
+            "animal registry is already enabled"
+        );
+        self.farm_variants[index] = Some(variants);
+        Ok(())
+    }
+
+    /// Execute one transition, obtaining construction data only at Java's
+    /// constructor point. The callback must produce unique independent UUIDs.
+    pub fn advance_with_construction(
+        &mut self,
+        batch: &mut FreshTerrainBatch,
+        construct: &mut impl FnMut(
+            &native_resources::packs::ResourceId,
+        ) -> Result<FreshCreatureConstruction>,
     ) -> Result<SheepSpawnProgress> {
         batch.validate_spawn_stamp(&self.stamp, self.center)?;
         let inputs = Arc::clone(&self.inputs);
@@ -214,7 +278,9 @@ impl GeneratedSheepSpawner {
                 }
                 CreatureSpawnProgress::Attempt(attempt) => {
                     ensure!(
-                        attempt.entity.namespace == "minecraft" && attempt.entity.path == "sheep",
+                        (attempt.entity.namespace == "minecraft" && attempt.entity.path == "sheep")
+                            || farm_index(&attempt.entity)
+                                .is_some_and(|index| self.farm_variants[index].is_some()),
                         "unsupported generated creature {}:{}",
                         attempt.entity.namespace,
                         attempt.entity.path
@@ -236,37 +302,69 @@ impl GeneratedSheepSpawner {
                 }
             },
             Stage::Construct => {
-                let uuid = new_uuid()?;
+                let CreatureSpawnProgress::Attempt(attempt) = self.planner.next(0)? else {
+                    anyhow::bail!("creature construction attempt is missing")
+                };
+                let construction = construct(&attempt.entity)?;
+                if attempt.entity.namespace == "minecraft" && attempt.entity.path == "chicken" {
+                    ensure!(
+                        construction
+                            .chicken_egg_time
+                            .is_some_and(|time| (6000..12000).contains(&time)),
+                        "invalid constructed chicken egg timer"
+                    );
+                } else {
+                    ensure!(
+                        construction.chicken_egg_time.is_none(),
+                        "egg timer belongs only to a chicken"
+                    );
+                }
                 let pose = self
                     .probe
                     .as_mut()
                     .context("missing creature probe")?
                     .mark_constructed(&mut self.planner)?;
-                self.uuid = Some(uuid);
+                self.construction = Some(construction);
                 self.pose = Some(pose);
                 self.stage = Stage::Instance;
                 Ok(SheepSpawnProgress::Pending)
             }
             Stage::Record => {
-                let uuid = self.uuid.context("missing constructed sheep UUID")?;
-                let addition = self
-                    .probe
-                    .as_mut()
-                    .context("missing creature probe")?
-                    .prepare_fresh_sheep(
+                let construction = self.construction.context("missing constructed creature")?;
+                let attempt = self
+                    .planner
+                    .created_attempt()
+                    .context("missing constructed creature attempt")?;
+                let probe = self.probe.as_mut().context("missing creature probe")?;
+                let addition = if let Some(index) = farm_index(&attempt.entity) {
+                    let variants = self.farm_variants[index]
+                        .as_ref()
+                        .context("farm animal registry is missing")?;
+                    probe.prepare_fresh_farm_animal(
+                        &mut self.planner,
+                        batch,
+                        variants,
+                        &mut self.random,
+                        &mut self.group,
+                        construction.uuid,
+                        construction.chicken_egg_time,
+                    )?
+                } else {
+                    probe.prepare_fresh_sheep(
                         &mut self.planner,
                         batch,
                         &inputs.biome_tags,
                         &mut self.random,
                         &mut self.group,
-                        uuid,
-                    )?;
+                        construction.uuid,
+                    )?
+                };
                 self.additions.push(addition);
                 self.probe = None;
                 self.pose = None;
-                self.uuid = None;
+                self.construction = None;
                 self.stage = Stage::Begin;
-                Ok(SheepSpawnProgress::Prepared(uuid))
+                Ok(SheepSpawnProgress::Prepared(construction.uuid))
             }
             stage => {
                 let mut view = GeneratedMobPlacementView::new(
@@ -318,7 +416,7 @@ impl GeneratedSheepSpawner {
                     Stage::Obstruction => {
                         let geometry = self
                             .pose
-                            .context("missing constructed sheep pose")?
+                            .context("missing constructed creature pose")?
                             .geometry;
                         let bounds = BoundingBox {
                             min: glam::DVec3::from_array(geometry.min),
@@ -358,9 +456,14 @@ impl GeneratedSheepSpawner {
     pub fn into_random(self) -> Result<RegionRandom> {
         ensure!(
             matches!(self.stage, Stage::Finished | Stage::Scheduled),
-            "sheep generation is unfinished"
+            "creature generation is unfinished"
         );
         Ok(self.random)
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_additions(&self) -> &[super::GeneratedEntityAddition] {
+        &self.additions
     }
 
     #[cfg(test)]

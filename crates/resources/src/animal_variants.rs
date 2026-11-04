@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FarmAnimal {
     Pig,
     Cow,
@@ -67,14 +67,24 @@ pub struct FarmAnimalInitialization {
 
 /// Visual and sound registries from the same active data-pack stack.
 pub struct FarmAnimalSpawnVariants {
+    species: FarmAnimal,
     visual: FarmAnimalVariants,
+    default_visual: ResourceId,
     sounds: Vec<ResourceId>,
 }
 
 impl FarmAnimalSpawnVariants {
     /// The caller must still validate the complete registries as Java does.
     pub fn load_active(provider: &mut impl ResourceProvider, animal: FarmAnimal) -> Result<Self> {
-        let visual = FarmAnimalVariants::load_active(provider, animal)?;
+        let ordered = provider.list_registry_data(animal.registry())?;
+        let temperate = ResourceId::parse("minecraft:temperate")?;
+        let default_visual = ordered
+            .iter()
+            .find(|id| **id == temperate)
+            .or_else(|| ordered.first())
+            .context("farm animal variant registry is empty")?
+            .clone();
+        let visual = FarmAnimalVariants::load_ordered(provider, animal, &ordered)?;
         let sounds = provider.list_registry_data(animal.sound_registry())?;
         ensure!(
             !sounds.is_empty(),
@@ -84,7 +94,22 @@ impl FarmAnimalSpawnVariants {
             i32::try_from(sounds.len()).is_ok(),
             "too many sound variants"
         );
-        Ok(Self { visual, sounds })
+        Ok(Self {
+            species: animal,
+            visual,
+            default_visual,
+            sounds,
+        })
+    }
+
+    pub fn species(&self) -> FarmAnimal {
+        self.species
+    }
+
+    /// Java constructs these animals with temperate, or the first registry
+    /// entry if a data pack removed it.
+    pub fn default_variant(&self) -> &ResourceId {
+        &self.default_visual
     }
 
     /// Match Java's variant, sound, AgeableMob and Mob random draw order.

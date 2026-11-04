@@ -117,6 +117,31 @@ fn animal_initialization_preserves_random_and_group_on_unknown_biome() {
 }
 
 #[test]
+fn construction_default_prefers_temperate_then_first_registry_entry() {
+    let mut data = Data::default();
+    data.0.insert(
+        "data/minecraft/worldgen/biome/plains.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/pig_sound_variant/classic.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0
+        .insert("data/minecraft/pig_variant/z.json".into(), b"{}".to_vec());
+    data.0
+        .insert("data/minecraft/pig_variant/a.json".into(), b"{}".to_vec());
+    let fallback = FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).unwrap();
+    assert_eq!(fallback.default_variant(), &id("a"));
+    data.0.insert(
+        "data/minecraft/pig_variant/temperate.json".into(),
+        b"{}".to_vec(),
+    );
+    let temperate = FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).unwrap();
+    assert_eq!(temperate.default_variant(), &id("temperate"));
+}
+
+#[test]
 fn selectors_preserve_order_duplicates_and_reject_unknown_conditions() {
     let mut data = Data::default();
     for biome in ["plains", "desert"] {

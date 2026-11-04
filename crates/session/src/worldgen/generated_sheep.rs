@@ -1,7 +1,9 @@
 //! An NBT draft for a newly constructed, otherwise unmodified sheep.
 use anyhow::{Context, Result, ensure};
 use native_persistence::nbt::{Tag, TagType};
-use native_resources::worldgen_region_random::{SheepInitialization, SheepSpawnColor};
+use native_resources::worldgen_region_random::{
+    AnimalBaseInitialization, SheepInitialization, SheepSpawnColor,
+};
 
 /// Serialize the vanilla defaults and verified spawn-finalization changes.
 /// This is valid only for a fresh sheep with no equipment, existing modifiers,
@@ -14,19 +16,6 @@ pub fn draft_fresh_sheep(
     yaw: f32,
     initialization: SheepInitialization,
 ) -> Result<Tag> {
-    ensure!(
-        position.iter().all(|v| v.is_finite())
-            && position[0].abs() <= 30_000_512.0
-            && position[2].abs() <= 30_000_512.0
-            && position[1].abs() <= 20_000_000.0,
-        "sheep position would be clamped"
-    );
-    ensure!(yaw.is_finite(), "invalid sheep rotation");
-    let bonus = initialization
-        .animal
-        .follow_range_bonus
-        .context("fresh sheep is missing its follow-range bonus")?;
-    ensure!(bonus.is_finite(), "invalid follow-range bonus");
     let color = match initialization.color {
         SheepSpawnColor::White => 0,
         SheepSpawnColor::Pink => 6,
@@ -35,6 +24,43 @@ pub fn draft_fresh_sheep(
         SheepSpawnColor::Brown => 12,
         SheepSpawnColor::Black => 15,
     };
+    let Tag::Compound(mut fields) = draft_fresh_animal_base(
+        uuid,
+        position,
+        yaw,
+        "minecraft:sheep",
+        8.0,
+        initialization.animal,
+    )?
+    else {
+        unreachable!("animal draft is always a compound")
+    };
+    fields.push(("Sheared".into(), Tag::Byte(0)));
+    fields.push(("Color".into(), Tag::Byte(color)));
+    Ok(Tag::Compound(fields))
+}
+
+/// Shared saved defaults for the verified, newly constructed farm animals.
+pub(super) fn draft_fresh_animal_base(
+    uuid: [i32; 4],
+    position: [f64; 3],
+    yaw: f32,
+    id: &'static str,
+    health: f32,
+    animal: AnimalBaseInitialization,
+) -> Result<Tag> {
+    ensure!(
+        position.iter().all(|v| v.is_finite())
+            && position[0].abs() <= 30_000_512.0
+            && position[2].abs() <= 30_000_512.0
+            && position[1].abs() <= 20_000_000.0,
+        "animal position would be clamped"
+    );
+    ensure!(yaw.is_finite(), "invalid animal rotation");
+    let bonus = animal
+        .follow_range_bonus
+        .context("fresh animal is missing its follow-range bonus")?;
+    ensure!(bonus.is_finite(), "invalid follow-range bonus");
     let compound = |fields: Vec<(&str, Tag)>| {
         Tag::Compound(
             fields
@@ -58,7 +84,7 @@ pub fn draft_fresh_sheep(
         ("modifiers", list(TagType::Compound, vec![modifier])),
     ]);
     Ok(compound(vec![
-        ("id", Tag::String("minecraft:sheep".into())),
+        ("id", Tag::String(id.into())),
         ("UUID", Tag::IntArray(uuid.to_vec())),
         (
             "Pos",
@@ -78,7 +104,7 @@ pub fn draft_fresh_sheep(
         ("OnGround", Tag::Byte(0)),
         ("Invulnerable", Tag::Byte(0)),
         ("PortalCooldown", Tag::Int(0)),
-        ("Health", Tag::Float(8.0)),
+        ("Health", Tag::Float(health)),
         ("HurtTime", Tag::Short(0)),
         ("DeathTime", Tag::Short(0)),
         ("AbsorptionAmount", Tag::Float(0.0)),
@@ -88,23 +114,14 @@ pub fn draft_fresh_sheep(
         ("Brain", compound(vec![("memories", compound(vec![]))])),
         ("CanPickUpLoot", Tag::Byte(0)),
         ("PersistenceRequired", Tag::Byte(0)),
-        (
-            "LeftHanded",
-            Tag::Byte(i8::from(initialization.animal.left_handed)),
-        ),
+        ("LeftHanded", Tag::Byte(i8::from(animal.left_handed))),
         (
             "Age",
-            Tag::Int(if initialization.animal.set_baby_age {
-                -24_000
-            } else {
-                0
-            }),
+            Tag::Int(if animal.set_baby_age { -24_000 } else { 0 }),
         ),
         ("ForcedAge", Tag::Int(0)),
         ("AgeLocked", Tag::Byte(0)),
         ("InLove", Tag::Int(0)),
-        ("Sheared", Tag::Byte(0)),
-        ("Color", Tag::Byte(color)),
     ]))
 }
 

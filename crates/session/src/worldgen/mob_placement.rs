@@ -436,6 +436,76 @@ impl GeneratedCreatureProbe {
         })
     }
 
+    /// Prepare a finalized farm animal without publishing the spawn stage.
+    /// The chicken timer is sampled by the independently constructed entity.
+    pub(super) fn prepare_fresh_farm_animal(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        batch: &FreshTerrainBatch,
+        variants: &native_resources::animal_variants::FarmAnimalSpawnVariants,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+        chicken_egg_time: Option<i32>,
+    ) -> Result<super::GeneratedEntityAddition> {
+        use native_resources::animal_variants::FarmAnimal;
+        let species = match (
+            self.attempt.entity.namespace.as_str(),
+            self.attempt.entity.path.as_str(),
+        ) {
+            ("minecraft", "pig") => FarmAnimal::Pig,
+            ("minecraft", "cow") => FarmAnimal::Cow,
+            ("minecraft", "chicken") => FarmAnimal::Chicken,
+            _ => anyhow::bail!("pending creature is not a supported farm animal"),
+        };
+        ensure!(
+            variants.species() == species,
+            "farm animal registry does not match creature"
+        );
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "animal is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed animal is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        let position = geometry_block_position(geometry)?.to_array();
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let initialized = batch.initialize_farm_animal(
+            position,
+            variants,
+            &mut next_random,
+            &mut next_group,
+            false,
+        )?;
+        let tag = super::draft_fresh_farm_animal(
+            species,
+            uuid,
+            geometry.position,
+            yaw,
+            variants.default_variant(),
+            &initialized,
+            chicken_egg_time,
+        )?;
+        let mut next_planner = planner.clone();
+        next_planner.finish_entity(true)?;
+        *planner = next_planner;
+        *random = next_random;
+        *group = next_group;
+        self.finalized = true;
+        Ok(super::GeneratedEntityAddition {
+            block_position: position,
+            record: super::GeneratedEntityRecord::Saved(tag),
+        })
+    }
+
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
     /// advancing the planner. The caller still checks collision and mob rules.

@@ -144,6 +144,11 @@ impl WorldCreationSettings {
         native_core::world_seed::parse_seed(self.seed.value())
     }
 
+    /// Call once when committing world creation; an empty field chooses a seed.
+    pub fn resolve_seed(&self) -> i64 {
+        native_core::world_seed::resolve_seed(self.seed.value())
+    }
+
     pub fn effective_difficulty(&self) -> Difficulty {
         if self.mode == GameMode::Hardcore {
             Difficulty::Hard
@@ -210,6 +215,15 @@ impl WorldCreationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entered_seed_is_used_when_resolving_world_creation() {
+        let mut settings = WorldCreationSettings::new("World".into());
+        settings.seed = crate::chat_input::ChatInput::field(" -123 ");
+        assert_eq!(settings.resolve_seed(), -123);
+        settings.seed = crate::chat_input::ChatInput::field("abc");
+        assert_eq!(settings.resolve_seed(), 96354);
+    }
 
     #[test]
     fn level_metadata_applies_game_mode_overrides() {

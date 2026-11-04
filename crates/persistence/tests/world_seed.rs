@@ -1,7 +1,7 @@
 //! Differential check against the installed Java Edition seed parser.
 use std::{path::PathBuf, process::Command};
 
-use native_core::world_seed::parse_seed;
+use native_core::world_seed::{RandomWorldSeed, parse_seed};
 
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
@@ -31,10 +31,17 @@ fn create_world_seed_text_matches_java_26_3() {
     let classpath = std::env::join_paths(classpath).unwrap();
     let source = temp.path().join("WorldSeedOracle.java");
     std::fs::write(&source, include_str!("java/WorldSeedOracle.java")).unwrap();
+    let random_source = temp.path().join("RandomWorldSeedOracle.java");
+    std::fs::write(
+        &random_source,
+        include_str!("java/RandomWorldSeedOracle.java"),
+    )
+    .unwrap();
     let compile = Command::new(java.join("javac.exe"))
         .arg("-cp")
         .arg(&classpath)
         .arg(source)
+        .arg(random_source)
         .output()
         .unwrap();
     assert!(
@@ -89,7 +96,37 @@ fn create_world_seed_text_matches_java_26_3() {
         .arg("-cp")
         .arg(&classpath)
         .arg("WorldSeedOracle")
-        .arg(input)
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let results = std::fs::read(&output).unwrap();
+    assert_eq!(results.len(), cases.len() * 9);
+    for (case, row) in cases.iter().zip(results.chunks_exact(9)) {
+        let value = i64::from_be_bytes(row[1..].try_into().unwrap());
+        let expected = (row[0] != 0).then_some(value);
+        assert_eq!(parse_seed(case), expected, "seed input {case:?}");
+    }
+
+    let clocks: Vec<i64> = (0..4096i64)
+        .map(|i| i.wrapping_mul(6364136223846793005).wrapping_add(i64::MIN))
+        .collect();
+    let mut bytes = Vec::with_capacity(4 + clocks.len() * 8);
+    bytes.extend_from_slice(&(clocks.len() as u32).to_be_bytes());
+    for clock in &clocks {
+        bytes.extend_from_slice(&clock.to_be_bytes());
+    }
+    std::fs::write(&input, bytes).unwrap();
+    let run = Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(classpath)
+        .arg("RandomWorldSeedOracle")
+        .arg(&input)
         .arg(&output)
         .output()
         .unwrap();
@@ -99,10 +136,14 @@ fn create_world_seed_text_matches_java_26_3() {
         String::from_utf8_lossy(&run.stderr)
     );
     let results = std::fs::read(output).unwrap();
-    assert_eq!(results.len(), cases.len() * 9);
-    for (case, row) in cases.iter().zip(results.chunks_exact(9)) {
-        let value = i64::from_be_bytes(row[1..].try_into().unwrap());
-        let expected = (row[0] != 0).then_some(value);
-        assert_eq!(parse_seed(case), expected, "seed input {case:?}");
+    assert_eq!(results.len(), clocks.len() * 8);
+    let generator = RandomWorldSeed::new();
+    for (clock, row) in clocks.into_iter().zip(results.chunks_exact(8)) {
+        let expected = i64::from_be_bytes(row.try_into().unwrap());
+        assert_eq!(
+            generator.next_with_clock(|| clock),
+            expected,
+            "clock {clock}"
+        );
     }
 }

@@ -18,6 +18,12 @@ public class HeightmapLifecycleOracle {
         for(var entry:chunk.getHeightmaps()) result.addProperty(entry.getKey().getSerializedName(), entry.getValue().getFirstAvailable(0,0));
         return result;
     }
+    static JsonObject captureBlock(ProtoChunk chunk) {
+        var result = capture(chunk);
+        result.addProperty("block", net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(chunk.getBlockState(BlockPos.ZERO).getBlock()).toString());
+        result.addProperty("section", net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(chunk.getSection(0).getBlockState(0,0,0).getBlock()).toString());
+        return result;
+    }
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class); bind.setAccessible(true);
@@ -39,6 +45,18 @@ public class HeightmapLifecycleOracle {
         chunk.getSection(0).setBlockState(0,13,0,Blocks.STONE.defaultBlockState(),false); result.add(capture(chunk));
         chunk.getHeight(Heightmap.Types.OCEAN_FLOOR,0,0); result.add(capture(chunk));
         chunk.setBlockState(new BlockPos(0,7,0),Blocks.ANCIENT_DEBRIS.defaultBlockState(),2); result.add(capture(chunk));
+        var empty = new ProtoChunk(new ChunkPos(0,0),UpgradeData.EMPTY,LevelHeightAccessor.create(0,16),palette,null);
+        empty.setPersistedStatus(ChunkStatus.TERRAIN);
+        Heightmap.primeHeightmaps(empty,EnumSet.of(Heightmap.Types.OCEAN_FLOOR_WG,Heightmap.Types.WORLD_SURFACE_WG));
+        result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.AIR.defaultBlockState(),2); result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.CAVE_AIR.defaultBlockState(),2); result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.AIR.defaultBlockState(),2); result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.STONE.defaultBlockState(),2); result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.AIR.defaultBlockState(),2); result.add(captureBlock(empty));
+        empty.setBlockState(BlockPos.ZERO,Blocks.CAVE_AIR.defaultBlockState(),2);
+        empty.getSection(0).setBlockState(1,0,0,Blocks.STONE.defaultBlockState(),false); result.add(captureBlock(empty));
+        empty.getSection(0).setBlockState(1,0,0,Blocks.AIR.defaultBlockState(),false); result.add(captureBlock(empty));
         Files.writeString(Path.of(args[0]),result.toString());
     }
 }

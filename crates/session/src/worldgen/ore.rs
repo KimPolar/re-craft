@@ -3,6 +3,7 @@
 //! The surrounding decoration scheduler must still supply Java's feature order,
 //! random seed, writable region and complete terrain-stage neighborhood.
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
 };
@@ -64,6 +65,7 @@ pub struct DecorationRegion<'a> {
     lake_water_fluids: Option<&'a BTreeSet<String>>,
     bubble_column_fluids: Option<&'a BTreeSet<String>>,
     motion_cache: BTreeMap<BlockStateId, bool>,
+    section_non_air: RefCell<BTreeMap<(ChunkPos, i8), usize>>,
     tree_logs: Vec<[i32; 3]>,
     tree_leaves: Vec<[i32; 3]>,
     freeze_context: Option<FreezeContext<'a>>,
@@ -1673,6 +1675,7 @@ impl CarvedTerrainWorld {
             lake_water_fluids: None,
             bubble_column_fluids: None,
             motion_cache: BTreeMap::new(),
+            section_non_air: RefCell::new(BTreeMap::new()),
             tree_logs: Vec::new(),
             tree_leaves: Vec::new(),
             freeze_context: None,
@@ -1927,11 +1930,44 @@ impl DecorationRegion<'_> {
         Ok(Arc::clone(&self.target.world))
     }
 
-    fn read(&self, p: [i32; 3]) -> Result<BlockState> {
+    fn raw_read(&self, p: [i32; 3]) -> Result<BlockState> {
         self.world
             .block(p[0], p[1], p[2])
             .cloned()
             .context("generation block or section is missing")
+    }
+
+    fn section_has_only_air(&self, p: [i32; 3]) -> Result<bool> {
+        let key = (chunk(p), i8::try_from(p[1].div_euclid(16))?);
+        if let Some(count) = self.section_non_air.borrow().get(&key) {
+            return Ok(*count == 0);
+        }
+        let blocks = self
+            .world
+            .chunks
+            .get(&key.0)
+            .and_then(|chunk| chunk.sections.get(&key.1))
+            .and_then(|section| section.blocks.as_ref())
+            .context("block read section is missing")?;
+        let mut count = 0;
+        for id in blocks.iter() {
+            if !is_air(self.world.state(*id).context("unknown section block")?) {
+                count += 1;
+            }
+        }
+        self.section_non_air.borrow_mut().insert(key, count);
+        Ok(count == 0)
+    }
+
+    fn read(&self, p: [i32; 3]) -> Result<BlockState> {
+        let state = self.raw_read(p)?;
+        if state.name != "minecraft:air" && is_air(&state) && self.section_has_only_air(p)? {
+            return Ok(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+        }
+        Ok(state)
     }
 
     fn is_outside(&self, y: i32) -> bool {
@@ -2110,6 +2146,18 @@ impl DecorationRegion<'_> {
         self.prime_heightmaps(pos, FINAL_HEIGHTMAPS)
     }
 
+    // ProtoChunk returns before writing ordinary air into an all-air section.
+    // Other air states still go through the normal block and heightmap path.
+    fn set_proto_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
+        if state.name == "minecraft:air" && state.properties.is_empty() {
+            if self.section_has_only_air(p)? {
+                return Ok(());
+            }
+        }
+        self.set_section_block(p, state)?;
+        self.update_final_heightmaps(p, state)
+    }
+
     fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
         let pos = chunk([x, 0, z]);
         self.prime_heightmaps(pos, WORLD_SURFACE_WG)?;
@@ -2154,8 +2202,7 @@ impl DecorationRegion<'_> {
         );
         // At TERRAIN, ProtoChunk updates final heightmaps, not the cached
         // world-generation maps. Saving remains outside this partial pipeline.
-        self.set_section_block(p, state)?;
-        self.update_final_heightmaps(p, state)?;
+        self.set_proto_block(p, state)?;
         Ok(true)
     }
 }
@@ -2698,10 +2745,9 @@ impl DecorationRegion<'_> {
             "unsupported tree source effects"
         );
         self.tree_block_write = true;
-        let result = self.set_section_block(pos, state);
+        let result = self.set_proto_block(pos, state);
         self.tree_block_write = false;
         result?;
-        self.update_final_heightmaps(pos, state)?;
         Ok(())
     }
 }
@@ -2824,8 +2870,7 @@ impl MushroomWorld for DecorationRegion<'_> {
             is_air(&old) || tree_generated_leaf(&old)?,
             "unsupported mushroom source effects"
         );
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)?;
+        self.set_proto_block(pos, state)?;
         Ok(())
     }
 }
@@ -2873,10 +2918,9 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
                 "unsupported vegetation patch source effects"
             );
             self.patch_block_write = true;
-            let write = self.set_section_block(pos, state);
+            let write = self.set_proto_block(pos, state);
             self.patch_block_write = false;
             write?;
-            self.update_final_heightmaps(pos, state)?;
             Ok(())
         })();
         if result.is_err() {
@@ -2940,8 +2984,7 @@ impl RootSystemWorld for DecorationRegion<'_> {
                 disk_safe_solid(&old.name).is_some() || valid_hanging_roots(&old),
                 "unsupported root source effects"
             );
-            self.set_section_block(pos, state)?;
-            self.update_final_heightmaps(pos, state)?;
+            self.set_proto_block(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -2981,8 +3024,7 @@ impl GroundDecorationWorld for DecorationRegion<'_> {
             is_air(&old) || old.name == "minecraft:vine",
             "unsupported ground decoration source"
         );
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)?;
+        self.set_proto_block(pos, state)?;
         Ok(())
     }
 }
@@ -3008,8 +3050,7 @@ impl BeehiveWorld for DecorationRegion<'_> {
                 ("honey_level".into(), "0".into()),
             ]),
         };
-        self.set_section_block(pos, &state)?;
-        self.update_final_heightmaps(pos, &state)?;
+        self.set_proto_block(pos, &state)?;
         Ok(true)
     }
     fn store_bees(&mut self, pos: [i32; 3], ticks: &[i32]) -> Result<()> {
@@ -3049,8 +3090,7 @@ impl DecorationRegion<'_> {
                 ),
             "unsupported fallen tree source effects"
         );
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)?;
+        self.set_proto_block(pos, state)?;
         Ok(())
     }
 }
@@ -3339,8 +3379,7 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         if self.monster_entities.contains_key(&pos) {
             Arc::make_mut(&mut self.monster_entities).remove(&pos);
         }
-        self.set_section_block(pos, &state)?;
-        self.update_final_heightmaps(pos, &state)?;
+        self.set_proto_block(pos, &state)?;
         match kind {
             RoomBlock::Chest(facing) => {
                 let chest = super::GeneratedLootChest::new(
@@ -3456,8 +3495,7 @@ impl DecorationRegion<'_> {
                 && state.properties.get("snowy").is_some_and(|v| v == "true")
         };
         ensure!(safe, "unsupported freeze block replacement effects");
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)?;
+        self.set_proto_block(pos, state)?;
         Ok(())
     }
 }
@@ -4092,8 +4130,7 @@ impl VinesWorld for DecorationRegion<'_> {
                 return Ok(true);
             }
             ensure!(is_air(&self.read(pos)?), "unsupported vines source effects");
-            self.set_section_block(pos, state)?;
-            self.update_final_heightmaps(pos, state)?;
+            self.set_proto_block(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -4219,8 +4256,7 @@ impl native_resources::multiface_growth::MultifaceWorld for DecorationRegion<'_>
             is_air(&old) || old.name == "minecraft:water" || valid_lichen(&old),
             "unsupported multiface replacement effect"
         );
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)?;
+        self.set_proto_block(pos, state)?;
         Ok(true)
     }
     fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()> {
@@ -4242,8 +4278,7 @@ impl GeodeEnvironment for DecorationRegion<'_> {
             return Ok(());
         }
         geode_safe_state(&self.read(pos)?)?;
-        self.set_section_block(pos, state)?;
-        self.update_final_heightmaps(pos, state)
+        self.set_proto_block(pos, state)
     }
     fn schedule_geode_fluid(&mut self, pos: [i32; 3]) -> Result<()> {
         use native_world::fluid::{FluidKind, FluidState};
@@ -4522,8 +4557,7 @@ impl DiskWorld for DecorationRegion<'_> {
                 disk_safe_solid(&self.read(p)?.name).is_some(),
                 "unsupported disk source effects"
             );
-            self.set_section_block(p, state)?;
-            self.update_final_heightmaps(p, state)?;
+            self.set_proto_block(p, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -4788,8 +4822,7 @@ impl DecorationRegion<'_> {
                 || simple_plant_kind(&old).is_ok(),
             "unsupported simple-block source effects"
         );
-        self.set_section_block(p, state)?;
-        self.update_final_heightmaps(p, state)?;
+        self.set_proto_block(p, state)?;
         // WorldGenRegion.setBlock records the mushroom's postprocess position.
         if matches!(
             state.name.as_str(),
@@ -5019,8 +5052,7 @@ impl SpringWorld for DecorationRegion<'_> {
                 disk_safe_solid(&self.read(pos)?.name).is_some(),
                 "unsupported spring source effects"
             );
-            self.set_section_block(pos, state)?;
-            self.update_final_heightmaps(pos, state)?;
+            self.set_proto_block(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -5090,8 +5122,7 @@ impl MagmaWorld for DecorationRegion<'_> {
                     disk_safe_solid(&self.read(pos)?.name).is_some(),
                     "unsupported magma source effects"
                 );
-                self.set_section_block(pos, state)?;
-                self.update_final_heightmaps(pos, state)?;
+                self.set_proto_block(pos, state)?;
             }
             self.mark_postprocessing([pos[0], pos[1].wrapping_add(1), pos[2]])?;
             Ok(true)
@@ -5148,10 +5179,9 @@ impl ColumnWorld for DecorationRegion<'_> {
                 "unsupported column source effects"
             );
             self.column_block_write = true;
-            let write = self.set_section_block(pos, state);
+            let write = self.set_proto_block(pos, state);
             self.column_block_write = false;
             write?;
-            self.update_final_heightmaps(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -5194,8 +5224,7 @@ impl LakeWorld for DecorationRegion<'_> {
                 disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
                 "unsupported lake source effects"
             );
-            self.set_section_block(pos, state)?;
-            self.update_final_heightmaps(pos, state)?;
+            self.set_proto_block(pos, state)?;
             Ok(true)
         })();
         if result.is_err() {
@@ -5260,7 +5289,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
         if self.is_outside(p[1]) {
             return Ok(None);
         }
-        self.read(p).map(Some)
+        self.raw_read(p).map(Some)
     }
     fn section_neighbor(&mut self, p: [i32; 3]) -> Result<BlockState> {
         if self.is_outside(p[1]) {
@@ -5269,14 +5298,14 @@ impl OreVeinWorld for DecorationRegion<'_> {
                 properties: BTreeMap::new(),
             });
         }
-        self.read(p)
+        self.raw_read(p)
     }
     fn set_section_block(&mut self, p: [i32; 3], state: &BlockState) -> Result<()> {
         ensure!(!self.is_outside(p[1]), "ore write outside build height");
         let mut unchanged_registered = false;
         if let Some(guard) = &self.light_guard {
             if guard.registered.contains(&chunk(p)) {
-                let old = self.read(p)?;
+                let old = self.raw_read(p)?;
                 if old == *state {
                     unchanged_registered = true;
                 } else {
@@ -5452,8 +5481,21 @@ impl OreVeinWorld for DecorationRegion<'_> {
         if unchanged_registered {
             return Ok(());
         }
-        let id = self.world.intern_state(state.clone());
         let section_y = i8::try_from(p[1].div_euclid(16))?;
+        let key = (chunk(p), section_y);
+        let cached_count = self.section_non_air.borrow().get(&key).copied();
+        let updated_count = if let Some(count) = cached_count {
+            let old_air = is_air(&self.raw_read(p)?);
+            let new_air = is_air(state);
+            Some(match (old_air, new_air) {
+                (true, false) => count + 1,
+                (false, true) => count.checked_sub(1).context("invalid section air count")?,
+                _ => count,
+            })
+        } else {
+            None
+        };
+        let id = self.world.intern_state(state.clone());
         let chunk = Arc::make_mut(
             self.world
                 .chunks
@@ -5474,6 +5516,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
             + p[2].rem_euclid(16) as usize * 16
             + p[1].rem_euclid(16) as usize * 256;
         blocks[index] = id;
+        if let Some(count) = updated_count {
+            self.section_non_air.borrow_mut().insert(key, count);
+        }
         Ok(())
     }
 }
@@ -11009,6 +11054,38 @@ mod tests {
     }
 
     #[test]
+    fn proto_air_write_skips_an_empty_section_without_priming() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let world = Arc::make_mut(&mut terrain.world);
+        let cave_air = world.intern_state(state("cave_air"));
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(cave_air);
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        region.set_proto_block([0, 0, 0], &state("air")).unwrap();
+        assert_eq!(region.read([0, 0, 0]).unwrap(), state("air"));
+        assert_eq!(region.raw_read([0, 0, 0]).unwrap(), state("cave_air"));
+        assert!(!region.final_heights.contains_key(&center));
+        region
+            .set_proto_block([0, 0, 0], &state("cave_air"))
+            .unwrap();
+        assert_eq!(region.final_heights[&center].primed, FINAL_HEIGHTMAPS);
+        region.set_proto_block([0, 0, 0], &state("stone")).unwrap();
+        region.set_proto_block([0, 0, 0], &state("air")).unwrap();
+        assert_eq!(region.read([0, 0, 0]).unwrap(), state("air"));
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn heightmap_priming_lifecycle_matches_java_protochunk() {
         use std::{path::PathBuf, process::Command};
@@ -11113,6 +11190,46 @@ mod tests {
             .set_block([0, 7, 0], &state("ancient_debris"), 2)
             .unwrap();
         actual.push(capture(&region));
+
+        let (mut empty_terrain, tags, motion, _) = fixture();
+        let world = Arc::make_mut(&mut empty_terrain.world);
+        let air = world.intern_state(state("air"));
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&center).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap().fill(air);
+        let mut empty = empty_terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        empty.ocean_floor_height(0, 0).unwrap();
+        empty.world_surface_height(0, 0).unwrap();
+        let capture_block = |region: &DecorationRegion<'_>| {
+            let mut value = capture(region);
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("block".into(), json!(region.read([0, 0, 0]).unwrap().name));
+            value.as_object_mut().unwrap().insert(
+                "section".into(),
+                json!(region.raw_read([0, 0, 0]).unwrap().name),
+            );
+            value
+        };
+        actual.push(capture_block(&empty));
+        for block in ["air", "cave_air", "air", "stone", "air"] {
+            empty.set_proto_block([0, 0, 0], &state(block)).unwrap();
+            actual.push(capture_block(&empty));
+        }
+        empty
+            .set_proto_block([0, 0, 0], &state("cave_air"))
+            .unwrap();
+        empty.set_section_block([1, 0, 0], &state("stone")).unwrap();
+        actual.push(capture_block(&empty));
+        empty.set_section_block([1, 0, 0], &state("air")).unwrap();
+        actual.push(capture_block(&empty));
         assert_eq!(actual, expected);
     }
 

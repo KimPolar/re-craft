@@ -1,14 +1,14 @@
-//! Compare region RNG and the common animal superclass against installed 26.3.
+//! Compare sheep color and common animal finalization against installed 26.3.
 use native_resources::{
     density::WorldgenRandom,
-    worldgen_region_random::{AnimalGroupData, RegionRandom, finalize_animal_base},
+    worldgen_region_random::{AnimalGroupData, RegionRandom, finalize_sheep},
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
-fn region_random_and_animal_superclasses_match_java() {
+fn region_random_and_sheep_finalization_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -27,7 +27,11 @@ fn region_random_and_animal_superclasses_match_java() {
                     (2, true, 0.0),
                 ] {
                     for existing in [false, true] {
-                        cases.push(json!({"legacy":legacy,"seed":seed,"x":x,"z":z,"size":size,"baby":baby,"chance":chance,"existing":existing}));
+                        for (warm, cold) in
+                            [(false, false), (true, false), (false, true), (true, true)]
+                        {
+                            cases.push(json!({"legacy":legacy,"seed":seed,"x":x,"z":z,"size":size,"baby":baby,"chance":chance,"existing":existing,"warm":warm,"cold":cold}));
+                        }
                     }
                 }
             }
@@ -93,8 +97,15 @@ fn region_random_and_animal_superclasses_match_java() {
         };
         let mut animals = Vec::new();
         for _ in 0..3 {
-            let actual = finalize_animal_base(&mut random, &mut group, existing);
-            animals.push(json!({"age":if actual.set_baby_age { -24000 } else { 123 }, "size":group.size,
+            let sheep = finalize_sheep(
+                &mut random,
+                &mut group,
+                existing,
+                case["warm"].as_bool().unwrap(),
+                case["cold"].as_bool().unwrap(),
+            );
+            let actual = sheep.animal;
+            animals.push(json!({"color":sheep.color.as_str(), "age":if actual.set_baby_age { -24000 } else { 123 }, "size":group.size,
                 "left":actual.left_handed, "modifier_bits":actual.follow_range_bonus.unwrap_or(0.25).to_bits() as i64,
                 "permanent":!existing}));
         }

@@ -1,7 +1,7 @@
 //! WorldGenRegion's random source and the common animal spawn-finalization steps.
 //!
-//! Species-specific initialization must run before `finalize_animal_base`.
-//! This does not construct, finalize completely, or store an entity.
+//! Species-specific initialization precedes `finalize_animal_base`.
+//! These functions do not construct or store an entity.
 
 use native_core::{
     normal_noise::{NoiseSeedFactory, NoiseSeedSource},
@@ -109,6 +109,74 @@ pub struct AnimalBaseInitialization {
     pub left_handed: bool,
 }
 
+/// Wool colors that may be selected for a naturally spawned sheep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SheepSpawnColor {
+    White,
+    Black,
+    Gray,
+    LightGray,
+    Brown,
+    Pink,
+}
+
+impl SheepSpawnColor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::White => "white",
+            Self::Black => "black",
+            Self::Gray => "gray",
+            Self::LightGray => "light_gray",
+            Self::Brown => "brown",
+            Self::Pink => "pink",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SheepInitialization {
+    pub color: SheepSpawnColor,
+    pub animal: AnimalBaseInitialization,
+}
+
+/// Apply Sheep.finalizeSpawn's color selection followed by the animal base.
+/// The booleans are membership in the resolved warm and cold biome tags;
+/// warm takes precedence if a data pack puts a biome in both. The caller
+/// supplies the region's persistent RNG and the current spawn group data.
+pub fn finalize_sheep(
+    random: &mut RegionRandom,
+    group: &mut AnimalGroupData,
+    has_follow_range_bonus: bool,
+    warm_biome: bool,
+    cold_biome: bool,
+) -> SheepInitialization {
+    use SheepSpawnColor::*;
+    let (first, second, third, fourth, common) = if warm_biome {
+        (Gray, LightGray, White, Black, Brown)
+    } else if cold_biome {
+        (LightGray, Gray, White, Brown, Black)
+    } else {
+        (Black, Gray, LightGray, Brown, White)
+    };
+    let color = match random.next_int_bound(100).expect("positive bound") {
+        0..=4 => first,
+        5..=9 => second,
+        10..=14 => third,
+        15..=17 => fourth,
+        _ => {
+            if random.next_int_bound(500).expect("positive bound") == 499 {
+                Pink
+            } else {
+                common
+            }
+        }
+    };
+    SheepInitialization {
+        color,
+        animal: finalize_animal_base(random, group, has_follow_range_bonus),
+    }
+}
+
 /// Apply only the common superclass steps, after species-specific logic.
 /// The caller owns the actual group data, random source and entity attributes.
 pub fn finalize_animal_base(
@@ -157,6 +225,31 @@ mod tests {
             assert_eq!(second.left_handed, expected.next_float() < 0.05);
             assert_eq!(group.size, 2);
             assert_eq!(random.next_long(), expected.next_long());
+        }
+    }
+
+    #[test]
+    fn sheep_respects_warm_tag_precedence_and_selects_all_natural_colors() {
+        for algorithm in [WorldgenRandom::Legacy, WorldgenRandom::Xoroshiro] {
+            let mut warm_random = RegionRandom::new(42, algorithm, -2, 7);
+            let mut both_random = warm_random.clone();
+            let mut warm_group = AnimalGroupData::default();
+            let mut both_group = warm_group;
+            let mut colors = std::collections::BTreeSet::new();
+            for _ in 0..10_000 {
+                let warm = finalize_sheep(&mut warm_random, &mut warm_group, false, true, false);
+                let both = finalize_sheep(&mut both_random, &mut both_group, false, true, true);
+                assert_eq!(warm, both);
+                colors.insert(warm.color.as_str());
+            }
+            assert_eq!(warm_random.next_long(), both_random.next_long());
+            assert_eq!(warm_group, both_group);
+            assert_eq!(
+                colors,
+                ["black", "brown", "gray", "light_gray", "pink", "white"]
+                    .into_iter()
+                    .collect()
+            );
         }
     }
 }

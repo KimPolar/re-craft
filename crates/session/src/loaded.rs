@@ -67,6 +67,17 @@ impl std::fmt::Display for MissingSpawnChunk {
 
 impl std::error::Error for MissingSpawnChunk {}
 
+#[derive(Debug)]
+struct MissingSpawnEntities(ChunkPos);
+
+impl std::fmt::Display for MissingSpawnEntities {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "entity chunk {}, {} is unavailable", self.0.x, self.0.z)
+    }
+}
+
+impl std::error::Error for MissingSpawnEntities {}
+
 /// Data needed to attempt an in-memory respawn at an existing saved bed or
 /// anchor. Missing chunks, rules and unsupported blocks remain unavailable.
 pub struct SavedRespawnSupport {
@@ -6631,46 +6642,11 @@ impl LoadedSession {
                 Ok(Some(found)) => return Ok(Progress::Found(found)),
                 Ok(None) => continue,
                 Err(error) => {
-                    // Entity collision checks cover a two-block margin around
-                    // the standing player; it also encloses block queries.
-                    let start_x = pos
-                        .x
-                        .checked_sub(2)
-                        .ok_or_else(|| anyhow::anyhow!("spawn query X overflow"))?
-                        .div_euclid(16);
-                    let end_x = pos
-                        .x
-                        .checked_add(2)
-                        .ok_or_else(|| anyhow::anyhow!("spawn query X overflow"))?
-                        .div_euclid(16);
-                    let start_z = pos
-                        .z
-                        .checked_sub(2)
-                        .ok_or_else(|| anyhow::anyhow!("spawn query Z overflow"))?
-                        .div_euclid(16);
-                    let end_z = pos
-                        .z
-                        .checked_add(2)
-                        .ok_or_else(|| anyhow::anyhow!("spawn query Z overflow"))?
-                        .div_euclid(16);
-                    for z in start_z..=end_z {
-                        for x in start_x..=end_x {
-                            let chunk = ChunkPos { x, z };
-                            if !generated_targets.contains(&chunk) {
-                                return Ok(Progress::NeedsTerrain(chunk));
-                            }
-                        }
+                    if let Some(missing) = error.downcast_ref::<MissingSpawnChunk>() {
+                        return Ok(Progress::NeedsTerrain(missing.0));
                     }
-                    for z in start_z..=end_z {
-                        for x in start_x..=end_x {
-                            let chunk = ChunkPos { x, z };
-                            if matches!(
-                                self.saved_entity_chunk(chunk),
-                                None | Some(SavedEntityData::Unavailable)
-                            ) {
-                                return Ok(Progress::NeedsEntities(chunk));
-                            }
-                        }
+                    if let Some(missing) = error.downcast_ref::<MissingSpawnEntities>() {
+                        return Ok(Progress::NeedsEntities(missing.0));
                     }
                     return Err(error);
                 }
@@ -6816,10 +6792,9 @@ impl LoadedSession {
             for x in min_x..=max_x {
                 let chunk_pos = ChunkPos { x, z };
                 if let Some(targets) = targets {
-                    anyhow::ensure!(
-                        targets.contains(&chunk_pos),
-                        "generated spawn entity chunk is not a light-complete target"
-                    );
+                    if !targets.contains(&chunk_pos) {
+                        return Err(MissingSpawnChunk(chunk_pos).into());
+                    }
                 }
                 match self.entity_chunks.get(&chunk_pos) {
                     Some(SavedEntityData::Empty) => {}
@@ -6849,9 +6824,17 @@ impl LoadedSession {
                         }
                     }
                     Some(SavedEntityData::Unavailable) => {
+                        if targets.is_some() {
+                            return Err(MissingSpawnEntities(chunk_pos).into());
+                        }
                         anyhow::bail!("entity chunk {x}, {z} is unavailable")
                     }
-                    None => return Err(MissingSpawnChunk(chunk_pos).into()),
+                    None => {
+                        if targets.is_some() {
+                            return Err(MissingSpawnEntities(chunk_pos).into());
+                        }
+                        return Err(MissingSpawnChunk(chunk_pos).into());
+                    }
                 }
             }
         }
@@ -19800,10 +19783,9 @@ impl LoadedColumnSpawnView<'_> {
             x: pos.x.div_euclid(16),
             z: pos.z.div_euclid(16),
         };
-        anyhow::ensure!(
-            targets.contains(&chunk_pos),
-            "generated spawn chunk is not a light-complete target"
-        );
+        if !targets.contains(&chunk_pos) {
+            return Err(MissingSpawnChunk(chunk_pos).into());
+        }
         let chunk = self
             .session
             .world
@@ -45098,6 +45080,61 @@ pub(crate) mod tests {
                 .generated_initial_spawn_search(home, 64, 63, &targets)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn generated_player_spawn_reports_real_errors_before_unrelated_neighbors() {
+        use crate::world_spawn::{ResumableWorldSpawn, WorldSpawnCandidates};
+        use native_persistence::nbt::{NamedTag, Tag};
+
+        let mut session = session();
+        let home = session.player_chunk().unwrap();
+        Arc::make_mut(
+            Arc::make_mut(&mut session.world)
+                .chunks
+                .get_mut(&home)
+                .unwrap(),
+        )
+        .block_light_correct = true;
+        session
+            .set_spawn_heightmap_tags(test_heightmap_tags())
+            .unwrap();
+        let targets = BTreeSet::from([home]);
+        // The entity query reaches the eastern neighbor, but the terrain
+        // column and block collisions are entirely inside this chunk.
+        let origin = session.origin + IVec3::new(14, 1, 8);
+        let candidates = WorldSpawnCandidates::new(origin, 0, 100.0, 0).unwrap();
+        let mut search = ResumableWorldSpawn::new(origin, Some(candidates.clone())).unwrap();
+        let error = session
+            .poll_generated_player_spawn(&mut search, None, &targets, 1)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("heightmaps are unavailable"));
+        assert_eq!(search.requested_position(), origin);
+
+        session
+            .prepare_initial_spawn_heightmaps(&saved_heightmap_chunk(home, None))
+            .unwrap();
+        session
+            .set_initial_entity_chunk(
+                home,
+                SavedEntityData::Present(Arc::new(native_persistence::world::SavedEntityChunk {
+                    position: native_persistence::world::ChunkPos {
+                        x: home.x,
+                        z: home.z,
+                    },
+                    document: Arc::new(NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![("Entities".into(), Tag::Int(0))]),
+                    }),
+                })),
+            )
+            .unwrap();
+        let mut search = ResumableWorldSpawn::new(origin, Some(candidates)).unwrap();
+        let error = session
+            .poll_generated_player_spawn(&mut search, None, &targets, 1)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("entity chunk list is invalid"));
+        assert_eq!(search.requested_position(), origin);
     }
 
     #[test]

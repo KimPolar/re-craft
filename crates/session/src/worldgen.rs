@@ -4940,6 +4940,10 @@ mod tests {
         );
         assert!(full.chunk.value.get("entities").is_none());
         assert_eq!(full.entity_records, component.entity_records);
+        let expected_entities = full.entity_records.as_ref().map(|records| {
+            native_persistence::generated_chunk::assemble_entity_chunk(center, records).unwrap()
+        });
+        assert_eq!(full.entity_chunk, expected_entities);
         assert_eq!(component.sections, postprocessed_sections);
         assert_eq!(
             component.heightmaps,

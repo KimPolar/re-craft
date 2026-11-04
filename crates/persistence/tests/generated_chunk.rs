@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 use native_core::postprocessing::PostProcessing;
 use native_persistence::{
     generated_chunk::{
-        FullChunkComponents, SpawnChunkComponents, assemble_full_chunk, assemble_spawn_chunk,
+        FullChunkComponents, SpawnChunkComponents, assemble_entity_chunk, assemble_full_chunk,
+        assemble_spawn_chunk,
     },
     generated_section::encode_generated_sections,
     generated_ticks::{encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks},
@@ -175,6 +176,46 @@ fn full_fixture(min_y: i32) -> FullChunkComponents {
     }
 }
 
+fn entity_records() -> Vec<Tag> {
+    let mut entities = fixture(0).entities;
+    let Tag::Compound(fields) = &mut entities[0] else {
+        unreachable!()
+    };
+    fields.push(("CustomMarker".into(), Tag::Int(73)));
+    entities
+}
+
+#[test]
+fn assembles_entity_chunk_and_retains_opaque_records() {
+    let pos = ChunkPos { x: -1, z: 2 };
+    let records = entity_records();
+    let document = assemble_entity_chunk(pos, &records).unwrap();
+    assert_eq!(
+        document.value.get("Position"),
+        Some(&Tag::IntArray(vec![-1, 2]))
+    );
+    assert_eq!(
+        document.value.get("Entities"),
+        Some(&Tag::List {
+            element_type: TagType::Compound,
+            values: records
+        })
+    );
+    assert_eq!(
+        nbt::read(&nbt::write(&document).unwrap()).unwrap(),
+        document
+    );
+    let empty = assemble_entity_chunk(pos, &[]).unwrap();
+    assert_eq!(
+        empty.value.get("Entities"),
+        Some(&Tag::List {
+            element_type: TagType::End,
+            values: vec![]
+        })
+    );
+    assert!(assemble_entity_chunk(pos, &[Tag::Int(0)]).is_err());
+}
+
 #[test]
 fn assembles_full_chunk_without_embedding_entities() {
     let result = assemble_full_chunk(full_fixture(0)).unwrap();
@@ -264,6 +305,13 @@ fn assembled_spawn_chunk_roundtrips_java_serializable_chunk_data() {
         .arg("-cp")
         .arg(&cp)
         .arg(&source));
+    let entity_input = temp.path().join("entities.nbt");
+    std::fs::write(
+        &entity_input,
+        nbt::write(&assemble_entity_chunk(ChunkPos { x: -1, z: 2 }, &entity_records()).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     for min_y in [-64, 0, 64] {
         let input = temp.path().join("chunk.nbt");
         std::fs::write(
@@ -276,7 +324,8 @@ fn assembled_spawn_chunk_roundtrips_java_serializable_chunk_data() {
             .arg(&cp)
             .arg("GeneratedChunkOracle")
             .arg(&input)
-            .arg(min_y.to_string()));
+            .arg(min_y.to_string())
+            .arg(&entity_input));
         std::fs::write(
             &input,
             nbt::write(&assemble_full_chunk(full_fixture(min_y)).unwrap()).unwrap(),
@@ -287,6 +336,7 @@ fn assembled_spawn_chunk_roundtrips_java_serializable_chunk_data() {
             .arg(&cp)
             .arg("GeneratedChunkOracle")
             .arg(&input)
-            .arg(min_y.to_string()));
+            .arg(min_y.to_string())
+            .arg(&entity_input));
     }
 }

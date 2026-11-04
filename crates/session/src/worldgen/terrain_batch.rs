@@ -65,6 +65,9 @@ pub struct PostprocessedChunkComponents {
 pub struct PostprocessedChunkDraft {
     pub chunk: native_persistence::nbt::NamedTag,
     pub entity_records: Option<Arc<Vec<native_persistence::nbt::Tag>>>,
+    /// Present only when the complete entity records are known. An empty
+    /// entity list still needs the correct Java storage action at save time.
+    pub entity_chunk: Option<native_persistence::nbt::NamedTag>,
 }
 
 pub(super) fn updated_postprocessing_sky_sources(
@@ -1930,6 +1933,13 @@ impl FreshTerrainBatch {
         self.postprocessed_chunk_components(processed, positions)?
             .into_iter()
             .map(|(pos, components)| {
+                let entity_chunk = components
+                    .entity_records
+                    .as_ref()
+                    .map(|records| {
+                        native_persistence::generated_chunk::assemble_entity_chunk(pos, records)
+                    })
+                    .transpose()?;
                 let chunk = native_persistence::generated_chunk::assemble_full_chunk(
                     native_persistence::generated_chunk::FullChunkComponents {
                         position: pos,
@@ -1948,6 +1958,7 @@ impl FreshTerrainBatch {
                     PostprocessedChunkDraft {
                         chunk,
                         entity_records: components.entity_records,
+                        entity_chunk,
                     },
                 ))
             })

@@ -49,5 +49,12 @@ public class GeneratedChunkOracle {
         for(int y=0;y<4;y++) for(int z=0;z<4;z++) for(int x=0;x<4;x++) {
             if(a.chunkSection().getNoiseBiome(x,y,z)!=biome || b.chunkSection().getNoiseBiome(x,y,z)!=biome) throw new AssertionError("biome");
         }
+        CompoundTag actualEntities; try(var stream=new DataInputStream(Files.newInputStream(Path.of(args[2])))) { actualEntities=NbtIo.read((DataInput)stream); }
+        var expectedEntities=NbtUtils.addCurrentDataVersion(new CompoundTag());
+        expectedEntities.store("Position",ChunkPos.CODEC,new ChunkPos(-1,2));
+        var pig=new CompoundTag();pig.putString("id","minecraft:pig");pig.putInt("CustomMarker",73);
+        var position=new ListTag();position.add(DoubleTag.valueOf(-14.5));position.add(DoubleTag.valueOf(4));position.add(DoubleTag.valueOf(34.5));
+        pig.put("Pos",position);var list=new ListTag();list.add(pig);expectedEntities.put("Entities",list);
+        if(!expectedEntities.equals(actualEntities))throw new AssertionError("entity chunk mismatch: "+actualEntities+" expected "+expectedEntities);
     }
 }

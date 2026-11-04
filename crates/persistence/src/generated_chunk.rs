@@ -42,6 +42,39 @@ pub struct FullChunkComponents {
     pub block_entities: Tag,
 }
 
+/// Assemble the entity-region document for already serialized entity records.
+/// A caller must separately establish record completeness, ownership and the
+/// correct empty-chunk storage action before saving.
+pub fn assemble_entity_chunk(position: ChunkPos, records: &[Tag]) -> Result<NamedTag> {
+    let entities = compound_list(
+        Tag::List {
+            element_type: TagType::Compound,
+            values: records.to_vec(),
+        },
+        "entities",
+    )?;
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+            ("Entities".into(), entities),
+            (
+                "Position".into(),
+                Tag::IntArray(vec![position.x, position.z]),
+            ),
+        ]),
+    };
+    crate::world::decode_entity_chunk(
+        document.clone(),
+        crate::world::ChunkPos {
+            x: position.x,
+            z: position.z,
+        },
+    )?;
+    nbt::write(&document)?;
+    Ok(document)
+}
+
 fn compound_list(tag: Tag, label: &str) -> Result<Tag> {
     let Tag::List {
         element_type,

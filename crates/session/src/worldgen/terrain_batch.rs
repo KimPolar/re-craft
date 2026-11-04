@@ -1710,6 +1710,94 @@ impl FreshTerrainBatch {
         )
     }
 
+    /// Encode postprocessed blocks and drained light for a set of chunks.
+    /// One light drain serves the entire set. Other FULL chunk data and
+    /// world-save validation remain separate.
+    pub fn postprocessed_sections_data(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, native_persistence::nbt::Tag>> {
+        use native_world::loaded::Section;
+
+        let mut selected = BTreeSet::new();
+        for pos in positions {
+            ensure!(selected.insert(pos), "duplicate postprocessed chunk");
+            ensure!(
+                processed.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+        }
+        ensure!(!selected.is_empty(), "no postprocessed chunks selected");
+        let light = self.postprocessed_light_snapshot(processed)?;
+        let has_skylight = self
+            .decoration
+            .as_ref()
+            .context("generation lighting is missing")?
+            .has_skylight;
+        ensure!(
+            light.has_block_channel() && light.has_sky_channel() == has_skylight,
+            "postprocessing light channels differ from the dimension"
+        );
+        let (min_y, max_y) = self.build_bounds()?;
+        let first = min_y.div_euclid(16);
+        let end = max_y.div_euclid(16);
+        let mut world = (*processed.world).clone();
+        for &pos in &selected {
+            let chunk = Arc::make_mut(
+                world
+                    .chunks
+                    .get_mut(&pos)
+                    .context("postprocessed chunk is missing")?,
+            );
+            ensure!(
+                chunk.position == pos,
+                "postprocessed chunk position differs"
+            );
+            for sy in first - 1..end + 1 {
+                let key = i8::try_from(sy).context("postprocessed light section out of range")?;
+                let (block, sky) = light
+                    .expanded_section(pos, sy)
+                    .context("postprocessed light column was not captured")?;
+                let section = chunk.sections.entry(key).or_insert_with(|| {
+                    Arc::new(Section {
+                        blocks: None,
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    })
+                });
+                let section = Arc::make_mut(section);
+                section.block_light = Some(block);
+                section.sky_light = Some(sky);
+            }
+        }
+        let registry = self
+            .light_registry
+            .as_ref()
+            .context("block registry is missing")?;
+        let biomes = self.generator.possible_biomes();
+        selected
+            .into_iter()
+            .map(|pos| {
+                let sections = native_persistence::generated_section::encode_generated_sections(
+                    &world,
+                    pos,
+                    min_y,
+                    self.generator.height,
+                    has_skylight,
+                    |state| registry.is_canonical_state(&state.name, &state.properties),
+                    |name| {
+                        ResourceId::parse(name)
+                            .ok()
+                            .is_some_and(|id| biomes.contains(&id))
+                    },
+                )?;
+                Ok((pos, sections))
+            })
+            .collect()
+    }
+
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the
     /// complete feature-generated entity list and the world's current tick.
     /// This is not a FULL chunk and must not be written as a playable world.

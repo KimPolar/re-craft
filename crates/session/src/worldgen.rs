@@ -4904,10 +4904,102 @@ mod tests {
             spawn_light.block_light([8, 8, 8])
         );
         assert_eq!(light.sky_light([8, 8, 8]), spawn_light.sky_light([8, 8, 8]));
+        let postprocessed_sections = batch
+            .postprocessed_sections_data(&processed, [center])
+            .unwrap()
+            .remove(&center)
+            .unwrap();
+        assert_eq!(
+            postprocessed_sections,
+            batch.spawned_section_data(center).unwrap()
+        );
+        assert!(
+            batch
+                .postprocessed_sections_data(&processed, [distant])
+                .is_err()
+        );
+        assert!(
+            batch
+                .postprocessed_sections_data(&processed, [center, center])
+                .is_err()
+        );
+        assert!(batch.postprocessed_sections_data(&processed, []).is_err());
+        // Exercise the encoder with a changed block and its queued light check.
+        let mut changed_world = (*processed.world).clone();
+        let air = native_world::loaded::BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        };
+        assert_eq!(
+            native_world::block_light::same_light_behavior(
+                changed_world.block(8, 8, 8).unwrap(),
+                &air
+            ),
+            Some(false)
+        );
+        let air_id = changed_world.intern_state(air);
+        assert!(changed_world.set_block_id(8, 8, 8, air_id).unwrap());
+        processed.world = Arc::new(changed_world);
+        processed.sealed_world = Arc::clone(&processed.world);
+        processed
+            .light_checks
+            .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
+        processed.sealed_checks = processed.light_checks.clone();
+        let changed_sections = batch
+            .postprocessed_sections_data(&processed, [center])
+            .unwrap()
+            .remove(&center)
+            .unwrap();
+        let changed = native_persistence::palette::decode_sections(
+            &native_persistence::nbt::Tag::Compound(vec![("sections".into(), changed_sections)]),
+        )
+        .unwrap();
+        let updated_light = batch.postprocessed_light_snapshot(&processed).unwrap();
+        let section_light = changed
+            .iter()
+            .find(|section| section.y == 0)
+            .unwrap()
+            .block_light
+            .as_ref()
+            .unwrap();
+        let nibble_index = 8 + 8 * 16 + 8 * 256;
+        let encoded_light = (section_light[nibble_index / 2] >> (4 * (nibble_index % 2))) & 15;
+        assert_eq!(Some(encoded_light), updated_light.block_light([8, 8, 8]));
+        assert_ne!(
+            updated_light.block_light([8, 8, 8]),
+            spawn_light.block_light([8, 8, 8])
+        );
+        assert_eq!(
+            changed
+                .iter()
+                .find(|section| section.y == 0)
+                .unwrap()
+                .blocks
+                .as_ref()
+                .unwrap()
+                .block(8, 8, 8)
+                .unwrap()
+                .name
+                .to_string_lossy(),
+            "minecraft:air"
+        );
+        assert_eq!(
+            original.block(8, 8, 8).unwrap().name,
+            "minecraft:brown_mushroom"
+        );
+        processed.world = Arc::clone(&original);
+        processed.sealed_world = Arc::clone(&original);
+        processed.light_checks.clear();
+        processed.sealed_checks.clear();
         processed
             .light_checks
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
         assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        assert!(
+            batch
+                .postprocessed_sections_data(&processed, [center])
+                .is_err()
+        );
         processed.light_checks.clear();
         let revision = processed.batch_revision;
         processed.batch_revision = revision.map(|value| value.wrapping_add(1));

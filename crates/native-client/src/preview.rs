@@ -3605,6 +3605,7 @@ mod tests {
             worldgen_settings_draft: Some(worldgen_draft.clone()),
             spawn_origin: Some(center),
             suggested_spawn: None,
+            player_spawn: None,
             initial_clocks: Some(Arc::clone(&initial_clocks)),
             entity_collision_registry: None,
             level_settings: Some(crate::world_creation::FrozenLevelSettings {

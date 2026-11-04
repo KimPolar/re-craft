@@ -49,6 +49,8 @@ pub struct GenerationReady {
     pub spawn_origin: Option<ChunkPos>,
     /// Initial world-spawn suggestion, not the collision-checked player spawn.
     pub suggested_spawn: Option<IVec3>,
+    /// Collision-checked initial player position, if requested by the caller.
+    pub player_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
     pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
     pub entity_collision_registry:
@@ -61,6 +63,14 @@ pub enum InitialSpawnProgress {
     Pending,
     NeedsChunk(ChunkPos),
     Found(IVec3),
+}
+
+/// World rules and independent random seed for the initial player search.
+#[derive(Clone, Copy)]
+pub struct InitialPlayerSpawnOptions {
+    pub radius: i32,
+    pub adventure: bool,
+    pub random_seed: i64,
 }
 
 impl GenerationReady {
@@ -479,6 +489,40 @@ impl GenerationWorker {
     where
         F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
     {
+        Self::start_initial_world_impl(prepare, revision, biome_blend, ceiling_spawn_height, None)
+    }
+
+    /// Also resolve the initial player's collision-checked position, expanding
+    /// terrain on demand using the same data-pack and creature-spawn inputs.
+    pub fn start_initial_world_with_player<F>(
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+        ceiling_spawn_height: Option<i32>,
+        player: InitialPlayerSpawnOptions,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
+    {
+        Self::start_initial_world_impl(
+            prepare,
+            revision,
+            biome_blend,
+            ceiling_spawn_height,
+            Some(player),
+        )
+    }
+
+    fn start_initial_world_impl<F>(
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+        ceiling_spawn_height: Option<i32>,
+        player: Option<InitialPlayerSpawnOptions>,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
+    {
         Self::spawn(move |cancelled, progress| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -492,6 +536,7 @@ impl GenerationWorker {
                 worldgen_settings,
                 creatures,
                 spawn_mobs,
+                border,
                 initial_clocks,
                 entity_collision_registry,
                 level_settings,
@@ -519,7 +564,7 @@ impl GenerationWorker {
                 &mut resources,
                 &mut classify,
                 &mut resolve,
-                height_tags,
+                Arc::clone(&height_tags),
                 biome_blend,
                 ceiling_spawn_height,
                 cancelled,
@@ -553,6 +598,31 @@ impl GenerationWorker {
                 progress,
             )? {
                 return Ok(None);
+            }
+            if let Some(player) = player {
+                if let Some(level) = &ready.level_settings {
+                    ensure!(
+                        player.adventure
+                            == (level.session.mode == native_session::GameMode::Adventure),
+                        "player spawn game mode differs from the frozen world settings"
+                    );
+                }
+                return complete_player_spawn(
+                    ready,
+                    &mut resources,
+                    &mut classify,
+                    &mut resolve,
+                    &mut build,
+                    &mut construct,
+                    spawn_mobs,
+                    height_tags,
+                    biome_blend,
+                    ceiling_spawn_height,
+                    border,
+                    player,
+                    cancelled,
+                    progress,
+                );
             }
             Ok(Some(ready))
         })
@@ -869,6 +939,7 @@ impl GenerationWorker {
                 worldgen_settings_draft: None,
                 spawn_origin: None,
                 suggested_spawn: None,
+                player_spawn: None,
                 initial_clocks: None,
                 entity_collision_registry: None,
                 level_settings: None,
@@ -1022,6 +1093,146 @@ where
         note_step(progress, pos, GenerationStage::Spawn);
     }
     Ok(true)
+}
+
+/// Resolve the player after spawn-stage entity generation. Expansion may
+/// alter previously examined chunks, so restart with the same random offset.
+fn complete_player_spawn<P, C, R, M, K>(
+    mut ready: GenerationReady,
+    provider: &mut P,
+    classify: &mut C,
+    resolve: &mut R,
+    build_spawner: &mut M,
+    construct: &mut K,
+    spawn_mobs: bool,
+    tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    biome_blend: u8,
+    ceiling_spawn_height: Option<i32>,
+    border: native_session::respawn::RespawnBorder,
+    options: InitialPlayerSpawnOptions,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>>
+where
+    P: ResourceProvider,
+    C: FnMut(&Value) -> Result<CarverBlockState>,
+    R: FnMut(&Value) -> Result<BlockState>,
+    M: FnMut(
+        &FreshTerrainBatch,
+        &mut P,
+        ChunkPos,
+    ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+    K: FnMut(
+        &native_resources::packs::ResourceId,
+    ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+{
+    use native_session::{
+        loaded::GeneratedPlayerSpawnProgress as SpawnProgress, world_spawn::WorldSpawnCandidates,
+    };
+    let suggestion = ready
+        .suggested_spawn
+        .context("world spawn suggestion missing")?;
+    ensure!(border.is_valid(), "player spawn border is invalid");
+    let x = f64::from(suggestion.x);
+    let z = f64::from(suggestion.z);
+    ensure!(
+        x >= border.min_x && x < border.max_x && z >= border.min_z && z < border.max_z,
+        "world spawn outside the border is not supported for fresh player generation"
+    );
+    let distance = (x - border.min_x)
+        .min(border.max_x - x)
+        .min(z - border.min_z)
+        .min(border.max_z - z);
+    let candidates = if options.adventure {
+        None
+    } else {
+        let first = WorldSpawnCandidates::new(suggestion, options.radius, distance, 0)?;
+        let mut random = native_core::random::LegacyRandom::new(options.random_seed);
+        let offset = random
+            .next_int_bound(first.candidate_count())
+            .context("invalid player spawn candidate count")?;
+        Some(WorldSpawnCandidates::new(
+            suggestion,
+            options.radius,
+            distance,
+            offset,
+        )?)
+    };
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        set_phase(progress, GenerationPhase::SearchingSpawn);
+        let player = native_session::PlayerState {
+            position: (suggestion - ready.mesh.origin).as_vec3() + glam::Vec3::new(0.5, 0.0, 0.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let (session, mut search) = ready.start_player_spawn_search(
+            player,
+            Arc::clone(&tags),
+            std::iter::empty(),
+            candidates.clone(),
+        )?;
+        let needed = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            match ready.poll_player_spawn(&session, &mut search, ceiling_spawn_height, 256)? {
+                SpawnProgress::Pending => continue,
+                SpawnProgress::Found(pos) => {
+                    ready.player_spawn = Some(pos);
+                    return Ok(Some(ready));
+                }
+                SpawnProgress::NeedsTerrain(pos) => break pos,
+                SpawnProgress::NeedsEntities(pos) => anyhow::bail!(
+                    "generated entity data for spawn chunk {}, {} is incomplete",
+                    pos.x,
+                    pos.z
+                ),
+            }
+        };
+        drop(session);
+        let revision = ready
+            .mesh
+            .revision
+            .checked_add(1)
+            .context("mesh revision overflow")?;
+        let Some(mut expanded) = expand_with_inputs(
+            ready,
+            needed,
+            provider,
+            classify,
+            resolve,
+            revision,
+            biome_blend,
+            cancelled,
+            progress,
+        )?
+        else {
+            return Ok(None);
+        };
+        expanded.suggested_spawn = Some(suggestion);
+        let targets = checked_spawn_targets(&mut expanded)?;
+        if !complete_creature_spawning_with_inputs(
+            &mut expanded,
+            &targets,
+            provider,
+            classify,
+            resolve,
+            build_spawner,
+            construct,
+            spawn_mobs,
+            cancelled,
+            progress,
+        )? {
+            return Ok(None);
+        }
+        ready = expanded;
+    }
 }
 
 fn complete_spawn_search(
@@ -1248,6 +1459,7 @@ fn generate_spawn_origin(
         worldgen_settings_draft: None,
         spawn_origin: Some(spawn),
         suggested_spawn: None,
+        player_spawn: None,
         initial_clocks: None,
         entity_collision_registry: None,
         level_settings: None,
@@ -1270,6 +1482,7 @@ fn expand_with_inputs(
         mesh,
         spawn_origin,
         suggested_spawn: _,
+        player_spawn: _,
         worldgen_settings_draft,
         initial_clocks,
         entity_collision_registry,
@@ -1363,6 +1576,7 @@ fn expand_with_inputs(
         worldgen_settings_draft,
         spawn_origin,
         suggested_spawn: None,
+        player_spawn: None,
         initial_clocks,
         entity_collision_registry,
         level_settings,
@@ -1805,7 +2019,8 @@ mod tests {
                 pack.join("data/example/worldgen/biome/flat.json"),
                 serde_json::to_vec(&selected_biome)?,
             )?;
-            let collision_height_tags = if disabled
+            let collision_height_tags = if !spawn_mobs
+                || disabled
                 || (spawn_mobs && !disabled && species == "minecraft:sheep")
             {
                 let mut resources = native_resources::packs::ResourceStack::open(&game)?;
@@ -1827,7 +2042,7 @@ mod tests {
             };
             let game = game.clone();
             let world = world.clone();
-            let worker = GenerationWorker::start_initial_world(
+            let prepare_inputs =
                 move || {
                     let mut settings =
                         crate::world_creation::WorldCreationSettings::new("Test".into());
@@ -1874,11 +2089,24 @@ mod tests {
                         Some(&0)
                     );
                     Ok(inputs)
-                },
-                80,
-                0,
-                None,
-            )?;
+                };
+            let resolve_player = !spawn_mobs
+                || (spawn_mobs && !disabled && species == "minecraft:sheep" && feature_kind == 0);
+            let worker = if resolve_player {
+                GenerationWorker::start_initial_world_with_player(
+                    prepare_inputs,
+                    80,
+                    0,
+                    None,
+                    InitialPlayerSpawnOptions {
+                        radius: 10,
+                        adventure: false,
+                        random_seed: 1234,
+                    },
+                )?
+            } else {
+                GenerationWorker::start_initial_world(prepare_inputs, 80, 0, None)?
+            };
             let mut ready = match worker.result.recv_timeout(Duration::from_secs(60))? {
                 GenerationResult::Ready(ready) => ready,
                 GenerationResult::Failed(error) => return Err(error),
@@ -1913,6 +2141,46 @@ mod tests {
                 Some(&0)
             );
             assert!(ready.suggested_spawn.is_some());
+            if resolve_player {
+                let spawn = ready.player_spawn.context("player spawn missing")?;
+                assert!(
+                    targets.len() > 1,
+                    "player search should expand beyond the initial target"
+                );
+                let suggestion = ready.suggested_spawn.unwrap();
+                let distance = (f64::from(suggestion.x) + 100.0)
+                    .min(100.0 - f64::from(suggestion.x))
+                    .min(f64::from(suggestion.z) + 100.0)
+                    .min(100.0 - f64::from(suggestion.z));
+                let first = native_session::world_spawn::WorldSpawnCandidates::new(
+                    suggestion, 10, distance, 0,
+                )?;
+                let offset = native_core::random::LegacyRandom::new(1234)
+                    .next_int_bound(first.candidate_count())
+                    .unwrap();
+                let expected = native_session::world_spawn::WorldSpawnCandidates::new(
+                    suggestion, 10, distance, offset,
+                )?
+                .next()
+                .unwrap();
+                assert_eq!((spawn.x, spawn.z), expected);
+                let player = native_session::PlayerState {
+                    position: (spawn - ready.mesh.origin).as_vec3()
+                        + glam::Vec3::new(0.5, 0.0, 0.5),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: false,
+                    pose: native_session::PlayerPose::Standing,
+                };
+                let session = ready.start_session_with_spawn_heightmaps(
+                    player,
+                    Arc::clone(collision_height_tags.as_ref().unwrap()),
+                )?;
+                assert!(session.generated_spawn_clear(spawn, &targets)?);
+            } else {
+                assert!(ready.player_spawn.is_none());
+            }
             assert!(
                 targets
                     .iter()

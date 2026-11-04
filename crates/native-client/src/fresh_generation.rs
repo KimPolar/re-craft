@@ -52,6 +52,7 @@ pub struct PreparedInitialWorld {
     pub worldgen_settings: native_persistence::nbt::NamedTag,
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
+    pub border: native_session::respawn::RespawnBorder,
     pub initial_clocks: Arc<InitialWorldClocks>,
     pub entity_collision_registry:
         Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
@@ -338,6 +339,7 @@ impl PreparedFreshGeneration {
             worldgen_settings: self.worldgen_settings,
             creatures,
             spawn_mobs,
+            border,
             initial_clocks,
             entity_collision_registry,
             pack_selection: self.pack_selection,

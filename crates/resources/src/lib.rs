@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use zip::ZipArchive;
 
+pub mod animal_variants;
 pub mod asset_index;
 pub mod biome_climate;
 pub mod biome_source;

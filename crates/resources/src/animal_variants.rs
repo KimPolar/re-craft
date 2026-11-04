@@ -1,0 +1,195 @@
+//! Data-pack spawn selectors for pig, cow, and chicken variants.
+//!
+//! Registry order must come from the active world's registry, not from the
+//! resource provider's sorted list: ties consume a random index in that order.
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
+
+use crate::{
+    packs::{ResourceId, ResourceProvider},
+    surface_biomes::resolve_tag,
+    worldgen_region_random::RegionRandom,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub enum FarmAnimal {
+    Pig,
+    Cow,
+    Chicken,
+}
+
+impl FarmAnimal {
+    fn registry(self) -> &'static str {
+        match self {
+            Self::Pig => "pig_variant",
+            Self::Cow => "cow_variant",
+            Self::Chicken => "chicken_variant",
+        }
+    }
+}
+
+struct Selector {
+    priority: i32,
+    variant: ResourceId,
+    biomes: Option<BTreeSet<ResourceId>>,
+}
+
+/// Loaded selectors in Java registry order. Multiple matching selectors for
+/// the same variant remain separate entries, just as in PriorityProvider.
+pub struct FarmAnimalVariants {
+    biome_registry: BTreeSet<ResourceId>,
+    selectors: Vec<Selector>,
+}
+
+impl FarmAnimalVariants {
+    /// `ordered_variants` must be the full, ordered active registry. Loading
+    /// stops on unsupported conditions instead of silently choosing wrongly.
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        animal: FarmAnimal,
+        ordered_variants: &[ResourceId],
+    ) -> Result<Self> {
+        let registry = animal.registry();
+        let visible: BTreeSet<_> = provider.list_data(registry)?.into_iter().collect();
+        let supplied: BTreeSet<_> = ordered_variants.iter().cloned().collect();
+        ensure!(
+            supplied.len() == ordered_variants.len() && supplied == visible,
+            "{registry} order must contain every active variant exactly once"
+        );
+        let biome_registry: BTreeSet<_> =
+            provider.list_data("worldgen/biome")?.into_iter().collect();
+        ensure!(!biome_registry.is_empty(), "biome registry is empty");
+        let mut cache = BTreeMap::new();
+        let mut selectors = Vec::new();
+        for id in ordered_variants {
+            let path = format!("data/{}/{}/{}.json", id.namespace, registry, id.path);
+            let bytes = provider
+                .read_data(&path)?
+                .with_context(|| format!("missing variant {path}"))?;
+            let value: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid variant {path}"))?;
+            let object = value
+                .as_object()
+                .with_context(|| format!("variant {path} must be an object"))?;
+            let Some(conditions) = object.get("spawn_conditions") else {
+                continue;
+            };
+            for entry in conditions
+                .as_array()
+                .context("spawn_conditions must be an array")?
+            {
+                let entry = entry
+                    .as_object()
+                    .context("spawn selector must be an object")?;
+                let priority = entry
+                    .get("priority")
+                    .and_then(Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok())
+                    .context("invalid spawn selector priority")?;
+                let biomes = match entry.get("condition") {
+                    None => None,
+                    Some(condition) => {
+                        let condition = condition
+                            .as_object()
+                            .context("spawn condition must be an object")?;
+                        let kind = condition
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .context("missing spawn condition type")?;
+                        ensure!(
+                            ResourceId::parse(kind)? == ResourceId::parse("minecraft:biome")?,
+                            "unsupported spawn condition {kind}"
+                        );
+                        let selection = condition
+                            .get("biomes")
+                            .context("missing spawn condition biomes")?;
+                        let values = if let Some(tag) =
+                            selection.as_str().and_then(|s| s.strip_prefix('#'))
+                        {
+                            let tag = ResourceId::parse(tag)?;
+                            resolve_tag(
+                                provider,
+                                &tag,
+                                &biome_registry,
+                                &mut cache,
+                                &mut BTreeSet::new(),
+                            )?
+                            .context("missing spawn condition biome tag")?
+                        } else {
+                            let entries: Vec<&Value> = match selection {
+                                Value::String(_) => vec![selection],
+                                Value::Array(values) => values.iter().collect(),
+                                _ => bail!("biomes must be an ID, tag, or list of IDs"),
+                            };
+                            let mut result = BTreeSet::new();
+                            for value in entries {
+                                let name = value.as_str().context("biome ID must be a string")?;
+                                ensure!(
+                                    !name.starts_with('#'),
+                                    "biome tags are not allowed inside lists"
+                                );
+                                let id = ResourceId::parse(name)?;
+                                ensure!(biome_registry.contains(&id), "unknown biome {name}");
+                                result.insert(id);
+                            }
+                            result
+                        };
+                        Some(values)
+                    }
+                };
+                selectors.push(Selector {
+                    priority,
+                    variant: id.clone(),
+                    biomes,
+                });
+            }
+        }
+        // Stable sorting preserves registry order and selector order for ties.
+        selectors.sort_by_key(|selector| Reverse(selector.priority));
+        Ok(Self {
+            biome_registry,
+            selectors,
+        })
+    }
+
+    /// A missing match leaves the animal's construction default unchanged.
+    /// A single match still consumes nextInt(1), as Java's getRandomSafe does.
+    pub fn choose<'a>(
+        &'a self,
+        biome: &ResourceId,
+        random: &mut RegionRandom,
+    ) -> Result<Option<&'a ResourceId>> {
+        ensure!(
+            self.biome_registry.contains(biome),
+            "biome is absent from the active registry"
+        );
+        let mut priority = None;
+        let mut matches = Vec::new();
+        for selector in &self.selectors {
+            if priority.is_some_and(|p| selector.priority < p) {
+                break;
+            }
+            if selector
+                .biomes
+                .as_ref()
+                .is_none_or(|values| values.contains(biome))
+            {
+                priority = Some(selector.priority);
+                matches.push(&selector.variant);
+            }
+        }
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let count = i32::try_from(matches.len()).context("too many matching variant selectors")?;
+        let index = random
+            .next_int_bound(count)
+            .context("invalid variant count")? as usize;
+        Ok(Some(matches[index]))
+    }
+}

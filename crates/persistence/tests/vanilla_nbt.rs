@@ -393,6 +393,108 @@ fn run_checked(command: &mut Command) -> String {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn new_world_clocks_round_trip_through_java_codec() {
+    use flate2::{Compression, write::GzEncoder};
+    use native_persistence::{
+        save::{WorldSavePlan, WorldWriteGuard},
+        world::SavedClock,
+    };
+    use std::{collections::BTreeMap, io::Write};
+    let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&parent).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-new-clocks-")
+        .tempdir_in(parent)
+        .unwrap();
+    let game = minecraft_dir();
+    let cp = classpath(&game, Some(temp.path()));
+    let source = temp.path().join("NewWorldClocksOracle.java");
+    std::fs::write(
+        &source,
+        r#"
+import java.nio.file.Path;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.data.registries.VanillaRegistries;
+import net.minecraft.nbt.*;
+import net.minecraft.world.clock.PackedClockStates;
+public class NewWorldClocksOracle {
+    public static void main(String[] args) throws Exception {
+        SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        var lookup = VanillaRegistries.createWorldLookup();
+        var ops = lookup.createSerializationContext(NbtOps.INSTANCE);
+        var path = Path.of(args[0]);
+        var root = NbtIo.readCompressed(path, NbtAccounter.unlimitedHeap());
+        var clocks = PackedClockStates.CODEC.parse(ops, root.get("data")).getOrThrow();
+        root.put("data", PackedClockStates.CODEC.encodeStart(ops, clocks).getOrThrow());
+        NbtIo.writeCompressed(root, path);
+    }
+}
+"#,
+    )
+    .unwrap();
+    run_checked(
+        Command::new(java_bin().join("javac.exe"))
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source),
+    );
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let level = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "Data".into(),
+            Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+        )]),
+    };
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(&nbt::write(&level).unwrap()).unwrap();
+    std::fs::write(world.join("level.dat"), gzip.finish().unwrap()).unwrap();
+    let clocks = BTreeMap::from([
+        (
+            DimensionId::parse("minecraft:overworld").unwrap(),
+            SavedClock {
+                total_ticks: 12345,
+                partial_tick: 0.25,
+                rate: 0.3,
+                paused: false,
+            },
+        ),
+        (
+            DimensionId::parse("minecraft:the_end").unwrap(),
+            SavedClock {
+                total_ticks: -100,
+                partial_tick: 0.75,
+                rate: 2.5,
+                paused: true,
+            },
+        ),
+    ]);
+    let mut plan = WorldSavePlan::new();
+    plan.add_new_world_clocks(&clocks).unwrap();
+    let mut writer = WorldWriteGuard::acquire(&world).unwrap();
+    writer.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(writer);
+    let path = world.join("data/minecraft/world_clocks.dat");
+    run_checked(
+        Command::new(java_bin().join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("NewWorldClocksOracle")
+            .arg(&path),
+    );
+    let restored = nbt::read_gzip(std::fs::File::open(path).unwrap()).unwrap();
+    assert_eq!(
+        native_persistence::world::parse_world_clocks(&restored).unwrap(),
+        clocks
+    );
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_poi_sections_are_decoded_from_dimension_region() {
     let game = minecraft_dir();
     let java = java_bin();

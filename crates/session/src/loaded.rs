@@ -138,7 +138,7 @@ pub struct PlayerWorldDraft {
 
 /// A partial clock update bound to the decoded document loaded at session start.
 pub struct WorldClockDraft {
-    source_nbt: Vec<u8>,
+    source_nbt: Option<Vec<u8>>,
     clocks: BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
 }
 
@@ -213,6 +213,26 @@ impl PartialSessionPoiSaveDraft {
         Ok(plan)
     }
 
+    pub fn into_save_plan_with_missing_clocks(
+        self,
+        uuid: [i32; 4],
+        player_source: &native_persistence::nbt::NamedTag,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        timestamp: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        let dimension = self.session.dimension.clone();
+        let mut plan = self.session.into_save_plan_with_missing_clocks(
+            uuid,
+            player_source,
+            entity_sources,
+            timestamp,
+        )?;
+        for draft in self.poi.values() {
+            draft.add_to_save_plan(&mut plan, dimension.clone(), draft.source(), timestamp)?;
+        }
+        Ok(plan)
+    }
+
     /// Assemble a new player's partial transaction with the POI drafts.
     /// Untracked gameplay effects must still be checked by the caller.
     pub fn into_new_player_save_plan(
@@ -225,6 +245,21 @@ impl PartialSessionPoiSaveDraft {
         let mut plan =
             self.session
                 .into_new_player_save_plan(entity_sources, clock_source, timestamp)?;
+        for draft in self.poi.values() {
+            draft.add_to_save_plan(&mut plan, dimension.clone(), draft.source(), timestamp)?;
+        }
+        Ok(plan)
+    }
+
+    pub fn into_new_player_save_plan_with_missing_clocks(
+        self,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        timestamp: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        let dimension = self.session.dimension.clone();
+        let mut plan = self
+            .session
+            .into_new_player_save_plan_with_missing_clocks(entity_sources, timestamp)?;
         for draft in self.poi.values() {
             draft.add_to_save_plan(&mut plan, dimension.clone(), draft.source(), timestamp)?;
         }
@@ -261,7 +296,26 @@ impl PartialSessionSaveDraft {
         self.into_plan(
             Some((uuid, player_source)),
             entity_sources,
-            clock_source,
+            Some(clock_source),
+            region_timestamp_seconds,
+        )
+    }
+
+    pub fn into_save_plan_with_missing_clocks(
+        self,
+        uuid: [i32; 4],
+        player_source: &native_persistence::nbt::NamedTag,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        region_timestamp_seconds: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        anyhow::ensure!(
+            self.new_player.is_none(),
+            "new player requires a creation transaction"
+        );
+        self.into_plan(
+            Some((uuid, player_source)),
+            entity_sources,
+            None,
             region_timestamp_seconds,
         )
     }
@@ -278,14 +332,31 @@ impl PartialSessionSaveDraft {
             self.new_player.is_some(),
             "new player source is unavailable"
         );
-        self.into_plan(None, entity_sources, clock_source, region_timestamp_seconds)
+        self.into_plan(
+            None,
+            entity_sources,
+            Some(clock_source),
+            region_timestamp_seconds,
+        )
+    }
+
+    pub fn into_new_player_save_plan_with_missing_clocks(
+        self,
+        entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
+        region_timestamp_seconds: u32,
+    ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
+        anyhow::ensure!(
+            self.new_player.is_some(),
+            "new player source is unavailable"
+        );
+        self.into_plan(None, entity_sources, None, region_timestamp_seconds)
     }
 
     fn into_plan(
         self,
         existing_player: Option<([i32; 4], &native_persistence::nbt::NamedTag)>,
         entity_sources: &BTreeMap<ChunkPos, Option<&native_persistence::nbt::NamedTag>>,
-        clock_source: &native_persistence::nbt::NamedTag,
+        clock_source: Option<&native_persistence::nbt::NamedTag>,
         region_timestamp_seconds: u32,
     ) -> anyhow::Result<native_persistence::save::WorldSavePlan> {
         anyhow::ensure!(
@@ -322,7 +393,11 @@ impl PartialSessionSaveDraft {
                 level.time,
             )?;
         }
-        self.clocks.add_to_save_plan(&mut plan, clock_source)?;
+        if let Some(source) = clock_source {
+            self.clocks.add_to_save_plan(&mut plan, source)?;
+        } else {
+            self.clocks.add_new_to_save_plan(&mut plan)?;
+        }
         if let Some(weather) = &self.weather {
             plan.add_weather(weather.source.as_ref(), weather.weather)?;
         }
@@ -355,10 +430,22 @@ impl WorldClockDraft {
         source: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            native_persistence::nbt::write(source)? == self.source_nbt,
+            self.source_nbt.as_ref() == Some(&native_persistence::nbt::write(source)?),
             "world clock source differs from the session source"
         );
         plan.add_world_clocks(source, &self.clocks)
+    }
+
+    /// Add a clock file captured as absent. Persistence rechecks its absence.
+    pub fn add_new_to_save_plan(
+        &self,
+        plan: &mut native_persistence::save::WorldSavePlan,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.source_nbt.is_none(),
+            "world clock source was not absent"
+        );
+        plan.add_new_world_clocks(&self.clocks)
     }
 }
 
@@ -776,7 +863,8 @@ pub struct LoadedSession {
     bounce_suppression_tag: Option<Arc<BTreeSet<String>>>,
     world_clocks:
         BTreeMap<native_persistence::world::DimensionId, native_persistence::world::SavedClock>,
-    saved_clock_source: Option<Vec<u8>>,
+    // None: not captured; Some(None): verified absent; Some(Some): existing NBT.
+    saved_clock_source: Option<Option<Vec<u8>>>,
     advance_time: bool,
     fast_lava: bool,
     fast_lava_environment: Option<Arc<native_resources::fluid_environment::FastLavaEnvironment>>,
@@ -3326,6 +3414,43 @@ impl LoadedSession {
             &native_persistence::palette::BlockState,
         ) -> anyhow::Result<(bool, bool)>,
     ) -> anyhow::Result<PartialSessionSaveDraft> {
+        self.draft_player_terrain_entities_and_clocks_from(
+            player,
+            terrain,
+            Some(clock),
+            tags,
+            air_and_fluid,
+        )
+    }
+
+    pub fn draft_player_terrain_entities_and_missing_clocks(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PartialSessionSaveDraft> {
+        self.draft_player_terrain_entities_and_clocks_from(
+            player,
+            terrain,
+            None,
+            tags,
+            air_and_fluid,
+        )
+    }
+
+    fn draft_player_terrain_entities_and_clocks_from(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        clock: Option<&native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PartialSessionSaveDraft> {
         if let Some((uuid, _)) = &self.new_player_source {
             anyhow::ensure!(
                 self.player_uuid == Some(*uuid),
@@ -3343,7 +3468,7 @@ impl LoadedSession {
             self.validate_closed_chest_item_balance(player)?;
         }
         let entity_chunks = self.draft_tracked_entity_chunks()?;
-        let clocks = self.draft_world_clocks(clock)?;
+        let clocks = self.draft_world_clocks_from(clock)?;
         anyhow::ensure!(
             self.can_have_weather != Some(true) || self.weather.is_some(),
             "saved weather is unavailable for this dimension"
@@ -3406,6 +3531,21 @@ impl LoadedSession {
         self.draft_player_terrain_entities_and_clocks(source, terrain, clock, tags, air_and_fluid)
     }
 
+    pub fn draft_new_player_terrain_entities_and_missing_clocks(
+        &self,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+    ) -> anyhow::Result<PartialSessionSaveDraft> {
+        let (_, source) = self
+            .new_player_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+        self.draft_player_terrain_entities_and_missing_clocks(source, terrain, tags, air_and_fluid)
+    }
+
     /// Include recorded POI changes in the new player's partial snapshot.
     pub fn draft_new_player_terrain_entities_clocks_and_poi(
         &self,
@@ -3437,6 +3577,35 @@ impl LoadedSession {
         )
     }
 
+    pub fn draft_new_player_terrain_entities_missing_clocks_and_poi(
+        &self,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+        resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
+        let (_, source) = self
+            .new_player_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+        self.draft_player_terrain_entities_clocks_and_poi_from(
+            source,
+            terrain,
+            None,
+            tags,
+            air_and_fluid,
+            resolve_saved_state,
+            validate_state,
+            validate_poi_type,
+        )
+    }
+
     /// Include POI transitions in the same immutable tick-boundary draft as
     /// the player, terrain, tracked entities and clocks. Registry callbacks
     /// must validate all supplied data. This is not a complete gameplay save.
@@ -3449,6 +3618,59 @@ impl LoadedSession {
         air_and_fluid: impl FnMut(
             &native_persistence::palette::BlockState,
         ) -> anyhow::Result<(bool, bool)>,
+        resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
+        self.draft_player_terrain_entities_clocks_and_poi_from(
+            player,
+            terrain,
+            Some(clock),
+            tags,
+            air_and_fluid,
+            resolve_saved_state,
+            validate_state,
+            validate_poi_type,
+        )
+    }
+
+    pub fn draft_player_terrain_entities_missing_clocks_and_poi(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
+        resolve_saved_state: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<BlockState>,
+        validate_state: impl FnMut(&BlockState) -> anyhow::Result<()>,
+        validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
+        self.draft_player_terrain_entities_clocks_and_poi_from(
+            player,
+            terrain,
+            None,
+            tags,
+            air_and_fluid,
+            resolve_saved_state,
+            validate_state,
+            validate_poi_type,
+        )
+    }
+
+    fn draft_player_terrain_entities_clocks_and_poi_from(
+        &self,
+        player: &native_persistence::nbt::NamedTag,
+        terrain: &BTreeMap<ChunkPos, &native_persistence::nbt::NamedTag>,
+        clock: Option<&native_persistence::nbt::NamedTag>,
+        tags: &HeightmapTags,
+        air_and_fluid: impl FnMut(
+            &native_persistence::palette::BlockState,
+        ) -> anyhow::Result<(bool, bool)>,
         mut resolve_saved_state: impl FnMut(
             &native_persistence::palette::BlockState,
         ) -> anyhow::Result<BlockState>,
@@ -3456,7 +3678,7 @@ impl LoadedSession {
         mut validate_poi_type: impl FnMut(&native_persistence::nbt::JavaString) -> anyhow::Result<()>,
     ) -> anyhow::Result<PartialSessionPoiSaveDraft> {
         use anyhow::Context;
-        let session = self.draft_player_terrain_entities_and_clocks(
+        let session = self.draft_player_terrain_entities_and_clocks_from(
             player,
             terrain,
             clock,
@@ -9626,7 +9848,33 @@ impl LoadedSession {
         );
         let encoded = native_persistence::nbt::write(source)?;
         self.set_world_clocks(clocks, advance_time);
-        self.saved_clock_source = Some(encoded);
+        self.saved_clock_source = Some(Some(encoded));
+        Ok(())
+    }
+
+    /// Capture an absent clock file and initialize all registered clocks with
+    /// their vanilla default state before any simulation ticks.
+    pub fn restore_missing_world_clocks(
+        &mut self,
+        clocks: BTreeMap<
+            native_persistence::world::DimensionId,
+            native_persistence::world::SavedClock,
+        >,
+        advance_time: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0
+                && self.accumulated == Duration::ZERO
+                && self.saved_clock_source.is_none(),
+            "world clocks must be restored once before the first tick"
+        );
+        anyhow::ensure!(
+            clocks.values().all(|clock| *clock == Default::default()),
+            "missing world clocks must start at their default state"
+        );
+        native_persistence::world::WorldReader::create_world_clock_document(&clocks)?;
+        self.set_world_clocks(clocks, advance_time);
+        self.saved_clock_source = Some(None);
         Ok(())
     }
 
@@ -9636,6 +9884,18 @@ impl LoadedSession {
         &self,
         source: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<WorldClockDraft> {
+        self.draft_world_clocks_from(Some(source))
+    }
+
+    /// Prepare a clock document for a source captured as absent.
+    pub fn draft_missing_world_clocks(&self) -> anyhow::Result<WorldClockDraft> {
+        self.draft_world_clocks_from(None)
+    }
+
+    fn draft_world_clocks_from(
+        &self,
+        source: Option<&native_persistence::nbt::NamedTag>,
+    ) -> anyhow::Result<WorldClockDraft> {
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -9643,15 +9903,21 @@ impl LoadedSession {
         let original = self.saved_clock_source.as_ref().ok_or_else(|| {
             anyhow::anyhow!("world clock source was not captured at session start")
         })?;
+        let encoded = source.map(native_persistence::nbt::write).transpose()?;
         anyhow::ensure!(
-            native_persistence::nbt::write(source)? == *original,
+            &encoded == original,
             "world clock source differs from the session source"
         );
-        // Validate that this state can be serialized while retaining unknown fields.
-        native_persistence::world::WorldReader::update_world_clock_document(
-            source,
-            &self.world_clocks,
-        )?;
+        if let Some(source) = source {
+            native_persistence::world::WorldReader::update_world_clock_document(
+                source,
+                &self.world_clocks,
+            )?;
+        } else {
+            native_persistence::world::WorldReader::create_world_clock_document(
+                &self.world_clocks,
+            )?;
+        }
         Ok(WorldClockDraft {
             source_nbt: original.clone(),
             clocks: self.world_clocks.clone(),
@@ -46405,6 +46671,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn missing_world_clocks_require_default_initial_state_and_track_absence() {
+        use native_persistence::world::{DimensionId, SavedClock};
+        let id = DimensionId::parse("minecraft:overworld").unwrap();
+        let mut session = session();
+        let mut nondefault = SavedClock::default();
+        nondefault.total_ticks = 1;
+        assert!(
+            session
+                .restore_missing_world_clocks(BTreeMap::from([(id.clone(), nondefault)]), true)
+                .is_err()
+        );
+        session
+            .restore_missing_world_clocks(
+                BTreeMap::from([(id.clone(), SavedClock::default())]),
+                true,
+            )
+            .unwrap();
+        assert!(
+            session
+                .restore_missing_world_clocks(BTreeMap::new(), true)
+                .is_err()
+        );
+        session.update(TICK);
+        let draft = session.draft_missing_world_clocks().unwrap();
+        assert_eq!(draft.clocks[&id].total_ticks, 1);
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        draft.add_new_to_save_plan(&mut plan).unwrap();
+        assert!(draft.add_new_to_save_plan(&mut plan).is_err());
+        session.set_world_clocks(BTreeMap::new(), true);
+        assert!(session.draft_missing_world_clocks().is_err());
+    }
+
+    #[test]
     fn new_player_partial_plan_requires_captured_level_source() {
         use native_persistence::nbt::{NamedTag, Tag};
         let clock = NamedTag {
@@ -46480,7 +46779,6 @@ pub(crate) mod tests {
             ]),
         };
         gzip(&root.path().join("level.dat"), &level);
-        gzip(&root.path().join("data/minecraft/world_clocks.dat"), &clock);
 
         let mut session = session();
         session.set_new_player_last_death().unwrap();
@@ -46489,9 +46787,14 @@ pub(crate) mod tests {
         session
             .capture_level_time_source(Arc::clone(&level))
             .unwrap();
+        let clock_id = DimensionId::parse("minecraft:overworld").unwrap();
         session
-            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .restore_missing_world_clocks(
+                BTreeMap::from([(clock_id.clone(), Default::default())]),
+                true,
+            )
             .unwrap();
+        assert!(session.draft_world_clocks(&clock).is_err());
         let home = session.player_chunk().unwrap();
         session
             .set_initial_poi_chunk(home, SavedPoiData::Missing)
@@ -46569,9 +46872,8 @@ pub(crate) mod tests {
         let tags = HeightmapTags::load(&mut HeightTags, &registry).unwrap();
         let terrain = BTreeMap::from([(home, &source)]);
         let make = || {
-            session.draft_new_player_terrain_entities_clocks_and_poi(
+            session.draft_new_player_terrain_entities_missing_clocks_and_poi(
                 &terrain,
-                &clock,
                 &tags,
                 |state| Ok((state.name.matches("minecraft:air"), false)),
                 resolve,
@@ -46594,30 +46896,25 @@ pub(crate) mod tests {
                 )
                 .is_err()
         );
-        let mut changed_clock = clock.clone();
-        let Tag::Compound(clock_fields) = &mut changed_clock.value else {
-            unreachable!()
-        };
-        clock_fields.push(("foreign".into(), Tag::Int(1)));
         let entity_sources = BTreeMap::from([(home, None)]);
         assert!(
             make()
                 .unwrap()
-                .into_new_player_save_plan(&entity_sources, &changed_clock, 1)
+                .into_new_player_save_plan(&entity_sources, &clock, 1)
                 .is_err()
         );
         assert!(
             make()
                 .unwrap()
-                .into_new_player_save_plan(&BTreeMap::new(), &clock, 1)
+                .into_new_player_save_plan_with_missing_clocks(&BTreeMap::new(), 1)
                 .is_err()
         );
         let stale = make()
             .unwrap()
-            .into_new_player_save_plan(&entity_sources, &clock, 1)
+            .into_new_player_save_plan_with_missing_clocks(&entity_sources, 1)
             .unwrap();
         let plan = draft
-            .into_new_player_save_plan(&entity_sources, &clock, 1)
+            .into_new_player_save_plan_with_missing_clocks(&entity_sources, 1)
             .unwrap();
         assert_eq!(plan.chunk_count(), 1);
         assert_eq!(plan.poi_chunk_count(), 1);
@@ -46647,6 +46944,7 @@ pub(crate) mod tests {
             Some(session.motion.position + session.origin.as_dvec3())
         );
         assert_eq!(reader.game_time().unwrap(), 42);
+        assert_eq!(reader.world_clocks().unwrap()[&clock_id].total_ticks, 1);
         assert_eq!(
             reader.level.value.get("Data").unwrap().get("future"),
             Some(&Tag::Int(73))

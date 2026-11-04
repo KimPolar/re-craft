@@ -1546,6 +1546,20 @@ impl WorldReader {
         Ok(document)
     }
 
+    /// Create the 26.3 clock document for an absent saved-data file.
+    pub fn create_world_clock_document(
+        clocks: &BTreeMap<DimensionId, SavedClock>,
+    ) -> Result<NamedTag> {
+        let source = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        Self::update_world_clock_document(&source, clocks)
+    }
+
     /// Serialize updated clock states while retaining unrecognized NBT fields.
     /// The supplied map is expected to contain the complete set of loaded clocks.
     pub fn update_world_clock_document(

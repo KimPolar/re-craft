@@ -1183,7 +1183,10 @@ fn prepare_existing_world(
             }
             Ok((clocks, None, registered)) => {
                 session.set_registered_clocks(Arc::new(registered));
-                session.set_world_clocks(clocks, rules.advance_time);
+                if let Err(error) = session.restore_missing_world_clocks(clocks, rules.advance_time)
+                {
+                    eprintln!("World clocks are unavailable: {error:#}");
+                }
             }
             Err(error) => eprintln!("World clocks are unavailable: {error:#}"),
         }

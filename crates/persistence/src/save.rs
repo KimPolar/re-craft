@@ -69,7 +69,7 @@ pub struct WorldSavePlan {
     entity_chunks: Vec<PlannedEntityChunk>,
     poi_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
-    world_clocks: Option<PlannedWorldClocks>,
+    world_clocks: Option<PlannedSharedData>,
     weather: Option<PlannedSharedData>,
     random_sequences: Option<PlannedSharedData>,
     level_time: Option<PlannedLevelTime>,
@@ -106,11 +106,6 @@ struct RegionChange {
 struct PlannedPlayerData {
     uuid_words: [i32; 4],
     source_nbt: Option<Vec<u8>>,
-    document: crate::nbt::NamedTag,
-}
-
-struct PlannedWorldClocks {
-    source_nbt: Vec<u8>,
     document: crate::nbt::NamedTag,
 }
 
@@ -393,9 +388,25 @@ impl WorldSavePlan {
             "world save plan contains duplicate world clocks"
         );
         let document = crate::world::WorldReader::update_world_clock_document(source, clocks)?;
-        self.world_clocks = Some(PlannedWorldClocks {
-            source_nbt: nbt::write(source)?,
+        self.world_clocks = Some(PlannedSharedData {
+            source_nbt: Some(nbt::write(source)?),
             document,
+        });
+        Ok(())
+    }
+
+    /// Create the clock file only if it is still absent at commit time.
+    pub fn add_new_world_clocks(
+        &mut self,
+        clocks: &BTreeMap<DimensionId, crate::world::SavedClock>,
+    ) -> Result<()> {
+        ensure!(
+            self.world_clocks.is_none(),
+            "world save plan contains duplicate world clocks"
+        );
+        self.world_clocks = Some(PlannedSharedData {
+            source_nbt: None,
+            document: crate::world::WorldReader::create_world_clock_document(clocks)?,
         });
         Ok(())
     }
@@ -468,6 +479,11 @@ pub struct WorldSaveResult {
 
 fn validate_weather_document(document: &nbt::NamedTag) -> Result<()> {
     crate::world::parse_weather_data(document)?;
+    Ok(())
+}
+
+fn validate_world_clock_document(document: &nbt::NamedTag) -> Result<()> {
+    crate::world::parse_world_clocks(document)?;
     Ok(())
 }
 
@@ -1355,85 +1371,13 @@ impl WorldWriteGuard {
             player_paths.push(target);
         }
 
-        if let Some(planned) = &plan.world_clocks {
-            let mut clock_directory = self.root.clone();
-            for component in ["data", "minecraft"] {
-                clock_directory.push(component);
-                let metadata = fs::symlink_metadata(&clock_directory)
-                    .context("cannot inspect world clock data directory")?;
-                ensure!(
-                    metadata.is_dir() && ordinary(&metadata),
-                    "world clock data path must contain ordinary directories"
-                );
-            }
-            let clock_directory = clock_directory.canonicalize()?;
-            ensure!(
-                clock_directory.starts_with(&self.root),
-                "world clock data directory is outside the world"
-            );
-            let clock_path = clock_directory.join("world_clocks.dat");
-            let metadata = fs::symlink_metadata(&clock_path)
-                .context("cannot inspect existing world clock data")?;
-            ensure!(
-                metadata.is_file() && ordinary(&metadata),
-                "world clock data must be an ordinary file"
-            );
-            let canonical = clock_path.canonicalize()?;
-            ensure!(
-                canonical.parent() == Some(clock_directory.as_path()),
-                "world clock data resolves outside its directory"
-            );
-            let original_bytes = nbt::decompress_limited(File::open(&canonical)?)?;
-            let compressed = original_bytes.starts_with(&[0x1f, 0x8b]);
-            let current = if compressed {
-                nbt::read_gzip(original_bytes.as_slice())
-            } else {
-                nbt::read(&original_bytes)
-            }
-            .context("cannot decode current world clock data")?;
-            ensure!(
-                nbt::write(&current)? == planned.source_nbt,
-                "world clock data changed after its draft was created"
-            );
-            let original_hash: [u8; 32] = Sha256::digest(&original_bytes).into();
-            let clock_backup_dir = backup.path().join("world-data");
-            fs::create_dir_all(&clock_backup_dir)?;
-            let clock_backup = clock_backup_dir.join("world_clocks.dat");
-            copy_sync(&canonical, &clock_backup)?;
-
-            let replacement = nbt::write(&planned.document)?;
-            let staged_bytes = if compressed {
-                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
-                gzip.write_all(&replacement)?;
-                gzip.finish()?
-            } else {
-                replacement.clone()
-            };
-            let mut stage = tempfile::Builder::new()
-                .prefix(".native-stage-")
-                .tempfile_in(&clock_directory)?;
-            stage.write_all(&staged_bytes)?;
-            stage.flush()?;
-            stage.as_file().sync_all()?;
-            let staged = if compressed {
-                nbt::read_gzip(File::open(stage.path())?)?
-            } else {
-                nbt::read(&staged_bytes)?
-            };
-            ensure!(
-                nbt::write(&staged)? == replacement,
-                "staged world clock data failed the NBT round-trip check"
-            );
-            replacements.push(crate::save_transaction::Replacement {
-                target: canonical.clone(),
-                backup: Some(clock_backup),
-                stage,
-                original_hash: Some(original_hash),
-            });
-            world_clocks_path = Some(canonical);
-        }
-
         for (planned, filename, label, validate) in [
+            (
+                &plan.world_clocks,
+                "world_clocks.dat",
+                "world clock",
+                validate_world_clock_document as fn(&nbt::NamedTag) -> Result<()>,
+            ),
             (
                 &plan.weather,
                 "weather.dat",
@@ -1553,7 +1497,9 @@ impl WorldWriteGuard {
                 stage,
                 original_hash,
             });
-            if filename == "weather.dat" {
+            if filename == "world_clocks.dat" {
+                world_clocks_path = Some(target);
+            } else if filename == "weather.dat" {
                 weather_path = Some(target);
             } else {
                 random_sequences_path = Some(target);
@@ -2300,6 +2246,37 @@ mod tests {
             .prefix("world-")
             .tempdir_in(root)
             .unwrap()
+    }
+
+    #[test]
+    fn missing_world_clocks_are_created_and_existing_files_are_never_overwritten() {
+        use crate::world::SavedClock;
+        let world = test_world();
+        fixture(world.path());
+        let id = DimensionId::parse("minecraft:overworld").unwrap();
+        let clocks = BTreeMap::from([(
+            id.clone(),
+            SavedClock {
+                total_ticks: 42,
+                partial_tick: 0.25,
+                rate: 0.5,
+                paused: false,
+            },
+        )]);
+        let mut plan = WorldSavePlan::new();
+        plan.add_new_world_clocks(&clocks).unwrap();
+        assert!(plan.add_new_world_clocks(&clocks).is_err());
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let path = world.path().join("data/minecraft/world_clocks.dat");
+        assert_eq!(result.world_clocks_path, Some(path.canonicalize().unwrap()));
+        let saved = nbt::read_gzip(File::open(&path).unwrap()).unwrap();
+        assert_eq!(crate::world::parse_world_clocks(&saved).unwrap(), clocks);
+        let original = fs::read(&path).unwrap();
+        let mut stale = WorldSavePlan::new();
+        stale.add_new_world_clocks(&clocks).unwrap();
+        assert!(guard.write_plan(stale, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]

@@ -363,6 +363,18 @@ fn valid_created_target(value: &str, version: u32) -> bool {
         || (version >= 7 && valid_created_random_sequences(value))
         || (version >= 8 && external_chunk_region(value).is_some())
         || (version >= 10 && valid_created_player(value))
+        || (version >= 11 && valid_created_world_clocks(value))
+}
+
+fn valid_created_world_clocks(value: &str) -> bool {
+    Path::new(value).components().collect::<Vec<_>>()
+        == [
+            Component::Normal("data".as_ref()),
+            Component::Normal("minecraft".as_ref()),
+            Component::Normal("world_clocks.dat".as_ref()),
+        ]
+        && value.replace('/', std::path::MAIN_SEPARATOR_STR)
+            == ["data", "minecraft", "world_clocks.dat"].join(std::path::MAIN_SEPARATOR_STR)
 }
 
 /// Limit recovery of a newly created player to canonical UUID filenames.
@@ -422,7 +434,10 @@ fn valid_absent_directory(value: &str, version: u32) -> bool {
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
-        matches!(manifest.version, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10),
+        matches!(
+            manifest.version,
+            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11
+        ),
         "unsupported transaction version"
     );
     ensure!(
@@ -737,6 +752,11 @@ fn prepare_with_deletions(
     }
     let manifest = Manifest {
         version: if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_world_clocks(&record.target))
+        {
+            11
+        } else if records
             .iter()
             .any(|record| record.original.is_none() && valid_created_player(&record.target))
         {
@@ -1329,6 +1349,47 @@ mod tests {
         assert!(prepare(&root, &backup, files, dependencies).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"outside writer");
         assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
+    fn created_world_clocks_recover_only_the_expected_canonical_file() {
+        let clock = "data/minecraft/world_clocks.dat";
+        assert!(!valid_created_target(clock, 10));
+        assert!(valid_created_target(clock, 11));
+        for invalid in [
+            "data/minecraft/world_clocks.dat_old",
+            "data/example/world_clocks.dat",
+            "data/minecraft/../world_clocks.dat",
+            "players/data/world_clocks.dat",
+        ] {
+            assert!(!valid_created_target(invalid, 11), "{invalid}");
+        }
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join(clock);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-stage-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"new world clocks").unwrap();
+        let file = Replacement {
+            target: target.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        };
+        let mut prepared = prepare(&root, &backup, vec![file], vec![]).unwrap();
+        assert_eq!(prepared.manifest.version, 11);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::write(&target, b"outside writer").unwrap();
+        assert!(recover(&root).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"outside writer");
+        fs::write(&target, b"new world clocks").unwrap();
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
     }
 
     #[test]

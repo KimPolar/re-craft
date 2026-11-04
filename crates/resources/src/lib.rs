@@ -38,6 +38,7 @@ pub mod item_registry;
 pub mod lake_feature;
 pub mod loot;
 pub mod mining_tags;
+pub mod mob_spawn_placement;
 pub mod mob_spawns;
 pub mod models;
 pub mod monster_room;

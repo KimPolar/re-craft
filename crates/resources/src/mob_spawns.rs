@@ -7,11 +7,33 @@
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::LegacyRandom;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    heightmap_tags::resolve,
     packs::{ResourceId, ResourceProvider},
     placed_feature::IntProvider,
+    transforms::read_block_tag,
 };
+
+/// Resolve the active data-pack tag used by Java's empty spawn-block check.
+pub fn load_prevent_mob_spawning_inside(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:prevent_mob_spawning_inside")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve prevent-mob-spawning-inside tag")
+}
 
 #[derive(Clone, Debug)]
 struct SpawnEntry {
@@ -229,5 +251,33 @@ mod tests {
         }
         let attrs = json!({"gameplay/natural_mob_spawns":settings(Some(json!([{"type":"example:unknown","weight":1,"count":1}])))});
         assert!(CreatureSpawnLayer::from_attributes(&attrs, |_| None).is_err());
+    }
+
+    #[test]
+    fn prevent_inside_tag_resolves_nested_pack_values() {
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/tags/block/prevent_mob_spawning_inside.json" => {
+                        Some(br##"{"values":["#minecraft:rails","minecraft:air"]}"##.to_vec())
+                    }
+                    "data/minecraft/tags/block/rails.json" => {
+                        Some(br#"{"values":["minecraft:rail"]}"#.to_vec())
+                    }
+                    _ => None,
+                })
+            }
+        }
+        let registry = BTreeSet::from(["minecraft:air".into(), "minecraft:rail".into()]);
+        assert_eq!(
+            load_prevent_mob_spawning_inside(&mut Data, &registry).unwrap(),
+            registry
+        );
+        let incomplete = BTreeSet::from(["minecraft:air".into()]);
+        assert!(load_prevent_mob_spawning_inside(&mut Data, &incomplete).is_err());
     }
 }

@@ -14,6 +14,7 @@ pub mod generation_light;
 pub mod generation_sky_light;
 pub mod lighting;
 pub mod loaded;
+pub mod mob_spawn_blocks;
 pub mod movement;
 pub mod poi;
 pub mod raycast;

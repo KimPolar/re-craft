@@ -31,6 +31,7 @@ mod carving;
 mod generated_beehive;
 mod generated_chest;
 mod generated_spawner;
+mod mob_placement;
 mod ore;
 pub mod postprocessing;
 pub mod schedule;
@@ -39,6 +40,9 @@ pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use generated_spawner::GeneratedMonsterSpawner;
+pub use mob_placement::{
+    GeneratedCreatureProbe, GeneratedCreatureProbeProgress, GeneratedMobPlacementView,
+};
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
@@ -1272,6 +1276,36 @@ impl CarvedTerrainWorld {
         self.generated_monster_entities
             .values()
             .filter_map(Option::as_ref)
+    }
+
+    /// Return the already-primed first-available Y without recomputing stale
+    /// generation heightmaps. None means the requested map is not primed.
+    pub fn primed_mob_spawn_height(
+        &self,
+        x: i32,
+        z: i32,
+        kind: native_resources::mob_spawn_placement::MobSpawnHeightmap,
+    ) -> Result<Option<i32>> {
+        use native_resources::mob_spawn_placement::MobSpawnHeightmap;
+        let pos = native_world::loaded::ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        ensure!(
+            self.world.chunks.contains_key(&pos),
+            "mob spawn heightmap chunk is missing"
+        );
+        let index = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize;
+        let map = match kind {
+            MobSpawnHeightmap::WorldSurface => 0,
+            MobSpawnHeightmap::OceanFloor => 1,
+            MobSpawnHeightmap::MotionBlocking => 2,
+            MobSpawnHeightmap::MotionBlockingNoLeaves => 3,
+        };
+        Ok(self
+            .final_heightmaps
+            .get(&pos)
+            .map(|maps| maps.values[map][index]))
     }
 
     /// Z, X, Y order, with Y measured from this collection's minimum height.
@@ -3192,6 +3226,45 @@ mod tests {
             batch.mob_spawn_biome(center).unwrap(),
             ResourceId::parse("minecraft:plains").unwrap()
         );
+        {
+            use native_resources::mob_spawn_placement::{
+                MobSpawnHeightmap, TopMobSpawnPosition, on_ground_spawn_position_ok,
+            };
+            let border = crate::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            };
+            let tag = BTreeSet::new();
+            let mut view = GeneratedMobPlacementView::new(
+                &batch,
+                MobSpawnHeightmap::MotionBlockingNoLeaves,
+                border,
+                &tag,
+            )
+            .unwrap();
+            let mut search = TopMobSpawnPosition::new(8, 8, 0, false);
+            let top = loop {
+                if let Some(pos) = search.poll(&mut view, 1).unwrap() {
+                    break pos;
+                }
+            };
+            assert_eq!(top, IVec3::new(8, 16, 8));
+            assert!(on_ground_spawn_position_ok(&mut view, top).unwrap());
+            let tag = BTreeSet::from(["minecraft:void_air".into()]);
+            let mut view = GeneratedMobPlacementView::new(
+                &batch,
+                MobSpawnHeightmap::MotionBlockingNoLeaves,
+                border,
+                &tag,
+            )
+            .unwrap();
+            assert!(!on_ground_spawn_position_ok(&mut view, top).unwrap());
+            assert!(
+                on_ground_spawn_position_ok(&mut view, IVec3::new(1000, 16, 8)).is_ok_and(|ok| !ok)
+            );
+        }
         let mut mob_spawns = native_resources::mob_spawns::CreatureSpawns::default();
         let attributes = json!({"gameplay/natural_mob_spawns":{
             "spawns_by_category":{"creature":[{"type":"minecraft:pig","count":2,"weight":1}]},
@@ -3213,6 +3286,58 @@ mod tests {
             panic!("expected creature attempt")
         };
         assert!((0..16).contains(&attempt.x) && (0..16).contains(&attempt.z));
+        {
+            use native_resources::mob_spawn_placement::MobSpawnHeightmap;
+            use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
+            let border = crate::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            };
+            let tag = BTreeSet::new();
+            let mut view = GeneratedMobPlacementView::new(
+                &batch,
+                MobSpawnHeightmap::MotionBlockingNoLeaves,
+                border,
+                &tag,
+            )
+            .unwrap();
+            let mut probe = GeneratedCreatureProbe::new(attempt.clone(), 0, false, true);
+            let top = loop {
+                match probe.poll(&mut planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::NeedsCollision(pos) => break pos,
+                    GeneratedCreatureProbeProgress::Rejected => {
+                        panic!("unexpected placement rejection")
+                    }
+                }
+            };
+            assert_eq!(top, IVec3::new(attempt.x, 16, attempt.z));
+            assert_eq!(
+                planner.next(0).unwrap(),
+                CreatureSpawnProgress::Attempt(attempt.clone())
+            );
+            let tag = BTreeSet::from(["minecraft:void_air".into()]);
+            let mut view = GeneratedMobPlacementView::new(
+                &batch,
+                MobSpawnHeightmap::MotionBlockingNoLeaves,
+                border,
+                &tag,
+            )
+            .unwrap();
+            let mut denied = GeneratedCreatureProbe::new(attempt, 0, false, true);
+            loop {
+                match denied.poll(&mut planner, &mut view, 1).unwrap() {
+                    GeneratedCreatureProbeProgress::Pending => continue,
+                    GeneratedCreatureProbeProgress::Rejected => break,
+                    GeneratedCreatureProbeProgress::NeedsCollision(_) => {
+                        panic!("tagged void air was accepted")
+                    }
+                }
+            }
+            assert!(denied.poll(&mut planner, &mut view, 1).is_err());
+        }
         assert_eq!(
             batch.schedule().completed(center),
             Some(schedule::GenerationStage::Light)

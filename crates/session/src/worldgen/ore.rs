@@ -10841,7 +10841,14 @@ mod tests {
 
     #[test]
     fn final_heightmaps_keep_stale_direct_section_writes() {
+        use native_resources::mob_spawn_placement::MobSpawnHeightmap;
         let (mut terrain, tags, motion, _) = fixture();
+        assert_eq!(
+            terrain
+                .primed_mob_spawn_height(0, 0, MobSpawnHeightmap::MotionBlockingNoLeaves)
+                .unwrap(),
+            None
+        );
         let mut region = terrain
             .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
             .unwrap();
@@ -10851,6 +10858,7 @@ mod tests {
         for kind in 0..4 {
             assert_eq!(region.final_height(kind, 0, 0).unwrap(), 8);
         }
+        assert_eq!(region.final_height(3, -1, -1).unwrap(), 8);
         region
             .set_block([0, 7, 0], &state("ancient_debris"), 2)
             .unwrap();
@@ -10865,6 +10873,30 @@ mod tests {
         for kind in 1..4 {
             assert_eq!(region.final_height(kind, 0, 0).unwrap(), 7);
         }
+        region.finish().unwrap();
+        assert_eq!(
+            terrain
+                .primed_mob_spawn_height(0, 0, MobSpawnHeightmap::WorldSurface)
+                .unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            terrain
+                .primed_mob_spawn_height(0, 0, MobSpawnHeightmap::MotionBlockingNoLeaves)
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            terrain
+                .primed_mob_spawn_height(-1, -1, MobSpawnHeightmap::MotionBlockingNoLeaves)
+                .unwrap(),
+            Some(8)
+        );
+        assert!(
+            terrain
+                .primed_mob_spawn_height(1000, 0, MobSpawnHeightmap::OceanFloor)
+                .is_err()
+        );
     }
 
     #[test]

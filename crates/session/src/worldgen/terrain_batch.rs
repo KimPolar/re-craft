@@ -599,6 +599,32 @@ impl FreshTerrainBatch {
             &maps.values[1],
         )?))
     }
+
+    /// Query a previously primed mob heightmap, preserving any stale value
+    /// caused by direct generation writes. None requires separate priming.
+    pub fn primed_mob_spawn_height(
+        &self,
+        x: i32,
+        z: i32,
+        kind: native_resources::mob_spawn_placement::MobSpawnHeightmap,
+    ) -> Result<Option<i32>> {
+        let pos = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        ensure!(
+            !self.failed
+                && self
+                    .schedule
+                    .completed(pos)
+                    .is_some_and(|stage| stage >= GenerationStage::Light),
+            "mob spawn height requires a light-complete chunk"
+        );
+        self.terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .primed_mob_spawn_height(x, z, kind)
+    }
     pub fn snapshot(&self) -> Option<Arc<World>> {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }

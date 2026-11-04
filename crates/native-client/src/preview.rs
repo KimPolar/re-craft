@@ -3098,10 +3098,33 @@ mod tests {
             let mut initial = generated.initial_spawn_search_at_origin(&session).unwrap();
             assert_eq!(initial.requested_position().y, 64);
             assert_eq!(
-                session
-                    .poll_generated_initial_spawn(&mut initial, None, &targets, 1)
+                generated
+                    .poll_initial_spawn(&session, &mut initial, None, 0)
                     .unwrap(),
-                Some(IVec3::new(0, 16, 0))
+                crate::generation_worker::InitialSpawnProgress::Pending
+            );
+            assert_eq!(
+                generated
+                    .poll_initial_spawn(&session, &mut initial, None, 1)
+                    .unwrap(),
+                crate::generation_worker::InitialSpawnProgress::Found(IVec3::new(0, 16, 0))
+            );
+            assert_eq!(
+                generated
+                    .poll_initial_spawn(&session, &mut initial, None, 0)
+                    .unwrap(),
+                crate::generation_worker::InitialSpawnProgress::Found(IVec3::new(0, 16, 0))
+            );
+            let mut missing =
+                native_session::world_spawn::InitialWorldSpawn::new(-1, 0, 64).unwrap();
+            assert_eq!(
+                generated
+                    .poll_initial_spawn(&session, &mut missing, None, 1)
+                    .unwrap(),
+                crate::generation_worker::InitialSpawnProgress::NeedsChunk(ChunkPos {
+                    x: -1,
+                    z: 0
+                })
             );
             let origin = IVec3::new(8, 16, 8);
             let candidates =
@@ -3186,6 +3209,110 @@ mod tests {
                 .opaque_vertices()
                 .any(|v| (v.position[1] - 16.0).abs() < 0.0001 && v.light / 16 == 15)
         );
+
+        let job = crate::mesh_worker::MeshJob::for_generated(
+            &mut batch,
+            targets.clone(),
+            8,
+            0,
+            IVec3::ZERO,
+        )
+        .unwrap();
+        let previous_world = Arc::clone(&job.world);
+        let ready = crate::generation_worker::GenerationReady {
+            batch,
+            mesh: job,
+            spawn_origin: Some(center),
+        };
+        let east = ChunkPos { x: 1, z: 0 };
+        let caller = std::thread::current().id();
+        let expansion = crate::generation_worker::GenerationWorker::expand(
+            ready,
+            east,
+            move || {
+                assert_ne!(std::thread::current().id(), caller);
+                Ok((Fixture, classify, resolve))
+            },
+            9,
+            0,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut expanded = loop {
+            if let Some(result) = expansion.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Ready(ready) => break ready,
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        panic!("{error:#}")
+                    }
+                    crate::generation_worker::GenerationResult::Cancelled => {
+                        panic!("expansion cancelled")
+                    }
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "expansion timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let expanded_targets = BTreeSet::from([center, east]);
+        assert_eq!(expanded.mesh.targets.as_deref(), Some(&expanded_targets));
+        assert_eq!(expanded.mesh.revision, 9);
+        assert_eq!(expanded.spawn_origin, Some(center));
+        assert_eq!(previous_world.light(8, 16, 8, true), Some(15));
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(8.5, 16.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: true,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let session = expanded
+            .start_session_with_spawn_heightmaps(player, spawn_tags)
+            .unwrap();
+        assert_eq!(
+            session
+                .generated_spawn_column_candidate(16, 8, None, &expanded_targets)
+                .unwrap(),
+            Some(IVec3::new(16, 16, 8))
+        );
+        let mut search = expanded.initial_spawn_search_at_origin(&session).unwrap();
+        assert_eq!(
+            expanded
+                .poll_initial_spawn(&session, &mut search, None, 1)
+                .unwrap(),
+            crate::generation_worker::InitialSpawnProgress::Found(IVec3::new(0, 16, 0))
+        );
+        let reopened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reopened_worker = Arc::clone(&reopened);
+        let duplicate = crate::generation_worker::GenerationWorker::expand(
+            expanded,
+            east,
+            move || {
+                reopened_worker.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok((Fixture, classify, resolve))
+            },
+            10,
+            0,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(result) = duplicate.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        assert!(error.to_string().contains("already ready"))
+                    }
+                    _ => panic!("duplicate target was accepted"),
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "duplicate check timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!reopened.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

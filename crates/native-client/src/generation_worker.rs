@@ -43,7 +43,63 @@ pub struct GenerationReady {
     pub spawn_origin: Option<ChunkPos>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialSpawnProgress {
+    Pending,
+    NeedsChunk(ChunkPos),
+    Found(IVec3),
+}
+
 impl GenerationReady {
+    /// Poll within the currently available chunk so reaching the next chunk
+    /// requests generation instead of treating absent terrain as an error.
+    /// Create a new search and session after expanding the batch.
+    pub fn poll_initial_spawn(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        search: &mut native_session::world_spawn::InitialWorldSpawn,
+        ceiling_spawn_height: Option<i32>,
+        budget: usize,
+    ) -> Result<InitialSpawnProgress> {
+        let targets = self
+            .mesh
+            .targets
+            .as_deref()
+            .context("generated session targets missing")?;
+        if let Some(found) =
+            session.poll_generated_initial_spawn(search, ceiling_spawn_height, targets, 0)?
+        {
+            return Ok(InitialSpawnProgress::Found(found));
+        }
+        let pos = search.requested_position();
+        let chunk = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        if !targets.contains(&chunk) {
+            return Ok(InitialSpawnProgress::NeedsChunk(chunk));
+        }
+        let column = pos.x.rem_euclid(16) as usize * 16 + pos.z.rem_euclid(16) as usize;
+        if let Some(found) = session.poll_generated_initial_spawn(
+            search,
+            ceiling_spawn_height,
+            targets,
+            budget.min(256 - column),
+        )? {
+            return Ok(InitialSpawnProgress::Found(found));
+        }
+        let pos = search.requested_position();
+        let next = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        Ok(if targets.contains(&next) {
+            InitialSpawnProgress::Pending
+        } else {
+            InitialSpawnProgress::NeedsChunk(next)
+        })
+    }
+
     pub fn initial_spawn_search_at_origin(
         &self,
         session: &native_session::loaded::LoadedSession,
@@ -245,6 +301,117 @@ impl GenerationWorker {
             revision,
             biome_blend,
         )
+    }
+
+    /// Extend a completed batch with one more light-complete target. The
+    /// resource provider and resolvers must use the same immutable data-pack
+    /// stack as the original batch. Restart any spawn search after expansion:
+    /// newly generated features can change previously inspected columns.
+    pub fn expand<P, C, R, F>(
+        ready: GenerationReady,
+        target: ChunkPos,
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(P, C, R)> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            let GenerationReady {
+                mut batch,
+                mesh,
+                spawn_origin,
+            } = ready;
+            ensure!(
+                revision != mesh.revision,
+                "expanded mesh needs a new revision"
+            );
+            let mut targets = mesh
+                .targets
+                .as_deref()
+                .context("generated session targets missing")?
+                .clone();
+            ensure!(batch.is_complete(), "generation batch has pending work");
+            ensure!(!targets.is_empty(), "generated session has no targets");
+            let previous = batch.lit_render_snapshot(targets.iter().copied())?;
+            ensure!(
+                Arc::ptr_eq(&previous, &mesh.world),
+                "generated mesh snapshot is stale"
+            );
+            ensure!(targets.insert(target), "generation target is already ready");
+            let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (mut provider, mut classify, mut resolve) = prepare()?;
+            set_phase(progress, GenerationPhase::Generating);
+            for &pos in &initialized {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if batch
+                    .schedule()
+                    .completed(pos)
+                    .is_none_or(|stage| stage < GenerationStage::Features)
+                {
+                    batch.request_features(pos)?;
+                }
+            }
+            while let Some((pos, stage)) = {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
+            } {
+                note_step(progress, pos, stage);
+            }
+            set_phase(progress, GenerationPhase::Lighting);
+            for &pos in &initialized {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if batch.schedule().completed(pos) == Some(GenerationStage::Features) {
+                    batch.request_light_initialization(pos)?;
+                }
+            }
+            while let Some((pos, stage)) = {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
+            } {
+                note_step(progress, pos, stage);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if batch.schedule().completed(target) != Some(GenerationStage::Light) {
+                batch.request_light(target)?;
+            }
+            while let Some((pos, stage)) = {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
+            } {
+                note_step(progress, pos, stage);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            set_phase(progress, GenerationPhase::PreparingMesh);
+            let mesh =
+                MeshJob::for_generated(&mut batch, targets, revision, biome_blend, mesh.origin)?;
+            Ok(Some(GenerationReady {
+                batch,
+                mesh,
+                spawn_origin,
+            }))
+        })
     }
 
     fn start_with_targets<P, C, R, F>(
@@ -682,11 +849,27 @@ mod tests {
                 "unavailable spawn columns: {unavailable:?}"
             );
             assert_eq!(candidates + unsuitable, 256);
+            let mut search = generated.initial_spawn_search(&session, ChunkPos { x: 0, z: 0 })?;
+            let progress = generated.poll_initial_spawn(&session, &mut search, None, 512)?;
+            if candidates == 0 {
+                assert_eq!(
+                    progress,
+                    InitialSpawnProgress::NeedsChunk(ChunkPos { x: 1, z: 0 })
+                );
+            } else {
+                assert!(matches!(progress, InitialSpawnProgress::Found(_)));
+            }
         }
         let mesher = crate::mesh_worker::MeshWorker::start(
             native_resources::packs::ResourceStack::open(&mesh_game)?,
         )?;
-        mesher.submit(generated.mesh);
+        mesher.submit(MeshJob {
+            revision: generated.mesh.revision,
+            biome_blend: generated.mesh.biome_blend,
+            origin: generated.mesh.origin,
+            world: Arc::clone(&generated.mesh.world),
+            targets: generated.mesh.targets.clone(),
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mesh = loop {
             if let Some(result) = mesher.try_result()? {
@@ -708,33 +891,82 @@ mod tests {
             return Ok(());
         }
 
-        // Continue the same generated batch toward the immediately adjacent
-        // chunk. Reopen the same vanilla pack stack for the test driver.
-        let mut batch = generated.batch;
-        let (_, mut provider, mut classify, mut resolve) = prepare(FreshGenerationSettings {
-            minecraft_dir: mesh_game,
-            preset: "minecraft:normal".into(),
-            dimension: "minecraft:overworld".into(),
-            seed: 42,
-            structures_enabled: false,
-            data_packs: None,
-        })?
-        .into_worker_inputs();
         let east = ChunkPos { x: 1, z: 0 };
-        let edge: Vec<_> = (-1..=1).map(|z| ChunkPos { x: 2, z }).collect();
-        for &pos in &edge {
-            batch.request_features(pos)?;
-        }
-        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
-        for &pos in &edge {
-            batch.request_light_initialization(pos)?;
-        }
-        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
-        batch.request_light(east)?;
-        while generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?.is_some() {}
+        let worker = GenerationWorker::expand(
+            generated,
+            east,
+            move || {
+                let (_, provider, classify, resolve) = prepare(FreshGenerationSettings {
+                    minecraft_dir: mesh_game,
+                    preset: "minecraft:normal".into(),
+                    dimension: "minecraft:overworld".into(),
+                    seed: 42,
+                    structures_enabled: false,
+                    data_packs: None,
+                })?
+                .into_worker_inputs();
+                Ok((provider, classify, resolve))
+            },
+            8,
+            0,
+        )?;
+        let mut generated = match worker.result.recv_timeout(Duration::from_secs(300))? {
+            GenerationResult::Ready(generated) => generated,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("generation was cancelled"),
+        };
         let expanded_targets = BTreeSet::from([ChunkPos { x: 0, z: 0 }, east]);
-        let job = MeshJob::for_generated(&mut batch, expanded_targets.clone(), 8, 0, IVec3::ZERO)?;
-        mesher.submit(job);
+        assert_eq!(generated.mesh.targets.as_deref(), Some(&expanded_targets));
+        {
+            use native_session::{PlayerPose, PlayerState};
+            let player = PlayerState {
+                position: glam::Vec3::new(8.5, 150.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: PlayerPose::Standing,
+            };
+            let game = std::env::var_os("MINECRAFT_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+            let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+            let registry = resources.vanilla_block_ids()?;
+            let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut resources,
+                &registry,
+            )?);
+            let session = generated.start_session_with_spawn_heightmaps(player, tags)?;
+            let mut search = generated.initial_spawn_search(&session, ChunkPos { x: 0, z: 0 })?;
+            let first =
+                session.poll_generated_initial_spawn(&mut search, None, &expanded_targets, 256)?;
+            if first.is_none() {
+                let pos = search.requested_position();
+                assert_eq!(
+                    (pos.x.div_euclid(16), pos.z.div_euclid(16)),
+                    (east.x, east.z)
+                );
+                let next = session.poll_generated_initial_spawn(
+                    &mut search,
+                    None,
+                    &expanded_targets,
+                    256,
+                )?;
+                if let Some(found) = next {
+                    assert_eq!(
+                        (found.x.div_euclid(16), found.z.div_euclid(16)),
+                        (east.x, east.z)
+                    );
+                } else {
+                    let pos = search.requested_position();
+                    assert_ne!(
+                        (pos.x.div_euclid(16), pos.z.div_euclid(16)),
+                        (east.x, east.z)
+                    );
+                }
+            }
+        }
+        mesher.submit(generated.mesh);
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mesh = loop {
             if let Some(result) = mesher.try_result()? {

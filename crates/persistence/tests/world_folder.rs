@@ -3,7 +3,7 @@
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
 fn folder_proposals_match_java_without_touching_existing_saves() {
-    use native_persistence::world_creation::propose_world_folder;
+    use native_persistence::world_creation::{propose_world_folder, reserve_world_folder};
     use std::{path::PathBuf, process::Command};
 
     let game = std::env::var_os("MINECRAFT_DIR")
@@ -101,7 +101,7 @@ fn folder_proposals_match_java_without_touching_existing_saves() {
     );
     let run = Command::new(java.join("java.exe"))
         .arg("-cp")
-        .arg(classpath)
+        .arg(&classpath)
         .arg("WorldFolderOracle")
         .arg(&saves)
         .arg(input)
@@ -124,4 +124,27 @@ fn folder_proposals_match_java_without_touching_existing_saves() {
         );
     }
     assert_eq!(std::fs::read(saves.join("World (1)")).unwrap(), b"keep");
+    let reserved = reserve_world_folder(&saves, "Lock Test", "New World").unwrap();
+    let world_path = reserved.path.clone();
+    let lock_output = temp.path().join("locked.txt");
+    let check_lock = || {
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("WorldFolderOracle")
+            .arg("--lock")
+            .arg(&world_path)
+            .arg(&lock_output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::read_to_string(&lock_output).unwrap()
+    };
+    assert_eq!(check_lock(), "true");
+    drop(reserved);
+    assert_eq!(check_lock(), "false");
 }

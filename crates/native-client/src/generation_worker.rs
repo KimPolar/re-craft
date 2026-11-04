@@ -24,6 +24,7 @@ pub enum GenerationPhase {
     Generating,
     Lighting,
     PreparingMesh,
+    SearchingSpawn,
     Ready,
     Cancelled,
     Failed,
@@ -41,6 +42,8 @@ pub struct GenerationReady {
     pub mesh: MeshJob,
     /// Present when the worker chose its target from the generator's spawn origin.
     pub spawn_origin: Option<ChunkPos>,
+    /// Initial world-spawn suggestion, not the collision-checked player spawn.
+    pub suggested_spawn: Option<IVec3>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +306,61 @@ impl GenerationWorker {
         )
     }
 
+    /// Select the initial world-spawn suggestion on a background thread,
+    /// generating further chunks as needed with the same resource provider.
+    /// The returned suggestion still requires the separate player spawn and
+    /// entity collision checks before it can be used to start play.
+    pub fn start_spawn_search<P, C, R, F>(
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+        ceiling_spawn_height: Option<i32>,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(
+                FreshTerrainBatch,
+                P,
+                C,
+                R,
+                Arc<native_resources::heightmap_tags::HeightmapTags>,
+            )> + Send
+            + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (batch, mut provider, mut classify, mut resolve, tags) = prepare()?;
+            let Some(ready) = generate_spawn_origin(
+                batch,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                revision,
+                biome_blend,
+                cancelled,
+                progress,
+            )?
+            else {
+                return Ok(None);
+            };
+            complete_spawn_search(
+                ready,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                tags,
+                biome_blend,
+                ceiling_spawn_height,
+                cancelled,
+                progress,
+            )
+        })
+    }
+
     /// Extend a completed batch with one more light-complete target. The
     /// resource provider and resolvers must use the same immutable data-pack
     /// stack as the original batch. Restart any spawn search after expansion:
@@ -321,96 +379,34 @@ impl GenerationWorker {
         R: FnMut(&Value) -> Result<BlockState>,
     {
         Self::spawn(move |cancelled, progress| {
-            let GenerationReady {
-                mut batch,
-                mesh,
-                spawn_origin,
-            } = ready;
             ensure!(
-                revision != mesh.revision,
+                revision != ready.mesh.revision,
                 "expanded mesh needs a new revision"
             );
-            let mut targets = mesh
+            let targets = ready
+                .mesh
                 .targets
                 .as_deref()
-                .context("generated session targets missing")?
-                .clone();
-            ensure!(batch.is_complete(), "generation batch has pending work");
-            ensure!(!targets.is_empty(), "generated session has no targets");
-            let previous = batch.lit_render_snapshot(targets.iter().copied())?;
+                .context("generated session targets missing")?;
             ensure!(
-                Arc::ptr_eq(&previous, &mesh.world),
-                "generated mesh snapshot is stale"
+                !targets.contains(&target),
+                "generation target is already ready"
             );
-            ensure!(targets.insert(target), "generation target is already ready");
-            let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
             let (mut provider, mut classify, mut resolve) = prepare()?;
-            set_phase(progress, GenerationPhase::Generating);
-            for &pos in &initialized {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if batch
-                    .schedule()
-                    .completed(pos)
-                    .is_none_or(|stage| stage < GenerationStage::Features)
-                {
-                    batch.request_features(pos)?;
-                }
-            }
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            set_phase(progress, GenerationPhase::Lighting);
-            for &pos in &initialized {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if batch.schedule().completed(pos) == Some(GenerationStage::Features) {
-                    batch.request_light_initialization(pos)?;
-                }
-            }
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            if batch.schedule().completed(target) != Some(GenerationStage::Light) {
-                batch.request_light(target)?;
-            }
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            set_phase(progress, GenerationPhase::PreparingMesh);
-            let mesh =
-                MeshJob::for_generated(&mut batch, targets, revision, biome_blend, mesh.origin)?;
-            Ok(Some(GenerationReady {
-                batch,
-                mesh,
-                spawn_origin,
-            }))
+            expand_with_inputs(
+                ready,
+                target,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                revision,
+                biome_blend,
+                cancelled,
+                progress,
+            )
         })
     }
 
@@ -446,20 +442,18 @@ impl GenerationWorker {
                 batch.is_complete() && batch.schedule().requested_chunks() == 0,
                 "generation batch must be fresh"
             );
-            let (targets, origin, initialized, spawn_origin) =
-                if let Some((targets, origin, initialized)) = explicit {
-                    (targets, origin, initialized, None)
-                } else {
-                    let pos = batch.spawn_origin(&mut provider)?;
-                    let targets = BTreeSet::from([pos]);
-                    let initialized = initialized_neighbors(&targets)?;
-                    let origin = IVec3::new(
-                        pos.x.checked_mul(16).context("spawn origin X overflow")?,
-                        0,
-                        pos.z.checked_mul(16).context("spawn origin Z overflow")?,
-                    );
-                    (targets, origin, initialized, Some(pos))
-                };
+            let Some((targets, origin, initialized)) = explicit else {
+                return generate_spawn_origin(
+                    batch,
+                    &mut provider,
+                    &mut classify,
+                    &mut resolve,
+                    revision,
+                    biome_blend,
+                    cancelled,
+                    progress,
+                );
+            };
             for pos in initialized {
                 if cancelled.load(Ordering::Relaxed) {
                     return Ok(None);
@@ -499,7 +493,8 @@ impl GenerationWorker {
             Ok(Some(GenerationReady {
                 batch,
                 mesh,
-                spawn_origin,
+                spawn_origin: None,
+                suggested_spawn: None,
             }))
         })
     }
@@ -561,6 +556,236 @@ impl GenerationWorker {
             }
         }
     }
+}
+
+fn complete_spawn_search(
+    mut ready: GenerationReady,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    biome_blend: u8,
+    ceiling_spawn_height: Option<i32>,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>> {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        set_phase(progress, GenerationPhase::SearchingSpawn);
+        let (min_y, _) = ready.batch.build_bounds()?;
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(8.5, min_y as f32, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let session = ready.start_session_with_spawn_heightmaps(player, Arc::clone(&tags))?;
+        let mut search = ready.initial_spawn_search_at_origin(&session)?;
+        let target = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            match ready.poll_initial_spawn(&session, &mut search, ceiling_spawn_height, 256)? {
+                InitialSpawnProgress::Pending => continue,
+                InitialSpawnProgress::Found(pos) => {
+                    ready.suggested_spawn = Some(pos);
+                    return Ok(Some(ready));
+                }
+                InitialSpawnProgress::NeedsChunk(pos) => break pos,
+            }
+        };
+        drop(session);
+        let revision = ready
+            .mesh
+            .revision
+            .checked_add(1)
+            .context("mesh revision overflow")?;
+        let Some(expanded) = expand_with_inputs(
+            ready,
+            target,
+            provider,
+            classify,
+            resolve,
+            revision,
+            biome_blend,
+            cancelled,
+            progress,
+        )?
+        else {
+            return Ok(None);
+        };
+        ready = expanded;
+    }
+}
+
+fn generate_spawn_origin(
+    mut batch: FreshTerrainBatch,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    revision: u64,
+    biome_blend: u8,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>> {
+    ensure!(
+        batch.is_complete() && batch.schedule().requested_chunks() == 0,
+        "generation batch must be fresh"
+    );
+    let spawn = batch.spawn_origin(provider)?;
+    let targets = BTreeSet::from([spawn]);
+    let origin = IVec3::new(
+        spawn.x.checked_mul(16).context("spawn origin X overflow")?,
+        0,
+        spawn.z.checked_mul(16).context("spawn origin Z overflow")?,
+    );
+    for pos in initialized_neighbors(&targets)? {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        batch.request_light_initialization(pos)?;
+    }
+    set_phase(progress, GenerationPhase::Generating);
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    batch.seal_for_light_propagation()?;
+    set_phase(progress, GenerationPhase::Lighting);
+    batch.request_light(spawn)?;
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    set_phase(progress, GenerationPhase::PreparingMesh);
+    let mesh = MeshJob::for_generated(&mut batch, targets, revision, biome_blend, origin)?;
+    Ok(Some(GenerationReady {
+        batch,
+        mesh,
+        spawn_origin: Some(spawn),
+        suggested_spawn: None,
+    }))
+}
+
+fn expand_with_inputs(
+    ready: GenerationReady,
+    target: ChunkPos,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    revision: u64,
+    biome_blend: u8,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>> {
+    let GenerationReady {
+        mut batch,
+        mesh,
+        spawn_origin,
+        suggested_spawn: _,
+    } = ready;
+    ensure!(
+        revision != mesh.revision,
+        "expanded mesh needs a new revision"
+    );
+    let mut targets = mesh
+        .targets
+        .as_deref()
+        .context("generated session targets missing")?
+        .clone();
+    ensure!(batch.is_complete(), "generation batch has pending work");
+    ensure!(!targets.is_empty(), "generated session has no targets");
+    let previous = batch.lit_render_snapshot(targets.iter().copied())?;
+    ensure!(
+        Arc::ptr_eq(&previous, &mesh.world),
+        "generated mesh snapshot is stale"
+    );
+    ensure!(targets.insert(target), "generation target is already ready");
+    let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    set_phase(progress, GenerationPhase::Generating);
+    for &pos in &initialized {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if batch
+            .schedule()
+            .completed(pos)
+            .is_none_or(|stage| stage < GenerationStage::Features)
+        {
+            batch.request_features(pos)?;
+        }
+    }
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    set_phase(progress, GenerationPhase::Lighting);
+    for &pos in &initialized {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if batch.schedule().completed(pos) == Some(GenerationStage::Features) {
+            batch.request_light_initialization(pos)?;
+        }
+    }
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    if batch.schedule().completed(target) != Some(GenerationStage::Light) {
+        batch.request_light(target)?;
+    }
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    set_phase(progress, GenerationPhase::PreparingMesh);
+    let mesh = MeshJob::for_generated(&mut batch, targets, revision, biome_blend, mesh.origin)?;
+    Ok(Some(GenerationReady {
+        batch,
+        mesh,
+        spawn_origin,
+        suggested_spawn: None,
+    }))
 }
 
 fn initialized_neighbors(targets: &BTreeSet<ChunkPos>) -> Result<BTreeSet<ChunkPos>> {
@@ -746,6 +971,139 @@ mod tests {
                 (expected.x, expected.z)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and fresh generation"]
+    fn installed_overworld_automatically_selects_initial_spawn() -> Result<()> {
+        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+        use native_session::{PlayerPose, PlayerState};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let worker_game = game.clone();
+        let worker = GenerationWorker::start_spawn_search(
+            move || {
+                prepare(FreshGenerationSettings {
+                    minecraft_dir: worker_game,
+                    preset: "minecraft:normal".into(),
+                    dimension: "minecraft:overworld".into(),
+                    seed: 42,
+                    structures_enabled: false,
+                    data_packs: None,
+                })?
+                .into_spawn_worker_inputs()
+            },
+            30,
+            0,
+            None,
+        )?;
+        let mut ready = match worker.result.recv_timeout(Duration::from_secs(600))? {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("generation was cancelled"),
+        };
+        let found = ready.suggested_spawn.context("spawn suggestion missing")?;
+        eprintln!(
+            "spawn origin {:?}, suggestion {found:?}, generated targets {}",
+            ready.spawn_origin,
+            ready
+                .mesh
+                .targets
+                .as_ref()
+                .map_or(0, |targets| targets.len())
+        );
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_block_ids()?;
+        let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+            &mut resources,
+            &registry,
+        )?);
+        let (min_y, _) = ready.batch.build_bounds()?;
+        let player = PlayerState {
+            position: glam::Vec3::new(8.5, min_y as f32, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: PlayerPose::Standing,
+        };
+        let session = ready.start_session_with_spawn_heightmaps(player, tags)?;
+        let mut search = ready.initial_spawn_search_at_origin(&session)?;
+        loop {
+            match ready.poll_initial_spawn(&session, &mut search, None, 256)? {
+                InitialSpawnProgress::Pending => continue,
+                InitialSpawnProgress::Found(pos) => {
+                    assert_eq!(pos, found);
+                    break;
+                }
+                InitialSpawnProgress::NeedsChunk(pos) => {
+                    anyhow::bail!("missing completed search chunk {pos:?}")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and multiple generated chunks"]
+    fn installed_spawn_search_expands_when_first_chunk_has_no_candidate() -> Result<()> {
+        use crate::fresh_generation::{FreshGenerationSettings, prepare};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let settings = |minecraft_dir| FreshGenerationSettings {
+            minecraft_dir,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            structures_enabled: false,
+            data_packs: None,
+        };
+        let worker_game = game.clone();
+        let origin = ChunkPos { x: 0, z: 0 };
+        let worker = GenerationWorker::start(
+            move || Ok(prepare(settings(worker_game))?.into_worker_inputs()),
+            BTreeSet::from([origin]),
+            40,
+            0,
+            IVec3::ZERO,
+        )?;
+        let mut ready = match worker.result.recv_timeout(Duration::from_secs(300))? {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("generation was cancelled"),
+        };
+        // This location is an intentionally chosen search origin; its first
+        // 256 columns have no candidate in this 26.3 seed, unlike the noise
+        // generator's real origin, and exercise the expansion path.
+        ready.spawn_origin = Some(origin);
+        let (_, mut provider, mut classify, mut resolve, tags) =
+            prepare(settings(game))?.into_spawn_worker_inputs()?;
+        let cancelled = AtomicBool::new(false);
+        let progress = Mutex::new(GenerationProgress {
+            phase: GenerationPhase::Planning,
+            completed_steps: 0,
+            last_step: None,
+        });
+        let ready = complete_spawn_search(
+            ready,
+            &mut provider,
+            &mut classify,
+            &mut resolve,
+            tags,
+            0,
+            None,
+            &cancelled,
+            &progress,
+        )?
+        .context("spawn selection cancelled")?;
+        let targets = ready.mesh.targets.as_deref().context("targets missing")?;
+        assert!(targets.contains(&ChunkPos { x: 1, z: 0 }));
+        assert!(targets.len() >= 2);
+        assert!(ready.suggested_spawn.is_some());
+        assert!(ready.mesh.revision > 40);
         Ok(())
     }
 

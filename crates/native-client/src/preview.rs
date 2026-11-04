@@ -2950,6 +2950,20 @@ mod tests {
         let mut batch =
             FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
                 .unwrap();
+        let tags2 = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let generator2 =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition, 42, 0, 16)
+                .unwrap();
+        let mut search_batch =
+            FreshTerrainBatch::new_without_structures(generator2, tags2, "minecraft:overworld")
+                .unwrap();
+        let tags3 = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let generator3 =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition, 42, 0, 16)
+                .unwrap();
+        let mut no_spawn_batch =
+            FreshTerrainBatch::new_without_structures(generator3, tags3, "minecraft:overworld")
+                .unwrap();
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
@@ -2958,9 +2972,23 @@ mod tests {
             has_skylight: true,
         };
         batch
+            .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
+            .unwrap();
+        batch
+            .enable_light_initialization(generated.clone())
+            .unwrap();
+        search_batch
+            .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
+            .unwrap();
+        search_batch
+            .enable_light_initialization(generated.clone())
+            .unwrap();
+        no_spawn_batch
             .enable_decoration(&mut data, &BTreeSet::new(), registry, &lighting)
             .unwrap();
-        batch.enable_light_initialization(generated).unwrap();
+        no_spawn_batch
+            .enable_light_initialization(generated)
+            .unwrap();
         let classify = |v: &Value| -> Result<CarverBlockState> {
             let name = v
                 .as_str()
@@ -3223,6 +3251,7 @@ mod tests {
             batch,
             mesh: job,
             spawn_origin: Some(center),
+            suggested_spawn: None,
         };
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();
@@ -3267,7 +3296,7 @@ mod tests {
             pose: native_session::PlayerPose::Standing,
         };
         let session = expanded
-            .start_session_with_spawn_heightmaps(player, spawn_tags)
+            .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
             .unwrap();
         assert_eq!(
             session
@@ -3313,6 +3342,78 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!reopened.load(std::sync::atomic::Ordering::Relaxed));
+        let search_tags = Arc::clone(&spawn_tags);
+        let search = crate::generation_worker::GenerationWorker::start_spawn_search(
+            move || Ok((search_batch, Fixture, classify, resolve, search_tags)),
+            20,
+            0,
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(result) = search.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Ready(ready) => {
+                        assert_eq!(ready.suggested_spawn, Some(IVec3::new(0, 16, 0)));
+                        assert_eq!(ready.mesh.revision, 20);
+                        assert_eq!(ready.mesh.targets.as_deref(), Some(&targets));
+                    }
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        panic!("{error:#}")
+                    }
+                    crate::generation_worker::GenerationResult::Cancelled => {
+                        panic!("spawn search cancelled")
+                    }
+                }
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn search timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let no_spawn = crate::generation_worker::GenerationWorker::start_spawn_search(
+            move || Ok((no_spawn_batch, Fixture, classify, resolve, spawn_tags)),
+            30,
+            0,
+            Some(-1),
+        )
+        .unwrap();
+        let baseline_steps = generation.progress().completed_steps;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while no_spawn.progress().completed_steps <= baseline_steps {
+            if let Some(result) = no_spawn.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        panic!("{error:#}")
+                    }
+                    _ => panic!("search ended before generating another chunk"),
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "automatic expansion timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        no_spawn.cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(result) = no_spawn.try_result().unwrap() {
+                assert!(matches!(
+                    result,
+                    crate::generation_worker::GenerationResult::Cancelled
+                ));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawn search cancellation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]

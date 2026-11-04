@@ -44,6 +44,31 @@ impl PreparedFreshGeneration {
     pub fn into_worker_inputs(self) -> (FreshTerrainBatch, ResourceStack, Classifier, Resolver) {
         (self.batch, self.resources, self.classify, self.resolve)
     }
+
+    /// Resolve spawn heightmap tags from the same data-pack stack before it
+    /// is handed to the background spawn search.
+    pub fn into_spawn_worker_inputs(
+        mut self,
+    ) -> Result<(
+        FreshTerrainBatch,
+        ResourceStack,
+        Classifier,
+        Resolver,
+        Arc<native_resources::heightmap_tags::HeightmapTags>,
+    )> {
+        let blocks = self.resources.vanilla_block_ids()?;
+        let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+            &mut self.resources,
+            &blocks,
+        )?);
+        Ok((
+            self.batch,
+            self.resources,
+            self.classify,
+            self.resolve,
+            tags,
+        ))
+    }
 }
 
 /// Call on the generation worker, not the window thread. Warnings from the

@@ -786,6 +786,7 @@ pub struct LoadedSession {
     player_effect_tick: i32,
     accumulated: Duration,
     tick: u64,
+    advancing_tick: bool,
     revision: u64,
     pending_light: BTreeMap<BlockPosition, PendingLight>,
     light_generation: u64,
@@ -1399,14 +1400,14 @@ impl GeneratedTickOrder {
     fn register_saved(
         &mut self,
         pos: ChunkPos,
-        tick: u64,
+        tick: i128,
         saved: Vec<crate::worldgen::chunk_ticks::SavedTick>,
     ) -> bool {
         use crate::worldgen::chunk_ticks::ChunkTicks;
         if self.parked.contains_key(&pos) {
             return false;
         }
-        let Ok(time) = i64::try_from(i128::from(self.base_time) + i128::from(tick)) else {
+        let Ok(time) = i64::try_from(i128::from(self.base_time) + tick) else {
             return false;
         };
         if saved
@@ -6733,6 +6734,7 @@ impl LoadedSession {
             player_effect_tick: 0,
             accumulated: Duration::ZERO,
             tick: 0,
+            advancing_tick: false,
             revision: 0,
             pending_light: BTreeMap::new(),
             light_generation: 0,
@@ -9590,7 +9592,7 @@ impl LoadedSession {
             .chain(&self.sand_deferred)
             .filter(|(_, tick)| tick.x.div_euclid(16) == pos.x && tick.z.div_euclid(16) == pos.z)
         {
-            let delay = i32::try_from(order.0 - i128::from(self.tick))
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
                 .context("block tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
@@ -9611,7 +9613,7 @@ impl LoadedSession {
             .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
         {
             queued_buttons.insert(key);
-            let delay = i32::try_from(order.0 - i128::from(self.tick))
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
                 .context("button tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
@@ -9639,7 +9641,7 @@ impl LoadedSession {
             .filter(|(_, (x, _, z))| x.div_euclid(16) == pos.x && z.div_euclid(16) == pos.z)
         {
             queued_lamps.insert((x, y, z));
-            let delay = i32::try_from(order.0 - i128::from(self.tick))
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
                 .context("lamp tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
@@ -9669,7 +9671,7 @@ impl LoadedSession {
                 })
         {
             queued_soil.insert((absolute.x, absolute.y, absolute.z, soil));
-            let delay = i32::try_from(order.0 - i128::from(self.tick))
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
                 .context("soil tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
@@ -9697,7 +9699,7 @@ impl LoadedSession {
             .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
         {
             queued_bubbles.insert(key);
-            let delay = i32::try_from(order.0 - i128::from(self.tick))
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
                 .context("bubble tick delay cannot be represented in NBT")?;
             scheduled.push((
                 order.2,
@@ -9782,7 +9784,7 @@ impl LoadedSession {
                 Ok(SavedFluidTick {
                     fluid: fluid.into(),
                     position: [key.x, key.y, key.z],
-                    delay: i32::try_from(order.0 - i128::from(self.tick))
+                    delay: i32::try_from(order.0 - self.scheduled_tick())
                         .context("fluid tick delay cannot be represented in NBT")?,
                     priority: order.1,
                 })
@@ -14987,12 +14989,11 @@ impl LoadedSession {
         if !duplicate {
             self.mark_tick_chunk_dirty(key.x, key.z);
         }
-        self.insert_fluid_tick(key, i128::from(self.tick) + i128::from(delay), 0, subtick);
+        let now = self.scheduled_tick();
+        self.insert_fluid_tick(key, now + i128::from(delay), 0, subtick);
         if let Some(indexed) = &mut self.generated_fluid_order {
             use crate::worldgen::chunk_ticks::{ScheduleOutcome, ScheduledTick};
-            let trigger = i64::try_from(
-                i128::from(indexed.base_time) + i128::from(self.tick) + i128::from(delay),
-            );
+            let trigger = i64::try_from(i128::from(indexed.base_time) + now + i128::from(delay));
             let kind = match (key.kind, key.source) {
                 (FluidKind::Water, true) => "minecraft:water",
                 (FluidKind::Water, false) => "minecraft:flowing_water",
@@ -15036,10 +15037,9 @@ impl LoadedSession {
         duplicate: bool,
     ) {
         use crate::worldgen::chunk_ticks::{ScheduleOutcome, ScheduledTick};
+        let now = self.scheduled_tick();
         if let Some(indexed) = &mut self.generated_block_order {
-            let trigger = i64::try_from(
-                i128::from(indexed.base_time) + i128::from(self.tick) + i128::from(delay),
-            );
+            let trigger = i64::try_from(i128::from(indexed.base_time) + now + i128::from(delay));
             let outcome = trigger.ok().and_then(|trigger| {
                 indexed
                     .queue
@@ -15128,7 +15128,7 @@ impl LoadedSession {
                     })
                     .collect()
             };
-            if !supported || !order.register_saved(pos, self.tick, saved()) {
+            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved()) {
                 fluid_order = None;
             }
         }
@@ -15147,7 +15147,7 @@ impl LoadedSession {
                     })
                     .collect()
             };
-            if !supported || !order.register_saved(pos, self.tick, saved()) {
+            if !supported || !order.register_saved(pos, self.scheduled_tick(), saved()) {
                 block_order = None;
             }
         }
@@ -15196,7 +15196,7 @@ impl LoadedSession {
             self.fluid_pending.insert(key);
             self.insert_fluid_tick_unchecked(
                 key,
-                i128::from(self.tick) + i128::from(tick.delay),
+                self.scheduled_tick() + i128::from(tick.delay),
                 tick.priority.clamp(-3, 3),
                 subtick,
             );
@@ -15227,7 +15227,7 @@ impl LoadedSession {
             let sequence = self.block_tick_sequence;
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             let order = (
-                i128::from(self.tick) + i128::from(tick.delay),
+                self.scheduled_tick() + i128::from(tick.delay),
                 tick.priority.clamp(-3, 3),
                 subtick,
                 sequence,
@@ -15254,7 +15254,7 @@ impl LoadedSession {
             let sequence = self.block_tick_sequence;
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             let order = (
-                i128::from(self.tick) + i128::from(tick.delay),
+                self.scheduled_tick() + i128::from(tick.delay),
                 tick.priority.clamp(-3, 3),
                 subtick,
                 sequence,
@@ -15285,7 +15285,7 @@ impl LoadedSession {
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             self.lamp_ticks.insert(
                 (
-                    i128::from(self.tick) + i128::from(tick.delay),
+                    self.scheduled_tick() + i128::from(tick.delay),
                     tick.priority.clamp(-3, 3),
                     subtick,
                     sequence,
@@ -15315,7 +15315,7 @@ impl LoadedSession {
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             self.bubble_ticks.insert(
                 (
-                    i128::from(self.tick) + i128::from(tick.delay),
+                    self.scheduled_tick() + i128::from(tick.delay),
                     tick.priority.clamp(-3, 3),
                     subtick,
                     sequence,
@@ -15346,7 +15346,7 @@ impl LoadedSession {
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.bubble_ticks.insert(
             (
-                i128::from(self.tick) + i128::from(delay),
+                self.scheduled_tick() + i128::from(delay),
                 0,
                 subtick,
                 sequence,
@@ -15478,7 +15478,7 @@ impl LoadedSession {
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             self.ice_ticks.insert(
                 (
-                    i128::from(self.tick) + i128::from(tick.delay),
+                    self.scheduled_tick() + i128::from(tick.delay),
                     tick.priority.clamp(-3, 3),
                     subtick,
                     sequence,
@@ -15509,7 +15509,7 @@ impl LoadedSession {
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             self.sensor_ticks.insert(
                 (
-                    i128::from(self.tick) + i128::from(tick.delay),
+                    self.scheduled_tick() + i128::from(tick.delay),
                     tick.priority.clamp(-3, 3),
                     subtick,
                     sequence,
@@ -15542,7 +15542,7 @@ impl LoadedSession {
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.sensor_ticks.insert(
             (
-                i128::from(self.tick) + i128::from(delay),
+                self.scheduled_tick() + i128::from(delay),
                 0,
                 subtick,
                 sequence,
@@ -15573,7 +15573,7 @@ impl LoadedSession {
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.ice_ticks.insert(
             (
-                i128::from(self.tick) + i128::from(delay),
+                self.scheduled_tick() + i128::from(delay),
                 0,
                 subtick,
                 sequence,
@@ -15603,7 +15603,7 @@ impl LoadedSession {
         let sequence = self.block_tick_sequence;
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.lamp_ticks
-            .insert((i128::from(self.tick) + 4, 0, subtick, sequence), key);
+            .insert((self.scheduled_tick() + 4, 0, subtick, sequence), key);
     }
 
     fn lamp_power(&self, relative: IVec3) -> Option<bool> {
@@ -15658,7 +15658,7 @@ impl LoadedSession {
             self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
             self.soil_ticks.insert(
                 (
-                    i128::from(self.tick) + i128::from(tick.delay),
+                    self.scheduled_tick() + i128::from(tick.delay),
                     tick.priority.clamp(-3, 3),
                     subtick,
                     sequence,
@@ -15695,7 +15695,7 @@ impl LoadedSession {
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.button_ticks.insert(
             (
-                i128::from(self.tick) + i128::from(kind.duration()),
+                self.scheduled_tick() + i128::from(kind.duration()),
                 0,
                 subtick,
                 sequence,
@@ -15874,12 +15874,12 @@ impl LoadedSession {
         if next
             .into_iter()
             .flatten()
-            .all(|due| due > i128::from(self.tick))
+            .all(|due| due > self.scheduled_tick())
         {
             self.generated_block_order = Some(indexed);
             return Some(Vec::new());
         }
-        let time = i64::try_from(i128::from(indexed.base_time) + i128::from(self.tick)).ok()?;
+        let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
         let world = &self.world;
         let selected = indexed.queue.collect_due(time, 65_536, |pos| {
             world
@@ -15892,7 +15892,7 @@ impl LoadedSession {
         for tick in selected {
             let entry = generated_block_key(&tick)?;
             let due = i128::from(tick.trigger) - i128::from(indexed.base_time);
-            if due > i128::from(self.tick) {
+            if due > self.scheduled_tick() {
                 return None;
             }
             let start = (due, tick.priority, tick.sub_tick, 0);
@@ -16080,7 +16080,7 @@ impl LoadedSession {
             .min() else {
                 break;
             };
-            if order.0 > i128::from(self.tick) {
+            if order.0 > self.scheduled_tick() {
                 break;
             }
             let absolute = match kind {
@@ -16882,7 +16882,7 @@ impl LoadedSession {
         let sequence = self.block_tick_sequence;
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
         self.sand_ticks
-            .insert((i128::from(self.tick) + 2, 0, subtick, sequence), key);
+            .insert((self.scheduled_tick() + 2, 0, subtick, sequence), key);
     }
 
     fn falling_sand_snapshot(&self) -> Arc<[crate::falling_block::FallingBlockVisual]> {
@@ -17545,7 +17545,7 @@ impl LoadedSession {
                 let sequence = self.block_tick_sequence;
                 self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
                 self.soil_ticks.insert(
-                    (i128::from(self.tick) + 1, 0, subtick, sequence),
+                    (self.scheduled_tick() + 1, 0, subtick, sequence),
                     (absolute, kind),
                 );
                 self.mark_tick_chunk_dirty(absolute.x, absolute.z);
@@ -18007,12 +18007,12 @@ impl LoadedSession {
         if self
             .fluid_ticks
             .first_key_value()
-            .is_none_or(|(order, _)| order.0 > i128::from(self.tick))
+            .is_none_or(|(order, _)| order.0 > self.scheduled_tick())
         {
             self.generated_fluid_order = Some(indexed);
             return Some(Vec::new());
         }
-        let time = i64::try_from(i128::from(indexed.base_time) + i128::from(self.tick)).ok()?;
+        let time = i64::try_from(i128::from(indexed.base_time) + self.scheduled_tick()).ok()?;
         let world = &self.world;
         let selected = indexed.queue.collect_due(time, 65_536, |pos| {
             world
@@ -18025,7 +18025,7 @@ impl LoadedSession {
         for tick in selected {
             let key = generated_fluid_key(&tick)?;
             let due = i128::from(tick.trigger) - i128::from(indexed.base_time);
-            if due > i128::from(self.tick) {
+            if due > self.scheduled_tick() {
                 return None;
             }
             let start = (due, tick.priority, tick.sub_tick, 0);
@@ -18073,7 +18073,7 @@ impl LoadedSession {
         let mut collected = Vec::new();
         let mut deferred = Vec::new();
         while let Some((&order, &scheduled)) = self.fluid_ticks.first_key_value() {
-            if order.0 > i128::from(self.tick) || collected.len() >= 65_536 {
+            if order.0 > self.scheduled_tick() || collected.len() >= 65_536 {
                 break;
             }
             self.fluid_ticks.pop_first();
@@ -18198,7 +18198,17 @@ impl LoadedSession {
         self.fluid_ticks.extend(unloaded);
     }
 
+    fn scheduled_tick(&self) -> i128 {
+        i128::from(self.tick) + i128::from(u8::from(self.advancing_tick))
+    }
+
     fn advance_tick(&mut self) {
+        self.advancing_tick = true;
+        self.advance_tick_inner();
+        self.advancing_tick = false;
+    }
+
+    fn advance_tick_inner(&mut self) {
         self.game_time = self.game_time.wrapping_add(1);
         // MinecraftServer advances shared clocks before ticking its levels.
         for clock in self.world_clocks.values_mut() {
@@ -23913,6 +23923,193 @@ pub(crate) mod tests {
         assert_eq!(session.sand_ticks.first_key_value().unwrap().0.2, i64::MAX);
         assert_eq!(session.ice_ticks.first_key_value().unwrap().0.2, i64::MIN);
         assert_eq!(session.next_sub_tick, i64::MIN + 1);
+    }
+
+    #[test]
+    fn scheduled_tick_clock_trace_matches_level_time_for_indexed_and_fallback_queues() {
+        let expected = ["43 1 0 1", "44 1 0 1", "45 2 0 0"];
+        for indexed in [false, true] {
+            assert_eq!(saved_tick_clock_trace(indexed), expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn scheduled_tick_clock_matches_java_26_3() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("ScheduledTickClockOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/ScheduledTickClockOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("ScheduledTickClockOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = String::from_utf8(output.stdout).unwrap();
+        for indexed in [false, true] {
+            assert_eq!(
+                actual.lines().collect::<Vec<_>>(),
+                saved_tick_clock_trace(indexed)
+            );
+        }
+    }
+
+    fn saved_tick_clock_trace(indexed: bool) -> Vec<String> {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let a = origin + IVec3::new(8, 2, 8);
+        let c = origin + IVec3::new(8, 3, 8);
+        let fluid = origin + IVec3::new(3, 2, 3);
+        let sand = world.intern_state(state("minecraft:sand", &[]));
+        world.set_block_id(a.x, a.y, a.z, sand).unwrap();
+        world.set_block_id(c.x, c.y, c.z, sand).unwrap();
+        world.saved_block_ticks.insert(
+            home,
+            vec![SavedBlockTick {
+                block: "minecraft:sand".into(),
+                position: a.to_array(),
+                delay: 1,
+                priority: 0,
+            }],
+        );
+        world.saved_fluid_ticks.insert(
+            home,
+            vec![SavedFluidTick {
+                fluid: "minecraft:water".into(),
+                position: fluid.to_array(),
+                delay: 1,
+                priority: 0,
+            }],
+        );
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_falling_fire_tag(Arc::new(BTreeSet::new()));
+        session.set_random_tick_speed(0);
+        session.set_initial_game_time(42).unwrap();
+        if indexed {
+            assert_eq!(
+                session.install_saved_tick_orders(&[home]).unwrap(),
+                (true, true)
+            );
+        }
+        let mut trace = Vec::new();
+        for _ in 0..3 {
+            session.update(TICK);
+            trace.push(format!(
+                "{} {} {} {}",
+                session.game_time,
+                session.falling_sand.len(),
+                session.fluid_ticks.len(),
+                session.sand_pending.contains(&SandTickKey {
+                    x: c.x,
+                    y: c.y,
+                    z: c.z,
+                    kind: FallingKind::Sand
+                }) as u8
+            ));
+        }
+        trace
+    }
+
+    #[test]
+    fn streamed_saved_ticks_start_delays_at_the_current_world_tick() {
+        for indexed in [false, true] {
+            let mut session = session();
+            session.set_random_tick_speed(0);
+            session.set_initial_game_time(42).unwrap();
+            let home = *session.world.chunks.keys().next().unwrap();
+            if indexed {
+                assert_eq!(
+                    session.install_saved_tick_orders(&[home]).unwrap(),
+                    (true, true)
+                );
+            }
+            let neighbor = ChunkPos {
+                x: home.x + 1,
+                z: home.z,
+            };
+            let mut source = session.world.as_ref().clone();
+            let mut chunk = source.chunks[&home].as_ref().clone();
+            chunk.position = neighbor;
+            source.chunks.insert(neighbor, Arc::new(chunk));
+            let at = [neighbor.x * 16 + 3, 2, neighbor.z * 16 + 3];
+            source.saved_block_ticks.insert(
+                neighbor,
+                vec![SavedBlockTick {
+                    block: "minecraft:sand".into(),
+                    position: at,
+                    delay: 1,
+                    priority: 0,
+                }],
+            );
+            source.saved_fluid_ticks.insert(
+                neighbor,
+                vec![SavedFluidTick {
+                    fluid: "minecraft:water".into(),
+                    position: at,
+                    delay: 1,
+                    priority: 0,
+                }],
+            );
+            session.queue_loaded_chunk(neighbor, source);
+            session.update(TICK);
+            assert_eq!(session.game_time, 43);
+            assert_eq!(session.sand_ticks.len(), 1);
+            assert_eq!(session.fluid_ticks.len(), 1);
+            session.update(TICK);
+            assert_eq!(session.game_time, 44);
+            assert!(session.sand_ticks.is_empty());
+            assert!(session.fluid_ticks.is_empty());
+        }
     }
 
     #[test]
@@ -33461,7 +33658,7 @@ pub(crate) mod tests {
                     .iter()
                     .any(|tick| tick.block == "minecraft:redstone_lamp")
             );
-            for _ in 0..3 {
+            for _ in 0..2 {
                 session.update(TICK);
             }
             assert!(lit(&session));
@@ -60440,7 +60637,14 @@ pub(crate) mod tests {
                         .unwrap()
                         .clone()
                 };
-                assert_eq!(block(&old), state(source, properties));
+                assert_eq!(
+                    block(&old),
+                    if blocked && source == "minecraft:dirt_path" {
+                        state("minecraft:dirt", &[])
+                    } else {
+                        state(source, properties)
+                    }
+                );
                 assert_eq!(
                     block(&after),
                     if blocked && source == "minecraft:dirt_path" {
@@ -60479,7 +60683,6 @@ pub(crate) mod tests {
                 session.update(TICK);
                 let old = session.snapshot();
                 assert!(session.set(relative + IVec3::Y, session.states[3]));
-                session.update(TICK);
                 let absolute = session.origin + relative;
                 let name_at = |snapshot: &WorldSnapshot| {
                     snapshot
@@ -64467,7 +64670,7 @@ pub(crate) mod tests {
         let wall = IVec3::new(9, 2, 8);
         let before = session.snapshot();
         assert!(session.set(wall, session.states[0]));
-        for _ in 0..5 {
+        for _ in 0..4 {
             session.update(TICK);
         }
         assert_eq!(session.simulation_cell(wall), fluid_sim::Cell::Air);
@@ -64696,7 +64899,7 @@ pub(crate) mod tests {
             };
             session.schedule_fluid(IVec3::new(8, 2, 8), source, 1);
             assert_eq!(session.fluid_pending.len(), 1);
-            for _ in 0..delay {
+            for _ in 0..delay - 1 {
                 session.update(TICK);
             }
             assert_eq!(session.simulation_cell(wall), fluid_sim::Cell::Air);
@@ -64766,7 +64969,7 @@ pub(crate) mod tests {
         let first = session.fluid_ticks.first_key_value().unwrap();
         assert_eq!((first.0.0, first.0.1, first.1.key.source), (3, -2, false));
         assert_eq!(session.take_stream_errors().len(), 1);
-        for _ in 0..3 {
+        for _ in 0..2 {
             session.update(TICK);
         }
         assert_eq!(
@@ -65646,7 +65849,6 @@ pub(crate) mod tests {
         assert!(session.set(source, id));
         session.update(TICK);
         let before = session.snapshot();
-        session.update(TICK);
         assert!(session.snapshot().falling_blocks.is_empty());
         session.update(TICK);
         let snapshot = session.snapshot();
@@ -65719,7 +65921,6 @@ pub(crate) mod tests {
         }
         assert!(session.falling_sand.is_empty());
         assert!(session.set(source + IVec3::NEG_Y, session.states[0]));
-        session.update(TICK);
         session.update(TICK);
         assert!(session.falling_sand.is_empty());
         session.update(TICK);

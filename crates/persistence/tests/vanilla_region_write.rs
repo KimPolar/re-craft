@@ -1839,6 +1839,24 @@ fn fresh_world_stage_is_readable_by_java_26_3() {
             .lines()
             .any(|line| line == "OK")
     );
+    let published = stage.publish(temp.path(), "World", "New World").unwrap();
+    assert!(
+        invoke("verifyFreshWorld", &published.path)
+            .lines()
+            .any(|line| line == "OK")
+    );
+    assert!(
+        invoke("locked", &published.path)
+            .lines()
+            .any(|line| line == "LOCKED")
+    );
+    let path = published.path.clone();
+    drop(published);
+    assert!(
+        invoke("locked", &path)
+            .lines()
+            .any(|line| line == "UNLOCKED")
+    );
 }
 
 #[test]

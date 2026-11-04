@@ -161,12 +161,231 @@ pub struct FreshWorldDraft {
 pub struct FreshWorldStage {
     _directory: tempfile::TempDir,
     root: PathBuf,
+    manifest: BTreeMap<PathBuf, Option<[u8; 32]>>,
 }
 
 impl FreshWorldStage {
     pub fn path(&self) -> &Path {
         &self.root
     }
+
+    /// Copy the generation snapshot while checking that existing staged files
+    /// have not changed. A failure invalidates this stage for publication.
+    pub fn install_data_packs(
+        &mut self,
+        snapshot: &native_resources::datapack_snapshot::DataPackSnapshot,
+    ) -> Result<()> {
+        self.verify()?;
+        snapshot.copy_into(&self.root)?;
+        let updated = staged_world_manifest(&self.root, false)?;
+        let previous: BTreeMap<_, _> = updated
+            .iter()
+            .filter(|(path, _)| !path.starts_with("datapacks"))
+            .map(|(path, hash)| (path.clone(), *hash))
+            .collect();
+        ensure!(
+            previous == self.manifest,
+            "staged world changed while copying data packs"
+        );
+        self.manifest = updated;
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<()> {
+        ensure!(
+            staged_world_manifest(&self.root, false)? == self.manifest,
+            "staged world changed before publication"
+        );
+        Ok(())
+    }
+
+    /// Reserve a Java-style folder and keep its session lock while copying.
+    /// Install level.dat last, atomically and without replacing any file. The
+    /// caller must independently prove the world data is complete.
+    pub fn publish(
+        self,
+        saves: &Path,
+        name: &str,
+        default_name: &str,
+    ) -> Result<PublishedFreshWorld> {
+        #[cfg(not(windows))]
+        {
+            let _ = (self, saves, name, default_name);
+            anyhow::bail!("world writing is currently supported only on Windows");
+        }
+        #[cfg(windows)]
+        {
+            self.verify()?;
+            let saves = saves
+                .canonicalize()
+                .context("cannot resolve saves directory")?;
+            ensure!(saves.is_dir(), "saves path is not a directory");
+            let staging = self._directory.path().canonicalize()?;
+            ensure!(
+                staging.parent() == Some(saves.as_path()),
+                "world must be staged inside the destination saves directory"
+            );
+            let root = self.root.canonicalize()?;
+            ensure!(
+                root.parent() == Some(staging.as_path()),
+                "staged world moved outside its staging directory"
+            );
+            let reserved = crate::world_creation::reserve_world_folder(&saves, name, default_name)?;
+            let result = (|| -> Result<()> {
+                let mut directories: Vec<_> = self
+                    .manifest
+                    .iter()
+                    .filter_map(|(path, hash)| hash.is_none().then_some(path))
+                    .collect();
+                directories.sort_by_key(|path| path.components().count());
+                for directory in directories {
+                    fs::create_dir(reserved.path.join(directory))?;
+                }
+                for (relative, hash) in &self.manifest {
+                    if let Some(hash) = hash
+                        && relative != Path::new("level.dat")
+                    {
+                        copy_new_verified(
+                            &root.join(relative),
+                            &reserved.path.join(relative),
+                            *hash,
+                        )?;
+                    }
+                }
+                let expected_level = self
+                    .manifest
+                    .get(Path::new("level.dat"))
+                    .and_then(|entry| *entry)
+                    .context("staged level.dat is missing")?;
+                let mut level = tempfile::Builder::new()
+                    .prefix(".re-craft-level-")
+                    .tempfile_in(&reserved.path)?;
+                let mut source = File::open(root.join("level.dat"))?;
+                std::io::copy(&mut source, level.as_file_mut())?;
+                level.as_file_mut().sync_all()?;
+                ensure!(
+                    hash_file(level.path())? == expected_level,
+                    "staged level.dat changed while copying"
+                );
+                let temporary = PathBuf::from(
+                    level
+                        .path()
+                        .file_name()
+                        .context("temporary level name missing")?,
+                );
+                let mut actual = staged_world_manifest(&reserved.path, true)?;
+                ensure!(
+                    actual.remove(&temporary) == Some(Some(expected_level)),
+                    "temporary level data changed"
+                );
+                let mut expected = self.manifest.clone();
+                expected.remove(Path::new("level.dat"));
+                ensure!(
+                    actual == expected,
+                    "new world files changed before publication"
+                );
+                self.verify()?;
+                level
+                    .persist_noclobber(reserved.path.join("level.dat"))
+                    .map_err(|error| error.error)
+                    .context("cannot publish level.dat")?;
+                Ok(())
+            })();
+            result.with_context(|| {
+                format!(
+                    "new world was not published; incomplete files remain at {}",
+                    reserved.path.display()
+                )
+            })?;
+            Ok(PublishedFreshWorld {
+                name: reserved.name.clone(),
+                path: reserved.path.clone(),
+                session: reserved.session().clone(),
+            })
+        }
+    }
+}
+
+/// Published world and its still-held vanilla session lock.
+pub struct PublishedFreshWorld {
+    pub name: String,
+    pub path: PathBuf,
+    session: WorldSessionGuard,
+}
+
+impl PublishedFreshWorld {
+    pub fn session(&self) -> &WorldSessionGuard {
+        &self.session
+    }
+}
+
+fn staged_world_manifest(
+    root: &Path,
+    ignore_session_lock: bool,
+) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>> {
+    let metadata = fs::symlink_metadata(root)?;
+    ensure!(
+        ordinary(&metadata) && metadata.is_dir(),
+        "staged world is not an ordinary directory"
+    );
+    let root = root.canonicalize()?;
+    let mut pending = vec![PathBuf::new()];
+    let mut output = BTreeMap::new();
+    while let Some(parent) = pending.pop() {
+        for entry in fs::read_dir(root.join(&parent))? {
+            let entry = entry?;
+            let relative = parent.join(entry.file_name());
+            let path = root.join(&relative);
+            let metadata = fs::symlink_metadata(&path)?;
+            ensure!(
+                ordinary(&metadata),
+                "staged world contains a link or reparse point"
+            );
+            ensure!(
+                path.canonicalize()?.starts_with(&root),
+                "staged path is outside the world"
+            );
+            if ignore_session_lock && relative == Path::new("session.lock") {
+                ensure!(
+                    metadata.is_file() && metadata.len() == 0,
+                    "invalid staged session lock"
+                );
+                continue;
+            }
+            let value = if metadata.is_dir() {
+                pending.push(relative.clone());
+                None
+            } else {
+                ensure!(
+                    metadata.is_file(),
+                    "staged world contains an unsupported file"
+                );
+                Some(hash_file(&path)?)
+            };
+            ensure!(
+                output.insert(relative, value).is_none(),
+                "duplicate staged path"
+            );
+            ensure!(output.len() <= 1_000_000, "too many staged world files");
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn copy_new_verified(source: &Path, target: &Path, expected: [u8; 32]) -> Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    ensure!(
+        hash_file(target)? == expected,
+        "new world file differs from its staged source"
+    );
+    Ok(())
 }
 
 impl FreshWorldDraft {
@@ -357,9 +576,11 @@ impl FreshWorldDraft {
             "staged spawn chunk cannot be read"
         );
         drop(reader);
+        let manifest = staged_world_manifest(&world_path, false)?;
         Ok(FreshWorldStage {
             _directory: directory,
             root: world_path,
+            manifest,
         })
     }
 }
@@ -1089,6 +1310,10 @@ impl WorldSessionGuard {
                 writer_active: AtomicBool::new(false),
             }),
         })
+    }
+
+    pub(crate) fn matches_root(&self, root: &Path) -> bool {
+        self.shared.root == root
     }
 
     /// Reuse this session's OS lock for a single writer. The caller must pause
@@ -3526,6 +3751,116 @@ mod tests {
             .unwrap();
         assert!(draft.stage(parent.path()).is_err());
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    fn publishable_stage(parent: &Path) -> FreshWorldStage {
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(crate::world::ChunkPos { x: 0, z: 0 }, &chunk(0, "stage"), 1)
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        draft.stage(parent).unwrap()
+    }
+
+    #[test]
+    fn fresh_world_publication_keeps_existing_world_and_session_lock() {
+        let saves = test_world();
+        let existing = saves.path().join("World");
+        fs::create_dir(&existing).unwrap();
+        fs::write(existing.join("marker"), b"original").unwrap();
+        let stage = publishable_stage(saves.path());
+        let stage_path = stage.path().to_owned();
+        let published = stage.publish(saves.path(), "World", "New World").unwrap();
+        assert_eq!(published.name, "World (1)");
+        assert!(!stage_path.exists());
+        assert_eq!(fs::read(existing.join("marker")).unwrap(), b"original");
+        assert!(published.path.join("level.dat").is_file());
+        assert!(WorldWriteGuard::acquire(&published.path).is_err());
+        let writer = published.session().acquire_write().unwrap();
+        drop(writer);
+        assert!(
+            crate::world::WorldReader::open_with_session(
+                &existing,
+                DimensionId::parse("overworld").unwrap(),
+                published.session().clone(),
+            )
+            .is_err()
+        );
+        let reader = crate::world::WorldReader::open_with_session(
+            &published.path,
+            DimensionId::parse("overworld").unwrap(),
+            published.session().clone(),
+        )
+        .unwrap();
+        let path = published.path.clone();
+        drop(published);
+        assert!(WorldWriteGuard::acquire(&path).is_err());
+        let shared = reader.session_guard().unwrap();
+        assert!(shared.acquire_write().is_ok());
+        drop(shared);
+        drop(reader);
+        assert!(WorldWriteGuard::acquire(&path).is_ok());
+    }
+
+    #[test]
+    fn fresh_world_publication_rejects_changed_stages_and_other_destinations() {
+        let parent = test_world();
+        let other = test_world();
+        let stage = publishable_stage(parent.path());
+        fs::write(stage.path().join("level.dat"), b"changed").unwrap();
+        assert!(stage.publish(parent.path(), "World", "New World").is_err());
+        assert!(!parent.path().join("World").exists());
+        let stage = publishable_stage(parent.path());
+        assert!(stage.publish(other.path(), "World", "New World").is_err());
+        assert!(!other.path().join("World").exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fresh_world_data_packs_are_sealed_before_publication() {
+        let parent = test_world();
+        let source = test_world();
+        fs::create_dir_all(source.path().join("datapacks/example")).unwrap();
+        fs::write(
+            source.path().join("datapacks/example/pack.mcmeta"),
+            b"original",
+        )
+        .unwrap();
+        let snapshot =
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(source.path()).unwrap();
+        let mut stage = publishable_stage(parent.path());
+        stage.install_data_packs(&snapshot).unwrap();
+        fs::write(
+            stage.path().join("datapacks/example/pack.mcmeta"),
+            b"changed",
+        )
+        .unwrap();
+        assert!(stage.publish(parent.path(), "World", "New World").is_err());
+        assert!(!parent.path().join("World").exists());
+        let mut stage = publishable_stage(parent.path());
+        stage.install_data_packs(&snapshot).unwrap();
+        let published = stage.publish(parent.path(), "World", "New World").unwrap();
+        assert_eq!(
+            fs::read(published.path.join("datapacks/example/pack.mcmeta")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn new_world_copy_never_overwrites_existing_files() {
+        let parent = test_world();
+        let source = parent.path().join("source");
+        fs::write(&source, b"source").unwrap();
+        let file = parent.path().join("file");
+        fs::write(&file, b"file").unwrap();
+        assert!(copy_new_verified(&source, &file, hash_file(&source).unwrap()).is_err());
+        assert_eq!(fs::read(file).unwrap(), b"file");
+        assert_eq!(fs::read(source).unwrap(), b"source");
     }
 
     #[test]

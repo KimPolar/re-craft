@@ -212,9 +212,9 @@ impl GenerationReady {
         for ((_, _, _), region) in regions {
             draft.add_region(dimension.clone(), region)?;
         }
-        let stage = draft.stage(parent)?;
+        let mut stage = draft.stage(parent)?;
         match (&settings.packs, &self.pack_snapshot) {
-            (Some(_), Some(snapshot)) => snapshot.copy_into(stage.path())?,
+            (Some(_), Some(snapshot)) => stage.install_data_packs(snapshot)?,
             (None, None) => {}
             _ => anyhow::bail!("generation data pack snapshot does not match level settings"),
         }
@@ -2675,7 +2675,12 @@ mod tests {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
-        let temp = tempfile::tempdir()?;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/generation-test-temp");
+        std::fs::create_dir_all(&root)?;
+        let temp = tempfile::Builder::new()
+            .prefix("initial-world-")
+            .tempdir_in(root)?;
         let world = temp.path().join("world");
         let pack = world.join("datapacks/compact");
         for dir in [
@@ -3317,6 +3322,27 @@ mod tests {
                         .read_data("data/example/worldgen/biome/flat.json")?
                         .unwrap(),
                     expected_biome
+                );
+                drop(staged_resources);
+                drop(reader);
+                let StagedInitialWorld { initial, stage } = staged;
+                let published = stage.publish(temp.path(), "Created", "New World")?;
+                assert_eq!(
+                    std::fs::read(
+                        published
+                            .path
+                            .join("datapacks/compact/data/example/worldgen/biome/flat.json")
+                    )?,
+                    expected_biome
+                );
+                let saved = native_persistence::world::WorldReader::open_with_session(
+                    &published.path,
+                    native_persistence::world::DimensionId::parse("overworld")?,
+                    published.session().clone(),
+                )?;
+                assert_eq!(saved.singleplayer_uuid_words()?, Some(initial.uuid));
+                assert!(
+                    native_persistence::save::WorldWriteGuard::acquire(&published.path).is_err()
                 );
             }
         }

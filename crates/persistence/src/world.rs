@@ -966,6 +966,26 @@ impl WorldReader {
         Self::open_inner(world_dir, dimension, true)
     }
 
+    /// Open using an already-held lock, such as one returned when a fresh
+    /// world is published. The reader retains the same guard for its lifetime.
+    pub fn open_with_session(
+        world_dir: &Path,
+        dimension: DimensionId,
+        session: crate::save::WorldSessionGuard,
+    ) -> Result<Self> {
+        let root = world_dir
+            .canonicalize()
+            .context("cannot resolve world directory")?;
+        ensure!(
+            session.matches_root(&root),
+            "session lock belongs to a different world"
+        );
+        let mut reader = Self::open_inner(&root, dimension, false)?;
+        ensure!(reader.root == root, "world directory changed while opening");
+        reader.session_guard = Some(session);
+        Ok(reader)
+    }
+
     fn open_inner(world_dir: &Path, dimension: DimensionId, locked: bool) -> Result<Self> {
         let root = world_dir
             .canonicalize()

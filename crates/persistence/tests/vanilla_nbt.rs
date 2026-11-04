@@ -540,6 +540,13 @@ public class PoiOracle {
     var refreshRoot = new CompoundTag(); refreshRoot.putInt("DataVersion", 5023); refreshRoot.put("Sections", refreshSections);
     NbtIo.write(refreshRoot, Path.of(args[0], "refresh-source.nbt"));
     var meeting = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.MEETING);
+    var missing = new PoiSection.Packed(true, List.of(
+      new PoiRecord.Packed(new BlockPos(-1,-1,0), meeting, 32),
+      new PoiRecord.Packed(new BlockPos(-3,-3,2), meeting, 32)));
+    var missingSections = new CompoundTag();
+    missingSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, missing).getOrThrow());
+    var missingRoot = new CompoundTag(); missingRoot.putInt("DataVersion", 5023); missingRoot.put("Sections", missingSections);
+    NbtIo.write(missingRoot, Path.of(args[0], "missing-expected.nbt"));
     var runtime = invalid.unpack(() -> {});
     runtime.refresh(add -> { add.accept(new BlockPos(-1,-1,0), meeting); add.accept(new BlockPos(-3,-3,2), meeting); });
     refreshSections.put("-1", PoiSection.Packed.CODEC.encodeStart(ops, runtime.pack()).getOrThrow());
@@ -715,6 +722,18 @@ public class PoiOracle {
             })
             .collect()
     };
+    let missing = native_persistence::poi::refresh_missing_chunk(
+        source.position,
+        &world,
+        -16,
+        16,
+        |_| Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let expected_missing =
+        nbt::read(&std::fs::read(temp.path().join("missing-expected.nbt")).unwrap()).unwrap();
+    assert_eq!(records(&missing), records(&expected_missing));
     assert_eq!(
         records(actual.document.as_ref().unwrap()),
         records(&expected)

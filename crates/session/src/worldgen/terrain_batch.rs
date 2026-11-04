@@ -1659,14 +1659,10 @@ impl FreshTerrainBatch {
         Ok(stage)
     }
 
-    /// Preview one drained batch of the postprocessing light checks. The
-    /// caller must choose a drain point with no other pending light-engine
-    /// work. Both channels are updated on an isolated snapshot; neither the
-    /// batch nor the intermediate block result is changed on failure.
-    pub fn postprocessed_light_snapshot(
+    fn validate_postprocessing(
         &self,
         processed: &super::PostprocessedGeneratedRegion,
-    ) -> Result<VisibleLightSnapshot> {
+    ) -> Result<()> {
         ensure!(
             !self.failed,
             "generation batch failed and must be discarded"
@@ -1690,6 +1686,19 @@ impl FreshTerrainBatch {
             (min_y, max_y) == (processed.min_y, processed.max_y),
             "postprocessing light bounds changed"
         );
+        Ok(())
+    }
+
+    /// Preview one drained batch of the postprocessing light checks. The
+    /// caller must choose a drain point with no other pending light-engine
+    /// work. Both channels are updated on an isolated snapshot; neither the
+    /// batch nor the intermediate block result is changed on failure.
+    pub fn postprocessed_light_snapshot(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<VisibleLightSnapshot> {
+        self.validate_postprocessing(processed)?;
+        let (min_y, max_y) = self.build_bounds()?;
         let bounds = native_world::block_light::LightBounds::new(min_y, max_y)
             .context("unsupported postprocessing light bounds")?;
         let engine = self
@@ -1963,6 +1972,46 @@ impl FreshTerrainBatch {
                 ))
             })
             .collect()
+    }
+
+    /// Preview a missing-POI consistency refresh against postprocessed blocks.
+    /// The caller must establish that POIs and tickets did not exist earlier;
+    /// this snapshot does not authorize writing a world.
+    pub fn postprocessed_missing_poi_snapshot(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>> {
+        self.validate_postprocessing(processed)?;
+        let registry = self
+            .light_registry
+            .as_ref()
+            .context("block registry is missing")?;
+        let mut output = BTreeMap::new();
+        for pos in positions {
+            ensure!(
+                processed.chunks.contains(&pos),
+                "chunk was not postprocessed"
+            );
+            ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
+            let poi_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
+            let draft = native_persistence::poi::refresh_missing_chunk(
+                poi_pos,
+                &processed.world,
+                self.generator.min_y,
+                self.generator.height,
+                |state| {
+                    ensure!(
+                        registry.is_canonical_state(&state.name, &state.properties),
+                        "unknown POI block state"
+                    );
+                    Ok(())
+                },
+            )?;
+            output.insert(pos, draft);
+        }
+        ensure!(!output.is_empty(), "no postprocessed chunks selected");
+        Ok(output)
     }
 
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the

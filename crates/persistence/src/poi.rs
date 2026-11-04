@@ -342,6 +342,55 @@ pub fn refresh_section(
     })
 }
 
+/// Model Java's missing-section consistency check for every build-height
+/// section of one chunk. The caller must know there is no prior POI storage
+/// or ticket activity; this block-derived snapshot is not a save authorization.
+pub fn refresh_missing_chunk(
+    position: ChunkPos,
+    world: &native_world::loaded::World,
+    min_y: i32,
+    height: i32,
+    mut validate_state: impl FnMut(&BlockState) -> Result<()>,
+) -> Result<Option<NamedTag>> {
+    ensure!(
+        min_y.rem_euclid(16) == 0 && height > 0 && height % 16 == 0,
+        "invalid POI refresh bounds"
+    );
+    let max_y = min_y
+        .checked_add(height)
+        .context("POI refresh height overflow")?;
+    let first = min_y.div_euclid(16);
+    let end = max_y.div_euclid(16);
+    ensure!(
+        first >= i32::from(i8::MIN) && end - 1 <= i32::from(i8::MAX),
+        "POI refresh section out of range"
+    );
+    let mut current: Option<SavedPoiChunk> = None;
+    for section_y in first..end {
+        let refreshed = refresh_section(
+            current.as_ref(),
+            position,
+            i8::try_from(section_y)?,
+            world,
+            &mut validate_state,
+            |_| Ok(()),
+        )?;
+        ensure!(
+            refreshed.discarded_positions.is_empty(),
+            "missing POI refresh discarded records"
+        );
+        if refreshed.changed {
+            current = Some(SavedPoiChunk::from_document(
+                refreshed
+                    .document
+                    .context("refreshed POI data is missing")?,
+                position,
+            )?);
+        }
+    }
+    Ok(current.map(|chunk| (*chunk.document).clone()))
+}
+
 /// This document is an incomplete draft; it is not a write authorization.
 pub struct PoiDraft {
     source: NamedTag,
@@ -848,6 +897,54 @@ mod tests {
         assert!(section.valid);
         assert_eq!(section.records[0].position, [2, 4, 0]);
         assert_eq!(section.records[0].free_tickets, 32);
+    }
+
+    #[test]
+    fn missing_chunk_refresh_checks_every_section_and_keeps_empty_sections_absent() {
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut world = terrain(&[(2, "bell")]);
+        let air = world.intern_state(state("air", &[]));
+        let head = world.intern_state(state("red_bed", &[("part", "head")]));
+        let foot = world.intern_state(state("red_bed", &[("part", "foot")]));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[0] = head;
+        blocks[1] = foot;
+        let chunk = Arc::make_mut(
+            world
+                .chunks
+                .get_mut(&loaded::ChunkPos { x: 0, z: 0 })
+                .unwrap(),
+        );
+        let empty = chunk.sections[&0].as_ref().clone();
+        let mut lower = empty.clone();
+        lower.blocks = Some(blocks);
+        let mut upper = empty;
+        upper.blocks = Some(Box::new([air; BLOCK_COUNT]));
+        chunk.sections.insert(-1, Arc::new(lower));
+        chunk.sections.insert(1, Arc::new(upper));
+        let draft = refresh_missing_chunk(pos, &world, -16, 48, |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        let decoded = decode_poi_chunk(draft, pos).unwrap();
+        assert_eq!(decoded.sections.len(), 2);
+        assert_eq!(decoded.sections[&-1].records.len(), 1);
+        assert_eq!(decoded.sections[&-1].records[0].position, [0, -16, 0]);
+        assert!(
+            decoded.sections[&-1].records[0]
+                .type_id
+                .matches("minecraft:home")
+        );
+        assert_eq!(decoded.sections[&0].records[0].free_tickets, 32);
+        assert!(refresh_missing_chunk(pos, &world, -16, 64, |_| Ok(())).is_err());
+        assert!(
+            refresh_missing_chunk(pos, &world, -16, 48, |_| anyhow::bail!("unknown state"))
+                .is_err()
+        );
+        assert!(
+            refresh_missing_chunk(pos, &terrain(&[]), 0, 16, |_| Ok(()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

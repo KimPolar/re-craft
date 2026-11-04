@@ -4911,6 +4911,20 @@ mod tests {
             .unwrap()
             .remove(&center)
             .unwrap();
+        let poi = batch
+            .postprocessed_missing_poi_snapshot(&processed, [center])
+            .unwrap();
+        assert!(poi[&center].is_none());
+        assert!(
+            batch
+                .postprocessed_missing_poi_snapshot(&processed, [center, center])
+                .is_err()
+        );
+        assert!(
+            batch
+                .postprocessed_missing_poi_snapshot(&processed, [distant])
+                .is_err()
+        );
         assert_eq!(
             postprocessed_sections,
             batch.spawned_section_data(center).unwrap()
@@ -5108,6 +5122,11 @@ mod tests {
             .light_checks
             .push(native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 });
         assert!(batch.postprocessed_light_snapshot(&processed).is_err());
+        assert!(
+            batch
+                .postprocessed_missing_poi_snapshot(&processed, [center])
+                .is_err()
+        );
         assert!(
             batch
                 .postprocessed_sections_data(&processed, [center])

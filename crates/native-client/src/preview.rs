@@ -2908,6 +2908,11 @@ mod tests {
                     || path == "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
                 {
                     Some(br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec())
+                } else if path == "data/minecraft/tags/block/animals_spawnable_on.json"
+                    || path == "data/minecraft/tags/block/goats_spawnable_on.json"
+                    || path == "data/minecraft/tags/block/rabbits_spawnable_on.json"
+                {
+                    Some(br#"{"values":["minecraft:stone","minecraft:dirt"]}"#.to_vec())
                 } else if path.starts_with("data/minecraft/worldgen/noise/") {
                     Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec())
                 } else {
@@ -2965,6 +2970,18 @@ mod tests {
         let mut no_spawn_batch =
             FreshTerrainBatch::new_without_structures(generator3, tags3, "minecraft:overworld")
                 .unwrap();
+        let mut farm_definition = definition.clone();
+        farm_definition["settings"]["disable_mob_generation"] = json!(false);
+        let farm_tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let farm_generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &farm_definition, 42, 0, 16)
+                .unwrap();
+        let mut farm_batch = FreshTerrainBatch::new_without_structures(
+            farm_generator,
+            farm_tags,
+            "minecraft:overworld",
+        )
+        .unwrap();
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
@@ -2986,11 +3003,15 @@ mod tests {
             .enable_light_initialization(generated.clone())
             .unwrap();
         no_spawn_batch
-            .enable_decoration(&mut data, &BTreeSet::new(), registry, &lighting)
+            .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
             .unwrap();
         no_spawn_batch
-            .enable_light_initialization(generated)
+            .enable_light_initialization(generated.clone())
             .unwrap();
+        farm_batch
+            .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
+            .unwrap();
+        farm_batch.enable_light_initialization(generated).unwrap();
         let classify = |v: &Value| -> Result<CarverBlockState> {
             let name = v
                 .as_str()
@@ -3060,6 +3081,141 @@ mod tests {
             crate::generation_worker::GenerationPhase::Ready
         );
         assert!(generation.progress().completed_steps > 0);
+        // Extend a separate mob-enabled batch on a worker and preserve its
+        // staged records until SPAWN has completed.
+        {
+            use crate::generation_worker::{GenerationPhase, GenerationResult, GenerationWorker};
+            use native_session::worldgen::{
+                FreshCreatureConstruction, GeneratedSheepSpawner, SheepSpawnInputs,
+                schedule::GenerationStage,
+            };
+            let initial = GenerationWorker::start(
+                move || Ok((farm_batch, Fixture, classify, resolve)),
+                targets.clone(),
+                20,
+                0,
+                IVec3::ZERO,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let ready = loop {
+                if let Some(result) = initial.try_result().unwrap() {
+                    match result {
+                        GenerationResult::Ready(ready) => break ready,
+                        GenerationResult::Failed(error) => panic!("{error:#}"),
+                        GenerationResult::Cancelled => panic!("generation cancelled"),
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "farm generation timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            let mut tags_provider = Fixture;
+            let heights = native_resources::heightmap_tags::HeightmapTags::load(
+                &mut tags_provider,
+                &registry,
+            )
+            .unwrap();
+            let grounds = native_resources::worldgen_mob_rules::GroundSpawnTags::load(
+                &mut tags_provider,
+                &registry,
+            )
+            .unwrap();
+            let biomes =
+                native_resources::worldgen_region_random::SheepBiomeTags::load(&mut tags_provider)
+                    .unwrap();
+            let original = Arc::clone(&ready.mesh.world);
+            let worker = GenerationWorker::complete_creature_spawning(ready, move || {
+                let empty = BTreeSet::<String>::new();
+                let mut spawns = native_resources::mob_spawns::CreatureSpawns::default();
+                spawns.apply(native_resources::mob_spawns::CreatureSpawnLayer::from_attributes(
+                    &json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:sheep","count":1,"weight":1}]},"spawn_costs":{}}}), |_| Some(false),
+                ).unwrap().unwrap());
+                let build = move |batch: &FreshTerrainBatch, _: &mut Fixture, pos| {
+                    let inputs = SheepSpawnInputs {
+                        border: native_session::respawn::RespawnBorder { min_x:-100.0, max_x:100.0, min_z:-100.0, max_z:100.0 },
+                        prevent_inside:&empty, height_tags:&heights, ground_tags:&grounds, biome_tags:&biomes, has_ceiling:false,
+                    };
+                    let probability = [0.5,0.75,0.9,0.99].into_iter().find(|&p| {
+                        let mut plan = batch.plan_creature_spawning(pos,true,p,spawns.clone()).unwrap();
+                        matches!(plan.next(1).unwrap(),native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_))
+                    }).unwrap();
+                    GeneratedSheepSpawner::new(batch,pos,probability,spawns.clone(),inputs)
+                };
+                let mut serial = 0;
+                let construct = move |_: &ResourceId| { serial += 1; Ok(FreshCreatureConstruction { uuid:[0,1,0,serial], chicken_egg_time:None }) };
+                Ok((Fixture, classify, resolve, build, construct))
+            }).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let ready = loop {
+                if let Some(result) = worker.try_result().unwrap() {
+                    match result {
+                        GenerationResult::Ready(ready) => break ready,
+                        GenerationResult::Failed(error) => panic!("{error:#}"),
+                        GenerationResult::Cancelled => panic!("spawn cancelled"),
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "farm spawn worker timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert_eq!(
+                ready.batch.schedule().completed(center),
+                Some(GenerationStage::Spawn)
+            );
+            assert!(
+                !ready
+                    .batch
+                    .recorded_generated_entities(center)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(Arc::ptr_eq(&ready.mesh.world, &original));
+            assert_eq!(worker.progress().phase, GenerationPhase::Ready);
+            assert_eq!(
+                worker.progress().last_step,
+                Some((center, GenerationStage::Spawn))
+            );
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let cancelled = GenerationWorker::complete_creature_spawning(ready, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let build = |_: &FreshTerrainBatch,
+                             _: &mut Fixture,
+                             _: ChunkPos|
+                 -> Result<GeneratedSheepSpawner> {
+                    panic!("cancelled worker must not start a spawner")
+                };
+                let construct = |_: &ResourceId| -> Result<FreshCreatureConstruction> {
+                    panic!("cancelled worker must not construct an entity")
+                };
+                Ok((Fixture, classify, resolve, build, construct))
+            })
+            .unwrap();
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            cancelled.cancel();
+            release_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(result) = cancelled.try_result().unwrap() {
+                    assert!(matches!(result, GenerationResult::Cancelled));
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "spawn cancellation timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(cancelled.progress().phase, GenerationPhase::Cancelled);
+        }
         {
             use native_session::{GameSession, PlayerPose, PlayerState, inventory::PlayerSlot};
             let player = PlayerState {

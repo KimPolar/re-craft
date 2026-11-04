@@ -23,6 +23,7 @@ pub enum GenerationPhase {
     Planning,
     Generating,
     Lighting,
+    Spawning,
     PreparingMesh,
     SearchingSpawn,
     Ready,
@@ -305,6 +306,90 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Complete generation-time creature spawning for the mesh targets on a
+    /// worker. The supplied builder must use this batch's unchanged packs,
+    /// dimension, clocks and tags. No chunk is marked SPAWN until its driver
+    /// finishes; cancellation discards the owned batch and all staged records.
+    pub fn complete_creature_spawning<P, C, R, M, K, F>(
+        mut ready: GenerationReady,
+        prepare: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(P, C, R, M, K)> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        M: FnMut(
+            &FreshTerrainBatch,
+            &mut P,
+            ChunkPos,
+        ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+        K: FnMut(
+            &native_resources::packs::ResourceId,
+        ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            let targets = ready
+                .mesh
+                .targets
+                .as_deref()
+                .context("generated session targets missing")?
+                .clone();
+            ensure!(!targets.is_empty(), "generated session has no targets");
+            ensure!(
+                ready.batch.is_complete(),
+                "generation batch has pending work"
+            );
+            let current = ready.batch.lit_render_snapshot(targets.iter().copied())?;
+            ensure!(
+                Arc::ptr_eq(&current, &ready.mesh.world),
+                "generated mesh snapshot is stale"
+            );
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (mut provider, mut classify, mut resolve, mut build_spawner, mut construct) =
+                prepare()?;
+            set_phase(progress, GenerationPhase::Spawning);
+            for &pos in &targets {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if ready.batch.schedule().completed(pos) == Some(GenerationStage::Spawn) {
+                    continue;
+                }
+                ensure!(
+                    ready.batch.schedule().completed(pos) == Some(GenerationStage::Light),
+                    "creature spawning requires a light-complete target"
+                );
+                let mut spawner = build_spawner(&ready.batch, &mut provider, pos)?;
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    match spawner.advance_with_construction(&mut ready.batch, &mut construct)? {
+                        native_session::worldgen::SheepSpawnProgress::Finished => break,
+                        native_session::worldgen::SheepSpawnProgress::Pending
+                        | native_session::worldgen::SheepSpawnProgress::Rejected
+                        | native_session::worldgen::SheepSpawnProgress::Prepared(_) => {}
+                    }
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                spawner.schedule_spawn(&mut ready.batch)?;
+                let completed =
+                    generation_step(&mut ready.batch, &mut provider, &mut classify, &mut resolve)?;
+                ensure!(
+                    completed == Some((pos, GenerationStage::Spawn)),
+                    "unexpected generation step after creature spawning"
+                );
+                note_step(progress, pos, GenerationStage::Spawn);
+            }
+            Ok(Some(ready))
+        })
+    }
+
     /// Construct the batch and its resources on the worker thread. They must
     /// use the same immutable pack stack and have decoration/light configured.
     /// This finite batch does not save or start play.

@@ -14,7 +14,7 @@ pub enum ChatAction {
     Submit(String),
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ChatInput {
     open: bool,
     text: String,
@@ -31,6 +31,16 @@ pub struct ChatInput {
 }
 
 impl ChatInput {
+    pub fn value(&self) -> &str {
+        &self.text
+    }
+
+    pub fn field(value: &str) -> Self {
+        let mut input = Self::default();
+        input.open(false);
+        input.insert_limited(value, 32);
+        input
+    }
     pub fn is_open(&self) -> bool {
         self.open
     }
@@ -94,8 +104,12 @@ impl ChatInput {
     }
 
     pub fn insert(&mut self, text: &str) {
+        self.insert_limited(text, 256);
+    }
+
+    pub fn insert_limited(&mut self, text: &str, limit: usize) {
         let (start, end) = self.selection();
-        let available = 256usize.saturating_sub(
+        let available = limit.saturating_sub(
             self.text[..start].encode_utf16().count() + self.text[end..].encode_utf16().count(),
         );
         if available == 0 {
@@ -359,6 +373,94 @@ impl ChatInput {
         ChatAction::None
     }
 
+    /// Draw a standard bordered edit box using the same editor as chat.
+    pub fn draw_field(
+        &self,
+        canvas: &mut Canvas,
+        assets: &MenuAssets,
+        rect: Rect,
+        focused: bool,
+        hint: &str,
+    ) {
+        canvas.fill(
+            rect,
+            if focused {
+                [255, 255, 255, 255]
+            } else {
+                [160, 160, 160, 255]
+            },
+        );
+        canvas.fill(
+            Rect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                w: rect.w - 2,
+                h: rect.h - 2,
+            },
+            [0, 0, 0, 255],
+        );
+        let available = (rect.w - 8).max(1);
+        let start = self.visible_start(canvas, assets, available);
+        let mut edit = Canvas::new(available as u32, 12);
+        let (sel_start, sel_end) = self.selection();
+        let pos = |at: usize| canvas.text_width(Some(assets), &self.text[start..at.max(start)]);
+        if focused && sel_start != sel_end && sel_end > start {
+            edit.fill(
+                Rect {
+                    x: pos(sel_start),
+                    y: 0,
+                    w: pos(sel_end) - pos(sel_start),
+                    h: 10,
+                },
+                [0, 0, 255, 255],
+            );
+        }
+        let cursor = pos(self.caret);
+        if self.text.is_empty() && self.preedit.is_empty() {
+            edit.text(Some(assets), 0, 0, hint, [128, 128, 128]);
+        } else {
+            edit.text(
+                Some(assets),
+                0,
+                0,
+                &self.text[start..self.caret],
+                [224, 224, 224],
+            );
+            edit.text(Some(assets), cursor, 0, &self.preedit, [255, 255, 255]);
+            let preedit_width = edit.text_width(Some(assets), &self.preedit);
+            edit.text(
+                Some(assets),
+                cursor + preedit_width,
+                0,
+                &self.text[self.caret..],
+                [224, 224, 224],
+            );
+            if !self.preedit.is_empty() {
+                edit.fill(
+                    Rect {
+                        x: cursor,
+                        y: 10,
+                        w: preedit_width,
+                        h: 1,
+                    },
+                    [255, 255, 255, 255],
+                );
+            }
+        }
+        if focused && self.preedit.is_empty() {
+            edit.fill(
+                Rect {
+                    x: cursor,
+                    y: 0,
+                    w: 1,
+                    h: 10,
+                },
+                [208, 208, 208, 255],
+            );
+        }
+        canvas.composite(&edit, rect.x + 4, rect.y + 6);
+    }
+
     pub fn draw(&self, canvas: &mut Canvas, assets: &MenuAssets) {
         let width = canvas.width;
         let height = canvas.height;
@@ -443,6 +545,25 @@ impl ChatInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_field_reuses_selection_and_enforces_utf16_limit() {
+        let mut field = ChatInput::field("New World");
+        field.key(KeyCode::KeyA, true, false);
+        field.insert_limited("한글 😀", 32);
+        assert_eq!(field.value(), "한글 😀");
+        field.key(KeyCode::ArrowLeft, false, false);
+        field.insert_limited("X", 32);
+        assert_eq!(field.value(), "한글 X😀");
+        field.key(KeyCode::KeyA, true, false);
+        field.insert_limited(&"😀".repeat(17), 32);
+        assert_eq!(field.value().encode_utf16().count(), 32);
+        field.set_preedit("한".into());
+        field.key(KeyCode::KeyA, true, false);
+        field.insert_limited("한", 32);
+        assert_eq!(field.value(), "한");
+        assert!(!field.composing());
+    }
 
     #[test]
     fn utf16_limit_selection_and_composition_are_safe() {

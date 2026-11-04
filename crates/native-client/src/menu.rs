@@ -47,6 +47,7 @@ enum Screen {
     Missing,
     Title,
     Worlds,
+    CreateWorld,
     Options,
     Controls,
     Mouse,
@@ -103,6 +104,17 @@ enum ButtonId {
     #[cfg(debug_assertions)]
     PreviewWorld,
     CreateWorld,
+    CreationGameTab,
+    CreationWorldTab,
+    CreationMoreTab,
+    CreationName,
+    CreationSeed,
+    CreationMode,
+    CreationDifficulty,
+    CreationCommands,
+    CreationStructures,
+    CreationBonusChest,
+    CreationConfirm,
     Demo,
     BrowseWorld,
     #[cfg(debug_assertions)]
@@ -232,6 +244,8 @@ struct State {
     selected_world: Option<usize>,
     world_scroll: usize,
     world_scroll_remainder: f64,
+    creation: crate::world_creation::WorldCreationSettings,
+    creation_tab: CreationTab,
     error: Option<String>,
     asset_load: Option<PendingAssetLoad>,
     world_load: Option<PendingWorldLoad>,
@@ -244,6 +258,13 @@ struct State {
     chunk_z: String,
     #[cfg(debug_assertions)]
     radius: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreationTab {
+    Game,
+    World,
+    More,
 }
 
 enum AssetLoadKind {
@@ -393,6 +414,8 @@ impl State {
             selected_world: None,
             world_scroll: 0,
             world_scroll_remainder: 0.0,
+            creation: crate::world_creation::WorldCreationSettings::new("New World".into()),
+            creation_tab: CreationTab::Game,
             error: None,
             asset_load: None,
             world_load: None,
@@ -941,6 +964,7 @@ struct Menu<'a> {
     cursor: (i32, i32),
     cursor_raw: Option<(f64, f64)>,
     focused: Option<ButtonId>,
+    modifiers: winit::keyboard::ModifiersState,
     action: Option<Action>,
     error: Option<anyhow::Error>,
     panorama: PanoramaClock,
@@ -1006,6 +1030,7 @@ impl<'a> Menu<'a> {
             cursor: (-1, -1),
             cursor_raw: None,
             focused: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
             action: None,
             error: None,
             panorama,
@@ -1498,7 +1523,7 @@ impl<'a> Menu<'a> {
                     h - 76,
                     150,
                     tr("selectWorld.create", "Create New World"),
-                    false,
+                    self.state.world_load.is_none(),
                 );
                 #[cfg(debug_assertions)]
                 add(
@@ -1543,6 +1568,194 @@ impl<'a> Menu<'a> {
                     150,
                     "Play Demo World".into(),
                     true,
+                );
+                add(
+                    ButtonId::Done,
+                    w / 2 + 4,
+                    h - 28,
+                    150,
+                    tr("gui.cancel", "Cancel"),
+                    true,
+                );
+            }
+            Screen::CreateWorld => {
+                use crate::world_creation::{Difficulty, GameMode};
+                let settings = &self.state.creation;
+                let top = ((h - 32) / 2 - 70).max(40);
+                for (i, (id, key, fallback)) in [
+                    (
+                        ButtonId::CreationGameTab,
+                        "createWorld.tab.game.title",
+                        "Game",
+                    ),
+                    (
+                        ButtonId::CreationWorldTab,
+                        "createWorld.tab.world.title",
+                        "World",
+                    ),
+                    (
+                        ButtonId::CreationMoreTab,
+                        "createWorld.tab.more.title",
+                        "More",
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    add(
+                        id,
+                        w / 2 - 150 + i as i32 * 100,
+                        0,
+                        100,
+                        tr(key, fallback),
+                        true,
+                    );
+                }
+                let yes_no = |value| {
+                    if value {
+                        tr("options.on", "ON")
+                    } else {
+                        tr("options.off", "OFF")
+                    }
+                };
+                match self.state.creation_tab {
+                    CreationTab::Game => {
+                        let (mode_key, mode) = match settings.mode {
+                            GameMode::Survival => ("selectWorld.gameMode.survival", "Survival"),
+                            GameMode::Hardcore => ("selectWorld.gameMode.hardcore", "Hardcore"),
+                            GameMode::Creative => ("selectWorld.gameMode.creative", "Creative"),
+                        };
+                        let (difficulty_key, difficulty) = match settings.effective_difficulty() {
+                            Difficulty::Peaceful => ("options.difficulty.peaceful", "Peaceful"),
+                            Difficulty::Easy => ("options.difficulty.easy", "Easy"),
+                            Difficulty::Normal => ("options.difficulty.normal", "Normal"),
+                            Difficulty::Hard => ("options.difficulty.hard", "Hard"),
+                        };
+                        add(
+                            ButtonId::CreationName,
+                            w / 2 - 104,
+                            top + 12,
+                            208,
+                            settings.name.value().to_owned(),
+                            true,
+                        );
+                        add(
+                            ButtonId::CreationMode,
+                            w / 2 - 105,
+                            top + 40,
+                            210,
+                            format!(
+                                "{}: {}",
+                                tr("selectWorld.gameMode", "Game Mode"),
+                                tr(mode_key, mode)
+                            ),
+                            true,
+                        );
+                        add(
+                            ButtonId::CreationDifficulty,
+                            w / 2 - 105,
+                            top + 68,
+                            210,
+                            format!(
+                                "{}: {}",
+                                tr("options.difficulty", "Difficulty"),
+                                tr(difficulty_key, difficulty)
+                            ),
+                            settings.mode != GameMode::Hardcore,
+                        );
+                        add(
+                            ButtonId::CreationCommands,
+                            w / 2 - 105,
+                            top + 96,
+                            210,
+                            format!(
+                                "{}: {}",
+                                tr("selectWorld.allowCommands", "Allow Cheats"),
+                                yes_no(settings.effective_allow_commands())
+                            ),
+                            settings.mode != GameMode::Hardcore,
+                        );
+                    }
+                    CreationTab::World => {
+                        add(
+                            ButtonId::Unavailable,
+                            w / 2 - 155,
+                            top,
+                            210,
+                            format!(
+                                "{}: {}",
+                                tr("selectWorld.mapType", "World Type"),
+                                tr("selectWorld.mapType.normal", "Normal")
+                            ),
+                            false,
+                        );
+                        add(
+                            ButtonId::Unavailable,
+                            w / 2 + 59,
+                            top,
+                            96,
+                            tr("selectWorld.customizeType", "Customize"),
+                            false,
+                        );
+                        add(
+                            ButtonId::CreationSeed,
+                            w / 2 - 154,
+                            top + 42,
+                            308,
+                            settings.seed.value().to_owned(),
+                            true,
+                        );
+                        add(
+                            ButtonId::CreationStructures,
+                            w / 2 - 155,
+                            top + 72,
+                            310,
+                            format!(
+                                "{}: {}",
+                                tr("selectWorld.mapFeatures", "Generate Structures"),
+                                yes_no(settings.generate_structures)
+                            ),
+                            true,
+                        );
+                        add(
+                            ButtonId::CreationBonusChest,
+                            w / 2 - 155,
+                            top + 100,
+                            310,
+                            format!(
+                                "{}: {}",
+                                tr("selectWorld.bonusItems", "Bonus Chest"),
+                                yes_no(settings.effective_bonus_chest())
+                            ),
+                            settings.mode != GameMode::Hardcore,
+                        );
+                    }
+                    CreationTab::More => {
+                        add(
+                            ButtonId::Unavailable,
+                            w / 2 - 105,
+                            top + 20,
+                            210,
+                            tr("selectWorld.gameRules", "Game Rules"),
+                            false,
+                        );
+                        add(
+                            ButtonId::Unavailable,
+                            w / 2 - 105,
+                            top + 48,
+                            210,
+                            tr("selectWorld.dataPacks", "Data Packs"),
+                            false,
+                        );
+                    }
+                }
+                add(
+                    ButtonId::CreationConfirm,
+                    w / 2 - 154,
+                    h - 28,
+                    150,
+                    tr("selectWorld.create", "Create New World"),
+                    false,
                 );
                 add(
                     ButtonId::Done,
@@ -1854,6 +2067,12 @@ impl<'a> Menu<'a> {
 
     fn do_button(&mut self, id: ButtonId, event_loop: &ActiveEventLoop) {
         self.state.error = None;
+        if self.focused != Some(id)
+            && let Some(field) = self.creation_field()
+        {
+            field.set_preedit(String::new());
+            field.end_drag();
+        }
         match id {
             ButtonId::Quit => {
                 self.action = Some(Action::Quit);
@@ -1863,6 +2082,69 @@ impl<'a> Menu<'a> {
                 self.state.refresh_worlds();
                 self.state.screen = Screen::Worlds;
             }
+            ButtonId::CreateWorld => {
+                let name = self.state.assets.as_ref().map_or_else(
+                    || "New World".to_owned(),
+                    |assets| {
+                        assets
+                            .translate("selectWorld.newWorld", "New World")
+                            .to_owned()
+                    },
+                );
+                self.state.creation = crate::world_creation::WorldCreationSettings::new(name);
+                self.state.creation_tab = CreationTab::Game;
+                self.state.screen = Screen::CreateWorld;
+            }
+            ButtonId::CreationGameTab => self.state.creation_tab = CreationTab::Game,
+            ButtonId::CreationWorldTab => self.state.creation_tab = CreationTab::World,
+            ButtonId::CreationMoreTab => self.state.creation_tab = CreationTab::More,
+            ButtonId::CreationName | ButtonId::CreationSeed => self.focused = Some(id),
+            ButtonId::CreationMode => {
+                use crate::world_creation::GameMode;
+                self.state.creation.mode =
+                    match (self.state.creation.mode, self.modifiers.shift_key()) {
+                        (GameMode::Survival, false) | (GameMode::Creative, true) => {
+                            GameMode::Hardcore
+                        }
+                        (GameMode::Hardcore, false) | (GameMode::Survival, true) => {
+                            GameMode::Creative
+                        }
+                        (GameMode::Creative, false) | (GameMode::Hardcore, true) => {
+                            GameMode::Survival
+                        }
+                    };
+            }
+            ButtonId::CreationDifficulty => {
+                use crate::world_creation::Difficulty;
+                let state = &mut self.state.creation;
+                if state.mode != crate::world_creation::GameMode::Hardcore {
+                    state.difficulty = match (state.difficulty, self.modifiers.shift_key()) {
+                        (Difficulty::Peaceful, false) | (Difficulty::Normal, true) => {
+                            Difficulty::Easy
+                        }
+                        (Difficulty::Easy, false) | (Difficulty::Hard, true) => Difficulty::Normal,
+                        (Difficulty::Normal, false) | (Difficulty::Peaceful, true) => {
+                            Difficulty::Hard
+                        }
+                        (Difficulty::Hard, false) | (Difficulty::Easy, true) => {
+                            Difficulty::Peaceful
+                        }
+                    };
+                }
+            }
+            ButtonId::CreationCommands => {
+                let state = &mut self.state.creation;
+                if state.mode != crate::world_creation::GameMode::Hardcore {
+                    state.allow_commands = Some(!state.effective_allow_commands());
+                }
+            }
+            ButtonId::CreationStructures => self.state.creation.generate_structures ^= true,
+            ButtonId::CreationBonusChest => {
+                if self.state.creation.mode != crate::world_creation::GameMode::Hardcore {
+                    self.state.creation.bonus_chest ^= true;
+                }
+            }
+            ButtonId::CreationConfirm => {}
             ButtonId::Options => self.state.screen = Screen::Options,
             ButtonId::SoundSettings => {
                 self.sound_ui = SoundUi::default();
@@ -2058,6 +2340,7 @@ impl<'a> Menu<'a> {
                 self.fov_ui.keyboard_adjust = false;
                 self.state.screen = match self.state.screen {
                     Screen::Worlds | Screen::Options => Screen::Title,
+                    Screen::CreateWorld => Screen::Worlds,
                     Screen::RecoverWorld => {
                         self.recovery_world = None;
                         self.recovery_return_screen
@@ -2133,18 +2416,20 @@ impl<'a> Menu<'a> {
             ButtonId::Dimension | ButtonId::ChunkX | ButtonId::ChunkZ | ButtonId::Radius => {
                 self.focused = Some(id)
             }
-            ButtonId::Multiplayer
-            | ButtonId::Realms
-            | ButtonId::CreateWorld
-            | ButtonId::Unavailable => {}
+            ButtonId::Multiplayer | ButtonId::Realms | ButtonId::Unavailable => {}
         }
         #[cfg(debug_assertions)]
         let keep_focus = matches!(
             id,
-            ButtonId::Dimension | ButtonId::ChunkX | ButtonId::ChunkZ | ButtonId::Radius
+            ButtonId::Dimension
+                | ButtonId::ChunkX
+                | ButtonId::ChunkZ
+                | ButtonId::Radius
+                | ButtonId::CreationName
+                | ButtonId::CreationSeed
         );
         #[cfg(not(debug_assertions))]
-        let keep_focus = false;
+        let keep_focus = matches!(id, ButtonId::CreationName | ButtonId::CreationSeed);
         if !keep_focus
             && id.accessibility_control().is_none()
             && !matches!(
@@ -2168,6 +2453,15 @@ impl<'a> Menu<'a> {
             )
         {
             self.focused = None;
+        }
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(
+                self.state.screen == Screen::CreateWorld
+                    && matches!(
+                        self.focused,
+                        Some(ButtonId::CreationName | ButtonId::CreationSeed)
+                    ),
+            );
         }
         self.invalidate();
     }
@@ -2246,6 +2540,17 @@ impl<'a> Menu<'a> {
     #[cfg(not(debug_assertions))]
     fn field(&mut self) -> Option<&mut String> {
         None
+    }
+
+    fn creation_field(&mut self) -> Option<&mut crate::chat_input::ChatInput> {
+        if self.state.screen != Screen::CreateWorld {
+            return None;
+        }
+        match self.focused? {
+            ButtonId::CreationName => Some(&mut self.state.creation.name),
+            ButtonId::CreationSeed => Some(&mut self.state.creation.seed),
+            _ => None,
+        }
     }
 
     fn redraw(&mut self) -> Result<()> {
@@ -2564,6 +2869,37 @@ impl<'a> Menu<'a> {
                     [255, 220, 140],
                 );
             }
+            Screen::CreateWorld => {
+                let top = ((lh - 32) / 2 - 70).max(40);
+                match self.state.creation_tab {
+                    CreationTab::Game => canvas.text(
+                        assets,
+                        lw / 2 - 104,
+                        top,
+                        assets.map_or("World Name", |a| {
+                            a.translate("selectWorld.enterName", "World Name")
+                        }),
+                        [255, 255, 255],
+                    ),
+                    CreationTab::World => canvas.text(
+                        assets,
+                        lw / 2 - 154,
+                        top + 30,
+                        assets.map_or("Seed for the world generator", |a| {
+                            a.translate("selectWorld.enterSeed", "Seed for the world generator")
+                        }),
+                        [255, 255, 255],
+                    ),
+                    CreationTab::More => {}
+                }
+                canvas.text_centered(
+                    assets,
+                    lw / 2,
+                    lh - 42,
+                    "World creation is not available yet",
+                    [180, 180, 180],
+                );
+            }
             Screen::Options => canvas.text_centered(
                 assets,
                 lw / 2,
@@ -2794,6 +3130,22 @@ impl<'a> Menu<'a> {
             }
         }
         for button in self.buttons() {
+            if matches!(button.id, ButtonId::CreationName | ButtonId::CreationSeed) {
+                let focused = self.focused == Some(button.id);
+                if let Some(assets) = assets {
+                    let (editor, hint) = if button.id == ButtonId::CreationSeed {
+                        (
+                            &self.state.creation.seed,
+                            assets
+                                .translate("selectWorld.seedInfo", "Leave blank for a random seed"),
+                        )
+                    } else {
+                        (&self.state.creation.name, "")
+                    };
+                    editor.draw_field(&mut canvas, assets, button.rect, focused, hint);
+                }
+                continue;
+            }
             if matches!(button.id, ButtonId::SoundSlider(_))
                 || button.id == ButtonId::SprintWindow
                 || button.id.mouse_control().is_some()
@@ -2824,9 +3176,17 @@ impl<'a> Menu<'a> {
                 );
                 continue;
             }
+            let selected_tab = self.state.screen == Screen::CreateWorld
+                && matches!(
+                    (self.state.creation_tab, button.id),
+                    (CreationTab::Game, ButtonId::CreationGameTab)
+                        | (CreationTab::World, ButtonId::CreationWorldTab)
+                        | (CreationTab::More, ButtonId::CreationMoreTab)
+                );
             let highlighted = button.active
                 && (button.rect.contains(self.cursor.0, self.cursor.1)
-                    || self.focused == Some(button.id));
+                    || self.focused == Some(button.id)
+                    || selected_tab);
             canvas.button(
                 assets,
                 button.rect,
@@ -3049,8 +3409,30 @@ impl ApplicationHandler for Menu<'_> {
                 {
                     audio.set_gain(self.state.sound.ui_gain());
                 }
-                request_redraw = dragged || previous != self.hover_target(&buttons, self.cursor);
-                hover_only = !dragged;
+                let edit_dragged = if let Some(assets) = self.state.assets.clone() {
+                    let rect = buttons
+                        .iter()
+                        .find(|button| {
+                            Some(button.id) == self.focused
+                                && matches!(
+                                    button.id,
+                                    ButtonId::CreationName | ButtonId::CreationSeed
+                                )
+                        })
+                        .map(|button| button.rect);
+                    if let Some(rect) = rect {
+                        let x = self.cursor.0 - rect.x;
+                        self.creation_field()
+                            .is_some_and(|field| field.drag(&assets, rect.w, x))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                request_redraw =
+                    dragged || edit_dragged || previous != self.hover_target(&buttons, self.cursor);
+                hover_only = !dragged && !edit_dragged;
             }
             WindowEvent::CursorLeft { .. } => {
                 let buttons = self.hover_buttons();
@@ -3142,6 +3524,15 @@ impl ApplicationHandler for Menu<'_> {
                         self.focused = Some(button.id);
                     }
                     self.do_button(button.id, event_loop);
+                    if matches!(button.id, ButtonId::CreationName | ButtonId::CreationSeed)
+                        && let Some(assets) = self.state.assets.clone()
+                    {
+                        let x = self.cursor.0 - button.rect.x;
+                        let shift = self.modifiers.shift_key();
+                        if let Some(field) = self.creation_field() {
+                            field.start_drag(&assets, button.rect.w, x, shift);
+                        }
+                    }
                 } else if self.state.asset_load.is_none() {
                     let (w, h) = self.logical_size();
                     if self.state.screen == Screen::Worlds
@@ -3186,7 +3577,16 @@ impl ApplicationHandler for Menu<'_> {
                             }
                         }
                     } else {
+                        if let Some(field) = self.creation_field() {
+                            field.set_preedit(String::new());
+                            field.end_drag();
+                        }
                         self.focused = None;
+                        if self.state.screen == Screen::CreateWorld
+                            && let Some(window) = &self.window
+                        {
+                            window.set_ime_allowed(false);
+                        }
                     }
                 }
             }
@@ -3195,6 +3595,9 @@ impl ApplicationHandler for Menu<'_> {
                 button: MouseButton::Left,
                 ..
             } => {
+                if let Some(field) = self.creation_field() {
+                    field.end_drag();
+                }
                 if self.slider_mouse_pressed {
                     self.play_button_sound();
                     self.slider_mouse_pressed = false;
@@ -3207,6 +3610,10 @@ impl ApplicationHandler for Menu<'_> {
                 self.sprint_window_ui.release();
             }
             WindowEvent::Focused(false) => {
+                if let Some(field) = self.creation_field() {
+                    field.end_drag();
+                    field.set_preedit(String::new());
+                }
                 self.slider_mouse_pressed = false;
                 self.video_ui.release(self.state.video);
                 self.accessibility_ui.release();
@@ -3285,6 +3692,29 @@ impl ApplicationHandler for Menu<'_> {
                         .min(max);
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, _))
+                if self.state.screen == Screen::CreateWorld && self.creation_field().is_some() =>
+            {
+                if let Some(field) = self.creation_field() {
+                    field.set_preedit(text);
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(text))
+                if self.state.screen == Screen::CreateWorld && self.creation_field().is_some() =>
+            {
+                if let Some(field) = self.creation_field() {
+                    field.insert_limited(&text, 32);
+                    field.set_preedit(String::new());
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                if let Some(field) = self.creation_field() {
+                    field.set_preedit(String::new());
+                }
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if crate::screenshot_shortcut(event.physical_key, event.state, event.repeat) =>
             {
@@ -3303,7 +3733,28 @@ impl ApplicationHandler for Menu<'_> {
                     PhysicalKey::Code(code) => Some(code),
                     _ => None,
                 };
-                if code == Some(KeyCode::Escape) {
+                if self.state.screen == Screen::CreateWorld
+                    && self.creation_field().is_some()
+                    && self.modifiers.control_key()
+                    && matches!(code, Some(KeyCode::KeyC | KeyCode::KeyX | KeyCode::KeyV))
+                {
+                    use crate::clipboard::Clipboard;
+                    let copy = code != Some(KeyCode::KeyV);
+                    let selected = if copy {
+                        self.creation_field().unwrap().selected_text().to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let mut clipboard =
+                        crate::clipboard::SystemClipboard::new(self.window.as_deref());
+                    if copy {
+                        if clipboard.write(&selected).is_ok() && code == Some(KeyCode::KeyX) {
+                            self.creation_field().unwrap().delete_selection();
+                        }
+                    } else if let Ok(text) = clipboard.read() {
+                        self.creation_field().unwrap().insert_limited(&text, 32);
+                    }
+                } else if code == Some(KeyCode::Escape) {
                     if self.field().is_some() {
                         self.focused = None;
                     } else if self.state.screen != Screen::Title
@@ -3311,6 +3762,25 @@ impl ApplicationHandler for Menu<'_> {
                     {
                         self.do_button(ButtonId::Done, event_loop);
                     }
+                } else if self.state.screen == Screen::CreateWorld
+                    && self.creation_field().is_some()
+                    && (matches!(
+                        code,
+                        Some(
+                            KeyCode::ArrowLeft
+                                | KeyCode::ArrowRight
+                                | KeyCode::Home
+                                | KeyCode::End
+                                | KeyCode::Backspace
+                                | KeyCode::Delete
+                        )
+                    ) || code == Some(KeyCode::KeyA) && self.modifiers.control_key())
+                {
+                    let control = self.modifiers.control_key();
+                    let shift = self.modifiers.shift_key();
+                    self.creation_field()
+                        .unwrap()
+                        .key(code.unwrap(), control, shift);
                 } else if self.state.screen == Screen::Worlds
                     && self.state.world_load.is_none()
                     && self.focused.is_none()
@@ -3432,6 +3902,10 @@ impl ApplicationHandler for Menu<'_> {
                         &mut self.state.video,
                     );
                 } else if code == Some(KeyCode::Tab) {
+                    if let Some(field) = self.creation_field() {
+                        field.set_preedit(String::new());
+                        field.end_drag();
+                    }
                     let buttons: Vec<_> = self
                         .buttons()
                         .into_iter()
@@ -3442,8 +3916,32 @@ impl ApplicationHandler for Menu<'_> {
                         let next = self
                             .focused
                             .and_then(|id| buttons.iter().position(|b| *b == id))
-                            .map_or(0, |i| (i + 1) % buttons.len());
+                            .map_or_else(
+                                || {
+                                    if self.modifiers.shift_key() {
+                                        buttons.len() - 1
+                                    } else {
+                                        0
+                                    }
+                                },
+                                |i| {
+                                    if self.modifiers.shift_key() {
+                                        (i + buttons.len() - 1) % buttons.len()
+                                    } else {
+                                        (i + 1) % buttons.len()
+                                    }
+                                },
+                            );
                         self.focused = Some(buttons[next]);
+                        if let Some(window) = &self.window {
+                            window.set_ime_allowed(
+                                self.state.screen == Screen::CreateWorld
+                                    && matches!(
+                                        self.focused,
+                                        Some(ButtonId::CreationName | ButtonId::CreationSeed)
+                                    ),
+                            );
+                        }
                         if self.state.screen == Screen::Video
                             && matches!(
                                 self.focused,
@@ -3518,6 +4016,13 @@ impl ApplicationHandler for Menu<'_> {
                     if let Some(field) = self.field() {
                         field.pop();
                     }
+                } else if code == Some(KeyCode::Space)
+                    && self.state.screen == Screen::CreateWorld
+                    && self.creation_field().is_some()
+                {
+                    if let Some(field) = self.creation_field() {
+                        field.insert_limited(" ", 32);
+                    }
                 } else if matches!(
                     code,
                     Some(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space)
@@ -3566,12 +4071,14 @@ impl ApplicationHandler for Menu<'_> {
                     {
                         self.do_button(ButtonId::PlayWorld, event_loop);
                     }
-                } else if let Some(text) = event.text
-                    && let Some(field) = self.field()
-                {
-                    for c in text.chars().filter(|c| !c.is_control()) {
-                        if field.len() < 100 {
-                            field.push(c);
+                } else if let Some(text) = event.text {
+                    if let Some(field) = self.creation_field() {
+                        field.insert_limited(&text, 32);
+                    } else if let Some(field) = self.field() {
+                        for c in text.chars().filter(|c| !c.is_control()) {
+                            if field.len() < 100 {
+                                field.push(c);
+                            }
                         }
                     }
                 }
@@ -3891,6 +4398,54 @@ fn draw_pack_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_world_tabs_expose_settings_but_keep_creation_unavailable() {
+        let mut state = State::new(PathBuf::new(), Vec::new());
+        state.asset_load = None;
+        state.screen = Screen::CreateWorld;
+        let mut menu = Menu::new(&mut state);
+        menu.size = (800, 600);
+        let game = menu.buttons();
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationName && b.active)
+        );
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationConfirm && !b.active)
+        );
+        menu.state.creation.mode = crate::world_creation::GameMode::Hardcore;
+        let game = menu.buttons();
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationDifficulty && !b.active)
+        );
+        assert!(
+            game.iter()
+                .any(|b| b.id == ButtonId::CreationCommands && !b.active)
+        );
+        menu.state.creation_tab = CreationTab::World;
+        let world = menu.buttons();
+        assert!(
+            world
+                .iter()
+                .any(|b| b.id == ButtonId::CreationSeed && b.active)
+        );
+        assert!(
+            world
+                .iter()
+                .any(|b| b.id == ButtonId::CreationBonusChest && !b.active)
+        );
+        assert!(!world.iter().any(|b| b.id == ButtonId::CreationName));
+        menu.state.creation_tab = CreationTab::More;
+        assert!(
+            !menu
+                .buttons()
+                .iter()
+                .any(|b| b.id == ButtonId::CreationSeed)
+        );
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

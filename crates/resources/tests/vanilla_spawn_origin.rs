@@ -52,6 +52,27 @@ fn noise_spawn_origins_match_java() {
         .arg(&cp)
         .arg("NoiseSpawnOriginOracle"));
     let mut resources = ResourceStack::open(&game).unwrap();
+    let mob_settings: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("M "))
+        .collect();
+    assert_eq!(mob_settings.len(), 3);
+    for line in mob_settings {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let dim: usize = fields[1].parse().unwrap();
+        let java_disabled: bool = fields[2].parse().unwrap();
+        let returned_without_region: bool = fields[3].parse().unwrap();
+        let name = ["overworld", "nether", "end"][dim];
+        let path = format!("data/minecraft/worldgen/noise_settings/{name}.json");
+        let settings: Value =
+            serde_json::from_slice(&resources.read_data(&path).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            settings["disable_mob_generation"].as_bool(),
+            Some(java_disabled),
+            "{name}"
+        );
+        assert_eq!(returned_without_region, java_disabled, "{name}");
+    }
     let mut count = 0;
     for line in output.lines().filter(|line| line.starts_with("P ")) {
         let fields: Vec<_> = line.split_whitespace().collect();

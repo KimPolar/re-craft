@@ -19,6 +19,11 @@ public final class NoiseSpawnOriginOracle {
         long[] seeds = {0, 42, -1, 12345, Long.MIN_VALUE, Long.MAX_VALUE};
         for (int d = 0; d < kinds.size(); d++) {
             var generator = (NoiseBasedChunkGenerator) dimensions.get(kinds.get(d)).orElseThrow().generator();
+            boolean mobDisabled = generator.generatorSettings().value().disableMobGeneration();
+            boolean returnedWithoutRegion;
+            try { generator.spawnOriginalMobs(null); returnedWithoutRegion = true; }
+            catch (NullPointerException expected) { returnedWithoutRegion = false; }
+            out.printf("M %d %s %s%n", d, mobDisabled, returnedWithoutRegion);
             for (int[] bounds : new int[][]{{-64,384},{0,256},{80,64},{-128,16}}) {
                 var level = net.minecraft.world.level.LevelHeightAccessor.create(bounds[0], bounds[1]);
                 out.printf("H %d %d %d %d%n", d, bounds[0], bounds[1], generator.getSpawnHeight(level));

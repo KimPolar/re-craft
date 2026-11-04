@@ -802,7 +802,11 @@ fn expand_with_inputs(
     if cancelled.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    if batch.schedule().completed(target) != Some(GenerationStage::Light) {
+    if batch
+        .schedule()
+        .completed(target)
+        .is_none_or(|stage| stage < GenerationStage::Light)
+    {
         batch.request_light(target)?;
     }
     while let Some((pos, stage)) = {

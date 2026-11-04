@@ -1699,6 +1699,7 @@ impl BiomeNeighborhood {
 pub struct TerrainGenerator {
     noise: NoiseStageGenerator,
     spawn_target: Option<Value>,
+    disable_mob_generation: Option<bool>,
     structure_context: bool,
     source: BiomeSource,
     possible_biomes: std::collections::BTreeSet<ResourceId>,
@@ -1844,6 +1845,14 @@ impl TerrainGenerator {
             serde_json::to_vec(settings)?
         };
         let parsed: Value = serde_json::from_slice(&bytes).context("invalid noise settings")?;
+        let disable_mob_generation = parsed
+            .get("disable_mob_generation")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .context("disable_mob_generation must be boolean")
+            })
+            .transpose()?;
         let mut compiler = SurfaceRuleCompiler::new(provider);
         let surface = compiler.compile(
             parsed
@@ -1879,6 +1888,7 @@ impl TerrainGenerator {
         Ok(Self {
             noise,
             spawn_target: parsed.get("spawn_target").cloned(),
+            disable_mob_generation,
             structure_context,
             source,
             possible_biomes,
@@ -1901,6 +1911,10 @@ impl TerrainGenerator {
     }
     pub fn sea_level(&self) -> i32 {
         self.noise.sea_level()
+    }
+    /// Absent in incomplete synthetic settings; Java requires this field.
+    pub fn disable_mob_generation(&self) -> Option<bool> {
+        self.disable_mob_generation
     }
     /// Compute the initial origin with the same immutable data-pack stack
     /// used to build this generator, before requesting generated chunks.
@@ -2842,6 +2856,25 @@ mod tests {
         assert!(generator.spawn_origin(&mut data).is_err());
     }
     #[test]
+    fn generator_reads_mob_generation_switch_and_rejects_invalid_values() {
+        let mut data = Data;
+        let mut config = definition();
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).unwrap();
+        assert_eq!(generator.disable_mob_generation(), None);
+        for disabled in [false, true] {
+            config["settings"]["disable_mob_generation"] = json!(disabled);
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16)
+                    .unwrap();
+            assert_eq!(generator.disable_mob_generation(), Some(disabled));
+        }
+        config["settings"]["disable_mob_generation"] = json!("false");
+        assert!(
+            TerrainGenerator::without_terrain_adjustments(&mut data, &config, 42, 0, 16).is_err()
+        );
+    }
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_tracks_light_registration_between_feature_steps() {
         use native_resources::{
@@ -3056,8 +3089,10 @@ mod tests {
             brown: true,
         };
         let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();
+        let mut spawn_settings = definition();
+        spawn_settings["settings"]["disable_mob_generation"] = json!(false);
         let generator =
-            TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)
+            TerrainGenerator::without_terrain_adjustments(&mut data, &spawn_settings, 42, 0, 16)
                 .unwrap();
         let mut batch =
             FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")
@@ -3279,10 +3314,34 @@ mod tests {
                 }
             }
         }
+        let original = batch.snapshot().unwrap();
+        assert!(batch.request_spawn_without_mobs(center, true).is_err());
+        assert_eq!(
+            batch.schedule().completed(center),
+            Some(schedule::GenerationStage::Light)
+        );
+        batch.request_spawn_without_mobs(center, false).unwrap();
+        assert_eq!(
+            batch.step(&mut data, &mut classify, &mut resolve).unwrap(),
+            Some((center, schedule::GenerationStage::Spawn))
+        );
+        assert!(batch.is_complete());
+        assert!(Arc::ptr_eq(&original, &batch.snapshot().unwrap()));
+        let spawn_light = batch.light_snapshot([center]).unwrap();
+        for y in -16..32 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = [x, y, z];
+                    assert_eq!(spawn_light.block_light(pos), extended.block_light(pos));
+                    assert_eq!(spawn_light.sky_light(pos), extended.sky_light(pos));
+                }
+            }
+        }
+        assert!(batch.request_spawn_without_mobs(center, false).is_err());
         let (schedule, _, terrain, light) = batch.into_parts().unwrap();
         assert_eq!(
             schedule.completed(center),
-            Some(schedule::GenerationStage::Light)
+            Some(schedule::GenerationStage::Spawn)
         );
         let (FreshBatchLight::Staged(engine), registry) = light.unwrap() else {
             panic!("expected propagated light history")

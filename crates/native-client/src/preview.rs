@@ -2940,6 +2940,7 @@ mod tests {
         let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
             "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
             "default_block":"minecraft:stone","default_fluid":"minecraft:water",
+            "disable_mob_generation":true,
             "spawn_target":[],
             "material_rule":{"type":"block","result_state":"minecraft:dirt"},
             "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
@@ -3300,6 +3301,19 @@ mod tests {
                 .any(|v| (v.position[1] - 16.0).abs() < 0.0001 && v.light / 16 == 15)
         );
 
+        batch.request_spawn_without_mobs(center, true).unwrap();
+        let mut spawn_data = Fixture;
+        let mut spawn_classify = classify;
+        let mut spawn_resolve = resolve;
+        assert_eq!(
+            batch
+                .step(&mut spawn_data, &mut spawn_classify, &mut spawn_resolve)
+                .unwrap(),
+            Some((
+                center,
+                native_session::worldgen::schedule::GenerationStage::Spawn
+            ))
+        );
         let job = crate::mesh_worker::MeshJob::for_generated(
             &mut batch,
             targets.clone(),
@@ -3373,6 +3387,45 @@ mod tests {
                 .unwrap(),
             crate::generation_worker::InitialSpawnProgress::Found(IVec3::new(0, 16, 0))
         );
+        // A previously generated SPAWN-stage target must not be sent through
+        // LIGHT again when it is reselected for the mesh.
+        expanded.mesh = crate::mesh_worker::MeshJob::for_generated(
+            &mut expanded.batch,
+            BTreeSet::from([east]),
+            10,
+            0,
+            IVec3::ZERO,
+        )
+        .unwrap();
+        let reselection = crate::generation_worker::GenerationWorker::expand(
+            expanded,
+            center,
+            move || Ok((Fixture, classify, resolve)),
+            11,
+            0,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let expanded = loop {
+            if let Some(result) = reselection.try_result().unwrap() {
+                match result {
+                    crate::generation_worker::GenerationResult::Ready(ready) => break ready,
+                    crate::generation_worker::GenerationResult::Failed(error) => {
+                        panic!("{error:#}")
+                    }
+                    crate::generation_worker::GenerationResult::Cancelled => {
+                        panic!("reselection cancelled")
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reselection timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(expanded.mesh.targets.as_deref(), Some(&expanded_targets));
+        assert_eq!(reselection.progress().completed_steps, 0);
         let reopened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reopened_worker = Arc::clone(&reopened);
         let duplicate = crate::generation_worker::GenerationWorker::expand(
@@ -3382,7 +3435,7 @@ mod tests {
                 reopened_worker.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok((Fixture, classify, resolve))
             },
-            10,
+            12,
             0,
         )
         .unwrap();

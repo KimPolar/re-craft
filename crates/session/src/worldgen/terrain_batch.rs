@@ -38,6 +38,7 @@ pub struct FreshTerrainBatch {
     light_tracker: Option<FreshGenerationLightTracker>,
     light_engine: Option<StagedGenerationLightEngine>,
     lit_cache: Option<(BTreeSet<ChunkPos>, Arc<World>)>,
+    spawn_without_mobs: BTreeSet<ChunkPos>,
     failed: bool,
 }
 
@@ -95,6 +96,7 @@ impl FreshTerrainBatch {
             light_tracker: None,
             light_engine: None,
             lit_cache: None,
+            spawn_without_mobs: BTreeSet::new(),
             failed: false,
         })
     }
@@ -277,6 +279,56 @@ impl FreshTerrainBatch {
             "finish pending terrain, decoration and registration before propagating light"
         );
         self.schedule.request(pos, GenerationStage::Light)
+    }
+
+    /// Advance SPAWN only when the generator disables initial mobs or the
+    /// active spawn_mobs game rule is false. This does not make the chunk
+    /// FULL or imply that feature-generated entity data is empty.
+    pub fn request_spawn_without_mobs(&mut self, pos: ChunkPos, spawn_mobs: bool) -> Result<()> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before spawning"
+        );
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        ensure!(
+            disabled || !spawn_mobs,
+            "world-generation mob spawning is not implemented"
+        );
+        ensure!(
+            self.schedule.completed(pos) == Some(GenerationStage::Light),
+            "spawn requires a light-complete chunk"
+        );
+        for (radius, &needed) in GenerationStage::Spawn
+            .accumulated()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let radius = i32::try_from(radius)?;
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs().max(dz.abs()) != radius {
+                        continue;
+                    }
+                    let neighbor = ChunkPos {
+                        x: pos.x.checked_add(dx).context("spawn chunk X overflow")?,
+                        z: pos.z.checked_add(dz).context("spawn chunk Z overflow")?,
+                    };
+                    ensure!(
+                        self.schedule
+                            .completed(neighbor)
+                            .is_some_and(|stage| stage >= needed),
+                        "spawn dependencies are incomplete"
+                    );
+                }
+            }
+        }
+        self.schedule.request(pos, GenerationStage::Spawn)?;
+        self.spawn_without_mobs.insert(pos);
+        Ok(())
     }
 
     fn has_light_dependencies(&self, pos: ChunkPos) -> bool {
@@ -650,6 +702,15 @@ impl FreshTerrainBatch {
                     .context("light propagation is not sealed")?;
                 self.schedule.run_light(terrain, pos, engine, registry)?;
                 self.lit_cache = None;
+                Ok(())
+            })(),
+            GenerationStage::Spawn => (|| {
+                ensure!(
+                    self.spawn_without_mobs.contains(&pos),
+                    "world-generation mob spawning is not implemented"
+                );
+                self.schedule.complete(pos, stage)?;
+                self.spawn_without_mobs.remove(&pos);
                 Ok(())
             })(),
             _ => Err(anyhow::anyhow!("unsupported terrain batch stage {stage:?}")),

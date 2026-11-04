@@ -12,3 +12,4 @@ pub mod simplex;
 pub mod stairs;
 pub mod weather_columns;
 pub mod wood;
+pub mod world_seed;

@@ -33,6 +33,7 @@ mod generated_beehive;
 mod generated_chest;
 mod generated_creature_random;
 mod generated_farm_animal;
+mod generated_horse;
 mod generated_sheep;
 mod generated_spawner;
 mod mob_collision;
@@ -48,6 +49,7 @@ pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
 pub use generated_creature_random::FreshCreatureRandom;
 pub use generated_farm_animal::draft_fresh_farm_animal;
+pub use generated_horse::draft_fresh_horse;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{

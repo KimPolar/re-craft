@@ -1196,7 +1196,19 @@ mod tests {
             pack.join("data/minecraft/tags/block/animals_spawnable_on.json"),
             br#"{"replace":true,"values":["minecraft:dirt"]}"#,
         )?;
-        for (spawn_mobs, disabled) in [(false, false), (true, true), (true, false)] {
+        for (spawn_mobs, disabled, species) in [
+            (false, false, "minecraft:sheep"),
+            (true, true, "minecraft:sheep"),
+            (true, false, "minecraft:sheep"),
+            (true, false, "minecraft:horse"),
+        ] {
+            let mut selected_biome = biome.clone();
+            selected_biome["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]
+                ["creature"][0]["type"] = json!(species);
+            std::fs::write(
+                pack.join("data/example/worldgen/biome/flat.json"),
+                serde_json::to_vec(&selected_biome)?,
+            )?;
             let game = game.clone();
             let world = world.clone();
             let worker = GenerationWorker::start_initial_world(
@@ -1258,7 +1270,14 @@ mod tests {
                 .map(|&pos| ready.batch.recorded_generated_entities(pos).unwrap().len())
                 .sum();
             if spawn_mobs && !disabled {
-                assert!(count > 0, "expected generated sheep");
+                assert!(count > 0, "expected generated {species}");
+                for &pos in targets.iter() {
+                    for entity in ready.batch.recorded_generated_entities(pos)? {
+                        assert!(
+                            matches!(entity.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(species))
+                        );
+                    }
+                }
             } else {
                 assert_eq!(count, 0);
             }

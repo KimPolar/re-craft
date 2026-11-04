@@ -159,6 +159,62 @@ pub struct AnimalBaseInitialization {
     pub left_handed: bool,
 }
 
+/// The group state created by Horse.finalizeSpawn. The first horse selects a
+/// coat shared by the group; markings and attributes are drawn per horse.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HorseGroupData {
+    pub animal: AnimalGroupData,
+    pub variant: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HorseInitialization {
+    pub variant: u8,
+    pub markings: u8,
+    pub max_health: f32,
+    pub movement_speed: f64,
+    pub jump_strength: f64,
+    pub animal: AnimalBaseInitialization,
+}
+
+/// Apply the 26.3 Horse and AbstractHorse finalization in Java's draw order.
+/// The region RNG is independent from both the spawner and entity RNGs.
+pub fn finalize_horse(
+    random: &mut RegionRandom,
+    group: &mut HorseGroupData,
+    has_follow_range_bonus: bool,
+) -> HorseInitialization {
+    let variant = *group.variant.get_or_insert_with(|| {
+        random
+            .next_int_bound(7)
+            .expect("positive horse variant count") as u8
+    });
+    let markings = random
+        .next_int_bound(5)
+        .expect("positive horse markings count") as u8;
+    let max_health = 15.0_f32
+        + random.next_int_bound(8).expect("positive health bound") as f32
+        + random.next_int_bound(9).expect("positive health bound") as f32;
+    let movement_speed = (f64::from(0.45_f32)
+        + random.next_double() * 0.3
+        + random.next_double() * 0.3
+        + random.next_double() * 0.3)
+        * 0.25;
+    let jump_strength = f64::from(0.4_f32)
+        + random.next_double() * 0.2
+        + random.next_double() * 0.2
+        + random.next_double() * 0.2;
+    let animal = finalize_animal_base(random, &mut group.animal, has_follow_range_bonus);
+    HorseInitialization {
+        variant,
+        markings,
+        max_health,
+        movement_speed,
+        jump_strength,
+        animal,
+    }
+}
+
 /// Wool colors that may be selected for a naturally spawned sheep.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SheepSpawnColor {

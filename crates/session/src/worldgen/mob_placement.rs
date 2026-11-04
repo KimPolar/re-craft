@@ -436,6 +436,53 @@ impl GeneratedCreatureProbe {
         })
     }
 
+    /// Prepare a horse without publishing the spawn stage. Random and group
+    /// state are committed only when serialization and the planner both pass.
+    pub(super) fn prepare_fresh_horse(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::HorseGroupData,
+        uuid: [i32; 4],
+    ) -> Result<super::GeneratedEntityAddition> {
+        ensure!(
+            self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "horse",
+            "pending creature is not a horse"
+        );
+        ensure!(
+            self.obstruction_passed && !self.rejected && !self.finalized,
+            "horse is not ready for finalization"
+        );
+        ensure!(
+            planner.created_attempt() == Some(self.attempt.clone()),
+            "constructed horse is no longer pending"
+        );
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        let position = geometry_block_position(geometry)?.to_array();
+        let mut next_random = random.clone();
+        let mut next_group = *group;
+        let initialized = native_resources::worldgen_region_random::finalize_horse(
+            &mut next_random,
+            &mut next_group,
+            false,
+        );
+        let tag = super::draft_fresh_horse(uuid, geometry.position, yaw, initialized)?;
+        let mut next_planner = planner.clone();
+        next_planner.finish_entity(true)?;
+        *planner = next_planner;
+        *random = next_random;
+        *group = next_group;
+        self.finalized = true;
+        Ok(super::GeneratedEntityAddition {
+            block_position: position,
+            record: super::GeneratedEntityRecord::Saved(tag),
+        })
+    }
+
     /// Prepare a finalized farm animal without publishing the spawn stage.
     /// The chicken timer is sampled by the independently constructed entity.
     pub(super) fn prepare_fresh_farm_animal(

@@ -184,7 +184,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         {
             (0, 0)
         }
-        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        "minecraft:air"
+        | "minecraft:cave_air"
+        | "minecraft:void_air"
+        | "minecraft:spore_blossom"
             if state.properties.is_empty() =>
         {
             (0, 0)
@@ -1262,6 +1265,14 @@ mod tests {
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
         }
+    }
+
+    #[test]
+    fn spore_blossom_is_transparent_and_rejects_unknown_properties() {
+        let mut blossom = state("spore_blossom", None);
+        assert!(same_light_behavior(&blossom, &state("air", None)).unwrap());
+        blossom.properties.insert("unknown".into(), "true".into());
+        assert!(light_properties(&blossom).is_none());
     }
 
     #[test]
@@ -2740,6 +2751,7 @@ mod tests {
             "air",
             "cave_air",
             "void_air",
+            "spore_blossom",
             "stone",
             "dirt",
             "sand",

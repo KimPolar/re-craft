@@ -529,6 +529,14 @@ impl GenerationReady {
                 .collect::<Result<BTreeMap<_, _>>>()?;
             session.set_registered_clocks(Arc::new(clocks.keys().cloned().collect()));
             session.set_world_clocks(clocks, initial.advance_time);
+            if let Some(environment) = &initial.fluid_environment.fast_lava {
+                session
+                    .set_fast_lava_environment(Arc::clone(environment))
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if let Some(environment) = &initial.fluid_environment.water_evaporation {
+                session.set_water_evaporation_environment(Arc::clone(environment));
+            }
             if let Some((dimension_type, clock)) = &initial.command_data.default_clock {
                 let clock = clock.as_ref().map(|id| DimensionId {
                     namespace: id.namespace.clone(),
@@ -2384,7 +2392,7 @@ mod tests {
             pack.join("data/example/worldgen/world_preset/compact_disabled.json"),
             serde_json::to_vec(&disabled_preset)?,
         )?;
-        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0,"default_clock":"example:creatures","timelines":["example:creatures"]});
+        let dimension = json!({"min_y":0,"height":16,"has_skylight":true,"has_ceiling":false,"ambient_light":0.0,"default_clock":"example:creatures","timelines":["example:creatures"],"attributes":{"minecraft:gameplay/fast_lava":true,"minecraft:gameplay/water_evaporates":true}});
         std::fs::write(
             pack.join("data/example/dimension_type/compact.json"),
             serde_json::to_vec(&dimension)?,
@@ -2393,7 +2401,9 @@ mod tests {
         let timeline = json!({"clock":"example:creatures","period_ticks":20,"time_markers":{"example:wake":7},"tracks":{
             "minecraft:gameplay/creature_world_gen_spawn_probability":{
                 "modifier":"override","keyframes":[{"ticks":0,"value":0.75},{"ticks":10,"value":0.0}]
-            }
+            },
+            "minecraft:gameplay/fast_lava":{"modifier":"xor","keyframes":[{"ticks":0,"value":false},{"ticks":2,"value":true}]},
+            "minecraft:gameplay/water_evaporates":{"modifier":"xor","keyframes":[{"ticks":0,"value":false},{"ticks":2,"value":true}]}
         }});
         std::fs::write(
             pack.join("data/example/timeline/creatures.json"),
@@ -2799,6 +2809,11 @@ mod tests {
                     Some(SavedEntityData::Empty)
                 )));
                 assert!(session.generated_spawn_clear(position, &targets)?);
+                assert!(session.fast_lava_enabled());
+                assert_eq!(session.water_evaporates(), Some(true));
+                session.update(Duration::from_millis(100));
+                assert!(!session.fast_lava_enabled());
+                assert_eq!(session.water_evaporates(), Some(false));
             }
             if spawn_mobs && !disabled && species == "minecraft:sheep" {
                 use native_session::loaded::SavedEntityData;

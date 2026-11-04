@@ -3594,6 +3594,7 @@ mod tests {
             ticks: BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), 0_i64)]),
             advance_time: true,
             command_data: Default::default(),
+            fluid_environment: Default::default(),
         });
         let session_settings = crate::world_creation::InitialSessionSettings {
             seed: 42,
@@ -3754,6 +3755,7 @@ mod tests {
             ticks: initial_clocks.ticks.clone(),
             advance_time: false,
             command_data: Default::default(),
+            fluid_environment: Default::default(),
         }));
         let mut stopped = expanded.start_session(player).unwrap();
         stopped.update(std::time::Duration::from_millis(150));

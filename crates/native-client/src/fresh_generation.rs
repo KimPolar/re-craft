@@ -98,6 +98,49 @@ pub struct InitialWorldClocks {
     pub ticks: BTreeMap<ResourceId, i64>,
     pub advance_time: bool,
     pub command_data: InitialClockCommandData,
+    /// Dimension attributes evaluated against these same world clocks.
+    pub fluid_environment: InitialFluidEnvironment,
+}
+
+#[derive(Default)]
+pub struct InitialFluidEnvironment {
+    pub fast_lava: Option<Arc<native_resources::fluid_environment::FastLavaEnvironment>>,
+    pub water_evaporation:
+        Option<Arc<native_resources::fluid_environment::WaterEvaporationEnvironment>>,
+}
+
+impl InitialFluidEnvironment {
+    fn load(resources: &mut ResourceStack, lighting: &GeneratedDimensionLighting) -> Self {
+        let Some(id) = &lighting.dimension_type else {
+            return Self::default();
+        };
+        let dimension_type = format!("{}:{}", id.namespace, id.path);
+        let fast_lava = match native_resources::fluid_environment::load_fast_lava_environment(
+            resources,
+            &dimension_type,
+        ) {
+            Ok(value) => Some(Arc::new(value)),
+            Err(error) => {
+                eprintln!("Fast lava environment is unavailable: {error:#}");
+                None
+            }
+        };
+        let water_evaporation =
+            match native_resources::fluid_environment::load_water_evaporation_environment(
+                resources,
+                &dimension_type,
+            ) {
+                Ok(value) => Some(Arc::new(value)),
+                Err(error) => {
+                    eprintln!("Water evaporation rules are unavailable: {error:#}");
+                    None
+                }
+            };
+        Self {
+            fast_lava,
+            water_evaporation,
+        }
+    }
 }
 
 /// Command registries are optional independently, matching existing-world
@@ -303,6 +346,7 @@ impl PreparedFreshGeneration {
             ticks: clocks.clone(),
             advance_time,
             command_data: InitialClockCommandData::load(&mut self.resources, &self.lighting),
+            fluid_environment: InitialFluidEnvironment::load(&mut self.resources, &self.lighting),
         });
         let entity_collision_registry = match self.resources.vanilla_entity_collision_registry() {
             Ok(registry) => Some(Arc::new(registry)),

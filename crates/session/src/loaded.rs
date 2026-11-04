@@ -9878,6 +9878,11 @@ impl LoadedSession {
         self.fast_lava_environment = None;
     }
 
+    /// Current dimension-wide lava speed after sampling the world clocks.
+    pub fn fast_lava_enabled(&self) -> bool {
+        self.fast_lava
+    }
+
     pub fn set_fast_lava_environment(
         &mut self,
         environment: Arc<native_resources::fluid_environment::FastLavaEnvironment>,
@@ -9902,6 +9907,17 @@ impl LoadedSession {
     ) {
         self.water_evaporation = Some(environment);
         self.ice_deferred_state = None;
+    }
+
+    /// Whether water evaporates under the supported dimension-wide rules.
+    /// Missing data or clocks remain unknown.
+    pub fn water_evaporates(&self) -> Option<bool> {
+        self.water_evaporation.as_ref()?.sample(|id| {
+            self.world_clocks
+                .iter()
+                .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
+                .map(|(_, clock)| clock.total_ticks)
+        })
     }
 
     /// Install the shared clock states before ticking the loaded world.
@@ -11973,15 +11989,7 @@ impl LoadedSession {
             state(fluid, &[("level", "0")])
         };
         let evaporates = if fluid == "minecraft:water" {
-            let Some(environment) = &self.water_evaporation else {
-                return false;
-            };
-            let Some(value) = environment.sample(|id| {
-                self.world_clocks
-                    .iter()
-                    .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
-                    .map(|(_, clock)| clock.total_ticks)
-            }) else {
+            let Some(value) = self.water_evaporates() else {
                 return false;
             };
             value
@@ -21419,20 +21427,10 @@ impl crate::frosted_ice::IceWorld for IceTickStage<'_> {
     }
 
     fn melt(&mut self, position: IVec3) -> anyhow::Result<()> {
-        let environment = self
+        let evaporates = self
             .session
-            .water_evaporation
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("water evaporation is unavailable"))?;
-        let evaporates = environment
-            .sample(|id| {
-                self.session
-                    .world_clocks
-                    .iter()
-                    .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
-                    .map(|(_, clock)| clock.total_ticks)
-            })
-            .ok_or_else(|| anyhow::anyhow!("water evaporation clock is unavailable"))?;
+            .water_evaporates()
+            .ok_or_else(|| anyhow::anyhow!("water evaporation or its clock is unavailable"))?;
         self.stage_melt(position, evaporates)?;
         let directions = [
             IVec3::NEG_X,

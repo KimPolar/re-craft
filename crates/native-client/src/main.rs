@@ -1064,6 +1064,7 @@ fn prepare_existing_world(
         let mut session =
             LoadedSession::new(world, origin, BuildBounds { min_y, max_y }, initial_player)
                 .map_err(anyhow::Error::msg)?;
+        let mut new_player_uuid = None;
         if let Some(seed) = world_seed {
             match reader.random_sequences() {
                 Ok(sequences) => session.set_random_sequences(seed, sequences)?,
@@ -1597,6 +1598,9 @@ fn prepare_existing_world(
                 hardcore: difficulty.hardcore,
                 ..Default::default()
             });
+            if initial_spawn.is_some() {
+                new_player_uuid = Some(session.initialize_new_player()?);
+            }
         }
         let recipes =
             CraftingRecipes::load(&mut resources).context("cannot load crafting recipes")?;
@@ -1626,7 +1630,24 @@ fn prepare_existing_world(
         session.set_entity_drops(rules.entity_drops);
         session.set_source_conversion(rules.water_source_conversion, rules.lava_source_conversion);
         let player_skin = if assets.is_some() {
-            let uuid = reader.singleplayer_uuid()?;
+            let uuid = match new_player_uuid {
+                Some(words) => {
+                    let mut bytes = [0u8; 16];
+                    for (index, word) in words.iter().enumerate() {
+                        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+                    }
+                    let hex = format!("{:032x}", u128::from_be_bytes(bytes));
+                    Some(format!(
+                        "{}-{}-{}-{}-{}",
+                        &hex[0..8],
+                        &hex[8..12],
+                        &hex[12..16],
+                        &hex[16..20],
+                        &hex[20..32]
+                    ))
+                }
+                None => reader.singleplayer_uuid()?,
+            };
             Some(Arc::new(player_skin::PlayerSkin::load(
                 &mut resources,
                 uuid.as_deref(),
@@ -3405,6 +3426,15 @@ mod world_open_tests {
                 assert_eq!(snapshot.player.position.z, 8.5);
                 assert_eq!(snapshot.player.yaw, 270_f32.to_radians());
                 assert_eq!(snapshot.player.pitch, (-20_f32).to_radians());
+                let draft = prepared.session.draft_new_player_state().unwrap();
+                assert_eq!(draft.document().value.get("XpSeed"), Some(&Tag::Int(0)));
+                assert!(
+                    matches!(draft.document().value.get("UUID"), Some(Tag::IntArray(words)) if words.len() == 4)
+                );
+                assert_eq!(
+                    native_session::player_data::read_saved_position(draft.document()).unwrap(),
+                    Some(DVec3::new(8.5, 16.0, 8.5))
+                );
             }
             assert_eq!(std::fs::read(level_path).unwrap(), level_bytes);
             if let Some(player_bytes) = player_bytes {

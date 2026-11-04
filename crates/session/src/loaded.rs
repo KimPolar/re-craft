@@ -420,6 +420,7 @@ pub struct LoadedSession {
     selected: Block,
     inventory: Arc<PlayerInventory>,
     saved_player_inventory_source: Option<Vec<u8>>,
+    new_player_source: Option<([i32; 4], native_persistence::nbt::NamedTag)>,
     last_death_dirty: bool,
     recipes: Option<Arc<CraftingRecipes>>,
     item_registry: Option<Arc<native_resources::item_registry::ItemRegistry>>,
@@ -1838,6 +1839,56 @@ impl LoadedSession {
         );
         Arc::make_mut(&mut self.snapshot).last_death = crate::LastDeathLocation::Absent;
         Ok(())
+    }
+
+    /// Assign a local identity once, and capture the initial player state that
+    /// later session drafts must match. Java starts a new player's XpSeed at 0.
+    pub fn initialize_new_player(&mut self) -> anyhow::Result<[i32; 4]> {
+        anyhow::ensure!(
+            self.tick == 0
+                && self.accumulated == Duration::ZERO
+                && self.player_uuid.is_none()
+                && self.saved_player_inventory_source.is_none()
+                && self.new_player_source.is_none(),
+            "new player identity must be initialized once before the first tick"
+        );
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("cannot generate player UUID: {error}"))?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let uuid = std::array::from_fn(|index| {
+            i32::from_be_bytes(
+                bytes[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("UUID word"),
+            )
+        });
+        let source =
+            crate::player_data::new_player_source(uuid, 0, self.game_mode, self.flight.flying)?;
+        self.restore_saved_player_inventory(&source)?;
+        self.new_player_source = Some((uuid, source));
+        self.set_player_uuid(Some(uuid));
+        Ok(uuid)
+    }
+
+    /// Prepare the tracked new player at the current tick boundary. World
+    /// chunks and other side effects still require coordinated validation.
+    pub fn draft_new_player_state(
+        &self,
+    ) -> anyhow::Result<crate::player_data::NewPlayerStateDraft> {
+        let (uuid, source) = self
+            .new_player_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("new player source is unavailable"))?;
+        anyhow::ensure!(
+            self.player_uuid == Some(*uuid),
+            "new player identity changed"
+        );
+        let draft = self.draft_player_state(source)?;
+        Ok(crate::player_data::NewPlayerStateDraft::from_session(
+            *uuid, draft,
+        ))
     }
 
     pub fn set_survival_rules(&mut self, rules: crate::survival::SurvivalRules) {
@@ -5259,6 +5310,7 @@ impl LoadedSession {
     /// Replace the temporary demonstration inventory with data from the saved player.
     pub fn set_player_inventory(&mut self, mut inventory: PlayerInventory) {
         self.saved_player_inventory_source = None;
+        self.new_player_source = None;
         self.tick_enchantment_cache = None;
         self.tick_enchantment_failure = None;
         self.mining.release();
@@ -5500,6 +5552,7 @@ impl LoadedSession {
             selected: Block::Grass,
             inventory,
             saved_player_inventory_source: None,
+            new_player_source: None,
             last_death_dirty: false,
             recipes: None,
             item_registry: None,
@@ -48825,6 +48878,101 @@ pub(crate) mod tests {
                 .find_loaded_world_spawn(suggestion, Some(candidates()), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn new_player_session_drafts_current_state_and_rejects_changed_identity() {
+        let mut session = session();
+        session.set_game_mode(GameMode::Creative);
+        session.set_new_player_last_death().unwrap();
+        let uuid = session.initialize_new_player().unwrap();
+        assert_eq!((uuid[1] as u32 >> 12) & 0xf, 4);
+        assert_eq!((uuid[2] as u32 >> 30) & 0x3, 2);
+        assert_eq!(session.player_uuid, Some(uuid));
+        assert!(session.initialize_new_player().is_err());
+        let position = DVec3::new(7.25, 4.5, 9.75);
+        session
+            .restore_saved_motion(
+                position,
+                crate::player_data::SavedPlayerMotion {
+                    velocity: DVec3::new(0.1, -0.2, 0.3),
+                    on_ground: false,
+                    fall_distance: 1.5,
+                },
+            )
+            .unwrap();
+        let stack = ItemStack::new(
+            "minecraft:stone".into(),
+            3,
+            64,
+            native_persistence::nbt::Tag::Compound(vec![]),
+        )
+        .unwrap();
+        assert!(
+            Arc::make_mut(&mut session.inventory)
+                .set_slot(crate::inventory::PlayerSlot::Storage(0), Some(stack))
+        );
+        let draft = session.draft_new_player_state().unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_position(draft.document()).unwrap(),
+            Some(position + session.origin.as_dvec3())
+        );
+        assert_eq!(
+            crate::player_data::read_saved_motion(draft.document())
+                .unwrap()
+                .fall_distance,
+            1.5
+        );
+        assert_eq!(
+            draft.document().value.get("UUID"),
+            Some(&native_persistence::nbt::Tag::IntArray(uuid.to_vec()))
+        );
+        assert_eq!(
+            draft.document().value.get("XpSeed"),
+            Some(&native_persistence::nbt::Tag::Int(0))
+        );
+        assert_eq!(
+            draft.document().value.get("playerGameType"),
+            Some(&native_persistence::nbt::Tag::Int(1))
+        );
+        assert_eq!(
+            crate::player_data::read_saved_player(draft.document())
+                .unwrap()
+                .slot(crate::inventory::PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            3
+        );
+        session.submit_command(PlayerCommand::Move {
+            forward: 1.0,
+            strafe: 0.0,
+            jump: false,
+        });
+        session.update(TICK);
+        let after_tick = session.draft_new_player_state().unwrap();
+        assert_eq!(
+            crate::player_data::read_saved_position(after_tick.document()).unwrap(),
+            Some(session.motion.position + session.origin.as_dvec3())
+        );
+        assert_ne!(session.motion.position, position);
+        session.set_player_uuid(Some([1, 2, 3, 4]));
+        assert!(session.draft_new_player_state().is_err());
+    }
+
+    #[test]
+    fn new_player_session_rejects_replaced_inventory_or_pending_commands() {
+        let mut session = session();
+        session.set_new_player_last_death().unwrap();
+        session.initialize_new_player().unwrap();
+        session.submit_command(PlayerCommand::Move {
+            forward: 0.0,
+            strafe: 0.0,
+            jump: true,
+        });
+        assert!(session.draft_new_player_state().is_err());
+        session.commands.clear();
+        session.set_player_inventory(PlayerInventory::default());
+        assert!(session.draft_new_player_state().is_err());
     }
 
     #[test]

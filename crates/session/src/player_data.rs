@@ -1097,6 +1097,10 @@ pub struct NewPlayerStateDraft {
 }
 
 impl NewPlayerStateDraft {
+    pub(crate) fn from_session(uuid: [i32; 4], draft: PlayerStateDraft) -> Self {
+        Self { uuid, draft }
+    }
+
     pub fn document(&self) -> &NamedTag {
         self.draft.document()
     }
@@ -1125,13 +1129,23 @@ pub fn draft_new_player_state(
     inventory: &PlayerInventory,
     flying: bool,
 ) -> Result<NewPlayerStateDraft> {
+    let source = new_player_source(uuid, enchantment_seed, state.game_mode, flying)?;
+    let draft = draft_player_state(&source, state, inventory)?;
+    Ok(NewPlayerStateDraft { uuid, draft })
+}
+
+pub(crate) fn new_player_source(
+    uuid: [i32; 4],
+    enchantment_seed: i32,
+    mode: GameMode,
+    flying: bool,
+) -> Result<NamedTag> {
     ensure!(
-        state.game_mode.flight_after_change(flying) == flying,
+        mode.flight_after_change(flying) == flying,
         "flight state is inconsistent with the game mode"
     );
-    let mode = state.game_mode;
     let ability = |value| Tag::Byte(i8::from(value));
-    let source = NamedTag {
+    Ok(NamedTag {
         name: "".into(),
         value: Tag::Compound(vec![
             (
@@ -1163,9 +1177,7 @@ pub fn draft_new_player_state(
                 ]),
             ),
         ]),
-    };
-    let draft = draft_player_state(&source, state, inventory)?;
-    Ok(NewPlayerStateDraft { uuid, draft })
+    })
 }
 
 impl PlayerStateDraft {

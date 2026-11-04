@@ -20,6 +20,8 @@ public class PostprocessingOracle {
   static TraceState a,b,c,d;
   static int shapeCount;
   static sun.misc.Unsafe unsafe;
+  static Map<BlockPos,CompoundTag> pending;
+  static BlockPos entity1,entity2,entity3;
   static void set(Object object,String name,Object value)throws Exception {
     Class<?> type=object.getClass();
     while(type!=null) { try {var field=type.getDeclaredField(name);field.setAccessible(true);field.set(object,value);return;}catch(NoSuchFieldException e){type=type.getSuperclass();} }
@@ -62,10 +64,23 @@ public class PostprocessingOracle {
     @Override public int getMinY(){return -16;}
     @Override public int getHeight(){return 32;}
     @Override public BlockState getBlockState(BlockPos p){return blocks.get(p);}
+    @Override public net.minecraft.world.level.block.entity.BlockEntity getBlockEntity(BlockPos p){
+      output.println("P "+pos(p));
+      if(p.equals(entity1)){pending.remove(entity2);pending.put(entity3,new CompoundTag());}
+      return null;
+    }
   }
   static class FakeUpgrade extends UpgradeData {
     FakeUpgrade(){super(new CompoundTag(),LevelHeightAccessor.create(-16,32));}
-    @Override public void upgrade(LevelChunk chunk){}
+    @Override public void upgrade(LevelChunk chunk){output.println("U");}
+  }
+  static class TraceList extends ShortArrayList {
+    final int section;
+    TraceList(int section){this.section=section;}
+    @Override public void clear(){output.println("CS "+section);super.clear();}
+  }
+  static class TracePending extends LinkedHashMap<BlockPos,CompoundTag> {
+    @Override public void clear(){output.println("CE");super.clear();}
   }
   static TraceState state(String name,boolean wet,boolean liquid,boolean change)throws Exception {
     var s=(TraceState)unsafe.allocateInstance(TraceState.class);s.name=name;s.wet=wet;s.liquid=liquid;s.change=change;return s;
@@ -80,12 +95,15 @@ public class PostprocessingOracle {
     var chunk=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
     var p1=new BlockPos(-16,-15,32);var p2=new BlockPos(-15,0,32);var p3=new BlockPos(-14,0,32);
     blocks.put(p1,a);blocks.put(p2,b);blocks.put(p3,c);
-    ShortList[] lists={new ShortArrayList(),new ShortArrayList()};
+    ShortList[] lists={new TraceList(0),new TraceList(1)};
     lists[0].add(ProtoChunk.packOffsetCoordinates(p1));lists[0].add(ProtoChunk.packOffsetCoordinates(p1));
     lists[1].add(ProtoChunk.packOffsetCoordinates(p2));lists[1].add(ProtoChunk.packOffsetCoordinates(p3));
-    set(chunk,"postProcessing",lists);set(chunk,"pendingBlockEntities",new HashMap<>());
+    entity1=p1;entity2=p2;entity3=p3;
+    pending=new TracePending();pending.put(entity1,new CompoundTag());pending.put(entity2,new CompoundTag());
+    set(chunk,"postProcessing",lists);set(chunk,"pendingBlockEntities",pending);
     set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
     chunk.postProcessGeneration(level);
     output.println("E "+lists[0].size()+" "+lists[1].size());
+    output.println("BE "+pending.size());
   }
 }

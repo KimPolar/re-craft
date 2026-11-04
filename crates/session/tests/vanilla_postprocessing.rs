@@ -1,7 +1,9 @@
 //! Compare the marked-position part of chunk postprocessing with Java 26.3.
 use anyhow::{Result, bail};
 use native_core::postprocessing::PostProcessing;
-use native_session::worldgen::postprocessing::{PostprocessingBlocks, PostprocessingWorld};
+use native_session::worldgen::postprocessing::{
+    PostprocessingBlocks, PostprocessingChunk, PostprocessingTask, PostprocessingWorld,
+};
 use native_world::loaded::ChunkPos;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
@@ -11,6 +13,9 @@ struct World {
     blocks: BTreeMap<[i32; 3], char>,
     events: Vec<String>,
     fail: bool,
+    fail_at: Option<&'static str>,
+    trace_lifecycle: bool,
+    pending: Vec<[i32; 3]>,
 }
 fn pos(p: [i32; 3]) -> String {
     format!("{},{},{}", p[0], p[1], p[2])
@@ -49,6 +54,53 @@ impl PostprocessingWorld for World {
         self.blocks.insert(p, *s);
         Ok(())
     }
+    fn clear_processed_section(&mut self, section: usize) -> Result<()> {
+        if self.trace_lifecycle {
+            self.events.push(format!("CS {section}"));
+        }
+        if self.fail_at == Some("section") {
+            bail!("section clear failed");
+        }
+        Ok(())
+    }
+}
+
+impl PostprocessingChunk for World {
+    fn pending_block_entity_positions(&mut self) -> Result<Vec<[i32; 3]>> {
+        if self.fail_at == Some("capture") {
+            bail!("capture failed");
+        }
+        Ok(self.pending.clone())
+    }
+    fn promote_pending_block_entity(&mut self, p: [i32; 3]) -> Result<()> {
+        self.events.push(format!("P {}", pos(p)));
+        if p == [-16, -15, 32] {
+            self.pending.retain(|&p| p != [-15, 0, 32]);
+            self.pending.push([-14, 0, 32]);
+        }
+        if self.fail_at == Some("panic") {
+            panic!("promotion panicked after mutating pending entities");
+        }
+        if self.fail_at == Some("promote") {
+            bail!("promotion failed");
+        }
+        Ok(())
+    }
+    fn clear_pending_block_entities(&mut self) -> Result<()> {
+        self.events.push("CE".into());
+        self.pending.clear();
+        if self.fail_at == Some("clear") {
+            bail!("clear failed");
+        }
+        Ok(())
+    }
+    fn apply_upgrade_data(&mut self) -> Result<()> {
+        self.events.push("U".into());
+        if self.fail_at == Some("upgrade") {
+            bail!("upgrade failed");
+        }
+        Ok(())
+    }
 }
 fn fixture() -> (Arc<PostProcessing>, World) {
     let p1 = [-16, -15, 32];
@@ -65,6 +117,69 @@ fn fixture() -> (Arc<PostProcessing>, World) {
             ..Default::default()
         },
     )
+}
+
+#[test]
+fn complete_pass_preserves_order_snapshots_pending_and_poisoning() {
+    let mut expected = None;
+    for budget in [1, 2, 3, 64] {
+        let (marks, mut world) = fixture();
+        world.trace_lifecycle = true;
+        world.pending = vec![[-16, -15, 32], [-15, 0, 32]];
+        let mut task = PostprocessingTask::new(marks, ChunkPos { x: -1, z: 2 });
+        assert!(!task.poll(&mut world, 0).unwrap());
+        assert!(world.events.is_empty());
+        while !task.poll(&mut world, budget).unwrap() {}
+        assert!(task.poll(&mut world, 0).unwrap());
+        assert!(world.pending.is_empty());
+        if let Some(expected) = &expected {
+            assert_eq!(&world.events, expected);
+        } else {
+            expected = Some(world.events.clone());
+        }
+    }
+    assert_eq!(
+        expected.unwrap(),
+        [
+            "F -16,-15,32 a",
+            "L -16,-15,32 a",
+            "F -16,-15,32 b",
+            "S -16,-15,32 b",
+            "W -16,-15,32 d 276",
+            "CS 0",
+            "F -15,0,32 b",
+            "S -15,0,32 b",
+            "W -15,0,32 d 276",
+            "S -14,0,32 c",
+            "CS 1",
+            "P -16,-15,32",
+            "P -15,0,32",
+            "CE",
+            "U"
+        ]
+    );
+    for phase in ["section", "capture", "promote", "clear", "upgrade"] {
+        let (marks, mut world) = fixture();
+        world.trace_lifecycle = true;
+        world.pending = vec![[-16, -15, 32], [-15, 0, 32]];
+        world.fail_at = Some(phase);
+        let mut task = PostprocessingTask::new(marks, ChunkPos { x: -1, z: 2 });
+        assert!(task.poll(&mut world, 64).is_err(), "{phase}");
+        let events = world.events.clone();
+        assert!(task.poll(&mut world, 64).is_err(), "{phase}");
+        assert_eq!(world.events, events, "{phase}");
+    }
+    let (marks, mut world) = fixture();
+    world.pending = vec![[-16, -15, 32], [-15, 0, 32]];
+    world.fail_at = Some("panic");
+    let mut task = PostprocessingTask::new(marks, ChunkPos { x: -1, z: 2 });
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.poll(&mut world, 64)))
+            .is_err()
+    );
+    let events = world.events.clone();
+    assert!(task.poll(&mut world, 64).is_err());
+    assert_eq!(world.events, events);
 }
 #[test]
 fn batches_preserve_order_and_failure_cannot_be_retried() {
@@ -158,4 +273,23 @@ fn marked_positions_match_java_level_chunk() {
         world.events.iter().map(String::as_str).collect::<Vec<_>>()
     );
     assert!(output.lines().any(|line| line == "E 0 0"));
+
+    let (marks, mut world) = fixture();
+    world.trace_lifecycle = true;
+    world.pending = vec![[-16, -15, 32], [-15, 0, 32]];
+    let mut task = PostprocessingTask::new(marks, ChunkPos { x: -1, z: 2 });
+    while !task.poll(&mut world, 1).unwrap() {}
+    let java_lifecycle: Vec<_> = output
+        .lines()
+        .filter(|line| {
+            ["F ", "L ", "S ", "W ", "CS ", "P ", "CE", "U"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+    assert_eq!(
+        java_lifecycle,
+        world.events.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(output.lines().any(|line| line == "BE 0"));
 }

@@ -1354,6 +1354,35 @@ impl FreshTerrainBatch {
             .generated_postprocessing_data(pos)
     }
 
+    /// Start postprocessing for the exact ordered marks of a SPAWN-stage
+    /// chunk. The caller supplies an isolated mutable world implementation;
+    /// this does not itself promote the chunk to FULL or authorize saving.
+    pub fn begin_spawned_postprocessing(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<super::postprocessing::PostprocessingTask> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before postprocessing"
+        );
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Spawn),
+            "postprocessing requires a spawn-complete chunk"
+        );
+        let marks = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?
+            .postprocessing_marks_to_date(pos)
+            .context("generation postprocessing history is missing")?;
+        Ok(super::postprocessing::PostprocessingTask::new(
+            Arc::new(marks),
+            pos,
+        ))
+    }
+
     /// Assemble an intermediate SPAWN protochunk. The caller must provide the
     /// complete feature-generated entity list and the world's current tick.
     /// This is not a FULL chunk and must not be written as a playable world.

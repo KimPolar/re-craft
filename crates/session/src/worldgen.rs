@@ -4437,6 +4437,7 @@ mod tests {
         assert!(batch.spawned_block_entity_data(center).is_err());
         assert!(batch.spawned_tick_data(center).is_err());
         assert!(batch.spawned_postprocessing_data(center).is_err());
+        assert!(batch.begin_spawned_postprocessing(center).is_err());
         assert!(batch.request_spawn_without_mobs(center, true).is_err());
         assert_eq!(
             batch.schedule().completed(center),
@@ -4761,6 +4762,62 @@ mod tests {
         let marks = batch.spawned_postprocessing_data(center).unwrap();
         let marks = native_persistence::postprocessing::decode(&marks, 0, 16).unwrap();
         assert_eq!(marks.sections().len(), 1);
+        struct TracePostprocessing(Vec<[i32; 3]>);
+        impl postprocessing::PostprocessingWorld for TracePostprocessing {
+            type State = ();
+            type Fluid = ();
+            fn block(&mut self, pos: [i32; 3]) -> anyhow::Result<()> {
+                self.0.push(pos);
+                Ok(())
+            }
+            fn fluid(&mut self, _: &()) -> anyhow::Result<Option<()>> {
+                Ok(None)
+            }
+            fn tick_fluid(&mut self, _: [i32; 3], _: &(), _: &()) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn is_liquid_block(&mut self, _: &()) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            fn tick_liquid_block(&mut self, _: [i32; 3], _: &()) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn update_neighbor_shapes(&mut self, _: [i32; 3], _: &()) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn set_block(&mut self, _: [i32; 3], _: &(), _: i32) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn clear_processed_section(&mut self, _: usize) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        impl postprocessing::PostprocessingChunk for TracePostprocessing {
+            fn pending_block_entity_positions(&mut self) -> anyhow::Result<Vec<[i32; 3]>> {
+                Ok(Vec::new())
+            }
+            fn promote_pending_block_entity(&mut self, _: [i32; 3]) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn clear_pending_block_entities(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn apply_upgrade_data(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let expected: Vec<_> = marks
+            .sections()
+            .iter()
+            .enumerate()
+            .flat_map(|(section, values)| values.iter().map(move |&packed| (section, packed)))
+            .map(|(section, packed)| marks.unpack(section, packed, center.x, center.z).unwrap())
+            .collect();
+        let mut task = batch.begin_spawned_postprocessing(center).unwrap();
+        let mut trace = TracePostprocessing(Vec::new());
+        while !task.poll(&mut trace, 1).unwrap() {}
+        assert_eq!(trace.0, expected);
+        assert!(batch.begin_spawned_postprocessing(distant).is_err());
         let (block_ticks, fluid_ticks) = batch.spawned_tick_data(center).unwrap();
         let native_persistence::nbt::Tag::List { values: ticks, .. } = block_ticks else {
             panic!("missing block ticks")

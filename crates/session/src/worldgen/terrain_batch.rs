@@ -1659,7 +1659,8 @@ impl FreshTerrainBatch {
         Ok(stage)
     }
 
-    fn validate_postprocessing(
+    /// Check that a completed pass still belongs to this batch and was not changed.
+    pub fn validate_postprocessing(
         &self,
         processed: &super::PostprocessedGeneratedRegion,
     ) -> Result<()> {

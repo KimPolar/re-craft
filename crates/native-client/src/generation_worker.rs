@@ -71,6 +71,8 @@ pub struct PostprocessedGeneration {
     pub activated_ticks: native_session::worldgen::chunk_ticks::ActivatedRegionTicks,
     /// A fresh mesh snapshot for the postprocessed subset of the old targets.
     pub mesh: Option<MeshJob>,
+    sealed_world: Arc<native_world::loaded::World>,
+    sealed_mesh: Option<MeshJob>,
 }
 
 #[derive(Clone)]
@@ -391,9 +393,10 @@ impl GenerationReady {
         Ok(())
     }
 
-    /// Construct a transient session from fully lit targets. The caller must
-    /// choose and validate the player spawn, and keep the batch for generation;
-    /// this does not create or save a Java world.
+    /// Construct an experimental transient session from fully lit targets.
+    /// Postprocessed ticks use the existing session scheduler, whose cross-chunk
+    /// execution order is not yet Java-compatible. This does not create or save
+    /// a Java world; the caller must choose and validate the player spawn.
     pub fn start_session(
         &mut self,
         player: native_session::PlayerState,
@@ -410,35 +413,69 @@ impl GenerationReady {
         &mut self,
         player: native_session::PlayerState,
     ) -> Result<native_session::loaded::LoadedSession> {
-        ensure!(
-            self.postprocessed.is_none(),
-            "postprocessed chunks cannot yet be opened in a session"
-        );
         use native_session::{
             inventory::PlayerInventory,
             loaded::{BuildBounds, LoadedSession},
         };
-        let targets = self
-            .mesh
-            .targets
-            .as_ref()
-            .context("generated session requires light-complete targets")?;
+        let targets = Arc::clone(
+            self.mesh
+                .targets
+                .as_ref()
+                .context("generated session requires light-complete targets")?,
+        );
         ensure!(!targets.is_empty(), "generated session has no targets");
         ensure!(
             self.batch.is_complete(),
             "generated session has pending generation work"
         );
-        let current = self.batch.lit_render_snapshot(targets.iter().copied())?;
-        ensure!(
-            Arc::ptr_eq(&current, &self.mesh.world),
-            "generated session mesh snapshot is stale"
-        );
+        if let Some(processed) = &self.postprocessed {
+            self.batch.validate_postprocessing(&processed.region)?;
+            ensure!(
+                Arc::ptr_eq(&processed.region.world, &processed.sealed_world),
+                "postprocessed region was replaced"
+            );
+            ensure!(
+                processed.activated_ticks == processed.region.ticks().activated_snapshot(),
+                "postprocessed tick snapshot changed"
+            );
+            let mesh = processed
+                .mesh
+                .as_ref()
+                .context("postprocessed mesh is missing")?;
+            let sealed = processed
+                .sealed_mesh
+                .as_ref()
+                .context("sealed postprocessed mesh is missing")?;
+            ensure!(
+                Arc::ptr_eq(&mesh.world, &sealed.world)
+                    && mesh.revision == sealed.revision
+                    && mesh.biome_blend == sealed.biome_blend
+                    && mesh.origin == sealed.origin
+                    && mesh.targets == sealed.targets,
+                "postprocessed mesh snapshot is stale"
+            );
+            ensure!(
+                mesh.targets.as_ref() == Some(&targets) && mesh.origin == self.mesh.origin,
+                "postprocessed session targets or origin differ"
+            );
+        } else {
+            let current = self.batch.lit_render_snapshot(targets.iter().copied())?;
+            ensure!(
+                Arc::ptr_eq(&current, &self.mesh.world),
+                "generated session mesh snapshot is stale"
+            );
+        }
+        let mesh = self
+            .postprocessed
+            .as_ref()
+            .and_then(|p| p.mesh.as_ref())
+            .unwrap_or(&self.mesh);
         let (min_y, max_y) = self.batch.build_bounds()?;
         ensure!(
             player.position.is_finite(),
             "invalid generated player position"
         );
-        let absolute = player.position.as_dvec3() + self.mesh.origin.as_dvec3();
+        let absolute = player.position.as_dvec3() + mesh.origin.as_dvec3();
         ensure!(
             absolute.x >= f64::from(i32::MIN)
                 && absolute.x < f64::from(i32::MAX)
@@ -456,7 +493,7 @@ impl GenerationReady {
             targets.contains(&player_chunk),
             "generated player is outside light-complete targets"
         );
-        let mut world = generated_session_world(&self.mesh.world, targets);
+        let mut world = generated_session_world(&mesh.world, &targets);
         ensure!(
             world.chunks.len() == targets.len(),
             "generated session target is missing"
@@ -487,13 +524,33 @@ impl GenerationReady {
             });
             world.saved_block_entities.insert(pos, payload);
         }
-        let mut session = LoadedSession::new(
-            world,
-            self.mesh.origin,
-            BuildBounds { min_y, max_y },
-            player,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let mut session =
+            LoadedSession::new(world, mesh.origin, BuildBounds { min_y, max_y }, player)
+                .map_err(anyhow::Error::msg)?;
+        if let Some(processed) = &self.postprocessed {
+            let mut selected = native_session::worldgen::chunk_ticks::ActivatedRegionTicks {
+                game_time: processed.activated_ticks.game_time,
+                next_sub_tick: processed.activated_ticks.next_sub_tick,
+                chunks: BTreeMap::new(),
+            };
+            for pos in targets.iter() {
+                selected.chunks.insert(
+                    *pos,
+                    processed
+                        .activated_ticks
+                        .chunks
+                        .get(pos)
+                        .context("postprocessed tick container is missing")?
+                        .clone(),
+                );
+            }
+            session.install_generated_ticks(&selected)?;
+            let water = processed
+                .region
+                .water_source_conversion()
+                .context("postprocessed water conversion rule is missing")?;
+            session.set_source_conversion(water, false);
+        }
         session
             .set_has_skylight(self.batch.has_skylight()?)
             .map_err(anyhow::Error::msg)?;
@@ -771,11 +828,15 @@ impl GenerationWorker {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
+            let sealed_world = Arc::clone(&region.world);
+            let sealed_mesh = mesh.clone();
             ready.postprocessed = Some(PostprocessedGeneration {
                 region,
                 chunks,
                 activated_ticks,
                 mesh,
+                sealed_world,
+                sealed_mesh,
             });
             Ok(Some(ready))
         })

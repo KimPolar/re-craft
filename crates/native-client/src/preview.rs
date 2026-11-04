@@ -3712,18 +3712,78 @@ mod tests {
             height_session.spawn_heightmaps_for_chunk(center).as_deref(),
             Some(&processed_heights)
         );
-        assert!(
-            ready
-                .start_session(native_session::PlayerState {
-                    position: glam::Vec3::new(8.5, 16.0, 8.5),
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    vertical_velocity: 0.0,
-                    on_ground: true,
-                    pose: native_session::PlayerPose::Standing,
-                })
-                .is_err()
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(8.5, 16.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: true,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let expected_block = ready
+            .postprocessed
+            .as_ref()
+            .unwrap()
+            .region
+            .world
+            .block(8, 15, 8)
+            .unwrap()
+            .clone();
+        let mut session = ready
+            .start_session_with_spawn_heightmaps(player, Arc::clone(&spawn_tags))
+            .unwrap();
+        let initial = session.snapshot();
+        assert_eq!(initial.game_time, 42);
+        assert_eq!(
+            initial.world.loaded().unwrap().block(8, 15, 8),
+            Some(&expected_block)
         );
+        assert!(initial.world.loaded().unwrap().chunks[&center].block_light_correct);
+        assert_eq!(
+            session.spawn_heightmaps_for_chunk(center).as_deref(),
+            Some(&processed_heights)
+        );
+        session.update(std::time::Duration::from_millis(50));
+        assert_eq!(session.snapshot().game_time, 43);
+        ready
+            .postprocessed
+            .as_mut()
+            .unwrap()
+            .activated_ticks
+            .game_time += 1;
+        assert!(ready.start_session(player).is_err());
+        ready
+            .postprocessed
+            .as_mut()
+            .unwrap()
+            .activated_ticks
+            .game_time -= 1;
+        let previous = ready
+            .postprocessed
+            .as_ref()
+            .unwrap()
+            .mesh
+            .as_ref()
+            .unwrap()
+            .world
+            .clone();
+        ready
+            .postprocessed
+            .as_mut()
+            .unwrap()
+            .mesh
+            .as_mut()
+            .unwrap()
+            .world = Arc::clone(&ready.mesh.world);
+        assert!(ready.start_session(player).is_err());
+        ready
+            .postprocessed
+            .as_mut()
+            .unwrap()
+            .mesh
+            .as_mut()
+            .unwrap()
+            .world = previous;
         ready.postprocessed = None;
         let east = ChunkPos { x: 1, z: 0 };
         let caller = std::thread::current().id();

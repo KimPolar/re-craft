@@ -31,6 +31,7 @@ mod carving;
 mod entity_order;
 mod generated_beehive;
 mod generated_chest;
+mod generated_sheep;
 mod generated_spawner;
 mod mob_collision;
 mod mob_obstruction;
@@ -42,6 +43,7 @@ mod terrain_batch;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_chest::GeneratedLootChest;
+pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{
     GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
@@ -4188,30 +4190,24 @@ mod tests {
                 false,
             );
             let initialized = bright
-                .finalize_sheep_and_record(
+                .finalize_fresh_sheep_and_record(
                     &mut bright_planner,
                     &mut batch,
-                    position,
                     &tags,
                     &mut transaction_random,
                     &mut transaction_group,
-                    false,
-                    |actual| {
-                        assert_eq!(actual, expected);
-                        Ok(vec![
-                            saved(),
-                            GeneratedEntityAddition {
-                                block_position: position,
-                                record: GeneratedEntityRecord::Passenger,
-                            },
-                        ])
-                    },
+                    [0, 1, 0, 2],
                 )
                 .unwrap();
             assert_eq!(initialized, expected);
             assert_eq!(transaction_group, expected_group);
             assert_eq!(transaction_random.next_long(), expected_random.next_long());
             assert_eq!(batch.recorded_generated_entities(center).unwrap().len(), 1);
+            assert_eq!(
+                batch.recorded_generated_entities(center).unwrap()[0],
+                draft_fresh_sheep([0, 1, 0, 2], geometry.position, bright_pose.yaw, expected)
+                    .unwrap()
+            );
             assert_eq!(
                 bright_planner.next(0).unwrap(),
                 expected_planner.next(0).unwrap()
@@ -4380,12 +4376,16 @@ mod tests {
         else {
             panic!("missing generated entities")
         };
+        assert_eq!(values.len(), 1);
         assert_eq!(
-            values,
-            &vec![native_persistence::nbt::Tag::Compound(vec![(
-                "test".into(),
-                native_persistence::nbt::Tag::Int(7)
-            ),])]
+            values[0].get("id"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:sheep".into()
+            ))
+        );
+        assert_eq!(
+            values[0].get("UUID"),
+            Some(&native_persistence::nbt::Tag::IntArray(vec![0, 1, 0, 2]))
         );
         assert_ne!(draft, recorded_draft);
         assert_eq!(

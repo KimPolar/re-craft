@@ -347,6 +347,49 @@ impl GeneratedCreatureProbe {
         Ok(initialization)
     }
 
+    /// Finalize and record an unmodified sheep using the verified vanilla
+    /// defaults. `uuid` must be the unique identity assigned when the entity
+    /// was constructed; it must not be drawn from the region random source.
+    /// This is an intermediate protochunk record, not a live mob or world save.
+    pub fn finalize_fresh_sheep_and_record(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        batch: &mut FreshTerrainBatch,
+        tags: &native_resources::worldgen_region_random::SheepBiomeTags,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+    ) -> Result<native_resources::worldgen_region_random::SheepInitialization> {
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let yaw = self
+            .constructed_yaw
+            .context("creature has not been constructed")?;
+        let position = geometry
+            .position
+            .map(|coordinate| coordinate.floor() as i32);
+        self.finalize_sheep_and_record(
+            planner,
+            batch,
+            position,
+            tags,
+            random,
+            group,
+            false,
+            |initialization| {
+                Ok(vec![super::GeneratedEntityAddition {
+                    block_position: position,
+                    record: super::GeneratedEntityRecord::Saved(super::draft_fresh_sheep(
+                        uuid,
+                        geometry.position,
+                        yaw,
+                        initialization,
+                    )?),
+                }])
+            },
+        )
+    }
+
     /// Resolve one pending planner attempt against generated blocks. Missing
     /// heightmap inputs or unsupported block states return an error without
     /// advancing the planner. The caller still checks collision and mob rules.

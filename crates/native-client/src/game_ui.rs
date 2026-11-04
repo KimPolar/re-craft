@@ -145,6 +145,7 @@ struct DrawKey {
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
     chat_input_tick: Option<u64>,
+    chat_tooltip_cursor: Option<(i32, i32)>,
     action_bar: Option<(u64, u8)>,
 }
 
@@ -2590,6 +2591,24 @@ impl GameUi {
             (!self.paused && !self.chat_input.is_open() && inventory.cursor().is_none())
                 .then(|| hovered_slot.and_then(|slot| inventory.slot(slot)))
                 .flatten();
+        let chat_tooltip = self.chat_input.is_open()
+            && !self.paused
+            && self.system_messages.iter().any(|message| {
+                matches!(
+                    message.kind,
+                    native_session::SystemMessageKind::WorldSeed(_)
+                )
+            })
+            && matches!(
+                crate::chat_hud::interaction_at(
+                    &self.assets,
+                    &self.system_messages,
+                    logical_height,
+                    self.chat_input.scroll_offset(),
+                    self.cursor,
+                ),
+                Some(crate::chat_hud::ChatClick::CopySeed(_))
+            );
         let key = DrawKey {
             width: size.0,
             height: size.1,
@@ -2652,6 +2671,7 @@ impl GameUi {
                 .chat_input
                 .is_open()
                 .then(|| self.chat_input.blink_key()),
+            chat_tooltip_cursor: chat_tooltip.then_some(self.cursor),
             action_bar: crate::action_bar::display_key(self.locked_chest_message.as_deref(), tick),
         };
         if self.last_draw == Some(key) {
@@ -3471,7 +3491,11 @@ impl GameUi {
             self.chat_input.clamp_scroll(max_scroll);
             self.chat_input.draw(&mut canvas, assets);
         }
-        if let Some(tooltip) = status_tooltip {
+        if chat_tooltip {
+            let text = assets.translate("chat.copy.click", "Click to Copy to Clipboard");
+            let lines = crate::chat_hud::wrap_hover_text(&canvas, assets, text);
+            crate::tooltip::draw_text(&mut canvas, assets, self.cursor, &lines);
+        } else if let Some(tooltip) = status_tooltip {
             crate::tooltip::draw_two_lines(
                 &mut canvas,
                 assets,
@@ -4054,6 +4078,53 @@ mod inventory_tests {
                 .iter()
                 .any(|pixel| (pixel >> 8 & 255) > (pixel >> 16 & 255))
         );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn seed_hover_tooltip_tracks_pointer_and_cached_frames() {
+        use native_session::{SystemMessage, SystemMessageKind};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut assets = MenuAssets::load(&game, &[]).unwrap();
+        assets.chat = crate::chat_hud::ChatSettings::default();
+        assets
+            .language
+            .insert("commands.seed.success".into(), "Seed: %1$s".into());
+        assets
+            .language
+            .insert("chat.square_brackets".into(), "[%s]".into());
+        assets
+            .language
+            .insert("chat.copy.click".into(), "Copy this seed".into());
+        let mut ui = GameUi::new(Arc::new(assets));
+        let inventory = PlayerInventory::default();
+        let size = (1280, 720);
+        ui.resize(size);
+        ui.system_messages = Arc::from([SystemMessage {
+            kind: SystemMessageKind::WorldSeed(-123456),
+            tick: CHAT_AGE_OFFSET,
+        }]);
+        ui.open_chat(false);
+        let height = ui.logical_size().1;
+        let prefix = Canvas::new(1, 1).text_width(Some(&ui.assets), "Seed: [");
+        ui.cursor = (0, 0);
+        let base = ui.compose(size, &inventory, 0).unwrap();
+        assert!(ui.compose(size, &inventory, 0).is_none());
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        let hovered = ui.compose(size, &inventory, 0).unwrap();
+        assert_ne!(base.pixels, hovered.pixels);
+        assert!(ui.compose(size, &inventory, 0).is_none());
+        ui.cursor.0 += 2;
+        assert!(ui.compose(size, &inventory, 0).is_some());
+        ui.cursor = (0, 0);
+        let left = ui.compose(size, &inventory, 0).unwrap();
+        assert_eq!(base.pixels, left.pixels);
+        ui.close_chat();
+        ui.cursor = (4 + prefix + 1, height - 40 - 8 + 1);
+        assert!(ui.compose(size, &inventory, 0).is_some());
+        assert_eq!(ui.last_draw.unwrap().chat_tooltip_cursor, None);
     }
 
     #[test]

@@ -263,6 +263,14 @@ fn wrap(
     lines
 }
 
+/// Wrap hover text to the width used by Java's component-hover renderer.
+pub fn wrap_hover_text(canvas: &Canvas, assets: &MenuAssets, text: &str) -> Vec<String> {
+    wrap(canvas, assets, text, (canvas.width / 2).max(200), 0)
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
 struct ChatLine {
     text: String,
     layout: LineLayout,
@@ -979,6 +987,25 @@ mod tests {
         assert_eq!(
             screenshot_message("invalid %2$s", "a.png"),
             ("invalid %2$s".into(), vec![])
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn hover_text_wraps_using_gui_width_and_explicit_newlines() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = MenuAssets::load(&game, &[]).unwrap();
+        let canvas = Canvas::new(320, 240);
+        let text = format!("{}\n{}", "Copy this seed ".repeat(8), "한글 설명");
+        let lines = wrap_hover_text(&canvas, &assets, &text);
+        assert!(lines.len() > 2);
+        assert_eq!(lines.last().unwrap(), "한글 설명");
+        assert!(
+            lines
+                .iter()
+                .all(|line| canvas.text_width(Some(&assets), line) <= 200)
         );
     }
 

@@ -2147,6 +2147,17 @@ impl BiomeNeighborhood {
             .at(quart)
             .context("biome coordinate missing from neighbor")
     }
+
+    /// Direct noise-biome lookup, without the seeded block-biome zoom.
+    pub fn noise_biome_at_block(&self, x: i32, y: i32, z: i32) -> Result<&ResourceId> {
+        let quart = IVec3::new(x.div_euclid(4), y.div_euclid(4), z.div_euclid(4));
+        let key = [quart.x.div_euclid(4), quart.z.div_euclid(4)];
+        self.chunks
+            .get(&key)
+            .with_context(|| format!("missing biome neighbor {},{}", key[0], key[1]))?
+            .at(quart)
+            .context("biome coordinate missing from neighbor")
+    }
 }
 
 /// A generator configured from the dimension's active biome source and noise
@@ -4435,9 +4446,18 @@ mod tests {
                 )
             })
             .expect("seed must produce a sheep group");
-        let mut driver =
-            GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
-                .unwrap();
+        let mut dimension_attributes = attributes.clone();
+        dimension_attributes["gameplay/creature_world_gen_spawn_probability"] = json!(probability);
+        let mut driver = GeneratedSheepSpawner::from_environment(
+            &batch,
+            &mut data,
+            center,
+            &dimension_attributes,
+            &[],
+            |_| Some(false),
+            inputs,
+        )
+        .unwrap();
         let mut stale =
             GeneratedSheepSpawner::new(&batch, center, probability, mob_spawns.clone(), inputs)
                 .unwrap();
@@ -5368,6 +5388,35 @@ mod tests {
         assert_eq!(rust, expected);
         assert_eq!(rust.len(), 32);
     }
+    #[test]
+    fn noise_biome_lookup_does_not_apply_seeded_block_zoom() {
+        let mut neighbors = BiomeNeighborhood::new(42, 0, 16).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let id = ResourceId::parse(&format!("example:biome_{}_{}", x + 1, z + 1)).unwrap();
+                neighbors
+                    .insert(Arc::new(
+                        QuartBiomeChunk::from_values([x, z], 42, 0, 16, vec![id; 64]).unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let mut different = false;
+        for z in -8_i32..=8 {
+            for x in -8_i32..=8 {
+                let noise = neighbors.noise_biome_at_block(x, 1000, z).unwrap();
+                assert_eq!(
+                    noise.path,
+                    format!("biome_{}_{}", x.div_euclid(16) + 1, z.div_euclid(16) + 1)
+                );
+                if noise != neighbors.biome_at_block(x, 15, z).unwrap() {
+                    different = true;
+                }
+            }
+        }
+        assert!(different, "fixture must cross a zoomed biome boundary");
+    }
+
     #[test]
     fn generates_biomes_and_surface_only_with_complete_matching_neighbors() {
         let mut data = Data;

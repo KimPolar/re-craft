@@ -84,6 +84,27 @@ pub struct GeneratedSheepSpawner {
 }
 
 impl GeneratedSheepSpawner {
+    /// Resolve the biome-dependent attributes before creating the spawn job.
+    /// The caller supplies dimension and already-sampled later layers.
+    pub fn from_environment(
+        batch: &FreshTerrainBatch,
+        provider: &mut impl native_resources::packs::ResourceProvider,
+        center: ChunkPos,
+        dimension_attributes: &serde_json::Value,
+        later_layers: &[serde_json::Value],
+        entity_is_misc: impl FnMut(&native_resources::packs::ResourceId) -> Option<bool>,
+        inputs: SheepSpawnInputs<'_>,
+    ) -> Result<Self> {
+        let settings = batch.resolve_creature_spawn_settings(
+            provider,
+            center,
+            dimension_attributes,
+            later_layers,
+            entity_is_misc,
+        )?;
+        Self::new(batch, center, settings.probability, settings.spawns, inputs)
+    }
+
     /// The spawn list and probability must contain all applicable environment
     /// layers at this chunk's spawn query position.
     pub fn new(

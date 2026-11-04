@@ -54,6 +54,169 @@ pub struct CreatureSpawnLayer {
     creatures: Option<CreatureSpawns>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedCreatureSpawns {
+    pub probability: f32,
+    pub spawns: CreatureSpawns,
+}
+
+#[derive(Clone, Copy)]
+enum FloatModifier {
+    Override,
+    Add,
+    Subtract,
+    Multiply,
+    Minimum,
+    Maximum,
+}
+
+#[derive(Clone, Copy)]
+struct ProbabilityLayer {
+    modifier: FloatModifier,
+    argument: f32,
+}
+
+impl ProbabilityLayer {
+    fn from_attributes(attributes: &Value) -> Result<Option<Self>> {
+        let attributes = attributes
+            .as_object()
+            .context("environment attributes must be an object")?;
+        let mut result = None;
+        for (name, value) in attributes {
+            let id = ResourceId::parse(name)?;
+            if id.namespace != "minecraft"
+                || id.path != "gameplay/creature_world_gen_spawn_probability"
+            {
+                continue;
+            }
+            ensure!(
+                result.is_none(),
+                "duplicate creature spawn probability attribute"
+            );
+            let (modifier, argument) = if value.is_number() {
+                (FloatModifier::Override, value)
+            } else {
+                let modifier = value
+                    .get("modifier")
+                    .and_then(Value::as_str)
+                    .context("missing probability modifier")?;
+                let modifier = ResourceId::parse(modifier)?;
+                ensure!(
+                    modifier.namespace == "minecraft",
+                    "unsupported probability modifier"
+                );
+                let modifier = match modifier.path.as_str() {
+                    "override" => FloatModifier::Override,
+                    "add" => FloatModifier::Add,
+                    "subtract" => FloatModifier::Subtract,
+                    "multiply" => FloatModifier::Multiply,
+                    "minimum" => FloatModifier::Minimum,
+                    "maximum" => FloatModifier::Maximum,
+                    _ => bail!("unsupported probability modifier"),
+                };
+                (
+                    modifier,
+                    value
+                        .get("argument")
+                        .context("missing probability argument")?,
+                )
+            };
+            let argument = argument.as_f64().context("invalid probability argument")? as f32;
+            ensure!(argument.is_finite(), "non-finite probability argument");
+            result = Some(Self { modifier, argument });
+        }
+        Ok(result)
+    }
+
+    fn apply(self, base: f32) -> f32 {
+        match self.modifier {
+            FloatModifier::Override => self.argument,
+            FloatModifier::Add => base + self.argument,
+            FloatModifier::Subtract => base - self.argument,
+            FloatModifier::Multiply => base * self.argument,
+            FloatModifier::Minimum => {
+                if base.is_nan() || self.argument.is_nan() {
+                    f32::NAN
+                } else if base == 0.0 && self.argument == 0.0 {
+                    f32::from_bits(base.to_bits() | self.argument.to_bits())
+                } else {
+                    base.min(self.argument)
+                }
+            }
+            FloatModifier::Maximum => {
+                if base.is_nan() || self.argument.is_nan() {
+                    f32::NAN
+                } else if base == 0.0 && self.argument == 0.0 {
+                    f32::from_bits(base.to_bits() & self.argument.to_bits())
+                } else {
+                    base.max(self.argument)
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the two spawn attributes in Java's dimension, biome, then sampled
+/// timeline order. The spawn list's biome uses the seeded full-resolution
+/// lookup; the probability's biome uses the direct noise-biome lookup. Timeline
+/// layers must already be sampled at the world's current clocks. Weather or
+/// custom layers, if present, must be supplied afterward in their server order.
+pub fn resolve_creature_spawns(
+    dimension: &Value,
+    spawn_biome: &Value,
+    probability_biome: &Value,
+    later_layers: &[Value],
+    mut entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
+) -> Result<ResolvedCreatureSpawns> {
+    let mut spawns = CreatureSpawns::default();
+    for attributes in [dimension, spawn_biome].into_iter().chain(later_layers) {
+        if let Some(layer) = CreatureSpawnLayer::from_attributes(attributes, &mut entity_is_misc)? {
+            spawns.apply(layer);
+        }
+    }
+    let mut probability = 0.1_f32;
+    for attributes in [dimension, probability_biome]
+        .into_iter()
+        .chain(later_layers)
+    {
+        if let Some(layer) = ProbabilityLayer::from_attributes(attributes)? {
+            probability = layer.apply(probability);
+        }
+    }
+    ensure!(!probability.is_nan(), "creature spawn probability is NaN");
+    probability = probability.clamp(0.0, 0.999_999_9_f32);
+    Ok(ResolvedCreatureSpawns {
+        probability,
+        spawns,
+    })
+}
+
+/// Read only the active biome's attribute map. Other biome data is left to
+/// its own consumers; pack overrides are resolved by the provider.
+pub fn load_biome_spawn_attributes(
+    provider: &mut impl ResourceProvider,
+    biome: &ResourceId,
+) -> Result<Value> {
+    let path = format!(
+        "data/{}/worldgen/biome/{}.json",
+        biome.namespace, biome.path
+    );
+    let bytes = provider
+        .read_data(&path)?
+        .with_context(|| format!("missing biome {path}"))?;
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("invalid biome {path}"))?;
+    let object = value
+        .as_object()
+        .context("biome definition must be an object")?;
+    let attributes = object
+        .get("attributes")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    ensure!(attributes.is_object(), "biome attributes must be an object");
+    Ok(attributes)
+}
+
 impl CreatureSpawns {
     /// Apply a decoded layer. Overlay replaces only explicitly defined
     /// categories; an explicitly empty creature list removes prior entries.
@@ -279,5 +442,33 @@ mod tests {
         );
         let incomplete = BTreeSet::from(["minecraft:air".into()]);
         assert!(load_prevent_mob_spawning_inside(&mut Data, &incomplete).is_err());
+    }
+
+    #[test]
+    fn spawn_attributes_use_distinct_biomes_and_sanitize_after_all_layers() {
+        let dimension = json!({"gameplay/creature_world_gen_spawn_probability": 0.8});
+        let full_biome = json!({
+            "gameplay/creature_world_gen_spawn_probability": 0.01,
+            "gameplay/natural_mob_spawns": settings(Some(json!([{"type":"minecraft:sheep","weight":1,"count":4}]))),
+        });
+        let noise_biome = json!({
+            "gameplay/creature_world_gen_spawn_probability": {"modifier":"add","argument":0.8},
+            "gameplay/natural_mob_spawns": settings(Some(json!([{"type":"minecraft:pig","weight":1,"count":1}]))),
+        });
+        let later = [
+            json!({"gameplay/creature_world_gen_spawn_probability":{"modifier":"subtract","argument":1.0}}),
+        ];
+        let resolved =
+            resolve_creature_spawns(&dimension, &full_biome, &noise_biome, &later, |_| {
+                Some(false)
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.probability.to_bits(),
+            (0.8_f32 + 0.8_f32 - 1.0_f32).to_bits()
+        );
+        let (id, count) = resolved.spawns.choose(&mut LegacyRandom::new(42)).unwrap();
+        assert_eq!((id.path.as_str(), count), ("sheep", 4));
+        assert!(resolve_creature_spawns(&json!({"gameplay/creature_world_gen_spawn_probability":{"modifier":"example:unknown","argument":1}}), &json!({}), &json!({}), &[], |_| Some(false)).is_err());
     }
 }

@@ -142,6 +142,58 @@ impl FreshTerrainBatch {
         Ok(self.biomes.biome_at_block(x, max_y - 1, z)?.clone())
     }
 
+    /// The probability attribute uses the unzoomed noise biome at the same
+    /// generation position, unlike the full-resolution spawn-list attribute.
+    pub fn mob_spawn_probability_biome(&self, pos: ChunkPos) -> Result<ResourceId> {
+        ensure!(
+            !self.failed
+                && self
+                    .schedule
+                    .completed(pos)
+                    .is_some_and(|stage| stage >= GenerationStage::Light),
+            "mob spawn biome requires a light-complete chunk"
+        );
+        let (_, max_y) = self.build_bounds()?;
+        let x = pos
+            .x
+            .checked_mul(16)
+            .context("mob spawn biome X overflow")?;
+        let z = pos
+            .z
+            .checked_mul(16)
+            .context("mob spawn biome Z overflow")?;
+        Ok(self.biomes.noise_biome_at_block(x, max_y - 1, z)?.clone())
+    }
+
+    /// Resolve the spawn list and probability using their distinct biome
+    /// lookup rules. Dimension attributes and already-sampled later layers
+    /// must come from this world's unchanged data-pack stack and clocks.
+    pub fn resolve_creature_spawn_settings(
+        &self,
+        provider: &mut impl ResourceProvider,
+        pos: ChunkPos,
+        dimension_attributes: &Value,
+        later_layers: &[Value],
+        entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
+    ) -> Result<native_resources::mob_spawns::ResolvedCreatureSpawns> {
+        let spawn_biome = self.mob_spawn_biome(pos)?;
+        let probability_biome = self.mob_spawn_probability_biome(pos)?;
+        let spawn =
+            native_resources::mob_spawns::load_biome_spawn_attributes(provider, &spawn_biome)?;
+        let probability = if probability_biome == spawn_biome {
+            spawn.clone()
+        } else {
+            native_resources::mob_spawns::load_biome_spawn_attributes(provider, &probability_biome)?
+        };
+        native_resources::mob_spawns::resolve_creature_spawns(
+            dimension_attributes,
+            &spawn,
+            &probability,
+            later_layers,
+            entity_is_misc,
+        )
+    }
+
     /// Initialize a sheep using the biome at its actual entity block position.
     /// The tags, region random source and group must belong to this world and
     /// spawn operation. This does not construct, serialize or store the entity.

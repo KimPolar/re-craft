@@ -831,6 +831,8 @@ pub struct LoadedSession {
     fluid_ticks: BTreeMap<(i128, i32, i64, u64), ScheduledFluid>,
     fluid_pending: BTreeSet<FluidTickKey>,
     fluid_sequence: u64,
+    // Java's level counter is shared by block and fluid schedule calls.
+    next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
     sand_ticks: BTreeMap<(i128, i32, i64, u64), SandTickKey>,
     sand_deferred: BTreeMap<(i128, i32, i64, u64), SandTickKey>,
@@ -5662,7 +5664,7 @@ impl LoadedSession {
             "generated ticks already installed"
         );
         ensure!(
-            self.block_tick_sequence == 0 && self.fluid_sequence == 0,
+            self.block_tick_sequence == 0 && self.fluid_sequence == 0 && self.next_sub_tick == 0,
             "session already has scheduled ticks"
         );
         ensure!(
@@ -5795,11 +5797,7 @@ impl LoadedSession {
                 tick.sub_tick,
             );
         }
-        // Runtime queues have separate sequence counters. Start both after the
-        // generation counter so later ticks remain after imported sub-ticks.
-        let next = ticks.next_sub_tick as u64;
-        self.block_tick_sequence = self.block_tick_sequence.max(next);
-        self.fluid_sequence = self.fluid_sequence.max(next);
+        self.next_sub_tick = ticks.next_sub_tick;
         self.generated_ticks_installed = true;
         Ok(())
     }
@@ -6348,6 +6346,7 @@ impl LoadedSession {
             fluid_ticks: BTreeMap::new(),
             fluid_pending: BTreeSet::new(),
             fluid_sequence: 0,
+            next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
             sand_deferred: BTreeMap::new(),
@@ -14546,11 +14545,17 @@ impl LoadedSession {
             kind: state.kind,
             source: state.source,
         };
+        let subtick = self.next_scheduled_sub_tick();
         if !self.fluid_pending.contains(&key) {
             self.mark_tick_chunk_dirty(key.x, key.z);
         }
-        let subtick = i64::try_from(self.fluid_sequence).unwrap_or(i64::MAX);
         self.insert_fluid_tick(key, i128::from(self.tick) + i128::from(delay), 0, subtick);
+    }
+
+    fn next_scheduled_sub_tick(&mut self) -> i64 {
+        let value = self.next_sub_tick;
+        self.next_sub_tick = self.next_sub_tick.wrapping_add(1);
+        value
     }
 
     fn insert_fluid_tick(&mut self, key: FluidTickKey, due: i128, priority: i32, subtick: i64) {
@@ -14736,6 +14741,7 @@ impl LoadedSession {
             z: absolute.z,
             kind,
         };
+        let subtick = self.next_scheduled_sub_tick();
         if !self.bubble_pending.insert(key) {
             return;
         }
@@ -14746,7 +14752,7 @@ impl LoadedSession {
             (
                 i128::from(self.tick) + i128::from(delay),
                 0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
+                subtick,
                 sequence,
             ),
             key,
@@ -14917,6 +14923,7 @@ impl LoadedSession {
 
     fn schedule_sensor(&mut self, absolute: IVec3, calibrated: bool, delay: u8) {
         let key = (absolute.x, absolute.y, absolute.z, calibrated);
+        let subtick = self.next_scheduled_sub_tick();
         if !self.sensor_pending.insert(key) {
             return;
         }
@@ -14927,7 +14934,7 @@ impl LoadedSession {
             (
                 i128::from(self.tick) + i128::from(delay),
                 0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
+                subtick,
                 sequence,
             ),
             key,
@@ -14939,6 +14946,7 @@ impl LoadedSession {
             return;
         };
         let key = (absolute.x, absolute.y, absolute.z);
+        let subtick = self.next_scheduled_sub_tick();
         if !self.ice_pending.insert(key) {
             return;
         }
@@ -14949,7 +14957,7 @@ impl LoadedSession {
             (
                 i128::from(self.tick) + i128::from(delay),
                 0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
+                subtick,
                 sequence,
             ),
             key,
@@ -14961,21 +14969,15 @@ impl LoadedSession {
             return;
         };
         let key = (absolute.x, absolute.y, absolute.z);
+        let subtick = self.next_scheduled_sub_tick();
         if !self.lamp_pending.insert(key) {
             return;
         }
         self.mark_tick_chunk_dirty(key.0, key.2);
         let sequence = self.block_tick_sequence;
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
-        self.lamp_ticks.insert(
-            (
-                i128::from(self.tick) + 4,
-                0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
-                sequence,
-            ),
-            key,
-        );
+        self.lamp_ticks
+            .insert((i128::from(self.tick) + 4, 0, subtick, sequence), key);
     }
 
     fn lamp_power(&self, relative: IVec3) -> Option<bool> {
@@ -15049,6 +15051,7 @@ impl LoadedSession {
             z: absolute.z,
             kind,
         };
+        let subtick = self.next_scheduled_sub_tick();
         if !self.button_pending.insert(key) {
             return;
         }
@@ -15059,7 +15062,7 @@ impl LoadedSession {
             (
                 i128::from(self.tick) + i128::from(kind.duration()),
                 0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
+                subtick,
                 sequence,
             ),
             key,
@@ -15983,21 +15986,15 @@ impl LoadedSession {
             z: absolute.z,
             kind,
         };
+        let subtick = self.next_scheduled_sub_tick();
         if !self.sand_pending.insert(key) {
             return;
         }
         self.mark_tick_chunk_dirty(key.x, key.z);
         let sequence = self.block_tick_sequence;
         self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
-        self.sand_ticks.insert(
-            (
-                i128::from(self.tick) + 2,
-                0,
-                i64::try_from(sequence).unwrap_or(i64::MAX),
-                sequence,
-            ),
-            key,
-        );
+        self.sand_ticks
+            .insert((i128::from(self.tick) + 2, 0, subtick, sequence), key);
     }
 
     fn falling_sand_snapshot(&self) -> Arc<[crate::falling_block::FallingBlockVisual]> {
@@ -16653,16 +16650,12 @@ impl LoadedSession {
                 return;
             }
             let key = (absolute.x, absolute.y, absolute.z, kind);
+            let subtick = self.next_scheduled_sub_tick();
             if self.soil_pending.insert(key) {
                 let sequence = self.block_tick_sequence;
                 self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
                 self.soil_ticks.insert(
-                    (
-                        i128::from(self.tick) + 1,
-                        0,
-                        i64::try_from(sequence).unwrap_or(i64::MAX),
-                        sequence,
-                    ),
+                    (i128::from(self.tick) + 1, 0, subtick, sequence),
                     (absolute, kind),
                 );
                 self.mark_tick_chunk_dirty(absolute.x, absolute.z);
@@ -22780,8 +22773,23 @@ pub(crate) mod tests {
             [(3, -2), (3, -1), (6, 8)]
         );
         assert_eq!(session.fluid_pending.len(), 2);
-        assert_eq!(session.block_tick_sequence, 10);
-        assert_eq!(session.fluid_sequence, 10);
+        assert_eq!(session.block_tick_sequence, 5);
+        assert_eq!(session.fluid_sequence, 3);
+        assert_eq!(session.next_sub_tick, 10);
+        session.schedule_bubble(IVec3::new(6, 2, 6), BubbleTickKind::Water, 3);
+        assert!(session.bubble_ticks.keys().any(|order| order.2 == 10));
+        session.schedule_fluid(
+            IVec3::new(7, 2, 6),
+            FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            },
+            3,
+        );
+        assert!(session.fluid_ticks.keys().any(|order| order.2 == 11));
+        assert_eq!(session.next_sub_tick, 12);
         assert!(session.tick_chunks_needing_dirty.contains(&ChunkPos {
             x: 1_000_000,
             z: -1_000_000
@@ -22833,6 +22841,99 @@ pub(crate) mod tests {
                 .install_generated_ticks(&generated_tick_fixture())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn block_and_fluid_schedules_share_java_subticks_including_duplicates() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, TickRegistry,
+        };
+        let mut session = session();
+        let chunk = *session.world.chunks.keys().next().unwrap();
+        let mut reference = RegionTicks::new(
+            BTreeMap::from([(
+                chunk,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                },
+            )]),
+            0,
+            0,
+        )
+        .unwrap();
+        let sand = IVec3::new(1, 2, 2);
+        let fluid = IVec3::new(2, 2, 2);
+        let bubble = IVec3::new(3, 2, 2);
+        let absolute = |relative: IVec3| (session.origin + relative).to_array();
+        let sand_pos = absolute(sand);
+        let fluid_pos = absolute(fluid);
+        let bubble_pos = absolute(bubble);
+        let water = FluidState {
+            kind: FluidKind::Water,
+            amount: 8,
+            source: true,
+            falling: false,
+        };
+        session.schedule_sand(sand, FallingKind::Sand);
+        reference
+            .schedule(TickRegistry::Block, "minecraft:sand", sand_pos, 2, 0)
+            .unwrap();
+        session.schedule_fluid(fluid, water, 5);
+        reference
+            .schedule(TickRegistry::Fluid, "minecraft:water", fluid_pos, 5, 0)
+            .unwrap();
+        session.schedule_sand(sand, FallingKind::Sand);
+        reference
+            .schedule(TickRegistry::Block, "minecraft:sand", sand_pos, 2, 0)
+            .unwrap();
+        session.schedule_bubble(bubble, BubbleTickKind::Water, 20);
+        reference
+            .schedule(TickRegistry::Block, "minecraft:water", bubble_pos, 20, 0)
+            .unwrap();
+        session.schedule_fluid(fluid, water, 5);
+        reference
+            .schedule(TickRegistry::Fluid, "minecraft:water", fluid_pos, 5, 0)
+            .unwrap();
+        let snapshot = reference.activated_snapshot();
+        let expected = &snapshot.chunks[&chunk];
+        assert_eq!(
+            session.sand_ticks.first_key_value().unwrap().0.2,
+            expected
+                .blocks
+                .iter()
+                .find(|t| t.kind == "minecraft:sand")
+                .unwrap()
+                .sub_tick
+        );
+        assert_eq!(
+            session.bubble_ticks.first_key_value().unwrap().0.2,
+            expected
+                .blocks
+                .iter()
+                .find(|t| t.kind == "minecraft:water")
+                .unwrap()
+                .sub_tick
+        );
+        assert_eq!(
+            session.fluid_ticks.first_key_value().unwrap().0.2,
+            expected.fluids[0].sub_tick
+        );
+        assert_eq!(session.next_sub_tick, snapshot.next_sub_tick);
+        assert_eq!(session.next_sub_tick, 5);
+        assert_eq!(session.sand_ticks.len(), 1);
+        assert_eq!(session.fluid_ticks.len(), 1);
+    }
+
+    #[test]
+    fn shared_subtick_counter_wraps_like_java_long() {
+        let mut session = session();
+        session.next_sub_tick = i64::MAX;
+        session.schedule_sand(IVec3::new(1, 2, 2), FallingKind::Sand);
+        session.schedule_ice(IVec3::new(2, 2, 2), 1);
+        assert_eq!(session.sand_ticks.first_key_value().unwrap().0.2, i64::MAX);
+        assert_eq!(session.ice_ticks.first_key_value().unwrap().0.2, i64::MIN);
+        assert_eq!(session.next_sub_tick, i64::MIN + 1);
     }
 
     struct SplashTestPacks;

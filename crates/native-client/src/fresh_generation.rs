@@ -53,6 +53,8 @@ pub struct PreparedInitialWorld {
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
     pub initial_clocks: Arc<InitialWorldClocks>,
+    pub entity_collision_registry:
+        Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pack_selection: Option<DataPackSettings>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
 }
@@ -301,6 +303,13 @@ impl PreparedFreshGeneration {
             advance_time,
             command_data: InitialClockCommandData::load(&mut self.resources, &self.lighting),
         });
+        let entity_collision_registry = match self.resources.vanilla_entity_collision_registry() {
+            Ok(registry) => Some(Arc::new(registry)),
+            Err(error) => {
+                eprintln!("Spawn entity collision registry is unavailable: {error:#}");
+                None
+            }
+        };
         let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
             Some(PreparedCreatureSpawning::load(
                 &mut self.resources,
@@ -330,6 +339,7 @@ impl PreparedFreshGeneration {
             creatures,
             spawn_mobs,
             initial_clocks,
+            entity_collision_registry,
             pack_selection: self.pack_selection,
             level_settings: None,
         })

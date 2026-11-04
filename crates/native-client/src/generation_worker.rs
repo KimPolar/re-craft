@@ -51,6 +51,8 @@ pub struct GenerationReady {
     pub suggested_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
     pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
+    pub entity_collision_registry:
+        Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
 }
 
@@ -286,6 +288,9 @@ impl GenerationReady {
         )
         .map_err(anyhow::Error::msg)?;
         session.set_player_inventory(PlayerInventory::default());
+        if let Some(registry) = &self.entity_collision_registry {
+            session.set_entity_collision_registry(Arc::clone(registry))?;
+        }
         if let Some(level) = &self.level_settings {
             let settings = level.session;
             session.set_game_mode(settings.mode);
@@ -383,6 +388,7 @@ impl GenerationWorker {
                 creatures,
                 spawn_mobs,
                 initial_clocks,
+                entity_collision_registry,
                 level_settings,
                 ..
             } = prepare()?;
@@ -401,6 +407,7 @@ impl GenerationWorker {
             };
             ready.worldgen_settings_draft = Some(worldgen_settings);
             ready.initial_clocks = Some(initial_clocks);
+            ready.entity_collision_registry = entity_collision_registry;
             ready.level_settings = level_settings;
             let Some(mut ready) = complete_spawn_search(
                 ready,
@@ -758,6 +765,7 @@ impl GenerationWorker {
                 spawn_origin: None,
                 suggested_spawn: None,
                 initial_clocks: None,
+                entity_collision_registry: None,
                 level_settings: None,
             }))
         })
@@ -1136,6 +1144,7 @@ fn generate_spawn_origin(
         spawn_origin: Some(spawn),
         suggested_spawn: None,
         initial_clocks: None,
+        entity_collision_registry: None,
         level_settings: None,
     }))
 }
@@ -1158,6 +1167,7 @@ fn expand_with_inputs(
         suggested_spawn: _,
         worldgen_settings_draft,
         initial_clocks,
+        entity_collision_registry,
         level_settings,
     } = ready;
     ensure!(
@@ -1249,6 +1259,7 @@ fn expand_with_inputs(
         spawn_origin,
         suggested_spawn: None,
         initial_clocks,
+        entity_collision_registry,
         level_settings,
     }))
 }
@@ -1529,6 +1540,24 @@ mod tests {
                 pack.join("data/example/worldgen/biome/flat.json"),
                 serde_json::to_vec(&selected_biome)?,
             )?;
+            let collision_height_tags = if spawn_mobs && !disabled && species == "minecraft:sheep" {
+                let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+                let warnings = resources.configure_world_data(
+                    &world,
+                    &DataPackSettings {
+                        enabled: vec!["vanilla".into(), "file/compact".into()],
+                        disabled: vec![],
+                        enabled_features: vec!["minecraft:vanilla".into()],
+                    },
+                )?;
+                assert!(warnings.is_empty());
+                let blocks = resources.vanilla_block_ids()?;
+                Some(Arc::new(
+                    native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &blocks)?,
+                ))
+            } else {
+                None
+            };
             let game = game.clone();
             let world = world.clone();
             let worker = GenerationWorker::start_initial_world(
@@ -1604,7 +1633,12 @@ mod tests {
                 Some(&native_persistence::nbt::Tag::Int(1))
             );
             assert!(level_data.get("DataPacks").is_some());
-            let targets = ready.mesh.targets.as_deref().context("targets missing")?;
+            let targets = ready
+                .mesh
+                .targets
+                .as_deref()
+                .context("targets missing")?
+                .clone();
             assert_eq!(
                 ready.initial_clocks.as_ref().unwrap().ticks.get(
                     &native_resources::packs::ResourceId::parse("example:creatures")?
@@ -1633,6 +1667,70 @@ mod tests {
                 }
             } else {
                 assert_eq!(count, 0);
+            }
+            if spawn_mobs && !disabled && species == "minecraft:sheep" {
+                use native_persistence::{
+                    nbt::{NamedTag, Tag, TagType},
+                    world::{ChunkPos as SavedChunkPos, SavedEntityChunk},
+                };
+                use native_session::loaded::SavedEntityData;
+                let target = *targets
+                    .iter()
+                    .find(|&&pos| {
+                        !ready
+                            .batch
+                            .recorded_generated_entities(pos)
+                            .unwrap()
+                            .is_empty()
+                    })
+                    .unwrap();
+                let entities = ready.batch.recorded_generated_entities(target)?.to_vec();
+                let document = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![(
+                        "Entities".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: entities,
+                        },
+                    )]),
+                };
+                let entity_chunk = SavedEntityData::Present(Arc::new(SavedEntityChunk {
+                    position: SavedChunkPos {
+                        x: target.x,
+                        z: target.z,
+                    },
+                    document: Arc::new(document),
+                }));
+                let origin = ready.mesh.origin;
+                let position = IVec3::new(target.x * 16 + 8, 16, target.z * 16 + 8);
+                let player = native_session::PlayerState {
+                    position: (position - origin).as_vec3() + glam::Vec3::new(0.5, 0.0, 0.5),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    vertical_velocity: 0.0,
+                    on_ground: true,
+                    pose: native_session::PlayerPose::Standing,
+                };
+                let registry = ready
+                    .entity_collision_registry
+                    .take()
+                    .context("collision registry missing")?;
+                let mut without_registry = ready.start_session(player)?;
+                without_registry.set_spawn_heightmap_tags(Arc::clone(
+                    collision_height_tags.as_ref().unwrap(),
+                ))?;
+                without_registry.set_initial_entity_chunk(target, entity_chunk.clone())?;
+                assert!(
+                    without_registry
+                        .generated_spawn_clear(position, &targets)
+                        .is_err()
+                );
+                ready.entity_collision_registry = Some(registry);
+                let mut session = ready.start_session(player)?;
+                session.set_spawn_heightmap_tags(collision_height_tags.unwrap())?;
+                session.set_initial_entity_chunk(target, entity_chunk)?;
+                assert!(session.generated_spawn_clear(position, &targets)?);
             }
             if !spawn_mobs {
                 use native_session::{GameSession, PlayerCommand, SystemMessageKind};

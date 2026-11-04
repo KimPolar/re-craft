@@ -306,6 +306,36 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Use the active data-pack-derived spawn configuration and independent
+    /// entity RNGs on the same worker as the chunk spawn operation.
+    pub fn complete_creature_spawning_from_packs<C, R, F>(
+        ready: GenerationReady,
+        prepare: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(
+                native_resources::packs::ResourceStack,
+                C,
+                R,
+                crate::fresh_generation::PreparedCreatureSpawning,
+            )> + Send
+            + 'static,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
+        Self::complete_creature_spawning(ready, move || {
+            let (resources, classify, resolve, spawn) = prepare()?;
+            let build =
+                move |batch: &FreshTerrainBatch,
+                      resources: &mut native_resources::packs::ResourceStack,
+                      pos| spawn.build_spawner(batch, resources, pos);
+            let construct = |id: &native_resources::packs::ResourceId| {
+                Ok(native_session::worldgen::FreshCreatureRandom::from_entropy(id)?.construction)
+            };
+            Ok((resources, classify, resolve, build, construct))
+        })
+    }
+
     /// Complete generation-time creature spawning for the mesh targets on a
     /// worker. The supplied builder must use this batch's unchanged packs,
     /// dimension, clocks and tags. No chunk is marked SPAWN until its driver

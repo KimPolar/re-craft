@@ -1,12 +1,16 @@
 //! Prepare generation inputs from a verified client and selected data packs.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Result, ensure};
 use native_resources::{
     carver::tags::CarverBlockTags,
     datapacks::DataPackSettings,
     dimension_lighting::GeneratedDimensionLighting,
-    packs::{ResourceProvider, ResourceStack},
+    packs::{ResourceId, ResourceProvider, ResourceStack},
 };
 use native_session::worldgen::{
     CarverBlockState, FreshTerrainBatch, TerrainGenerator, resolve_generated_terrain_state,
@@ -35,6 +39,134 @@ pub struct PreparedFreshGeneration {
     resources: ResourceStack,
     classify: Classifier,
     resolve: Resolver,
+}
+
+/// All inputs for world-generation creatures, resolved from the same active
+/// pack stack and world clock state used by the generation batch.
+pub struct PreparedCreatureSpawning {
+    environment: native_resources::creature_timeline::CreatureSpawnEnvironment,
+    categories: native_resources::entity_category::EntityCategoryRegistry,
+    prevent_inside: BTreeSet<String>,
+    height_tags: native_resources::heightmap_tags::HeightmapTags,
+    ground_tags: native_resources::worldgen_mob_rules::GroundSpawnTags,
+    biome_tags: native_resources::worldgen_region_random::SheepBiomeTags,
+    variants: [Arc<native_resources::animal_variants::FarmAnimalSpawnVariants>; 3],
+    border: native_session::respawn::RespawnBorder,
+    clocks: BTreeMap<ResourceId, i64>,
+    has_ceiling: bool,
+}
+
+impl PreparedCreatureSpawning {
+    /// Load on the worker with the already-configured world data packs.
+    /// Inline dimension types and unsupported spawn conditions remain errors.
+    pub fn load(
+        resources: &mut ResourceStack,
+        lighting: &GeneratedDimensionLighting,
+        border: native_session::respawn::RespawnBorder,
+        clocks: BTreeMap<ResourceId, i64>,
+    ) -> Result<Self> {
+        use anyhow::Context;
+        use native_resources::animal_variants::{FarmAnimal, FarmAnimalSpawnVariants};
+        ensure!(
+            border.min_x.is_finite()
+                && border.max_x.is_finite()
+                && border.min_z.is_finite()
+                && border.max_z.is_finite()
+                && border.min_x < border.max_x
+                && border.min_z < border.max_z,
+            "invalid world border"
+        );
+        let dimension_type = lighting
+            .dimension_type
+            .as_ref()
+            .context("inline dimension types are not yet supported for creature generation")?;
+        let path = format!(
+            "data/{}/dimension_type/{}.json",
+            dimension_type.namespace, dimension_type.path
+        );
+        let bytes = resources
+            .read_data(&path)?
+            .with_context(|| format!("missing dimension type {path}"))?;
+        let definition: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid dimension type {path}"))?;
+        let has_ceiling = definition
+            .get("has_ceiling")
+            .and_then(Value::as_bool)
+            .context("dimension has_ceiling is missing or invalid")?;
+        let categories = resources.vanilla_entity_category_registry()?;
+        let name = format!("{}:{}", dimension_type.namespace, dimension_type.path);
+        let environment =
+            native_resources::creature_timeline::CreatureSpawnEnvironment::load_with_registry(
+                resources,
+                &name,
+                &categories,
+            )?;
+        environment.sample_layers(|id| clocks.get(id).copied())?;
+        let blocks = resources.vanilla_block_ids()?;
+        let prevent_inside =
+            native_resources::mob_spawns::load_prevent_mob_spawning_inside(resources, &blocks)?;
+        let height_tags =
+            native_resources::heightmap_tags::HeightmapTags::load(resources, &blocks)?;
+        let ground_tags =
+            native_resources::worldgen_mob_rules::GroundSpawnTags::load(resources, &blocks)?;
+        let biome_tags = native_resources::worldgen_region_random::SheepBiomeTags::load(resources)?;
+        let variants = [
+            Arc::new(FarmAnimalSpawnVariants::load_active(
+                resources,
+                FarmAnimal::Pig,
+            )?),
+            Arc::new(FarmAnimalSpawnVariants::load_active(
+                resources,
+                FarmAnimal::Cow,
+            )?),
+            Arc::new(FarmAnimalSpawnVariants::load_active(
+                resources,
+                FarmAnimal::Chicken,
+            )?),
+        ];
+        Ok(Self {
+            environment,
+            categories,
+            prevent_inside,
+            height_tags,
+            ground_tags,
+            biome_tags,
+            variants,
+            border,
+            clocks,
+            has_ceiling,
+        })
+    }
+
+    pub fn build_spawner(
+        &self,
+        batch: &FreshTerrainBatch,
+        resources: &mut ResourceStack,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<native_session::worldgen::GeneratedSheepSpawner> {
+        use native_session::worldgen::{GeneratedSheepSpawner, SheepSpawnInputs};
+        let inputs = SheepSpawnInputs {
+            border: self.border,
+            prevent_inside: &self.prevent_inside,
+            height_tags: &self.height_tags,
+            ground_tags: &self.ground_tags,
+            biome_tags: &self.biome_tags,
+            has_ceiling: self.has_ceiling,
+        };
+        let mut driver = GeneratedSheepSpawner::from_verified_environment(
+            batch,
+            resources,
+            pos,
+            &self.environment,
+            |id| self.clocks.get(id).copied(),
+            &self.categories,
+            inputs,
+        )?;
+        for variants in &self.variants {
+            driver.enable_farm_animal(Arc::clone(variants))?;
+        }
+        Ok(driver)
+    }
 }
 
 impl PreparedFreshGeneration {
@@ -158,6 +290,53 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_creature_inputs_load_from_active_pack_stack() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let clocks: BTreeMap<ResourceId, i64> =
+            native_resources::world_clock::registered_clocks(&mut resources)?
+                .into_iter()
+                .map(|id| (id, 0_i64))
+                .collect();
+        for (dimension, ceiling) in [
+            ("minecraft:overworld", false),
+            ("minecraft:the_nether", true),
+        ] {
+            let lighting = GeneratedDimensionLighting::load_preset(
+                &mut resources,
+                "minecraft:normal",
+                dimension,
+            )?;
+            let border = native_session::respawn::RespawnBorder {
+                min_x: -29_999_984.0,
+                max_x: 29_999_984.0,
+                min_z: -29_999_984.0,
+                max_z: 29_999_984.0,
+            };
+            let inputs =
+                PreparedCreatureSpawning::load(&mut resources, &lighting, border, clocks.clone())?;
+            assert_eq!(inputs.has_ceiling, ceiling);
+            assert!(!inputs.prevent_inside.is_empty());
+            assert_eq!(
+                inputs.variants[0].species(),
+                native_resources::animal_variants::FarmAnimal::Pig
+            );
+            assert_eq!(
+                inputs.variants[1].species(),
+                native_resources::animal_variants::FarmAnimal::Cow
+            );
+            assert_eq!(
+                inputs.variants[2].species(),
+                native_resources::animal_variants::FarmAnimal::Chicken
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn structures_are_rejected_before_reading_files() {

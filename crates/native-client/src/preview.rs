@@ -2982,6 +2982,16 @@ mod tests {
             "minecraft:overworld",
         )
         .unwrap();
+        let pack_tags = CarverBlockTags::load(&mut data, &registry).unwrap();
+        let pack_generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &farm_definition, 42, 0, 16)
+                .unwrap();
+        let mut pack_batch = FreshTerrainBatch::new_without_structures(
+            pack_generator,
+            pack_tags,
+            "minecraft:overworld",
+        )
+        .unwrap();
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
@@ -3011,7 +3021,13 @@ mod tests {
         farm_batch
             .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
             .unwrap();
-        farm_batch.enable_light_initialization(generated).unwrap();
+        farm_batch
+            .enable_light_initialization(generated.clone())
+            .unwrap();
+        pack_batch
+            .enable_decoration(&mut data, &BTreeSet::new(), registry.clone(), &lighting)
+            .unwrap();
+        pack_batch.enable_light_initialization(generated).unwrap();
         let classify = |v: &Value| -> Result<CarverBlockState> {
             let name = v
                 .as_str()
@@ -3215,6 +3231,80 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert_eq!(cancelled.progress().phase, GenerationPhase::Cancelled);
+
+            // The same worker path can construct its inputs from the verified
+            // installed client and active vanilla data, rather than test lists.
+            let initial = GenerationWorker::start(
+                move || Ok((pack_batch, Fixture, classify, resolve)),
+                targets.clone(),
+                21,
+                0,
+                IVec3::ZERO,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let ready = loop {
+                if let Some(result) = initial.try_result().unwrap() {
+                    match result {
+                        GenerationResult::Ready(ready) => break ready,
+                        GenerationResult::Failed(error) => panic!("{error:#}"),
+                        GenerationResult::Cancelled => panic!("generation cancelled"),
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pack test generation timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            let pack_game = game.clone();
+            let worker =
+                GenerationWorker::complete_creature_spawning_from_packs(ready, move || {
+                    let mut resources = native_resources::packs::ResourceStack::open(&pack_game)?;
+                    let lighting = GeneratedDimensionLighting::load_preset(
+                        &mut resources,
+                        "minecraft:normal",
+                        "minecraft:overworld",
+                    )?;
+                    let clocks = native_resources::world_clock::registered_clocks(&mut resources)?
+                        .into_iter()
+                        .map(|id| (id, 0))
+                        .collect();
+                    let border = native_session::respawn::RespawnBorder {
+                        min_x: -100.0,
+                        max_x: 100.0,
+                        min_z: -100.0,
+                        max_z: 100.0,
+                    };
+                    let spawn = crate::fresh_generation::PreparedCreatureSpawning::load(
+                        &mut resources,
+                        &lighting,
+                        border,
+                        clocks,
+                    )?;
+                    Ok((resources, classify, resolve, spawn))
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let ready = loop {
+                if let Some(result) = worker.try_result().unwrap() {
+                    match result {
+                        GenerationResult::Ready(ready) => break ready,
+                        GenerationResult::Failed(error) => panic!("{error:#}"),
+                        GenerationResult::Cancelled => panic!("spawn cancelled"),
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pack spawn worker timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert_eq!(
+                ready.batch.schedule().completed(center),
+                Some(GenerationStage::Spawn)
+            );
+            assert_eq!(worker.progress().phase, GenerationPhase::Ready);
         }
         {
             use native_session::{GameSession, PlayerPose, PlayerState, inventory::PlayerSlot};

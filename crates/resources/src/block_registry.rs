@@ -45,12 +45,27 @@ enum StateSchema {
     BigDripleafStem,
     HangingRoots,
     Vine,
+    Beehive,
+    Chest,
 }
 
 impl StateSchema {
     fn default_properties(self) -> BTreeMap<String, String> {
         let value = match self {
             Self::Stateless => return BTreeMap::new(),
+            Self::Beehive => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("honey_level".into(), "0".into()),
+                ]);
+            }
+            Self::Chest => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::Leaves => {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
@@ -135,6 +150,20 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Beehive | Self::Chest
+                if name == "facing" && matches!(value, "north" | "south" | "west" | "east") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Beehive if name == "honey_level" => java_decimal(value)
+                .filter(|n| (0..=5).contains(n))
+                .map(|n| n.to_string()),
+            Self::Chest if name == "type" && matches!(value, "single" | "left" | "right") => {
+                Some(value.to_owned())
+            }
+            Self::Chest if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
             Self::Vine
                 if matches!(name, "up" | "north" | "south" | "west" | "east")
                     && matches!(value, "true" | "false") =>
@@ -372,6 +401,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
+                "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
+                "net/minecraft/world/level/block/ChestBlock"
+                | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
+                "net/minecraft/world/level/block/SpawnerBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
                 }

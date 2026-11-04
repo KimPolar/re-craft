@@ -673,6 +673,12 @@ impl Class {
                 0x11 | 0x13 | 0xb2 | 0xbb => {
                     r.u16()?;
                 }
+                0xba if class == "net/minecraft/world/level/block/ChestBlock" => {
+                    let index = r.u16()?;
+                    if r.u16()? != 0 || !self.is_no_capture_supplier(index)? {
+                        return Ok(None);
+                    }
+                }
                 0xb7 => {
                     let (owner, method, _) = self.member(r.u16()?)?;
                     if method != "<init>" {
@@ -718,6 +724,34 @@ impl Class {
             }
         }
         Ok(None)
+    }
+
+    /// A no-capture LambdaMetafactory supplier creates a value on the stack;
+    /// it does not execute the supplier target while the block is constructed.
+    fn is_no_capture_supplier(&self, index: u16) -> Result<bool> {
+        let Some(Constant::InvokeDynamic(bootstrap, name_type)) =
+            self.constants.get(index as usize)
+        else {
+            bail!("invalid supplier invocation")
+        };
+        let Some(Constant::NameType(_, descriptor)) = self.constants.get(*name_type as usize)
+        else {
+            bail!("invalid supplier signature")
+        };
+        if self.utf8(*descriptor)? != "()Ljava/util/function/Supplier;" {
+            return Ok(false);
+        }
+        let (method, args) = self
+            .bootstraps
+            .get(*bootstrap as usize)
+            .context("missing supplier bootstrap")?;
+        let Some(Constant::MethodHandle(6, target)) = self.constants.get(*method as usize) else {
+            return Ok(false);
+        };
+        let (owner, name, _) = self.member(*target)?;
+        Ok(owner == "java/lang/invoke/LambdaMetafactory"
+            && name == "metafactory"
+            && args.len() == 3)
     }
     pub(crate) fn reference_names(&self) -> Result<HashMap<String, String>> {
         let mut values = HashMap::new();

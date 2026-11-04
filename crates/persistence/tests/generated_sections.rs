@@ -53,6 +53,29 @@ fn fixture() -> (World, ChunkPos) {
             properties: BTreeMap::new(),
         }));
     }
+    for (name, properties) in [
+        (
+            "bee_nest",
+            BTreeMap::from([
+                ("facing".into(), "south".into()),
+                ("honey_level".into(), "2".into()),
+            ]),
+        ),
+        (
+            "chest",
+            BTreeMap::from([
+                ("facing".into(), "west".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        ),
+        ("spawner", BTreeMap::new()),
+    ] {
+        states.push(world.intern_state(BlockState {
+            name: format!("minecraft:{name}"),
+            properties,
+        }));
+    }
     let biomes =
         ["minecraft:plains", "minecraft:desert"].map(|name| world.intern_biome(name.into()));
     let mut blocks = Box::new([states[0]; BLOCK_COUNT]);

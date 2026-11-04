@@ -171,6 +171,13 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:glow_lichen","properties":{"down":"true","north":"true","waterlogged":"true"}}),
         serde_json::json!({"id":"minecraft:glow_lichen","properties":{"up":"invalid","east":"true"}}),
         serde_json::json!("minecraft:stone"),
+        serde_json::json!("minecraft:spawner"),
+        serde_json::json!("minecraft:chest"),
+        serde_json::json!("minecraft:trapped_chest"),
+        serde_json::json!("minecraft:bee_nest"),
+        serde_json::json!("minecraft:beehive"),
+        serde_json::json!({"id":"minecraft:chest","properties":{"facing":"up","type":"invalid","waterlogged":"invalid"}}),
+        serde_json::json!({"id":"minecraft:bee_nest","properties":{"facing":"down","honey_level":"6"}}),
         serde_json::json!("minecraft:diamond_ore"),
         serde_json::json!("minecraft:deepslate_diamond_ore"),
         serde_json::json!("minecraft:coal_ore"),
@@ -233,6 +240,22 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for id in ["minecraft:bee_nest", "minecraft:beehive"] {
+        for facing in ["north", "south", "east", "west"] {
+            for honey in 0..=5 {
+                cases.push(serde_json::json!({"id":id,"properties":{"facing":facing,"honey_level":honey.to_string()}}));
+            }
+        }
+    }
+    for id in ["minecraft:chest", "minecraft:trapped_chest"] {
+        for facing in ["north", "south", "east", "west"] {
+            for chest_type in ["single", "left", "right"] {
+                for waterlogged in ["true", "false"] {
+                    cases.push(serde_json::json!({"id":id,"properties":{"facing":facing,"type":chest_type,"waterlogged":waterlogged}}));
+                }
+            }
+        }
+    }
     for id in ["minecraft:water", "minecraft:lava"] {
         for level in -1..=16 {
             cases.push(serde_json::json!({"id":id, "properties":{"level":level.to_string()}}));
@@ -315,6 +338,15 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:water"));
     assert!(registry.contains("minecraft:lava"));
     assert!(registry.contains("minecraft:deepslate"));
+    for id in [
+        "minecraft:bee_nest",
+        "minecraft:beehive",
+        "minecraft:chest",
+        "minecraft:trapped_chest",
+        "minecraft:spawner",
+    ] {
+        assert!(registry.contains(id), "missing block entity state {id}");
+    }
     println!("verified {} generated block defaults", registry.len());
     for id in registry.ids() {
         let expected = expected

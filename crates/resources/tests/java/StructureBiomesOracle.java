@@ -6,6 +6,8 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.RegistryLayer;
+import net.minecraft.resources.RegistryDataLoader;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.repository.ServerPacksSource;
 import net.minecraft.server.packs.resources.MultiPackResourceManager;
@@ -28,8 +30,18 @@ public class StructureBiomesOracle {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     var registries=VanillaRegistries.createWorldLookup();var dims=WorldPresets.createNormalWorldDimensions(registries);
     var repo=ServerPacksSource.createPackRepository(Path.of(args[0]),new DirectoryValidator(path->false));
-    MinecraftServer.configurePackRepository(repo,new WorldDataConfiguration(new DataPackConfig(List.of("vanilla"),List.of()),FeatureFlags.DEFAULT_FLAGS),false,false);
+    boolean custom=args.length>1 && args[1].equals("custom");
+    MinecraftServer.configurePackRepository(repo,new WorldDataConfiguration(new DataPackConfig(custom?List.of("vanilla","file/overrides"):List.of("vanilla"),List.of()),FeatureFlags.DEFAULT_FLAGS),false,false);
     try(var manager=new MultiPackResourceManager(PackType.SERVER_DATA,repo.openAllSelected())) {
+    var layers=RegistryLayer.createRegistryAccess();
+    var pending=TagLoader.loadTagsForExistingRegistries(manager,layers.getLayer(RegistryLayer.STATIC));
+    var base=layers.getAccessForLoading(RegistryLayer.WORLD);
+    var lookups=TagLoader.buildUpdatedLookups(base,pending);
+    var runtime=RegistryDataLoader.load(manager,lookups,
+        RegistryDataLoader.WORLD_REGISTRIES,java.util.concurrent.ForkJoinPool.commonPool()).join();
+    var runtimeSets=runtime.lookupOrThrow(Registries.STRUCTURE_SET).listElements().toList();
+    runtimeSets.forEach(holder ->
+        out.printf("R %s%n", holder.key().identifier()));
     var biomeLookup=registries.lookupOrThrow(Registries.BIOME);
     TagLoader.ElementLookup<Holder<Biome>> lookup=(id,required)->biomeLookup.get(net.minecraft.resources.ResourceKey.create(Registries.BIOME,id)).map(h->(Holder<Biome>)h);
     var tags=TagLoader.loadTagsForRegistry(manager,Registries.BIOME,lookup);
@@ -39,6 +51,14 @@ public class StructureBiomesOracle {
       String name=key.identifier().toString();all.put(name,biomes);
       for(var biome:biomes)out.printf("B %s %s%n",name,biome.unwrapKey().orElseThrow().identifier());
     }
+    for(var holder:runtimeSets) for(var dim:all.entrySet()) {
+      var possibleIds=dim.getValue().stream().map(b->b.unwrapKey().orElseThrow().identifier()).collect(java.util.stream.Collectors.toSet());
+      boolean present=holder.value().structures().stream()
+          .flatMap(e->e.structure().value().biomes().stream())
+          .anyMatch(b->possibleIds.contains(b.unwrapKey().orElseThrow().identifier()));
+      out.printf("Q %s %s %s%n",dim.getKey(),holder.key().identifier(),present);
+    }
+    if(custom)return;
     var union=new HashSet<Holder<Biome>>();all.values().forEach(union::addAll);
     var structures=new LinkedHashMap<String,Holder<Structure>>();
     registries.lookupOrThrow(Registries.STRUCTURE_SET).listElements().forEach(holder->{

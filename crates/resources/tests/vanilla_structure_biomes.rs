@@ -17,7 +17,7 @@ fn run(command: &mut Command) -> String {
         out.status.success(),
         "Java structure-biome oracle failed: {}\n{}",
         String::from_utf8_lossy(&out.stderr),
-        String::from_utf8_lossy(&out.stdout[out.stdout.len().saturating_sub(2500)..])
+        String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(16000)])
     );
     String::from_utf8(out.stdout).unwrap()
 }
@@ -93,11 +93,18 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
     let mut java_biomes = BTreeMap::<String, BTreeSet<ResourceId>>::new();
     let mut java_selected = BTreeMap::<String, Vec<ResourceId>>::new();
     let mut java_candidates = BTreeMap::<String, Vec<ResourceId>>::new();
+    let mut java_runtime_selected = BTreeMap::<String, Vec<ResourceId>>::new();
+    let mut runtime_order = Vec::new();
     let mut checks = 0;
     let mut set_checks = 0;
     for line in output.lines() {
         let p: Vec<_> = line.split_whitespace().collect();
         match p.first().copied() {
+            Some("R") => runtime_order.push(ResourceId::parse(p[1]).unwrap()),
+            Some("Q") if p[3] == "true" => java_runtime_selected
+                .entry(p[1].to_owned())
+                .or_default()
+                .push(ResourceId::parse(p[2]).unwrap()),
             Some("B") => {
                 java_biomes
                     .entry(p[1].to_owned())
@@ -143,6 +150,12 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
         }
     }
     assert_eq!(java_biomes, possible);
+    assert_eq!(
+        runtime_order,
+        resources
+            .list_registry_data("worldgen/structure_set")
+            .unwrap()
+    );
     for (dimension, biomes) in &possible {
         let mut cache = StructureSetCache::default();
         let (selected, _) = cache
@@ -160,7 +173,108 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
             ordered, java_selected[dimension],
             "observed registry order in {dimension}"
         );
+        let expected_runtime: Vec<_> = runtime_order
+            .iter()
+            .filter(|id| selected.contains(*id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            expected_runtime, java_runtime_selected[dimension],
+            "Java resource-loaded set selection in {dimension}"
+        );
+        let (ordered_runtime, _) = cache
+            .possible_sets(&mut resources, &runtime_order, biomes)
+            .unwrap();
+        assert_eq!(
+            ordered_runtime, expected_runtime,
+            "resource-loaded registry order in {dimension}"
+        );
+        let (automatic, _) = cache
+            .possible_registry_sets(&mut resources, biomes)
+            .unwrap();
+        assert_eq!(
+            automatic, expected_runtime,
+            "automatic registry order in {dimension}"
+        );
     }
     assert!(set_checks >= 60);
     assert!(checks >= 1000);
+
+    // A selected pack adds names in two namespaces and overrides a vanilla set.
+    let world = temp.path().join("world");
+    let pack = world.join("datapacks/overrides");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("pack.mcmeta"),
+        br#"{"pack":{"description":"structure test","min_format":121,"max_format":121}}"#,
+    )
+    .unwrap();
+    for (namespace, name, structure) in [
+        ("alpha", "a", "minecraft:buried_treasure"),
+        ("beta", "a", "minecraft:buried_treasure"),
+        ("minecraft", "buried_treasures", "minecraft:fortress"),
+    ] {
+        let folder = pack
+            .join("data")
+            .join(namespace)
+            .join("worldgen/structure_set");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(format!("{name}.json")), serde_json::to_vec(&serde_json::json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":8,"salt":42},"structures":[{"structure":structure,"weight":1}]})).unwrap()).unwrap();
+    }
+    let custom_output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("StructureBiomesOracle")
+        .arg(world.join("datapacks"))
+        .arg("custom"));
+    let mut custom_order = Vec::new();
+    let mut custom_selected = BTreeMap::<String, Vec<ResourceId>>::new();
+    for line in custom_output.lines() {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        match parts.first().copied() {
+            Some("R") => custom_order.push(ResourceId::parse(parts[1]).unwrap()),
+            Some("Q") if parts[3] == "true" => custom_selected
+                .entry(parts[1].to_owned())
+                .or_default()
+                .push(ResourceId::parse(parts[2]).unwrap()),
+            _ => {}
+        }
+    }
+    let selection = native_resources::datapacks::DataPackSettings {
+        enabled: vec!["vanilla".into(), "file/overrides".into()],
+        disabled: vec![],
+        enabled_features: vec!["minecraft:vanilla".into()],
+    };
+    assert!(
+        resources
+            .configure_world_data(&world, &selection)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        custom_order,
+        resources
+            .list_registry_data("worldgen/structure_set")
+            .unwrap()
+    );
+    for (dimension, biomes) in &possible {
+        let (automatic, _) = StructureSetCache::default()
+            .possible_registry_sets(&mut resources, biomes)
+            .unwrap();
+        assert_eq!(
+            automatic, custom_selected[dimension],
+            "custom pack in {dimension}"
+        );
+    }
+    assert!(
+        custom_selected["minecraft:overworld"].contains(&ResourceId::parse("alpha:a").unwrap())
+    );
+    assert!(
+        !custom_selected["minecraft:overworld"]
+            .contains(&ResourceId::parse("minecraft:buried_treasures").unwrap())
+    );
+    assert!(
+        custom_selected["minecraft:the_nether"]
+            .contains(&ResourceId::parse("minecraft:buried_treasures").unwrap())
+    );
 }

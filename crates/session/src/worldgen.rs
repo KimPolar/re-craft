@@ -6958,6 +6958,20 @@ mod tests {
         );
         let selected_generator =
             TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let automatic_generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let automatic = structure_batch::StructureGenerationBatch::from_registry(
+            automatic_generator,
+            &mut data,
+        )
+        .unwrap();
+        assert_eq!(
+            automatic.structure_sets(),
+            &[
+                ResourceId::parse("example:pyramid").unwrap(),
+                ResourceId::parse("example:sparse").unwrap()
+            ]
+        );
         let order = vec![
             ResourceId::parse("example:sparse").unwrap(),
             ResourceId::parse("example:pyramid").unwrap(),

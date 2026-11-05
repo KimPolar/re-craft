@@ -529,8 +529,19 @@ fn missing_ring_positions<P: ResourceProvider>(
     )
 }
 impl StructureSetCache {
+    /// Select sets in Java's resource-loaded registry order. Registry files
+    /// are registered in resource-identifier order, including pack overrides.
+    pub fn possible_registry_sets(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        possible_biomes: &BTreeSet<ResourceId>,
+    ) -> Result<(Vec<ResourceId>, crate::structure_biomes::StructureBiomes)> {
+        let candidates = provider.list_registry_data("worldgen/structure_set")?;
+        self.possible_sets(provider, &candidates, possible_biomes)
+    }
+
     /// Find the registry sets compatible with the generator's possible biomes.
-    /// Membership is independent of Java's process-specific registry order.
+    /// Membership does not depend on the registry's iteration order.
     /// The cache and biome rules belong to this exact data-pack stack.
     pub fn possible_registry_membership(
         &mut self,
@@ -540,8 +551,7 @@ impl StructureSetCache {
         BTreeSet<ResourceId>,
         crate::structure_biomes::StructureBiomes,
     )> {
-        let candidates = provider.list_registry_data("worldgen/structure_set")?;
-        let (selected, rules) = self.possible_sets(provider, &candidates, possible_biomes)?;
+        let (selected, rules) = self.possible_registry_sets(provider, possible_biomes)?;
         Ok((selected.into_iter().collect(), rules))
     }
 

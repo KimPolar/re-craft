@@ -135,6 +135,24 @@ pub struct StructureGenerationBatch {
 }
 
 impl StructureGenerationBatch {
+    /// Prepare a normal resource-loaded registry in Java's registration
+    /// order, filtering out sets with no possible generator biome.
+    pub fn from_registry(
+        generator: TerrainGenerator,
+        provider: &mut impl ResourceProvider,
+    ) -> Result<Self> {
+        ensure!(
+            generator.structure_context,
+            "generator lacks structure context"
+        );
+        let mut cache = StructureSetCache::default();
+        let (sets, biome_rules) =
+            cache.possible_registry_sets(provider, generator.possible_biomes())?;
+        let mut batch = Self::new(generator, biome_rules, sets)?;
+        batch.cache = cache;
+        Ok(batch)
+    }
+
     /// Validate an observed Java normal-generator order against the complete
     /// registry and possible biomes before attempting any structure starts.
     /// Unsupported starts still fail when a candidate is generated.

@@ -2,8 +2,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
+use native_persistence::nbt::Tag;
 use native_persistence::structure_template::StructureTemplate;
 use native_resources::{
+    block_registry::GeneratedBlockRegistry,
     ocean_ruin::{self, Piece, Settings},
     packs::{ResourceId, ResourceProvider},
 };
@@ -14,6 +16,16 @@ pub struct PreparedPiece {
     pub template: Arc<StructureTemplate>,
     /// Initial Java template bounds, before ocean-floor postprocessing.
     pub bounds: native_core::beardifier::BoundingBox,
+}
+
+/// A structure block is retained for the later data-marker pass and must not
+/// be placed as an ordinary template block.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreparedPaletteState {
+    Block(native_world::loaded::BlockState),
+    StructureMarker {
+        properties: BTreeMap<String, String>,
+    },
 }
 
 impl PreparedPiece {
@@ -28,6 +40,66 @@ impl PreparedPiece {
             self.selection.rotation,
             [0; 3],
         )
+    }
+
+    /// Transform one explicitly selected palette. The block list still uses
+    /// NBT order; Java's placement ordering and processors remain separate.
+    pub fn transformed_palette(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        palette_index: usize,
+    ) -> Result<Vec<PreparedPaletteState>> {
+        let palette = self
+            .template
+            .palettes
+            .get(palette_index)
+            .context("template palette index out of bounds")?;
+        palette
+            .iter()
+            .map(|tag| {
+                let name = match tag.get("id") {
+                    Some(Tag::String(name)) => {
+                        String::from_utf16(&name.0).context("invalid template block identifier")?
+                    }
+                    _ => anyhow::bail!("template block identifier missing"),
+                };
+                let mut properties = BTreeMap::new();
+                if let Some(value) = tag.get("properties") {
+                    let Tag::Compound(entries) = value else {
+                        anyhow::bail!("template properties are not a compound")
+                    };
+                    for (key, value) in entries {
+                        let key =
+                            String::from_utf16(&key.0).context("invalid template property name")?;
+                        let Tag::String(value) = value else {
+                            anyhow::bail!("template property is not a string")
+                        };
+                        let value = String::from_utf16(&value.0)
+                            .context("invalid template property value")?;
+                        ensure!(
+                            properties.insert(key, value).is_none(),
+                            "duplicate template property"
+                        );
+                    }
+                }
+                let id = ResourceId::parse(&name)?;
+                let name = format!("{}:{}", id.namespace, id.path);
+                if name == "minecraft:structure_block" {
+                    return Ok(PreparedPaletteState::StructureMarker { properties });
+                }
+                let input = serde_json::json!({"id": name, "properties": properties});
+                let (name, properties) = registry.resolve(&input)?;
+                let properties = registry.transform_template_state(
+                    &name,
+                    &properties,
+                    native_resources::structure_transform::Mirror::None,
+                    self.selection.rotation,
+                )?;
+                Ok(PreparedPaletteState::Block(
+                    native_world::loaded::BlockState { name, properties },
+                ))
+            })
+            .collect()
     }
 }
 
@@ -168,6 +240,9 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let mut data = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = data.vanilla_generated_block_registry()?;
+        let mut markers = 0;
+        let mut glazed = 0;
         for temperature in ["warm", "cold"] {
             let definition = json!({"type":"minecraft:ocean_ruin","biome_temp":temperature,"large_probability":0.5,"cluster_probability":0.9});
             for seed in 0..16 {
@@ -175,6 +250,21 @@ mod tests {
                 assert!(!pieces.is_empty());
                 assert!(pieces.iter().all(|piece| !piece.template.blocks.is_empty()));
                 for piece in &pieces {
+                    for index in 0..piece.template.palettes.len() {
+                        let palette = piece.transformed_palette(&registry, index)?;
+                        assert_eq!(palette.len(), piece.template.palettes[index].len());
+                        for state in palette {
+                            match state {
+                                PreparedPaletteState::StructureMarker { .. } => markers += 1,
+                                PreparedPaletteState::Block(state)
+                                    if state.name.ends_with("_glazed_terracotta") =>
+                                {
+                                    glazed += 1
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     for block in &piece.template.blocks {
                         let pos = piece.block_position(block);
                         assert!((0..3).all(|axis| {
@@ -184,6 +274,8 @@ mod tests {
                 }
             }
         }
+        assert!(markers > 0);
+        assert!(glazed > 0);
         Ok(())
     }
 }

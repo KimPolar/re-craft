@@ -69,7 +69,7 @@ fn validate_entity(entity: &ResourceId) -> Result<()> {
         entity.namespace == "minecraft"
             && matches!(
                 entity.path.as_str(),
-                "sheep" | "pig" | "cow" | "chicken" | "horse" | "donkey"
+                "sheep" | "pig" | "cow" | "chicken" | "horse" | "donkey" | "witch" | "cat"
             ),
         "unsupported creature construction"
     );

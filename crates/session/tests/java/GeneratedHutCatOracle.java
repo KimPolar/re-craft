@@ -12,6 +12,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.*;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.animal.feline.*;
+import net.minecraft.world.entity.monster.Witch;
 import net.minecraft.world.entity.variant.SpawnPrioritySelectors;
 import net.minecraft.world.entity.variant.SpawnContext;
 import net.minecraft.world.entity.variant.MoonBrightnessCheck;
@@ -39,10 +40,29 @@ public class GeneratedHutCatOracle {
         @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level){return null;}
         @Override protected void registerGoals(){}
     }
+    static class TestWitch extends Witch {
+        TestWitch(World world){super(EntityTypes.WITCH,world);}
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level){return null;}
+        @Override protected void registerGoals(){}
+    }
+    static class DummyNavigation extends net.minecraft.world.entity.ai.navigation.GroundPathNavigation {
+        DummyNavigation(){super(null,null);}
+        @Override public void setCanFloat(boolean value){}
+    }
+    static Unsafe unsafe;
+    static net.minecraft.world.entity.ai.navigation.PathNavigation navigation(){try{return (DummyNavigation)unsafe.allocateInstance(DummyNavigation.class);}catch(InstantiationException error){throw new AssertionError(error);}}
+    static class ObserveCat extends Cat {
+        ObserveCat(World world){super(EntityTypes.CAT,world);}
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level){return navigation();}
+    }
+    static class ObserveWitch extends Witch {
+        ObserveWitch(World world){super(EntityTypes.WITCH,world);}
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level){return navigation();}
+    }
     public static void main(String[] args)throws Exception {
         SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
         var field=Unsafe.class.getDeclaredField("theUnsafe");field.setAccessible(true);
-        var unsafe=(Unsafe)field.get(null);var world=(World)unsafe.allocateInstance(World.class);
+        unsafe=(Unsafe)field.get(null);var world=(World)unsafe.allocateInstance(World.class);
         var lookup=VanillaRegistries.createWorldLookup();
         var input=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         for(var entry:input){
@@ -65,6 +85,13 @@ public class GeneratedHutCatOracle {
             var region=(ServerLevelAccessor)java.lang.reflect.Proxy.newProxyInstance(ServerLevelAccessor.class.getClassLoader(),new Class<?>[]{ServerLevelAccessor.class},(p,m,v)->switch(m.getName()){
                 case "getRandom" -> random; case "getBiome","environmentAttributes" -> null;case "registryAccess" -> access;default -> throw new AssertionError(m);
             });
+            if(test.has("witch_path")) {
+                var witch=new TestWitch(world);witch.setUUID(new UUID(3,4));witch.setPersistenceRequired();witch.snapTo(3.5,10,-2.5,0,0);
+                witch.finalizeSpawn(region,null,EntitySpawnReason.STRUCTURE,null);
+                var witchOutput=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
+                if(!witch.save(witchOutput))throw new AssertionError("witch not saved");
+                if(!witchOutput.buildResult().equals(NbtIo.read(Path.of(test.get("witch_path").getAsString()))))throw new AssertionError("joint witch data differs: "+test);
+            }
             var cat=new TestCat(world);cat.setUUID(new UUID(1,2));cat.setPersistenceRequired();cat.snapTo(3.5,10,-2.5,0,0);
             cat.finalizeSpawn(region,null,EntitySpawnReason.STRUCTURE,null);
             var output=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
@@ -89,5 +116,13 @@ public class GeneratedHutCatOracle {
             var check=entry.getAsJsonObject();var point=new BlockPos(check.get("x").getAsInt(),check.get("y").getAsInt(),check.get("z").getAsInt());
             if(manager.structureHasPieceAt(point,start)!=check.get("expected").getAsBoolean())throw new AssertionError("structure piece condition differs: "+check);
         }
+        var seedField=LegacyRandomSource.class.getDeclaredField("seed");seedField.setAccessible(true);var constructions=new JsonArray();
+        for(var type:List.of("cat","witch")) for(int index=0;index<32;index++) {
+            Mob entity=type.equals("cat")?new ObserveCat(world):new ObserveWitch(world);
+            var state=((java.util.concurrent.atomic.AtomicLong)seedField.get(entity.getRandom())).get();var uuid=entity.getUUID();
+            var result=new JsonObject();result.addProperty("entity",type);result.addProperty("state",state);result.addProperty("yaw_bits",Float.floatToRawIntBits(entity.getYRot()));
+            var words=new JsonArray();words.add((int)(uuid.getMostSignificantBits()>>>32));words.add((int)uuid.getMostSignificantBits());words.add((int)(uuid.getLeastSignificantBits()>>>32));words.add((int)uuid.getLeastSignificantBits());result.add("uuid",words);constructions.add(result);
+        }
+        Files.writeString(Path.of(args[1]),constructions.toString());
     }
 }

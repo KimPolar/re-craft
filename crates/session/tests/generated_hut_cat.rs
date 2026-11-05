@@ -110,27 +110,59 @@ fn fresh_hut_cats_match_java_nbt_and_region_random() {
         let variants = CatSpawnVariants::load_active(&mut Fixture(mode)).unwrap();
         for legacy in [false, true] {
             for seed in [0_i64, 1, 42, -1, i64::MIN, i64::MAX] {
-                let algorithm = if legacy {
-                    WorldgenRandom::Legacy
-                } else {
-                    WorldgenRandom::Xoroshiro
-                };
-                let mut random = RegionRandom::new(seed, algorithm, -13, 17);
-                let init = variants
-                    .finalize_hut_cat(&mut random, |_| unreachable!("unconditional selectors"))
+                for witch_first in [false, true] {
+                    let algorithm = if legacy {
+                        WorldgenRandom::Legacy
+                    } else {
+                        WorldgenRandom::Xoroshiro
+                    };
+                    let mut random = RegionRandom::new(seed, algorithm, -13, 17);
+                    let witch_path = if witch_first {
+                        let initialization =
+                            native_resources::worldgen_region_random::finalize_mob_base(
+                                &mut random,
+                                false,
+                            );
+                        let tag = native_session::worldgen::draft_fresh_hut_witch(
+                            [0, 3, 0, 4],
+                            [3, 10, -3],
+                            initialization,
+                        )
+                        .unwrap();
+                        let path = temp.path().join(format!("witch-joint-{}.nbt", cases.len()));
+                        std::fs::write(
+                            &path,
+                            write(&NamedTag {
+                                name: "".into(),
+                                value: tag,
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        Some(path)
+                    } else {
+                        None
+                    };
+                    let init = variants
+                        .finalize_hut_cat(&mut random, |_| unreachable!("unconditional selectors"))
+                        .unwrap();
+                    let tag = draft_fresh_hut_cat([0, 1, 0, 2], [3, 10, -3], &init).unwrap();
+                    let path = temp.path().join(format!("cat-{}.nbt", cases.len()));
+                    std::fs::write(
+                        &path,
+                        write(&NamedTag {
+                            name: "".into(),
+                            value: tag,
+                        })
+                        .unwrap(),
+                    )
                     .unwrap();
-                let tag = draft_fresh_hut_cat([0, 1, 0, 2], [3, 10, -3], &init).unwrap();
-                let path = temp.path().join(format!("cat-{}.nbt", cases.len()));
-                std::fs::write(
-                    &path,
-                    write(&NamedTag {
-                        name: "".into(),
-                        value: tag,
-                    })
-                    .unwrap(),
-                )
-                .unwrap();
-                cases.push(json!({"mode":mode,"legacy":legacy,"seed":seed,"path":path,"next":random.next_long()}));
+                    let mut case = json!({"mode":mode,"legacy":legacy,"seed":seed,"path":path,"next":random.next_long()});
+                    if let Some(path) = witch_path {
+                        case["witch_path"] = json!(path);
+                    }
+                    cases.push(case);
+                }
             }
         }
     }
@@ -171,11 +203,44 @@ fn fresh_hut_cats_match_java_nbt_and_region_random() {
     cases[0]["piece_checks"] = json!(checks);
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let constructions = temp.path().join("constructions.json");
     run(Command::new(java.join("java.exe"))
         .arg("-cp")
         .arg(&cp)
         .arg("GeneratedHutCatOracle")
-        .arg(input));
+        .arg(input)
+        .arg(&constructions));
+    let observations: Value =
+        serde_json::from_slice(&std::fs::read(constructions).unwrap()).unwrap();
+    for case in observations.as_array().unwrap() {
+        let id = ResourceId::parse(case["entity"].as_str().unwrap()).unwrap();
+        let final_state = case["state"].as_u64().unwrap();
+        let uuid: Vec<_> = case["uuid"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap() as i32)
+            .collect();
+        let mut initial = final_state;
+        let mut matched = None;
+        for _ in 0..32 {
+            initial = initial.wrapping_sub(11).wrapping_mul(0xdfe05bcb1365) & ((1_u64 << 48) - 1);
+            let random = native_core::random::LegacyRandom::from_state(initial).unwrap();
+            let candidate =
+                native_session::worldgen::FreshCreatureRandom::from_random(&id, random).unwrap();
+            if candidate.construction.uuid.as_slice() == uuid
+                && candidate.random.state() == final_state
+            {
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let actual = matched.unwrap_or_else(|| panic!("constructor RNG mismatch for {}", id.path));
+        assert_eq!(
+            actual.initial_yaw.to_bits() as i32,
+            case["yaw_bits"].as_i64().unwrap() as i32
+        );
+    }
 }
 
 #[test]

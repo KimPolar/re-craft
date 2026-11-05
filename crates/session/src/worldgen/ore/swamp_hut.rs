@@ -86,6 +86,59 @@ struct HutRegion<'a, 'b, F> {
 }
 
 impl DecorationRegion<'_> {
+    /// Place a hut and initialize its witch and cat against one region RNG.
+    /// `construct` must return the independently seeded constructor state for
+    /// the requested species. `condition_matches` must use the active world,
+    /// complete structure pieces, data packs, and environment at `pos`.
+    /// Both callbacks must own their state so cloning isolates a failed try.
+    /// The caller must also stage these inputs for the entire region and only
+    /// publish them after `DecorationRegion::finish` succeeds.
+    pub fn place_swamp_hut_with_initialized_mobs<C, P>(
+        &mut self,
+        piece: &mut SimpleStructureStart,
+        state: &mut SwampHutState,
+        clip: BoundingBox,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        cat_variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition_matches: &mut P,
+    ) -> Result<bool>
+    where
+        C: Clone + FnMut(HutMob) -> Result<super::super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &serde_json::Value) -> Result<bool>,
+    {
+        use native_resources::worldgen_region_random::finalize_mob_base;
+        let mut next_random = random.clone();
+        let mut next_construct = construct.clone();
+        let mut next_condition_matches = condition_matches.clone();
+        let result = self.place_swamp_hut(piece, state, clip, |mob, pos, world| {
+            let construction = next_construct(mob)?;
+            ensure!(
+                construction.construction.chicken_egg_time.is_none(),
+                "invalid hut mob construction"
+            );
+            let uuid = construction.construction.uuid;
+            let tag = match mob {
+                HutMob::Witch => super::super::draft_fresh_hut_witch(
+                    uuid,
+                    pos,
+                    finalize_mob_base(&mut next_random, false),
+                )?,
+                HutMob::Cat => {
+                    let cat = cat_variants.finalize_hut_cat(&mut next_random, |condition| {
+                        next_condition_matches(pos, world, condition)
+                    })?;
+                    super::super::draft_fresh_hut_cat(uuid, pos, &cat)?
+                }
+            };
+            Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
+        })?;
+        *random = next_random;
+        *construct = next_construct;
+        *condition_matches = next_condition_matches;
+        Ok(result)
+    }
+
     /// Place on this isolated region. The callback must use the active level's
     /// difficulty and entity RNG and return the exact serialized addition.
     /// On error discard the region and restore callback-owned random state.

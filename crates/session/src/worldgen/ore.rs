@@ -6913,6 +6913,183 @@ mod tests {
     }
 
     #[test]
+    fn swamp_hut_initializes_mobs_in_order_and_rolls_back_failed_context() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            cat_variants::CatSpawnVariants,
+            density::WorldgenRandom,
+            packs::{ResourceId, ResourceProvider},
+            structure_piece::swamp_hut::{HutMob, SwampHutState},
+            structure_start::{HorizontalDirection, SimpleStructureKind, SimpleStructureStart},
+            worldgen_region_random::{RegionRandom, finalize_mob_base},
+        };
+        struct Cats;
+        impl ResourceProvider for Cats {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/cat_variant/all_black.json" => {
+                        serde_json::json!({"spawn_conditions":[{"priority":1,"condition":{"type":"minecraft:structure","structures":"#minecraft:cats_spawn_as_black"}}]})
+                    }
+                    "data/minecraft/cat_variant/black.json" => {
+                        serde_json::json!({"spawn_conditions":[{"priority":0}]})
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(serde_json::to_vec(&value)?))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                let values = match folder {
+                    "cat_variant" => vec!["all_black", "black"],
+                    "cat_sound_variant" => vec!["classic", "royal"],
+                    _ => anyhow::bail!("unknown registry"),
+                };
+                values
+                    .into_iter()
+                    .map(|name| ResourceId::parse(&format!("minecraft:{name}")))
+                    .collect()
+            }
+        }
+        let piece = || SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 64, 3], [9, 70, 11]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let registry: BTreeSet<_> = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "water",
+            "lava",
+            "spruce_planks",
+            "oak_log",
+            "oak_fence",
+            "spruce_stairs",
+            "potted_red_mushroom",
+            "crafting_table",
+            "cauldron",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let variants = CatSpawnVariants::load_active(&mut Cats).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let writable = BTreeSet::from([center]);
+        let clip = BoundingBox::new([0, -64, 0], [15, 100, 15]).unwrap();
+        let make_construct = || {
+            |mob| {
+                let (name, seed) = match mob {
+                    HutMob::Witch => ("minecraft:witch", 1),
+                    HutMob::Cat => ("minecraft:cat", 2),
+                };
+                super::super::FreshCreatureRandom::from_seed(&ResourceId::parse(name)?, seed)
+            }
+        };
+        let (mut terrain, tags, _, _) = fixture();
+        let mut actual_piece = piece();
+        let mut actual_state = SwampHutState::default();
+        let mut random = RegionRandom::new(42, WorldgenRandom::Xoroshiro, 0, 0);
+        let mut expected_random = random.clone();
+        let mut construct = make_construct();
+        let mut matching = |_: [i32; 3], _: &World, value: &serde_json::Value| {
+            Ok(value["type"] == "minecraft:structure")
+        };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, writable.clone())
+            .unwrap();
+        assert!(
+            region
+                .place_swamp_hut_with_initialized_mobs(
+                    &mut actual_piece,
+                    &mut actual_state,
+                    clip,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut matching
+                )
+                .unwrap()
+        );
+        let mut after_first = random.clone();
+        assert!(
+            region
+                .place_swamp_hut_with_initialized_mobs(
+                    &mut actual_piece,
+                    &mut actual_state,
+                    clip,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut matching
+                )
+                .unwrap()
+        );
+        let mut after_second = random.clone();
+        assert_eq!(after_first.next_long(), after_second.next_long());
+        region.finish().unwrap();
+        let pos = [5, 10, 8];
+        let witch = super::super::draft_fresh_hut_witch(
+            make_construct()(HutMob::Witch).unwrap().construction.uuid,
+            pos,
+            finalize_mob_base(&mut expected_random, false),
+        )
+        .unwrap();
+        let cat = variants
+            .finalize_hut_cat(&mut expected_random, |_| Ok(true))
+            .unwrap();
+        let cat = super::super::draft_fresh_hut_cat(
+            make_construct()(HutMob::Cat).unwrap().construction.uuid,
+            pos,
+            &cat,
+        )
+        .unwrap();
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap(),
+            &[witch, cat]
+        );
+        assert_eq!(random.next_long(), expected_random.next_long());
+        assert!(actual_state.spawned_witch && actual_state.spawned_cat);
+
+        let (mut terrain, tags, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut actual_piece = piece();
+        let mut actual_state = SwampHutState::default();
+        let mut random = RegionRandom::new(42, WorldgenRandom::Xoroshiro, 0, 0);
+        let mut untouched = random.clone();
+        let mut construct = make_construct();
+        let mut missing_context = |_: [i32; 3], _: &World, _: &serde_json::Value| -> Result<bool> {
+            anyhow::bail!("missing structure context")
+        };
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        assert!(
+            region
+                .place_swamp_hut_with_initialized_mobs(
+                    &mut actual_piece,
+                    &mut actual_state,
+                    clip,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut missing_context
+                )
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert_eq!(random.next_long(), untouched.next_long());
+        assert_eq!(actual_piece.bounds, piece().bounds);
+        assert_eq!(actual_state, SwampHutState::default());
+        assert!(Arc::ptr_eq(&terrain.snapshot(), &before));
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn generated_swamp_hut_blocks_and_marks_match_java() {
         use native_core::beardifier::{BoundingBox, TerrainAdjustment};

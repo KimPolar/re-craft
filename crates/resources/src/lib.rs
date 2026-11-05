@@ -20,6 +20,7 @@ pub mod block_registry;
 pub mod blockstates;
 pub mod bonus_chest;
 pub mod carver;
+pub mod cat_variants;
 pub mod chest_loot;
 pub mod creature_timeline;
 pub mod datapack_snapshot;

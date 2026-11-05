@@ -60,7 +60,7 @@ pub use generated_creature_random::FreshCreatureRandom;
 pub use generated_donkey::draft_fresh_donkey;
 pub use generated_farm_animal::draft_fresh_farm_animal;
 pub use generated_horse::draft_fresh_horse;
-pub use generated_hut_mobs::draft_fresh_hut_witch;
+pub use generated_hut_mobs::{draft_fresh_hut_cat, draft_fresh_hut_witch};
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{

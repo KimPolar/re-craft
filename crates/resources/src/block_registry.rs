@@ -48,6 +48,8 @@ enum StateSchema {
     Vine,
     Beehive,
     Chest,
+    Fence,
+    Stairs,
 }
 
 impl StateSchema {
@@ -64,6 +66,20 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("facing".into(), "north".into()),
                     ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::Fence => {
+                return ["north", "south", "west", "east", "waterlogged"]
+                    .into_iter()
+                    .map(|name| (name.into(), "false".into()))
+                    .collect();
+            }
+            Self::Stairs => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "straight".into()),
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
@@ -151,6 +167,28 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Fence
+                if matches!(name, "north" | "south" | "west" | "east" | "waterlogged")
+                    && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Stairs
+                if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
+                    || (name == "half" && matches!(value, "top" | "bottom"))
+                    || (name == "shape"
+                        && matches!(
+                            value,
+                            "straight"
+                                | "inner_left"
+                                | "inner_right"
+                                | "outer_left"
+                                | "outer_right"
+                        ))
+                    || (name == "waterlogged" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
             Self::Beehive | Self::Chest
                 if name == "facing" && matches!(value, "north" | "south" | "west" | "east") =>
             {
@@ -306,6 +344,7 @@ impl GeneratedBlockRegistry {
         const DIRECT: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const KEY_FACTORY: &str = "(Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
+        const STAIR_FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/Block;)Lnet/minecraft/world/level/block/Block;";
         const BASE: &str = "net/minecraft/world/level/block/Block";
         let mut load = |name: &str| -> Result<crate::item_registry::Class> {
             let bytes = read_class(&format!("{name}.class"))?
@@ -353,6 +392,15 @@ impl GeneratedBlockRegistry {
             {
                 ensure!(registration.is_none(), "ambiguous block registration");
                 registration = Some(false);
+            } else if ins.op == 0xb8
+                && owner == BLOCKS
+                && matches!(member, "registerLegacyStair" | "registerStair")
+                && descriptor == STAIR_FACTORY
+            {
+                // Both helpers construct StairBlock in the verified 26.3 client.
+                ensure!(registration.is_none(), "ambiguous block registration");
+                registration = Some(false);
+                constructors.insert("net/minecraft/world/level/block/StairBlock".to_owned());
             } else if ins.op == 0xb3 && owner == BLOCKS {
                 let class = match registration {
                     Some(true) => Some(BASE.to_owned()),
@@ -407,6 +455,8 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
+                "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
+                "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
                 "net/minecraft/world/level/block/SpawnerBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
@@ -777,6 +827,8 @@ mod tests {
             states: BTreeMap::from([
                 ("minecraft:stone".into(), StateSchema::Stateless),
                 ("minecraft:water".into(), StateSchema::Liquid),
+                ("minecraft:oak_fence".into(), StateSchema::Fence),
+                ("minecraft:spruce_stairs".into(), StateSchema::Stairs),
             ]),
             block_entities: BTreeMap::new(),
         };
@@ -795,6 +847,15 @@ mod tests {
             &BTreeMap::from([("level".into(), "01".into())])
         ));
         assert!(!registry.is_canonical_state("example:stone", &BTreeMap::new()));
+        let mut fence = StateSchema::Fence.default_properties();
+        assert!(registry.is_canonical_state("minecraft:oak_fence", &fence));
+        fence.insert("north".into(), "yes".into());
+        assert!(!registry.is_canonical_state("minecraft:oak_fence", &fence));
+        let mut stairs = StateSchema::Stairs.default_properties();
+        stairs.insert("shape".into(), "outer_left".into());
+        assert!(registry.is_canonical_state("minecraft:spruce_stairs", &stairs));
+        stairs.remove("half");
+        assert!(!registry.is_canonical_state("minecraft:spruce_stairs", &stairs));
     }
 
     #[test]

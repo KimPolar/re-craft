@@ -173,6 +173,12 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:glow_lichen","properties":{"up":"invalid","east":"true"}}),
         serde_json::json!("minecraft:stone"),
         serde_json::json!("minecraft:spawner"),
+        serde_json::json!("minecraft:oak_fence"),
+        serde_json::json!("minecraft:nether_brick_fence"),
+        serde_json::json!("minecraft:spruce_stairs"),
+        serde_json::json!("minecraft:stone_stairs"),
+        serde_json::json!("minecraft:cauldron"),
+        serde_json::json!("minecraft:potted_red_mushroom"),
         serde_json::json!("minecraft:chest"),
         serde_json::json!("minecraft:trapped_chest"),
         serde_json::json!("minecraft:bee_nest"),
@@ -241,6 +247,38 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for id in ["minecraft:oak_fence", "minecraft:nether_brick_fence"] {
+        for bits in 0..32 {
+            let mut properties = serde_json::Map::new();
+            for (bit, name) in ["north", "south", "west", "east", "waterlogged"]
+                .into_iter()
+                .enumerate()
+            {
+                properties.insert(
+                    name.into(),
+                    serde_json::json!((bits & (1 << bit) != 0).to_string()),
+                );
+            }
+            cases.push(serde_json::json!({"id":id,"properties":properties}));
+        }
+    }
+    for id in ["minecraft:spruce_stairs", "minecraft:stone_stairs"] {
+        for facing in ["north", "south", "west", "east"] {
+            for half in ["bottom", "top"] {
+                for shape in [
+                    "straight",
+                    "inner_left",
+                    "inner_right",
+                    "outer_left",
+                    "outer_right",
+                ] {
+                    for waterlogged in ["true", "false"] {
+                        cases.push(serde_json::json!({"id":id,"properties":{"facing":facing,"half":half,"shape":shape,"waterlogged":waterlogged}}));
+                    }
+                }
+            }
+        }
+    }
     for id in ["minecraft:bee_nest", "minecraft:beehive"] {
         for facing in ["north", "south", "east", "west"] {
             for honey in 0..=5 {

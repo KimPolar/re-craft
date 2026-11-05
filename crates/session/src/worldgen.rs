@@ -74,6 +74,7 @@ pub use ore::{
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
+    PostprocessingAttempt,
 };
 pub use terrain_batch::{
     FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,

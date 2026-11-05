@@ -161,6 +161,13 @@ pub enum InitialBonusChestAttempt {
     NeedsChunk(ChunkPos),
 }
 
+/// Result of an isolated bounded postprocessing attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostprocessingAttempt {
+    Progress { complete: bool },
+    NeedsChunk(ChunkPos),
+}
+
 #[derive(Debug)]
 struct MissingPostprocessingChunk(ChunkPos);
 
@@ -276,6 +283,23 @@ pub(super) fn drain_postprocessing_light(
 }
 
 impl GeneratedPostprocessing {
+    /// Try a bounded pass without exposing partial callbacks on failure.
+    /// The caller must preserve Java's callback order when supplying a missing
+    /// chunk; merely processing that chunk first is not always equivalent.
+    pub fn try_poll(&mut self, pos: ChunkPos, budget: usize) -> Result<PostprocessingAttempt> {
+        let mut attempt = self.clone();
+        match attempt.poll(pos, budget) {
+            Ok(complete) => {
+                *self = attempt;
+                Ok(PostprocessingAttempt::Progress { complete })
+            }
+            Err(error) => match error.downcast_ref::<MissingPostprocessingChunk>() {
+                Some(missing) => Ok(PostprocessingAttempt::NeedsChunk(missing.0)),
+                None => Err(error),
+            },
+        }
+    }
+
     /// Attempt placement on an isolated fork. Missing neighbors are reported
     /// without publishing partial blocks, ticks, block entities or RNG changes.
     pub fn try_place_initial_bonus_chest<
@@ -1000,9 +1024,7 @@ impl GeneratedBlockView<'_> {
                     fluid,
                     settings,
                 )
-                .map_err(|error| {
-                    anyhow::anyhow!("generated fluid tick is incomplete: {error:?}")
-                })?;
+                .map_err(|error| self.fluid_incomplete_error(error, "generated fluid tick"))?;
                 if let Some(previous) = &planned {
                     ensure!(
                         *previous == changes,
@@ -1035,9 +1057,7 @@ impl GeneratedBlockView<'_> {
                 ..Settings::default()
             };
             let strict = try_tick(&|p| self.fluid_cell_for_spread(p), origin, fluid, settings)
-                .map_err(|error| {
-                    anyhow::anyhow!("generated water path is incomplete: {error:?}")
-                })?;
+                .map_err(|error| self.fluid_incomplete_error(error, "generated water path"))?;
             ensure!(
                 strict == planned,
                 "water path differs under active replacement tags"
@@ -1100,14 +1120,37 @@ impl GeneratedBlockView<'_> {
             view: self,
             origin: glam::IVec3::from_array(pos),
         };
-        native_world::fluid_sim::tick_live(
+        let result = native_world::fluid_sim::tick_live(
             &mut live,
             glam::IVec3::from_array(pos),
             fluid,
             settings,
-        )
-        .map_err(|error| anyhow::anyhow!("generated water tick failed: {error:?}"))?;
+        );
+        match result {
+            Ok(()) => {}
+            Err(native_world::fluid_sim::LiveTickError::World(error)) => {
+                return Err(error.context("generated water tick failed"));
+            }
+            Err(native_world::fluid_sim::LiveTickError::Incomplete(error)) => {
+                return Err(live
+                    .view
+                    .fluid_incomplete_error(error, "generated water tick"));
+            }
+        }
         Ok(())
+    }
+
+    fn fluid_incomplete_error(
+        &self,
+        error: native_world::fluid_sim::IncompleteTick,
+        context: &str,
+    ) -> anyhow::Error {
+        if let native_world::fluid_sim::IncompleteTick::Unknown(pos) = error {
+            if let Err(cause) = self.read(pos.to_array()) {
+                return cause.context(context.to_owned());
+            }
+        }
+        anyhow::anyhow!("{context} is incomplete: {error:?}")
     }
 
     fn schedule_water(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
@@ -2274,6 +2317,56 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    #[test]
+    fn transactional_poll_reports_missing_fluid_neighbor_without_partial_ticks() {
+        let (mut stage, _, chunk) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        world.set_block_id(15, 8, 8, water).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        marks.mark(15, 8, 8);
+        stage
+            .region
+            .tasks
+            .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+        let before_world = Arc::clone(&stage.world);
+        let before_ticks = stage.region.ticks.activated_snapshot();
+        let before_reads = stage.read_chunks.borrow().clone();
+        for _ in 0..2 {
+            assert_eq!(
+                stage.try_poll(chunk, 10).unwrap(),
+                PostprocessingAttempt::NeedsChunk(ChunkPos { x: 1, z: 0 })
+            );
+            assert!(Arc::ptr_eq(&stage.world, &before_world));
+            assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+            assert_eq!(*stage.read_chunks.borrow(), before_reads);
+            assert!(stage.edits.is_empty() && stage.light_checks.is_empty());
+            assert!(!stage.failed && stage.active.is_none());
+        }
+        assert_eq!(
+            stage.try_poll(chunk, 1).unwrap(),
+            PostprocessingAttempt::Progress { complete: false }
+        );
+        assert_ne!(stage.region.ticks.activated_snapshot(), before_ticks);
+    }
+
+    #[test]
+    fn transactional_poll_does_not_convert_unsupported_blocks_to_missing_chunks() {
+        let (mut stage, _, chunk) = fixture(true);
+        let before_world = Arc::clone(&stage.world);
+        let before_ticks = stage.region.ticks.activated_snapshot();
+        let error = stage.try_poll(chunk, 10).unwrap_err();
+        assert!(error.downcast_ref::<MissingPostprocessingChunk>().is_none());
+        assert!(Arc::ptr_eq(&stage.world, &before_world));
+        assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+        assert!(!stage.failed && stage.active.is_none());
     }
 
     fn bonus_chest_fixture() -> (GeneratedPostprocessing, Arc<World>) {

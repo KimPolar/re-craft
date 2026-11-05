@@ -3032,6 +3032,8 @@ mod tests {
         }
         let preset_path = pack.join("data/example/worldgen/world_preset/test.json");
         let mut spawn_preset: Value = serde_json::from_slice(&std::fs::read(&preset_path)?)?;
+        spawn_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["disable_mob_generation"] =
+            json!(true);
         spawn_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["noise_router"]
             ["final_density"] = json!({
             "type":"range_choice",
@@ -3065,7 +3067,7 @@ mod tests {
             0,
             None,
         )?;
-        let spawned = match spawn_worker
+        let mut spawned = match spawn_worker
             .result
             .recv_timeout(std::time::Duration::from_secs(120))?
         {
@@ -3083,6 +3085,69 @@ mod tests {
                 .unwrap()
                 .contains_key(&ResourceId::parse("example:treasure")?)
         );
+        let snapshot = Arc::clone(
+            spawned
+                .pack_snapshot
+                .as_ref()
+                .context("spawn snapshot missing")?,
+        );
+        let mut spawn_resources = native_resources::packs::ResourceStack::open(&game)?;
+        let selection = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/structures".into()],
+            disabled: vec![],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        ensure!(
+            spawn_resources
+                .configure_snapshot_data(snapshot, &selection)?
+                .is_empty(),
+            "data pack selection changed"
+        );
+        let blocks = spawn_resources.vanilla_block_ids()?;
+        let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+            &mut spawn_resources,
+            &blocks,
+        )?);
+        let targets = spawned.mesh.targets.as_deref().unwrap().clone();
+        for pos in &targets {
+            spawned.batch.request_spawn_without_mobs(*pos, false)?;
+            let step = generation_step(
+                &mut spawned.batch,
+                &mut spawn_resources,
+                &mut |_: &Value| -> Result<CarverBlockState> {
+                    anyhow::bail!("unexpected classification")
+                },
+                &mut |_: &Value| -> Result<BlockState> { anyhow::bail!("unexpected resolution") },
+            )?;
+            assert_eq!(step, Some((*pos, GenerationStage::Spawn)));
+            assert_eq!(
+                spawned.batch.complete_generated_entity_records(*pos)?,
+                Some([].as_slice())
+            );
+        }
+        let suggestion = spawned.suggested_spawn.unwrap();
+        let origin = IVec3::new(24, suggestion.y, 8);
+        spawned.suggested_spawn = Some(origin);
+        let player = native_session::PlayerState {
+            position: (origin - spawned.mesh.origin).as_vec3() + glam::Vec3::new(0.5, 0.0, 0.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let candidates =
+            native_session::world_spawn::WorldSpawnCandidates::new(origin, 0, 100.0, 0)?;
+        let (session, mut search) = spawned.start_player_spawn_search(
+            player,
+            tags,
+            std::iter::empty(),
+            Some(candidates),
+        )?;
+        assert!(matches!(
+            spawned.poll_player_spawn(&session, &mut search, None, 256)?,
+            native_session::loaded::GeneratedPlayerSpawnProgress::Found(_)
+        ));
         let worker = GenerationWorker::start_selected_structures_at_spawn(
             crate::fresh_generation::FreshGenerationSettings {
                 minecraft_dir: game.clone(),

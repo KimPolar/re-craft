@@ -654,6 +654,32 @@ struct GeneratedEntitySources {
     untracked: bool,
 }
 
+fn structures_cannot_spawn_entities(
+    structures: &PreparedStructureStages,
+    registry: &StructureDecorationSchedule,
+    pos: ChunkPos,
+    completed: impl Fn(ChunkPos) -> bool,
+) -> bool {
+    let registered: BTreeSet<_> = registry
+        .steps()
+        .iter()
+        .flatten()
+        .map(|entry| &entry.id)
+        .collect();
+    (-1..=1).all(|dz| {
+        (-1..=1).all(|dx| {
+            let Some(x) = pos.x.checked_add(dx) else {
+                return false;
+            };
+            let Some(z) = pos.z.checked_add(dz) else {
+                return false;
+            };
+            let source = ChunkPos { x, z };
+            completed(source) && structures.only_buried_treasure_references(source, &registered)
+        })
+    })
+}
+
 impl GeneratedEntitySources {
     fn complete_spawn(&mut self, pos: ChunkPos, additions: &[super::GeneratedEntityAddition]) {
         if additions.iter().all(|addition| {
@@ -673,10 +699,10 @@ impl GeneratedEntitySources {
     fn complete_entity_coverage(
         &self,
         pos: ChunkPos,
-        structures_enabled: bool,
+        structures_entity_free: bool,
         features_entity_free: bool,
     ) -> bool {
-        !structures_enabled && features_entity_free && self.contains_complete_spawn(pos)
+        structures_entity_free && features_entity_free && self.contains_complete_spawn(pos)
     }
 }
 
@@ -969,8 +995,8 @@ impl FreshTerrainBatch {
             .recorded_generated_entities(pos)
     }
 
-    /// Return complete records only when this no-structures batch has no
-    /// unverified entity-producing features and spawning was fully recorded.
+    /// Return complete records only when structure and feature entity sources
+    /// are verified and spawning was fully recorded.
     /// Unsupported or cross-chunk entity sources keep the result unknown.
     pub fn complete_generated_entity_records(
         &self,
@@ -984,9 +1010,19 @@ impl FreshTerrainBatch {
             "entity completeness requires a spawn-complete chunk"
         );
         let decoration = self.decoration.as_ref().context("decoration is missing")?;
+        let structures_entity_free = match &self.structures {
+            None => true,
+            Some(structures) => decoration.structures.as_ref().is_some_and(|registry| {
+                structures_cannot_spawn_entities(structures, registry, pos, |source| {
+                    self.schedule
+                        .completed(source)
+                        .is_some_and(|stage| stage >= GenerationStage::Features)
+                })
+            }),
+        };
         if !self.entity_sources.complete_entity_coverage(
             pos,
-            self.structures.is_some(),
+            structures_entity_free,
             decoration.features_cannot_spawn_entities,
         ) {
             return Ok(None);
@@ -2870,6 +2906,10 @@ impl FreshTerrainBatch {
             native_persistence::save::FreshRegionDraft,
         >,
     > {
+        ensure!(
+            self.structures.is_none(),
+            "structure world persistence is not yet supported"
+        );
         let positions: Vec<_> = positions.into_iter().collect();
         let chunks = self.postprocessed_chunk_drafts(processed, positions.iter().copied())?;
         let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
@@ -3539,6 +3579,106 @@ mod entity_source_tests {
     }
 
     #[test]
+    fn structure_entity_evidence_requires_complete_known_neighbor_decorations() {
+        use crate::worldgen::structure_references::{
+            StructureStartBounds, collect_ordered_structure_references,
+        };
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        struct Registry;
+        impl ResourceProvider for Registry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/treasure.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:treasure")?])
+            }
+        }
+        let registry = StructureDecorationSchedule::load(&mut Registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:treasure").unwrap();
+        let start = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 64, 8],
+            orientation: None,
+            bounds: BoundingBox::new([9, 64, 9], [9, 64, 9]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let bounds = StructureStartBounds::from_simple(id.clone(), &start).unwrap();
+        let mut structures = PreparedStructureStages::default();
+        structures
+            .starts
+            .insert(center, BTreeMap::from([(id.clone(), start)]));
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let source = ChunkPos { x, z };
+                let refs = collect_ordered_structure_references(source, |pos| {
+                    Ok(if pos == center {
+                        vec![bounds.clone()]
+                    } else {
+                        vec![]
+                    })
+                })
+                .unwrap();
+                structures.references.insert(source, refs);
+            }
+        }
+        assert!(!structures.references[&center].membership().is_empty());
+        assert!(structures_cannot_spawn_entities(
+            &structures,
+            &registry,
+            center,
+            |_| true
+        ));
+        assert!(!structures_cannot_spawn_entities(
+            &structures,
+            &registry,
+            center,
+            |pos| pos != ChunkPos { x: 1, z: 0 }
+        ));
+        structures.references.remove(&ChunkPos { x: -1, z: 0 });
+        assert!(!structures_cannot_spawn_entities(
+            &structures,
+            &registry,
+            center,
+            |_| true
+        ));
+        let refs = collect_ordered_structure_references(ChunkPos { x: -1, z: 0 }, |pos| {
+            Ok(if pos == center {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        structures.references.insert(ChunkPos { x: -1, z: 0 }, refs);
+        structures
+            .starts
+            .get_mut(&center)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .kind = SimpleStructureKind::SwampHut;
+        assert!(!structures_cannot_spawn_entities(
+            &structures,
+            &registry,
+            center,
+            |_| true
+        ));
+        assert!(!structures_cannot_spawn_entities(
+            &structures,
+            &registry,
+            ChunkPos { x: i32::MAX, z: 0 },
+            |_| true
+        ));
+    }
+
+    #[test]
     fn feature_entity_evidence_uses_active_inline_and_registered_definitions() {
         let mut data = Data::default();
         let put = |data: &mut Data, path: &str, value: Value| {
@@ -3715,9 +3855,9 @@ mod entity_source_tests {
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[local]);
         assert!(evidence.contains_complete_spawn(chunk));
-        assert!(evidence.complete_entity_coverage(chunk, false, true));
-        assert!(!evidence.complete_entity_coverage(chunk, true, true));
-        assert!(!evidence.complete_entity_coverage(chunk, false, false));
+        assert!(evidence.complete_entity_coverage(chunk, true, true));
+        assert!(!evidence.complete_entity_coverage(chunk, false, true));
+        assert!(!evidence.complete_entity_coverage(chunk, true, false));
         evidence.complete_spawn(ChunkPos { x: 1, z: 0 }, &[neighbor]);
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[]);

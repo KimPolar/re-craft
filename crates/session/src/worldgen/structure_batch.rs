@@ -175,6 +175,27 @@ pub(super) struct PreparedStructureStages {
 }
 
 impl PreparedStructureStages {
+    /// Check membership only; entity-source coverage does not depend on the
+    /// structure decoration iteration order.
+    pub(super) fn only_buried_treasure_references(
+        &self,
+        pos: ChunkPos,
+        registered: &BTreeSet<&ResourceId>,
+    ) -> bool {
+        self.references.get(&pos).is_some_and(|references| {
+            references.membership().iter().all(|(id, positions)| {
+                registered.contains(id) && positions.iter().all(|packed| {
+                    let bits = *packed as u64;
+                    let source = ChunkPos { x: bits as u32 as i32, z: (bits >> 32) as u32 as i32 };
+                    self.starts.get(&source).and_then(|starts| starts.get(id)).is_some_and(|start| {
+                        start.chunk == [source.x, source.z]
+                            && start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure
+                    })
+                })
+            })
+        })
+    }
+
     pub(super) fn decoration_plan<'a>(
         &'a self,
         pos: ChunkPos,

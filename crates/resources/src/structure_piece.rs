@@ -61,6 +61,77 @@ pub enum BuriedTreasureOutcome {
     },
 }
 
+/// Coordinate and horizontal-facing transforms used by Java StructurePiece.
+/// Blocks with additional orientation-dependent properties must still apply
+/// their own mirror and rotation rules before being placed.
+#[derive(Clone, Copy, Debug)]
+pub struct StructureFrame {
+    pub bounds: BoundingBox,
+    pub orientation: Option<HorizontalDirection>,
+}
+
+impl StructureFrame {
+    /// Java performs these coordinate operations with wrapping 32-bit ints.
+    pub fn world_position(&self, [x, y, z]: [i32; 3]) -> [i32; 3] {
+        use HorizontalDirection::{East, North, South, West};
+        match self.orientation {
+            None => [x, y, z],
+            Some(North) => [
+                self.bounds.min[0].wrapping_add(x),
+                self.bounds.min[1].wrapping_add(y),
+                self.bounds.max[2].wrapping_sub(z),
+            ],
+            Some(South) => [
+                self.bounds.min[0].wrapping_add(x),
+                self.bounds.min[1].wrapping_add(y),
+                self.bounds.min[2].wrapping_add(z),
+            ],
+            Some(West) => [
+                self.bounds.max[0].wrapping_sub(z),
+                self.bounds.min[1].wrapping_add(y),
+                self.bounds.min[2].wrapping_add(x),
+            ],
+            Some(East) => [
+                self.bounds.min[0].wrapping_add(z),
+                self.bounds.min[1].wrapping_add(y),
+                self.bounds.min[2].wrapping_add(x),
+            ],
+        }
+    }
+
+    /// Transform a horizontal facing by the piece's mirror, then rotation.
+    pub fn horizontal_facing(&self, mut facing: HorizontalDirection) -> HorizontalDirection {
+        use HorizontalDirection::{East, North, South, West};
+        if matches!(self.orientation, Some(South | West)) {
+            facing = match facing {
+                North => South,
+                South => North,
+                other => other,
+            };
+        }
+        if matches!(self.orientation, Some(West | East)) {
+            facing = clockwise(facing);
+        }
+        facing
+    }
+
+    /// StairBlock mirrors its left/right shape only when the original facing
+    /// points along the mirrored Z axis. Rotation does not change the shape.
+    pub fn stair_shape(&self, facing: HorizontalDirection, shape: &str) -> Option<&'static str> {
+        use HorizontalDirection::{North, South};
+        let mirrored = matches!(self.orientation, Some(South | HorizontalDirection::West))
+            && matches!(facing, North | South);
+        Some(match (shape, mirrored) {
+            ("straight", _) => "straight",
+            ("inner_left", false) | ("inner_right", true) => "inner_left",
+            ("inner_right", false) | ("inner_left", true) => "inner_right",
+            ("outer_left", false) | ("outer_right", true) => "outer_left",
+            ("outer_right", false) | ("outer_left", true) => "outer_right",
+            _ => return None,
+        })
+    }
+}
+
 /// Ground alignment saved by Java's scattered structure pieces as `HPos`.
 /// This adjusts the piece bounds only; block and entity placement must follow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -498,6 +569,42 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(p.bounds.min[1], 76);
+    }
+
+    #[test]
+    fn structure_frame_tracks_height_alignment_and_orientation() {
+        let mut p = piece();
+        p.kind = SimpleStructureKind::SwampHut;
+        p.orientation = Some(HorizontalDirection::West);
+        p.bounds = BoundingBox::new([-4, 40, 9], [4, 46, 15]).unwrap();
+        let mut height = ScatteredGroundHeight::default();
+        let clip = BoundingBox::new([-16, 0, 0], [15, 255, 31]).unwrap();
+        assert!(
+            height
+                .update_average(&mut p, clip, 0, |_, _| Ok(70))
+                .unwrap()
+        );
+        let frame = StructureFrame {
+            bounds: p.bounds,
+            orientation: p.orientation,
+        };
+        assert_eq!(frame.world_position([1, 2, 3]), [1, 72, 10]);
+        assert_eq!(
+            frame.horizontal_facing(HorizontalDirection::North),
+            HorizontalDirection::West
+        );
+        assert_eq!(
+            frame.stair_shape(HorizontalDirection::North, "outer_left"),
+            Some("outer_right")
+        );
+        assert_eq!(
+            frame.stair_shape(HorizontalDirection::East, "outer_left"),
+            Some("outer_left")
+        );
+        assert_eq!(
+            frame.stair_shape(HorizontalDirection::East, "unknown"),
+            None
+        );
     }
 
     #[test]

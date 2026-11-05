@@ -231,72 +231,20 @@ impl FreshWorldStage {
                 "staged world moved outside its staging directory"
             );
             let reserved = crate::world_creation::reserve_world_folder(&saves, name, default_name)?;
-            let result = (|| -> Result<()> {
-                let mut directories: Vec<_> = self
-                    .manifest
-                    .iter()
-                    .filter_map(|(path, hash)| hash.is_none().then_some(path))
-                    .collect();
-                directories.sort_by_key(|path| path.components().count());
-                for directory in directories {
-                    fs::create_dir(reserved.path.join(directory))?;
-                }
-                for (relative, hash) in &self.manifest {
-                    if let Some(hash) = hash
-                        && relative != Path::new("level.dat")
-                    {
-                        copy_new_verified(
-                            &root.join(relative),
-                            &reserved.path.join(relative),
-                            *hash,
-                        )?;
-                    }
-                }
-                let expected_level = self
-                    .manifest
-                    .get(Path::new("level.dat"))
-                    .and_then(|entry| *entry)
-                    .context("staged level.dat is missing")?;
-                let mut level = tempfile::Builder::new()
-                    .prefix(".re-craft-level-")
-                    .tempfile_in(&reserved.path)?;
-                let mut source = File::open(root.join("level.dat"))?;
-                std::io::copy(&mut source, level.as_file_mut())?;
-                level.as_file_mut().sync_all()?;
-                ensure!(
-                    hash_file(level.path())? == expected_level,
-                    "staged level.dat changed while copying"
-                );
-                let temporary = PathBuf::from(
-                    level
-                        .path()
-                        .file_name()
-                        .context("temporary level name missing")?,
-                );
-                let mut actual = staged_world_manifest(&reserved.path, true)?;
-                ensure!(
-                    actual.remove(&temporary) == Some(Some(expected_level)),
-                    "temporary level data changed"
-                );
-                let mut expected = self.manifest.clone();
-                expected.remove(Path::new("level.dat"));
-                ensure!(
-                    actual == expected,
-                    "new world files changed before publication"
-                );
-                self.verify()?;
-                level
-                    .persist_noclobber(reserved.path.join("level.dat"))
-                    .map_err(|error| error.error)
-                    .context("cannot publish level.dat")?;
-                Ok(())
-            })();
-            result.with_context(|| {
-                format!(
-                    "new world was not published; incomplete files remain at {}",
-                    reserved.path.display()
-                )
-            })?;
+            let result = write_fresh_creation_journal(&staging, &reserved.name, &self.manifest)
+                .and_then(|()| {
+                    install_fresh_world(&root, &staging, &reserved.path, &self.manifest)
+                });
+            if let Err(error) = result {
+                let preserved = self._directory.keep();
+                return Err(error).with_context(|| {
+                    format!(
+                        "new world was not published; incomplete files remain at {}; staging files remain at {}",
+                        reserved.path.display(),
+                        preserved.display()
+                    )
+                });
+            }
             Ok(PublishedFreshWorld {
                 name: reserved.name.clone(),
                 path: reserved.path.clone(),
@@ -373,18 +321,284 @@ fn staged_world_manifest(
 }
 
 #[cfg(windows)]
-fn copy_new_verified(source: &Path, target: &Path, expected: [u8; 32]) -> Result<()> {
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
+const FRESH_CREATION_JOURNAL: &str = "creation.json";
+#[cfg(windows)]
+const MAX_FRESH_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
+// UTF-16 code units preserve Windows names that are not valid Unicode strings.
+#[cfg(windows)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshCreationJournal {
+    version: u32,
+    target: String,
+    entries: Vec<FreshCreationEntry>,
+}
+
+#[cfg(windows)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshCreationEntry {
+    components: Vec<Vec<u16>>,
+    hash: Option<[u8; 32]>,
+}
+
+#[cfg(windows)]
+fn checked_component(component: &std::ffi::OsStr) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+    let mut components = Path::new(component).components();
+    ensure!(
+        matches!(components.next(), Some(Component::Normal(part)) if part == component)
+            && components.next().is_none()
+            && !component
+                .encode_wide()
+                .any(|unit| unit == 0 || unit == b':' as u16),
+        "invalid fresh world journal path component"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_fresh_creation_journal(
+    staging: &Path,
+    target: &str,
+    manifest: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    checked_component(target.as_ref())?;
+    let mut entries = Vec::with_capacity(manifest.len());
+    for (path, hash) in manifest {
+        let mut components = Vec::new();
+        for component in path.components() {
+            let std::path::Component::Normal(part) = component else {
+                anyhow::bail!("invalid staged path");
+            };
+            checked_component(part)?;
+            components.push(part.encode_wide().collect());
+        }
+        ensure!(!components.is_empty(), "empty staged path");
+        entries.push(FreshCreationEntry {
+            components,
+            hash: *hash,
+        });
+    }
+    let bytes = serde_json::to_vec(&FreshCreationJournal {
+        version: 1,
+        target: target.to_owned(),
+        entries,
+    })?;
+    ensure!(
+        bytes.len() as u64 <= MAX_FRESH_JOURNAL_BYTES,
+        "fresh world journal is too large"
+    );
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(target)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
+        .open(staging.join(FRESH_CREATION_JOURNAL))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_fresh_creation_journal(
+    staging: &Path,
+) -> Result<(String, BTreeMap<PathBuf, Option<[u8; 32]>>)> {
+    use std::os::windows::ffi::OsStringExt;
+    let path = staging.join(FRESH_CREATION_JOURNAL);
+    let metadata = fs::symlink_metadata(&path)?;
     ensure!(
-        hash_file(target)? == expected,
+        ordinary(&metadata) && metadata.is_file() && metadata.len() <= MAX_FRESH_JOURNAL_BYTES,
+        "invalid fresh world journal"
+    );
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_FRESH_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_FRESH_JOURNAL_BYTES,
+        "fresh world journal is too large"
+    );
+    let journal: FreshCreationJournal =
+        serde_json::from_slice(&bytes).context("invalid fresh world journal")?;
+    ensure!(
+        journal.version == 1 && journal.entries.len() <= 1_000_000,
+        "unsupported fresh world journal"
+    );
+    checked_component(journal.target.as_ref())?;
+    let mut manifest = BTreeMap::new();
+    for entry in journal.entries {
+        ensure!(
+            !entry.components.is_empty(),
+            "empty fresh world journal path"
+        );
+        let mut path = PathBuf::new();
+        for component in entry.components {
+            let component = std::ffi::OsString::from_wide(&component);
+            checked_component(&component)?;
+            path.push(component);
+        }
+        ensure!(
+            path != Path::new("session.lock"),
+            "journal contains session lock"
+        );
+        ensure!(
+            manifest.insert(path, entry.hash).is_none(),
+            "duplicate fresh world journal path"
+        );
+    }
+    ensure!(
+        matches!(manifest.get(Path::new("level.dat")), Some(Some(_))),
+        "journal is missing level.dat"
+    );
+    for path in manifest.keys() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            ensure!(
+                manifest.get(parent) == Some(&None),
+                "journal is missing a parent directory"
+            );
+        }
+    }
+    Ok((journal.target, manifest))
+}
+
+/// Resume a recognized interrupted publication, without replacing existing data.
+/// The staging directory is retained after recovery for explicit inspection.
+#[cfg(windows)]
+pub fn recover_fresh_world(saves: &Path, staging: &Path) -> Result<PublishedFreshWorld> {
+    let saves = saves
+        .canonicalize()
+        .context("cannot resolve saves directory")?;
+    let metadata = fs::symlink_metadata(staging)?;
+    ensure!(
+        ordinary(&metadata) && metadata.is_dir(),
+        "invalid fresh world staging directory"
+    );
+    let staging = staging.canonicalize()?;
+    ensure!(
+        staging.parent() == Some(saves.as_path())
+            && staging
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".re-craft-world-")),
+        "fresh world staging directory is outside saves"
+    );
+    let (name, manifest) = read_fresh_creation_journal(&staging)?;
+    let root = staging.join("world");
+    let root_metadata = fs::symlink_metadata(&root)?;
+    ensure!(
+        ordinary(&root_metadata)
+            && root_metadata.is_dir()
+            && root.canonicalize()?.parent() == Some(staging.as_path()),
+        "invalid staged world directory"
+    );
+    let target = saves.join(&name);
+    let target_metadata = fs::symlink_metadata(&target)?;
+    ensure!(
+        ordinary(&target_metadata) && target_metadata.is_dir(),
+        "invalid destination world directory"
+    );
+    let target = target.canonicalize()?;
+    ensure!(
+        target.parent() == Some(saves.as_path()) && target != staging,
+        "invalid destination world path"
+    );
+    let session = WorldSessionGuard::acquire(&target).context("cannot lock destination world")?;
+    install_fresh_world(&root, &staging, &target, &manifest)?;
+    Ok(PublishedFreshWorld {
+        name,
+        path: target,
+        session,
+    })
+}
+
+#[cfg(windows)]
+fn install_fresh_world(
+    root: &Path,
+    staging: &Path,
+    target: &Path,
+    manifest: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+) -> Result<()> {
+    ensure!(
+        staged_world_manifest(root, false)? == *manifest,
+        "staged world changed before publication"
+    );
+    let actual = staged_world_manifest(target, true)?;
+    for (path, hash) in &actual {
+        ensure!(
+            manifest.get(path) == Some(hash),
+            "destination contains changed or unexpected files"
+        );
+    }
+    if actual.contains_key(Path::new("level.dat")) {
+        ensure!(actual == *manifest, "published world is incomplete");
+        return Ok(());
+    }
+    let mut directories: Vec<_> = manifest
+        .iter()
+        .filter_map(|(path, hash)| hash.is_none().then_some(path))
+        .collect();
+    directories.sort_by_key(|path| path.components().count());
+    for directory in directories {
+        if !actual.contains_key(directory) {
+            fs::create_dir(target.join(directory))?;
+        }
+    }
+    for (path, hash) in manifest {
+        if let Some(hash) = hash
+            && path != Path::new("level.dat")
+            && !actual.contains_key(path)
+        {
+            copy_new_verified(&root.join(path), &target.join(path), staging, *hash)?;
+        }
+    }
+    let expected_level = manifest
+        .get(Path::new("level.dat"))
+        .and_then(|entry| *entry)
+        .context("staged level.dat is missing")?;
+    let mut expected = manifest.clone();
+    expected.remove(Path::new("level.dat"));
+    ensure!(
+        staged_world_manifest(target, true)? == expected,
+        "new world files changed before publication"
+    );
+    ensure!(
+        staged_world_manifest(root, false)? == *manifest,
+        "staged world changed before publication"
+    );
+    copy_new_verified(
+        &root.join("level.dat"),
+        &target.join("level.dat"),
+        staging,
+        expected_level,
+    )
+    .context("cannot publish level.dat")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_new_verified(
+    source: &Path,
+    target: &Path,
+    staging: &Path,
+    expected: [u8; 32],
+) -> Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = tempfile::Builder::new()
+        .prefix(".re-craft-copy-")
+        .tempfile_in(staging)?;
+    std::io::copy(&mut input, output.as_file_mut())?;
+    output.as_file_mut().sync_all()?;
+    ensure!(
+        hash_file(output.path())? == expected,
         "new world file differs from its staged source"
     );
+    output
+        .persist_noclobber(target)
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -3822,6 +4036,25 @@ mod tests {
     }
 
     #[test]
+    fn fresh_world_publication_failure_preserves_staging_and_destination() {
+        let saves = test_world();
+        let stage = publishable_stage(saves.path());
+        let staging = stage._directory.path().to_owned();
+        fs::write(staging.join(FRESH_CREATION_JOURNAL), b"existing").unwrap();
+        let error = stage
+            .publish(saves.path(), "World", "New World")
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("staging files remain"));
+        assert_eq!(
+            fs::read(staging.join(FRESH_CREATION_JOURNAL)).unwrap(),
+            b"existing"
+        );
+        assert!(staging.join("world/level.dat").is_file());
+        assert!(!saves.path().join("World/level.dat").exists());
+    }
+
+    #[test]
     fn fresh_world_data_packs_are_sealed_before_publication() {
         let parent = test_world();
         let source = test_world();
@@ -3858,9 +4091,148 @@ mod tests {
         fs::write(&source, b"source").unwrap();
         let file = parent.path().join("file");
         fs::write(&file, b"file").unwrap();
-        assert!(copy_new_verified(&source, &file, hash_file(&source).unwrap()).is_err());
+        assert!(
+            copy_new_verified(&source, &file, parent.path(), hash_file(&source).unwrap()).is_err()
+        );
         assert_eq!(fs::read(file).unwrap(), b"file");
         assert_eq!(fs::read(source).unwrap(), b"source");
+    }
+
+    fn interrupted_fresh_world(saves: &Path) -> (PathBuf, PathBuf) {
+        let stage = publishable_stage(saves);
+        let reserved =
+            crate::world_creation::reserve_world_folder(saves, "World", "New World").unwrap();
+        let staging = stage._directory.path().to_owned();
+        write_fresh_creation_journal(&staging, &reserved.name, &stage.manifest).unwrap();
+        fs::create_dir(reserved.path.join("data")).unwrap();
+        fs::create_dir(reserved.path.join("data/minecraft")).unwrap();
+        let relative = Path::new("data/minecraft/world_gen_settings.dat");
+        copy_new_verified(
+            &stage.root.join(relative),
+            &reserved.path.join(relative),
+            &staging,
+            stage.manifest[relative].unwrap(),
+        )
+        .unwrap();
+        let target = reserved.path.clone();
+        drop(reserved);
+        let preserved = stage._directory.keep();
+        (preserved, target)
+    }
+
+    #[test]
+    fn fresh_world_recovery_resumes_without_replacing_existing_files() {
+        let saves = test_world();
+        let (staging, target) = interrupted_fresh_world(saves.path());
+        let saved = fs::read(target.join("data/minecraft/world_gen_settings.dat")).unwrap();
+        fs::write(staging.join(".re-craft-copy-abandoned"), b"partial").unwrap();
+        assert!(!target.join("level.dat").exists());
+        let recovered = recover_fresh_world(saves.path(), &staging).unwrap();
+        assert_eq!(recovered.path, target);
+        assert_eq!(
+            fs::read(target.join("data/minecraft/world_gen_settings.dat")).unwrap(),
+            saved
+        );
+        assert!(target.join("level.dat").is_file());
+        assert!(WorldSessionGuard::acquire(&target).is_err());
+        assert!(staging.exists());
+        drop(recovered);
+        let recovered_again = recover_fresh_world(saves.path(), &staging).unwrap();
+        assert_eq!(recovered_again.path, target);
+    }
+
+    #[test]
+    fn fresh_world_recovery_rejects_changed_files_and_locks() {
+        let saves = test_world();
+        let (staging, target) = interrupted_fresh_world(saves.path());
+        let lock = WorldSessionGuard::acquire(&target).unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        drop(lock);
+        let installed = target.join("data/minecraft/world_gen_settings.dat");
+        fs::write(&installed, b"changed").unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert_eq!(fs::read(&installed).unwrap(), b"changed");
+        assert!(!target.join("level.dat").exists());
+        fs::copy(
+            staging.join("world/data/minecraft/world_gen_settings.dat"),
+            &installed,
+        )
+        .unwrap();
+        fs::write(target.join("unexpected"), b"user file").unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert_eq!(fs::read(target.join("unexpected")).unwrap(), b"user file");
+        fs::remove_file(target.join("unexpected")).unwrap();
+        fs::write(staging.join("world/level.dat"), b"changed").unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert!(!target.join("level.dat").exists());
+    }
+
+    #[test]
+    fn fresh_world_recovery_rejects_invalid_journal_paths() {
+        let saves = test_world();
+        let (staging, target) = interrupted_fresh_world(saves.path());
+        let path = staging.join(FRESH_CREATION_JOURNAL);
+        let mut journal: FreshCreationJournal =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        journal.target = "../other".into();
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert!(!target.join("level.dat").exists());
+        journal.target = "World".into();
+        journal.entries[0].components = vec![vec![46, 46], vec![101, 118, 105, 108]];
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert!(!target.join("level.dat").exists());
+    }
+
+    #[test]
+    fn fresh_world_crash_helper() {
+        let Some(saves) = std::env::var_os("RE_CRAFT_FRESH_CRASH_TEST") else {
+            return;
+        };
+        let saves = PathBuf::from(saves);
+        let stage = publishable_stage(&saves);
+        let reserved =
+            crate::world_creation::reserve_world_folder(&saves, "World", "New World").unwrap();
+        write_fresh_creation_journal(stage._directory.path(), &reserved.name, &stage.manifest)
+            .unwrap();
+        fs::create_dir(reserved.path.join("data")).unwrap();
+        fs::create_dir(reserved.path.join("data/minecraft")).unwrap();
+        let relative = Path::new("data/minecraft/world_gen_settings.dat");
+        copy_new_verified(
+            &stage.root.join(relative),
+            &reserved.path.join(relative),
+            stage._directory.path(),
+            stage.manifest[relative].unwrap(),
+        )
+        .unwrap();
+        // Terminate without running destructors, like a process interruption.
+        std::process::exit(24);
+    }
+
+    #[test]
+    fn fresh_world_recovery_survives_process_termination() {
+        let saves = test_world();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "save::tests::fresh_world_crash_helper"])
+            .env("RE_CRAFT_FRESH_CRASH_TEST", saves.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(24));
+        let staging = fs::read_dir(saves.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".re-craft-world-")
+            })
+            .unwrap();
+        assert!(!saves.path().join("World/level.dat").exists());
+        let recovered = recover_fresh_world(saves.path(), &staging).unwrap();
+        assert!(recovered.path.join("level.dat").is_file());
+        assert!(WorldSessionGuard::acquire(&recovered.path).is_err());
     }
 
     #[test]

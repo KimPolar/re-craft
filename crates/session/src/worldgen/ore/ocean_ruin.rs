@@ -149,6 +149,7 @@ mod tests {
             .align_ocean_ruin(&mut piece, &custom_ice, &water)
             .unwrap();
         assert_eq!(piece.selection.position, [8, 2, 8]);
-        assert_eq!(piece.bounds.min, [8, 90, 8]);
+        assert_eq!(piece.bounds.min, [8, 2, 8]);
+        assert_eq!(piece.bounds.max, [8, 2, 8]);
     }
 }

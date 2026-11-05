@@ -81,7 +81,6 @@ pub trait FloorWorld {
 }
 
 /// Find the postprocessing origin before processing or placing a piece.
-/// Java leaves the structure start's original bounding box unchanged.
 pub fn floor_position(
     piece: &Piece,
     size: [i32; 3],

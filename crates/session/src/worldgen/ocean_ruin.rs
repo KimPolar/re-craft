@@ -14,7 +14,7 @@ use serde_json::Value;
 pub struct PreparedPiece {
     pub selection: Piece,
     pub template: Arc<StructureTemplate>,
-    /// Initial Java template bounds, before ocean-floor postprocessing.
+    /// Java template bounds, updated when the piece is aligned to the floor.
     pub bounds: native_core::beardifier::BoundingBox,
 }
 
@@ -50,12 +50,97 @@ pub struct ProcessedRuinBlock {
     pub archaeology: Option<ArchaeologyReplacement>,
 }
 
+/// A structure-block DATA marker, retained separately from normal blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuinDataMarker {
+    pub source_index: usize,
+    pub position: [i32; 3],
+    pub metadata: native_persistence::nbt::JavaString,
+}
+
 impl PreparedPiece {
-    /// Update the template origin as Java does immediately before placement.
-    /// The original structure-start bounding box intentionally stays intact.
+    /// Java creates a fresh position-seeded random source each time it chooses
+    /// a palette, including for the later marker pass.
+    pub fn selected_palette_index(&self) -> Result<Option<usize>> {
+        let count = i32::try_from(self.template.palettes.len()).context("too many palettes")?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let [x, y, z] = self.selection.position;
+        let seed = native_resources::blockstates::positional_seed(x, y, z);
+        Ok(Some(
+            native_core::random::LegacyRandom::new(seed)
+                .next_int_bound(count)
+                .unwrap() as usize,
+        ))
+    }
+
+    /// Find DATA markers from the unprocessed template after successful block
+    /// placement. Decay does not remove them; only the placement box clips them.
+    pub fn data_markers(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        clip: native_core::beardifier::BoundingBox,
+    ) -> Result<Vec<RuinDataMarker>> {
+        let Some(index) = self.selected_palette_index()? else {
+            return Ok(Vec::new());
+        };
+        let palette = self.transformed_palette(registry, index)?;
+        self.data_markers_with_palette(index, &palette, clip)
+    }
+
+    fn data_markers_with_palette(
+        &self,
+        palette_index: usize,
+        palette: &[PreparedPaletteState],
+        clip: native_core::beardifier::BoundingBox,
+    ) -> Result<Vec<RuinDataMarker>> {
+        let mut markers = Vec::new();
+        for source_index in self.order_for_palette(palette_index, palette)? {
+            let block = &self.template.blocks[source_index];
+            if !matches!(
+                &palette[block.state],
+                PreparedPaletteState::StructureMarker { .. }
+            ) {
+                continue;
+            }
+            let position = self.block_position(block);
+            if !(0..3).all(|i| (clip.min[i]..=clip.max[i]).contains(&position[i])) {
+                continue;
+            }
+            let Some(nbt) = &block.nbt else { continue };
+            let Some(Tag::String(mode)) = nbt.get("mode") else {
+                anyhow::bail!("structure marker mode missing or invalid")
+            };
+            if mode.matches("SAVE") || mode.matches("LOAD") || mode.matches("CORNER") {
+                continue;
+            }
+            ensure!(mode.matches("DATA"), "invalid structure marker mode");
+            let metadata = match nbt.get("metadata") {
+                Some(Tag::String(value)) => value.clone(),
+                _ => "".into(),
+            };
+            markers.push(RuinDataMarker {
+                source_index,
+                position,
+                metadata,
+            });
+        }
+        Ok(markers)
+    }
+
+    /// Update the template origin and bounds as Java does before placement.
     pub fn align_to_floor(&mut self, world: &mut impl ocean_ruin::FloorWorld) -> Result<()> {
         let position = ocean_ruin::floor_position(&self.selection, self.template.size, world)?;
+        let bounds = native_resources::structure_transform::bounding_box(
+            self.template.size,
+            position,
+            native_resources::structure_transform::Mirror::None,
+            self.selection.rotation,
+            [0; 3],
+        )?;
         self.selection.position = position;
+        self.bounds = bounds;
         Ok(())
     }
 
@@ -512,7 +597,10 @@ mod tests {
             TemplateBlock {
                 position: [0, 1, 0],
                 state: 3,
-                nbt: Some(Tag::Compound(vec![])),
+                nbt: Some(Tag::Compound(vec![
+                    ("mode".into(), Tag::String("DATA".into())),
+                    ("metadata".into(), Tag::String("chest".into())),
+                ])),
             },
         ];
         let mut piece = PreparedPiece {
@@ -551,6 +639,31 @@ mod tests {
                     position: [10, 40, -4]
                 },
             ]
+        );
+        piece.selection.integrity = 0.0;
+        let clip = native_core::beardifier::BoundingBox::new([10, 41, -5], [10, 41, -5]).unwrap();
+        let markers = piece.data_markers_with_palette(0, &palette, clip).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].source_index, 3);
+        assert_eq!(markers[0].position, [10, 41, -5]);
+        assert!(markers[0].metadata.matches("chest"));
+        let outside = native_core::beardifier::BoundingBox::new([0; 3], [0; 3]).unwrap();
+        assert!(
+            piece
+                .data_markers_with_palette(0, &palette, outside)
+                .unwrap()
+                .is_empty()
+        );
+        Arc::make_mut(&mut piece.template).blocks[3].nbt = Some(Tag::Compound(vec![(
+            "mode".into(),
+            Tag::String("invalid".into()),
+        )]));
+        assert!(piece.data_markers_with_palette(0, &palette, clip).is_err());
+        assert!(
+            piece
+                .data_markers_with_palette(0, &palette, outside)
+                .unwrap()
+                .is_empty()
         );
         piece.selection.integrity = f32::NAN;
         assert!(piece.first_pass_with_palette(0, &palette).is_err());
@@ -712,6 +825,191 @@ mod tests {
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn vanilla_ruin_archaeology_matches_java() -> Result<()> {
         compare_vanilla_ruin_processors(true)
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn vanilla_ruin_markers_and_palettes_match_java() -> Result<()> {
+        use native_resources::structure_transform::Rotation;
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = temp.path().join("OceanRuinMarkersOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/OceanRuinMarkersOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut names = Vec::new();
+        for prefix in ["brick", "cracked", "mossy", "warm"] {
+            for n in 1..=8 {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for prefix in ["big_brick", "big_cracked", "big_mossy"] {
+            for n in [1, 2, 3, 8] {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for n in 4..=7 {
+            names.push(format!("underwater_ruin/big_warm_{n}"));
+        }
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("OceanRuinMarkersOracle")
+            .args(&names)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout)?;
+        let mut rows = output.lines().filter(|line| {
+            line.starts_with("P\t") || line.starts_with("T\t") || line.starts_with("M\t")
+        });
+        for count in [1, 2, 3, 7, 16, 257] {
+            let template = Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [1; 3],
+                palettes: vec![vec![]; count],
+                blocks: vec![],
+                entities: vec![],
+            });
+            let mut piece = PreparedPiece {
+                selection: Piece {
+                    template: "minecraft:test".into(),
+                    position: [0; 3],
+                    rotation: Rotation::None,
+                    integrity: 1.0,
+                    large: false,
+                },
+                template,
+                bounds: native_core::beardifier::BoundingBox::new([0; 3], [0; 3]).unwrap(),
+            };
+            for i in 0..128 {
+                piece.selection.position = [i * 173 - 10000, i * 19 % 511 - 255, 1000 - i * 237];
+                let row = rows.next().context("missing palette row")?;
+                let fields: Vec<_> = row.split('\t').collect();
+                assert_eq!(fields[0], "P");
+                assert_eq!(fields[1].parse::<usize>()?, count);
+                assert_eq!(fields[2].parse::<i32>()?, i);
+                assert_eq!(piece.selected_palette_index()?, Some(fields[3].parse()?));
+            }
+        }
+        struct Flat(i32);
+        impl ocean_ruin::FloorWorld for Flat {
+            fn min_y(&self) -> i32 {
+                -64
+            }
+            fn ocean_floor_height(&mut self, _: i32, _: i32) -> Result<i32> {
+                Ok(self.0)
+            }
+            fn floor_scan_passable(&mut self, _: [i32; 3]) -> Result<bool> {
+                Ok(false)
+            }
+        }
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let rotations = [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Clockwise180,
+            Rotation::Counterclockwise90,
+        ];
+        let mut total = 0;
+        for (i, name) in names.iter().enumerate() {
+            let row = rows.next().context("missing template header")?;
+            let fields: Vec<_> = row.split('\t').collect();
+            assert_eq!(fields[0], "T");
+            assert_eq!(fields[1], name);
+            let count: usize = fields[2].parse()?;
+            let expected_min: [i32; 3] =
+                [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+            let expected_max: [i32; 3] =
+                [fields[6].parse()?, fields[7].parse()?, fields[8].parse()?];
+            let origin = [i as i32 * 7 - 120, 45 + i as i32 % 7, 170 - i as i32 * 13];
+            let template = Arc::new(
+                StructureTemplate::load(&mut resources, &ResourceId::parse(name)?)?
+                    .context("missing template")?,
+            );
+            let mut piece = PreparedPiece {
+                selection: Piece {
+                    template: format!("minecraft:{name}"),
+                    position: [origin[0], 90, origin[2]],
+                    rotation: rotations[i % 4],
+                    integrity: 0.0,
+                    large: false,
+                },
+                template,
+                bounds: native_core::beardifier::BoundingBox::new([0; 3], [0; 3]).unwrap(),
+            };
+            piece.align_to_floor(&mut Flat(origin[1]))?;
+            assert_eq!(piece.bounds.min, expected_min, "{name}");
+            assert_eq!(piece.bounds.max, expected_max, "{name}");
+            let radius = if i % 2 == 0 { 32 } else { 3 };
+            let clip = native_core::beardifier::BoundingBox::new(
+                origin.map(|v| v - radius),
+                origin.map(|v| v + radius),
+            )
+            .unwrap();
+            let markers = piece.data_markers(&registry, clip)?;
+            assert_eq!(markers.len(), count, "{name}");
+            for marker in markers {
+                let row = rows.next().context("missing marker")?;
+                let fields: Vec<_> = row.split('\t').collect();
+                assert_eq!(fields[0], "M");
+                let position: [i32; 3] =
+                    [fields[1].parse()?, fields[2].parse()?, fields[3].parse()?];
+                assert_eq!(marker.position, position, "{name}");
+                assert!(marker.metadata.matches(fields[4]), "{name}");
+                total += 1;
+            }
+        }
+        assert!(rows.next().is_none());
+        assert!(total > 0);
+        println!(
+            "verified 768 palette choices and {total} clipped markers with updated bounds across {} ruins",
+            names.len()
+        );
+        Ok(())
     }
 
     fn compare_vanilla_ruin_processors(archaeology: bool) -> Result<()> {

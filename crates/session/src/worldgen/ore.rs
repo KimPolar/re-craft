@@ -50,6 +50,56 @@ use super::{
 mod buried_treasure;
 mod swamp_hut;
 
+trait PlannedHutPlacement {
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+    ) -> Result<()>;
+}
+
+struct StagedHutPlacement<'a, C, P> {
+    states: &'a mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+    random: &'a mut native_resources::worldgen_region_random::RegionRandom,
+    variants: &'a native_resources::cat_variants::CatSpawnVariants,
+    construct: &'a mut C,
+    condition: &'a mut P,
+}
+
+impl<C, P> PlannedHutPlacement for StagedHutPlacement<'_, C, P>
+where
+    C: Clone
+        + FnMut(
+            native_resources::structure_piece::swamp_hut::HutMob,
+        ) -> Result<super::FreshCreatureRandom>,
+    P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+{
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+    ) -> Result<()> {
+        let state = self
+            .states
+            .get_mut(key)
+            .context("swamp hut piece state is missing")?;
+        region.resume_swamp_hut_with_initialized_mobs(
+            start,
+            state,
+            clip,
+            self.random,
+            self.variants,
+            self.construct,
+            self.condition,
+        )?;
+        Ok(())
+    }
+}
+
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
 pub struct DecorationRegion<'a> {
@@ -914,7 +964,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None, None, None, None)
+        self.execute_inner(terrain, structures_enabled, None, None, None, None, None)
     }
 
     /// Supply the level light engine's block-light values for FEATURES-stage
@@ -929,6 +979,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             terrain,
             structures_enabled,
             Some(block_light),
+            None,
             None,
             None,
             None,
@@ -950,6 +1001,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(raw_brightness),
             None,
             None,
+            None,
         )
     }
 
@@ -966,6 +1018,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(block_light),
             Some(raw_brightness),
+            None,
             None,
             None,
         )
@@ -1072,6 +1125,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&raw),
             Some(tracking),
             structures,
+            None,
         )
     }
 
@@ -1157,6 +1211,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             None,
             None,
             Some((structures, &mut updated)),
+            None,
         )?;
         Ok((features, updated))
     }
@@ -1194,10 +1249,69 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&raw),
             None,
             Some((structures, &mut updated)),
+            None,
         )?;
         Ok((features, updated))
     }
 
+    /// Run huts in the same ordered structure/feature plan. The complete
+    /// state map, region RNG and callback-owned state commit only if the
+    /// entire decoration attempt succeeds. Callbacks must not mutate shared
+    /// external state through their clones.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_hut_structure_plan<C, P>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
+        ensure!(
+            !terrain.has_published_light,
+            "structure decoration requires unpublished lighting"
+        );
+        let mut next_states = states.clone();
+        let mut next_random = random.clone();
+        let mut next_construct = construct.clone();
+        let mut next_condition = condition.clone();
+        let mut updated = clone_structure_starts(structures);
+        let mut huts = StagedHutPlacement {
+            states: &mut next_states,
+            random: &mut next_random,
+            variants,
+            construct: &mut next_construct,
+            condition: &mut next_condition,
+        };
+        let features = self.execute_inner(
+            terrain,
+            true,
+            None,
+            None,
+            None,
+            Some((structures, &mut updated)),
+            Some(&mut huts),
+        )?;
+        *states = next_states;
+        *random = next_random;
+        *construct = next_construct;
+        *condition = next_condition;
+        Ok((features, updated))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn execute_inner(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -1209,6 +1323,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             &[PlannedStructureDecoration<'_>],
             &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
         )>,
+        mut huts: Option<&mut dyn PlannedHutPlacement>,
     ) -> Result<Vec<bool>> {
         ensure!(
             structures_enabled == structures.is_some(),
@@ -1335,11 +1450,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                     && start.bounds.min[axis] <= clip.max[axis]
                             });
                             if intersects {
-                                ensure!(
-                                    start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
-                                    "unsupported structure decoration"
-                                );
-                                region.place_buried_treasure(start, clip, &mut random)?;
+                                match start.kind {
+                                    native_resources::structure_start::SimpleStructureKind::BuriedTreasure => { region.place_buried_treasure(start, clip, &mut random)?; }
+                                    native_resources::structure_start::SimpleStructureKind::SwampHut => {
+                                        let key = (plan[index].entry.id.clone(), ChunkPos { x: start.chunk[0], z: start.chunk[1] });
+                                        huts.as_mut().context("swamp hut decoration context is missing")?.place(&mut region, &key, start, clip)?;
+                                    }
+                                    _ => bail!("unsupported structure decoration"),
+                                }
                             }
                         }
                     }
@@ -20620,6 +20738,171 @@ mod tests {
             .unwrap();
         assert_eq!(starts[0][0].bounds.min, [9, 90, 9]);
         assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
+    #[test]
+    fn ordered_decoration_executes_hut_and_rolls_back_later_failure() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            cat_variants::CatSpawnVariants,
+            density::WorldgenRandom,
+            structure_decoration::StructureDecorationEntry,
+            structure_piece::swamp_hut::{HutMob, SwampHutState},
+            structure_start::{HorizontalDirection, SimpleStructureKind, SimpleStructureStart},
+            worldgen_region_random::RegionRandom,
+        };
+        struct Cats;
+        impl ResourceProvider for Cats {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/cat_variant/black.json")
+                    .then(|| br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse(match folder {
+                    "cat_variant" => "minecraft:black",
+                    "cat_sound_variant" => "minecraft:classic",
+                    _ => anyhow::bail!("unexpected registry"),
+                })?])
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend(
+            [
+                "minecraft:water",
+                "minecraft:lava",
+                "minecraft:spruce_planks",
+                "minecraft:oak_log",
+                "minecraft:oak_fence",
+                "minecraft:spruce_stairs",
+                "minecraft:potted_red_mushroom",
+                "minecraft:crafting_table",
+                "minecraft:cauldron",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test).unwrap();
+        let variants = CatSpawnVariants::load_active(&mut Cats).unwrap();
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:swamp_hut").unwrap(),
+            step: 0,
+            index: 0,
+        };
+        let hut = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [3, 8, 3],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 8, 3], [9, 14, 11]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let state = SwampHutState {
+            ground: native_resources::structure_piece::ScatteredGroundHeight::from_saved(8),
+            ..Default::default()
+        };
+        let key = (entry.id.clone(), ChunkPos { x: 0, z: 0 });
+        let initial = BTreeMap::from([(
+            key.clone(),
+            super::super::SavedSwampHutPiece::capture(&hut, state).unwrap(),
+        )]);
+        let structures = [PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&hut],
+        }];
+        let make_construct = || {
+            |mob| {
+                let (id, seed) = match mob {
+                    HutMob::Witch => ("minecraft:witch", 1),
+                    HutMob::Cat => ("minecraft:cat", 2),
+                };
+                super::super::FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
+            }
+        };
+        let mut construct = make_construct();
+        let mut condition = |_: [i32; 3], _: &World, _: &Value| -> Result<bool> {
+            anyhow::bail!("unexpected condition")
+        };
+        let mut states = initial.clone();
+        let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
+        let (mut terrain, _, _, _) = fixture();
+        let (_, updated) = prepared
+            .execute_with_hut_structure_plan(
+                &mut terrain,
+                &structures,
+                &mut states,
+                &mut random,
+                &variants,
+                &mut construct,
+                &mut condition,
+            )
+            .unwrap();
+        assert_eq!(updated[0][0].bounds, hut.bounds);
+        assert!(states[&key].state.spawned_witch && states[&key].state.spawned_cat);
+        assert_eq!(
+            terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            terrain.snapshot().block(5, 9, 4).unwrap().name,
+            "minecraft:spruce_planks"
+        );
+
+        let bad_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:desert_pyramid").unwrap(),
+            step: 0,
+            index: 1,
+        };
+        let bad_start = SimpleStructureStart {
+            kind: SimpleStructureKind::DesertPyramid,
+            ..hut.clone()
+        };
+        let structures = [
+            PlannedStructureDecoration {
+                entry: &entry,
+                starts: vec![&hut],
+            },
+            PlannedStructureDecoration {
+                entry: &bad_entry,
+                starts: vec![&bad_start],
+            },
+        ];
+        let (mut terrain, _, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut states = initial.clone();
+        let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
+        let mut expected_random = random.clone();
+        let mut construct = make_construct();
+        assert!(
+            prepared
+                .execute_with_hut_structure_plan(
+                    &mut terrain,
+                    &structures,
+                    &mut states,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut condition
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert_eq!(states, initial);
+        assert_eq!(random.next_long(), expected_random.next_long());
+        assert!(
+            terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

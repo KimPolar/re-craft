@@ -129,6 +129,30 @@ pub struct FrozenWorldCreation {
     pub level: FrozenLevelSettings,
 }
 
+impl FrozenWorldCreation {
+    /// Reject settings mixed from different create-world selections.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.generation.seed == self.level.session.seed,
+            "session seed differs from the generation seed"
+        );
+        let same_packs = match (&self.generation.data_packs, &self.level.packs) {
+            (None, None) => true,
+            (Some((_, a)), Some(b)) => {
+                a.enabled == b.enabled
+                    && a.disabled == b.disabled
+                    && a.enabled_features == b.enabled_features
+            }
+            _ => false,
+        };
+        anyhow::ensure!(
+            same_packs,
+            "level data packs differ from the generation selection"
+        );
+        Ok(())
+    }
+}
+
 /// Metadata retained after the generator is moved to a background worker.
 #[derive(Clone, Debug)]
 pub struct FrozenLevelSettings {
@@ -355,6 +379,29 @@ impl WorldCreationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_generation_rejects_mixed_seed_and_pack_selection() {
+        use native_resources::datapacks::DataPackSettings;
+        let state = WorldCreationSettings::new("World".into());
+        let packs = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/test".into()],
+            disabled: vec![],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        let mut frozen = state.freeze(
+            PathBuf::from("game"),
+            Some((PathBuf::from("source"), packs)),
+        );
+        frozen.validate().unwrap();
+        frozen.level.session.seed ^= 1;
+        assert!(frozen.validate().is_err());
+        frozen.level.session.seed = frozen.generation.seed;
+        frozen.level.packs.as_mut().unwrap().enabled.reverse();
+        assert!(frozen.validate().is_err());
+        frozen.level.packs = None;
+        assert!(frozen.validate().is_err());
+    }
 
     #[test]
     fn preset_cycle_keeps_options_and_freezes_selected_generation_inputs() {

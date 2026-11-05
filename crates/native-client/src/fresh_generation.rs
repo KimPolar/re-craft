@@ -30,8 +30,8 @@ pub struct FreshGenerationSettings {
     pub data_packs: Option<(PathBuf, DataPackSettings)>,
 }
 
-type Classifier = Box<dyn FnMut(&Value) -> Result<CarverBlockState> + Send>;
-type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
+pub(crate) type Classifier = Box<dyn FnMut(&Value) -> Result<CarverBlockState> + Send>;
+pub(crate) type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
 pub(crate) type HeightClassifier =
     Box<dyn FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags> + Send>;
 type StructuredConfigurer =
@@ -63,6 +63,27 @@ pub(crate) fn height_classifier(
                 .is_some(),
         })
     })
+}
+
+pub(crate) fn block_classifiers(
+    registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
+) -> (Classifier, Resolver) {
+    let for_classify = Arc::clone(&registry);
+    let classify: Classifier = Box::new(move |value| {
+        let block = resolve_generated_terrain_state(value, &for_classify)?;
+        Ok(CarverBlockState {
+            is_air: matches!(
+                block.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ),
+            has_fluid: FluidState::from_block(&block)
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    });
+    let resolve: Resolver =
+        Box::new(move |value| resolve_generated_terrain_state(value, &registry));
+    (classify, resolve)
 }
 
 pub struct PreparedFreshGeneration {
@@ -352,6 +373,55 @@ impl PreparedCreatureSpawning {
     }
 }
 
+pub(crate) struct StructuredInitialContext {
+    pub clocks: Arc<InitialWorldClocks>,
+    pub collision_registry:
+        Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
+    pub creatures: Option<PreparedCreatureSpawning>,
+}
+
+/// Resolve initial rules from the already captured generation pack stack.
+pub(crate) fn structured_initial_context(
+    resources: &mut ResourceStack,
+    preset: &str,
+    dimension: &str,
+    border: native_session::respawn::RespawnBorder,
+    spawn_mobs: bool,
+    generator_disables_mobs: bool,
+    advance_time: bool,
+) -> Result<StructuredInitialContext> {
+    let lighting = GeneratedDimensionLighting::load_preset(resources, preset, dimension)?;
+    let ticks: BTreeMap<_, _> = native_resources::world_clock::registered_clocks(resources)?
+        .into_iter()
+        .map(|id| (id, 0))
+        .collect();
+    let clocks = Arc::new(InitialWorldClocks {
+        ticks: ticks.clone(),
+        advance_time,
+        command_data: InitialClockCommandData::load(resources, &lighting),
+        fluid_environment: InitialFluidEnvironment::load(resources, &lighting),
+    });
+    let collision_registry = match resources.vanilla_entity_collision_registry() {
+        Ok(registry) => Some(Arc::new(registry)),
+        Err(error) => {
+            eprintln!("Spawn entity collision registry is unavailable: {error:#}");
+            None
+        }
+    };
+    let creatures = if spawn_mobs && !generator_disables_mobs {
+        Some(PreparedCreatureSpawning::load(
+            resources, &lighting, border, ticks,
+        )?)
+    } else {
+        None
+    };
+    Ok(StructuredInitialContext {
+        clocks,
+        collision_registry,
+        creatures,
+    })
+}
+
 impl PreparedFreshGeneration {
     /// Initialize every registered clock from the selected pack stack to the
     /// fresh server's default tick. Debug-world time changes are handled by
@@ -608,23 +678,8 @@ pub(crate) fn prepare_with_structures(
         .into_iter()
         .collect();
     let registry = Arc::new(resources.vanilla_generated_block_registry()?);
-    let for_classify = Arc::clone(&registry);
-    let classify: Classifier = Box::new(move |value| {
-        let block = resolve_generated_terrain_state(value, &for_classify)?;
-        Ok(CarverBlockState {
-            is_air: matches!(
-                block.name.as_str(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            ),
-            has_fluid: FluidState::from_block(&block)
-                .map_err(anyhow::Error::msg)?
-                .is_some(),
-        })
-    });
+    let (classify, resolve) = block_classifiers(Arc::clone(&registry));
     let classify_height = height_classifier(Arc::clone(&registry), Arc::clone(&height_tags));
-    let for_resolve = Arc::clone(&registry);
-    let resolve: Resolver =
-        Box::new(move |value| resolve_generated_terrain_state(value, &for_resolve));
     let configure_terrain: StructuredConfigurer = Box::new(move |batch, provider| {
         batch.enable_decoration(provider, &features, blocks, &lighting)?;
         batch.enable_light_initialization((*registry).clone())

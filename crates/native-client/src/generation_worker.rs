@@ -164,6 +164,16 @@ pub struct InitialPlayerSpawnOptions {
     pub saved_border: Option<native_persistence::world::SavedWorldBorder>,
 }
 
+/// World rules frozen alongside the create-world settings before starting.
+pub(crate) struct StructuredInitialOptions {
+    pub border: native_session::respawn::RespawnBorder,
+    pub spawn_mobs: bool,
+    pub advance_time: bool,
+    pub water_source_conversion: bool,
+    pub player: InitialPlayerSpawnOptions,
+    pub ceiling_spawn_height: Option<i32>,
+}
+
 /// A transient player and matching level metadata. This is not a completed
 /// world and cannot be saved until chunk and saved-data validation succeeds.
 pub struct GeneratedInitialPlayer {
@@ -967,6 +977,112 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Resolve one frozen create-world selection through structure generation,
+    /// initial creatures and player spawn. The result remains unsaveable.
+    pub(crate) fn start_structured_initial_world(
+        frozen: crate::world_creation::FrozenWorldCreation,
+        options: StructuredInitialOptions,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self> {
+        frozen.validate()?;
+        ensure!(
+            frozen.generation.structures_enabled,
+            "structures must be enabled"
+        );
+        ensure!(
+            frozen.generation.dimension == "minecraft:overworld",
+            "initial world spawn requires the overworld"
+        );
+        ensure!(
+            !frozen.generation.bonus_chest,
+            "initial bonus chest is not yet supported for structures"
+        );
+        ensure!(
+            options.player.adventure
+                == (frozen.level.session.mode == native_session::GameMode::Adventure),
+            "player spawn game mode differs from frozen settings"
+        );
+        ensure!(options.player.radius >= 0, "player spawn radius is invalid");
+        validated_initial_border(options.border, options.player.saved_border)?;
+        Self::spawn(move |cancelled, progress| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let crate::world_creation::FrozenWorldCreation { generation, level } = frozen;
+            let game = generation.minecraft_dir.clone();
+            let preset = generation.preset.clone();
+            let dimension = generation.dimension.clone();
+            let selection = generation
+                .data_packs
+                .as_ref()
+                .map(|(_, selection)| selection.clone());
+            let child = Self::start_selected_structures_spawn_search(
+                generation,
+                revision,
+                biome_blend,
+                options.ceiling_spawn_height,
+            )?;
+            let Some(mut ready) = wait_nested_generation(child, cancelled, progress)? else {
+                return Ok(None);
+            };
+            ensure!(
+                ready
+                    .worldgen_settings_draft
+                    .as_ref()
+                    .and_then(|draft| draft.value.get("data"))
+                    .and_then(|data| data.get("seed"))
+                    == Some(&native_persistence::nbt::Tag::Long(level.session.seed)),
+                "generation seed differs from frozen level settings"
+            );
+            let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+            match (&ready.pack_snapshot, &selection) {
+                (Some(snapshot), Some(selection)) => {
+                    snapshot.verify()?;
+                    let warnings =
+                        resources.configure_snapshot_data(Arc::clone(snapshot), selection)?;
+                    ensure!(
+                        warnings.is_empty(),
+                        "data pack selection needs attention: {}",
+                        warnings.join("; ")
+                    );
+                }
+                (None, None) => {}
+                _ => anyhow::bail!("generation data pack snapshot does not match frozen settings"),
+            }
+            let disabled = if options.spawn_mobs {
+                ready.batch.mob_generation_disabled()?
+            } else {
+                false
+            };
+            let context = crate::fresh_generation::structured_initial_context(
+                &mut resources,
+                &preset,
+                &dimension,
+                options.border,
+                options.spawn_mobs,
+                disabled,
+                options.advance_time,
+            )?;
+            let registry = Arc::new(resources.vanilla_generated_block_registry()?);
+            let (classify, resolve) = crate::fresh_generation::block_classifiers(registry);
+            ready.initial_clocks = Some(context.clocks);
+            ready.entity_collision_registry = context.collision_registry;
+            ready.level_settings = Some(level);
+            let child = Self::complete_structured_player_spawn_from_packs(
+                ready,
+                move || Ok((resources, classify, resolve, context.creatures)),
+                options.spawn_mobs,
+                options.water_source_conversion,
+                options.border,
+                options.player,
+                options.ceiling_spawn_height,
+                biome_blend,
+            )?;
+            wait_nested_generation(child, cancelled, progress)
+        })
+    }
+
     /// Run the isolated post-generation callbacks and assemble chunk drafts on
     /// the worker, in the caller's explicit chunk order. A failure or
     /// cancellation discards the owned batch and all partial results.
@@ -3209,6 +3325,61 @@ impl Drop for GenerationWorker {
     }
 }
 
+fn wait_nested_generation(
+    worker: GenerationWorker,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>> {
+    let base = *progress.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            worker.cancel();
+        }
+        publish_nested_progress(progress, base, worker.progress());
+        let result = worker
+            .result
+            .recv_timeout(std::time::Duration::from_millis(25));
+        // The worker may finish between the first snapshot and receiving its result.
+        publish_nested_progress(progress, base, worker.progress());
+        match result {
+            Ok(GenerationResult::Ready(ready)) => return Ok(Some(ready)),
+            Ok(GenerationResult::Cancelled) => return Ok(None),
+            Ok(GenerationResult::Failed(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("generation worker stopped unexpectedly")
+            }
+        }
+    }
+}
+
+fn publish_nested_progress(
+    progress: &Mutex<GenerationProgress>,
+    base: GenerationProgress,
+    current: GenerationProgress,
+) {
+    let mut published = progress.lock().unwrap_or_else(|e| e.into_inner());
+    let phase = if matches!(
+        current.phase,
+        GenerationPhase::Ready | GenerationPhase::Cancelled | GenerationPhase::Failed
+    ) {
+        published.phase
+    } else {
+        current.phase
+    };
+    *published = GenerationProgress {
+        phase,
+        completed_steps: base.completed_steps.saturating_add(current.completed_steps),
+        last_step: current.last_step.or(base.last_step),
+        spawn_search_resumptions: base
+            .spawn_search_resumptions
+            .saturating_add(current.spawn_search_resumptions),
+        player_spawn_search_resumptions: base
+            .player_spawn_search_resumptions
+            .saturating_add(current.player_spawn_search_resumptions),
+    };
+}
+
 fn set_phase(progress: &Mutex<GenerationProgress>, phase: GenerationPhase) {
     progress.lock().unwrap_or_else(|e| e.into_inner()).phase = phase;
 }
@@ -3221,6 +3392,89 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_generation_propagates_cancellation_and_failure() -> Result<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let child = GenerationWorker::spawn(move |cancelled, progress| {
+            set_phase(progress, GenerationPhase::Generating);
+            note_step(progress, ChunkPos { x: 0, z: 0 }, GenerationStage::Biomes);
+            entered_tx.send(())?;
+            while !cancelled.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_millis(5));
+            }
+            Ok(None)
+        })?;
+        let parent = GenerationWorker::spawn(move |cancelled, progress| {
+            progress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .completed_steps = 7;
+            wait_nested_generation(child, cancelled, progress)
+        })?;
+        entered_rx.recv_timeout(std::time::Duration::from_secs(10))?;
+        parent.cancel();
+        assert!(matches!(
+            parent
+                .result
+                .recv_timeout(std::time::Duration::from_secs(10))?,
+            GenerationResult::Cancelled
+        ));
+        assert_eq!(parent.progress().phase, GenerationPhase::Cancelled);
+        assert_eq!(parent.progress().completed_steps, 8);
+        let child = GenerationWorker::spawn(|_, _| anyhow::bail!("nested generation failed"))?;
+        let parent = GenerationWorker::spawn(move |cancelled, progress| {
+            wait_nested_generation(child, cancelled, progress)
+        })?;
+        match parent
+            .result
+            .recv_timeout(std::time::Duration::from_secs(10))?
+        {
+            GenerationResult::Failed(error) => {
+                assert!(format!("{error:#}").contains("nested generation failed"))
+            }
+            _ => anyhow::bail!("nested generation failure was lost"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn structured_initial_world_rejects_inconsistent_settings_before_start() {
+        let creation = crate::world_creation::WorldCreationSettings::new("World".into());
+        let options = || StructuredInitialOptions {
+            border: native_session::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            },
+            spawn_mobs: true,
+            advance_time: true,
+            water_source_conversion: true,
+            player: InitialPlayerSpawnOptions {
+                radius: 0,
+                adventure: false,
+                random_seed: 0,
+                saved_border: None,
+            },
+            ceiling_spawn_height: None,
+        };
+        let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
+        frozen.level.session.seed ^= 1;
+        assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
+        let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
+        frozen.generation.bonus_chest = true;
+        assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
+        let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
+        frozen.generation.structures_enabled = false;
+        assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
+        let frozen = creation.freeze(std::path::PathBuf::new(), None);
+        let mut mismatched = options();
+        mismatched.player.adventure = true;
+        assert!(
+            GenerationWorker::start_structured_initial_world(frozen, mismatched, 1, 0).is_err()
+        );
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
@@ -3286,6 +3540,74 @@ mod tests {
             preset_path.with_file_name("spawn.json"),
             serde_json::to_vec(&spawn_preset)?,
         )?;
+        let selection = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/structures".into()],
+            disabled: vec![],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        let mut creation =
+            crate::world_creation::WorldCreationSettings::new("Structured test".into());
+        creation.seed = crate::chat_input::ChatInput::field("42");
+        creation.preset = ResourceId::parse("example:spawn")?;
+        creation.mode = crate::world_creation::GameMode::Creative;
+        let frozen = creation.freeze(game.clone(), Some((world.clone(), selection)));
+        let saved_border = native_persistence::world::SavedWorldBorder::default();
+        let initial_worker = GenerationWorker::start_structured_initial_world(
+            frozen,
+            StructuredInitialOptions {
+                border: native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?,
+                spawn_mobs: true,
+                advance_time: false,
+                water_source_conversion: true,
+                player: InitialPlayerSpawnOptions {
+                    radius: 0,
+                    adventure: false,
+                    random_seed: 3,
+                    saved_border: Some(saved_border),
+                },
+                ceiling_spawn_height: None,
+            },
+            50,
+            0,
+        )?;
+        let mut initial_ready = match initial_worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(180))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structured initial world cancelled"),
+        };
+        assert_eq!(
+            initial_ready.level_settings.as_ref().unwrap().name,
+            "Structured test"
+        );
+        assert_eq!(
+            initial_ready.level_settings.as_ref().unwrap().session.seed,
+            42
+        );
+        assert!(!initial_ready.initial_clocks.as_ref().unwrap().advance_time);
+        assert!(initial_ready.postprocessed.is_some());
+        assert!(initial_ready.pack_snapshot.is_some());
+        assert!(initial_ready.player_spawn.is_some());
+        let initial = initial_ready.start_initial_player_session(123)?;
+        assert_eq!(
+            native_session::GameSession::snapshot(&initial.session).game_mode,
+            native_session::GameMode::Creative
+        );
+        assert_eq!(
+            initial
+                .level_data
+                .value
+                .get("Data")
+                .and_then(|data| data.get("GameType")),
+            Some(&native_persistence::nbt::Tag::Int(1))
+        );
+        assert!(
+            initial_ready
+                .stage_initial_world(temp.path(), 123, 1)
+                .is_err()
+        );
         let spawn_worker = GenerationWorker::start_selected_structures_spawn_search(
             crate::fresh_generation::FreshGenerationSettings {
                 minecraft_dir: game.clone(),

@@ -101,6 +101,67 @@ impl PreparedPiece {
             })
             .collect()
     }
+
+    /// Calculate Java's local template load order. This includes structure
+    /// blocks; later processors must still filter and handle their markers.
+    pub fn block_order(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        palette_index: usize,
+    ) -> Result<Vec<usize>> {
+        // The supported ocean-ruin states have rotation-invariant static-full
+        // classification, verified for all four template rotations.
+        let palette = self.transformed_palette(registry, palette_index)?;
+        self.template.java_block_order(palette_index, |index, _| {
+            let PreparedPaletteState::Block(state) = &palette[index] else {
+                anyhow::bail!("structure block without NBT needs collision classification")
+            };
+            ocean_template_static_full(state)
+        })
+    }
+}
+
+/// Verified collision classes for the vanilla ocean-ruin palette. Unknown
+/// data-pack blocks remain errors until their dynamic shape is established.
+fn ocean_template_static_full(state: &native_world::loaded::BlockState) -> Result<bool> {
+    let id = state
+        .name
+        .strip_prefix("minecraft:")
+        .context("unknown template collision")?;
+    if matches!(id, "air" | "cave_air" | "void_air") || id.ends_with("_stairs") {
+        return Ok(false);
+    }
+    if matches!(
+        id,
+        "bricks"
+            | "chiseled_sandstone"
+            | "chiseled_stone_bricks"
+            | "cobblestone"
+            | "cracked_stone_bricks"
+            | "cut_sandstone"
+            | "dark_oak_planks"
+            | "gravel"
+            | "light_blue_terracotta"
+            | "magma_block"
+            | "mossy_cobblestone"
+            | "mossy_stone_bricks"
+            | "obsidian"
+            | "polished_diorite"
+            | "polished_granite"
+            | "prismarine"
+            | "sand"
+            | "sandstone"
+            | "sea_lantern"
+            | "spruce_planks"
+            | "stone_bricks"
+    ) || id.ends_with("_glazed_terracotta")
+    {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "template collision classification is unsupported for {}",
+        state.name
+    )
 }
 
 /// Read the exact selected templates from the same active data-pack stack.
@@ -276,6 +337,168 @@ mod tests {
         }
         assert!(markers > 0);
         assert!(glazed > 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn vanilla_ruin_template_order_matches_java() -> Result<()> {
+        use native_resources::structure_transform::Rotation;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = temp.path().join("OceanRuinTemplateOrderOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/OceanRuinTemplateOrderOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut names = Vec::new();
+        for prefix in ["brick", "cracked", "mossy", "warm"] {
+            for n in 1..=8 {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for prefix in ["big_brick", "big_cracked", "big_mossy"] {
+            for n in [1, 2, 3, 8] {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for n in 4..=7 {
+            names.push(format!("underwater_ruin/big_warm_{n}"));
+        }
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("OceanRuinTemplateOrderOracle")
+            .args(&names)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("T\t") || line.starts_with("B\t"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let mut total = 0;
+        for name in &names {
+            let header = rows.next().context("missing Java template")?;
+            let mut fields = header.split('\t');
+            ensure!(
+                fields.next() == Some("T") && fields.next() == Some(name.as_str()),
+                "unexpected Java template {header}"
+            );
+            let expected_count: usize = fields.next().context("missing Java count")?.parse()?;
+            let template = Arc::new(
+                StructureTemplate::load(&mut resources, &ResourceId::parse(name)?)?
+                    .context("missing template")?,
+            );
+            let bounds = native_resources::structure_transform::bounding_box(
+                template.size,
+                [0, 90, 0],
+                native_resources::structure_transform::Mirror::None,
+                Rotation::None,
+                [0; 3],
+            )?;
+            let mut piece = PreparedPiece {
+                selection: Piece {
+                    template: format!("minecraft:{name}"),
+                    position: [0, 90, 0],
+                    rotation: Rotation::None,
+                    integrity: 0.8,
+                    large: false,
+                },
+                template,
+                bounds,
+            };
+            let palette = piece.transformed_palette(&registry, 0)?;
+            let order = piece.block_order(&registry, 0)?;
+            for rotation in [
+                Rotation::Clockwise90,
+                Rotation::Clockwise180,
+                Rotation::Counterclockwise90,
+            ] {
+                piece.selection.rotation = rotation;
+                assert_eq!(
+                    piece.block_order(&registry, 0)?,
+                    order,
+                    "rotation changed load order for {name}"
+                );
+            }
+            piece.selection.rotation = Rotation::None;
+            assert_eq!(order.len(), expected_count, "{name}");
+            for index in order {
+                let row: Value = serde_json::from_str(
+                    rows.next()
+                        .context("missing Java block")?
+                        .strip_prefix("B\t")
+                        .context("unexpected Java row")?,
+                )?;
+                let block = &piece.template.blocks[index];
+                assert_eq!(
+                    block.position,
+                    [
+                        row["x"].as_i64().unwrap() as i32,
+                        row["y"].as_i64().unwrap() as i32,
+                        row["z"].as_i64().unwrap() as i32
+                    ],
+                    "{name}"
+                );
+                assert_eq!(block.nbt.is_some(), row["nbt"].as_bool().unwrap(), "{name}");
+                let (id, properties) = match &palette[block.state] {
+                    PreparedPaletteState::Block(state) => (state.name.as_str(), &state.properties),
+                    PreparedPaletteState::StructureMarker { properties } => {
+                        ("minecraft:structure_block", properties)
+                    }
+                };
+                assert_eq!(id, row["id"].as_str().unwrap(), "{name}");
+                assert_eq!(
+                    serde_json::to_value(properties)?,
+                    row["properties"],
+                    "{name}"
+                );
+                total += 1;
+            }
+        }
+        assert!(rows.next().is_none());
+        println!(
+            "verified {total} ordered template blocks across {} ruins",
+            names.len()
+        );
         Ok(())
     }
 }

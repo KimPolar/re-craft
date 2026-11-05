@@ -200,6 +200,9 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 (u8::from(boolean("waterlogged")?), 0)
             }
         }
+        name if name.ends_with("_fence") => {
+            (u8::from(crate::collision::fence_waterlogged(state)?), 0)
+        }
         "minecraft:dirt_path" if state.properties.is_empty() => (0, 0),
         "minecraft:farmland" if state.properties.len() == 1 => {
             if !matches!(
@@ -2832,6 +2835,33 @@ mod tests {
                 }
             }
         }
+        for name in [
+            "oak_fence",
+            "spruce_fence",
+            "birch_fence",
+            "jungle_fence",
+            "acacia_fence",
+            "dark_oak_fence",
+            "mangrove_fence",
+            "cherry_fence",
+            "pale_oak_fence",
+            "bamboo_fence",
+            "crimson_fence",
+            "warped_fence",
+            "poplar_fence",
+            "nether_brick_fence",
+        ] {
+            for bits in 0..32 {
+                states.push(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: ["north", "east", "south", "west", "waterlogged"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, key)| (key.into(), (bits & (1 << i) != 0).to_string()))
+                        .collect(),
+                });
+            }
+        }
         for name in ["small_dripleaf", "big_dripleaf", "big_dripleaf_stem"] {
             for facing in ["north", "south", "west", "east"] {
                 for waterlogged in ["false", "true"] {
@@ -2902,6 +2932,14 @@ mod tests {
                     }
                     if let Some(waterlogged) = s.properties.get("waterlogged") {
                         row["waterlogged"] = serde_json::json!(waterlogged == "true");
+                    }
+                }
+                if let Some(waterlogged) = s.properties.get("waterlogged") {
+                    row["waterlogged"] = serde_json::json!(waterlogged == "true");
+                }
+                for side in ["north", "east", "south", "west"] {
+                    if let Some(value) = s.properties.get(side) {
+                        row[side] = serde_json::json!(value == "true");
                     }
                 }
                 if let Some(amount) = s.properties.get("segment_amount") {

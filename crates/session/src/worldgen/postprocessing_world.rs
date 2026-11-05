@@ -138,6 +138,7 @@ pub struct GeneratedPostprocessing {
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
@@ -358,6 +359,7 @@ impl GeneratedPostprocessing {
             light_checkpoint: None,
             mushroom_tags,
             leaf_tags: None,
+            fence_tags: None,
             bubble_tags: None,
             washed_blocks: None,
             lava_fluids: None,
@@ -536,6 +538,13 @@ impl GeneratedPostprocessing {
         self.leaf_tags = tags;
     }
 
+    pub(super) fn set_fence_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    ) {
+        self.fence_tags = tags;
+    }
+
     pub(super) fn set_bubble_tags(
         &mut self,
         tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
@@ -598,6 +607,7 @@ impl GeneratedPostprocessing {
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
+            fence_tags: self.fence_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
@@ -663,6 +673,7 @@ impl GeneratedPostprocessing {
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
+            fence_tags: self.fence_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
             lava_fluids: self.lava_fluids.as_deref(),
@@ -728,6 +739,7 @@ struct GeneratedBlockView<'a> {
     light: Option<&'a VisibleLightSnapshot>,
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    fence_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
     lava_fluids: Option<&'a BTreeSet<String>>,
@@ -930,6 +942,70 @@ fn bonus_falling_shape_schedules(state: &BlockState) -> bool {
 }
 
 impl GeneratedBlockView<'_> {
+    fn fence_connection(
+        &self,
+        state: &BlockState,
+        neighbor: &BlockState,
+        direction: [i32; 3],
+    ) -> Result<bool> {
+        use native_resources::packs::ResourceId;
+        let tags = self
+            .fence_tags
+            .context("fence connection tags unavailable")?;
+        let fences = ResourceId::parse("minecraft:fences")?;
+        let wooden = ResourceId::parse("minecraft:wooden_fences")?;
+        let shulkers = ResourceId::parse("minecraft:shulker_boxes")?;
+        if tags.contains(&fences, &neighbor.name)?
+            && tags.contains(&wooden, &neighbor.name)? == tags.contains(&wooden, &state.name)?
+        {
+            return Ok(true);
+        }
+        let gate = neighbor
+            .name
+            .strip_prefix("minecraft:")
+            .and_then(|name| name.strip_suffix("_fence_gate"))
+            .is_some_and(|family| {
+                native_core::wood::Planks::ALL.into_iter().any(|wood| {
+                    wood.id()
+                        .strip_prefix("minecraft:")
+                        .and_then(|id| id.strip_suffix("_planks"))
+                        == Some(family)
+                })
+            });
+        if gate {
+            ensure!(
+                neighbor.properties.len() == 4
+                    && ["in_wall", "open", "powered"].iter().all(|key| matches!(
+                        neighbor.properties.get(*key).map(String::as_str),
+                        Some("true" | "false")
+                    )),
+                "invalid fence gate state"
+            );
+            let gate_x = match neighbor.properties.get("facing").map(String::as_str) {
+                Some("east" | "west") => true,
+                Some("north" | "south") => false,
+                _ => anyhow::bail!("invalid fence gate facing"),
+            };
+            return Ok(gate_x != (direction[0] != 0));
+        }
+        let except = leaf_distance(neighbor)?.is_some()
+            || matches!(
+                neighbor.name.as_str(),
+                "minecraft:barrier"
+                    | "minecraft:carved_pumpkin"
+                    | "minecraft:jack_o_lantern"
+                    | "minecraft:melon"
+                    | "minecraft:pumpkin"
+            )
+            || tags.contains(&shulkers, &neighbor.name)?;
+        if except {
+            return Ok(false);
+        }
+        let face = glam::IVec3::new(-direction[0], -direction[1], -direction[2]);
+        native_world::collision::button_support_face(neighbor, face)
+            .with_context(|| format!("unsupported fence neighbor support: {}", neighbor.name))
+    }
+
     fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
         if !state.name.starts_with("minecraft:")
             || !state.name.ends_with("_slab")
@@ -1567,6 +1643,21 @@ impl GeneratedBlockView<'_> {
         flags: i32,
     ) -> Result<()> {
         let old = self.read(pos)?;
+        if native_world::collision::fence_waterlogged(&old).is_some()
+            && native_world::collision::fence_waterlogged(next).is_some()
+        {
+            let mut expected = old.clone();
+            for side in ["north", "east", "south", "west"] {
+                expected
+                    .properties
+                    .insert(side.into(), next.properties[side].clone());
+            }
+            ensure!(
+                flags == 276 && *next == expected,
+                "unsupported generated fence write"
+            );
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         if self.stair(&old).is_some() && self.stair(next).is_some() {
             let mut expected = old.clone();
             expected
@@ -1796,6 +1887,29 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if let Some(waterlogged) = native_world::collision::fence_waterlogged(state) {
+            if waterlogged {
+                self.schedule_contained_water(pos)?;
+            }
+            let side = match direction {
+                [-1, 0, 0] => Some("west"),
+                [1, 0, 0] => Some("east"),
+                [0, 0, -1] => Some("north"),
+                [0, 0, 1] => Some("south"),
+                [0, -1, 0] | [0, 1, 0] => None,
+                _ => anyhow::bail!("invalid fence update direction"),
+            };
+            if let Some(side) = side {
+                let mut updated = state.clone();
+                updated.properties.insert(
+                    side.into(),
+                    self.fence_connection(state, neighbor, direction)?
+                        .to_string(),
+                );
+                return Ok(updated);
+            }
+            return Ok(state.clone());
+        }
         if let Some((_, waterlogged)) = self.slab(state) {
             if waterlogged {
                 self.schedule_contained_water(pos)?;
@@ -1901,6 +2015,14 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         if let Some(fluid) = liquid_state(state)? {
             return Ok(Some(fluid));
         }
+        if let Some(waterlogged) = native_world::collision::fence_waterlogged(state) {
+            return Ok(waterlogged.then_some(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            }));
+        }
         if let Some((top, waterlogged)) = self.slab(state) {
             return Ok(native_world::fluid_sim::Cell::Slab { top, waterlogged }.contained_fluid());
         }
@@ -1922,7 +2044,23 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         supported_postprocessing_block(state)?;
         Ok(None)
     }
-    fn tick_fluid(&mut self, pos: [i32; 3], _: &BlockState, fluid: &Self::Fluid) -> Result<()> {
+    fn tick_fluid(&mut self, pos: [i32; 3], state: &BlockState, fluid: &Self::Fluid) -> Result<()> {
+        if native_world::collision::fence_waterlogged(state) == Some(true) {
+            for delta in [[0, -1, 0], [-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]] {
+                let p = [
+                    pos[0].wrapping_add(delta[0]),
+                    pos[1].wrapping_add(delta[1]),
+                    pos[2].wrapping_add(delta[2]),
+                ];
+                self.read(p)?;
+                ensure!(
+                    self.fluid_cell(glam::IVec3::from_array(p))
+                        == native_world::fluid_sim::Cell::Solid,
+                    "waterlogged fence flow is not yet supported"
+                );
+            }
+            return Ok(());
+        }
         self.tick_generated_fluid(pos, *fluid)
     }
     fn is_liquid_block(&mut self, state: &BlockState) -> Result<bool> {
@@ -2402,6 +2540,206 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    fn fence_postprocessing_trace(mode: &str) -> String {
+        use native_resources::{
+            ore_feature::OreBlockTags,
+            packs::{ResourceId, ResourceProvider},
+        };
+        struct Tags(bool);
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/minecraft/tags/block/fences.json" => {
+                        if self.0 {
+                            r#"{"values":["minecraft:oak_fence","minecraft:nether_brick_fence","minecraft:air"]}"#
+                        } else {
+                            r#"{"values":["minecraft:oak_fence","minecraft:nether_brick_fence"]}"#
+                        }
+                    }
+                    "data/minecraft/tags/block/wooden_fences.json" => {
+                        if self.0 {
+                            r#"{"values":["minecraft:oak_fence","minecraft:air"]}"#
+                        } else {
+                            r#"{"values":["minecraft:oak_fence"]}"#
+                        }
+                    }
+                    "data/minecraft/tags/block/shulker_boxes.json" => r#"{"values":[]}"#,
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        r#"{"values":["minecraft:stone","minecraft:spruce_planks","minecraft:oak_log","minecraft:oak_fence","minecraft:nether_brick_fence","minecraft:oak_fence_gate"]}"#
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(value.as_bytes().to_vec()))
+            }
+        }
+        let registry = [
+            "air",
+            "stone",
+            "oak_fence",
+            "nether_brick_fence",
+            "oak_fence_gate",
+            "spruce_planks",
+            "oak_log",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let ids = [
+            "minecraft:fences",
+            "minecraft:wooden_fences",
+            "minecraft:shulker_boxes",
+        ]
+        .into_iter()
+        .map(|name| ResourceId::parse(name).unwrap())
+        .collect();
+        let (mut stage, _, chunk) = fixture(false);
+        stage.set_fence_tags(Some(Arc::new(
+            OreBlockTags::load(&mut Tags(mode == "tag_air"), &registry, &ids).unwrap(),
+        )));
+        stage.heightmap_tags = Some(Arc::new(
+            native_resources::heightmap_tags::HeightmapTags::load(&mut Tags(false), &registry)
+                .unwrap(),
+        ));
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(stone);
+        let fence = |name: &str, wet: bool| BlockState {
+            name: format!("minecraft:{name}"),
+            properties: [
+                ("north", "false"),
+                ("east", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("waterlogged", if wet { "true" } else { "false" }),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect(),
+        };
+        let wet = mode == "wet_enclosed";
+        let id = world.intern_state(fence("oak_fence", wet));
+        world.set_block_id(8, 8, 8, id).unwrap();
+        if !wet {
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let planks = world.intern_state(BlockState {
+                name: "minecraft:spruce_planks".into(),
+                properties: BTreeMap::new(),
+            });
+            let log = world.intern_state(BlockState {
+                name: "minecraft:oak_log".into(),
+                properties: BTreeMap::from([("axis".into(), "y".into())]),
+            });
+            world.set_block_id(7, 8, 8, air).unwrap();
+            world.set_block_id(9, 8, 8, planks).unwrap();
+            world.set_block_id(8, 8, 7, log).unwrap();
+            world.set_block_id(8, 8, 9, air).unwrap();
+            if mode == "same_fence" || mode == "other_fence" {
+                let name = if mode == "same_fence" {
+                    "oak_fence"
+                } else {
+                    "nether_brick_fence"
+                };
+                let id = world.intern_state(fence(name, false));
+                world.set_block_id(7, 8, 8, id).unwrap();
+            }
+            if mode.starts_with("gate_") {
+                let gate = world.intern_state(BlockState {
+                    name: "minecraft:oak_fence_gate".into(),
+                    properties: [
+                        (
+                            "facing",
+                            if mode == "gate_north" {
+                                "north"
+                            } else {
+                                "east"
+                            },
+                        ),
+                        ("in_wall", "false"),
+                        ("open", "false"),
+                        ("powered", "false"),
+                    ]
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+                });
+                world.set_block_id(7, 8, 8, gate).unwrap();
+            }
+        }
+        stage.source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        stage
+            .region
+            .tasks
+            .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+        stage.region.ticks = RegionTicks::new(
+            BTreeMap::from([(
+                chunk,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                },
+            )]),
+            100,
+            0,
+        )
+        .unwrap();
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        let state = result.world.block(8, 8, 8).unwrap();
+        let ticks = result.ticks.chunk(chunk).unwrap();
+        let blocks = ticks.blocks.pack(100);
+        let fluids = ticks.fluids.pack(100);
+        format!(
+            "F {mode} {} {} {} {} {} {} {} {} {} {} {}",
+            state.properties["north"],
+            state.properties["east"],
+            state.properties["south"],
+            state.properties["west"],
+            state.properties["waterlogged"],
+            blocks.len(),
+            fluids.len(),
+            fluids.first().map_or(-1, |tick| tick.delay),
+            result.ticks.activated_snapshot().next_sub_tick,
+            result.edits.len(),
+            result.light_checks.len()
+        )
+    }
+
+    #[test]
+    fn fence_postprocessing_updates_connections_and_water_ticks() {
+        for (mode, expected) in [
+            ("mixed", "true true false false false 0 0 -1 0 1 0"),
+            ("same_fence", "true true false true false 0 0 -1 0 1 0"),
+            ("other_fence", "true true false false false 0 0 -1 0 1 0"),
+            ("tag_air", "true true true true false 0 0 -1 0 1 0"),
+            ("wet_enclosed", "true true true true true 0 1 5 6 1 0"),
+            ("gate_north", "true true false true false 0 0 -1 0 1 0"),
+            ("gate_east", "true true false false false 0 0 -1 0 1 0"),
+        ] {
+            assert_eq!(
+                fence_postprocessing_trace(mode),
+                format!("F {mode} {expected}")
+            );
+        }
     }
 
     #[test]
@@ -5788,6 +6126,28 @@ mod tests {
             .iter()
             .map(|line| (*line).to_owned())
             .collect()
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_fence_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedFencePostprocessingOracle",
+            include_str!("../../tests/java/GeneratedFencePostprocessingOracle.java"),
+        );
+        let expected: Vec<_> = [
+            "mixed",
+            "same_fence",
+            "other_fence",
+            "tag_air",
+            "wet_enclosed",
+            "gate_north",
+            "gate_east",
+        ]
+        .into_iter()
+        .map(fence_postprocessing_trace)
+        .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

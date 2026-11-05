@@ -33,6 +33,10 @@ public class BlockLightPropertiesOracle {
             if (entry.has("age")) state = state.setValue(GrowingPlantHeadBlock.AGE, entry.get("age").getAsInt());
             if (entry.has("facing")) state = state.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.byName(entry.get("facing").getAsString()));
             if (entry.has("waterlogged")) state = state.setValue(BlockStateProperties.WATERLOGGED, entry.get("waterlogged").getAsBoolean());
+            if (entry.has("north")) state = state.setValue(BlockStateProperties.NORTH, entry.get("north").getAsBoolean());
+            if (entry.has("east")) state = state.setValue(BlockStateProperties.EAST, entry.get("east").getAsBoolean());
+            if (entry.has("south")) state = state.setValue(BlockStateProperties.SOUTH, entry.get("south").getAsBoolean());
+            if (entry.has("west")) state = state.setValue(BlockStateProperties.WEST, entry.get("west").getAsBoolean());
             if (entry.has("segment_amount")) state = state.setValue(SegmentableBlock.AMOUNT, entry.get("segment_amount").getAsInt());
             if (entry.has("type")) state = state.setValue(ChestBlock.TYPE, ChestType.valueOf(entry.get("type").getAsString().toUpperCase(java.util.Locale.ROOT)));
             if (entry.has("half")) state = state.setValue(BlockStateProperties.DOUBLE_BLOCK_HALF, DoubleBlockHalf.valueOf(entry.get("half").getAsString().toUpperCase(java.util.Locale.ROOT)));

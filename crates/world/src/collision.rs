@@ -49,6 +49,36 @@ const FLOWER_POT: &[Aabb] = &[Aabb {
     max: Vec3::new(11.0 / 16.0, 6.0 / 16.0, 11.0 / 16.0),
 }];
 
+/// Validate a vanilla fence state and return its contained-water flag.
+pub fn fence_waterlogged(state: &BlockState) -> Option<bool> {
+    let name = state.name.strip_prefix("minecraft:")?;
+    let valid = name == "nether_brick_fence"
+        || name.strip_suffix("_fence").is_some_and(|family| {
+            native_core::wood::Planks::ALL.into_iter().any(|wood| {
+                wood.id()
+                    .strip_prefix("minecraft:")
+                    .and_then(|id| id.strip_suffix("_planks"))
+                    == Some(family)
+            })
+        });
+    if !valid || state.properties.len() != 5 {
+        return None;
+    }
+    for key in ["north", "east", "south", "west"] {
+        if !matches!(
+            state.properties.get(key).map(String::as_str),
+            Some("true" | "false")
+        ) {
+            return None;
+        }
+    }
+    match state.properties.get("waterlogged").map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether the supplied collision boxes cover an entire block boundary face.
 /// Blocks may still override face sturdiness independently of their shape.
 pub fn covers_full_face(boxes: &[Aabb], direction: IVec3) -> bool {

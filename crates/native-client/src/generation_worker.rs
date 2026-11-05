@@ -80,6 +80,8 @@ pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
     pub terrain_tags: native_resources::carver::tags::CarverBlockTags,
     pub dimension: String,
     pub configure_terrain: F,
+    pub worldgen_settings_draft: Option<native_persistence::nbt::NamedTag>,
+    pub pack_snapshot: Option<Arc<native_resources::datapack_snapshot::DataPackSnapshot>>,
 }
 
 pub struct PostprocessedGeneration {
@@ -1584,6 +1586,8 @@ impl GenerationWorker {
                 terrain_tags,
                 dimension,
                 configure_terrain,
+                worldgen_settings_draft,
+                pack_snapshot,
             } = prepare()?;
             ensure!(
                 structures.is_complete(),
@@ -1644,6 +1648,8 @@ impl GenerationWorker {
                 return Ok(None);
             };
             ready.spawn_origin = spawn_origin;
+            ready.worldgen_settings_draft = worldgen_settings_draft;
+            ready.pack_snapshot = pack_snapshot;
             Ok(Some(ready))
         })
     }
@@ -2866,6 +2872,14 @@ mod tests {
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let registry = ResourceStack::open(&game)?.vanilla_generated_block_registry()?;
         let blocks: BTreeSet<_> = registry.ids().map(str::to_owned).collect();
+        let pack_source = tempfile::tempdir()?;
+        let snapshot = Arc::new(
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(pack_source.path())?,
+        );
+        let worldgen_settings = native_persistence::nbt::NamedTag {
+            name: "settings".into(),
+            value: native_persistence::nbt::Tag::Long(42),
+        };
         assert_eq!(target, ChunkPos { x: 0, z: 0 });
         let mut baseline: Option<(
             Arc<native_world::loaded::World>,
@@ -2879,6 +2893,8 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
             let registry = registry.clone();
             let blocks = blocks.clone();
+            let worker_snapshot = Arc::clone(&snapshot);
+            let worker_settings = worldgen_settings.clone();
             let prepare = move || {
                 if cancel_during_setup {
                     entered_tx.send(())?;
@@ -2963,6 +2979,8 @@ mod tests {
                     terrain_tags,
                     dimension: "minecraft:overworld".into(),
                     configure_terrain,
+                    worldgen_settings_draft: Some(worker_settings),
+                    pack_snapshot: Some(worker_snapshot),
                 })
             };
             let worker = if from_spawn {
@@ -3003,6 +3021,15 @@ mod tests {
                 GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
             };
             assert_eq!(ready.spawn_origin, from_spawn.then_some(target));
+            assert_eq!(
+                ready.worldgen_settings_draft.as_ref(),
+                Some(&worldgen_settings)
+            );
+            assert!(Arc::ptr_eq(
+                ready.pack_snapshot.as_ref().unwrap(),
+                &snapshot
+            ));
+            ready.pack_snapshot.as_ref().unwrap().verify()?;
             assert_eq!(
                 ready.mesh.targets.as_deref(),
                 Some(&BTreeSet::from([target]))

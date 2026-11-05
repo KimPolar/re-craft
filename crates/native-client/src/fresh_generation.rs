@@ -14,6 +14,7 @@ use native_resources::{
 };
 use native_session::worldgen::{
     CarverBlockState, FreshTerrainBatch, TerrainGenerator, resolve_generated_terrain_state,
+    structure_batch::StructureGenerationBatch,
 };
 use native_world::{fluid::FluidState, loaded::BlockState};
 use serde_json::Value;
@@ -24,13 +25,24 @@ pub struct FreshGenerationSettings {
     pub dimension: String,
     pub seed: i64,
     pub bonus_chest: bool,
-    /// Structures and old-world blending are not supported by this batch.
+    /// The ordinary fresh-generation batch does not yet support structures.
     pub structures_enabled: bool,
     pub data_packs: Option<(PathBuf, DataPackSettings)>,
 }
 
 type Classifier = Box<dyn FnMut(&Value) -> Result<CarverBlockState> + Send>;
 type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
+type HeightClassifier =
+    Box<dyn FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags> + Send>;
+type StructuredConfigurer =
+    Box<dyn FnOnce(&mut FreshTerrainBatch, &mut ResourceStack) -> Result<()> + Send>;
+pub(crate) type PreparedStructuredGeneration = crate::generation_worker::StructuredGenerationInputs<
+    ResourceStack,
+    Classifier,
+    Resolver,
+    HeightClassifier,
+    StructuredConfigurer,
+>;
 
 pub struct PreparedFreshGeneration {
     pub lighting: GeneratedDimensionLighting,
@@ -447,30 +459,35 @@ impl PreparedFreshGeneration {
 
 /// Call on the generation worker, not the window thread. Warnings from the
 /// chosen pack stack are errors until the UI can present and resolve them.
-pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGeneration> {
-    ensure!(
-        !settings.structures_enabled,
-        "fresh generation with structures is not implemented"
-    );
+fn open_resources(settings: &FreshGenerationSettings) -> Result<ResourceStack> {
     ensure!(
         !settings.bonus_chest || settings.dimension == "minecraft:overworld",
         "initial bonus chest requires the overworld"
     );
     let mut resources = ResourceStack::open(&settings.minecraft_dir)?;
-    let pack_selection = settings
-        .data_packs
-        .as_ref()
-        .map(|(_, selection)| selection.clone());
-    if let Some((world_dir, selection)) = settings.data_packs {
+    if let Some((world_dir, selection)) = &settings.data_packs {
         let snapshot =
-            Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(&world_dir)?);
-        let warnings = resources.configure_snapshot_data(snapshot, &selection)?;
+            Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(world_dir)?);
+        let warnings = resources.configure_snapshot_data(snapshot, selection)?;
         ensure!(
             warnings.is_empty(),
             "data pack selection needs attention: {}",
             warnings.join("; ")
         );
     }
+    Ok(resources)
+}
+
+pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGeneration> {
+    ensure!(
+        !settings.structures_enabled,
+        "fresh generation with structures is not implemented"
+    );
+    let mut resources = open_resources(&settings)?;
+    let pack_selection = settings
+        .data_packs
+        .as_ref()
+        .map(|(_, selection)| selection.clone());
     let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
         &mut resources,
         &settings.preset,
@@ -530,11 +547,178 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
     })
 }
 
+/// Prepare a finite structure-aware batch from one captured pack stack.
+/// The worker result remains intermediate until spawn and saving are supported.
+pub(crate) fn prepare_with_structures(
+    settings: FreshGenerationSettings,
+) -> Result<PreparedStructuredGeneration> {
+    ensure!(settings.structures_enabled, "structures must be enabled");
+    let mut resources = open_resources(&settings)?;
+    let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
+        &mut resources,
+        &settings.preset,
+        native_persistence::worldgen_settings::NewWorldOptions {
+            seed: settings.seed,
+            generate_structures: true,
+            bonus_chest: settings.bonus_chest,
+        },
+    )?;
+    let (lighting, definition) = GeneratedDimensionLighting::load_preset_with_generator(
+        &mut resources,
+        &settings.preset,
+        &settings.dimension,
+    )?;
+    let blocks = resources.vanilla_block_ids()?;
+    let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
+    let height_tags =
+        native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &blocks)?;
+    let generator = TerrainGenerator::with_structure_context(
+        &mut resources,
+        &definition,
+        settings.seed,
+        lighting.min_y,
+        lighting.height,
+    )?;
+    let structures = StructureGenerationBatch::from_registry(generator, &mut resources)?;
+    let features = resources
+        .list_data("worldgen/placed_feature")?
+        .into_iter()
+        .collect();
+    let registry = Arc::new(resources.vanilla_generated_block_registry()?);
+    let for_classify = Arc::clone(&registry);
+    let classify: Classifier = Box::new(move |value| {
+        let block = resolve_generated_terrain_state(value, &for_classify)?;
+        Ok(CarverBlockState {
+            is_air: matches!(
+                block.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ),
+            has_fluid: FluidState::from_block(&block)
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    });
+    let for_height = Arc::clone(&registry);
+    let classify_height: HeightClassifier = Box::new(move |value| {
+        let block = resolve_generated_terrain_state(value, &for_height)?;
+        let motion = height_tags.for_block(&block.name)?;
+        Ok(native_persistence::heightmap::BlockHeightFlags {
+            is_air: matches!(
+                block.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ),
+            blocks_motion: motion.blocks_motion,
+            blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+            has_fluid: FluidState::from_block(&block)
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    });
+    let for_resolve = Arc::clone(&registry);
+    let resolve: Resolver =
+        Box::new(move |value| resolve_generated_terrain_state(value, &for_resolve));
+    let configure_terrain: StructuredConfigurer = Box::new(move |batch, provider| {
+        batch.enable_decoration(provider, &features, blocks, &lighting)?;
+        batch.enable_light_initialization((*registry).clone())
+    });
+    let pack_snapshot = resources.data_pack_snapshot();
+    Ok(crate::generation_worker::StructuredGenerationInputs {
+        structures,
+        provider: resources,
+        classify,
+        resolve,
+        classify_height,
+        terrain_tags,
+        dimension: settings.dimension,
+        configure_terrain,
+        worldgen_settings_draft: Some(worldgen_settings),
+        pack_snapshot,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn structured_inputs_keep_active_pack_tags_and_snapshot() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/overrides");
+        let tags = pack.join("data/minecraft/tags/block");
+        let structures = pack.join("data/example/worldgen/structure");
+        let sets = pack.join("data/example/worldgen/structure_set");
+        std::fs::create_dir_all(&tags)?;
+        std::fs::create_dir_all(&structures)?;
+        std::fs::create_dir_all(&sets)?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        let tag_path = tags.join("blocks_motion_in_heightmap.json");
+        std::fs::write(
+            &tag_path,
+            br#"{"replace":true,"values":["minecraft:grass_block"]}"#,
+        )?;
+        std::fs::write(structures.join("treasure.json"), br#"{"type":"minecraft:buried_treasure","biomes":["minecraft:plains"],"step":"surface_structures"}"#)?;
+        std::fs::write(sets.join("treasure.json"), br#"{"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}"#)?;
+        let mut inputs = prepare_with_structures(FreshGenerationSettings {
+            minecraft_dir: game,
+            preset: "minecraft:normal".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            bonus_chest: false,
+            structures_enabled: true,
+            data_packs: Some((
+                world,
+                DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/overrides".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                },
+            )),
+        })?;
+        std::fs::write(
+            &tag_path,
+            br#"{"replace":true,"values":["minecraft:stone"]}"#,
+        )?;
+        assert!((inputs.classify_height)(&json!("minecraft:grass_block"))?.blocks_motion);
+        assert!(!(inputs.classify_height)(&json!("minecraft:stone"))?.blocks_motion);
+        assert!((inputs.classify_height)(&json!("minecraft:air"))?.is_air);
+        assert!((inputs.classify_height)(&json!("minecraft:water"))?.has_fluid);
+        assert_eq!(
+            inputs
+                .worldgen_settings_draft
+                .as_ref()
+                .unwrap()
+                .value
+                .get("data")
+                .and_then(|v| v.get("generate_structures")),
+            Some(&native_persistence::nbt::Tag::Byte(1))
+        );
+        let snapshot = inputs
+            .pack_snapshot
+            .as_ref()
+            .context("pack snapshot missing")?;
+        assert!(Arc::ptr_eq(
+            snapshot,
+            &inputs.provider.data_pack_snapshot().unwrap()
+        ));
+        snapshot.verify()?;
+        assert!(
+            inputs
+                .structures
+                .structure_sets()
+                .contains(&ResourceId::parse("example:treasure")?)
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

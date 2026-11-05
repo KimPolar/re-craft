@@ -19,6 +19,28 @@ pub struct StructureStartBounds {
     pub bounds: BoundingBox,
 }
 
+/// Find structure IDs whose actual piece boxes contain `pos`, as required by
+/// StructureManager.getStructureWithPieceAt. The caller supplies every valid
+/// referenced start and its complete piece list for the target chunk.
+pub fn structures_with_piece_at<'a>(
+    pos: [i32; 3],
+    starts: impl IntoIterator<Item = (&'a ResourceId, &'a [BoundingBox])>,
+) -> Result<BTreeSet<ResourceId>> {
+    let mut result = BTreeSet::new();
+    for (id, pieces) in starts {
+        for piece in pieces {
+            ensure!(
+                (0..3).all(|axis| piece.min[axis] <= piece.max[axis]),
+                "invalid structure piece bounds"
+            );
+            if (0..3).all(|axis| (piece.min[axis]..=piece.max[axis]).contains(&pos[axis])) {
+                result.insert(id.clone());
+            }
+        }
+    }
+    Ok(result)
+}
+
 impl StructureStartBounds {
     /// Construct the complete reference bounds from all generated pieces.
     pub fn from_pieces(
@@ -242,6 +264,32 @@ fn collect_with_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn piece_membership_checks_full_piece_bounds_and_validates_every_box() {
+        let id = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let boxes = [BoundingBox::new([3, 10, -3], [9, 16, 5]).unwrap()];
+        assert!(
+            structures_with_piece_at([3, 10, -3], [(&id, boxes.as_slice())])
+                .unwrap()
+                .contains(&id)
+        );
+        assert!(
+            structures_with_piece_at([9, 16, 5], [(&id, boxes.as_slice())])
+                .unwrap()
+                .contains(&id)
+        );
+        assert!(
+            structures_with_piece_at([10, 16, 5], [(&id, boxes.as_slice())])
+                .unwrap()
+                .is_empty()
+        );
+        let invalid = [BoundingBox {
+            min: [0, 0, 0],
+            max: [-1, 2, 2],
+        }];
+        assert!(structures_with_piece_at([100, 100, 100], [(&id, invalid.as_slice())]).is_err());
+    }
     use anyhow::bail;
     use native_resources::structure_start::SimpleStructureKind;
 

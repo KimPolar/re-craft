@@ -1,11 +1,15 @@
 //! Spawn selection and random ordering for freshly generated cats.
-use std::cmp::Reverse;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
+};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
 use crate::{
     packs::{ResourceId, ResourceProvider},
+    recipes::{TagEntry, parse_tag},
     worldgen_region_random::{
         AnimalBaseInitialization, AnimalGroupData, RegionRandom, finalize_animal_base,
     },
@@ -30,6 +34,26 @@ pub struct CatInitialization {
     pub animal: AnimalBaseInitialization,
     pub variant: ResourceId,
     pub sound_variant: ResourceId,
+}
+
+enum WorldCondition {
+    Structures(BTreeSet<ResourceId>),
+    Biomes(BTreeSet<ResourceId>),
+    Moon { min: Option<f64>, max: Option<f64> },
+}
+
+/// Conditions compiled against the same immutable pack stack and registries.
+pub struct CatWorldConditions {
+    predicates: BTreeMap<String, WorldCondition>,
+}
+
+/// The caller must supply all structure IDs with an actual piece containing
+/// the spawn position, not just IDs whose expanded start bounds contain it.
+#[derive(Clone, Copy)]
+pub struct CatSpawnContext<'a> {
+    pub biome: Option<&'a ResourceId>,
+    pub moon_phase: Option<u8>,
+    pub structures_with_piece: Option<&'a BTreeSet<ResourceId>>,
 }
 
 impl CatSpawnVariants {
@@ -142,6 +166,240 @@ impl CatSpawnVariants {
         *random = next;
         Ok(result)
     }
+
+    /// Compile the condition types against active structure and biome tags.
+    /// Unsupported predicates fail rather than selecting a guessed variant.
+    pub fn prepare_world_conditions(
+        &self,
+        provider: &mut impl ResourceProvider,
+    ) -> Result<CatWorldConditions> {
+        let mut predicates = BTreeMap::new();
+        let mut structures = None;
+        let mut biomes = None;
+        let mut structure_tags = BTreeMap::new();
+        let mut biome_tags = BTreeMap::new();
+        for value in self
+            .selectors
+            .iter()
+            .filter_map(|selector| selector.condition.as_ref())
+        {
+            let key = serde_json::to_string(value)?;
+            if predicates.contains_key(&key) {
+                continue;
+            }
+            let object = value.as_object().context("condition must be an object")?;
+            let kind = ResourceId::parse(
+                object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .context("missing condition type")?,
+            )?;
+            let predicate = match (kind.namespace.as_str(), kind.path.as_str()) {
+                ("minecraft", "structure") => {
+                    if structures.is_none() {
+                        structures = Some(
+                            provider
+                                .list_data("worldgen/structure")?
+                                .into_iter()
+                                .collect::<BTreeSet<_>>(),
+                        );
+                    }
+                    WorldCondition::Structures(resolve_selection(
+                        provider,
+                        "structure",
+                        structures.as_ref().unwrap(),
+                        object.get("structures").context("missing structures")?,
+                        &mut structure_tags,
+                    )?)
+                }
+                ("minecraft", "biome") => {
+                    if biomes.is_none() {
+                        biomes = Some(
+                            provider
+                                .list_data("worldgen/biome")?
+                                .into_iter()
+                                .collect::<BTreeSet<_>>(),
+                        );
+                    }
+                    WorldCondition::Biomes(resolve_selection(
+                        provider,
+                        "biome",
+                        biomes.as_ref().unwrap(),
+                        object.get("biomes").context("missing biomes")?,
+                        &mut biome_tags,
+                    )?)
+                }
+                ("minecraft", "moon_brightness") => {
+                    let range = object
+                        .get("range")
+                        .context("missing moon brightness range")?;
+                    let (min, max) = if let Some(value) = range.as_f64() {
+                        (Some(value), Some(value))
+                    } else {
+                        let range = range.as_object().context("invalid moon brightness range")?;
+                        let bound = |key: &str| -> Result<Option<f64>> {
+                            range
+                                .get(key)
+                                .map(|value| {
+                                    value.as_f64().context("invalid moon brightness bound")
+                                })
+                                .transpose()
+                        };
+                        (bound("min")?, bound("max")?)
+                    };
+                    ensure!(
+                        min.zip(max).is_none_or(|(min, max)| min <= max),
+                        "inverted moon brightness range"
+                    );
+                    WorldCondition::Moon { min, max }
+                }
+                _ => bail!(
+                    "unsupported cat spawn condition {}:{}",
+                    kind.namespace,
+                    kind.path
+                ),
+            };
+            predicates.insert(key, predicate);
+        }
+        Ok(CatWorldConditions { predicates })
+    }
+}
+
+impl CatWorldConditions {
+    pub fn matches(&self, condition: &Value, context: &CatSpawnContext<'_>) -> Result<bool> {
+        let key = serde_json::to_string(condition)?;
+        match self
+            .predicates
+            .get(&key)
+            .context("cat condition was not prepared")?
+        {
+            WorldCondition::Structures(values) => Ok(!values.is_disjoint(
+                context
+                    .structures_with_piece
+                    .context("structure pieces unavailable")?,
+            )),
+            WorldCondition::Biomes(values) => {
+                Ok(values.contains(context.biome.context("spawn biome unavailable")?))
+            }
+            WorldCondition::Moon { min, max } => {
+                const BRIGHTNESS: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
+                let phase = usize::from(context.moon_phase.context("moon phase unavailable")?);
+                let brightness = f64::from(*BRIGHTNESS.get(phase).context("invalid moon phase")?);
+                Ok(min.is_none_or(|min| brightness >= min)
+                    && max.is_none_or(|max| brightness <= max))
+            }
+        }
+    }
+}
+
+fn resolve_selection(
+    provider: &mut impl ResourceProvider,
+    registry_name: &str,
+    registry: &BTreeSet<ResourceId>,
+    value: &Value,
+    cache: &mut BTreeMap<ResourceId, Option<BTreeSet<ResourceId>>>,
+) -> Result<BTreeSet<ResourceId>> {
+    if let Some(tag) = value.as_str().and_then(|name| name.strip_prefix('#')) {
+        return resolve_registry_tag(
+            provider,
+            registry_name,
+            registry,
+            &ResourceId::parse(tag)?,
+            cache,
+            &mut BTreeSet::new(),
+        )?
+        .context("missing cat condition tag");
+    }
+    let entries: Vec<&Value> = match value {
+        Value::String(_) => vec![value],
+        Value::Array(values) => values.iter().collect(),
+        _ => bail!("invalid cat condition holder set"),
+    };
+    let mut result = BTreeSet::new();
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .context("invalid cat condition registry ID")?;
+        ensure!(
+            !name.starts_with('#'),
+            "tags are unsupported inside holder lists"
+        );
+        let id = ResourceId::parse(name)?;
+        ensure!(
+            registry.contains(&id),
+            "cat condition references missing {registry_name} {name}"
+        );
+        result.insert(id);
+    }
+    Ok(result)
+}
+
+fn resolve_registry_tag(
+    provider: &mut impl ResourceProvider,
+    registry_name: &str,
+    registry: &BTreeSet<ResourceId>,
+    id: &ResourceId,
+    cache: &mut BTreeMap<ResourceId, Option<BTreeSet<ResourceId>>>,
+    visiting: &mut BTreeSet<ResourceId>,
+) -> Result<Option<BTreeSet<ResourceId>>> {
+    if let Some(value) = cache.get(id) {
+        return Ok(value.clone());
+    }
+    ensure!(
+        visiting.len() < 128 && cache.len() < 4096,
+        "cat condition tag limit exceeded"
+    );
+    ensure!(visiting.insert(id.clone()), "cyclic cat condition tag");
+    let result = (|| {
+        let path = format!(
+            "data/{}/tags/worldgen/{registry_name}/{}.json",
+            id.namespace, id.path
+        );
+        let stack = provider.read_data_stack(&path)?;
+        if stack.is_empty() {
+            return Ok(None);
+        }
+        let mut entries = Vec::new();
+        for bytes in stack {
+            let (replace, values) =
+                parse_tag(&bytes).with_context(|| format!("invalid cat condition tag {path}"))?;
+            if replace {
+                entries.clear();
+            }
+            entries.extend(values);
+        }
+        let mut values = BTreeSet::new();
+        for entry in entries {
+            match entry {
+                TagEntry::Item { id, required } => {
+                    let key = ResourceId::parse(&id)?;
+                    if registry.contains(&key) {
+                        values.insert(key);
+                    } else if required {
+                        bail!("missing required {registry_name} {id}");
+                    }
+                }
+                TagEntry::Tag { id, required } => match resolve_registry_tag(
+                    provider,
+                    registry_name,
+                    registry,
+                    &id,
+                    cache,
+                    visiting,
+                )? {
+                    Some(child) => values.extend(child),
+                    None if required => bail!("missing required nested {registry_name} tag"),
+                    None => {}
+                },
+            }
+        }
+        Ok(Some(values))
+    })();
+    visiting.remove(id);
+    if let Ok(value) = &result {
+        cache.insert(id.clone(), value.clone());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -156,6 +414,15 @@ mod tests {
             Ok(None)
         }
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            if path == "data/minecraft/tags/worldgen/structure/cats_spawn_as_black.json" {
+                return Ok(Some(
+                    br##"{"values":["#test:hut_group",{"id":"test:missing","required":false}]}"##
+                        .to_vec(),
+                ));
+            }
+            if path == "data/test/tags/worldgen/structure/hut_group.json" {
+                return Ok(Some(br#"{"values":["minecraft:swamp_hut"]}"#.to_vec()));
+            }
             let conditions = match path {
                 "data/minecraft/cat_variant/all_black.json" => json!([
                     {"condition":{"type":"minecraft:structure","structures":"#minecraft:cats_spawn_as_black"},"priority":1},
@@ -172,6 +439,7 @@ mod tests {
             let names = match folder {
                 "cat_variant" => vec!["black", "all_black"],
                 "cat_sound_variant" => vec!["royal", "classic"],
+                "worldgen/structure" => vec!["swamp_hut", "buried_treasure"],
                 _ => anyhow::bail!("unexpected registry"),
             };
             names
@@ -208,5 +476,73 @@ mod tests {
         );
         assert_eq!(visited, ["minecraft:structure"]);
         assert!(!cat.animal.set_baby_age);
+    }
+
+    #[test]
+    fn prepared_structure_and_moon_predicates_use_world_context() {
+        let variants = CatSpawnVariants::load_active(&mut Data).unwrap();
+        let conditions = variants.prepare_world_conditions(&mut Data).unwrap();
+        let hut = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let pieces = BTreeSet::from([hut]);
+        let context = CatSpawnContext {
+            biome: None,
+            moon_phase: Some(4),
+            structures_with_piece: Some(&pieces),
+        };
+        let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, -13, 17);
+        let result = variants
+            .finalize_hut_cat(&mut random, |value| conditions.matches(value, &context))
+            .unwrap();
+        assert_eq!(
+            result.variant,
+            ResourceId::parse("minecraft:all_black").unwrap()
+        );
+        let moon = json!({"type":"minecraft:moon_brightness","range":{"min":0.9}});
+        for phase in 0..8 {
+            let context = CatSpawnContext {
+                moon_phase: Some(phase),
+                ..context
+            };
+            assert_eq!(conditions.matches(&moon, &context).unwrap(), phase == 0);
+        }
+        let missing = CatSpawnContext {
+            structures_with_piece: None,
+            ..context
+        };
+        let structure =
+            json!({"type":"minecraft:structure","structures":"#minecraft:cats_spawn_as_black"});
+        assert!(conditions.matches(&structure, &missing).is_err());
+    }
+
+    #[test]
+    fn structure_tags_respect_pack_replacement_and_missing_optional_entries() {
+        struct Layers;
+        impl ResourceProvider for Layers {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(match path {
+                    "data/test/tags/worldgen/structure/selection.json" => vec![br#"{"values":["minecraft:buried_treasure"]}"#.to_vec(), br##"{"replace":true,"values":["#test:nested",{"id":"test:absent","required":false}]}"##.to_vec()],
+                    "data/test/tags/worldgen/structure/nested.json" => vec![br#"{"values":["minecraft:swamp_hut"]}"#.to_vec()],
+                    _ => vec![],
+                })
+            }
+        }
+        let hut = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let treasure = ResourceId::parse("minecraft:buried_treasure").unwrap();
+        let registry = BTreeSet::from([hut.clone(), treasure]);
+        let values = resolve_selection(
+            &mut Layers,
+            "structure",
+            &registry,
+            &json!("#test:selection"),
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(values, BTreeSet::from([hut]));
     }
 }

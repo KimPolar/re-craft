@@ -13,8 +13,16 @@ import net.minecraft.util.*;
 import net.minecraft.world.entity.*;
 import net.minecraft.world.entity.animal.feline.*;
 import net.minecraft.world.entity.variant.SpawnPrioritySelectors;
+import net.minecraft.world.entity.variant.SpawnContext;
+import net.minecraft.world.entity.variant.MoonBrightnessCheck;
+import net.minecraft.advancements.predicates.MinMaxBounds;
+import net.minecraft.world.attribute.*;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.levelgen.*;
+import net.minecraft.world.level.levelgen.structure.*;
+import net.minecraft.world.level.levelgen.structure.structures.SwampHutPiece;
+import net.minecraft.world.level.levelgen.structure.pieces.PiecesContainer;
 import net.minecraft.world.level.storage.TagValueOutput;
 import com.mojang.serialization.Lifecycle;
 import sun.misc.Unsafe;
@@ -34,7 +42,7 @@ public class GeneratedHutCatOracle {
     public static void main(String[] args)throws Exception {
         SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
         var field=Unsafe.class.getDeclaredField("theUnsafe");field.setAccessible(true);
-        var world=(World)((Unsafe)field.get(null)).allocateInstance(World.class);
+        var unsafe=(Unsafe)field.get(null);var world=(World)unsafe.allocateInstance(World.class);
         var lookup=VanillaRegistries.createWorldLookup();
         var input=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         for(var entry:input){
@@ -64,6 +72,22 @@ public class GeneratedHutCatOracle {
             var actual=output.buildResult();var expected=NbtIo.read(Path.of(test.get("path").getAsString()));
             if(!actual.equals(expected))throw new AssertionError("case="+test+" java="+actual+" rust="+expected);
             if(random.nextLong()!=test.get("next").getAsLong())throw new AssertionError("random stream differs: "+test);
+        }
+        for(var entry:input.get(0).getAsJsonObject().getAsJsonArray("moon_checks")) {
+            var check=entry.getAsJsonObject();var phase=MoonPhase.values()[check.get("phase").getAsInt()];
+            var reader=new EnvironmentAttributeReader(){@Override @SuppressWarnings("unchecked") public <T> T getValue(EnvironmentAttribute<T> attribute,Vec3 point,SpatialAttributeInterpolator interpolator){return (T)phase;} @Override @SuppressWarnings("unchecked") public <T> T getDimensionValue(EnvironmentAttribute<T> attribute){return (T)phase;}};
+            var context=new SpawnContext(new BlockPos(3,10,-3),null,reader,null);
+            var predicate=new MoonBrightnessCheck(MinMaxBounds.Doubles.between(check.get("min").getAsDouble(),check.get("max").getAsDouble()));
+            if(predicate.test(context)!=check.get("expected").getAsBoolean())throw new AssertionError("moon condition differs: "+check);
+        }
+        var piece=new SwampHutPiece(RandomSource.create(42),0,0);
+        var boxField=StructurePiece.class.getDeclaredField("boundingBox");boxField.setAccessible(true);
+        boxField.set(piece,new BoundingBox(3,10,-3,9,16,5));
+        var start=new StructureStart(null,new ChunkPos(0,0),0,new PiecesContainer(List.of(piece)));
+        var manager=(StructureManager)unsafe.allocateInstance(StructureManager.class);
+        for(var entry:input.get(0).getAsJsonObject().getAsJsonArray("piece_checks")) {
+            var check=entry.getAsJsonObject();var point=new BlockPos(check.get("x").getAsInt(),check.get("y").getAsInt(),check.get("z").getAsInt());
+            if(manager.structureHasPieceAt(point,start)!=check.get("expected").getAsBoolean())throw new AssertionError("structure piece condition differs: "+check);
         }
     }
 }

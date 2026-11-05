@@ -11,6 +11,32 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
 struct Fixture(&'static str);
+
+struct MoonFixture;
+impl ResourceProvider for MoonFixture {
+    fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        if path != "data/minecraft/cat_variant/black.json" {
+            return Ok(None);
+        }
+        let mut entries = Vec::new();
+        for (min, max) in [(0.0, 0.0), (0.25, 0.5), (0.75, 1.0), (0.9, 1.0)] {
+            entries.push(json!({"priority":0,"condition":{"type":"minecraft:moon_brightness","range":{"min":min,"max":max}}}));
+        }
+        Ok(Some(serde_json::to_vec(
+            &json!({"spawn_conditions":entries}),
+        )?))
+    }
+    fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+        match folder {
+            "cat_variant" => Ok(vec![ResourceId::parse("minecraft:black")?]),
+            "cat_sound_variant" => Ok(vec![ResourceId::parse("minecraft:classic")?]),
+            _ => anyhow::bail!("unknown registry"),
+        }
+    }
+}
 impl ResourceProvider for Fixture {
     fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)
@@ -108,6 +134,41 @@ fn fresh_hut_cats_match_java_nbt_and_region_random() {
             }
         }
     }
+    let moons = CatSpawnVariants::load_active(&mut MoonFixture)
+        .unwrap()
+        .prepare_world_conditions(&mut MoonFixture)
+        .unwrap();
+    let mut checks = Vec::new();
+    for phase in 0..8 {
+        let context = native_resources::cat_variants::CatSpawnContext {
+            biome: None,
+            moon_phase: Some(phase),
+            structures_with_piece: None,
+        };
+        for (min, max) in [(0.0, 0.0), (0.25, 0.5), (0.75, 1.0), (0.9, 1.0)] {
+            let condition =
+                json!({"type":"minecraft:moon_brightness","range":{"min":min,"max":max}});
+            checks.push(json!({"phase":phase,"min":min,"max":max,"expected":moons.matches(&condition,&context).unwrap()}));
+        }
+    }
+    cases[0]["moon_checks"] = json!(checks);
+    let structure = ResourceId::parse("minecraft:swamp_hut").unwrap();
+    let piece = native_core::beardifier::BoundingBox::new([3, 10, -3], [9, 16, 5]).unwrap();
+    let mut checks = Vec::new();
+    for x in [2, 3, 9, 10] {
+        for y in [9, 10, 16, 17] {
+            for z in [-4, -3, 5, 6] {
+                let actual =
+                    native_session::worldgen::structure_references::structures_with_piece_at(
+                        [x, y, z],
+                        [(&structure, std::slice::from_ref(&piece))],
+                    )
+                    .unwrap();
+                checks.push(json!({"x":x,"y":y,"z":z,"expected":actual.contains(&structure)}));
+            }
+        }
+    }
+    cases[0]["piece_checks"] = json!(checks);
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     run(Command::new(java.join("java.exe"))
@@ -125,12 +186,18 @@ fn installed_hut_cat_variants_use_the_structure_selector() {
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
     let mut provider = native_resources::packs::ResourceStack::open(&game).unwrap();
     let variants = CatSpawnVariants::load_active(&mut provider).unwrap();
+    let conditions = variants.prepare_world_conditions(&mut provider).unwrap();
+    let pieces =
+        std::collections::BTreeSet::from([ResourceId::parse("minecraft:swamp_hut").unwrap()]);
+    let context = native_resources::cat_variants::CatSpawnContext {
+        biome: None,
+        moon_phase: None,
+        structures_with_piece: Some(&pieces),
+    };
     let mut random = RegionRandom::new(42, WorldgenRandom::Xoroshiro, -13, 17);
     let cat = variants
         .finalize_hut_cat(&mut random, |condition| {
-            assert_eq!(condition["type"], "minecraft:structure");
-            assert_eq!(condition["structures"], "#minecraft:cats_spawn_as_black");
-            Ok(true)
+            conditions.matches(condition, &context)
         })
         .unwrap();
     assert_eq!(

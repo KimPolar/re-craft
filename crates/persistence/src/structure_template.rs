@@ -53,6 +53,49 @@ fn int_vec3(tag: &Tag, label: &str) -> Result<[i32; 3]> {
 }
 
 impl StructureTemplate {
+    /// Java sorts full, non-full, then NBT-bearing blocks separately by
+    /// local Y, X, Z. Classification applies to untransformed palette states.
+    /// Returns source indices without modifying the original template.
+    pub fn java_block_order(
+        &self,
+        palette_index: usize,
+        mut is_static_full: impl FnMut(usize, &Tag) -> Result<bool>,
+    ) -> Result<Vec<usize>> {
+        let palette = self
+            .palettes
+            .get(palette_index)
+            .context("template palette index out of bounds")?;
+        let mut cached = vec![None; palette.len()];
+        let mut keys = Vec::with_capacity(self.blocks.len());
+        for (index, block) in self.blocks.iter().enumerate() {
+            let state = palette
+                .get(block.state)
+                .context("template state index outside palette")?;
+            let group = if block.nbt.is_some() {
+                2_u8
+            } else {
+                let full = match cached[block.state] {
+                    Some(value) => value,
+                    None => {
+                        let value = is_static_full(block.state, state)?;
+                        cached[block.state] = Some(value);
+                        value
+                    }
+                };
+                u8::from(!full)
+            };
+            keys.push((
+                group,
+                block.position[1],
+                block.position[0],
+                block.position[2],
+                index,
+            ));
+        }
+        keys.sort_by_key(|&(group, y, x, z, _)| (group, y, x, z));
+        Ok(keys.into_iter().map(|(_, _, _, _, index)| index).collect())
+    }
+
     /// Resolve the highest-priority active data-pack template. A missing
     /// resource is distinct from malformed or unsupported template data.
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Option<Self>> {
@@ -256,5 +299,35 @@ mod tests {
         data.0
             .insert("data/example/structure/ruin/test.nbt".into(), vec![0, 1, 2]);
         assert!(StructureTemplate::load(&mut data, &id).is_err());
+    }
+
+    #[test]
+    fn block_order_groups_full_nonfull_and_nbt_with_stable_local_coordinates() {
+        let mut template = StructureTemplate::from_document(document(0)).unwrap();
+        template.palettes[0].push(Tag::Compound(vec![]));
+        let block = |position, state, nbt| TemplateBlock {
+            position,
+            state,
+            nbt,
+        };
+        template.blocks = vec![
+            block([3, 0, 2], 1, None),
+            block([1, 0, 2], 0, Some(Tag::Compound(vec![]))),
+            block([2, 1, 0], 0, None),
+            block([1, 0, 1], 0, None),
+            block([3, 0, 2], 1, None),
+        ];
+        let mut calls = Vec::new();
+        let order = template
+            .java_block_order(0, |index, _| {
+                calls.push(index);
+                Ok(index == 0)
+            })
+            .unwrap();
+        assert_eq!(order, [3, 2, 0, 4, 1]);
+        assert_eq!(calls, [1, 0]);
+        assert!(template.java_block_order(2, |_, _| Ok(true)).is_err());
+        template.blocks[1].state = 99;
+        assert!(template.java_block_order(0, |_, _| Ok(true)).is_err());
     }
 }

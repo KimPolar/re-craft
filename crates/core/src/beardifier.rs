@@ -44,6 +44,34 @@ pub enum TerrainAdjustment {
     BeardBox,
     Encapsulate,
 }
+
+/// Java StructureStart's reference bounds: the union of all piece bounds,
+/// expanded by twelve blocks in every direction when terrain adaptation is on.
+/// An empty piece list is an invalid start, and overflow is rejected rather
+/// than publishing a wrapped bounding box.
+pub fn structure_start_bounds(
+    pieces: &[BoundingBox],
+    adjustment: TerrainAdjustment,
+) -> Result<BoundingBox, &'static str> {
+    let (&first, rest) = pieces
+        .split_first()
+        .ok_or("structure start has no pieces")?;
+    if (0..3).any(|axis| first.min[axis] > first.max[axis]) {
+        return Err("invalid bounding box");
+    }
+    let mut bounds = first;
+    for piece in rest {
+        if (0..3).any(|axis| piece.min[axis] > piece.max[axis]) {
+            return Err("invalid bounding box");
+        }
+        bounds.include(*piece);
+    }
+    if adjustment == TerrainAdjustment::None {
+        Ok(bounds)
+    } else {
+        bounds.inflate(12)
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RigidPiece {
     pub bounds: BoundingBox,
@@ -298,6 +326,38 @@ mod tests {
 
     fn bounds(min: [i32; 3], max: [i32; 3]) -> BoundingBox {
         BoundingBox::new(min, max).unwrap()
+    }
+
+    #[test]
+    fn start_bounds_union_pieces_and_apply_terrain_margin() {
+        let pieces = [
+            bounds([-3, 5, 7], [2, 8, 9]),
+            bounds([20, -4, -8], [25, 2, -6]),
+        ];
+        let union = bounds([-3, -4, -8], [25, 8, 9]);
+        assert_eq!(
+            structure_start_bounds(&pieces, TerrainAdjustment::None).unwrap(),
+            union
+        );
+        for adjustment in [
+            TerrainAdjustment::Bury,
+            TerrainAdjustment::BeardThin,
+            TerrainAdjustment::BeardBox,
+            TerrainAdjustment::Encapsulate,
+        ] {
+            assert_eq!(
+                structure_start_bounds(&pieces, adjustment).unwrap(),
+                bounds([-15, -16, -20], [37, 20, 21])
+            );
+        }
+        assert!(structure_start_bounds(&[], TerrainAdjustment::None).is_err());
+        assert!(
+            structure_start_bounds(
+                &[bounds([i32::MIN, 0, 0], [0, 0, 0])],
+                TerrainAdjustment::Bury
+            )
+            .is_err()
+        );
     }
 
     #[test]

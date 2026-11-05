@@ -54,12 +54,17 @@ public class StructureReferencesOracle {
                         .getOrThrow(ResourceKey.create(Registries.STRUCTURE,id)).value();
                 structureIds.put(structure, id);
                 int x=s.get("x").getAsInt(), z=s.get("z").getAsInt();
-                var b=s.getAsJsonArray("bounds");
-                var box = new BoundingBox(b.get(0).getAsInt(),b.get(1).getAsInt(),b.get(2).getAsInt(),
-                        b.get(3).getAsInt(),b.get(4).getAsInt(),b.get(5).getAsInt());
-                var start = new StructureStart(structure,new ChunkPos(x,z),0,new PiecesContainer(List.of(new Piece(box))));
-                var actual = start.getBoundingBox();
-                if (!actual.equals(box)) throw new AssertionError("fixture must use unadjusted bounds");
+                List<StructurePiece> pieces = new ArrayList<>();
+                for (var pieceElement : s.getAsJsonArray("pieces")) {
+                    var b = pieceElement.getAsJsonArray();
+                    var box = new BoundingBox(b.get(0).getAsInt(),b.get(1).getAsInt(),b.get(2).getAsInt(),
+                            b.get(3).getAsInt(),b.get(4).getAsInt(),b.get(5).getAsInt());
+                    pieces.add(new Piece(box));
+                }
+                var start = new StructureStart(structure,new ChunkPos(x,z),0,new PiecesContainer(pieces));
+                var bounds = start.getBoundingBox();
+                out.printf("BOUND %d %d %s %d %d %d %d %d %d%n", x,z,id,
+                        bounds.minX(),bounds.minY(),bounds.minZ(),bounds.maxX(),bounds.maxY(),bounds.maxZ());
                 chunk.apply(x,z).setStartForStructure(structure,start);
             }
             var world = (WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),

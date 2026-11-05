@@ -1,7 +1,7 @@
 //! Compare reference discovery with Java 26.3's ChunkGenerator.createReferences.
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
-use native_core::beardifier::BoundingBox;
+use native_core::beardifier::{BoundingBox, TerrainAdjustment};
 use native_resources::packs::ResourceId;
 use native_session::worldgen::structure_references::{
     StructureStartBounds, collect_structure_references,
@@ -71,25 +71,51 @@ fn generated_structure_references_match_java() {
                     x: target.x + dx,
                     z: target.z + dz,
                 };
-                let id = if (dx + dz).rem_euclid(2) == 0 {
-                    "minecraft:buried_treasure"
-                } else {
-                    "minecraft:desert_pyramid"
+                let (id, adjustment) = match (dx + dz).rem_euclid(5) {
+                    0 => ("minecraft:buried_treasure", TerrainAdjustment::None),
+                    1 => ("minecraft:stronghold", TerrainAdjustment::Bury),
+                    2 => ("minecraft:village_plains", TerrainAdjustment::BeardThin),
+                    3 => ("minecraft:ancient_city", TerrainAdjustment::BeardBox),
+                    _ => ("minecraft:trial_chambers", TerrainAdjustment::Encapsulate),
                 };
                 // Exercise inclusive edges, non-overlap, Y independence, and the eight-chunk limit.
-                let edge_x = target.x * 16 + (dx * 3 + dz).rem_euclid(20) - 2;
-                let edge_z = target.z * 16 + (dz * 5 - dx).rem_euclid(20) - 2;
-                let bounds =
+                let edge_x = target.x * 16 + (dx * 3 + dz).rem_euclid(50) - 17;
+                let edge_z = target.z * 16 + (dz * 5 - dx).rem_euclid(50) - 17;
+                let mut pieces = vec![
                     BoundingBox::new([edge_x, -300, edge_z], [edge_x + 1, -290, edge_z + 1])
-                        .unwrap();
-                starts
-                    .entry(source)
-                    .or_default()
-                    .push(StructureStartBounds {
-                        structure: ResourceId::parse(id).unwrap(),
-                        bounds,
-                    });
-                records.push(json!({"x":source.x,"z":source.z,"id":id,"bounds":[bounds.min[0],bounds.min[1],bounds.min[2],bounds.max[0],bounds.max[1],bounds.max[2]]}));
+                        .unwrap(),
+                ];
+                if (dx - dz).rem_euclid(2) == 0 {
+                    pieces.push(
+                        BoundingBox::new(
+                            [edge_x + 5, -320, edge_z - 7],
+                            [edge_x + 7, -310, edge_z - 4],
+                        )
+                        .unwrap(),
+                    );
+                }
+                starts.entry(source).or_default().push(
+                    StructureStartBounds::from_pieces(
+                        ResourceId::parse(id).unwrap(),
+                        &pieces,
+                        adjustment,
+                    )
+                    .unwrap(),
+                );
+                let boxes: Vec<_> = pieces
+                    .iter()
+                    .map(|bounds| {
+                        json!([
+                            bounds.min[0],
+                            bounds.min[1],
+                            bounds.min[2],
+                            bounds.max[0],
+                            bounds.max[1],
+                            bounds.max[2]
+                        ])
+                    })
+                    .collect();
+                records.push(json!({"x":source.x,"z":source.z,"id":id,"pieces":boxes}));
             }
         }
         cases.push(json!({"x":target.x,"z":target.z,"starts":records}));
@@ -104,20 +130,64 @@ fn generated_structure_references_match_java() {
         .arg(input));
     let mut groups = Vec::new();
     let mut java_refs = BTreeMap::<ResourceId, std::collections::BTreeSet<i64>>::new();
+    let mut bounding_groups = Vec::new();
+    let mut java_bounds = BTreeMap::<(ChunkPos, ResourceId), BoundingBox>::new();
     for line in output.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.first() == Some(&"REF") {
+        if parts.first() == Some(&"BOUND") {
+            let number = |index: usize| parts[index].parse::<i32>().unwrap();
+            let pos = ChunkPos {
+                x: number(1),
+                z: number(2),
+            };
+            let id = ResourceId::parse(parts[3]).unwrap();
+            let bounds = BoundingBox::new(
+                [number(4), number(5), number(6)],
+                [number(7), number(8), number(9)],
+            )
+            .unwrap();
+            assert!(java_bounds.insert((pos, id), bounds).is_none());
+        } else if parts.first() == Some(&"REF") {
             java_refs
                 .entry(ResourceId::parse(parts[1]).unwrap())
                 .or_default()
                 .insert(parts[2].parse().unwrap());
         } else if parts.first() == Some(&"END") {
             groups.push(std::mem::take(&mut java_refs));
+            bounding_groups.push(std::mem::take(&mut java_bounds));
         }
     }
     assert_eq!(groups.len(), expected_inputs.len());
-    for ((target, starts), expected) in expected_inputs.into_iter().zip(groups) {
+    for name in [
+        "minecraft:buried_treasure",
+        "minecraft:stronghold",
+        "minecraft:village_plains",
+        "minecraft:ancient_city",
+        "minecraft:trial_chambers",
+    ] {
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.contains_key(&ResourceId::parse(name).unwrap())),
+            "missing fixture for {name}"
+        );
+    }
+    for (((target, starts), expected), expected_bounds) in
+        expected_inputs.into_iter().zip(groups).zip(bounding_groups)
+    {
         assert!(!expected.is_empty());
+        let actual_bounds: BTreeMap<_, _> = starts
+            .iter()
+            .flat_map(|(&pos, starts)| {
+                starts
+                    .iter()
+                    .map(move |start| ((pos, start.structure.clone()), start.bounds))
+            })
+            .collect();
+        assert_eq!(
+            actual_bounds, expected_bounds,
+            "structure bounds at target {target:?}"
+        );
         let actual = collect_structure_references(target, |source| {
             Ok(starts.get(&source).cloned().unwrap_or_default())
         })

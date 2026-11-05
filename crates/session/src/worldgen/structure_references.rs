@@ -5,8 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
-use native_core::beardifier::BoundingBox;
+use native_core::beardifier::{BoundingBox, TerrainAdjustment, structure_start_bounds};
 use native_resources::packs::ResourceId;
+use native_resources::structure_start::SimpleStructureStart;
 use native_world::loaded::ChunkPos;
 
 /// A valid start and its complete, structure-adjusted bounding box. Invalid
@@ -15,6 +16,25 @@ use native_world::loaded::ChunkPos;
 pub struct StructureStartBounds {
     pub structure: ResourceId,
     pub bounds: BoundingBox,
+}
+
+impl StructureStartBounds {
+    /// Construct the complete reference bounds from all generated pieces.
+    pub fn from_pieces(
+        structure: ResourceId,
+        pieces: &[BoundingBox],
+        adjustment: TerrainAdjustment,
+    ) -> Result<Self> {
+        Ok(Self {
+            structure,
+            bounds: structure_start_bounds(pieces, adjustment).map_err(anyhow::Error::msg)?,
+        })
+    }
+
+    /// Simple starts currently contain exactly one non-pool piece.
+    pub fn from_simple(structure: ResourceId, start: &SimpleStructureStart) -> Result<Self> {
+        Self::from_pieces(structure, &[start.bounds], start.terrain_adjustment)
+    }
 }
 
 /// Packed source chunk coordinates grouped by structure registry key.
@@ -69,6 +89,34 @@ pub fn collect_structure_references(
 mod tests {
     use super::*;
     use anyhow::bail;
+    use native_resources::structure_start::SimpleStructureKind;
+
+    #[test]
+    fn simple_starts_feed_reference_bounds_with_adaptation() {
+        let start = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            orientation: None,
+            bounds: BoundingBox::new([16, 20, 0], [20, 25, 4]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::BeardThin,
+        };
+        let reference =
+            StructureStartBounds::from_simple(ResourceId::parse("example:hut").unwrap(), &start)
+                .unwrap();
+        let result = collect_structure_references(ChunkPos { x: 0, z: 0 }, |pos| {
+            Ok(if pos == (ChunkPos { x: 1, z: 0 }) {
+                vec![reference.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            result[&ResourceId::parse("example:hut").unwrap()],
+            BTreeSet::from([1])
+        );
+    }
 
     #[test]
     fn scans_complete_neighborhood_and_rejects_missing_or_invalid_starts() {

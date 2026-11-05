@@ -53,6 +53,14 @@ pub struct StructureGenerationBatch {
 }
 
 impl StructureGenerationBatch {
+    pub(super) fn generator(&self) -> &TerrainGenerator {
+        &self.generator
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.failed = true;
+    }
+
     pub fn new(
         generator: TerrainGenerator,
         biome_rules: StructureBiomes,

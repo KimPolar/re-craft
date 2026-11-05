@@ -6541,6 +6541,126 @@ mod tests {
         assert_eq!(actual.states, expected.states);
         assert_eq!(actual.fluid_updates, expected.fluid_updates);
 
+        // The regular generation schedule also requires starts around each
+        // neighboring biome chunk, so prepare all nine reference stages.
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    batch
+                        .request_references(ChunkPos {
+                            x: x + dx,
+                            z: z + dz,
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        while batch
+            .step(&mut data, &mut |v| {
+                let id = v.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: id == "minecraft:air",
+                    blocks_motion: id == "minecraft:stone",
+                    blocks_motion_no_leaves: id == "minecraft:stone",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        let prepare_schedule = |batch: &super::structure_batch::StructureGenerationBatch,
+                                neighborhood: &BiomeNeighborhood| {
+            use super::schedule::{GenerationSchedule, GenerationStage};
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(target, GenerationStage::Terrain).unwrap();
+            loop {
+                let (pos, stage) = schedule.next_ready().unwrap();
+                if stage == GenerationStage::Terrain {
+                    assert_eq!(pos, target);
+                    break;
+                }
+                match stage {
+                    GenerationStage::StructureStarts => assert!(batch.starts(pos).is_some()),
+                    GenerationStage::StructureReferences => {
+                        assert!(batch.references(pos).is_some())
+                    }
+                    GenerationStage::Biomes => {
+                        assert!(neighborhood.chunk([pos.x, pos.z]).is_some())
+                    }
+                    _ => panic!("unexpected generation stage"),
+                }
+                schedule.complete(pos, stage).unwrap();
+            }
+            schedule
+        };
+        let mut schedule = prepare_schedule(&batch, &neighborhood);
+        let mut assembled = None;
+        schedule
+            .run_terrain_with_structures(
+                &mut batch,
+                &mut data,
+                &mut CarverCache::default(),
+                &neighborhood,
+                &tags,
+                &mut assembled,
+                target,
+                "minecraft:overworld",
+                &order,
+                classify,
+                |value| {
+                    Ok(native_world::loaded::BlockState {
+                        name: value.as_str().unwrap().into(),
+                        properties: BTreeMap::new(),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            schedule.completed(target),
+            Some(super::schedule::GenerationStage::Terrain)
+        );
+        let snapshot = assembled.as_ref().unwrap().snapshot();
+        for local_z in 0..16usize {
+            for local_x in 0..16usize {
+                for y in 0..16usize {
+                    let block = snapshot
+                        .block(x * 16 + local_x as i32, y as i32, z * 16 + local_z as i32)
+                        .unwrap();
+                    assert_eq!(
+                        block.name,
+                        actual.states[(local_z * 16 + local_x) * 16 + y]
+                            .as_str()
+                            .unwrap()
+                    );
+                }
+            }
+        }
+        let mut failed_schedule = prepare_schedule(&batch, &neighborhood);
+        let mut failed_world = None;
+        assert!(
+            failed_schedule
+                .run_terrain_with_structures(
+                    &mut batch,
+                    &mut data,
+                    &mut CarverCache::default(),
+                    &neighborhood,
+                    &tags,
+                    &mut failed_world,
+                    target,
+                    "minecraft:overworld",
+                    &order,
+                    classify,
+                    |_| anyhow::bail!("unknown block"),
+                )
+                .is_err()
+        );
+        assert!(failed_world.is_none());
+        assert_eq!(
+            failed_schedule.completed(target),
+            Some(super::schedule::GenerationStage::Biomes)
+        );
+        assert!(batch.references(target).is_none());
+
         // Make the structure's initial Y=64 piece overlap generated terrain
         // and let a material rule depend on the beardifier contribution.
         let mut tall = definition();
@@ -6622,6 +6742,70 @@ mod tests {
                 .any(|(a, b)| a != b),
             "generated structure must change terrain material"
         );
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    tall_batch
+                        .request_references(ChunkPos {
+                            x: x + dx,
+                            z: z + dz,
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        while tall_batch
+            .step(&mut data, &mut |v| {
+                let id = v.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: id == "minecraft:air",
+                    blocks_motion: id == "minecraft:stone",
+                    blocks_motion_no_leaves: id == "minecraft:stone",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        let mut tall_schedule = prepare_schedule(&tall_batch, &tall_neighborhood);
+        let mut tall_world = None;
+        tall_schedule
+            .run_terrain_with_structures(
+                &mut tall_batch,
+                &mut data,
+                &mut CarverCache::default(),
+                &tall_neighborhood,
+                &tags,
+                &mut tall_world,
+                target,
+                "minecraft:overworld",
+                &tall_order,
+                classify,
+                |value| {
+                    Ok(native_world::loaded::BlockState {
+                        name: value.as_str().unwrap().into(),
+                        properties: BTreeMap::new(),
+                    })
+                },
+            )
+            .unwrap();
+        let tall_snapshot = tall_world.unwrap().snapshot();
+        let mut adjusted_blocks = 0;
+        for local_z in 0..16usize {
+            for local_x in 0..16usize {
+                for y in 0..96usize {
+                    let index = (local_z * 16 + local_x) * 96 + y;
+                    let block = tall_snapshot
+                        .block(x * 16 + local_x as i32, y as i32, z * 16 + local_z as i32)
+                        .unwrap();
+                    assert_eq!(block.name, with_structure.states[index].as_str().unwrap());
+                    adjusted_blocks += usize::from(
+                        with_structure.states[index] != without_structure.states[index],
+                    );
+                }
+            }
+        }
+        assert!(adjusted_blocks > 0);
 
         data.0.insert(
             "data/example/worldgen/structure/pyramid.json".into(),

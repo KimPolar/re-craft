@@ -375,6 +375,21 @@ impl GeneratedBlockView<'_> {
         Some((top, state.properties.get("waterlogged")? == "true"))
     }
 
+    fn stair(&self, state: &BlockState) -> Option<(u8, bool)> {
+        if !state.name.starts_with("minecraft:")
+            || !state.name.ends_with("_stairs")
+            || self.heightmap_tags?.for_block(&state.name).is_err()
+            || native_world::collision::slab_stair_solid(state) != Some(true)
+        {
+            return None;
+        }
+        let shape = native_world::collision::block_shape(state)?;
+        Some((
+            native_world::fluid_sim::octants(&shape)?,
+            state.properties.get("waterlogged")? == "true",
+        ))
+    }
+
     fn read(&self, pos: [i32; 3]) -> Result<BlockState> {
         if !(self.min_y..self.max_y).contains(&pos[1]) {
             return Ok(BlockState {
@@ -403,6 +418,12 @@ impl GeneratedBlockView<'_> {
         };
         if let Some((top, waterlogged)) = self.slab(&state) {
             return Cell::Slab { top, waterlogged };
+        }
+        if let Some((voxels, waterlogged)) = self.stair(&state) {
+            return Cell::Stairs {
+                voxels,
+                waterlogged,
+            };
         }
         if leaf_distance(&state).ok().flatten().is_some()
             && state
@@ -607,6 +628,10 @@ impl GeneratedBlockView<'_> {
                     self.fluid_cell_for_spread(change.position),
                     Cell::Slab { top: actual, waterlogged: false } if actual == top
                 ),
+                ChangedBlock::WaterloggedStairs { voxels } => matches!(
+                    self.fluid_cell_for_spread(change.position),
+                    Cell::Stairs { voxels: actual, waterlogged: false } if actual == voxels
+                ),
                 _ => false,
             };
             ensure!(
@@ -680,9 +705,15 @@ impl GeneratedBlockView<'_> {
             Cell::Slab {
                 waterlogged: false,
                 ..
+            } | Cell::Stairs {
+                waterlogged: false,
+                ..
             }
         ) {
-            ensure!(fluid.source && !fluid.falling, "slab requires source water");
+            ensure!(
+                fluid.source && !fluid.falling,
+                "block requires source water"
+            );
             let mut next = old.clone();
             next.properties.insert("waterlogged".into(), "true".into());
             self.apply_water_change(target, &old, &next)?;
@@ -734,7 +765,9 @@ impl GeneratedBlockView<'_> {
         );
         let next_fluid = liquid_state(next)?;
         let next_slab = self.slab(next);
-        let contained_source = next_slab.is_some_and(|(_, wet)| wet);
+        let next_stair = self.stair(next);
+        let contained_source =
+            next_slab.is_some_and(|(_, wet)| wet) || next_stair.is_some_and(|(_, wet)| wet);
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (next.name == "minecraft:air" && next.properties.is_empty())
@@ -750,7 +783,9 @@ impl GeneratedBlockView<'_> {
                 || liquid_state(old)?
                     .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (self.slab(old).is_some_and(|(_, wet)| !wet)
-                    && next_slab.is_some_and(|(_, wet)| wet)),
+                    && next_slab.is_some_and(|(_, wet)| wet))
+                || (self.stair(old).is_some_and(|(_, wet)| !wet)
+                    && next_stair.is_some_and(|(_, wet)| wet)),
             "unsupported original water state"
         );
         let next_air = next.name == "minecraft:air";
@@ -803,7 +838,11 @@ impl GeneratedBlockView<'_> {
             ensure!(
                 matches!(
                     self.fluid_cell(p),
-                    Cell::Air | Cell::Solid | Cell::Fluid(_) | Cell::Slab { .. }
+                    Cell::Air
+                        | Cell::Solid
+                        | Cell::Fluid(_)
+                        | Cell::Slab { .. }
+                        | Cell::Stairs { .. }
                 ),
                 "unsupported water neighbor callback"
             );
@@ -865,7 +904,9 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
-            } else if self.slab(&state).is_some_and(|(_, wet)| wet) {
+            } else if self.slab(&state).is_some_and(|(_, wet)| wet)
+                || self.stair(&state).is_some_and(|(_, wet)| wet)
+            {
                 self.schedule_contained_water(p.to_array())?;
             } else if matches!(
                 state.name.as_str(),
@@ -934,12 +975,42 @@ impl GeneratedBlockView<'_> {
         Ok(super::ore::monster_block_flags(&below)?.1)
     }
 
-    fn replace_mushroom(&mut self, pos: [i32; 3], next: &BlockState, flags: i32) -> Result<()> {
+    fn replace_postprocessed_shape(
+        &mut self,
+        pos: [i32; 3],
+        next: &BlockState,
+        flags: i32,
+    ) -> Result<()> {
+        let old = self.read(pos)?;
+        if self.stair(&old).is_some() && self.stair(next).is_some() {
+            let mut expected = old.clone();
+            expected
+                .properties
+                .insert("shape".into(), next.properties["shape"].clone());
+            ensure!(
+                flags == 276 && *next == expected,
+                "unsupported generated stair write"
+            );
+            let same_light = native_world::block_light::same_light_behavior(&old, next)
+                .context("stair light behavior unavailable")?;
+            ensure!(
+                native_world::sky_light::same_sky_behavior(&old, next) == Some(true),
+                "stair shape changes direct sky sources"
+            );
+            if !same_light {
+                let change = native_world::block_light::light_change(&old, next)
+                    .context("stair light change unavailable")?;
+                ensure!(
+                    change.radius() == 0,
+                    "stair shape requires light propagation during postprocessing"
+                );
+            }
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         ensure!(
             flags == 276 && next.name == "minecraft:air" && next.properties.is_empty(),
             "unsupported generated postprocessing write"
         );
-        let old = self.read(pos)?;
         ensure!(
             matches!(supported_postprocessing_block(&old)?, DryBlock::Mushroom),
             "postprocessing source is not a mushroom"
@@ -1116,6 +1187,9 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                     Cell::Slab {
                         waterlogged: false,
                         ..
+                    } | Cell::Stairs {
+                        waterlogged: false,
+                        ..
                     }
                 ) && fluid.source)
                 && pos == self.origin + direction
@@ -1145,7 +1219,7 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         &mut self,
         pos: [i32; 3],
         state: &BlockState,
-        _: [i32; 3],
+        direction: [i32; 3],
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
@@ -1154,6 +1228,42 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 self.schedule_contained_water(pos)?;
             }
             return Ok(state.clone());
+        }
+        if let Some((_, waterlogged)) = self.stair(state) {
+            if waterlogged {
+                self.schedule_contained_water(pos)?;
+            }
+            if direction[1] != 0 {
+                return Ok(state.clone());
+            }
+            let stair = native_world::stairs::Stair::from_state(state)
+                .context("invalid generated stair")?;
+            let base = glam::IVec3::from_array(pos);
+            let shape = native_world::stairs::shape(stair, |offset| {
+                let Some(x) = base.x.checked_add(offset.x) else {
+                    return native_world::stairs::Neighbor::Unknown;
+                };
+                let Some(z) = base.z.checked_add(offset.z) else {
+                    return native_world::stairs::Neighbor::Unknown;
+                };
+                let Ok(other) = self.read([x, base.y, z]) else {
+                    return native_world::stairs::Neighbor::Unknown;
+                };
+                if let Some((_, _)) = self.stair(&other) {
+                    native_world::stairs::Stair::from_state(&other).map_or(
+                        native_world::stairs::Neighbor::Unknown,
+                        native_world::stairs::Neighbor::Stair,
+                    )
+                } else if other.name.ends_with("_stairs") {
+                    native_world::stairs::Neighbor::Unknown
+                } else {
+                    native_world::stairs::Neighbor::Other
+                }
+            })
+            .context("stair shape needs unavailable neighbors")?;
+            let mut updated = state.clone();
+            updated.properties.insert("shape".into(), shape.into());
+            return Ok(updated);
         }
         match supported_postprocessing_block(state)? {
             DryBlock::Falling => {
@@ -1203,7 +1313,7 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
     }
 
     fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
-        self.replace_mushroom(pos, state, flags)
+        self.replace_postprocessed_shape(pos, state, flags)
     }
 }
 
@@ -1220,6 +1330,13 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         }
         if let Some((top, waterlogged)) = self.slab(state) {
             return Ok(native_world::fluid_sim::Cell::Slab { top, waterlogged }.contained_fluid());
+        }
+        if let Some((voxels, waterlogged)) = self.stair(state) {
+            return Ok(native_world::fluid_sim::Cell::Stairs {
+                voxels,
+                waterlogged,
+            }
+            .contained_fluid());
         }
         if leaf_distance(state)?.is_some() && state.properties["waterlogged"] == "true" {
             return Ok(Some(native_world::fluid::FluidState {
@@ -1246,7 +1363,7 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         update_from_neighbor_shapes(self, pos, state)
     }
     fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
-        self.replace_mushroom(pos, state, flags)
+        self.replace_postprocessed_shape(pos, state, flags)
     }
     fn clear_processed_section(&mut self, _: usize) -> Result<()> {
         Ok(())
@@ -1870,7 +1987,7 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     return Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab","minecraft:oak_stairs"]}"#.to_vec(),
                     ));
                 }
                 if path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" {
@@ -1973,6 +2090,65 @@ mod tests {
                 });
                 world.set_block_id(9, 8, 8, slab).unwrap();
                 world.set_block_id(9, 8, 7, water).unwrap();
+            }
+            "stair_bottom" | "stair_top" | "stair_bottom_off" => {
+                let stair = world.intern_state(BlockState {
+                    name: "minecraft:oak_stairs".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        (
+                            "half".into(),
+                            if case == "stair_top" { "top" } else { "bottom" }.into(),
+                        ),
+                        ("shape".into(), "straight".into()),
+                        ("waterlogged".into(), "false".into()),
+                    ]),
+                });
+                world.set_block_id(9, 8, 8, stair).unwrap();
+                world.set_block_id(9, 8, 7, water).unwrap();
+            }
+            "marked_stair_dry" | "marked_stair_wet" | "marked_stair_side" | "marked_stair_down" => {
+                let stair = world.intern_state(BlockState {
+                    name: "minecraft:oak_stairs".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), "north".into()),
+                        (
+                            "half".into(),
+                            if case == "marked_stair_down" {
+                                "top"
+                            } else {
+                                "bottom"
+                            }
+                            .into(),
+                        ),
+                        ("shape".into(), "straight".into()),
+                        (
+                            "waterlogged".into(),
+                            (case != "marked_stair_dry").to_string(),
+                        ),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, stair).unwrap();
+                if case == "marked_stair_side" {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if case == "marked_stair_down" {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+            }
+            case if case.starts_with("marked_stair_variant_") => {
+                let parts: Vec<_> = case["marked_stair_variant_".len()..].split('_').collect();
+                assert_eq!(parts.len(), 3);
+                let stair = world.intern_state(BlockState {
+                    name: "minecraft:oak_stairs".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), parts[0].into()),
+                        ("half".into(), parts[1].into()),
+                        ("shape".into(), "straight".into()),
+                        ("waterlogged".into(), parts[2].into()),
+                    ]),
+                });
+                world.set_block_id(8, 8, 8, stair).unwrap();
             }
             "marked_slab_dry" | "marked_slab_wet" | "marked_slab_side" | "marked_slab_down" => {
                 let slab = world.intern_state(BlockState {
@@ -2102,6 +2278,7 @@ mod tests {
             "dirt",
             "stone_slab",
             "oak_slab",
+            "oak_stairs",
             "oak_leaves",
         ]
         .into_iter()
@@ -2157,11 +2334,14 @@ mod tests {
                 | "slab_top"
                 | "slab_bottom_off"
                 | "slab_oak"
+                | "stair_bottom"
+                | "stair_top"
+                | "stair_bottom_off"
         ) {
             stage
                 .set_water_source_conversion(!matches!(
                     case,
-                    "convert_off" | "origin_source_off" | "slab_bottom_off"
+                    "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off"
                 ))
                 .unwrap();
         }
@@ -2173,9 +2353,10 @@ mod tests {
         assert_eq!(
             result.water_source_conversion(),
             match case {
-                "convert_off" | "origin_source_off" | "slab_bottom_off" => Some(false),
+                "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off" =>
+                    Some(false),
                 "convert_on" | "convert_bubble" | "origin_source_on" | "slab_bottom"
-                | "slab_top" | "slab_oak" => Some(true),
+                | "slab_top" | "slab_oak" | "stair_bottom" | "stair_top" => Some(true),
                 _ => None,
             }
         );
@@ -2209,6 +2390,12 @@ mod tests {
                     .or_else(|| state.properties.get("waterlogged"))
                     .map_or("-", String::as_str)
             ));
+            if state.name == "minecraft:oak_stairs" {
+                trace.push(format!(
+                    "stair {x},{y},{z} {} {} {}",
+                    state.properties["facing"], state.properties["half"], state.properties["shape"]
+                ));
+            }
         }
         for change in &result.edits {
             assert_ne!(
@@ -2448,6 +2635,34 @@ mod tests {
     }
 
     #[test]
+    fn marked_waterlogged_stairs_and_water_spread_preserve_stair_state() {
+        for case in [
+            "stair_bottom",
+            "stair_top",
+            "stair_bottom_off",
+            "marked_stair_dry",
+            "marked_stair_wet",
+            "marked_stair_side",
+            "marked_stair_down",
+        ] {
+            let trace = water_spread_trace(case);
+            assert!(
+                trace
+                    .iter()
+                    .any(|line| line.contains("minecraft:oak_stairs")),
+                "{case}"
+            );
+            if case == "marked_stair_wet" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "fluid minecraft:water 8,8,8 5")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn marked_waterlogged_leaves_schedule_fluid_and_leaf_ticks_without_spreading() {
         let dry = water_spread_trace("marked_leaf_dry");
         assert!(!dry.iter().any(|line| line.starts_with("fluid ")));
@@ -2520,6 +2735,13 @@ mod tests {
             "marked_slab_wet",
             "marked_slab_side",
             "marked_slab_down",
+            "stair_bottom",
+            "stair_top",
+            "stair_bottom_off",
+            "marked_stair_dry",
+            "marked_stair_wet",
+            "marked_stair_side",
+            "marked_stair_down",
             "marked_leaf_dry",
             "marked_leaf_wet",
             "marked_leaf_side",
@@ -2541,6 +2763,15 @@ mod tests {
             "flowering_azalea_leaves",
         ] {
             expected.extend(water_spread_trace(&format!("marked_leaf_type_{name}")));
+        }
+        for facing in ["north", "south", "west", "east"] {
+            for half in ["bottom", "top"] {
+                for wet in [false, true] {
+                    expected.extend(water_spread_trace(&format!(
+                        "marked_stair_variant_{facing}_{half}_{wet}"
+                    )));
+                }
+            }
         }
         assert_eq!(actual, expected);
     }

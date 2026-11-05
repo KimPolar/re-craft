@@ -17,6 +17,7 @@ import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.SlabType;
+import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.material.*;
@@ -100,12 +101,15 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         leafTypes.put("mangrove_leaves",Blocks.MANGROVE_LEAVES); leafTypes.put("cherry_leaves",Blocks.CHERRY_LEAVES);
         leafTypes.put("pale_oak_leaves",Blocks.PALE_OAK_LEAVES); leafTypes.put("azalea_leaves",Blocks.AZALEA_LEAVES);
         leafTypes.put("flowering_azalea_leaves",Blocks.FLOWERING_AZALEA_LEAVES);
-        var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
+        var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","stair_bottom","stair_top","stair_bottom_off","marked_stair_dry","marked_stair_wet","marked_stair_side","marked_stair_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
         for(var name:leafTypes.keySet()) scenarios.add("marked_leaf_type_"+name);
+        for(var facing:List.of("north","south","west","east"))
+            for(var half:List.of("bottom","top"))
+                for(var wet:List.of(false,true)) scenarios.add("marked_stair_variant_"+facing+"_"+half+"_"+wet);
         for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
-            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off"),null);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off"),null);
             blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("down_wet_slab")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
@@ -131,6 +135,23 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     .setValue(BlockStateProperties.WATERLOGGED,!scenario.equals("marked_slab_dry")));
                 if(scenario.equals("marked_slab_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
                 if(scenario.equals("marked_slab_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+            }
+            if(scenario.startsWith("stair_")) {
+                blocks.put(pos.east(),Blocks.OAK_STAIRS.defaultBlockState().setValue(BlockStateProperties.HALF,scenario.equals("stair_top")?Half.TOP:Half.BOTTOM));
+                blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
+            }
+            if(scenario.startsWith("marked_stair_variant_")) {
+                var parts=scenario.substring("marked_stair_variant_".length()).split("_");
+                blocks.put(pos,Blocks.OAK_STAIRS.defaultBlockState()
+                    .setValue(BlockStateProperties.HORIZONTAL_FACING,Direction.byName(parts[0]))
+                    .setValue(BlockStateProperties.HALF,parts[1].equals("top")?Half.TOP:Half.BOTTOM)
+                    .setValue(BlockStateProperties.WATERLOGGED,Boolean.parseBoolean(parts[2])));
+            } else if(scenario.startsWith("marked_stair_")) {
+                blocks.put(pos,Blocks.OAK_STAIRS.defaultBlockState()
+                    .setValue(BlockStateProperties.HALF,scenario.equals("marked_stair_down")?Half.TOP:Half.BOTTOM)
+                    .setValue(BlockStateProperties.WATERLOGGED,!scenario.equals("marked_stair_dry")));
+                if(scenario.equals("marked_stair_side"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("marked_stair_down"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             }
             if(scenario.startsWith("marked_leaf_")) {
                 var block=scenario.startsWith("marked_leaf_type_")?leafTypes.get(scenario.substring("marked_leaf_type_".length())):Blocks.OAK_LEAVES;
@@ -167,7 +188,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             out.println("case "+scenario);
             for(var p:List.of(pos,pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
-                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof LeavesBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
+                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock || state.getBlock() instanceof LeavesBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
+                if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
             }
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}

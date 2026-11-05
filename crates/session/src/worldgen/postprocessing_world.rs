@@ -145,6 +145,8 @@ pub struct GeneratedPostprocessing {
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
+    bonus_chest_attempted: bool,
 }
 
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
@@ -170,6 +172,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     water_source_conversion: Option<bool>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
 }
 
 /// A completed explicit light drain and the world revision it covered.
@@ -182,7 +185,18 @@ pub(super) struct PostprocessingLightCheckpoint {
 }
 
 impl PostprocessedGeneratedRegion {
-    pub(super) fn block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+    pub(super) fn permits_block_entity_edit(
+        &self,
+        pos: BlockPosition,
+        old: &BlockState,
+        new: &BlockState,
+    ) -> bool {
+        self.block_entity_edits
+            .get(&pos)
+            .is_some_and(|(before, after)| before == old && after == new)
+    }
+    /// Block entities after this chunk's post-generation promotions and writes.
+    pub fn block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
         self.block_entities
             .get(&pos)
             .context("converted block entities are missing")?
@@ -268,6 +282,8 @@ impl GeneratedPostprocessing {
             heightmaps,
             heightmap_tags,
             block_entities,
+            block_entity_edits: BTreeMap::new(),
+            bonus_chest_attempted: false,
         }
     }
 
@@ -393,6 +409,7 @@ impl GeneratedPostprocessing {
                 .block_entities
                 .get_mut(&pos)
                 .context("converted block entities are missing")?,
+            block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             min_y: self.min_y,
             max_y: self.max_y,
@@ -416,6 +433,67 @@ impl GeneratedPostprocessing {
         }
         self.failed = false;
         Ok(done)
+    }
+
+    /// Place the initial bonus chest after all selected LevelChunks finish
+    /// postprocessing. The isolated stage is discarded on an unsupported write.
+    /// The caller controls the server-level RNG and must invoke this before the
+    /// first player-spawn collision search. Its clone must have independent
+    /// state so an unsuccessful attempt cannot advance the original stream.
+    pub fn place_initial_bonus_chest<R: native_resources::bonus_chest::BonusChestRandom + Clone>(
+        &mut self,
+        feature: &native_resources::bonus_chest::BonusChestFeature,
+        random: &mut R,
+        origin: [i32; 3],
+    ) -> Result<Option<[i32; 3]>> {
+        ensure!(
+            !self.failed
+                && self.active.is_none()
+                && self.completed.len() == self.region.tasks.len(),
+            "complete postprocessing before the bonus chest"
+        );
+        ensure!(
+            !self.bonus_chest_attempted,
+            "bonus chest was already attempted"
+        );
+        let pos = ChunkPos {
+            x: origin[0].div_euclid(16),
+            z: origin[2].div_euclid(16),
+        };
+        ensure!(
+            self.completed.contains(&pos),
+            "bonus chest spawn chunk is not postprocessed"
+        );
+        let mut staged_random = random.clone();
+        self.failed = true;
+        let mut view = GeneratedBlockView {
+            chunk: pos,
+            block_entities: self
+                .block_entities
+                .get_mut(&pos)
+                .context("converted block entities are missing")?,
+            block_entity_edits: &mut self.block_entity_edits,
+            world: &mut self.world,
+            min_y: self.min_y,
+            max_y: self.max_y,
+            ticks: &mut self.region.ticks,
+            light: self.light.as_ref(),
+            mushroom_tags: self.mushroom_tags.as_deref(),
+            leaf_tags: self.leaf_tags.as_deref(),
+            bubble_tags: self.bubble_tags.as_deref(),
+            washed_blocks: self.washed_blocks.as_deref(),
+            lava_fluids: self.lava_fluids.as_deref(),
+            water_source_conversion: self.water_source_conversion,
+            edits: &mut self.edits,
+            light_checks: &mut self.light_checks,
+            heightmaps: &mut self.heightmaps,
+            heightmap_tags: self.heightmap_tags.as_deref(),
+        };
+        let placed = feature.place(&mut view, &mut staged_random, origin)?;
+        *random = staged_random;
+        self.bonus_chest_attempted = true;
+        self.failed = false;
+        Ok(placed)
     }
 
     pub fn finish(self) -> Result<PostprocessedGeneratedRegion> {
@@ -442,6 +520,7 @@ impl GeneratedPostprocessing {
             light_checkpoint: self.light_checkpoint,
             water_source_conversion: self.water_source_conversion,
             block_entities: self.block_entities,
+            block_entity_edits: self.block_entity_edits,
         })
     }
 }
@@ -449,6 +528,7 @@ impl GeneratedPostprocessing {
 struct GeneratedBlockView<'a> {
     chunk: ChunkPos,
     block_entities: &'a mut ConvertedBlockEntities,
+    block_entity_edits: &'a mut BTreeMap<BlockPosition, (BlockState, BlockState)>,
     world: &'a mut Arc<World>,
     min_y: i32,
     max_y: i32,
@@ -1606,6 +1686,184 @@ impl PostprocessingChunk for GeneratedBlockView<'_> {
     }
 }
 
+impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
+    fn motion_blocking_no_leaves(&mut self, x: i32, z: i32) -> Result<[i32; 3]> {
+        let chunk = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        let map = self
+            .heightmaps
+            .get(&chunk)
+            .context("bonus chest heightmap is missing")?;
+        Ok([x, map.motion_blocking_no_leaves(x, z), z])
+    }
+
+    fn is_empty_block(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let state = self.read(pos)?;
+        Ok(matches!(
+            state.name.as_str(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        ))
+    }
+
+    fn collision_shape_empty(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let state = self.read(pos)?;
+        Ok(native_world::collision::block_shape(&state)
+            .context("bonus chest collision shape is unavailable")?
+            .is_empty())
+    }
+
+    fn set_chest(&mut self, pos: [i32; 3]) -> Result<()> {
+        ensure!(
+            pos[0].div_euclid(16) == self.chunk.x && pos[2].div_euclid(16) == self.chunk.z,
+            "bonus chest is outside its spawn chunk"
+        );
+        let old = self.read(pos)?;
+        ensure!(
+            matches!(old.name.as_str(), "minecraft:air" | "minecraft:cave_air"),
+            "bonus chest replacement effects are unsupported"
+        );
+        ensure!(
+            !self.block_entities.records.contains_key(&pos),
+            "bonus chest entity already exists"
+        );
+        let state = BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        self.check_bonus_neighbors(pos, false)?;
+        self.write_postprocessed_state(pos, &old, &state)?;
+        let entity = super::GeneratedEmptyChest {
+            position: pos,
+            state: state.clone(),
+        };
+        self.block_entities
+            .records
+            .insert(pos, entity.block_entity());
+        self.block_entities.live.insert(pos);
+        self.block_entity_edits.insert(
+            BlockPosition {
+                x: pos[0],
+                y: pos[1],
+                z: pos[2],
+            },
+            (old, state),
+        );
+        Ok(())
+    }
+
+    fn has_randomizable_container(&mut self, pos: [i32; 3]) -> Result<bool> {
+        Ok(self.block_entities.records.contains_key(&pos))
+    }
+
+    fn set_bonus_chest_loot(&mut self, pos: [i32; 3], seed: i64) -> Result<()> {
+        ensure!(
+            self.block_entities.records.contains_key(&pos),
+            "bonus chest entity is missing"
+        );
+        let chest = super::GeneratedLootChest::new(
+            pos,
+            native_resources::structure_start::HorizontalDirection::North,
+            native_resources::bonus_chest::BONUS_CHEST_LOOT_TABLE,
+            seed,
+        )?;
+        self.block_entities
+            .records
+            .insert(pos, chest.block_entity());
+        Ok(())
+    }
+
+    fn torch_can_survive(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let below = self.read([pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+        if matches!(
+            below.name.as_str(),
+            "minecraft:air"
+                | "minecraft:cave_air"
+                | "minecraft:void_air"
+                | "minecraft:water"
+                | "minecraft:lava"
+        ) {
+            return Ok(false);
+        }
+        ensure!(
+            native_world::collision::button_support_face(&below, glam::IVec3::Y) == Some(true),
+            "bonus torch center support is unavailable"
+        );
+        Ok(true)
+    }
+
+    fn set_torch(&mut self, pos: [i32; 3]) -> Result<()> {
+        let old = self.read(pos)?;
+        let torch = BlockState {
+            name: "minecraft:torch".into(),
+            properties: BTreeMap::new(),
+        };
+        if old == torch {
+            return Ok(());
+        }
+        ensure!(
+            matches!(old.name.as_str(), "minecraft:air" | "minecraft:cave_air"),
+            "bonus torch replacement effects are unsupported"
+        );
+        self.check_bonus_neighbors(pos, true)?;
+        self.write_postprocessed_state(pos, &old, &torch)
+    }
+}
+
+impl GeneratedBlockView<'_> {
+    /// Flags=2 still updates neighboring shapes. Only admit neighbors whose
+    /// callbacks are known to be inert for these specific changes.
+    fn check_bonus_neighbors(&self, pos: [i32; 3], torch: bool) -> Result<()> {
+        for [dx, dy, dz] in [
+            [-1i32, 0i32, 0i32],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ] {
+            let neighbor = [
+                pos[0].wrapping_add(dx),
+                pos[1].wrapping_add(dy),
+                pos[2].wrapping_add(dz),
+            ];
+            let state = self.read(neighbor)?;
+            let inert = matches!(
+                state.name.as_str(),
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:void_air"
+                    | "minecraft:stone"
+                    | "minecraft:dirt"
+                    | "minecraft:coarse_dirt"
+                    | "minecraft:rooted_dirt"
+                    | "minecraft:cobblestone"
+            ) && state.properties.is_empty();
+            let same_height_torch =
+                torch && dy == 0 && state.name == "minecraft:torch" && state.properties.is_empty();
+            let same_height_new_chest = torch
+                && dy == 0
+                && self.block_entity_edits.contains_key(&BlockPosition {
+                    x: neighbor[0],
+                    y: neighbor[1],
+                    z: neighbor[2],
+                })
+                && state.name == "minecraft:chest";
+            ensure!(
+                inert || same_height_torch || same_height_new_chest,
+                "bonus chest neighbor shape callback is unsupported: {}",
+                state.name
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1711,6 +1969,336 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    fn bonus_chest_fixture() -> (GeneratedPostprocessing, Arc<World>) {
+        use native_persistence::heightmap::{
+            FullHeightmaps, GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps,
+            generated_full_heightmaps,
+        };
+        use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceProvider};
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.ends_with("blocks_motion_in_heightmap.json")
+                    || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
+                {
+                    Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let registry = ["air", "cave_air", "void_air", "stone", "chest", "torch"]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+        let tags = Arc::new(HeightmapTags::load(&mut Tags, &registry).unwrap());
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let stone = world.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        });
+        let mut tasks = BTreeMap::new();
+        let mut ticks = BTreeMap::new();
+        let mut maps = BTreeMap::new();
+        let bounds = HeightBounds {
+            min_y: 0,
+            max_y: 16,
+        };
+        let heights = [8; 256];
+        let raw = encode_generated_heightmaps(
+            bounds,
+            &GeneratedHeightmaps {
+                world_surface: Some(&heights),
+                ocean_floor: Some(&heights),
+                motion_blocking: Some(&heights),
+                motion_blocking_no_leaves: Some(&heights),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let full = generated_full_heightmaps(bounds, &raw).unwrap();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                let mut blocks = Box::new([air; BLOCK_COUNT]);
+                for y in 0..8 {
+                    blocks[y * 256..(y + 1) * 256].fill(stone);
+                }
+                world.chunks.insert(
+                    pos,
+                    Arc::new(Chunk {
+                        position: pos,
+                        status: Some("minecraft:spawn".into()),
+                        block_light_correct: false,
+                        sections: BTreeMap::from([(
+                            0,
+                            Arc::new(Section {
+                                blocks: Some(blocks),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        )]),
+                    }),
+                );
+                let marks = PostProcessing::new(0, 16).unwrap();
+                tasks.insert(pos, PostprocessingTask::new(Arc::new(marks), pos));
+                ticks.insert(
+                    pos,
+                    ConvertedChunkTicks {
+                        blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                        fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+                    },
+                );
+                maps.insert(pos, FullHeightmaps::from_converted(bounds, &full).unwrap());
+            }
+        }
+        let world = Arc::new(world);
+        let region = ConvertedPostprocessingRegion {
+            tasks,
+            ticks: RegionTicks::new(ticks, 0, 0).unwrap(),
+        };
+        (
+            GeneratedPostprocessing::new(
+                Arc::clone(&world),
+                0,
+                16,
+                region,
+                None,
+                None,
+                maps,
+                Some(tags),
+            ),
+            world,
+        )
+    }
+
+    #[test]
+    fn bonus_chest_updates_isolated_generated_world_and_records() {
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::Tag;
+        let (mut stage, original) = bonus_chest_fixture();
+        let mut random = LegacyRandom::new(42);
+        let before = random.state();
+        assert!(
+            stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0]
+                )
+                .is_err()
+        );
+        assert_eq!(random.state(), before);
+        let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !stage.poll(chunk, 10).unwrap() {}
+        }
+        let p = stage
+            .place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut random,
+                [0, 8, 0],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(p[1], 8);
+        assert_eq!(
+            original.block(p[0], p[1], p[2]).unwrap().name,
+            "minecraft:air"
+        );
+        assert!(
+            stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0]
+                )
+                .is_err()
+        );
+        let processed = stage.finish().unwrap();
+        assert_eq!(
+            processed.world.block(p[0], p[1], p[2]).unwrap().name,
+            "minecraft:chest"
+        );
+        for [dx, dz] in [[0, -1], [1, 0], [0, 1], [-1, 0]] {
+            assert_eq!(
+                processed
+                    .world
+                    .block(p[0] + dx, p[1], p[2] + dz)
+                    .unwrap()
+                    .name,
+                "minecraft:torch"
+            );
+        }
+        let chunk = ChunkPos { x: 0, z: 0 };
+        assert_eq!(
+            processed.heightmaps[&chunk].motion_blocking_no_leaves(p[0], p[2]),
+            9
+        );
+        assert_eq!(processed.edits.len(), 5);
+        assert!(processed.light_checks.len() >= 4);
+        let Tag::List { values, .. } = processed.block_entity_data(chunk).unwrap() else {
+            panic!("missing entities")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("LootTable"),
+            Some(&Tag::String("minecraft:chests/spawn_bonus_chest".into()))
+        );
+        assert!(matches!(values[0].get("LootTableSeed"), Some(Tag::Long(_))));
+        assert_eq!(values[0].get("keepPacked"), Some(&Tag::Byte(0)));
+    }
+
+    #[test]
+    fn bonus_chest_rejects_unmodeled_neighbor_effects_without_advancing_rng() {
+        use native_core::random::LegacyRandom;
+        let (mut stage, _) = bonus_chest_fixture();
+        let world = Arc::make_mut(&mut stage.world);
+        let sand = world.intern_state(BlockState {
+            name: "minecraft:sand".into(),
+            properties: BTreeMap::new(),
+        });
+        for z in -16..32 {
+            for x in -16..32 {
+                world.set_block_id(x, 7, z, sand).unwrap();
+            }
+        }
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.source);
+        let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !stage.poll(chunk, 10).unwrap() {}
+        }
+        let mut random = LegacyRandom::new(42);
+        let state = random.state();
+        let error = stage
+            .place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut random,
+                [0, 8, 0],
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("neighbor shape callback"));
+        assert_eq!(random.state(), state);
+        assert_eq!(source.block(0, 7, 0).unwrap().name, "minecraft:sand");
+        assert!(stage.finish().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_bonus_chest_matches_java_flat_world() {
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::Tag;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(p) = lib["downloads"]["artifact"]["path"].as_str() {
+                let p = game.join("libraries").join(p);
+                if p.is_file() {
+                    paths.push(p);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("BonusChestOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/BonusChestOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("BonusChestOracle")
+            .arg("flat"));
+        let line = output
+            .lines()
+            .find(|line| line.starts_with("C 0 42 4 true true "))
+            .unwrap();
+        let (_, tail) = line.split_once(" W ").unwrap();
+        let (expected_writes, tail) = tail.split_once(" L ").unwrap();
+        let (expected_loot, expected_next) = tail.split_once(" R ").unwrap();
+        let (mut stage, _) = bonus_chest_fixture();
+        let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !stage.poll(chunk, 10).unwrap() {}
+        }
+        let mut random = LegacyRandom::new(42);
+        let pos = stage
+            .place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut random,
+                [0, 8, 0],
+            )
+            .unwrap()
+            .unwrap();
+        let result = stage.finish().unwrap();
+        let writes = result
+            .edits
+            .iter()
+            .map(|p| {
+                let state = result.world.block(p.x, p.y, p.z).unwrap();
+                format!(
+                    "{},{},{},{}",
+                    p.x,
+                    p.y,
+                    p.z,
+                    state.name.strip_prefix("minecraft:").unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(writes, expected_writes);
+        let Tag::List { values, .. } = result.block_entity_data(ChunkPos { x: 0, z: 0 }).unwrap()
+        else {
+            panic!("missing block entity")
+        };
+        let seed = match values[0].get("LootTableSeed") {
+            Some(Tag::Long(seed)) => *seed,
+            None => 0,
+            _ => panic!("invalid loot seed"),
+        };
+        assert_eq!(
+            format!("{},{},{},{seed}", pos[0], pos[1], pos[2]),
+            expected_loot
+        );
+        assert_eq!(random.next_long(), expected_next.parse::<i64>().unwrap());
     }
 
     #[test]

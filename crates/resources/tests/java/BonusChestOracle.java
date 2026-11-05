@@ -16,19 +16,20 @@ public class BonusChestOracle {
     static String pos(BlockPos p) { return p.getX()+","+p.getY()+","+p.getZ(); }
     static BlockState initial(BlockPos p, int mode) {
         int x=p.getX(), z=p.getZ();
-        if (p.getY()==7) return ((x*31+z*17)&3)==0 ? Blocks.AIR.defaultBlockState() : Blocks.STONE.defaultBlockState();
+        if (p.getY()==7) return mode!=4 && ((x*31+z*17)&3)==0 ? Blocks.AIR.defaultBlockState() : Blocks.STONE.defaultBlockState();
         if (p.getY()!=8) return Blocks.AIR.defaultBlockState();
         if (mode==1 && (x&15)==7 && (z&15)==3) return Blocks.AIR.defaultBlockState();
         if (mode==2 && ((x^z)&3)==0) return Blocks.WATER.defaultBlockState();
-        if (mode==3) return Blocks.AIR.defaultBlockState();
+        if (mode==3 || mode==4) return Blocks.AIR.defaultBlockState();
         return Blocks.STONE.defaultBlockState();
     }
     public static void main(String[] args) throws Exception {
         var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
-        long[] seeds={0,1,-1,987654321,Long.MIN_VALUE,Long.MAX_VALUE};
+        boolean flat=args.length>0 && args[0].equals("flat");
+        long[] seeds=flat ? new long[]{42} : new long[]{0,1,-1,987654321,Long.MIN_VALUE,Long.MAX_VALUE};
         BlockPos[] origins={new BlockPos(0,20,0),new BlockPos(-17,-50,-33),new BlockPos(Integer.MAX_VALUE,8,Integer.MIN_VALUE)};
-        for (int type=0;type<3;type++) for (long seed:seeds) for (int mode=0;mode<4;mode++) for (boolean hasEntity:new boolean[]{false,true}) {
-            var origin=origins[(mode+type)%origins.length];
+        for (int type=0;type<(flat?1:3);type++) for (long seed:seeds) for (int mode=flat?4:0;mode<(flat?5:4);mode++) for (boolean hasEntity:flat?new boolean[]{true}:new boolean[]{false,true}) {
+            var origin=flat?origins[0]:origins[(mode+type)%origins.length];
             final int scenario=mode;
             var blocks=new HashMap<BlockPos,BlockState>(); var entities=new HashMap<BlockPos,ChestBlockEntity>();
             var probes=new ArrayList<String>(); var writes=new ArrayList<String>();

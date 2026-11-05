@@ -579,6 +579,12 @@ fn full_predicates(flags: BlockHeightFlags) -> [bool; 4] {
 }
 
 impl FullHeightmaps {
+    /// First available Y for the final map used by the initial bonus chest.
+    pub fn motion_blocking_no_leaves(&self, x: i32, z: i32) -> i32 {
+        let column = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize;
+        self.bounds.min_y + self.values[3][column] as i32
+    }
+
     /// Read the exact four maps output by `generated_full_heightmaps`.
     pub fn from_converted(bounds: HeightBounds, source: &Tag) -> Result<Self> {
         let height = bounds.height()?;

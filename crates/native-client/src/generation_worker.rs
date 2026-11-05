@@ -614,7 +614,11 @@ impl GenerationReady {
         for &pos in targets.iter() {
             let stage = self.batch.schedule().completed(pos);
             let payload = generated_session_block_entities(stage, || {
-                self.batch.spawned_block_entity_data(pos)
+                if let Some(processed) = &self.postprocessed {
+                    processed.region.block_entity_data(pos)
+                } else {
+                    self.batch.spawned_block_entity_data(pos)
+                }
             });
             world.saved_block_entities.insert(pos, payload);
         }

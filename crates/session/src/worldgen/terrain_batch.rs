@@ -2159,7 +2159,8 @@ impl FreshTerrainBatch {
                         .context("edited block entity classification is unavailable")
                 };
                 ensure!(
-                    !has_entity(old)? && !has_entity(new)?,
+                    (!has_entity(old)? && !has_entity(new)?)
+                        || processed.permits_block_entity_edit(*edit, old, new),
                     "postprocessing changed a block entity"
                 );
             }

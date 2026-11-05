@@ -5487,6 +5487,14 @@ mod tests {
             .rebase_postprocessing_after_expansion(&mut processed, &checkpoint)
             .unwrap();
         batch.validate_postprocessing(&processed).unwrap();
+        let reads = processed.read_chunks.clone();
+        processed.read_chunks.insert(ChunkPos {
+            x: i32::MAX,
+            z: i32::MAX,
+        });
+        assert!(batch.validate_postprocessing(&processed).is_err());
+        processed.read_chunks = reads;
+        batch.validate_postprocessing(&processed).unwrap();
         assert_eq!(
             processed.world.block(8, 8, 8).unwrap().name,
             "minecraft:air"

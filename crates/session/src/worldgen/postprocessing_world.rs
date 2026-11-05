@@ -3,6 +3,7 @@
 //! More block and fluid callbacks are needed before this can produce a
 //! playable or saveable chunk. Unknown callbacks fail the entire attempt.
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -141,6 +142,7 @@ pub struct GeneratedPostprocessing {
     lava_fluids: Option<Arc<BTreeSet<String>>>,
     water_source_conversion: Option<bool>,
     edits: Vec<BlockPosition>,
+    read_chunks: RefCell<BTreeSet<ChunkPos>>,
     pub(super) light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
@@ -157,6 +159,8 @@ pub struct PostprocessedGeneratedRegion {
     pub chunks: BTreeSet<ChunkPos>,
     /// Ordered block changes performed during postprocessing.
     pub edits: Vec<BlockPosition>,
+    pub(super) read_chunks: BTreeSet<ChunkPos>,
+    pub(super) sealed_read_chunks: BTreeSet<ChunkPos>,
     /// These light checks must be processed before publishing the result.
     pub light_checks: Vec<BlockPosition>,
     /// Updated FULL maps; other chunk and world validation remains necessary.
@@ -280,6 +284,7 @@ impl GeneratedPostprocessing {
             lava_fluids: None,
             water_source_conversion: None,
             edits: Vec::new(),
+            read_chunks: RefCell::new(BTreeSet::new()),
             light_checks: Vec::new(),
             heightmaps,
             heightmap_tags,
@@ -352,6 +357,7 @@ impl GeneratedPostprocessing {
         stage.light_checkpoint = completed.light_checkpoint.clone();
         stage.water_source_conversion = completed.water_source_conversion;
         stage.edits = completed.edits.clone();
+        stage.read_chunks = RefCell::new(completed.read_chunks.clone());
         stage.light_checks = completed.light_checks.clone();
         stage.block_entities = completed.block_entities.clone();
         stage.block_entity_edits = completed.block_entity_edits.clone();
@@ -503,6 +509,7 @@ impl GeneratedPostprocessing {
                 .context("converted block entities are missing")?,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
+            read_chunks: &self.read_chunks,
             min_y: self.min_y,
             max_y: self.max_y,
             ticks: &mut self.region.ticks,
@@ -566,6 +573,7 @@ impl GeneratedPostprocessing {
                 .context("converted block entities are missing")?,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
+            read_chunks: &self.read_chunks,
             min_y: self.min_y,
             max_y: self.max_y,
             ticks: &mut self.region.ticks,
@@ -594,6 +602,7 @@ impl GeneratedPostprocessing {
             self.completed.len() == self.region.tasks.len(),
             "generated postprocessing is incomplete"
         );
+        let read_chunks = self.read_chunks.into_inner();
         Ok(PostprocessedGeneratedRegion {
             sealed_world: Arc::clone(&self.world),
             world: self.world,
@@ -602,6 +611,8 @@ impl GeneratedPostprocessing {
             chunks: self.completed,
             sealed_edits: self.edits.clone(),
             edits: self.edits,
+            sealed_read_chunks: read_chunks.clone(),
+            read_chunks,
             sealed_checks: self.light_checks.clone(),
             light_checks: self.light_checks,
             heightmaps: self.heightmaps,
@@ -623,6 +634,7 @@ struct GeneratedBlockView<'a> {
     block_entities: &'a mut ConvertedBlockEntities,
     block_entity_edits: &'a mut BTreeMap<BlockPosition, (BlockState, BlockState)>,
     world: &'a mut Arc<World>,
+    read_chunks: &'a RefCell<BTreeSet<ChunkPos>>,
     min_y: i32,
     max_y: i32,
     ticks: &'a mut RegionTicks,
@@ -767,6 +779,7 @@ impl GeneratedBlockView<'_> {
             x: pos[0].div_euclid(16),
             z: pos[2].div_euclid(16),
         };
+        self.read_chunks.borrow_mut().insert(chunk);
         ensure!(
             self.ticks.chunk(chunk).is_some(),
             "postprocessing neighbor is not converted"
@@ -2429,6 +2442,8 @@ mod tests {
             .unwrap();
         while !resumed.poll(third, 20).unwrap() {}
         let extended = resumed.finish().unwrap();
+        assert!(result.read_chunks.is_subset(&extended.read_chunks));
+        assert_eq!(extended.read_chunks, extended.sealed_read_chunks);
         assert_eq!(
             extended.ticks().registration_order(),
             &[first, second, third]
@@ -2627,6 +2642,8 @@ mod tests {
                 .is_err()
         );
         let processed = stage.finish().unwrap();
+        assert!(!processed.read_chunks.is_empty());
+        assert_eq!(processed.read_chunks, processed.sealed_read_chunks);
         assert_eq!(
             processed.world.block(p[0], p[1], p[2]).unwrap().name,
             "minecraft:chest"

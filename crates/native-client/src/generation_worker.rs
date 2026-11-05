@@ -3347,8 +3347,28 @@ mod tests {
         let suggestion = spawned.suggested_spawn.unwrap();
         let origin = IVec3::new(24, suggestion.y, 8);
         spawned.suggested_spawn = Some(origin);
-        let radius = 0;
-        let random_seed = 0;
+        let radius = 24;
+        let first =
+            native_session::world_spawn::WorldSpawnCandidates::new(origin, radius, 76.0, 0)?;
+        let mut selected = None;
+        for seed in 0..10_000 {
+            let mut random = native_core::random::LegacyRandom::new(seed);
+            let offset = random.next_int_bound(first.candidate_count()).unwrap();
+            let (x, z) = native_session::world_spawn::WorldSpawnCandidates::new(
+                origin, radius, 76.0, offset,
+            )?
+            .next()
+            .unwrap();
+            let chunk = ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            };
+            if x >= 24 && !targets.contains(&chunk) {
+                selected = Some((seed, chunk));
+                break;
+            }
+        }
+        let (random_seed, expected_chunk) = selected.context("no expansion candidate")?;
         let registry = Arc::new(spawn_resources.vanilla_generated_block_registry()?);
         let player_worker = GenerationWorker::complete_structured_player_spawn_from_packs(
             spawned,
@@ -3398,7 +3418,15 @@ mod tests {
             GenerationResult::Cancelled => anyhow::bail!("structure player spawn cancelled"),
         };
         assert!(player_ready.player_spawn.is_some());
-        assert_eq!(player_ready.mesh.targets.as_deref(), Some(&targets));
+        assert!(
+            player_ready
+                .mesh
+                .targets
+                .as_deref()
+                .unwrap()
+                .contains(&expected_chunk)
+        );
+        assert!(player_ready.mesh.targets.as_deref().unwrap().len() > targets.len());
         assert!(player_ready.postprocessed.is_some());
         assert!(player_ready.pack_snapshot.as_ref().is_some());
         for pos in targets {

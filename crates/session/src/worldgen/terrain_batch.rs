@@ -85,6 +85,7 @@ pub struct PostprocessingExpansionCheckpoint {
     revision: u64,
     chunks: BTreeSet<ChunkPos>,
     edits: Vec<native_world::loaded::BlockPosition>,
+    read_chunks: BTreeSet<ChunkPos>,
     light_checks: Vec<native_world::loaded::BlockPosition>,
     inputs: BTreeMap<ChunkPos, PostprocessingSourceInputs>,
     light_positions: BTreeSet<ChunkPos>,
@@ -104,7 +105,11 @@ struct PostprocessingSourceInputs {
     complete_entities: Option<Vec<native_persistence::nbt::Tag>>,
 }
 
-fn unchanged_generation_world(before: &World, after: &World) -> bool {
+fn unchanged_generation_world_for(
+    before: &World,
+    after: &World,
+    observed: &BTreeSet<ChunkPos>,
+) -> bool {
     if before.dimension != after.dimension
         || before.dimension_type != after.dimension_type
         || before.biome_zoom_seed() != after.biome_zoom_seed()
@@ -115,14 +120,17 @@ fn unchanged_generation_world(before: &World, after: &World) -> bool {
         || !before.biomes().zip(after.biomes()).all(|(a, b)| a == b)
         || !before
             .block_edits()
-            .filter(|edit| before.chunks.contains_key(&edit.position.chunk()))
+            .filter(|edit| observed.contains(&edit.position.chunk()))
             .eq(after
                 .block_edits()
-                .filter(|edit| before.chunks.contains_key(&edit.position.chunk())))
+                .filter(|edit| observed.contains(&edit.position.chunk())))
     {
         return false;
     }
-    before.chunks.iter().all(|(pos, old)| {
+    observed.iter().all(|pos| {
+        let Some(old) = before.chunks.get(pos) else {
+            return false;
+        };
         let Some(new) = after.chunks.get(pos) else {
             return false;
         };
@@ -147,6 +155,29 @@ fn unchanged_generation_world(before: &World, after: &World) -> bool {
             && before.saved_block_entities.get(pos) == after.saved_block_entities.get(pos)
             && before.live_block_entities.get(pos) == after.live_block_entities.get(pos)
     })
+}
+
+fn postprocessing_observed_chunks(
+    processed: &BTreeSet<ChunkPos>,
+    reads: &BTreeSet<ChunkPos>,
+    edits: &[native_world::loaded::BlockPosition],
+) -> Option<BTreeSet<ChunkPos>> {
+    if reads.is_subset(processed) {
+        Some(
+            processed
+                .iter()
+                .copied()
+                .chain(edits.iter().map(|edit| edit.chunk()))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn unchanged_generation_world(before: &World, after: &World) -> bool {
+    unchanged_generation_world_for(before, after, &before.chunks.keys().copied().collect())
 }
 
 fn unchanged_visible_light(
@@ -2343,6 +2374,7 @@ impl FreshTerrainBatch {
         ensure!(
             Arc::ptr_eq(&processed.world, &processed.sealed_world)
                 && processed.edits == processed.sealed_edits
+                && processed.read_chunks == processed.sealed_read_chunks
                 && processed.light_checks == processed.sealed_checks
                 && processed.chunks == processed.sealed_chunks,
             "postprocessing result was modified"
@@ -2411,6 +2443,7 @@ impl FreshTerrainBatch {
             revision: self.schedule.revision(),
             chunks: processed.chunks.clone(),
             edits: processed.edits.clone(),
+            read_chunks: processed.read_chunks.clone(),
             light_checks: processed.light_checks.clone(),
             inputs,
             light_positions,
@@ -2445,6 +2478,8 @@ impl FreshTerrainBatch {
                 && processed.chunks == processed.sealed_chunks
                 && processed.edits == checkpoint.edits
                 && processed.edits == processed.sealed_edits
+                && processed.read_chunks == checkpoint.read_chunks
+                && processed.read_chunks == processed.sealed_read_chunks
                 && processed.light_checks == checkpoint.light_checks
                 && processed.light_checks == processed.sealed_checks
                 && processed.light_checkpoint.is_none(),
@@ -2456,8 +2491,16 @@ impl FreshTerrainBatch {
             "generation bounds changed"
         );
         let current = self.snapshot().context("generated terrain is missing")?;
+        // An unconverted read can change when another chunk is registered;
+        // do not reuse the old pass without replaying that observation.
+        let observed = postprocessing_observed_chunks(
+            &checkpoint.chunks,
+            &checkpoint.read_chunks,
+            &checkpoint.edits,
+        )
+        .context("postprocessing observed an unconverted chunk")?;
         ensure!(
-            unchanged_generation_world(&checkpoint.source, &current),
+            unchanged_generation_world_for(&checkpoint.source, &current, &observed),
             "existing generation terrain changed during expansion"
         );
         for (&pos, before) in &checkpoint.inputs {
@@ -3906,6 +3949,10 @@ mod expansion_checkpoint_tests {
                 )]),
             }),
         );
+        let halo_pos = ChunkPos { x: -2, z: 0 };
+        let mut halo = (*before.chunks[&old_pos]).clone();
+        halo.position = halo_pos;
+        before.chunks.insert(halo_pos, Arc::new(halo));
         let mut expanded = before.clone();
         let air = expanded.intern_state(BlockState {
             name: "minecraft:air".into(),
@@ -3916,6 +3963,38 @@ mod expansion_checkpoint_tests {
         added.position = new_pos;
         expanded.chunks.insert(new_pos, Arc::new(added));
         assert!(unchanged_generation_world(&before, &expanded));
+        let observed = BTreeSet::from([old_pos]);
+        assert_eq!(
+            postprocessing_observed_chunks(&observed, &BTreeSet::from([old_pos]), &[]),
+            Some(observed.clone())
+        );
+        assert_eq!(
+            postprocessing_observed_chunks(&observed, &BTreeSet::from([halo_pos]), &[]),
+            None
+        );
+        let halo_edit = native_world::loaded::BlockPosition { x: -32, y: 0, z: 0 };
+        assert_eq!(
+            postprocessing_observed_chunks(&observed, &BTreeSet::new(), &[halo_edit]),
+            Some(BTreeSet::from([old_pos, halo_pos]))
+        );
+        let mut changed_halo = expanded.clone();
+        changed_halo.set_block_id(-32, 0, 0, air).unwrap();
+        assert!(unchanged_generation_world_for(
+            &before,
+            &changed_halo,
+            &observed
+        ));
+        assert!(!unchanged_generation_world(&before, &changed_halo));
+        assert!(!unchanged_generation_world_for(
+            &before,
+            &changed_halo,
+            &BTreeSet::from([old_pos, halo_pos])
+        ));
+        assert!(!unchanged_generation_world_for(
+            &before,
+            &changed_halo,
+            &BTreeSet::from([new_pos])
+        ));
         let mut processed = before.clone();
         let chest = processed.intern_state(BlockState {
             name: "minecraft:chest".into(),

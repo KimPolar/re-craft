@@ -73,6 +73,7 @@ pub use ore::{
 pub use postprocessing_world::{GeneratedPostprocessing, PostprocessedGeneratedRegion};
 pub use terrain_batch::{
     FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,
+    PostprocessingExpansionCheckpoint,
 };
 
 /// Block entities created by a monster-room feature in intermediate terrain.
@@ -5301,6 +5302,55 @@ mod tests {
                 }
             }
         }
+        // Retain a postprocessing edit while extending the original batch far
+        // outside every previously generated chunk and active light halo.
+        let mut edited = (*processed.world).clone();
+        let air = edited.intern_state(native_world::loaded::BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        });
+        assert!(edited.set_block_id(8, 8, 8, air).unwrap());
+        processed.world = Arc::new(edited);
+        processed.sealed_world = Arc::clone(&processed.world);
+        let position = native_world::loaded::BlockPosition { x: 8, y: 8, z: 8 };
+        processed.edits.push(position);
+        processed.sealed_edits.push(position);
+        processed.light_checks.push(position);
+        processed.sealed_checks.push(position);
+        let checkpoint = batch
+            .checkpoint_postprocessing_expansion(&processed)
+            .unwrap();
+        let old_world = Arc::clone(&processed.world);
+        processed.edits.push(position);
+        assert!(
+            batch
+                .rebase_postprocessing_after_expansion(&mut processed, &checkpoint)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&old_world, &processed.world));
+        processed.edits.pop();
+        let far = ChunkPos { x: 64, z: 0 };
+        batch.request_features(far).unwrap();
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        assert!(batch.validate_postprocessing(&processed).is_err());
+        batch
+            .rebase_postprocessing_after_expansion(&mut processed, &checkpoint)
+            .unwrap();
+        batch.validate_postprocessing(&processed).unwrap();
+        assert_eq!(
+            processed.world.block(8, 8, 8).unwrap().name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            processed.source.block(8, 8, 8).unwrap().name,
+            "minecraft:brown_mushroom"
+        );
+        assert!(processed.world.chunks.contains_key(&far));
+        assert!(batch.postprocessed_light_snapshot(&processed).is_ok());
         assert!(batch.request_spawn_without_mobs(center, false).is_err());
         let (schedule, _, terrain, light) = batch.into_parts().unwrap();
         assert_eq!(

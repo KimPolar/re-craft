@@ -188,6 +188,23 @@ impl VisibleLightSnapshot {
         self.columns.get(&pos).cloned()
     }
 
+    /// Compare complete visible storage, including allocated zero layers,
+    /// without expanding or copying section arrays.
+    pub fn same_complete_column(&self, other: &Self, pos: ChunkPos) -> Option<bool> {
+        if self.has_block != other.has_block || self.has_sky != other.has_sky {
+            return Some(false);
+        }
+        let left = self.columns.get(&pos)?;
+        let right = other.columns.get(&pos)?;
+        let same = |a: &VisibleLayers, b: &VisibleLayers| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((ay, av), (by, bv))| {
+                    ay == by && (Arc::ptr_eq(av, bv) || av.as_ref() == bv.as_ref())
+                })
+        };
+        Some(same(&left.block, &right.block) && same(&left.sky, &right.sky))
+    }
+
     /// Apply empty-to-nonempty section events to updating storage. The caller
     /// supplies the actual event order and only previously empty sections;
     /// no removals, queued saved layers or concurrent updates may be pending.

@@ -31,6 +31,7 @@ use super::{
 /// Its deterministic work order has not been proven to match Java's thread
 /// scheduling for climate ties. Outputs remain intermediate and unsaveable.
 pub struct FreshTerrainBatch {
+    identity: Arc<()>,
     schedule: GenerationSchedule,
     generator: TerrainGenerator,
     structures: Option<PreparedStructureStages>,
@@ -71,6 +72,117 @@ pub struct PostprocessedChunkDraft {
     /// Present only when the complete entity records are known. An empty
     /// entity list still needs the correct Java storage action at save time.
     pub entity_chunk: Option<native_persistence::nbt::NamedTag>,
+}
+
+/// A sealed proof of the inputs used by one completed postprocessing pass.
+/// The region remains owned by the caller and is unchanged on a failed rebase.
+pub struct PostprocessingExpansionCheckpoint {
+    batch_identity: Arc<()>,
+    source: Arc<World>,
+    processed_world: Arc<World>,
+    revision: u64,
+    chunks: BTreeSet<ChunkPos>,
+    edits: Vec<native_world::loaded::BlockPosition>,
+    light_checks: Vec<native_world::loaded::BlockPosition>,
+    inputs: BTreeMap<ChunkPos, PostprocessingSourceInputs>,
+    light_positions: BTreeSet<ChunkPos>,
+    active_light: BTreeSet<ChunkPos>,
+    light: VisibleLightSnapshot,
+    sky_sources: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+}
+
+#[derive(PartialEq)]
+struct PostprocessingSourceInputs {
+    heightmaps: native_persistence::nbt::Tag,
+    block_entities: native_persistence::nbt::Tag,
+    block_ticks: native_persistence::nbt::Tag,
+    fluid_ticks: native_persistence::nbt::Tag,
+    postprocessing: native_persistence::nbt::Tag,
+    entities: Vec<native_persistence::nbt::Tag>,
+    complete_entities: Option<Vec<native_persistence::nbt::Tag>>,
+}
+
+fn unchanged_generation_world(before: &World, after: &World) -> bool {
+    if before.dimension != after.dimension
+        || before.dimension_type != after.dimension_type
+        || before.biome_zoom_seed() != after.biome_zoom_seed()
+        || !before
+            .states()
+            .all(|(id, state)| after.state(id) == Some(state))
+        || before.biome_count() > after.biome_count()
+        || !before.biomes().zip(after.biomes()).all(|(a, b)| a == b)
+        || !before
+            .block_edits()
+            .filter(|edit| before.chunks.contains_key(&edit.position.chunk()))
+            .eq(after
+                .block_edits()
+                .filter(|edit| before.chunks.contains_key(&edit.position.chunk())))
+    {
+        return false;
+    }
+    before.chunks.iter().all(|(pos, old)| {
+        let Some(new) = after.chunks.get(pos) else {
+            return false;
+        };
+        let sections_match = Arc::ptr_eq(old, new)
+            || (old.position == new.position
+                && old.status == new.status
+                && old.block_light_correct == new.block_light_correct
+                && old.sections.len() == new.sections.len()
+                && old.sections.iter().all(|(y, a)| {
+                    new.sections.get(y).is_some_and(|b| {
+                        Arc::ptr_eq(a, b)
+                            || (a.blocks == b.blocks
+                                && a.biomes == b.biomes
+                                && a.block_light == b.block_light
+                                && a.sky_light == b.sky_light)
+                    })
+                }));
+        sections_match
+            && before.missing_chunks.contains(pos) == after.missing_chunks.contains(pos)
+            && before.saved_block_ticks.get(pos) == after.saved_block_ticks.get(pos)
+            && before.saved_fluid_ticks.get(pos) == after.saved_fluid_ticks.get(pos)
+            && before.saved_block_entities.get(pos) == after.saved_block_entities.get(pos)
+            && before.live_block_entities.get(pos) == after.live_block_entities.get(pos)
+    })
+}
+
+fn unchanged_visible_light(
+    before: &VisibleLightSnapshot,
+    after: &VisibleLightSnapshot,
+    positions: &BTreeSet<ChunkPos>,
+) -> bool {
+    if before.has_block_channel() != after.has_block_channel()
+        || before.has_sky_channel() != after.has_sky_channel()
+    {
+        return false;
+    }
+    positions
+        .iter()
+        .all(|&pos| before.same_complete_column(after, pos) == Some(true))
+}
+
+fn replay_postprocessing_edits(
+    current: &Arc<World>,
+    processed: &World,
+    edits: &[native_world::loaded::BlockPosition],
+) -> Result<Arc<World>> {
+    if edits.is_empty() {
+        return Ok(Arc::clone(current));
+    }
+    let mut world = (**current).clone();
+    for pos in edits {
+        let state = processed
+            .block(pos.x, pos.y, pos.z)
+            .context("postprocessed block is missing")?
+            .clone();
+        // Forked registries can append different states at the same numeric ID.
+        let id = world.intern_state(state);
+        world
+            .set_block_id(pos.x, pos.y, pos.z, id)
+            .map_err(|error| anyhow::anyhow!("cannot rebase postprocessed block: {error}"))?;
+    }
+    Ok(Arc::new(world))
 }
 
 /// Group components from one completed pass; this does not authorize a save.
@@ -898,6 +1010,7 @@ impl FreshTerrainBatch {
         let id = ResourceId::parse(dimension)?;
         let biomes = generator.biome_neighborhood()?;
         Ok(Self {
+            identity: Arc::new(()),
             schedule: GenerationSchedule::new(),
             generator,
             structures,
@@ -1954,6 +2067,147 @@ impl FreshTerrainBatch {
             (min_y, max_y) == (processed.min_y, processed.max_y),
             "postprocessing light bounds changed"
         );
+        Ok(())
+    }
+
+    fn postprocessing_source_inputs(&self, pos: ChunkPos) -> Result<PostprocessingSourceInputs> {
+        let (block_ticks, fluid_ticks) = self.spawned_tick_data(pos)?;
+        Ok(PostprocessingSourceInputs {
+            heightmaps: self.spawned_heightmap_data(pos)?,
+            block_entities: self.spawned_block_entity_data(pos)?,
+            block_ticks,
+            fluid_ticks,
+            postprocessing: self.spawned_postprocessing_data(pos)?,
+            entities: self.recorded_generated_entities(pos)?.to_vec(),
+            complete_entities: self
+                .complete_generated_entity_records(pos)?
+                .map(<[_]>::to_vec),
+        })
+    }
+
+    /// Capture the immutable source and lighting used by a completed pass
+    /// before generating more chunks. The caller retains the original result.
+    pub fn checkpoint_postprocessing_expansion(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<PostprocessingExpansionCheckpoint> {
+        self.validate_postprocessing(processed)?;
+        ensure!(
+            processed.light_checkpoint.is_none(),
+            "postprocessing with a drained light checkpoint cannot yet be rebased"
+        );
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        let mut light_positions = engine.active.clone();
+        light_positions.extend(processed.chunks.iter().copied());
+        extend_postprocessing_light_coverage(&mut light_positions, &processed.light_checks)?;
+        let light = self.light_snapshot(light_positions.iter().copied())?;
+        let sky_sources = light_positions
+            .iter()
+            .filter_map(|pos| {
+                engine
+                    .fresh
+                    .sky_sources
+                    .get(pos)
+                    .map(|source| (*pos, Arc::clone(source)))
+            })
+            .collect();
+        let inputs = processed
+            .chunks
+            .iter()
+            .map(|&pos| Ok((pos, self.postprocessing_source_inputs(pos)?)))
+            .collect::<Result<_>>()?;
+        Ok(PostprocessingExpansionCheckpoint {
+            batch_identity: Arc::clone(&self.identity),
+            source: Arc::clone(&processed.source),
+            processed_world: Arc::clone(&processed.world),
+            revision: self.schedule.revision(),
+            chunks: processed.chunks.clone(),
+            edits: processed.edits.clone(),
+            light_checks: processed.light_checks.clone(),
+            inputs,
+            light_positions,
+            active_light: engine.active.clone(),
+            light,
+            sky_sources,
+        })
+    }
+
+    /// Rebase an isolated pass after generation only if every old input and
+    /// captured light column is unchanged. Errors leave `processed` untouched.
+    /// Newly generated chunks are not yet converted or registered.
+    pub fn rebase_postprocessing_after_expansion(
+        &self,
+        processed: &mut super::PostprocessedGeneratedRegion,
+        checkpoint: &PostprocessingExpansionCheckpoint,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed && self.is_complete(),
+            "generation batch is not complete"
+        );
+        ensure!(
+            Arc::ptr_eq(&self.identity, &checkpoint.batch_identity),
+            "postprocessing belongs to another batch"
+        );
+        ensure!(
+            processed.batch_revision == Some(checkpoint.revision)
+                && Arc::ptr_eq(&processed.source, &checkpoint.source)
+                && Arc::ptr_eq(&processed.world, &checkpoint.processed_world)
+                && Arc::ptr_eq(&processed.world, &processed.sealed_world)
+                && processed.chunks == checkpoint.chunks
+                && processed.chunks == processed.sealed_chunks
+                && processed.edits == checkpoint.edits
+                && processed.edits == processed.sealed_edits
+                && processed.light_checks == checkpoint.light_checks
+                && processed.light_checks == processed.sealed_checks
+                && processed.light_checkpoint.is_none(),
+            "postprocessing changed after the expansion checkpoint"
+        );
+        let (min_y, max_y) = self.build_bounds()?;
+        ensure!(
+            (min_y, max_y) == (processed.min_y, processed.max_y),
+            "generation bounds changed"
+        );
+        let current = self.snapshot().context("generated terrain is missing")?;
+        ensure!(
+            unchanged_generation_world(&checkpoint.source, &current),
+            "existing generation terrain changed during expansion"
+        );
+        for (&pos, before) in &checkpoint.inputs {
+            ensure!(
+                *before == self.postprocessing_source_inputs(pos)?,
+                "generation data changed for postprocessed chunk {}, {}",
+                pos.x,
+                pos.z
+            );
+        }
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        ensure!(
+            checkpoint.active_light.is_subset(&engine.active),
+            "previously active light chunks were removed"
+        );
+        let light = self.light_snapshot(checkpoint.light_positions.iter().copied())?;
+        ensure!(
+            unchanged_visible_light(
+                &checkpoint.light,
+                &light,
+                &checkpoint.light_positions,
+            ) && checkpoint
+                .light_positions
+                .iter()
+                .all(|pos| checkpoint.sky_sources.get(pos) == engine.fresh.sky_sources.get(pos)),
+            "existing generation lighting changed during expansion"
+        );
+        let rebased = replay_postprocessing_edits(&current, &processed.world, &processed.edits)?;
+        processed.source = current;
+        processed.world = rebased;
+        processed.sealed_world = Arc::clone(&processed.world);
+        processed.batch_revision = Some(self.schedule.revision());
         Ok(())
     }
 
@@ -3063,5 +3317,144 @@ mod entity_source_tests {
         external.complete_spawn(chunk, &[]);
         external.untracked = true;
         assert!(!external.contains_complete_spawn(chunk));
+    }
+}
+
+#[cfg(test)]
+mod expansion_checkpoint_tests {
+    use super::*;
+    use native_world::loaded::{BIOME_COUNT, BLOCK_COUNT, BlockState, Chunk, Section};
+
+    #[test]
+    fn snapshot_guard_allows_new_chunks_but_rejects_changes_to_existing_data() {
+        let old_pos = ChunkPos { x: 0, z: 0 };
+        let new_pos = ChunkPos { x: 4, z: -1 };
+        let mut before = World::new("minecraft:overworld");
+        let stone = before.intern_state(BlockState {
+            name: "minecraft:stone".into(),
+            properties: Default::default(),
+        });
+        let plains = before.intern_biome("minecraft:plains".into());
+        before.chunks.insert(
+            old_pos,
+            Arc::new(Chunk {
+                position: old_pos,
+                status: Some("minecraft:terrain".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(Box::new([stone; BLOCK_COUNT])),
+                        biomes: Some(Box::new([plains; BIOME_COUNT])),
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let mut expanded = before.clone();
+        let air = expanded.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        });
+        expanded.intern_biome("minecraft:desert".into());
+        let mut added = (*expanded.chunks[&old_pos]).clone();
+        added.position = new_pos;
+        expanded.chunks.insert(new_pos, Arc::new(added));
+        assert!(unchanged_generation_world(&before, &expanded));
+        let mut processed = before.clone();
+        let chest = processed.intern_state(BlockState {
+            name: "minecraft:chest".into(),
+            properties: Default::default(),
+        });
+        assert_eq!(chest, air, "fixture must use conflicting forked state IDs");
+        processed.set_block_id(0, 0, 0, chest).unwrap();
+        let current = Arc::new(expanded.clone());
+        let unchanged = replay_postprocessing_edits(&current, &processed, &[]).unwrap();
+        assert!(Arc::ptr_eq(&current, &unchanged));
+        let at = native_world::loaded::BlockPosition { x: 0, y: 0, z: 0 };
+        let rebased = replay_postprocessing_edits(&current, &processed, &[at]).unwrap();
+        assert_eq!(rebased.block(0, 0, 0).unwrap().name, "minecraft:chest");
+        assert_eq!(current.block(0, 0, 0).unwrap().name, "minecraft:stone");
+        assert!(
+            replay_postprocessing_edits(
+                &current,
+                &processed,
+                &[native_world::loaded::BlockPosition { x: 999, y: 0, z: 0 }]
+            )
+            .is_err()
+        );
+        assert_eq!(current.block(0, 0, 0).unwrap().name, "minecraft:stone");
+        let mut changed = expanded.clone();
+        changed.set_block_id(0, 0, 0, air).unwrap();
+        assert!(!unchanged_generation_world(&before, &changed));
+        let mut changed = expanded.clone();
+        changed.dimension_type = Some("minecraft:overworld".into());
+        assert!(!unchanged_generation_world(&before, &changed));
+        let mut changed = expanded.clone();
+        changed.chunks.remove(&old_pos);
+        assert!(!unchanged_generation_world(&before, &changed));
+        let mut changed = expanded.clone();
+        Arc::make_mut(changed.chunks.get_mut(&old_pos).unwrap()).status =
+            Some("minecraft:full".into());
+        assert!(!unchanged_generation_world(&before, &changed));
+    }
+
+    #[test]
+    fn light_guard_checks_coverage_values_and_allocation() {
+        use native_world::generation_light::{VisibleLayers, VisibleLightColumn};
+        let pos = ChunkPos { x: 0, z: 0 };
+        let positions = BTreeSet::from([pos]);
+        let mut before = VisibleLightSnapshot::new(true, false);
+        before.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(VisibleLayers::new(), VisibleLayers::new()),
+        );
+        assert!(unchanged_visible_light(
+            &before,
+            &before.clone(),
+            &positions
+        ));
+        assert!(!unchanged_visible_light(
+            &before,
+            &VisibleLightSnapshot::new(true, false),
+            &positions
+        ));
+        let mut allocated = VisibleLightSnapshot::new(true, false);
+        allocated.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(
+                BTreeMap::from([(0, Arc::new([0; native_world::loaded::LIGHT_BYTES]))]),
+                VisibleLayers::new(),
+            ),
+        );
+        assert!(!unchanged_visible_light(&before, &allocated, &positions));
+        let mut same_contents = VisibleLightSnapshot::new(true, false);
+        same_contents.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(
+                BTreeMap::from([(0, Arc::new([0; native_world::loaded::LIGHT_BYTES]))]),
+                VisibleLayers::new(),
+            ),
+        );
+        assert!(unchanged_visible_light(
+            &allocated,
+            &same_contents,
+            &positions
+        ));
+        assert!(!unchanged_visible_light(
+            &allocated,
+            &VisibleLightSnapshot::new(true, true),
+            &positions
+        ));
+        let mut lit = VisibleLightSnapshot::new(true, false);
+        lit.insert_complete_column(
+            pos,
+            VisibleLightColumn::new(
+                BTreeMap::from([(0, Arc::new([1; native_world::loaded::LIGHT_BYTES]))]),
+                VisibleLayers::new(),
+            ),
+        );
+        assert!(!unchanged_visible_light(&allocated, &lit, &positions));
     }
 }

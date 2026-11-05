@@ -329,6 +329,42 @@ mod tests {
     }
 
     #[test]
+    fn two_structure_contributions_commute_bitwise() {
+        let kinds = [
+            TerrainAdjustment::Bury,
+            TerrainAdjustment::BeardThin,
+            TerrainAdjustment::BeardBox,
+            TerrainAdjustment::Encapsulate,
+        ];
+        for &first in &kinds {
+            for &second in &kinds {
+                let piece = |bounds, adjustment| StructurePiece {
+                    bounds,
+                    adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: vec![],
+                };
+                let a = piece(bounds([-5, 3, -2], [9, 10, 12]), first);
+                let b = piece(bounds([8, 1, 7], [21, 15, 19]), second);
+                let forward = Beardifier::for_chunk([0, 0], &[a.clone(), b.clone()]).unwrap();
+                let reverse = Beardifier::for_chunk([0, 0], &[b, a]).unwrap();
+                for x in [-12, -1, 0, 5, 11, 16, 27] {
+                    for y in [-10, 0, 3, 8, 15, 25] {
+                        for z in [-12, -1, 0, 7, 13, 16, 27] {
+                            assert_eq!(
+                                forward.sample(x, y, z).to_bits(),
+                                reverse.sample(x, y, z).to_bits(),
+                                "{first:?}, {second:?} at {x},{y},{z}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn start_bounds_union_pieces_and_apply_terrain_margin() {
         let pieces = [
             bounds([-3, 5, 7], [2, 8, 9]),

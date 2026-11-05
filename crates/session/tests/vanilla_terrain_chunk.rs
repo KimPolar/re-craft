@@ -586,9 +586,9 @@ fn terrain_matches_java_before_and_after_carvers() {
                 .is_some()
             {}
             let structure_tags = CarverBlockTags::load(&mut resources, &registry).unwrap();
-            let mut structure_terrain = FreshTerrainBatch::new_with_prepared_structures(
+            let mut structure_terrain = FreshTerrainBatch::new_with_unambiguous_structures(
                 structures,
-                BTreeMap::from([(center, vec![])]),
+                [center],
                 structure_tags,
                 dimension,
             )

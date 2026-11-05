@@ -37,6 +37,13 @@ pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
 
+/// One structure kind has a known per-kind reference order. Two total
+/// contributions also commute under Java's finite IEEE-754 addition.
+fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<ResourceId>> {
+    let kinds: BTreeSet<_> = starts.iter().map(|(id, _)| id.clone()).collect();
+    (kinds.len() <= 1 || starts.len() <= 2).then(|| kinds.into_iter().collect())
+}
+
 /// Validated structure stages retained for an intermediate terrain batch.
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
@@ -219,6 +226,40 @@ impl StructureGenerationBatch {
         Ok(result)
     }
 
+    /// Infer a Java-equivalent order without object identity hashes only when
+    /// there is one contributing structure kind or at most two contributions.
+    /// Multiple additions of different kinds may round differently and remain
+    /// unresolved unless the actual Java structure-key order is supplied.
+    pub fn unambiguous_terrain_start_order(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Option<Vec<TerrainStartKey>>> {
+        let starts = self.terrain_start_keys(pos)?;
+        let Some(kinds) = unambiguous_structure_keys(&starts) else {
+            return Ok(None);
+        };
+        Ok(Some(self.terrain_start_order(pos, &kinds)?))
+    }
+
+    /// Prepare terrain orders for all requested chunks without guessing any
+    /// identity-dependent ordering. Duplicate or unresolved chunks fail.
+    pub fn unambiguous_terrain_orders(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, Vec<TerrainStartKey>>> {
+        let mut result = BTreeMap::new();
+        for pos in positions {
+            let order = self
+                .unambiguous_terrain_start_order(pos)?
+                .with_context(|| format!("structure terrain order is ambiguous for {pos:?}"))?;
+            ensure!(
+                result.insert(pos, order).is_none(),
+                "duplicate terrain chunk"
+            );
+        }
+        Ok(result)
+    }
+
     /// Recover the full Java order when the structure identity hashes from the
     /// corresponding Java process are available. Hashes are not seed-derived.
     pub fn terrain_start_order_with_identity_hashes(
@@ -385,5 +426,31 @@ impl StructureGenerationBatch {
             return Err(error);
         }
         Ok(Some((pos, stage)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inferred_structure_order_requires_unambiguous_float_sum() {
+        let a = ResourceId::parse("test:a").unwrap();
+        let b = ResourceId::parse("test:b").unwrap();
+        let pos = |x| ChunkPos { x, z: 0 };
+        assert_eq!(unambiguous_structure_keys(&BTreeSet::new()), Some(vec![]));
+        let mut starts = BTreeSet::from([
+            (a.clone(), pos(0)),
+            (a.clone(), pos(1)),
+            (a.clone(), pos(2)),
+        ]);
+        assert_eq!(unambiguous_structure_keys(&starts), Some(vec![a.clone()]));
+        starts = BTreeSet::from([(a.clone(), pos(0)), (b.clone(), pos(1))]);
+        assert_eq!(
+            unambiguous_structure_keys(&starts),
+            Some(vec![a.clone(), b.clone()])
+        );
+        starts.insert((b, pos(2)));
+        assert_eq!(unambiguous_structure_keys(&starts), None);
     }
 }

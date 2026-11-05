@@ -6663,6 +6663,15 @@ mod tests {
             .terrain_start_order(target, std::slice::from_ref(&structure_id))
             .unwrap();
         assert_eq!(
+            batch.unambiguous_terrain_start_order(target).unwrap(),
+            Some(java_order.clone())
+        );
+        assert_eq!(
+            batch.unambiguous_terrain_orders([target]).unwrap()[&target],
+            java_order
+        );
+        assert!(batch.unambiguous_terrain_orders([target, target]).is_err());
+        assert_eq!(
             batch
                 .terrain_start_order_with_identity_hashes(
                     target,

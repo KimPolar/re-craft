@@ -1001,6 +1001,19 @@ impl FreshTerrainBatch {
         Self::new_inner(generator, tags, dimension, Some(structures))
     }
 
+    /// Construct a structure-aware intermediate terrain batch when every
+    /// requested chunk has a Java-equivalent order independent of identity
+    /// hashes. Ambiguous or unavailable structure histories remain errors.
+    pub fn new_with_unambiguous_structures(
+        structures: StructureGenerationBatch,
+        terrain_chunks: impl IntoIterator<Item = ChunkPos>,
+        tags: CarverBlockTags,
+        dimension: &str,
+    ) -> Result<Self> {
+        let orders = structures.unambiguous_terrain_orders(terrain_chunks)?;
+        Self::new_with_prepared_structures(structures, orders, tags, dimension)
+    }
+
     fn new_inner(
         generator: TerrainGenerator,
         tags: CarverBlockTags,

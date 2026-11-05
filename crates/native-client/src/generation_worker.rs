@@ -12,7 +12,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
 use native_resources::packs::ResourceProvider;
-use native_session::worldgen::{CarverBlockState, FreshTerrainBatch, schedule::GenerationStage};
+use native_session::worldgen::{
+    CarverBlockState, FreshTerrainBatch,
+    schedule::GenerationStage,
+    structure_batch::{StructureGenerationBatch, StructurePreparationPlan},
+};
 use native_world::loaded::{BlockState, ChunkPos};
 use serde_json::Value;
 
@@ -63,6 +67,19 @@ pub struct GenerationReady {
     pub(crate) initial_respawn: Option<InitialRespawnSettings>,
     /// Isolated postprocessing output; it is not yet a playable world.
     pub postprocessed: Option<PostprocessedGeneration>,
+}
+
+/// Inputs for a finite, structure-aware generation request. They must all
+/// originate from the same immutable resource stack and dimension settings.
+pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
+    pub structures: StructureGenerationBatch,
+    pub provider: P,
+    pub classify: C,
+    pub resolve: R,
+    pub classify_height: H,
+    pub terrain_tags: native_resources::carver::tags::CarverBlockTags,
+    pub dimension: String,
+    pub configure_terrain: F,
 }
 
 pub struct PostprocessedGeneration {
@@ -1476,6 +1493,82 @@ impl GenerationWorker {
         )
     }
 
+    /// Prepare structure starts and references on the worker before generating
+    /// a finite set of lit chunks. The result is intermediate and unsaveable.
+    pub(crate) fn start_with_structures<P, C, R, H, K, F>(
+        prepare: F,
+        targets: BTreeSet<ChunkPos>,
+        revision: u64,
+        biome_blend: u8,
+        origin: IVec3,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<StructuredGenerationInputs<P, C, R, H, K>> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+        K: FnOnce(&mut FreshTerrainBatch, &mut P) -> Result<()>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let initialized = initialized_neighbors(&targets)?;
+            let plan = StructurePreparationPlan::new(
+                initialized
+                    .iter()
+                    .copied()
+                    .map(|pos| (pos, GenerationStage::InitializeLight)),
+            )?;
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let StructuredGenerationInputs {
+                mut structures,
+                mut provider,
+                mut classify,
+                mut resolve,
+                mut classify_height,
+                terrain_tags,
+                dimension,
+                configure_terrain,
+            } = prepare()?;
+            ensure!(
+                structures.is_complete(),
+                "structure batch has unfinished or failed work"
+            );
+            plan.request_structures(&mut structures)?;
+            set_phase(progress, GenerationPhase::Generating);
+            while let Some((pos, stage)) = {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                structures.step(&mut provider, &mut classify_height)?
+            } {
+                note_step(progress, pos, stage);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let mut batch = plan.into_terrain_batch(structures, terrain_tags, &dimension)?;
+            configure_terrain(&mut batch, &mut provider)?;
+            generate_targets(
+                batch,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                targets,
+                initialized,
+                revision,
+                biome_blend,
+                origin,
+                cancelled,
+                progress,
+            )
+        })
+    }
+
     /// Compute the generator's spawn origin on the worker and generate its
     /// first LIGHT-complete chunk. More chunks can be required to find spawn.
     pub fn start_at_spawn<P, C, R, F>(prepare: F, revision: u64, biome_blend: u8) -> Result<Self>
@@ -1627,7 +1720,7 @@ impl GenerationWorker {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let (mut batch, mut provider, mut classify, mut resolve) = prepare()?;
+            let (batch, mut provider, mut classify, mut resolve) = prepare()?;
             ensure!(
                 batch.is_complete() && batch.schedule().requested_chunks() == 0,
                 "generation batch must be fresh"
@@ -1644,54 +1737,19 @@ impl GenerationWorker {
                     progress,
                 );
             };
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            batch.request_light_initialization_many(initialized)?;
-            set_phase(progress, GenerationPhase::Generating);
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            batch.seal_for_light_propagation()?;
-            set_phase(progress, GenerationPhase::Lighting);
-            for &pos in &targets {
-                batch.request_light(pos)?;
-            }
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                generation_step(&mut batch, &mut provider, &mut classify, &mut resolve)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            set_phase(progress, GenerationPhase::PreparingMesh);
-            let mesh = MeshJob::for_generated(&mut batch, targets, revision, biome_blend, origin)?;
-            Ok(Some(GenerationReady {
+            generate_targets(
                 batch,
-                mesh,
-                worldgen_settings_draft: None,
-                pack_snapshot: None,
-                spawn_origin: None,
-                suggested_spawn: None,
-                player_spawn: None,
-                initial_clocks: None,
-                entity_collision_registry: None,
-                level_settings: None,
-                initial_respawn: None,
-                postprocessed: None,
-            }))
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                targets,
+                initialized,
+                revision,
+                biome_blend,
+                origin,
+                cancelled,
+                progress,
+            )
         })
     }
 
@@ -2350,6 +2408,74 @@ fn same_spawn_blocks(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn generate_targets(
+    mut batch: FreshTerrainBatch,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    targets: BTreeSet<ChunkPos>,
+    initialized: BTreeSet<ChunkPos>,
+    revision: u64,
+    biome_blend: u8,
+    origin: IVec3,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>> {
+    ensure!(
+        batch.is_complete() && batch.schedule().requested_chunks() == 0,
+        "generation batch must be fresh"
+    );
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    batch.request_light_initialization_many(initialized)?;
+    set_phase(progress, GenerationPhase::Generating);
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    batch.seal_for_light_propagation()?;
+    set_phase(progress, GenerationPhase::Lighting);
+    for &pos in &targets {
+        batch.request_light(pos)?;
+    }
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        generation_step(&mut batch, provider, classify, resolve)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    set_phase(progress, GenerationPhase::PreparingMesh);
+    let mesh = MeshJob::for_generated(&mut batch, targets, revision, biome_blend, origin)?;
+    Ok(Some(GenerationReady {
+        batch,
+        mesh,
+        worldgen_settings_draft: None,
+        pack_snapshot: None,
+        spawn_origin: None,
+        suggested_spawn: None,
+        player_spawn: None,
+        initial_clocks: None,
+        entity_collision_registry: None,
+        level_settings: None,
+        initial_respawn: None,
+        postprocessed: None,
+    }))
+}
+
 fn generate_spawn_origin(
     mut batch: FreshTerrainBatch,
     provider: &mut impl ResourceProvider,
@@ -2596,6 +2722,192 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn worker_prepares_structures_before_lit_terrain() -> Result<()> {
+        use native_resources::{
+            carver::tags::CarverBlockTags,
+            dimension_lighting::GeneratedDimensionLighting,
+            packs::{ResourceId, ResourceStack},
+            structure_placement::StructureSetCache,
+        };
+        use native_session::worldgen::{TerrainGenerator, resolve_generated_terrain_state};
+        use native_world::fluid::FluidState;
+        use serde_json::json;
+
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.starts_with("data/minecraft/worldgen/noise/") {
+                    return Ok(Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec()));
+                }
+                let value = match path {
+                    "data/example/worldgen/structure/treasure.json" => Some(
+                        json!({"type":"minecraft:buried_treasure","biomes":["minecraft:plains"],"step":"surface_structures"}),
+                    ),
+                    "data/example/worldgen/structure_set/treasure.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    "data/minecraft/tags/block/uncarvable.json" => Some(json!({"values":[]})),
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        Some(
+                            json!({"values":["minecraft:stone","minecraft:sand","minecraft:chest"]}),
+                        )
+                    }
+                    _ => None,
+                };
+                Ok(value.map(|v| serde_json::to_vec(&v).unwrap()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                match folder {
+                    "worldgen/biome" => Ok(vec![ResourceId::parse("minecraft:plains")?]),
+                    "worldgen/structure_set" | "worldgen/structure" => {
+                        Ok(vec![ResourceId::parse("example:treasure")?])
+                    }
+                    _ => Ok(vec![]),
+                }
+            }
+        }
+        let set_id = ResourceId::parse("example:treasure")?;
+        let [x, z] = StructureSetCache::default()
+            .load(&mut Data, &set_id)?
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let registry = ResourceStack::open(&game)?.vanilla_generated_block_registry()?;
+        let blocks: BTreeSet<_> = registry.ids().map(str::to_owned).collect();
+        let worker = GenerationWorker::start_with_structures(
+            move || {
+                let mut provider = Data;
+                let definition = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"},"settings":{
+                    "noise":{"min_y":80,"height":16},"legacy_random_source":false,"sea_level":88,
+                    "default_block":"minecraft:stone","default_fluid":"minecraft:water",
+                    "material_rule":{"type":"block","result_state":"minecraft:stone"},
+                    "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":80,"to_coordinate":96,"from_value":1,"to_value":-1},
+                        "temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":88}
+                }});
+                let generator = TerrainGenerator::with_structure_context(
+                    &mut provider,
+                    &definition,
+                    42,
+                    80,
+                    16,
+                )?;
+                let structures = StructureGenerationBatch::from_registry(generator, &mut provider)?;
+                let terrain_tags = CarverBlockTags::load(&mut provider, &blocks)?;
+                let registry = Arc::new(registry);
+                let for_height = Arc::clone(&registry);
+                let classify_height = move |value: &Value| {
+                    let state = resolve_generated_terrain_state(value, &for_height)?;
+                    let is_air = matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    );
+                    let has_fluid = FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some();
+                    Ok(native_persistence::heightmap::BlockHeightFlags {
+                        is_air,
+                        blocks_motion: !is_air && !has_fluid,
+                        blocks_motion_no_leaves: !is_air && !has_fluid,
+                        has_fluid,
+                    })
+                };
+                let for_classify = Arc::clone(&registry);
+                let classify = move |value: &Value| {
+                    let state = resolve_generated_terrain_state(value, &for_classify)?;
+                    Ok(CarverBlockState {
+                        is_air: matches!(
+                            state.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        has_fluid: FluidState::from_block(&state)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                };
+                let for_resolve = Arc::clone(&registry);
+                let resolve =
+                    move |value: &Value| resolve_generated_terrain_state(value, &for_resolve);
+                let configure_terrain =
+                    move |batch: &mut FreshTerrainBatch, provider: &mut Data| {
+                        let lighting = GeneratedDimensionLighting {
+                            dimension: ResourceId::parse("minecraft:overworld")?,
+                            dimension_type: None,
+                            min_y: 80,
+                            height: 16,
+                            has_skylight: true,
+                            ambient_light: Some(0.0),
+                        };
+                        batch.enable_decoration(provider, &BTreeSet::new(), blocks, &lighting)?;
+                        batch.enable_light_initialization((*registry).clone())
+                    };
+                Ok(StructuredGenerationInputs {
+                    structures,
+                    provider,
+                    classify,
+                    resolve,
+                    classify_height,
+                    terrain_tags,
+                    dimension: "minecraft:overworld".into(),
+                    configure_terrain,
+                })
+            },
+            BTreeSet::from([target]),
+            71,
+            0,
+            IVec3::ZERO,
+        )?;
+        let ready = match worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
+        };
+        let id = ResourceId::parse("example:treasure")?;
+        let start = &ready
+            .batch
+            .structure_starts(target)
+            .context("structure starts missing")?[&id];
+        assert_ne!(start.bounds.min[1], 90);
+        assert_eq!(
+            ready
+                .mesh
+                .world
+                .block(
+                    start.bounds.min[0],
+                    start.bounds.min[1],
+                    start.bounds.min[2]
+                )
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert!(
+            ready
+                .batch
+                .structure_data(target)?
+                .get("starts")
+                .unwrap()
+                .get("example:treasure")
+                .is_some()
+        );
+        assert!(ready.batch.into_parts().is_err());
+        Ok(())
+    }
 
     #[test]
     fn bonus_generation_rejects_every_missing_final_heightmap() {

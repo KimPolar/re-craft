@@ -168,7 +168,69 @@ fn trace() -> Vec<String> {
     out.extend(callback_reschedule_trace());
     out.extend(streamed_containers_trace());
     out.extend(captured_index_history_trace());
+    out.extend(incremental_registration_trace());
     out
+}
+
+fn incremental_registration_trace() -> Vec<String> {
+    use std::collections::BTreeMap;
+    let first = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 1, z: 0 };
+    let empty = |pos| ChunkTicks::from_saved(pos, vec![]).unwrap();
+    let mut region = RegionTicks::new_ordered(
+        BTreeMap::from([(
+            first,
+            ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(first, vec![saved("pending0", [0, 0, 0], 0, 0)])
+                    .unwrap(),
+                fluids: empty(first),
+            },
+        )]),
+        100,
+        5,
+        &[first],
+    )
+    .unwrap();
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Block, "live0", [0, 1, 0], 1, 0)
+            .unwrap(),
+        ScheduleOutcome::Added
+    );
+    let mut blocks =
+        ChunkTicks::from_saved(second, vec![saved("pending1", [16, 0, 0], 0, 0)]).unwrap();
+    assert!(
+        blocks
+            .schedule(scheduled("existing1", [16, 1, 0], 102, 0, 7))
+            .unwrap()
+    );
+    region
+        .register_chunk(
+            second,
+            ConvertedChunkTicks {
+                blocks,
+                fluids: empty(second),
+            },
+        )
+        .unwrap();
+    assert_eq!(region.registration_order(), &[first, second]);
+    assert_eq!(
+        region
+            .schedule(TickRegistry::Block, "live1", [16, 2, 0], 1, 0)
+            .unwrap(),
+        ScheduleOutcome::Added
+    );
+    assert_eq!(region.next_sub_tick(), 7);
+    let mut active = region
+        .captured_indexed_queue(TickRegistry::Block, &[first, second])
+        .unwrap();
+    let mut output = Vec::new();
+    for time in 100..=102 {
+        for tick in active.collect_due(time, 100, |_| true) {
+            output.push(format!("D {time} {}", tick.kind));
+        }
+    }
+    output
 }
 
 fn captured_index_history_trace() -> Vec<String> {
@@ -461,7 +523,48 @@ fn pending_ticks_block_duplicates_and_validate_chunk_inputs() {
     assert!(ChunkTicks::from_saved(pos, vec![saved("water", [-31, 0, 50], 0, 4)]).is_err());
     assert!(ChunkTicks::from_saved(pos, vec![saved("bad id", [-31, 0, 50], 0, 0)]).is_err());
     let lines = trace();
-    assert_eq!(lines.len(), 231);
+    assert_eq!(lines.len(), 236);
+}
+
+#[test]
+fn registering_chunks_preserves_history_and_rejects_invalid_inputs_atomically() {
+    use std::collections::BTreeMap;
+    let first = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 1, z: 0 };
+    let make = |blocks, fluids| ConvertedChunkTicks {
+        blocks: ChunkTicks::from_saved(blocks, vec![]).unwrap(),
+        fluids: ChunkTicks::from_saved(fluids, vec![]).unwrap(),
+    };
+    let mut region =
+        RegionTicks::new(BTreeMap::from([(first, make(first, first))]), 42, 9).unwrap();
+    region
+        .schedule(TickRegistry::Block, "stone", [0, 1, 0], 2, 0)
+        .unwrap();
+    let before = region.activated_snapshot();
+    assert!(region.register_chunk(first, make(first, first)).is_err());
+    assert!(region.register_chunk(second, make(second, first)).is_err());
+    assert_eq!(region.registration_order(), &[first]);
+    assert_eq!(region.activated_snapshot(), before);
+    region.register_chunk(second, make(second, second)).unwrap();
+    assert_eq!(region.registration_order(), &[first, second]);
+    assert_eq!(region.next_sub_tick(), before.next_sub_tick);
+    assert_eq!(
+        region.activated_snapshot().chunks[&first],
+        before.chunks[&first]
+    );
+    assert!(
+        region
+            .captured_indexed_queue(TickRegistry::Block, &[first, second])
+            .is_ok()
+    );
+    region.chunk_mut(first).unwrap();
+    let third = ChunkPos { x: -1, z: 0 };
+    region.register_chunk(third, make(third, third)).unwrap();
+    assert!(
+        region
+            .captured_indexed_queue(TickRegistry::Block, &[first, second, third])
+            .is_err()
+    );
 }
 
 #[test]

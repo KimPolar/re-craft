@@ -559,6 +559,32 @@ impl RegionTicks {
         self.chunks.get(&pos)
     }
 
+    /// Register one newly converted chunk after earlier postprocessing has
+    /// already scheduled ticks. Existing containers and the shared sub-tick
+    /// counter are preserved. Replacement is rejected because it would discard
+    /// their pending ticks and registration history.
+    pub fn register_chunk(&mut self, pos: ChunkPos, ticks: ConvertedChunkTicks) -> Result<()> {
+        ensure!(
+            ticks.blocks.chunk == pos && ticks.fluids.chunk == pos,
+            "tick container belongs to another chunk"
+        );
+        ensure!(
+            !self.chunks.contains_key(&pos),
+            "tick container is already registered"
+        );
+        if let Some(indexes) = &mut self.indexes {
+            if let Some(head) = ticks.blocks.peek() {
+                indexes.blocks.insert(pos, head.trigger);
+            }
+            if let Some(head) = ticks.fluids.peek() {
+                indexes.fluids.insert(pos, head.trigger);
+            }
+        }
+        self.chunks.insert(pos, ticks);
+        self.registration.push(pos);
+        Ok(())
+    }
+
     pub fn chunk_mut(&mut self, pos: ChunkPos) -> Option<&mut ConvertedChunkTicks> {
         if self.chunks.contains_key(&pos) {
             // Direct edits bypass LevelTicks' onTickAdded callback.

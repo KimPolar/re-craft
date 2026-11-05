@@ -3638,6 +3638,46 @@ mod tests {
             assert_eq!(worker.progress().phase, GenerationPhase::Ready);
             if !spawn_mobs {
                 let positions: Vec<_> = targets.iter().copied().collect();
+                assert!(positions.len() >= 2);
+                let mut incremental =
+                    ready
+                        .batch
+                        .begin_generated_postprocessing([positions[0]], 0, 0)?;
+                assert!(
+                    ready
+                        .batch
+                        .register_generated_postprocessing_chunk(&mut incremental, positions[1])
+                        .is_err()
+                );
+                while !incremental.poll(positions[0], 256)? {}
+                ready
+                    .batch
+                    .register_generated_postprocessing_chunk(&mut incremental, positions[1])?;
+                assert!(
+                    ready
+                        .batch
+                        .register_generated_postprocessing_chunk(&mut incremental, positions[1])
+                        .is_err()
+                );
+                while !incremental.poll(positions[1], 256)? {}
+                let incremental = incremental.finish()?;
+                ready.batch.validate_postprocessing(&incremental)?;
+                assert_eq!(incremental.ticks().registration_order(), &positions[..2]);
+                assert_eq!(incremental.chunks, positions[..2].iter().copied().collect());
+                let drafts = ready
+                    .batch
+                    .postprocessed_chunk_drafts(&incremental, positions[..2].iter().copied())?;
+                for pos in &positions[..2] {
+                    let draft = &drafts[pos].chunk;
+                    assert_eq!(
+                        draft.value.get("Status"),
+                        Some(&native_persistence::nbt::Tag::String(
+                            "minecraft:full".into()
+                        ))
+                    );
+                    assert!(draft.value.get("Heightmaps").is_some());
+                    assert!(draft.value.get("block_entities").is_some());
+                }
                 let next_revision = ready
                     .mesh
                     .revision

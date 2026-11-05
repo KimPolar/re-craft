@@ -1821,6 +1821,48 @@ impl FreshTerrainBatch {
         Ok(stage)
     }
 
+    /// Append a spawn-complete chunk to an isolated pass at a boundary after
+    /// its previous chunks have finished. The batch and its source snapshot
+    /// must still be the same revision; this does not yet extend a batch that
+    /// has generated additional terrain since the pass began.
+    pub fn register_generated_postprocessing_chunk(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+        pos: ChunkPos,
+    ) -> Result<()> {
+        stage.check_registration(pos)?;
+        ensure!(
+            stage.batch_revision == Some(self.schedule.revision())
+                && self
+                    .snapshot()
+                    .is_some_and(|world| Arc::ptr_eq(&world, &stage.source)),
+            "postprocessing belongs to a different generation revision"
+        );
+        let converted = self.begin_converted_postprocessing(pos)?;
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        let entities = super::postprocessing_world::ConvertedBlockEntities::from_proto(
+            self.spawned_block_entity_data(pos)?,
+            terrain.generated_entity_order.get(&pos).map(Arc::as_ref),
+            terrain.generated_pending_order.get(&pos).map(Arc::as_ref),
+        )?;
+        let (min_y, max_y) = self.build_bounds()?;
+        let heightmaps = native_persistence::heightmap::FullHeightmaps::from_converted(
+            native_persistence::heightmap::HeightBounds { min_y, max_y },
+            &self.converted_full_heightmap_data(pos)?,
+        )?;
+        let light = if stage.light.is_some() {
+            let mut covered: BTreeSet<_> = stage.region.tasks.keys().copied().collect();
+            covered.insert(pos);
+            Some(self.postprocessing_light_input(stage.light_checkpoint.as_ref(), covered)?)
+        } else {
+            None
+        };
+        stage.register_converted_chunk(pos, converted, entities, heightmaps, light)
+    }
+
     /// Drain the checks recorded so far at a caller-selected boundary between
     /// postprocessing polls. A failed drain leaves the stage unchanged. The
     /// caller must reproduce Java's actual lighting schedule; this API does not

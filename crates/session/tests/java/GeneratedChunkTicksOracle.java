@@ -175,5 +175,21 @@ public class GeneratedChunkTicksOracle {
             history.tick(100, 3, (p, type) -> System.out.println("H1 " + type));
         }
         history.tick(101, 100, (p, type) -> System.out.println("H2 " + type));
+        var dynamic = new LevelTicks<String>(p -> true);
+        var first = new LevelChunkTicks<String>(List.of(new SavedTick<String>(
+            "minecraft:pending0", new BlockPos(0, 0, 0), 0, TickPriority.NORMAL)));
+        dynamic.addContainer(new ChunkPos(0, 0), first);
+        dynamic.schedule(tick("minecraft:live0", new BlockPos(0, 1, 0), 101, TickPriority.NORMAL, 5));
+        var second = new LevelChunkTicks<String>(List.of(new SavedTick<String>(
+            "minecraft:pending1", new BlockPos(16, 0, 0), 0, TickPriority.NORMAL)));
+        second.schedule(tick("minecraft:existing1", new BlockPos(16, 1, 0), 102, TickPriority.NORMAL, 7));
+        dynamic.addContainer(new ChunkPos(1, 0), second);
+        dynamic.schedule(tick("minecraft:live1", new BlockPos(16, 2, 0), 101, TickPriority.NORMAL, 6));
+        first.unpack(100);
+        second.unpack(100);
+        for (long time = 100; time <= 102; time++) {
+            final long now = time;
+            dynamic.tick(time, 100, (p, type) -> System.out.println("D " + now + " " + type));
+        }
     }
 }

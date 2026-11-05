@@ -303,6 +303,42 @@ impl GeneratedPostprocessing {
         self.batch_revision = Some(revision);
     }
 
+    pub(super) fn check_registration(&self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed
+                && self.active.is_none()
+                && self.completed.len() == self.region.tasks.len(),
+            "finish existing postprocessing before registering a chunk"
+        );
+        ensure!(
+            !self.region.tasks.contains_key(&pos)
+                && !self.heightmaps.contains_key(&pos)
+                && !self.block_entities.contains_key(&pos)
+                && self.region.ticks.chunk(pos).is_none(),
+            "postprocessing chunk is already registered"
+        );
+        Ok(())
+    }
+
+    pub(super) fn register_converted_chunk(
+        &mut self,
+        pos: ChunkPos,
+        converted: super::postprocessing::ConvertedChunkPostprocessing,
+        entities: ConvertedBlockEntities,
+        heightmaps: native_persistence::heightmap::FullHeightmaps,
+        light: Option<VisibleLightSnapshot>,
+    ) -> Result<()> {
+        self.check_registration(pos)?;
+        self.region.ticks.register_chunk(pos, converted.ticks)?;
+        self.region.tasks.insert(pos, converted.task);
+        self.block_entities.insert(pos, entities);
+        self.heightmaps.insert(pos, heightmaps);
+        if let Some(light) = light {
+            self.light = Some(light);
+        }
+        Ok(())
+    }
+
     /// `before` must include the last checkpoint plus every newly needed
     /// column; callers are responsible for validating its batch revision.
     pub(super) fn drain_recorded_light(
@@ -2175,6 +2211,130 @@ mod tests {
             ),
             world,
         )
+    }
+
+    #[test]
+    fn adding_converted_chunk_retains_bonus_and_prior_tick_history() {
+        use super::super::chunk_ticks::{ScheduleOutcome, TickRegistry};
+        use native_core::random::LegacyRandom;
+
+        let (fixture, world) = bonus_chest_fixture();
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        let empty_ticks = |pos| ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        };
+        let task =
+            |pos| PostprocessingTask::new(Arc::new(PostProcessing::new(0, 16).unwrap()), pos);
+        let first_maps = fixture.heightmaps[&first].clone();
+        let second_maps = fixture.heightmaps[&second].clone();
+        let mut stage = GeneratedPostprocessing::new(
+            Arc::clone(&world),
+            0,
+            16,
+            ConvertedPostprocessingRegion {
+                tasks: BTreeMap::from([(first, task(first))]),
+                ticks: RegionTicks::new(BTreeMap::from([(first, empty_ticks(first))]), 100, 7)
+                    .unwrap(),
+            },
+            None,
+            None,
+            BTreeMap::from([(first, first_maps)]),
+            fixture.heightmap_tags.clone(),
+        );
+        assert!(
+            stage
+                .register_converted_chunk(
+                    second,
+                    super::super::postprocessing::ConvertedChunkPostprocessing {
+                        task: task(second),
+                        ticks: empty_ticks(second)
+                    },
+                    ConvertedBlockEntities::default(),
+                    second_maps.clone(),
+                    None,
+                )
+                .is_err()
+        );
+        while !stage.poll(first, 20).unwrap() {}
+        assert_eq!(
+            stage
+                .region
+                .ticks
+                .schedule(TickRegistry::Block, "sand", [2, 8, 2], 1, 0)
+                .unwrap(),
+            ScheduleOutcome::Added
+        );
+        let mut random = LegacyRandom::new(1);
+        let chest = stage
+            .place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut random,
+                [0, 8, 0],
+            )
+            .unwrap()
+            .unwrap();
+        let state = random.state();
+        stage
+            .register_converted_chunk(
+                second,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: task(second),
+                    ticks: empty_ticks(second),
+                },
+                ConvertedBlockEntities::default(),
+                second_maps,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stage.region.ticks.registration_order(), &[first, second]);
+        assert_eq!(stage.region.ticks.next_sub_tick(), 8);
+        assert_eq!(
+            stage
+                .region
+                .ticks
+                .schedule(TickRegistry::Fluid, "water", [16, 8, 0], 2, 0)
+                .unwrap(),
+            ScheduleOutcome::Added
+        );
+        while !stage.poll(second, 20).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert_eq!(random.state(), state);
+        assert_eq!(
+            result
+                .world
+                .block(chest[0], chest[1], chest[2])
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert_eq!(result.ticks().next_sub_tick(), 9);
+        assert_eq!(
+            result
+                .ticks()
+                .chunk(first)
+                .unwrap()
+                .blocks
+                .peek()
+                .unwrap()
+                .sub_tick,
+            7
+        );
+        assert_eq!(
+            result
+                .ticks()
+                .chunk(second)
+                .unwrap()
+                .fluids
+                .peek()
+                .unwrap()
+                .sub_tick,
+            8
+        );
+        assert!(
+            matches!(result.block_entity_data(first).unwrap(), native_persistence::nbt::Tag::List { values, .. } if values.len() == 1)
+        );
     }
 
     fn bonus_chest_snowy_surface(name: &str, snowy: bool) -> (GeneratedPostprocessing, Arc<World>) {

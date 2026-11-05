@@ -1520,6 +1520,20 @@ impl GenerationWorker {
         )
     }
 
+    /// Capture the selected data packs on the worker, then prepare the
+    /// structure-aware spawn-origin chunk from that same snapshot.
+    pub(crate) fn start_selected_structures_at_spawn(
+        settings: crate::fresh_generation::FreshGenerationSettings,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self> {
+        Self::start_with_structures_at_spawn(
+            move || crate::fresh_generation::prepare_with_structures(settings),
+            revision,
+            biome_blend,
+        )
+    }
+
     /// Compute the generator's initial spawn origin before preparing the
     /// structures and lighting needed for that chunk.
     pub(crate) fn start_with_structures_at_spawn<P, C, R, H, K, F>(
@@ -2807,6 +2821,129 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn selected_packs_generate_structures_on_worker() -> Result<()> {
+        use native_resources::{datapacks::DataPackSettings, packs::ResourceId};
+        use serde_json::json;
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/structures");
+        let files = [
+            (
+                "pack.mcmeta",
+                json!({"pack":{"description":"test","min_format":121,"max_format":121}}),
+            ),
+            (
+                "data/example/worldgen/biome/test.json",
+                json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+            ),
+            (
+                "data/example/worldgen/structure/treasure.json",
+                json!({"type":"minecraft:buried_treasure","biomes":["example:test"],"step":"surface_structures"}),
+            ),
+            (
+                "data/example/worldgen/structure_set/treasure.json",
+                json!({"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}),
+            ),
+            (
+                "data/example/worldgen/world_preset/test.json",
+                json!({"dimensions":{"minecraft:overworld":{
+                    "type":{"min_y":80,"height":16,"has_skylight":true,"ambient_light":0.0},
+                    "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:test"},"settings":{
+                        "noise":{"min_y":80,"height":16},"legacy_random_source":false,"sea_level":88,
+                        "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
+                        "material_rule":{"type":"block","result_state":"minecraft:stone"},
+                        "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":80,"to_coordinate":96,"from_value":1,"to_value":-1},
+                            "temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":88}
+                    }}
+                }}}),
+            ),
+        ];
+        for (path, contents) in files {
+            let path = pack.join(path);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, serde_json::to_vec(&contents)?)?;
+        }
+        let worker = GenerationWorker::start_selected_structures_at_spawn(
+            crate::fresh_generation::FreshGenerationSettings {
+                minecraft_dir: game,
+                preset: "example:test".into(),
+                dimension: "minecraft:overworld".into(),
+                seed: 42,
+                bonus_chest: false,
+                structures_enabled: true,
+                data_packs: Some((
+                    world,
+                    DataPackSettings {
+                        enabled: vec!["vanilla".into(), "file/structures".into()],
+                        disabled: vec![],
+                        enabled_features: vec!["minecraft:vanilla".into()],
+                    },
+                )),
+            },
+            71,
+            0,
+        )?;
+        let ready = match worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
+        };
+        let target = ChunkPos { x: 0, z: 0 };
+        assert_eq!(ready.spawn_origin, Some(target));
+        let id = ResourceId::parse("example:treasure")?;
+        let start = &ready
+            .batch
+            .structure_starts(target)
+            .context("structure starts missing")?[&id];
+        assert_eq!(
+            ready
+                .mesh
+                .world
+                .block(
+                    start.bounds.min[0],
+                    start.bounds.min[1],
+                    start.bounds.min[2]
+                )
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert_eq!(
+            ready
+                .worldgen_settings_draft
+                .as_ref()
+                .unwrap()
+                .value
+                .get("data")
+                .and_then(|v| v.get("seed")),
+            Some(&native_persistence::nbt::Tag::Long(42))
+        );
+        let snapshot = ready
+            .pack_snapshot
+            .as_ref()
+            .context("pack snapshot missing")?;
+        std::fs::write(pack.join("pack.mcmeta"), b"{}")?;
+        snapshot.verify()?;
+        let staged = tempfile::tempdir()?;
+        snapshot.copy_into(staged.path())?;
+        let copied = std::fs::read(staged.path().join("datapacks/structures/pack.mcmeta"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&copied)?["pack"]["description"],
+            "test"
+        );
+        assert!(ready.batch.into_parts().is_err());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

@@ -74,6 +74,29 @@ pub struct PostprocessedGeneration {
     pub mesh: Option<MeshJob>,
     sealed_world: Arc<native_world::loaded::World>,
     sealed_mesh: Option<MeshJob>,
+    initial_bonus_chest: Option<InitialBonusChest>,
+}
+
+/// A feature resolved from the same data-pack stack as the generation batch,
+/// and the server-level random stream at the start of feature placement.
+pub(crate) struct InitialBonusChestRequest {
+    pub feature: Option<native_resources::bonus_chest::BonusChestFeature>,
+    pub level_random: native_core::random::LegacyRandom,
+}
+
+struct InitialBonusChest {
+    position: Option<IVec3>,
+    level_random: native_core::random::LegacyRandom,
+}
+
+impl PostprocessedGeneration {
+    /// `None` means no initial bonus was requested; `Some(None)` means the
+    /// feature was absent or did not find a valid location.
+    pub(crate) fn initial_bonus_chest_position(&self) -> Option<Option<IVec3>> {
+        self.initial_bonus_chest
+            .as_ref()
+            .map(|bonus| bonus.position)
+    }
 }
 
 #[derive(Clone)]
@@ -524,10 +547,35 @@ impl GenerationReady {
         );
         if let Some(processed) = &self.postprocessed {
             self.batch.validate_postprocessing(&processed.region)?;
+            if self.worldgen_settings_draft.is_some() || processed.initial_bonus_chest.is_some() {
+                let settings = self
+                    .worldgen_settings_draft
+                    .as_ref()
+                    .context("initial bonus chest settings are missing")?;
+                let bonus_enabled = settings
+                    .value
+                    .get("data")
+                    .and_then(|data| data.get("bonus_chest"))
+                    == Some(&native_persistence::nbt::Tag::Byte(1));
+                ensure!(
+                    bonus_enabled == processed.initial_bonus_chest.is_some(),
+                    "initial bonus chest settings changed after postprocessing"
+                );
+            }
             ensure!(
                 Arc::ptr_eq(&processed.region.world, &processed.sealed_world),
                 "postprocessed region was replaced"
             );
+            if let Some(Some(pos)) = processed.initial_bonus_chest_position() {
+                ensure!(
+                    processed
+                        .region
+                        .world
+                        .block(pos.x, pos.y, pos.z)
+                        .is_some_and(|state| state.name == "minecraft:chest"),
+                    "initial bonus chest is missing from postprocessed terrain"
+                );
+            }
             ensure!(
                 processed.activated_ticks == processed.region.ticks().activated_snapshot(),
                 "postprocessed tick snapshot changed"
@@ -622,9 +670,23 @@ impl GenerationReady {
             });
             world.saved_block_entities.insert(pos, payload);
         }
-        let mut session =
+        let initial_random = self
+            .postprocessed
+            .as_ref()
+            .and_then(|processed| processed.initial_bonus_chest.as_ref())
+            .map(|bonus| bonus.level_random.clone());
+        let mut session = if let Some(random) = initial_random {
+            LoadedSession::new_with_initial_level_random(
+                world,
+                mesh.origin,
+                BuildBounds { min_y, max_y },
+                player,
+                random,
+            )
+        } else {
             LoadedSession::new(world, mesh.origin, BuildBounds { min_y, max_y }, player)
-                .map_err(anyhow::Error::msg)?;
+        }
+        .map_err(anyhow::Error::msg)?;
         if let Some(tags) = self.batch.leaf_support_tags() {
             session.set_leaf_support_tags(tags);
         }
@@ -873,12 +935,54 @@ impl GenerationWorker {
     /// the worker, in the caller's explicit chunk order. A failure or
     /// cancellation discards the owned batch and all partial results.
     pub fn postprocess(
+        ready: GenerationReady,
+        positions: Vec<ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+        mesh_revision: u64,
+    ) -> Result<Self> {
+        Self::postprocess_inner(
+            ready,
+            positions,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
+            mesh_revision,
+            None,
+        )
+    }
+
+    /// Place the initial bonus only after postprocessing and before player
+    /// spawn search. The feature must come from the batch's data-pack stack.
+    pub(crate) fn postprocess_with_initial_bonus_chest(
+        ready: GenerationReady,
+        positions: Vec<ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+        water_source_conversion: bool,
+        mesh_revision: u64,
+        bonus: InitialBonusChestRequest,
+    ) -> Result<Self> {
+        Self::postprocess_inner(
+            ready,
+            positions,
+            game_time,
+            next_sub_tick,
+            water_source_conversion,
+            mesh_revision,
+            Some(bonus),
+        )
+    }
+
+    fn postprocess_inner(
         mut ready: GenerationReady,
         positions: Vec<ChunkPos>,
         game_time: i64,
         next_sub_tick: i64,
         water_source_conversion: bool,
         mesh_revision: u64,
+        bonus: Option<InitialBonusChestRequest>,
     ) -> Result<Self> {
         ensure!(!positions.is_empty(), "no postprocessing chunks");
         let unique: BTreeSet<_> = positions.iter().copied().collect();
@@ -894,6 +998,43 @@ impl GenerationWorker {
             mesh_revision != ready.mesh.revision,
             "postprocessed mesh needs a new revision"
         );
+        let bonus_origin = if bonus.is_some() {
+            ensure!(
+                ready.player_spawn.is_none(),
+                "bonus chest must precede player spawn search"
+            );
+            ensure!(
+                ready
+                    .worldgen_settings_draft
+                    .as_ref()
+                    .and_then(|draft| draft.value.get("data"))
+                    .and_then(|data| data.get("bonus_chest"))
+                    == Some(&native_persistence::nbt::Tag::Byte(1)),
+                "initial world settings do not enable a bonus chest"
+            );
+            let origin = ready
+                .suggested_spawn
+                .context("initial world spawn is missing")?;
+            ensure!(
+                unique.contains(&ChunkPos {
+                    x: origin.x.div_euclid(16),
+                    z: origin.z.div_euclid(16)
+                }),
+                "bonus chest spawn chunk is not selected"
+            );
+            Some(origin)
+        } else {
+            ensure!(
+                ready
+                    .worldgen_settings_draft
+                    .as_ref()
+                    .and_then(|draft| draft.value.get("data"))
+                    .and_then(|data| data.get("bonus_chest"))
+                    != Some(&native_persistence::nbt::Tag::Byte(1)),
+                "bonus chest settings require initial bonus postprocessing"
+            );
+            None
+        };
         Self::spawn(move |cancelled, progress| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -917,6 +1058,28 @@ impl GenerationWorker {
                 let mut state = progress.lock().unwrap_or_else(|error| error.into_inner());
                 state.completed_steps = state.completed_steps.saturating_add(1);
             }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let initial_bonus_chest = if let Some(mut bonus) = bonus {
+                let origin = bonus_origin.context("initial bonus chest origin is missing")?;
+                let position = match bonus.feature {
+                    Some(feature) => stage
+                        .place_initial_bonus_chest(
+                            &feature,
+                            &mut bonus.level_random,
+                            origin.to_array(),
+                        )?
+                        .map(IVec3::from_array),
+                    None => None,
+                };
+                Some(InitialBonusChest {
+                    position,
+                    level_random: bonus.level_random,
+                })
+            } else {
+                None
+            };
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -955,6 +1118,7 @@ impl GenerationWorker {
                 mesh,
                 sealed_world,
                 sealed_mesh,
+                initial_bonus_chest,
             });
             Ok(Some(ready))
         })
@@ -3259,13 +3423,64 @@ mod tests {
                     .revision
                     .checked_add(1)
                     .context("mesh revision overflow")?;
-                let worker =
-                    GenerationWorker::postprocess(ready, positions, 0, 0, true, next_revision)?;
+                // Exercise the intermediate worker with an absent feature:
+                // this must preserve the level RNG and happen before player
+                // spawn search. Restore the original fixture afterwards.
+                let original_spawn = ready.player_spawn.take();
+                let original_worldgen = ready.worldgen_settings_draft.clone();
+                use native_persistence::nbt::Tag;
+                let Tag::Compound(root) =
+                    &mut ready.worldgen_settings_draft.as_mut().unwrap().value
+                else {
+                    panic!("worldgen root is not a compound");
+                };
+                let Tag::Compound(data) = &mut root
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("data"))
+                    .unwrap()
+                    .1
+                else {
+                    panic!("worldgen data is not a compound");
+                };
+                data.iter_mut()
+                    .find(|(name, _)| name.matches("bonus_chest"))
+                    .unwrap()
+                    .1 = Tag::Byte(1);
+                let random = native_core::random::LegacyRandom::new(1234);
+                let expected_state = random.state();
+                let worker = GenerationWorker::postprocess_with_initial_bonus_chest(
+                    ready,
+                    positions,
+                    0,
+                    0,
+                    true,
+                    next_revision,
+                    InitialBonusChestRequest {
+                        feature: None,
+                        level_random: random,
+                    },
+                )?;
                 let mut ready = match worker.result.recv_timeout(Duration::from_secs(120))? {
                     GenerationResult::Ready(ready) => ready,
                     GenerationResult::Failed(error) => return Err(error),
                     GenerationResult::Cancelled => anyhow::bail!("postprocessing cancelled"),
                 };
+                let processed = ready.postprocessed.as_mut().unwrap();
+                assert_eq!(processed.initial_bonus_chest_position(), Some(None));
+                assert_eq!(
+                    processed
+                        .initial_bonus_chest
+                        .as_ref()
+                        .unwrap()
+                        .level_random
+                        .state(),
+                    expected_state
+                );
+                ready.player_spawn = original_spawn;
+                ready.start_initial_player_session(123)?;
+                ready.worldgen_settings_draft = original_worldgen;
+                assert!(ready.start_initial_player_session(123).is_err());
+                ready.postprocessed.as_mut().unwrap().initial_bonus_chest = None;
                 let source_biome = pack.join("data/example/worldgen/biome/flat.json");
                 let expected_biome = std::fs::read(&source_biome)?;
                 std::fs::write(&source_biome, br#"{"changed_after_generation":true}"#)?;

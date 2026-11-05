@@ -6559,10 +6559,32 @@ impl LoadedSession {
     }
 
     pub fn new(
+        world: World,
+        origin: IVec3,
+        bounds: BuildBounds,
+        player: PlayerState,
+    ) -> Result<Self, &'static str> {
+        Self::new_inner(world, origin, bounds, player, None)
+    }
+
+    /// Continue the server-level random stream after initial world setup.
+    /// This must be the same generator that was used for spawn features.
+    pub fn new_with_initial_level_random(
+        world: World,
+        origin: IVec3,
+        bounds: BuildBounds,
+        player: PlayerState,
+        random: native_core::random::LegacyRandom,
+    ) -> Result<Self, &'static str> {
+        Self::new_inner(world, origin, bounds, player, Some(random))
+    }
+
+    fn new_inner(
         mut world: World,
         origin: IVec3,
         bounds: BuildBounds,
         player: PlayerState,
+        initial_level_random: Option<native_core::random::LegacyRandom>,
     ) -> Result<Self, &'static str> {
         if bounds.min_y >= bounds.max_y
             || !player.position.is_finite()
@@ -6803,7 +6825,9 @@ impl LoadedSession {
                 crate::fresh_session_seed(),
             ),
             client_level_random: native_core::random::LegacyRandom::new(crate::fresh_session_seed()),
-            level_random: native_core::random::LegacyRandom::new(crate::fresh_session_seed()),
+            level_random: initial_level_random.unwrap_or_else(|| {
+                native_core::random::LegacyRandom::new(crate::fresh_session_seed())
+            }),
             random_tick_speed: 3,
             random_block_position: native_core::random::BlockRandomPosition::new(
                 crate::fresh_session_seed() as i32,
@@ -24803,6 +24827,29 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    #[test]
+    fn initial_level_random_continues_after_spawn_setup() {
+        let (world, origin, player) = fixture();
+        let mut random = native_core::random::LegacyRandom::new(12345);
+        random.skip_ints(17);
+        let mut expected = random.clone();
+        let mut session = LoadedSession::new_with_initial_level_random(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+            random,
+        )
+        .unwrap();
+        assert_eq!(session.level_random.state(), expected.state());
+        for _ in 0..16 {
+            assert_eq!(session.level_random.next_int(), expected.next_int());
+        }
     }
 
     fn generated_tick_fixture() -> crate::worldgen::chunk_ticks::ActivatedRegionTicks {

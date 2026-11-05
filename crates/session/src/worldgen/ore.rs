@@ -48,6 +48,7 @@ use super::{
 };
 
 mod buried_treasure;
+mod ocean_ruin;
 mod swamp_hut;
 
 trait PlannedHutPlacement {

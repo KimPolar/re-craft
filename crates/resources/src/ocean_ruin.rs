@@ -4,7 +4,11 @@ use native_core::random::LegacyRandom;
 use serde_json::Value;
 
 pub use crate::structure_transform::Rotation;
-use crate::{packs::ResourceId, structure_placement::large_feature};
+use crate::{
+    packs::ResourceId,
+    structure_placement::large_feature,
+    structure_transform::{Mirror, block_world_position},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Temperature {
@@ -64,6 +68,61 @@ pub struct Piece {
     pub rotation: Rotation,
     pub integrity: f32,
     pub large: bool,
+}
+
+/// Access to the current world used by Java's ocean-floor adjustment.
+pub trait FloorWorld {
+    fn min_y(&self) -> i32;
+    /// First available Y of the current OCEAN_FLOOR_WG heightmap.
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32>;
+    /// True for air, a fluid in the active water tag, or a block in the
+    /// active ice tag. Waterlogged blocks must use their actual fluid state.
+    fn floor_scan_passable(&mut self, position: [i32; 3]) -> Result<bool>;
+}
+
+/// Find the postprocessing origin before processing or placing a piece.
+/// Java leaves the structure start's original bounding box unchanged.
+pub fn floor_position(
+    piece: &Piece,
+    size: [i32; 3],
+    world: &mut impl FloorWorld,
+) -> Result<[i32; 3]> {
+    let [x, _, z] = piece.position;
+    let initial_y = world.ocean_floor_height(x, z)?;
+    let start = [x, initial_y, z];
+    let end = block_world_position(
+        [size[0].wrapping_sub(1), 0, size[2].wrapping_sub(1)],
+        start,
+        Mirror::None,
+        piece.rotation,
+        [0; 3],
+    );
+    let mut lowest = 512_i32;
+    let reference_y = initial_y.wrapping_sub(1);
+    let mut deep_columns = 0_i32;
+    for z in start[2].min(end[2])..=start[2].max(end[2]) {
+        for x in start[0].min(end[0])..=start[0].max(end[0]) {
+            let mut y = reference_y;
+            loop {
+                let passable = world.floor_scan_passable([x, y, z])?;
+                if !passable || y <= world.min_y().wrapping_add(1) {
+                    break;
+                }
+                y = y.wrapping_sub(1);
+            }
+            lowest = lowest.min(y);
+            if y < reference_y.wrapping_sub(2) {
+                deep_columns = deep_columns.wrapping_add(1);
+            }
+        }
+    }
+    let width = start[0].wrapping_sub(end[0]).wrapping_abs();
+    let adjusted = if reference_y.wrapping_sub(lowest) > 2 && deep_columns > width.wrapping_sub(2) {
+        lowest.wrapping_add(1)
+    } else {
+        initial_y
+    };
+    Ok([x, adjusted, z])
 }
 
 fn add_piece(
@@ -229,6 +288,51 @@ pub fn select_for_chunk(seed: i64, chunk: [i32; 2], settings: Settings) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Floor {
+        height: i32,
+        bottom: i32,
+        fail: bool,
+    }
+    impl FloorWorld for Floor {
+        fn min_y(&self) -> i32 {
+            -64
+        }
+        fn ocean_floor_height(&mut self, _: i32, _: i32) -> Result<i32> {
+            Ok(self.height)
+        }
+        fn floor_scan_passable(&mut self, p: [i32; 3]) -> Result<bool> {
+            ensure!(!self.fail, "missing column");
+            Ok(p[1] > self.bottom)
+        }
+    }
+
+    #[test]
+    fn adjusts_to_deep_floor_and_propagates_read_failure() {
+        let piece = Piece {
+            template: "minecraft:test".into(),
+            position: [4, 90, -5],
+            rotation: Rotation::Clockwise90,
+            integrity: 0.8,
+            large: false,
+        };
+        let mut floor = Floor {
+            height: 64,
+            bottom: 58,
+            fail: false,
+        };
+        assert_eq!(
+            floor_position(&piece, [5, 4, 3], &mut floor).unwrap(),
+            [4, 59, -5]
+        );
+        floor.bottom = 61;
+        assert_eq!(
+            floor_position(&piece, [5, 4, 3], &mut floor).unwrap(),
+            [4, 64, -5]
+        );
+        floor.fail = true;
+        assert!(floor_position(&piece, [5, 4, 3], &mut floor).is_err());
+    }
     #[test]
     fn rejects_invalid_probabilities_without_consuming_randomness() {
         let mut random = LegacyRandom::new(42);

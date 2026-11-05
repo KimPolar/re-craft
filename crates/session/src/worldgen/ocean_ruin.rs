@@ -51,6 +51,14 @@ pub struct ProcessedRuinBlock {
 }
 
 impl PreparedPiece {
+    /// Update the template origin as Java does immediately before placement.
+    /// The original structure-start bounding box intentionally stays intact.
+    pub fn align_to_floor(&mut self, world: &mut impl ocean_ruin::FloorWorld) -> Result<()> {
+        let position = ocean_ruin::floor_position(&self.selection, self.template.size, world)?;
+        self.selection.position = position;
+        Ok(())
+    }
+
     pub fn block_position(
         &self,
         block: &native_persistence::structure_template::TemplateBlock,

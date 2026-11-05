@@ -1272,10 +1272,12 @@ impl GenerationWorker {
             )? {
                 return Ok(None);
             }
-            if let Some(feature) = bonus_chest_feature {
-                for &pos in &targets {
-                    let maps = ready.batch.spawned_heightmap_data(pos)?;
-                    require_initial_heightmaps(pos, &maps)?;
+            if player.is_some() || bonus_chest_feature.is_some() {
+                if bonus_chest_feature.is_some() {
+                    for &pos in &targets {
+                        let maps = ready.batch.spawned_heightmap_data(pos)?;
+                        require_initial_heightmaps(pos, &maps)?;
+                    }
                 }
                 let positions = targets.iter().copied().collect();
                 let next_revision = ready
@@ -1283,19 +1285,23 @@ impl GenerationWorker {
                     .revision
                     .checked_add(1)
                     .context("mesh revision overflow")?;
-                let postprocessor = Self::postprocess_with_initial_bonus_chest(
-                    ready,
-                    positions,
-                    0,
-                    0,
-                    true,
-                    next_revision,
-                    InitialBonusChestRequest {
-                        feature,
-                        level_random: initial_level_random
-                            .unwrap_or_else(native_session::fresh_level_random),
-                    },
-                )?;
+                let postprocessor = if let Some(feature) = bonus_chest_feature {
+                    Self::postprocess_with_initial_bonus_chest(
+                        ready,
+                        positions,
+                        0,
+                        0,
+                        true,
+                        next_revision,
+                        InitialBonusChestRequest {
+                            feature,
+                            level_random: initial_level_random
+                                .unwrap_or_else(native_session::fresh_level_random),
+                        },
+                    )?
+                } else {
+                    Self::postprocess(ready, positions, 0, 0, true, next_revision)?
+                };
                 set_phase(progress, GenerationPhase::Postprocessing);
                 loop {
                     if cancelled.load(Ordering::Relaxed) {
@@ -1313,7 +1319,7 @@ impl GenerationWorker {
                         Ok(GenerationResult::Failed(error)) => return Err(error),
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            anyhow::bail!("bonus chest postprocessing worker stopped unexpectedly")
+                            anyhow::bail!("initial postprocessing worker stopped unexpectedly")
                         }
                     }
                 }
@@ -3909,6 +3915,18 @@ mod tests {
             }
             assert_eq!(worker.progress().phase, GenerationPhase::Ready);
             if !spawn_mobs {
+                let automatic = ready
+                    .postprocessed
+                    .as_ref()
+                    .context("initial player worker did not postprocess its targets")?;
+                assert_eq!(automatic.region.chunks, targets);
+                assert_eq!(automatic.initial_bonus_chest_position(), None);
+                let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+                assert!(staged.stage.path().join("level.dat").is_file());
+                drop(staged);
+                // The remaining checks exercise an independent, manually
+                // assembled pass against the original protochunk batch.
+                ready.postprocessed.take();
                 let positions: Vec<_> = targets.iter().copied().collect();
                 assert!(positions.len() >= 2);
                 let mut incremental =

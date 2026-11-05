@@ -11,6 +11,10 @@ use native_resources::{
 };
 use serde_json::Value;
 
+mod placement;
+pub use placement::OceanRuinPlacementWorld;
+
+#[derive(Clone)]
 pub struct PreparedPiece {
     pub selection: Piece,
     pub template: Arc<StructureTemplate>,

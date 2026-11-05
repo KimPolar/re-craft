@@ -52,7 +52,7 @@ mod terrain_batch;
 pub mod tick_index;
 pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
-pub use generated_chest::GeneratedLootChest;
+pub use generated_chest::{GeneratedEmptyChest, GeneratedLootChest};
 pub use generated_creature_random::FreshCreatureRandom;
 pub use generated_donkey::draft_fresh_donkey;
 pub use generated_farm_animal::draft_fresh_farm_animal;
@@ -79,6 +79,7 @@ pub use terrain_batch::{
 #[derive(Clone, Debug)]
 pub enum GeneratedMonsterRoomEntity {
     Chest(GeneratedLootChest),
+    EmptyChest(GeneratedEmptyChest),
     Spawner(GeneratedMonsterSpawner),
     /// A protochunk DUMMY chest not yet materialized by getBlockEntity.
     PendingChest {
@@ -1635,6 +1636,13 @@ impl CarvedTerrainWorld {
                         },
                         spawner.block_entity(),
                     )
+                }
+                GeneratedMonsterRoomEntity::EmptyChest(chest) => {
+                    ensure!(
+                        p == chest.position,
+                        "generated empty chest position mismatch"
+                    );
+                    (chest.state.clone(), chest.block_entity())
                 }
                 GeneratedMonsterRoomEntity::PendingChest { .. } => {
                     bail!("pending generated chest serialization is not implemented")

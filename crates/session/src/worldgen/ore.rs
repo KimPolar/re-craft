@@ -3369,6 +3369,65 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     }
     bail!("unsupported monster-room block {}", name)
 }
+impl DecorationRegion<'_> {
+    fn resolve_generated_chest_inner(&mut self, pos: [i32; 3]) -> Result<bool> {
+        let state = OreWorld::block(self, pos)?;
+        if state.name != "minecraft:chest" {
+            ensure!(
+                !matches!(
+                    self.monster_entities.get(&pos),
+                    Some(Some(
+                        super::GeneratedMonsterRoomEntity::PendingChest { .. }
+                            | super::GeneratedMonsterRoomEntity::EmptyChest(_)
+                            | super::GeneratedMonsterRoomEntity::Chest(_)
+                    ))
+                ),
+                "generated chest block is missing"
+            );
+            return Ok(false);
+        }
+        monster_block_flags(&state)?;
+        match self.monster_entities.get(&pos).cloned() {
+            Some(Some(super::GeneratedMonsterRoomEntity::PendingChest {
+                position,
+                state: expected,
+            })) => {
+                ensure!(
+                    position == pos && expected == state,
+                    "pending chest state mismatch"
+                );
+                Arc::make_mut(&mut self.monster_entities).insert(
+                    pos,
+                    Some(super::GeneratedMonsterRoomEntity::EmptyChest(
+                        super::GeneratedEmptyChest { position, state },
+                    )),
+                );
+            }
+            Some(Some(super::GeneratedMonsterRoomEntity::EmptyChest(chest))) => {
+                ensure!(
+                    chest.position == pos && chest.state == state,
+                    "empty chest state mismatch"
+                );
+            }
+            Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => {}
+            _ => bail!("chest block entity is unavailable"),
+        }
+        Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
+        Ok(true)
+    }
+
+    /// Mirror a generation-time block-entity lookup. Resolving a pending chest
+    /// creates an empty inventory, retains its block state and records its live
+    /// iteration order. On error the unpublished region must be discarded.
+    pub fn resolve_pending_chest(&mut self, pos: [i32; 3]) -> Result<bool> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        self.failed = true;
+        let result = self.resolve_generated_chest_inner(pos)?;
+        self.failed = false;
+        Ok(result)
+    }
+}
+
 impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
     type State = BlockState;
     fn min_y(&self) -> i32 {
@@ -3489,29 +3548,18 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         Ok(())
     }
     fn chest_entity_exists(&mut self, pos: [i32; 3]) -> Result<bool> {
-        if OreWorld::block(self, pos)?.name != "minecraft:chest" {
-            return Ok(false);
-        }
-        match self.monster_entities.get(&pos) {
-            Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => {
-                Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
-                Ok(true)
-            }
-            _ => bail!("chest block entity is unavailable"),
-        }
+        self.resolve_generated_chest_inner(pos)
     }
     fn set_chest_loot(&mut self, pos: [i32; 3], seed: i64) -> Result<()> {
-        let Some(Some(super::GeneratedMonsterRoomEntity::Chest(chest))) =
-            self.monster_entities.get(&pos)
-        else {
-            bail!("generated chest is unavailable")
+        let updated = match self.monster_entities.get(&pos) {
+            Some(Some(super::GeneratedMonsterRoomEntity::Chest(chest))) => {
+                chest.with_loot_table("minecraft:chests/simple_dungeon", seed)?
+            }
+            Some(Some(super::GeneratedMonsterRoomEntity::EmptyChest(chest))) => {
+                chest.with_loot("minecraft:chests/simple_dungeon", seed)?
+            }
+            _ => bail!("generated chest is unavailable"),
         };
-        let updated = super::GeneratedLootChest::new(
-            pos,
-            chest.facing,
-            "minecraft:chests/simple_dungeon",
-            seed,
-        )?;
         Arc::make_mut(&mut self.monster_entities)
             .insert(pos, Some(super::GeneratedMonsterRoomEntity::Chest(updated)));
         Ok(())
@@ -5632,6 +5680,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
 #[cfg(test)]
 mod disk_tests;
 #[cfg(test)]
+mod pending_chest_tests;
+#[cfg(test)]
 mod scattered_tests;
 #[cfg(test)]
 mod simple_tests;
@@ -6275,7 +6325,7 @@ mod tests {
         assert!(generation_face_sturdy(&invalid, [0, 1, 0]).is_err());
     }
 
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         CarvedTerrainWorld,
         OreBlockTags,
         HeightmapTags,
@@ -15504,7 +15554,8 @@ mod tests {
                                 RoomMob::Spider => "minecraft:spider",
                             };
                         }
-                        super::super::GeneratedMonsterRoomEntity::PendingChest { .. } => {
+                        super::super::GeneratedMonsterRoomEntity::PendingChest { .. }
+                        | super::super::GeneratedMonsterRoomEntity::EmptyChest(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }
                     }

@@ -1,5 +1,5 @@
 //! Deferred-loot chest data for intermediate structure-generation drafts.
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use native_persistence::{
     edit::{BlockChange, BlockEntityMutation, ChunkDraft},
     nbt::Tag,
@@ -17,8 +17,61 @@ pub struct GeneratedLootChest {
     pub facing: HorizontalDirection,
     loot_table: ResourceId,
     pub loot_seed: i64,
+    state_override: Option<native_world::loaded::BlockState>,
+}
+
+/// A materialized DUMMY chest with an empty inventory and no loot table.
+#[derive(Clone, Debug)]
+pub struct GeneratedEmptyChest {
+    pub position: [i32; 3],
+    pub state: native_world::loaded::BlockState,
+}
+
+impl GeneratedEmptyChest {
+    pub fn block_entity(&self) -> Tag {
+        let [x, y, z] = self.position;
+        Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:chest".into())),
+            ("x".into(), Tag::Int(x)),
+            ("y".into(), Tag::Int(y)),
+            ("z".into(), Tag::Int(z)),
+            (
+                "Items".into(),
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::End,
+                    values: vec![],
+                },
+            ),
+            ("components".into(), Tag::Compound(vec![])),
+        ])
+    }
+
+    pub(super) fn with_loot(&self, table: &str, seed: i64) -> Result<GeneratedLootChest> {
+        ensure!(
+            self.state.name == "minecraft:chest",
+            "empty chest state does not match"
+        );
+        let facing = match self.state.properties.get("facing").map(String::as_str) {
+            Some("north") => HorizontalDirection::North,
+            Some("south") => HorizontalDirection::South,
+            Some("east") => HorizontalDirection::East,
+            Some("west") => HorizontalDirection::West,
+            _ => anyhow::bail!("empty chest facing is invalid"),
+        };
+        let mut chest = GeneratedLootChest::new(self.position, facing, table, seed)
+            .context("invalid generated chest loot")?;
+        chest.state_override = Some(self.state.clone());
+        Ok(chest)
+    }
 }
 impl GeneratedLootChest {
+    pub(super) fn with_loot_table(&self, table: &str, seed: i64) -> Result<Self> {
+        let mut chest = self.clone();
+        chest.loot_table = ResourceId::parse(table)?;
+        chest.loot_seed = seed;
+        Ok(chest)
+    }
+
     /// Convert a successfully created chest entity into its deferred-loot data.
     pub fn from_buried_treasure(outcome: BuriedTreasureOutcome) -> Option<Self> {
         match outcome {
@@ -33,6 +86,7 @@ impl GeneratedLootChest {
                 loot_table: ResourceId::parse("minecraft:chests/buried_treasure")
                     .expect("valid built-in loot table"),
                 loot_seed,
+                state_override: None,
             }),
             _ => None,
         }
@@ -48,10 +102,21 @@ impl GeneratedLootChest {
             facing,
             loot_table: ResourceId::parse(loot_table)?,
             loot_seed,
+            state_override: None,
         })
     }
     /// Registry state of Java's default single, non-waterlogged chest.
     pub fn block_state(&self) -> BlockState {
+        if let Some(state) = &self.state_override {
+            return BlockState {
+                name: state.name.as_str().into(),
+                properties: state
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.as_str().into(), v.as_str().into()))
+                    .collect(),
+            };
+        }
         let facing = match self.facing {
             HorizontalDirection::North => "north",
             HorizontalDirection::East => "east",

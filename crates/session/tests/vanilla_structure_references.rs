@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command};
 use native_core::beardifier::{BoundingBox, TerrainAdjustment};
 use native_resources::packs::ResourceId;
 use native_session::worldgen::structure_references::{
-    StructureStartBounds, collect_structure_references,
+    StructureStartBounds, collect_ordered_structure_references, collect_structure_references,
 };
 use native_world::loaded::ChunkPos;
 use serde_json::{Value, json};
@@ -121,6 +121,34 @@ fn generated_structure_references_match_java() {
         cases.push(json!({"x":target.x,"z":target.z,"starts":records}));
         expected_inputs.push((target, starts));
     }
+    // More than 24 references triggers fastutil rehashing; include zero,
+    // negative packed coordinates, and collisions across the whole radius.
+    let target = ChunkPos { x: 0, z: 0 };
+    let id = ResourceId::parse("minecraft:buried_treasure").unwrap();
+    let mut starts = BTreeMap::new();
+    let mut records = Vec::new();
+    for x in -8..=8 {
+        for z in -8..=8 {
+            let source = ChunkPos { x, z };
+            let bounds = BoundingBox::new([0, -10, 0], [15, 10, 15]).unwrap();
+            starts.insert(
+                source,
+                vec![
+                    StructureStartBounds::from_pieces(
+                        id.clone(),
+                        &[bounds],
+                        TerrainAdjustment::None,
+                    )
+                    .unwrap(),
+                ],
+            );
+            records.push(
+                json!({"x":x,"z":z,"id":"minecraft:buried_treasure","pieces":[[0,-10,0,15,10,15]]}),
+            );
+        }
+    }
+    cases.push(json!({"x":0,"z":0,"starts":records}));
+    expected_inputs.push((target, starts));
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -130,6 +158,8 @@ fn generated_structure_references_match_java() {
         .arg(input));
     let mut groups = Vec::new();
     let mut java_refs = BTreeMap::<ResourceId, std::collections::BTreeSet<i64>>::new();
+    let mut ordered_groups = Vec::new();
+    let mut java_order = BTreeMap::<ResourceId, Vec<i64>>::new();
     let mut bounding_groups = Vec::new();
     let mut java_bounds = BTreeMap::<(ChunkPos, ResourceId), BoundingBox>::new();
     for line in output.lines() {
@@ -148,12 +178,17 @@ fn generated_structure_references_match_java() {
             .unwrap();
             assert!(java_bounds.insert((pos, id), bounds).is_none());
         } else if parts.first() == Some(&"REF") {
+            java_order
+                .entry(ResourceId::parse(parts[1]).unwrap())
+                .or_default()
+                .push(parts[2].parse().unwrap());
             java_refs
                 .entry(ResourceId::parse(parts[1]).unwrap())
                 .or_default()
                 .insert(parts[2].parse().unwrap());
         } else if parts.first() == Some(&"END") {
             groups.push(std::mem::take(&mut java_refs));
+            ordered_groups.push(std::mem::take(&mut java_order));
             bounding_groups.push(std::mem::take(&mut java_bounds));
         }
     }
@@ -172,8 +207,11 @@ fn generated_structure_references_match_java() {
             "missing fixture for {name}"
         );
     }
-    for (((target, starts), expected), expected_bounds) in
-        expected_inputs.into_iter().zip(groups).zip(bounding_groups)
+    for ((((target, starts), expected), expected_bounds), expected_order) in expected_inputs
+        .into_iter()
+        .zip(groups)
+        .zip(bounding_groups)
+        .zip(ordered_groups)
     {
         assert!(!expected.is_empty());
         let actual_bounds: BTreeMap<_, _> = starts
@@ -193,5 +231,16 @@ fn generated_structure_references_match_java() {
         })
         .unwrap();
         assert_eq!(actual, expected, "target {target:?}");
+        let ordered = collect_ordered_structure_references(target, |source| {
+            Ok(starts.get(&source).cloned().unwrap_or_default())
+        })
+        .unwrap();
+        for (id, java) in expected_order {
+            assert_eq!(
+                ordered.order(&id),
+                Some(java.as_slice()),
+                "reference order for {id:?} at {target:?}"
+            );
+        }
     }
 }

@@ -6637,12 +6637,44 @@ mod tests {
         assert!(batch.starts(target).unwrap().contains_key(&structure_id));
         let packed = ((z as u32 as u64) << 32 | x as u32 as u64) as i64;
         assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+        assert!(
+            batch
+                .reference_order(target, &structure_id)
+                .unwrap()
+                .contains(&packed)
+        );
+        assert_eq!(
+            batch
+                .reference_order(target, &structure_id)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            batch.references(target).unwrap()[&structure_id],
+        );
         let order: Vec<_> = batch
             .terrain_start_keys(target)
             .unwrap()
             .into_iter()
             .collect();
         assert!(order.contains(&(structure_id.clone(), target)));
+        let java_order = batch
+            .terrain_start_order(target, std::slice::from_ref(&structure_id))
+            .unwrap();
+        assert_eq!(
+            java_order
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            order.iter().cloned().collect()
+        );
+        assert!(batch.terrain_start_order(target, &[]).is_err());
+        assert!(
+            batch
+                .terrain_start_order(target, &[structure_id.clone(), structure_id.clone()])
+                .is_err()
+        );
+        assert!(batch.beardifier_for_chunk(target, &java_order).is_ok());
         assert!(batch.beardifier_for_chunk(target, &[]).is_err());
         let mut duplicates = order.clone();
         duplicates.push(order[0].clone());

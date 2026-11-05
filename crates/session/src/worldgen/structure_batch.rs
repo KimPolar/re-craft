@@ -26,7 +26,8 @@ use super::{
     BiomeNeighborhood, CarverBlockState, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
     structure_references::{
-        StructureReferences, StructureStartBounds, collect_structure_references,
+        OrderedStructureReferences, StructureReferences, StructureStartBounds,
+        collect_ordered_structure_references,
     },
 };
 
@@ -39,7 +40,7 @@ pub type TerrainStartKey = (ResourceId, ChunkPos);
 /// Validated structure stages retained for an intermediate terrain batch.
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
-    pub(super) references: BTreeMap<ChunkPos, StructureReferences>,
+    pub(super) references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
 }
 
@@ -55,7 +56,7 @@ pub struct StructureGenerationBatch {
     schedule: GenerationSchedule,
     starts: BTreeMap<ChunkPos, SimpleStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
-    references: BTreeMap<ChunkPos, StructureReferences>,
+    references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
 }
 
@@ -132,7 +133,25 @@ impl StructureGenerationBatch {
     }
 
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
-        (!self.failed).then(|| self.references.get(&pos)).flatten()
+        (!self.failed)
+            .then(|| {
+                self.references
+                    .get(&pos)
+                    .map(OrderedStructureReferences::membership)
+            })
+            .flatten()
+    }
+
+    /// References for one structure in the order Java's long set iterates.
+    /// The caller must still determine the order between structure keys.
+    pub fn reference_order(&self, pos: ChunkPos, structure: &ResourceId) -> Option<&[i64]> {
+        (!self.failed)
+            .then(|| {
+                self.references
+                    .get(&pos)
+                    .and_then(|refs| refs.order(structure))
+            })
+            .flatten()
     }
 
     /// All referenced starts with terrain adaptation. The sorted result is a
@@ -159,6 +178,45 @@ impl StructureGenerationBatch {
             }
         }
         Ok(keys)
+    }
+
+    /// Traverse each structure's references in Java's set order. The caller
+    /// must supply Java's order for the structure keys that have terrain
+    /// adaptations; supplying an incomplete or duplicate order fails.
+    pub fn terrain_start_order(
+        &self,
+        pos: ChunkPos,
+        structure_order: &[ResourceId],
+    ) -> Result<Vec<TerrainStartKey>> {
+        let expected = self.terrain_start_keys(pos)?;
+        let mut seen = BTreeSet::new();
+        let mut result = Vec::with_capacity(expected.len());
+        for structure in structure_order {
+            ensure!(
+                seen.insert(structure),
+                "duplicate structure in terrain order"
+            );
+            let references = self
+                .reference_order(pos, structure)
+                .context("structure in terrain order has no references")?;
+            for &packed in references {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                let key = (structure.clone(), source);
+                if expected.contains(&key) {
+                    result.push(key);
+                }
+            }
+        }
+        ensure!(
+            result.len() == expected.len()
+                && result.iter().cloned().collect::<BTreeSet<_>>() == expected,
+            "structure terrain order does not cover references exactly"
+        );
+        Ok(result)
     }
 
     /// The caller must supply Java's start iteration order, including every
@@ -278,7 +336,7 @@ impl StructureGenerationBatch {
                     !self.references.contains_key(&pos),
                     "structure references already exist"
                 );
-                let refs = collect_structure_references(pos, |source| {
+                let refs = collect_ordered_structure_references(pos, |source| {
                     self.bounds
                         .get(&source)
                         .cloned()

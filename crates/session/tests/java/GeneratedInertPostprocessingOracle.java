@@ -11,6 +11,7 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.ticks.*;
@@ -79,6 +80,31 @@ public class GeneratedInertPostprocessingOracle {
             random=RandomSource.create(42);writes=0;
             chunk.postProcessGeneration(level);
             out.printf("%s %s %d %d %d %d%n",name,BuiltInRegistries.BLOCK.getKey(adjacent).getPath(),
+                writes,blockTicks.pack(100).size(),fluidTicks.pack(100).size(),random.nextLong());
+        }
+        var pillars=new ArrayList<String>();
+        for(var species:List.of("oak","spruce","birch","jungle","acacia","dark_oak","mangrove","cherry","pale_oak"))
+            for(var suffix:List.of("_log","_wood")) for(var prefix:List.of("","stripped_"))
+                pillars.add(prefix+species+suffix);
+        for(var species:List.of("crimson","warped"))
+            for(var suffix:List.of("_stem","_hyphae")) for(var prefix:List.of("","stripped_"))
+                pillars.add(prefix+species+suffix);
+        pillars.addAll(List.of("bamboo_block","stripped_bamboo_block","deepslate","basalt","polished_basalt","bone_block","quartz_pillar"));
+        for(var name:pillars) for(var axis:List.of("x","y","z")) for(var adjacent:List.of(Blocks.STONE,Blocks.AIR,Blocks.WATER)) {
+            var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
+            state=block.defaultBlockState().setValue(BlockStateProperties.AXIS,Direction.Axis.valueOf(axis.toUpperCase(Locale.ROOT)));
+            neighbor=adjacent.defaultBlockState();
+            if(block.getStateDefinition().getPossibleStates().size()!=3 || !state.getFluidState().isEmpty()
+                || !Block.isShapeFullBlock(state.getCollisionShape(EmptyBlockGetter.INSTANCE,POS)))
+                throw new AssertionError("not an inert full-cube pillar: "+name+" "+axis);
+            ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(POS));
+            set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());
+            blocks=new LevelTicks<>(p->true);fluids=new LevelTicks<>(p->true);
+            var blockTicks=new LevelChunkTicks<Block>();var fluidTicks=new LevelChunkTicks<Fluid>();
+            blocks.addContainer(new ChunkPos(0,0),blockTicks);fluids.addContainer(new ChunkPos(0,0),fluidTicks);
+            random=RandomSource.create(42);writes=0;
+            chunk.postProcessGeneration(level);
+            out.printf("P %s %s %s %d %d %d %d%n",name,axis,BuiltInRegistries.BLOCK.getKey(adjacent).getPath(),
                 writes,blockTicks.pack(100).size(),fluidTicks.pack(100).size(),random.nextLong());
         }
         out.println("END_RESULT");

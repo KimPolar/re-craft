@@ -791,6 +791,52 @@ fn inert_generated_full_cube(name: &str) -> bool {
     )
 }
 
+// These vanilla pillars have exactly one axis property, no contained fluid,
+// full faces, and no neighbor-shape side effects in Java 26.3.
+fn inert_generated_pillar(state: &BlockState) -> bool {
+    if state.properties.len() != 1
+        || !matches!(
+            state.properties.get("axis").map(String::as_str),
+            Some("x" | "y" | "z")
+        )
+    {
+        return false;
+    }
+    let Some(name) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    if matches!(
+        name,
+        "deepslate" | "basalt" | "polished_basalt" | "bone_block" | "quartz_pillar"
+    ) {
+        return true;
+    }
+    let name = name.strip_prefix("stripped_").unwrap_or(name);
+    if name == "bamboo_block" {
+        return true;
+    }
+    if let Some(species) = name
+        .strip_suffix("_log")
+        .or_else(|| name.strip_suffix("_wood"))
+    {
+        return matches!(
+            species,
+            "oak"
+                | "spruce"
+                | "birch"
+                | "jungle"
+                | "acacia"
+                | "dark_oak"
+                | "mangrove"
+                | "cherry"
+                | "pale_oak"
+        );
+    }
+    name.strip_suffix("_stem")
+        .or_else(|| name.strip_suffix("_hyphae"))
+        .is_some_and(|species| matches!(species, "crimson" | "warped"))
+}
+
 fn leaf_distance(state: &BlockState) -> Result<Option<u8>> {
     if !matches!(
         state.name.as_str(),
@@ -835,6 +881,9 @@ fn leaf_distance(state: &BlockState) -> Result<Option<u8>> {
 fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     if leaf_distance(state)?.is_some() {
         return Ok(DryBlock::Leaves);
+    }
+    if inert_generated_pillar(state) {
+        return Ok(DryBlock::Plain);
     }
     ensure!(
         state.properties.is_empty(),
@@ -966,15 +1015,15 @@ impl GeneratedBlockView<'_> {
                 .flatten()
                 .map_or(Cell::Unknown, Cell::Fluid);
         }
+        if inert_generated_pillar(&state) {
+            return Cell::Solid;
+        }
         if !state.properties.is_empty() {
             return Cell::Unknown;
         }
         match state.name.as_str() {
             "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => Cell::Air,
-            "minecraft:deepslate"
-            | "minecraft:sand"
-            | "minecraft:red_sand"
-            | "minecraft:gravel" => Cell::Solid,
+            "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => Cell::Solid,
             name if inert_generated_full_cube(name) => Cell::Solid,
             _ => Cell::Unknown,
         }
@@ -2508,6 +2557,127 @@ mod tests {
         trace
     }
 
+    fn inert_pillar_postprocessing_trace() -> Vec<String> {
+        let mut names = Vec::new();
+        for species in [
+            "oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry",
+            "pale_oak",
+        ] {
+            for suffix in ["_log", "_wood"] {
+                for prefix in ["", "stripped_"] {
+                    names.push(format!("{prefix}{species}{suffix}"));
+                }
+            }
+        }
+        for species in ["crimson", "warped"] {
+            for suffix in ["_stem", "_hyphae"] {
+                for prefix in ["", "stripped_"] {
+                    names.push(format!("{prefix}{species}{suffix}"));
+                }
+            }
+        }
+        names.extend(
+            [
+                "bamboo_block",
+                "stripped_bamboo_block",
+                "deepslate",
+                "basalt",
+                "polished_basalt",
+                "bone_block",
+                "quartz_pillar",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let mut trace = Vec::new();
+        for name in names {
+            for axis in ["x", "y", "z"] {
+                for adjacent in ["stone", "air", "water"] {
+                    let (mut stage, _, chunk) = fixture(false);
+                    let world = Arc::make_mut(&mut stage.world);
+                    let pillar = BlockState {
+                        name: format!("minecraft:{name}"),
+                        properties: BTreeMap::from([("axis".into(), axis.into())]),
+                    };
+                    assert!(inert_generated_pillar(&pillar));
+                    let id = world.intern_state(pillar);
+                    let neighbor = world.intern_state(BlockState {
+                        name: format!("minecraft:{adjacent}"),
+                        properties: if adjacent == "water" {
+                            BTreeMap::from([("level".into(), "0".into())])
+                        } else {
+                            BTreeMap::new()
+                        },
+                    });
+                    world.set_block_id(8, 8, 8, id).unwrap();
+                    for [x, y, z] in [
+                        [7, 8, 8],
+                        [9, 8, 8],
+                        [8, 7, 8],
+                        [8, 9, 8],
+                        [8, 8, 7],
+                        [8, 8, 9],
+                    ] {
+                        world.set_block_id(x, y, z, neighbor).unwrap();
+                    }
+                    stage.source = Arc::clone(&stage.world);
+                    let mut marks = PostProcessing::new(0, 16).unwrap();
+                    marks.mark(8, 8, 8);
+                    stage
+                        .region
+                        .tasks
+                        .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+                    stage.region.ticks = RegionTicks::new(
+                        BTreeMap::from([(
+                            chunk,
+                            ConvertedChunkTicks {
+                                blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                                fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                            },
+                        )]),
+                        100,
+                        0,
+                    )
+                    .unwrap();
+                    let before_ticks = stage.region.ticks.activated_snapshot();
+                    let before_world = Arc::clone(&stage.world);
+                    while !stage.poll(chunk, 1).unwrap() {}
+                    let result = stage.finish().unwrap();
+                    assert!(Arc::ptr_eq(&before_world, &result.world));
+                    assert_eq!(before_ticks, result.ticks.activated_snapshot());
+                    assert!(result.edits.is_empty());
+                    trace.push(format!(
+                        "P {name} {axis} {adjacent} 0 0 0 {}",
+                        native_core::random::LegacyRandom::new(42).next_long()
+                    ));
+                }
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn natural_pillars_preserve_axis_and_reject_invalid_states() {
+        assert_eq!(inert_pillar_postprocessing_trace().len(), 459);
+        for (name, props) in [
+            ("minecraft:oak_log", vec![]),
+            ("minecraft:oak_log", vec![("axis", "invalid")]),
+            ("minecraft:oak_log", vec![("axis", "x"), ("extra", "true")]),
+            ("minecraft:crimson_log", vec![("axis", "x")]),
+            ("example:oak_log", vec![("axis", "y")]),
+        ] {
+            let state = BlockState {
+                name: name.into(),
+                properties: props
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+            };
+            assert!(!inert_generated_pillar(&state), "{state:?}");
+            assert!(supported_postprocessing_block(&state).is_err());
+        }
+    }
+
     #[test]
     fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
         assert_eq!(inert_cube_postprocessing_trace().len(), 108);
@@ -2521,12 +2691,21 @@ mod tests {
 
     #[test]
     fn natural_cubes_contain_generated_water_without_changing_ticks() {
-        for material in ["diamond_ore", "nether_quartz_ore", "obsidian"] {
+        for (material, axis) in [
+            ("diamond_ore", None),
+            ("nether_quartz_ore", None),
+            ("obsidian", None),
+            ("deepslate", Some("y")),
+            ("oak_log", Some("x")),
+            ("warped_hyphae", Some("z")),
+        ] {
             let (mut stage, _, chunk) = fixture(false);
             let world = Arc::make_mut(&mut stage.world);
             let solid = world.intern_state(BlockState {
                 name: format!("minecraft:{material}"),
-                properties: BTreeMap::new(),
+                properties: axis.map_or_else(BTreeMap::new, |axis| {
+                    BTreeMap::from([("axis".into(), axis.into())])
+                }),
             });
             let water = world.intern_state(BlockState {
                 name: "minecraft:water".into(),
@@ -5618,7 +5797,9 @@ mod tests {
             "GeneratedInertPostprocessingOracle",
             include_str!("../../tests/java/GeneratedInertPostprocessingOracle.java"),
         );
-        assert_eq!(actual, inert_cube_postprocessing_trace());
+        let mut expected = inert_cube_postprocessing_trace();
+        expected.extend(inert_pillar_postprocessing_trace());
+        assert_eq!(actual, expected);
     }
 
     #[test]

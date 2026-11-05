@@ -119,6 +119,7 @@ impl TreasureWorld for DecorationRegion<'_> {
                 position,
                 Some(super::super::GeneratedMonsterRoomEntity::PendingChest { position, state }),
             );
+            Arc::make_mut(self.pending_order.entry(chunk(position)).or_default()).insert(position);
         }
         Ok(())
     }

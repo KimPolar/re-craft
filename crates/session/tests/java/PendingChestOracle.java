@@ -1,4 +1,5 @@
 import java.nio.file.Path;
+import java.util.ArrayList;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.*;
 import net.minecraft.core.registries.Registries;
@@ -25,6 +26,8 @@ public class PendingChestOracle {
                 Blocks.AIR.defaultBlockState(), null, Strategy.createForBiomes(ids), biome, null);
         var chunk = new ProtoChunk(new ChunkPos(0,0), UpgradeData.EMPTY,
                 LevelHeightAccessor.create(0,16), palette, null);
+        var positions = new ArrayList<BlockPos>();
+        var states = new ArrayList<net.minecraft.world.level.block.state.BlockState>();
         int index = 0;
         for (var facing : new Direction[]{Direction.NORTH,Direction.SOUTH,Direction.EAST,Direction.WEST}) {
             for (var type : ChestType.values()) for (boolean waterlogged : new boolean[]{false,true}) {
@@ -38,17 +41,31 @@ public class PendingChestOracle {
                 chunk.setBlockEntityNbt(dummy);
                 if (chunk.getBlockEntity(pos) != null || !dummy.equals(chunk.getBlockEntityNbtForSaving(pos, registries)))
                     throw new AssertionError("pending chest changed before access");
-                var entity = new ChestBlockEntity(pos, state);
-                chunk.setBlockEntity(entity);
-                if (chunk.getBlockEntityNbt(pos) != null || chunk.getBlockEntity(pos) != entity)
-                    throw new AssertionError("pending chest did not resolve");
-                var saved = chunk.getBlockEntityNbtForSaving(pos, registries);
-                NbtIo.write(saved, Path.of(args[0]).resolve(index + ".nbt"));
-                if (index == 0) out.println("NBT " + saved);
+                positions.add(pos);
+                states.add(state);
                 out.printf("P %d %s %s %s %d %d %d%n", index, facing.getName(), type.getSerializedName(), waterlogged,
                         pos.getX(), pos.getY(), pos.getZ());
                 index++;
             }
+        }
+        for (int i = 0; i < positions.size(); i++) {
+                var pos = positions.get(i);
+                var entity = new ChestBlockEntity(pos, states.get(i));
+                chunk.setBlockEntity(entity);
+                if (chunk.getBlockEntityNbt(pos) != null || chunk.getBlockEntity(pos) != entity)
+                    throw new AssertionError("pending chest did not resolve");
+                var saved = chunk.getBlockEntityNbtForSaving(pos, registries);
+                NbtIo.write(saved, Path.of(args[0]).resolve(i + ".nbt"));
+                if (i == 11) {
+                    out.print("M");
+                    for (var p : chunk.getBlockEntitiesPos()) {
+                        out.printf(" %d,%d,%d", p.getX(), p.getY(), p.getZ());
+                        int j = positions.indexOf(p);
+                        NbtIo.write(chunk.getBlockEntityNbtForSaving(p, registries),
+                                Path.of(args[0]).resolve("middle-" + j + ".nbt"));
+                    }
+                    out.println();
+                }
         }
         out.print("O");
         for (var pos : chunk.getBlockEntitiesPos()) out.printf(" %d,%d,%d", pos.getX(), pos.getY(), pos.getZ());

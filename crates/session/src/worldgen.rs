@@ -187,6 +187,8 @@ pub struct CarvedTerrainWorld {
     generated_monster_entities: Arc<BTreeMap<[i32; 3], Option<GeneratedMonsterRoomEntity>>>,
     generated_entity_order:
         BTreeMap<native_world::loaded::ChunkPos, Arc<entity_order::LivePositions>>,
+    generated_pending_order:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<entity_order::PendingPositions>>,
     generated_entities:
         Arc<BTreeMap<native_world::loaded::ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
 }
@@ -1273,6 +1275,7 @@ impl CarvedTerrainWorld {
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
             generated_entity_order: BTreeMap::new(),
+            generated_pending_order: BTreeMap::new(),
             generated_entities: Arc::new(BTreeMap::new()),
         }
     }
@@ -1585,6 +1588,7 @@ impl CarvedTerrainWorld {
         let x_range = [origin_x, i32::MIN, i32::MIN]..=[origin_x + 15, i32::MAX, i32::MAX];
         let belongs_z = |p: [i32; 3]| p[2].div_euclid(16) == pos.z;
         let mut entities = BTreeMap::<[i32; 3], (BlockState, Tag)>::new();
+        let mut pending_positions = std::collections::BTreeSet::new();
         for (&p, nest) in self
             .generated_bee_nests
             .range(x_range.clone())
@@ -1644,8 +1648,18 @@ impl CarvedTerrainWorld {
                     );
                     (chest.state.clone(), chest.block_entity())
                 }
-                GeneratedMonsterRoomEntity::PendingChest { .. } => {
-                    bail!("pending generated chest serialization is not implemented")
+                GeneratedMonsterRoomEntity::PendingChest { position, state } => {
+                    ensure!(p == *position, "pending chest position mismatch");
+                    pending_positions.insert(p);
+                    (
+                        state.clone(),
+                        Tag::Compound(vec![
+                            ("id".into(), Tag::String("DUMMY".into())),
+                            ("x".into(), Tag::Int(p[0])),
+                            ("y".into(), Tag::Int(p[1])),
+                            ("z".into(), Tag::Int(p[2])),
+                        ]),
+                    )
                 }
             };
             ensure!(
@@ -1696,12 +1710,19 @@ impl CarvedTerrainWorld {
             entities.is_empty(),
             "generated block entity has no matching block"
         );
-        let order = self
+        let pending = self.generated_pending_order.get(&pos);
+        ensure!(
+            pending.map_or(pending_positions.is_empty(), |history| history.members()
+                == &pending_positions),
+            "generated pending block entity order does not match positions"
+        );
+        let empty_live = entity_order::LivePositions::default();
+        let live = self
             .generated_entity_order
             .get(&pos)
-            .map(|history| history.saving_order())
-            .transpose()?
-            .unwrap_or_default();
+            .map(Arc::as_ref)
+            .unwrap_or(&empty_live);
+        let order = live.saving_order_with_pending(pending.map(Arc::as_ref))?;
         let ordered = order
             .into_iter()
             .map(|p| {

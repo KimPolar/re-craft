@@ -29,6 +29,26 @@ fn pending_chest_resolution_is_transactional_and_preserves_state() {
             state: chest.clone(),
         }),
     );
+    Arc::make_mut(
+        terrain
+            .generated_pending_order
+            .entry(ChunkPos { x: 0, z: 0 })
+            .or_default(),
+    )
+    .insert(position);
+    let Tag::List { values, .. } = terrain
+        .generated_block_entity_data_with(ChunkPos { x: 0, z: 0 }, |state| {
+            Some(state.name == "minecraft:chest")
+        })
+        .unwrap()
+    else {
+        panic!("missing pending entity list")
+    };
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].get("id"), Some(&Tag::String("DUMMY".into())));
+    assert_eq!(values[0].get("x"), Some(&Tag::Int(position[0])));
+    assert_eq!(values[0].get("y"), Some(&Tag::Int(position[1])));
+    assert_eq!(values[0].get("z"), Some(&Tag::Int(position[2])));
     let writable = terrain.snapshot().chunks.keys().copied().collect();
     let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
     assert!(!region.resolve_pending_chest([9, 9, 9]).unwrap());
@@ -131,6 +151,7 @@ fn pending_chests_resolve_with_java_nbt_and_order() {
     let (mut terrain, tags, _, _) = super::tests::fixture();
     let mut records = Vec::new();
     let mut java_order = None;
+    let mut java_middle_order = None;
     for line in output.lines() {
         let words: Vec<_> = line.split_whitespace().collect();
         if words.first() == Some(&"P") {
@@ -148,8 +169,8 @@ fn pending_chests_resolve_with_java_nbt_and_order() {
                 .unwrap()
                 .value;
             records.push((pos, state, expected));
-        } else if words.first() == Some(&"O") {
-            java_order = Some(
+        } else if matches!(words.first(), Some(&"O") | Some(&"M")) {
+            let parsed = Some(
                 words[1..]
                     .iter()
                     .map(|entry| {
@@ -159,6 +180,11 @@ fn pending_chests_resolve_with_java_nbt_and_order() {
                     })
                     .collect::<Vec<_>>(),
             );
+            if words[0] == "O" {
+                java_order = parsed;
+            } else {
+                java_middle_order = parsed;
+            }
         }
     }
     assert_eq!(records.len(), 24);
@@ -184,6 +210,7 @@ fn pending_chests_resolve_with_java_nbt_and_order() {
                 state: state.clone(),
             }),
         );
+        Arc::make_mut(terrain.generated_pending_order.entry(center).or_default()).insert(*pos);
     }
     let writable = terrain.snapshot().chunks.keys().copied().collect();
     let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
@@ -193,11 +220,53 @@ fn pending_chests_resolve_with_java_nbt_and_order() {
     }
     assert!(region.resolve_pending_chest(records[0].0).unwrap());
     region.finish().unwrap();
-    assert!(
-        terrain
-            .generated_block_entity_data(center, &generated)
-            .is_err()
-    );
+    let Tag::List { values: middle, .. } = terrain
+        .generated_block_entity_data(center, &generated)
+        .unwrap()
+    else {
+        panic!("missing intermediate entity list")
+    };
+    let actual_middle: Vec<_> = middle
+        .iter()
+        .map(|tag| {
+            let number = |name| match tag.get(name) {
+                Some(Tag::Int(v)) => *v,
+                _ => panic!("missing coordinate"),
+            };
+            [number("x"), number("y"), number("z")]
+        })
+        .collect();
+    assert_eq!(actual_middle, java_middle_order.unwrap());
+    for (p, actual) in actual_middle.iter().zip(&middle) {
+        let i = records.iter().position(|(pos, _, _)| pos == p).unwrap();
+        let expected =
+            nbt::read(&std::fs::read(temp.path().join(format!("middle-{i}.nbt"))).unwrap())
+                .unwrap()
+                .value;
+        let (Tag::Compound(actual_fields), Tag::Compound(expected_fields)) = (actual, &expected)
+        else {
+            panic!("invalid intermediate NBT at {p:?}")
+        };
+        let actual_names: BTreeSet<_> = actual_fields
+            .iter()
+            .map(|(name, _)| name.to_string_lossy())
+            .collect();
+        let expected_names: BTreeSet<_> = expected_fields
+            .iter()
+            .map(|(name, _)| name.to_string_lossy())
+            .collect();
+        assert_eq!(
+            actual_names, expected_names,
+            "intermediate NBT fields at {p:?}"
+        );
+        for field in actual_names {
+            assert_eq!(
+                actual.get(&field),
+                expected.get(&field),
+                "field {field} at {p:?}"
+            );
+        }
+    }
     let writable = terrain.snapshot().chunks.keys().copied().collect();
     let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
     for (pos, _, _) in &records[12..] {

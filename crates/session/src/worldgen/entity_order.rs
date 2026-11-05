@@ -1,5 +1,7 @@
 //! Position ordering used by a fresh protochunk's materialized block entities.
-use anyhow::Result;
+use std::collections::BTreeSet;
+
+use anyhow::{Result, ensure};
 
 mod tree;
 use tree::TreeBin;
@@ -92,53 +94,150 @@ impl LivePositions {
         }
     }
 
-    /// ChunkAccess copies the empty pending key set to a Java HashSet, then
-    /// adds this fastutil map's keys in descending slot order.
+    /// ChunkAccess copies pending keys into a HashSet, then adds fastutil keys.
     pub(super) fn saving_order(&self) -> Result<Vec<Pos>> {
-        let mut buckets = vec![Bin::default(); 16];
-        let mut size = 0;
-        for pos in self.slots.iter().rev().flatten().copied() {
-            let h = hash(pos);
-            let spread = h ^ (h >> 16);
-            let index = spread as usize & (buckets.len() - 1);
-            let capacity = buckets.len();
-            let mut grow = false;
-            match &mut buckets[index] {
-                Bin::Empty => buckets[index] = Bin::List(vec![pos]),
-                Bin::List(chain) => {
-                    if chain.contains(&pos) {
-                        continue;
-                    }
-                    let treeify = chain.len() >= 8;
-                    chain.push(pos);
-                    if treeify {
-                        if capacity < 64 {
-                            grow = true;
-                        } else {
-                            buckets[index] = Bin::Tree(TreeBin::from_chain(std::mem::take(chain))?);
-                        }
-                    }
-                }
-                Bin::Tree(tree) => tree.insert(pos)?,
-            }
-            size += 1;
-            if grow {
-                resize_set(&mut buckets)?;
-            }
-            if size > buckets.len() * 3 / 4 {
-                resize_set(&mut buckets)?;
-            }
-        }
-        let mut result = Vec::with_capacity(size);
-        for bucket in buckets {
-            match bucket {
-                Bin::Empty => {}
-                Bin::List(chain) => result.extend(chain),
-                Bin::Tree(tree) => result.extend(tree.positions()),
-            }
-        }
-        Ok(result)
+        self.saving_order_with_pending(None)
     }
+
+    pub(super) fn saving_order_with_pending(
+        &self,
+        pending: Option<&PendingPositions>,
+    ) -> Result<Vec<Pos>> {
+        let count = pending.map_or(0, |positions| positions.members.len());
+        // Java 25 HashSet(Collection) reserves ceil(max(size, 12) / .75).
+        let requested = count
+            .max(12)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(2))
+            .map(|n| n / 3)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| anyhow::anyhow!("generated block entity order is too large"))?;
+        let mut buckets = vec![Bin::default(); requested];
+        let mut size = 0;
+        // Live keys are already unique; track duplicates only for the mixed case.
+        let mut inserted = (count != 0).then(BTreeSet::new);
+        if let Some(pending) = pending {
+            for pos in pending.positions()? {
+                if inserted.as_mut().is_none_or(|keys| keys.insert(pos)) {
+                    insert_set(&mut buckets, &mut size, pos)?;
+                }
+            }
+        }
+        for pos in self.slots.iter().rev().flatten().copied() {
+            if inserted.as_mut().is_none_or(|keys| keys.insert(pos)) {
+                insert_set(&mut buckets, &mut size, pos)?;
+            }
+        }
+        Ok(bucket_positions(&buckets))
+    }
+}
+
+/// Java HashMap insertion history for protochunk block entity placeholders.
+#[derive(Clone, Debug)]
+pub(super) struct PendingPositions {
+    buckets: Vec<Bin>,
+    members: BTreeSet<Pos>,
+    exact: bool,
+}
+
+impl Default for PendingPositions {
+    fn default() -> Self {
+        Self {
+            buckets: vec![Bin::default(); 16],
+            members: BTreeSet::new(),
+            exact: true,
+        }
+    }
+}
+
+impl PendingPositions {
+    pub(super) fn insert(&mut self, pos: Pos) {
+        if self.members.insert(pos) && self.exact {
+            let mut size = self.members.len() - 1;
+            if insert_set(&mut self.buckets, &mut size, pos).is_err() {
+                self.exact = false;
+            }
+        }
+    }
+
+    pub(super) fn remove(&mut self, pos: Pos) {
+        if !self.members.remove(&pos) || !self.exact {
+            return;
+        }
+        let h = hash(pos);
+        let index = (h ^ (h >> 16)) as usize & (self.buckets.len() - 1);
+        match &mut self.buckets[index] {
+            Bin::List(chain) => {
+                if let Some(i) = chain.iter().position(|&p| p == pos) {
+                    chain.remove(i);
+                } else {
+                    self.exact = false;
+                }
+                if chain.is_empty() {
+                    self.buckets[index] = Bin::Empty;
+                }
+            }
+            // Tree deletion changes both tree structure and linked iteration order.
+            Bin::Tree(_) | Bin::Empty => self.exact = false,
+        }
+    }
+
+    pub(super) fn members(&self) -> &BTreeSet<Pos> {
+        &self.members
+    }
+
+    fn positions(&self) -> Result<Vec<Pos>> {
+        if self.members.is_empty() {
+            return Ok(Vec::new());
+        }
+        ensure!(
+            self.exact,
+            "pending block entity hash tree order is unavailable"
+        );
+        Ok(bucket_positions(&self.buckets))
+    }
+}
+
+fn bucket_positions(buckets: &[Bin]) -> Vec<Pos> {
+    let mut result = Vec::new();
+    for bucket in buckets {
+        match bucket {
+            Bin::Empty => {}
+            Bin::List(chain) => result.extend(chain.iter().copied()),
+            Bin::Tree(tree) => result.extend(tree.positions()),
+        }
+    }
+    result
+}
+
+fn insert_set(buckets: &mut Vec<Bin>, size: &mut usize, pos: Pos) -> Result<()> {
+    let h = hash(pos);
+    let index = (h ^ (h >> 16)) as usize & (buckets.len() - 1);
+    let capacity = buckets.len();
+    let mut grow = false;
+    match &mut buckets[index] {
+        Bin::Empty => buckets[index] = Bin::List(vec![pos]),
+        Bin::List(chain) => {
+            let treeify = chain.len() >= 8;
+            chain.push(pos);
+            if treeify {
+                if capacity < 64 {
+                    grow = true;
+                } else {
+                    buckets[index] = Bin::Tree(TreeBin::from_chain(std::mem::take(chain))?);
+                }
+            }
+        }
+        Bin::Tree(tree) => tree.insert(pos)?,
+    }
+    *size += 1;
+    if grow {
+        resize_set(buckets)?;
+    }
+    if *size > buckets.len() * 3 / 4 {
+        resize_set(buckets)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -204,6 +303,42 @@ mod tests {
             positions.insert([0, -31 * z, z]);
         }
         assert!(positions.saving_order().is_err());
+    }
+
+    #[test]
+    fn pending_tree_removal_fails_closed_until_no_pending_entities_remain() {
+        let mut pending = PendingPositions::default();
+        let positions: Vec<_> = (-10000..10000)
+            .map(|y| [0, y, 0])
+            .filter(|&pos| {
+                let h = hash(pos);
+                (h ^ (h >> 16)) & 63 == 0
+            })
+            .take(12)
+            .collect();
+        for &pos in &positions {
+            pending.insert(pos);
+        }
+        assert!(
+            LivePositions::default()
+                .saving_order_with_pending(Some(&pending))
+                .is_ok()
+        );
+        pending.remove(positions[0]);
+        assert!(
+            LivePositions::default()
+                .saving_order_with_pending(Some(&pending))
+                .is_err()
+        );
+        for &pos in &positions[1..] {
+            pending.remove(pos);
+        }
+        assert!(
+            LivePositions::default()
+                .saving_order_with_pending(Some(&pending))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -342,6 +477,66 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(";");
             assert_eq!(actual, expected, "operation {index}");
+        }
+
+        // Pending HashMap retains its capacity after removal. Interleave
+        // resolution and removals across several resizes and compare each step.
+        let mut operations = Vec::new();
+        let position = |i: i32| [(i * 7 % 16) - 16, (i * 71 % 384) - 64, (i * 11 % 16) + 32];
+        for i in 0..180 {
+            operations.push(('P', position(i)));
+            if i % 4 == 0 {
+                operations.push(('P', position(i)));
+            }
+            if i > 8 && i % 3 == 0 {
+                operations.push(('C', position(i - 8)));
+            }
+            if i > 20 && i % 7 == 0 {
+                operations.push(('X', position(i - 19)));
+            }
+        }
+        for i in 0..180 {
+            operations.push(('C', position(i)));
+        }
+        for i in 180..280 {
+            operations.push(('P', position(i)));
+        }
+        std::fs::write(
+            &input,
+            operations
+                .iter()
+                .map(|(op, p)| format!("{op} {} {} {}\n", p[0], p[1], p[2]))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let expected = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedEntityOrderOracle")
+            .arg(&input));
+        let rows: Vec<_> = expected.lines().collect();
+        assert_eq!(rows.len(), operations.len());
+        let mut live = LivePositions::default();
+        let mut pending = PendingPositions::default();
+        let mut live_members = BTreeSet::new();
+        for (index, ((op, p), expected)) in operations.into_iter().zip(rows).enumerate() {
+            match op {
+                'P' if !live_members.contains(&p) => pending.insert(p),
+                'C' => {
+                    pending.remove(p);
+                    live.insert(p);
+                    live_members.insert(p);
+                }
+                'X' => pending.remove(p),
+                _ => {}
+            }
+            let actual = live.saving_order_with_pending(Some(&pending)).unwrap();
+            let actual = actual
+                .iter()
+                .map(|p| format!("{},{},{}", p[0], p[1], p[2]))
+                .collect::<Vec<_>>()
+                .join(";");
+            assert_eq!(actual, expected, "mixed operation {index}: {op} {p:?}");
         }
     }
 }

@@ -76,6 +76,7 @@ pub struct DecorationRegion<'a> {
     bee_nests: Arc<BTreeMap<[i32; 3], super::GeneratedBeeNest>>,
     monster_entities: Arc<BTreeMap<[i32; 3], Option<super::GeneratedMonsterRoomEntity>>>,
     entity_order: BTreeMap<ChunkPos, Arc<super::entity_order::LivePositions>>,
+    pending_order: BTreeMap<ChunkPos, Arc<super::entity_order::PendingPositions>>,
     generated_entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
@@ -1716,6 +1717,7 @@ impl CarvedTerrainWorld {
         let bee_nests = self.generated_bee_nests.clone();
         let monster_entities = self.generated_monster_entities.clone();
         let entity_order = self.generated_entity_order.clone();
+        let pending_order = self.generated_pending_order.clone();
         let generated_entities = self.generated_entities.clone();
         Ok(DecorationRegion {
             target: self,
@@ -1743,6 +1745,7 @@ impl CarvedTerrainWorld {
             bee_nests,
             monster_entities,
             entity_order,
+            pending_order,
             generated_entities,
             pending_monster_spawners: 0,
             light_guard: None,
@@ -2011,6 +2014,7 @@ impl DecorationRegion<'_> {
         self.target.generated_bee_nests = self.bee_nests;
         self.target.generated_monster_entities = self.monster_entities;
         self.target.generated_entity_order = self.entity_order;
+        self.target.generated_pending_order = self.pending_order;
         self.target.generated_entities = self.generated_entities;
         Ok(Arc::clone(&self.target.world))
     }
@@ -3136,6 +3140,7 @@ impl BeehiveWorld for DecorationRegion<'_> {
             ]),
         };
         self.set_proto_block(pos, &state)?;
+        Arc::make_mut(self.pending_order.entry(chunk(pos)).or_default()).insert(pos);
         Ok(true)
     }
     fn store_bees(&mut self, pos: [i32; 3], ticks: &[i32]) -> Result<()> {
@@ -3146,6 +3151,9 @@ impl BeehiveWorld for DecorationRegion<'_> {
                 .is_none(),
             "duplicate generated bee nest"
         );
+        if let Some(pending) = self.pending_order.get_mut(&chunk(pos)) {
+            Arc::make_mut(pending).remove(pos);
+        }
         Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         Ok(())
     }
@@ -3412,6 +3420,9 @@ impl DecorationRegion<'_> {
             Some(Some(super::GeneratedMonsterRoomEntity::Chest(_))) => {}
             _ => bail!("chest block entity is unavailable"),
         }
+        if let Some(pending) = self.pending_order.get_mut(&chunk(pos)) {
+            Arc::make_mut(pending).remove(pos);
+        }
         Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         Ok(true)
     }
@@ -3526,8 +3537,14 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
             if let Some(order) = self.entity_order.get_mut(&chunk(pos)) {
                 Arc::make_mut(order).remove(pos);
             }
+            if let Some(pending) = self.pending_order.get_mut(&chunk(pos)) {
+                Arc::make_mut(pending).remove(pos);
+            }
         }
         self.set_proto_block(pos, &state)?;
+        if matches!(kind, RoomBlock::Chest(_) | RoomBlock::Spawner) {
+            Arc::make_mut(self.pending_order.entry(chunk(pos)).or_default()).insert(pos);
+        }
         match kind {
             RoomBlock::Chest(facing) => {
                 let chest = super::GeneratedLootChest::new(
@@ -3570,6 +3587,9 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         }
         match self.monster_entities.get(&pos) {
             Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_))) => {
+                if let Some(pending) = self.pending_order.get_mut(&chunk(pos)) {
+                    Arc::make_mut(pending).remove(pos);
+                }
                 Arc::make_mut(self.entity_order.entry(chunk(pos)).or_default()).insert(pos);
                 Ok(true)
             }
@@ -6406,6 +6426,7 @@ mod tests {
             generated_bee_nests: Arc::new(BTreeMap::new()),
             generated_monster_entities: Arc::new(BTreeMap::new()),
             generated_entity_order: BTreeMap::new(),
+            generated_pending_order: BTreeMap::new(),
             generated_entities: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
@@ -6892,8 +6913,8 @@ mod tests {
                     .generated_block_entity_data(center, &generated)
                     .unwrap_err();
                 assert!(
-                    format!("{error:#}")
-                        .contains("pending generated chest serialization is not implemented")
+                    format!("{error:#}").contains("generated block entity data is missing"),
+                    "fixture {id} must reject its untracked source chest: {error:#}"
                 );
             }
         }

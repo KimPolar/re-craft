@@ -2326,6 +2326,8 @@ impl BiomeNeighborhood {
 /// A generator configured from the dimension's active biome source and noise
 /// settings. It must be used with the same data-pack stack throughout its life.
 pub struct TerrainGenerator {
+    /// Identifies generators compiled together from one immutable input stack.
+    pair_identity: Arc<()>,
     noise: NoiseStageGenerator,
     spawn_target: Option<Value>,
     disable_mob_generation: Option<bool>,
@@ -2434,6 +2436,20 @@ impl TerrainGenerator {
     ) -> Result<Self> {
         Self::build(provider, definition, seed, min_y, height, true)
     }
+    /// Compile independent structure and terrain generators from the same
+    /// immutable resource stack. Their biome caches can advance independently.
+    pub fn paired_with_structure_context(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        seed: i64,
+        min_y: i32,
+        height: i32,
+    ) -> Result<(Self, Self)> {
+        let first = Self::with_structure_context(provider, definition, seed, min_y, height)?;
+        let mut second = Self::with_structure_context(provider, definition, seed, min_y, height)?;
+        second.pair_identity = Arc::clone(&first.pair_identity);
+        Ok((first, second))
+    }
     fn build(
         provider: &mut impl ResourceProvider,
         definition: &Value,
@@ -2515,6 +2531,7 @@ impl TerrainGenerator {
         let possible_biomes = source.possible_biomes();
         let possible_biomes_ordered = source.possible_biomes_in_order();
         Ok(Self {
+            pair_identity: Arc::new(()),
             noise,
             spawn_target: parsed.get("spawn_target").cloned(),
             disable_mob_generation,
@@ -6736,8 +6753,8 @@ mod tests {
         config["settings"]["material_rule"] =
             json!({"type":"block","result_state":"minecraft:stone"});
         config["settings"]["noise_router"]["final_density"] = json!({"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1});
-        let generator =
-            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 96).unwrap();
+        let (generator, terrain_generator) =
+            TerrainGenerator::paired_with_structure_context(&mut data, &config, 42, 0, 96).unwrap();
         let structure = ResourceId::parse("example:treasure").unwrap();
         let set = ResourceId::parse("example:treasure").unwrap();
         let [x, z] = StructureSetCache::default()
@@ -6776,8 +6793,27 @@ mod tests {
         .map(|name| format!("minecraft:{name}"))
         .collect();
         let tags = CarverBlockTags::load(&mut data, &blocks).unwrap();
+        let unrelated =
+            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 96).unwrap();
+        let other_rules = StructureBiomes::load(&mut data, [structure.clone()]).unwrap();
+        let other_generator =
+            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 96).unwrap();
+        let other =
+            structure_batch::StructureGenerationBatch::new(other_generator, other_rules, vec![])
+                .unwrap();
+        let other_tags = CarverBlockTags::load(&mut data, &blocks).unwrap();
+        assert!(
+            preparation
+                .into_expandable_terrain_batch(other, unrelated, other_tags, "minecraft:overworld")
+                .is_err()
+        );
         let mut batch = preparation
-            .into_terrain_batch(structures, tags, "minecraft:overworld")
+            .into_expandable_terrain_batch(
+                structures,
+                terrain_generator,
+                tags,
+                "minecraft:overworld",
+            )
             .unwrap();
         assert_eq!(
             batch.structure_starts(target).unwrap()[&structure]
@@ -6849,6 +6885,68 @@ mod tests {
                     .collect()
             ))
         );
+        let next = ChunkPos {
+            x: target.x + 3,
+            z: target.z,
+        };
+        let expansion = structure_batch::StructurePreparationPlan::new([(
+            next,
+            schedule::GenerationStage::Features,
+        )])
+        .unwrap();
+        let old_world = batch.snapshot().unwrap();
+        assert!(batch.request_features(next).is_err());
+        assert!(batch.finish_structure_expansion(&expansion).is_err());
+        assert_eq!(batch.structure_data(target).unwrap(), data);
+        batch.request_structure_expansion(&expansion).unwrap();
+        assert!(batch.request_features(target).is_err());
+        while batch
+            .step_structure_expansion(&mut TreasureData, &mut |value| {
+                let name = value.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: name == "minecraft:air",
+                    blocks_motion: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    blocks_motion_no_leaves: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        batch.finish_structure_expansion(&expansion).unwrap();
+        assert_eq!(batch.structure_data(target).unwrap(), data);
+        assert!(Arc::ptr_eq(&batch.snapshot().unwrap(), &old_world));
+        batch.request_features(next).unwrap();
+        while batch
+            .step(
+                &mut TreasureData,
+                &mut |value| {
+                    let name = value.as_str().unwrap();
+                    Ok(CarverBlockState {
+                        is_air: name == "minecraft:air",
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                },
+                &mut |value| {
+                    Ok(BlockState {
+                        name: value.as_str().unwrap().into(),
+                        properties: BTreeMap::new(),
+                    })
+                },
+            )
+            .unwrap()
+            .is_some()
+        {}
+        assert_eq!(batch.structure_data(target).unwrap(), data);
+        let new_world = batch.snapshot().unwrap();
+        for y in 0..96 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let (x, z) = (target.x * 16 + x, target.z * 16 + z);
+                    assert_eq!(old_world.block(x, y, z), new_world.block(x, y, z));
+                }
+            }
+        }
         assert!(batch.into_parts().is_err());
     }
 

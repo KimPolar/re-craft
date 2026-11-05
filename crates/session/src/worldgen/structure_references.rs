@@ -45,6 +45,7 @@ pub type StructureReferences = BTreeMap<ResourceId, BTreeSet<i64>>;
 
 /// Both membership and fastutil iteration order for each structure key.
 /// The order between distinct structure keys is still caller-supplied.
+#[derive(Clone)]
 pub struct OrderedStructureReferences {
     membership: StructureReferences,
     ordered: BTreeMap<ResourceId, Vec<i64>>,

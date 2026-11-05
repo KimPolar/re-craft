@@ -572,7 +572,7 @@ pub(crate) fn prepare_with_structures(
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let height_tags =
         native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &blocks)?;
-    let generator = TerrainGenerator::with_structure_context(
+    let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
         &mut resources,
         &definition,
         settings.seed,
@@ -624,6 +624,7 @@ pub(crate) fn prepare_with_structures(
     let pack_snapshot = resources.data_pack_snapshot();
     Ok(crate::generation_worker::StructuredGenerationInputs {
         structures,
+        terrain_generator: Some(terrain_generator),
         provider: resources,
         classify,
         resolve,

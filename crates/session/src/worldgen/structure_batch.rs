@@ -131,6 +131,32 @@ impl StructurePreparationPlan {
             dimension,
         )
     }
+
+    /// Keep structure generation state for later requests. The terrain
+    /// generator must be the paired generator compiled from the same stack.
+    pub fn into_expandable_terrain_batch(
+        &self,
+        structures: StructureGenerationBatch,
+        terrain_generator: TerrainGenerator,
+        tags: CarverBlockTags,
+        dimension: &str,
+    ) -> Result<super::FreshTerrainBatch> {
+        ensure!(
+            Arc::ptr_eq(
+                &structures.generator.pair_identity,
+                &terrain_generator.pair_identity
+            ),
+            "structure and terrain generators are not paired"
+        );
+        let stages = structures.prepare_additional_stages(self, None)?;
+        super::FreshTerrainBatch::new_with_retained_structures(
+            terrain_generator,
+            structures,
+            stages,
+            tags,
+            dimension,
+        )
+    }
 }
 
 /// One structure kind has a known per-kind reference order. Two total
@@ -141,6 +167,7 @@ fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<
 }
 
 /// Validated structure stages retained for an intermediate terrain batch.
+#[derive(Default)]
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
     pub(super) references: BTreeMap<ChunkPos, OrderedStructureReferences>,
@@ -223,6 +250,47 @@ pub struct StructureGenerationBatch {
 }
 
 impl StructureGenerationBatch {
+    /// Assemble only missing inputs. No existing terrain contexts are changed.
+    pub(super) fn prepare_additional_stages(
+        &self,
+        plan: &StructurePreparationPlan,
+        existing: Option<&PreparedStructureStages>,
+    ) -> Result<PreparedStructureStages> {
+        ensure!(
+            self.is_complete(),
+            "structure batch has unfinished or failed work"
+        );
+        let mut added = PreparedStructureStages::default();
+        for pos in plan.starts() {
+            let starts = self
+                .starts(pos)
+                .context("structure starts required by plan are missing")?;
+            if existing.is_none_or(|old| !old.starts.contains_key(&pos)) {
+                added.starts.insert(pos, starts.clone());
+            }
+        }
+        for pos in plan.references() {
+            let references = self
+                .references
+                .get(&pos)
+                .context("structure references required by plan are missing")?;
+            if existing.is_none_or(|old| !old.references.contains_key(&pos)) {
+                added.references.insert(pos, references.clone());
+            }
+        }
+        for pos in plan.terrain() {
+            if existing.is_none_or(|old| !old.terrain.contains_key(&pos)) {
+                let order = self
+                    .unambiguous_terrain_start_order(pos)?
+                    .with_context(|| format!("structure terrain order is ambiguous for {pos:?}"))?;
+                added
+                    .terrain
+                    .insert(pos, self.beardifier_for_chunk(pos, &order)?);
+            }
+        }
+        Ok(added)
+    }
+
     /// Prepare a normal resource-loaded registry in Java's registration
     /// order, filtering out sets with no possible generator biome.
     pub fn from_registry(

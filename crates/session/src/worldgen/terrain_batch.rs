@@ -36,6 +36,7 @@ pub struct FreshTerrainBatch {
     schedule: GenerationSchedule,
     generator: TerrainGenerator,
     structures: Option<PreparedStructureStages>,
+    structure_continuation: Option<StructureGenerationBatch>,
     evaluator: DensityEvaluator,
     carvers: CarverCache,
     biomes: BiomeNeighborhood,
@@ -1097,6 +1098,79 @@ impl FreshTerrainBatch {
         Self::new_with_prepared_structures(structures, orders, tags, dimension)
     }
 
+    pub(super) fn new_with_retained_structures(
+        generator: TerrainGenerator,
+        continuation: StructureGenerationBatch,
+        stages: PreparedStructureStages,
+        tags: CarverBlockTags,
+        dimension: &str,
+    ) -> Result<Self> {
+        let mut batch = Self::new_inner(generator, tags, dimension, Some(stages))?;
+        batch.structure_continuation = Some(continuation);
+        Ok(batch)
+    }
+
+    /// Request structure prerequisites for an expansion without modifying the
+    /// contexts already used by generated terrain.
+    pub fn request_structure_expansion(
+        &mut self,
+        plan: &super::structure_batch::StructurePreparationPlan,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed && self.schedule.is_complete(),
+            "terrain batch has pending or failed work"
+        );
+        let structures = self
+            .structure_continuation
+            .as_mut()
+            .context("structure continuation is unavailable")?;
+        ensure!(
+            structures.is_complete(),
+            "structure batch has pending or failed work"
+        );
+        plan.request_structures(structures)
+    }
+
+    pub fn step_structure_expansion<P: ResourceProvider>(
+        &mut self,
+        provider: &mut P,
+        classify: &mut impl FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>> {
+        ensure!(
+            !self.failed && self.schedule.is_complete(),
+            "terrain batch has pending or failed work"
+        );
+        self.structure_continuation
+            .as_mut()
+            .context("structure continuation is unavailable")?
+            .step(provider, classify)
+    }
+
+    /// Add validated structure contexts atomically after the structure work
+    /// has completed. Missing or ambiguous data leaves existing contexts intact.
+    pub fn finish_structure_expansion(
+        &mut self,
+        plan: &super::structure_batch::StructurePreparationPlan,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed && self.schedule.is_complete(),
+            "terrain batch has pending or failed work"
+        );
+        let structures = self
+            .structure_continuation
+            .as_ref()
+            .context("structure continuation is unavailable")?;
+        let existing = self
+            .structures
+            .as_mut()
+            .context("structure stages are unavailable")?;
+        let added = structures.prepare_additional_stages(plan, Some(existing))?;
+        existing.starts.extend(added.starts);
+        existing.references.extend(added.references);
+        existing.terrain.extend(added.terrain);
+        Ok(())
+    }
+
     fn new_inner(
         generator: TerrainGenerator,
         tags: CarverBlockTags,
@@ -1110,6 +1184,7 @@ impl FreshTerrainBatch {
             schedule: GenerationSchedule::new(),
             generator,
             structures,
+            structure_continuation: None,
             evaluator: DensityEvaluator::default(),
             carvers: CarverCache::default(),
             biomes,
@@ -1264,6 +1339,12 @@ impl FreshTerrainBatch {
     }
 
     fn validate_structure_dependencies(&self, pos: ChunkPos, stage: GenerationStage) -> Result<()> {
+        ensure!(
+            self.structure_continuation
+                .as_ref()
+                .is_none_or(StructureGenerationBatch::is_complete),
+            "structure expansion has pending or failed work"
+        );
         if let Some(structures) = &self.structures {
             if stage >= GenerationStage::Terrain {
                 ensure!(

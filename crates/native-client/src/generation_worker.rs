@@ -73,6 +73,8 @@ pub struct GenerationReady {
 /// originate from the same immutable resource stack and dimension settings.
 pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
     pub structures: StructureGenerationBatch,
+    /// Paired terrain generator enables later structure-aware expansion.
+    pub terrain_generator: Option<native_session::worldgen::TerrainGenerator>,
     pub provider: P,
     pub classify: C,
     pub resolve: R,
@@ -1593,6 +1595,7 @@ impl GenerationWorker {
             }
             let StructuredGenerationInputs {
                 mut structures,
+                terrain_generator,
                 mut provider,
                 mut classify,
                 mut resolve,
@@ -1643,7 +1646,11 @@ impl GenerationWorker {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let mut batch = plan.into_terrain_batch(structures, terrain_tags, &dimension)?;
+            let mut batch = if let Some(generator) = terrain_generator {
+                plan.into_expandable_terrain_batch(structures, generator, terrain_tags, &dimension)?
+            } else {
+                plan.into_terrain_batch(structures, terrain_tags, &dimension)?
+            };
             configure_terrain(&mut batch, &mut provider)?;
             let Some(mut ready) = generate_targets(
                 batch,
@@ -1778,6 +1785,84 @@ impl GenerationWorker {
                 return Ok(None);
             }
             let (mut provider, mut classify, mut resolve) = prepare()?;
+            expand_with_inputs(
+                ready,
+                target,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                revision,
+                biome_blend,
+                cancelled,
+                progress,
+            )
+        })
+    }
+
+    /// Prepare only the additional structure dependencies before extending a
+    /// structure-aware batch. The provider must use its original pack snapshot.
+    pub(crate) fn expand_with_structures<C, R, H, F>(
+        mut ready: GenerationReady,
+        target: ChunkPos,
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(native_resources::packs::ResourceStack, C, R, H)> + Send + 'static,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            ensure!(
+                revision != ready.mesh.revision,
+                "expanded mesh needs a new revision"
+            );
+            let targets = ready
+                .mesh
+                .targets
+                .as_deref()
+                .context("generated session targets missing")?;
+            ensure!(
+                !targets.contains(&target),
+                "generation target is already ready"
+            );
+            let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
+            let plan = StructurePreparationPlan::new(
+                initialized
+                    .into_iter()
+                    .map(|pos| (pos, GenerationStage::InitializeLight)),
+            )?;
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (mut provider, mut classify, mut resolve, mut classify_height) = prepare()?;
+            let current_snapshot = provider.data_pack_snapshot();
+            ensure!(
+                match (&ready.pack_snapshot, &current_snapshot) {
+                    (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "structure expansion requires the original data-pack snapshot"
+            );
+            ready.batch.request_structure_expansion(&plan)?;
+            set_phase(progress, GenerationPhase::Generating);
+            while let Some((pos, stage)) = {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                ready
+                    .batch
+                    .step_structure_expansion(&mut provider, &mut classify_height)?
+            } {
+                note_step(progress, pos, stage);
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            ready.batch.finish_structure_expansion(&plan)?;
             expand_with_inputs(
                 ready,
                 target,
@@ -2872,7 +2957,7 @@ mod tests {
         }
         let worker = GenerationWorker::start_selected_structures_at_spawn(
             crate::fresh_generation::FreshGenerationSettings {
-                minecraft_dir: game,
+                minecraft_dir: game.clone(),
                 preset: "example:test".into(),
                 dimension: "minecraft:overworld".into(),
                 seed: 42,
@@ -2928,10 +3013,12 @@ mod tests {
                 .and_then(|v| v.get("seed")),
             Some(&native_persistence::nbt::Tag::Long(42))
         );
-        let snapshot = ready
-            .pack_snapshot
-            .as_ref()
-            .context("pack snapshot missing")?;
+        let snapshot = Arc::clone(
+            ready
+                .pack_snapshot
+                .as_ref()
+                .context("pack snapshot missing")?,
+        );
         std::fs::write(pack.join("pack.mcmeta"), b"{}")?;
         snapshot.verify()?;
         let staged = tempfile::tempdir()?;
@@ -2941,7 +3028,228 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&copied)?["pack"]["description"],
             "test"
         );
-        assert!(ready.batch.into_parts().is_err());
+        let mismatch_worker = GenerationWorker::start_selected_structures_at_spawn(
+            crate::fresh_generation::FreshGenerationSettings {
+                minecraft_dir: game.clone(),
+                preset: "example:test".into(),
+                dimension: "minecraft:overworld".into(),
+                seed: 42,
+                bonus_chest: false,
+                structures_enabled: true,
+                data_packs: Some((
+                    staged.path().to_path_buf(),
+                    DataPackSettings {
+                        enabled: vec!["vanilla".into(), "file/structures".into()],
+                        disabled: vec![],
+                        enabled_features: vec!["minecraft:vanilla".into()],
+                    },
+                )),
+            },
+            71,
+            0,
+        )?;
+        let mismatch_ready = match mismatch_worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
+        };
+        let wrong_snapshot = Arc::clone(&snapshot);
+        let other_game = game.clone();
+        let mismatch_worker = GenerationWorker::expand_with_structures(
+            mismatch_ready,
+            ChunkPos { x: 1, z: 0 },
+            move || {
+                let mut provider = native_resources::packs::ResourceStack::open(&other_game)?;
+                let selection = DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/structures".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                };
+                ensure!(
+                    provider
+                        .configure_snapshot_data(wrong_snapshot, &selection)?
+                        .is_empty(),
+                    "data pack selection changed"
+                );
+                Ok((
+                    provider,
+                    |_: &Value| -> Result<CarverBlockState> {
+                        anyhow::bail!("unexpected block classification")
+                    },
+                    |_: &Value| -> Result<BlockState> {
+                        anyhow::bail!("unexpected block resolution")
+                    },
+                    |_: &Value| -> Result<native_persistence::heightmap::BlockHeightFlags> {
+                        anyhow::bail!("unexpected height classification")
+                    },
+                ))
+            },
+            72,
+            0,
+        )?;
+        match mismatch_worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Failed(error) => {
+                assert!(format!("{error:#}").contains("original data-pack snapshot"))
+            }
+            _ => anyhow::bail!("a different data-pack snapshot was accepted"),
+        }
+        let original_world = Arc::clone(&ready.mesh.world);
+        let original_structure = ready.batch.structure_data(target)?;
+        let next = ChunkPos { x: 1, z: 0 };
+        let comparison_game = game.clone();
+        let comparison_world = staged.path().to_path_buf();
+        let worker = GenerationWorker::expand_with_structures(
+            ready,
+            next,
+            move || {
+                use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceStack};
+                use native_session::worldgen::resolve_generated_terrain_state;
+                use native_world::fluid::FluidState;
+                let mut provider = ResourceStack::open(&game)?;
+                let selection = DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/structures".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                };
+                ensure!(
+                    provider
+                        .configure_snapshot_data(snapshot, &selection)?
+                        .is_empty(),
+                    "data pack selection changed"
+                );
+                let blocks = provider.vanilla_block_ids()?;
+                let tags = HeightmapTags::load(&mut provider, &blocks)?;
+                let registry = Arc::new(provider.vanilla_generated_block_registry()?);
+                let for_height = Arc::clone(&registry);
+                let height = move |value: &Value| {
+                    let block = resolve_generated_terrain_state(value, &for_height)?;
+                    let motion = tags.for_block(&block.name)?;
+                    Ok(native_persistence::heightmap::BlockHeightFlags {
+                        is_air: matches!(
+                            block.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        blocks_motion: motion.blocks_motion,
+                        blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+                        has_fluid: FluidState::from_block(&block)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                };
+                let for_classify = Arc::clone(&registry);
+                let classify = move |value: &Value| {
+                    let block = resolve_generated_terrain_state(value, &for_classify)?;
+                    Ok(CarverBlockState {
+                        is_air: matches!(
+                            block.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        has_fluid: FluidState::from_block(&block)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                };
+                let resolve =
+                    move |value: &Value| resolve_generated_terrain_state(value, &registry);
+                Ok((provider, classify, resolve, height))
+            },
+            72,
+            0,
+        )?;
+        let expanded = match worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure expansion cancelled"),
+        };
+        assert_eq!(
+            expanded.mesh.targets.as_deref(),
+            Some(&BTreeSet::from([target, next]))
+        );
+        assert_eq!(expanded.batch.structure_data(target)?, original_structure);
+        assert!(
+            expanded
+                .batch
+                .structure_starts(next)
+                .context("expanded structure starts missing")?
+                .contains_key(&id)
+        );
+        for y in 80..96 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        original_world.block(x, y, z),
+                        expanded.mesh.world.block(x, y, z)
+                    );
+                }
+            }
+        }
+        let combined = GenerationWorker::start_with_structures(
+            move || {
+                crate::fresh_generation::prepare_with_structures(
+                    crate::fresh_generation::FreshGenerationSettings {
+                        minecraft_dir: comparison_game,
+                        preset: "example:test".into(),
+                        dimension: "minecraft:overworld".into(),
+                        seed: 42,
+                        bonus_chest: false,
+                        structures_enabled: true,
+                        data_packs: Some((
+                            comparison_world,
+                            DataPackSettings {
+                                enabled: vec!["vanilla".into(), "file/structures".into()],
+                                disabled: vec![],
+                                enabled_features: vec!["minecraft:vanilla".into()],
+                            },
+                        )),
+                    },
+                )
+            },
+            BTreeSet::from([target, next]),
+            73,
+            0,
+            IVec3::ZERO,
+        )?;
+        let combined = match combined
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("combined structure generation cancelled"),
+        };
+        for pos in [target, next] {
+            assert_eq!(
+                expanded.batch.structure_data(pos)?,
+                combined.batch.structure_data(pos)?
+            );
+            for y in 80..96 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let (x, z) = (pos.x * 16 + x, pos.z * 16 + z);
+                        assert_eq!(
+                            expanded.mesh.world.block(x, y, z),
+                            combined.mesh.world.block(x, y, z)
+                        );
+                        for sky in [false, true] {
+                            assert_eq!(
+                                expanded.mesh.world.light(x, y, z, sky),
+                                combined.mesh.world.light(x, y, z, sky)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(expanded.batch.into_parts().is_err());
         Ok(())
     }
 
@@ -3109,6 +3417,7 @@ mod tests {
                     };
                 Ok(StructuredGenerationInputs {
                     structures,
+                    terrain_generator: None,
                     provider,
                     classify,
                     resolve,

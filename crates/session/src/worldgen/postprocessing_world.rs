@@ -752,6 +752,13 @@ fn bonus_water_shape_schedules(state: &BlockState) -> Result<bool> {
         .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water && fluid.source))
 }
 
+fn bonus_falling_shape_schedules(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+    ) && state.properties.is_empty()
+}
+
 impl GeneratedBlockView<'_> {
     fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
         if !state.name.starts_with("minecraft:")
@@ -1944,8 +1951,8 @@ impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
 }
 
 impl GeneratedBlockView<'_> {
-    /// Flags=2 still updates neighboring shapes. Only admit neighbors whose
-    /// callbacks are known to be inert for these specific changes.
+    /// Flags=2 still updates neighboring shapes. Admit only callbacks that
+    /// are modeled for these specific changes.
     fn check_bonus_neighbors(&self, pos: [i32; 3], torch: bool) -> Result<()> {
         for [dx, dy, dz] in [
             [-1i32, 0i32, 0i32],
@@ -1989,6 +1996,7 @@ impl GeneratedBlockView<'_> {
                     || same_height_torch
                     || same_height_new_chest
                     || water
+                    || bonus_falling_shape_schedules(&state)
                     || snowy_bonus_neighbor_inert(&state, dy)
                     || snowy_bonus_neighbor_changes(&state, dy),
                 "bonus chest neighbor shape callback is unsupported: {}",
@@ -1998,8 +2006,8 @@ impl GeneratedBlockView<'_> {
         Ok(())
     }
 
-    /// Apply shape callbacks in Java's neighbor-update order. A water source
-    /// schedules itself; flowing water sees a dry chest or torch and is inert.
+    /// Apply shape callbacks in Java's neighbor-update order. Water sources
+    /// and falling blocks schedule ticks; flowing water remains unchanged.
     fn update_bonus_neighbors(&mut self, pos: [i32; 3]) -> Result<()> {
         for [dx, dy, dz] in [
             [-1i32, 0i32, 0i32],
@@ -2017,6 +2025,13 @@ impl GeneratedBlockView<'_> {
             let state = self.read(neighbor)?;
             if bonus_water_shape_schedules(&state)? {
                 self.schedule_water(neighbor, &state)?;
+            } else if bonus_falling_shape_schedules(&state) {
+                ensure!(
+                    self.ticks
+                        .schedule(TickRegistry::Block, &state.name, neighbor, 2, 0)?
+                        != ScheduleOutcome::MissingChunk,
+                    "falling tick container is missing"
+                );
             }
             if dy == -1 {
                 self.update_snowy_bonus_support(pos)?;
@@ -2226,7 +2241,7 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:chest","minecraft:grass_block","minecraft:podzol","minecraft:mycelium"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:chest","minecraft:grass_block","minecraft:podzol","minecraft:mycelium","minecraft:sand","minecraft:red_sand","minecraft:gravel"]}"#.to_vec(),
                     ))
                 } else {
                     Ok(None)
@@ -2243,6 +2258,9 @@ mod tests {
             "grass_block",
             "podzol",
             "mycelium",
+            "sand",
+            "red_sand",
+            "gravel",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
@@ -2826,17 +2844,145 @@ mod tests {
     }
 
     #[test]
+    fn bonus_chest_schedules_falling_neighbors_without_replacing_existing_ticks() {
+        use native_core::random::LegacyRandom;
+        let (mut baseline, _) = bonus_chest_fixture();
+        let chunks: Vec<_> = baseline.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !baseline.poll(chunk, 10).unwrap() {}
+        }
+        let expected_chest = baseline
+            .place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut LegacyRandom::new(42),
+                [0, 8, 0],
+            )
+            .unwrap()
+            .unwrap();
+        for block in ["minecraft:sand", "minecraft:red_sand", "minecraft:gravel"] {
+            let (mut stage, _) = bonus_chest_fixture();
+            let world = Arc::make_mut(&mut stage.world);
+            let falling = world.intern_state(BlockState {
+                name: block.into(),
+                properties: BTreeMap::new(),
+            });
+            for z in -16..32 {
+                for x in -16..32 {
+                    world.set_block_id(x, 7, z, falling).unwrap();
+                }
+            }
+            let water = world.intern_state(BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            });
+            world
+                .set_block_id(expected_chest[0], 9, expected_chest[2], water)
+                .unwrap();
+            stage.source = Arc::clone(&stage.world);
+            let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+            for chunk in chunks {
+                while !stage.poll(chunk, 10).unwrap() {}
+            }
+            let below_chest = [expected_chest[0], 7, expected_chest[2]];
+            assert_eq!(
+                stage
+                    .region
+                    .ticks
+                    .schedule(TickRegistry::Block, block, below_chest, 9, 0)
+                    .unwrap(),
+                ScheduleOutcome::Added
+            );
+            let mut random = LegacyRandom::new(42);
+            let pos = stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(pos, expected_chest);
+            let result = stage.finish().unwrap();
+            let ticks = result.ticks.activated_snapshot();
+            let scheduled: Vec<_> = ticks
+                .chunks
+                .values()
+                .flat_map(|chunk| &chunk.blocks)
+                .collect();
+            let expected: Vec<_> = [[0, 0], [0, -1], [1, 0], [0, 1], [-1, 0]]
+                .into_iter()
+                .map(|[dx, dz]| [pos[0] + dx, 7, pos[2] + dz])
+                .collect();
+            assert_eq!(scheduled.len(), expected.len());
+            for (sub_tick, target) in expected.into_iter().enumerate() {
+                let tick = scheduled
+                    .iter()
+                    .find(|tick| tick.position == target)
+                    .unwrap();
+                assert_eq!(tick.kind, block);
+                assert_eq!(tick.trigger, if sub_tick == 0 { 9 } else { 2 });
+                assert_eq!(
+                    tick.sub_tick,
+                    if sub_tick == 0 {
+                        0
+                    } else {
+                        sub_tick as i64 + 2
+                    }
+                );
+            }
+            let fluid_ticks: Vec<_> = ticks
+                .chunks
+                .values()
+                .flat_map(|chunk| &chunk.fluids)
+                .collect();
+            assert_eq!(fluid_ticks.len(), 1);
+            assert_eq!(fluid_ticks[0].position, [pos[0], 9, pos[2]]);
+            assert_eq!(fluid_ticks[0].kind, "minecraft:water");
+            assert_eq!(fluid_ticks[0].trigger, 5);
+            assert_eq!(fluid_ticks[0].sub_tick, 2);
+            assert_eq!(ticks.next_sub_tick, 7);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn bonus_falling_neighbor_callbacks_match_java() {
+        use native_core::random::LegacyRandom;
+        let rows = java_results(
+            "BonusFallingNeighborOracle",
+            include_str!("../../tests/java/BonusFallingNeighborOracle.java"),
+        );
+        assert_eq!(rows.len(), 3 * 6 * 2);
+        for row in rows {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 6, "{row}");
+            let state = BlockState {
+                name: fields[0].into(),
+                properties: BTreeMap::new(),
+            };
+            assert!(bonus_falling_shape_schedules(&state), "{row}");
+            assert_eq!(fields[3], "true", "{row}");
+            assert_eq!(fields[4], format!("{}:2", fields[0]), "{row}");
+            assert_eq!(
+                fields[5].parse::<i64>().unwrap(),
+                LegacyRandom::new(42).next_long(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
     fn bonus_chest_rejects_unmodeled_neighbor_effects_without_advancing_rng() {
         use native_core::random::LegacyRandom;
         let (mut stage, _) = bonus_chest_fixture();
         let world = Arc::make_mut(&mut stage.world);
-        let sand = world.intern_state(BlockState {
-            name: "minecraft:sand".into(),
+        let unsupported = world.intern_state(BlockState {
+            name: "minecraft:bedrock".into(),
             properties: BTreeMap::new(),
         });
         for z in -16..32 {
             for x in -16..32 {
-                world.set_block_id(x, 7, z, sand).unwrap();
+                world.set_block_id(x, 7, z, unsupported).unwrap();
             }
         }
         stage.source = Arc::clone(&stage.world);
@@ -2856,7 +3002,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("neighbor shape callback"));
         assert_eq!(random.state(), state);
-        assert_eq!(source.block(0, 7, 0).unwrap().name, "minecraft:sand");
+        assert_eq!(source.block(0, 7, 0).unwrap().name, "minecraft:bedrock");
         assert!(stage.finish().is_err());
     }
 

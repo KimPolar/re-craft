@@ -3697,6 +3697,134 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn selected_packs_generate_structures_on_worker() -> Result<()> {
+        selected_packs_generate_structures_on_worker_impl(false)
+    }
+
+    fn verify_generated_structure_region_with_java(
+        game: &std::path::Path,
+        parent: &std::path::Path,
+        ready: &GenerationReady,
+        sources: &BTreeSet<ChunkPos>,
+    ) -> Result<()> {
+        use native_persistence::save::{FreshRegionDraft, FreshRegionKind};
+        use native_resources::packs::ResourceId;
+        use std::{fs::OpenOptions, path::PathBuf, process::Command};
+
+        let key = ResourceId::parse("example:treasure")?;
+        let (pos, chest) = sources
+            .iter()
+            .find_map(|&pos| {
+                let start = ready.batch.structure_starts(pos)?.get(&key)?;
+                let [x, y, z] = start.bounds.min;
+                if ready
+                    .batch
+                    .structure_reference_sources(pos)
+                    .ok()?
+                    .contains(&pos)
+                    && ready.mesh.world.block(x, y, z)?.name == "minecraft:chest"
+                {
+                    Some((pos, [x, y, z]))
+                } else {
+                    None
+                }
+            })
+            .context("no generated treasure start with its own reference and chest")?;
+        let processed = ready
+            .postprocessed
+            .as_ref()
+            .context("postprocessing missing")?;
+        let draft = ready
+            .batch
+            .postprocessed_chunk_drafts(&processed.region, [pos])?
+            .remove(&pos)
+            .context("generated treasure chunk missing")?;
+        let directory = parent.join("structure-region-verification");
+        std::fs::create_dir(&directory)?;
+        let rx = pos.x.div_euclid(32);
+        let rz = pos.z.div_euclid(32);
+        let mut region = FreshRegionDraft::new(FreshRegionKind::Terrain, rx, rz);
+        region.add(
+            native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+            &draft.chunk,
+            1,
+        )?;
+        let path = directory.join(format!("r.{rx}.{rz}.mca"));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        ensure!(
+            region.write_staged(&mut file)?.is_empty(),
+            "external chunk not expected"
+        );
+        drop(file);
+        std::fs::write(
+            directory.join("expected.nbt"),
+            native_persistence::nbt::write(&draft.chunk)?,
+        )?;
+
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+        let mut paths = vec![version.join("26.3.jar"), directory.clone()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = directory.join("GeneratedStructureRegionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedStructureRegionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("GeneratedStructureRegionOracle")
+            .arg(&directory)
+            .arg(pos.x.to_string())
+            .arg(pos.z.to_string())
+            .args(chest.map(|coordinate| coordinate.to_string()))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java could not round-trip generated region: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_structure_region_round_trips_through_java() -> Result<()> {
+        selected_packs_generate_structures_on_worker_impl(true)
+    }
+
+    fn selected_packs_generate_structures_on_worker_impl(verify_java: bool) -> Result<()> {
         use native_resources::{datapacks::DataPackSettings, packs::ResourceId};
         use serde_json::json;
 
@@ -4051,6 +4179,15 @@ mod tests {
         assert!(preview.terrain_regions > 0);
         assert!(!preview.referenced_start_chunks.is_empty());
         assert!(preview.referenced_start_chunks.is_subset(selected));
+        if verify_java {
+            verify_generated_structure_region_with_java(
+                &game,
+                temp.path(),
+                &player_ready,
+                &preview.referenced_start_chunks,
+            )?;
+            return Ok(());
+        }
         assert!(
             player_ready
                 .batch

@@ -570,8 +570,10 @@ pub(crate) fn prepare_with_structures(
     )?;
     let blocks = resources.vanilla_block_ids()?;
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
-    let height_tags =
-        native_resources::heightmap_tags::HeightmapTags::load(&mut resources, &blocks)?;
+    let height_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+        &mut resources,
+        &blocks,
+    )?);
     let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
         &mut resources,
         &definition,
@@ -599,9 +601,10 @@ pub(crate) fn prepare_with_structures(
         })
     });
     let for_height = Arc::clone(&registry);
+    let classifier_tags = Arc::clone(&height_tags);
     let classify_height: HeightClassifier = Box::new(move |value| {
         let block = resolve_generated_terrain_state(value, &for_height)?;
-        let motion = height_tags.for_block(&block.name)?;
+        let motion = classifier_tags.for_block(&block.name)?;
         Ok(native_persistence::heightmap::BlockHeightFlags {
             is_air: matches!(
                 block.name.as_str(),
@@ -625,6 +628,7 @@ pub(crate) fn prepare_with_structures(
     Ok(crate::generation_worker::StructuredGenerationInputs {
         structures,
         terrain_generator: Some(terrain_generator),
+        height_tags: Some(height_tags),
         provider: resources,
         classify,
         resolve,

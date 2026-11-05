@@ -75,6 +75,7 @@ pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
     pub structures: StructureGenerationBatch,
     /// Paired terrain generator enables later structure-aware expansion.
     pub terrain_generator: Option<native_session::worldgen::TerrainGenerator>,
+    pub height_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     pub provider: P,
     pub classify: C,
     pub resolve: R,
@@ -1259,6 +1260,7 @@ impl GenerationWorker {
                 &mut classify,
                 &mut resolve,
                 Arc::clone(&height_tags),
+                None,
                 biome_blend,
                 ceiling_spawn_height,
                 cancelled,
@@ -1519,6 +1521,7 @@ impl GenerationWorker {
             GenerationTargets::Explicit { targets, origin },
             revision,
             biome_blend,
+            None,
         )
     }
 
@@ -1533,6 +1536,23 @@ impl GenerationWorker {
             move || crate::fresh_generation::prepare_with_structures(settings),
             revision,
             biome_blend,
+        )
+    }
+
+    /// Find the initial world spawn, expanding structures and terrain on the
+    /// same worker and frozen pack stack when the search needs another chunk.
+    pub(crate) fn start_selected_structures_spawn_search(
+        settings: crate::fresh_generation::FreshGenerationSettings,
+        revision: u64,
+        biome_blend: u8,
+        ceiling_spawn_height: Option<i32>,
+    ) -> Result<Self> {
+        Self::start_structured(
+            move || crate::fresh_generation::prepare_with_structures(settings),
+            GenerationTargets::SpawnOrigin,
+            revision,
+            biome_blend,
+            Some(ceiling_spawn_height),
         )
     }
 
@@ -1556,6 +1576,7 @@ impl GenerationWorker {
             GenerationTargets::SpawnOrigin,
             revision,
             biome_blend,
+            None,
         )
     }
 
@@ -1564,6 +1585,7 @@ impl GenerationWorker {
         selection: GenerationTargets,
         revision: u64,
         biome_blend: u8,
+        spawn_search: Option<Option<i32>>,
     ) -> Result<Self>
     where
         F: FnOnce() -> Result<StructuredGenerationInputs<P, C, R, H, K>> + Send + 'static,
@@ -1596,6 +1618,7 @@ impl GenerationWorker {
             let StructuredGenerationInputs {
                 mut structures,
                 terrain_generator,
+                height_tags,
                 mut provider,
                 mut classify,
                 mut resolve,
@@ -1671,6 +1694,20 @@ impl GenerationWorker {
             ready.spawn_origin = spawn_origin;
             ready.worldgen_settings_draft = worldgen_settings_draft;
             ready.pack_snapshot = pack_snapshot;
+            if let Some(ceiling_spawn_height) = spawn_search {
+                return complete_spawn_search(
+                    ready,
+                    &mut provider,
+                    &mut classify,
+                    &mut resolve,
+                    height_tags.context("structure spawn height tags are missing")?,
+                    Some(&mut classify_height),
+                    biome_blend,
+                    ceiling_spawn_height,
+                    cancelled,
+                    progress,
+                );
+            }
             Ok(Some(ready))
         })
     }
@@ -1742,6 +1779,7 @@ impl GenerationWorker {
                 &mut classify,
                 &mut resolve,
                 tags,
+                None,
                 biome_blend,
                 ceiling_spawn_height,
                 cancelled,
@@ -1828,12 +1866,6 @@ impl GenerationWorker {
                 !targets.contains(&target),
                 "generation target is already ready"
             );
-            let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
-            let plan = StructurePreparationPlan::new(
-                initialized
-                    .into_iter()
-                    .map(|pos| (pos, GenerationStage::InitializeLight)),
-            )?;
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -1847,22 +1879,16 @@ impl GenerationWorker {
                 },
                 "structure expansion requires the original data-pack snapshot"
             );
-            ready.batch.request_structure_expansion(&plan)?;
-            set_phase(progress, GenerationPhase::Generating);
-            while let Some((pos, stage)) = {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                ready
-                    .batch
-                    .step_structure_expansion(&mut provider, &mut classify_height)?
-            } {
-                note_step(progress, pos, stage);
-            }
-            if cancelled.load(Ordering::Relaxed) {
+            if !prepare_structure_expansion(
+                &mut ready.batch,
+                target,
+                &mut provider,
+                &mut classify_height,
+                cancelled,
+                progress,
+            )? {
                 return Ok(None);
             }
-            ready.batch.finish_structure_expansion(&plan)?;
             expand_with_inputs(
                 ready,
                 target,
@@ -2326,6 +2352,9 @@ fn complete_spawn_search(
     classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
     resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    mut structure_height: Option<
+        &mut dyn FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    >,
     biome_blend: u8,
     ceiling_spawn_height: Option<i32>,
     cancelled: &AtomicBool,
@@ -2382,6 +2411,18 @@ fn complete_spawn_search(
             .revision
             .checked_add(1)
             .context("mesh revision overflow")?;
+        if let Some(classify_height) = &mut structure_height {
+            if !prepare_structure_expansion(
+                &mut ready.batch,
+                target,
+                provider,
+                classify_height,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
+            }
+        }
         let Some(expanded) = expand_with_inputs(
             ready,
             target,
@@ -2398,6 +2439,40 @@ fn complete_spawn_search(
         };
         ready = expanded;
     }
+}
+
+fn prepare_structure_expansion(
+    batch: &mut FreshTerrainBatch,
+    target: ChunkPos,
+    provider: &mut impl ResourceProvider,
+    classify_height: &mut impl FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<bool> {
+    let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
+    let plan = StructurePreparationPlan::new(
+        initialized
+            .into_iter()
+            .map(|pos| (pos, GenerationStage::InitializeLight)),
+    )?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    batch.request_structure_expansion(&plan)?;
+    set_phase(progress, GenerationPhase::Generating);
+    while let Some((pos, stage)) = {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        batch.step_structure_expansion(provider, classify_height)?
+    } {
+        note_step(progress, pos, stage);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    batch.finish_structure_expansion(&plan)?;
+    Ok(true)
 }
 
 /// Search results remain valid only while every previously available target's
@@ -2955,6 +3030,59 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap())?;
             std::fs::write(path, serde_json::to_vec(&contents)?)?;
         }
+        let preset_path = pack.join("data/example/worldgen/world_preset/test.json");
+        let mut spawn_preset: Value = serde_json::from_slice(&std::fs::read(&preset_path)?)?;
+        spawn_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["noise_router"]
+            ["final_density"] = json!({
+            "type":"range_choice",
+            "input":{"type":"gradient","axis":"x","from_coordinate":0,"to_coordinate":32,"from_value":0,"to_value":32},
+            "min_inclusive":20,"max_exclusive":1000000,
+            "when_in_range":{"type":"gradient","axis":"y","from_coordinate":80,"to_coordinate":96,"from_value":2,"to_value":-1},
+            "when_out_of_range":-1
+        });
+        std::fs::write(
+            preset_path.with_file_name("spawn.json"),
+            serde_json::to_vec(&spawn_preset)?,
+        )?;
+        let spawn_worker = GenerationWorker::start_selected_structures_spawn_search(
+            crate::fresh_generation::FreshGenerationSettings {
+                minecraft_dir: game.clone(),
+                preset: "example:spawn".into(),
+                dimension: "minecraft:overworld".into(),
+                seed: 42,
+                bonus_chest: false,
+                structures_enabled: true,
+                data_packs: Some((
+                    world.clone(),
+                    DataPackSettings {
+                        enabled: vec!["vanilla".into(), "file/structures".into()],
+                        disabled: vec![],
+                        enabled_features: vec!["minecraft:vanilla".into()],
+                    },
+                )),
+            },
+            60,
+            0,
+            None,
+        )?;
+        let spawned = match spawn_worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure spawn search cancelled"),
+        };
+        assert_eq!(spawned.spawn_origin, Some(ChunkPos { x: 0, z: 0 }));
+        assert!(spawned.mesh.targets.as_deref().unwrap().len() >= 2);
+        assert!(spawned.suggested_spawn.context("world spawn missing")?.x >= 16);
+        assert!(
+            spawned
+                .batch
+                .structure_starts(ChunkPos { x: 1, z: 0 })
+                .unwrap()
+                .contains_key(&ResourceId::parse("example:treasure")?)
+        );
         let worker = GenerationWorker::start_selected_structures_at_spawn(
             crate::fresh_generation::FreshGenerationSettings {
                 minecraft_dir: game.clone(),
@@ -3418,6 +3546,7 @@ mod tests {
                 Ok(StructuredGenerationInputs {
                     structures,
                     terrain_generator: None,
+                    height_tags: None,
                     provider,
                     classify,
                     resolve,
@@ -5318,6 +5447,7 @@ mod tests {
             &mut classify,
             &mut resolve,
             tags,
+            None,
             0,
             None,
             &cancelled,

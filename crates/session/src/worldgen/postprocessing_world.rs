@@ -1574,10 +1574,10 @@ impl GeneratedBlockView<'_> {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
-                ensure!(
-                    updated == state,
-                    "water neighbor fence shape changes are unsupported"
-                );
+                if updated != state {
+                    self.write_postprocessed_state(p.to_array(), &state, &updated)?;
+                    self.update_fence_shape_neighbors(p.to_array(), &updated, 512)?;
+                }
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -1589,6 +1589,92 @@ impl GeneratedBlockView<'_> {
                 ensure!(
                     self.ticks
                         .schedule(TickRegistry::Block, &state.name, p.to_array(), 2, 0)?
+                        != ScheduleOutcome::MissingChunk,
+                    "falling tick container is missing"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A shape-update write has Java's flag 2: shape notifications, but no
+    /// redstone neighbor notifications. Each nested write runs before the
+    /// remaining shape callbacks of the enclosing update.
+    fn update_fence_shape_neighbors(
+        &mut self,
+        pos: [i32; 3],
+        fence: &BlockState,
+        depth: usize,
+    ) -> Result<()> {
+        use native_world::fluid_sim::Cell;
+        ensure!(depth > 0, "fence shape update depth exceeded");
+        for d in [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ] {
+            let neighbor = [
+                pos[0].wrapping_add(d[0]),
+                pos[1].wrapping_add(d[1]),
+                pos[2].wrapping_add(d[2]),
+            ];
+            let state = self.read(neighbor)?;
+            let cell = self.fluid_cell(glam::IVec3::from_array(neighbor));
+            ensure!(
+                matches!(
+                    cell,
+                    Cell::Air
+                        | Cell::Solid
+                        | Cell::Fluid(_)
+                        | Cell::FenceWater(_)
+                        | Cell::Slab { .. }
+                        | Cell::Stairs { .. }
+                ),
+                "unsupported fence neighbor shape callback: {}",
+                state.name
+            );
+            if let Some(fluid) = liquid_state(&state)? {
+                ensure!(
+                    fluid.kind == native_world::fluid::FluidKind::Water,
+                    "fence touches unsupported liquid"
+                );
+                self.schedule_water(neighbor, &state)?;
+                if fluid.source && d == [0, 1, 0] {
+                    let tags = self.bubble_tags.context("bubble-column tags unavailable")?;
+                    if tags.can_occupy_fluid("minecraft:water") && tags.enables(&fence.name) {
+                        ensure!(
+                            self.ticks.schedule(
+                                TickRegistry::Block,
+                                "minecraft:water",
+                                neighbor,
+                                20,
+                                0
+                            )? != ScheduleOutcome::MissingChunk,
+                            "bubble tick container is missing"
+                        );
+                    }
+                }
+            } else if native_world::collision::fence_waterlogged(&state) == Some(true) {
+                let next =
+                    self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, fence)?;
+                if next != state {
+                    self.write_postprocessed_state(neighbor, &state, &next)?;
+                    self.update_fence_shape_neighbors(neighbor, &next, depth - 1)?;
+                }
+            } else if self.slab(&state).is_some_and(|(_, wet)| wet)
+                || self.stair(&state).is_some_and(|(_, wet)| wet)
+            {
+                self.schedule_contained_water(neighbor)?;
+            } else if matches!(
+                state.name.as_str(),
+                "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+            ) {
+                ensure!(
+                    self.ticks
+                        .schedule(TickRegistry::Block, &state.name, neighbor, 2, 0)?
                         != ScheduleOutcome::MissingChunk,
                     "falling tick container is missing"
                 );
@@ -5140,20 +5226,50 @@ mod tests {
                     world.set_block_id(8, 7, 8, air).unwrap();
                 }
             }
-            "marked_fence_wet" | "marked_fence_side" | "marked_fence_down" => {
+            "marked_fence_wet"
+            | "marked_fence_side"
+            | "marked_fence_down"
+            | "marked_fence_disconnect"
+            | "marked_fence_disconnect_sand"
+            | "marked_fence_disconnect_water"
+            | "marked_fence_disconnect_neighbor" => {
                 let fence = world.intern_state(BlockState {
                     name: "minecraft:oak_fence".into(),
                     properties: ["north", "east", "south", "west", "waterlogged"]
                         .into_iter()
-                        .map(|key| (key.into(), (key == "waterlogged").to_string()))
+                        .map(|key| {
+                            (
+                                key.into(),
+                                (key == "waterlogged"
+                                    || (key == "east"
+                                        && case.starts_with("marked_fence_disconnect")))
+                                .to_string(),
+                            )
+                        })
                         .collect(),
                 });
                 world.set_block_id(8, 8, 8, fence).unwrap();
-                if case == "marked_fence_side" {
+                if case == "marked_fence_side" || case.starts_with("marked_fence_disconnect") {
                     world.set_block_id(9, 8, 8, air).unwrap();
                 }
                 if case == "marked_fence_down" {
                     world.set_block_id(8, 7, 8, air).unwrap();
+                }
+                if case == "marked_fence_disconnect_sand" {
+                    world.set_block_id(8, 8, 7, sand).unwrap();
+                }
+                if case == "marked_fence_disconnect_water" {
+                    world.set_block_id(8, 8, 7, water).unwrap();
+                }
+                if case == "marked_fence_disconnect_neighbor" {
+                    let neighbor = world.intern_state(BlockState {
+                        name: "minecraft:oak_fence".into(),
+                        properties: ["north", "east", "south", "west", "waterlogged"]
+                            .into_iter()
+                            .map(|key| (key.into(), (key == "waterlogged").to_string()))
+                            .collect(),
+                    });
+                    world.set_block_id(8, 8, 7, neighbor).unwrap();
                 }
             }
             case if case.starts_with("marked_leaf_") => {
@@ -5384,6 +5500,15 @@ mod tests {
                 trace.push(format!(
                     "stair {x},{y},{z} {} {} {}",
                     state.properties["facing"], state.properties["half"], state.properties["shape"]
+                ));
+            }
+            if state.name == "minecraft:oak_fence" {
+                trace.push(format!(
+                    "fence {x},{y},{z} {} {} {} {}",
+                    state.properties["north"],
+                    state.properties["east"],
+                    state.properties["south"],
+                    state.properties["west"]
                 ));
             }
         }
@@ -5663,6 +5788,22 @@ mod tests {
             ("marked_fence_wet", None),
             ("marked_fence_side", Some("state 9,8,8 minecraft:water 1")),
             ("marked_fence_down", Some("state 8,7,8 minecraft:water 8")),
+            (
+                "marked_fence_disconnect",
+                Some("state 9,8,8 minecraft:water 1"),
+            ),
+            (
+                "marked_fence_disconnect_sand",
+                Some("state 9,8,8 minecraft:water 1"),
+            ),
+            (
+                "marked_fence_disconnect_water",
+                Some("state 9,8,8 minecraft:water 1"),
+            ),
+            (
+                "marked_fence_disconnect_neighbor",
+                Some("state 9,8,8 minecraft:water 1"),
+            ),
         ] {
             let trace = water_spread_trace(case);
             assert!(
@@ -5674,6 +5815,29 @@ mod tests {
                 assert!(
                     trace.iter().any(|line| line == expected),
                     "{case}: {trace:?}"
+                );
+            }
+            if case.starts_with("marked_fence_disconnect") {
+                let north = case != "marked_fence_disconnect_water";
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == &format!("fence 8,8,8 {north} false true true")),
+                    "{case}: {trace:?}"
+                );
+            }
+            if case == "marked_fence_disconnect_sand" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "block minecraft:sand 8,8,7 2")
+                );
+            }
+            if case == "marked_fence_disconnect_neighbor" {
+                assert!(
+                    trace
+                        .iter()
+                        .any(|line| line == "fence 8,8,7 false false true false")
                 );
             }
         }
@@ -5784,6 +5948,10 @@ mod tests {
             "marked_fence_wet",
             "marked_fence_side",
             "marked_fence_down",
+            "marked_fence_disconnect",
+            "marked_fence_disconnect_sand",
+            "marked_fence_disconnect_water",
+            "marked_fence_disconnect_neighbor",
         ] {
             expected.extend(water_spread_trace(case));
         }

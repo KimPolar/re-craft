@@ -1644,12 +1644,10 @@ impl GenerationWorker {
                     progress,
                 );
             };
-            for pos in initialized {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                batch.request_light_initialization(pos)?;
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
             }
+            batch.request_light_initialization_many(initialized)?;
             set_phase(progress, GenerationPhase::Generating);
             while let Some((pos, stage)) = {
                 if cancelled.load(Ordering::Relaxed) {
@@ -2373,12 +2371,10 @@ fn generate_spawn_origin(
         0,
         spawn.z.checked_mul(16).context("spawn origin Z overflow")?,
     );
-    for pos in initialized_neighbors(&targets)? {
-        if cancelled.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        batch.request_light_initialization(pos)?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
     }
+    batch.request_light_initialization_many(initialized_neighbors(&targets)?)?;
     set_phase(progress, GenerationPhase::Generating);
     while let Some((pos, stage)) = {
         if cancelled.load(Ordering::Relaxed) {
@@ -2495,13 +2491,17 @@ fn expand_with_inputs(
         note_step(progress, pos, stage);
     }
     set_phase(progress, GenerationPhase::Lighting);
+    let mut registrations = Vec::new();
     for &pos in &initialized {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
         if batch.schedule().completed(pos) == Some(GenerationStage::Features) {
-            batch.request_light_initialization(pos)?;
+            registrations.push(pos);
         }
+    }
+    if !registrations.is_empty() {
+        batch.request_light_initialization_many(registrations)?;
     }
     while let Some((pos, stage)) = {
         if cancelled.load(Ordering::Relaxed) {

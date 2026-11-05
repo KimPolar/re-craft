@@ -3663,7 +3663,16 @@ mod tests {
             batch
                 .enable_light_initialization(generated_registry)
                 .unwrap();
-            batch.request_light_initialization(center).unwrap();
+            assert!(batch.request_light_initialization_many([]).is_err());
+            assert!(
+                batch
+                    .request_light_initialization_many([center, ChunkPos { x: i32::MAX, z: 0 }])
+                    .is_err()
+            );
+            assert_eq!(batch.schedule().requested_chunks(), 0);
+            batch
+                .request_light_initialization_many([center, center])
+                .unwrap();
             let mut classify = |v: &Value| -> Result<CarverBlockState> {
                 let id = v
                     .as_str()

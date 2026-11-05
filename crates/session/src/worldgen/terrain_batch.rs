@@ -1351,6 +1351,14 @@ impl FreshTerrainBatch {
     /// Request FEATURES and light section/source registration for a chunk.
     /// This step does not propagate light or produce saveable lighting.
     pub fn request_light_initialization(&mut self, pos: ChunkPos) -> Result<()> {
+        self.request_light_initialization_many([pos])
+    }
+
+    /// Request overlapping light-initialization neighborhoods atomically.
+    pub fn request_light_initialization_many(
+        &mut self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<()> {
         ensure!(
             !self.failed,
             "generation batch failed and must be discarded"
@@ -1359,7 +1367,8 @@ impl FreshTerrainBatch {
             self.light_registry.is_some(),
             "light initialization is not configured"
         );
-        self.validate_structure_dependencies(pos, GenerationStage::InitializeLight)?;
+        let positions: Vec<_> = positions.into_iter().collect();
+        ensure!(!positions.is_empty(), "no light initialization targets");
         if self.light_engine.is_some() {
             ensure!(
                 !self.schedule.has_pending_stage(GenerationStage::Terrain)
@@ -1367,12 +1376,21 @@ impl FreshTerrainBatch {
                     && !self.schedule.has_pending_stage(GenerationStage::Light),
                 "finish pending terrain, decoration and propagation before light registration"
             );
-            ensure!(
-                self.schedule.completed(pos) == Some(GenerationStage::Features),
-                "sealed batches can only initialize already decorated chunks"
-            );
         }
-        self.schedule.request(pos, GenerationStage::InitializeLight)
+        for &pos in &positions {
+            self.validate_structure_dependencies(pos, GenerationStage::InitializeLight)?;
+            if self.light_engine.is_some() {
+                ensure!(
+                    self.schedule.completed(pos) == Some(GenerationStage::Features),
+                    "sealed batches can only initialize already decorated chunks"
+                );
+            }
+        }
+        self.schedule.request_many(
+            positions
+                .into_iter()
+                .map(|pos| (pos, GenerationStage::InitializeLight)),
+        )
     }
 
     /// Finish all requested registrations before entering a frozen light

@@ -45,6 +45,94 @@ pub struct PlannedStructureDecoration<'a> {
     pub starts: Vec<&'a SimpleStructureStart>,
 }
 
+/// Structure and terrain coverage required by a set of later chunk stages.
+/// This uses the same dependency expansion as the generation scheduler.
+pub struct StructurePreparationPlan {
+    starts: BTreeSet<ChunkPos>,
+    references: BTreeSet<ChunkPos>,
+    terrain: BTreeSet<ChunkPos>,
+}
+
+impl StructurePreparationPlan {
+    pub fn new(requests: impl IntoIterator<Item = (ChunkPos, GenerationStage)>) -> Result<Self> {
+        let mut schedule = GenerationSchedule::new();
+        schedule.request_many(requests)?;
+        ensure!(schedule.requested_chunks() > 0, "no generation requests");
+        let mut plan = Self {
+            starts: BTreeSet::new(),
+            references: BTreeSet::new(),
+            terrain: BTreeSet::new(),
+        };
+        for (pos, stage) in schedule.requirements() {
+            if stage >= GenerationStage::StructureStarts {
+                plan.starts.insert(pos);
+            }
+            if stage >= GenerationStage::StructureReferences {
+                plan.references.insert(pos);
+            }
+            if stage >= GenerationStage::Terrain {
+                plan.terrain.insert(pos);
+            }
+        }
+        Ok(plan)
+    }
+
+    pub fn starts(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.starts.iter().copied()
+    }
+    pub fn references(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.references.iter().copied()
+    }
+    pub fn terrain(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.terrain.iter().copied()
+    }
+
+    /// Request all prerequisites together; coordinate failures leave the
+    /// structure batch's existing schedule unchanged.
+    pub fn request_structures(&self, batch: &mut StructureGenerationBatch) -> Result<()> {
+        ensure!(
+            !batch.failed,
+            "structure batch failed and must be discarded"
+        );
+        let requests = self
+            .starts()
+            .map(|pos| (pos, GenerationStage::StructureStarts))
+            .chain(
+                self.references()
+                    .map(|pos| (pos, GenerationStage::StructureReferences)),
+            );
+        batch.schedule.request_many(requests)
+    }
+
+    /// Transfer completed structure work when all terrain orders are known to
+    /// be independent of Java's identity-dependent iteration order.
+    pub fn into_terrain_batch(
+        &self,
+        batch: StructureGenerationBatch,
+        tags: CarverBlockTags,
+        dimension: &str,
+    ) -> Result<super::FreshTerrainBatch> {
+        ensure!(
+            batch.is_complete(),
+            "structure batch has unfinished or failed work"
+        );
+        ensure!(
+            self.starts().all(|pos| batch.starts(pos).is_some()),
+            "structure starts required by plan are missing"
+        );
+        ensure!(
+            self.references().all(|pos| batch.references(pos).is_some()),
+            "structure references required by plan are missing"
+        );
+        super::FreshTerrainBatch::new_with_unambiguous_structures(
+            batch,
+            self.terrain(),
+            tags,
+            dimension,
+        )
+    }
+}
+
 /// One structure kind has a known per-kind reference order. Two total
 /// contributions also commute under Java's finite IEEE-754 addition.
 fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<ResourceId>> {
@@ -559,6 +647,31 @@ impl StructureGenerationBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_plan_covers_spawn_light_neighborhood_and_rejects_overflow() {
+        let targets = (-1..=1).flat_map(|z| {
+            (-1..=1).map(move |x| (ChunkPos { x, z }, GenerationStage::InitializeLight))
+        });
+        let plan = StructurePreparationPlan::new(targets).unwrap();
+        assert_eq!(plan.starts().count(), 23 * 23);
+        assert_eq!(plan.references().count(), 7 * 7);
+        assert_eq!(plan.terrain().count(), 5 * 5);
+        assert!(plan.starts().any(|pos| pos == ChunkPos { x: -11, z: 11 }));
+        assert!(
+            !plan
+                .references()
+                .any(|pos| pos.x.abs() > 3 || pos.z.abs() > 3)
+        );
+        assert!(StructurePreparationPlan::new([]).is_err());
+        assert!(
+            StructurePreparationPlan::new([(
+                ChunkPos { x: i32::MAX, z: 0 },
+                GenerationStage::Features
+            )])
+            .is_err()
+        );
+    }
 
     #[test]
     fn inferred_structure_order_requires_unambiguous_float_sum() {

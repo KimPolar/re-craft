@@ -237,27 +237,48 @@ impl GenerationSchedule {
     /// Expand Java's accumulated dependencies transactionally. Requests can overlap or
     /// increase existing targets without discarding completed work.
     pub fn request(&mut self, pos: ChunkPos, target: GenerationStage) -> Result<()> {
-        let mut staged = BTreeMap::from([(pos, target)]);
-        for (radius, &needed) in target.accumulated().iter().enumerate().skip(1) {
-            let r = i32::try_from(radius)?;
-            for dz in -r..=r {
-                for dx in -r..=r {
-                    if dx.abs().max(dz.abs()) != r {
-                        continue;
+        self.request_many([(pos, target)])
+    }
+
+    /// Expand overlapping requests in one transaction. If any coordinate
+    /// overflows, none of the requested stages are recorded.
+    pub fn request_many(
+        &mut self,
+        requests: impl IntoIterator<Item = (ChunkPos, GenerationStage)>,
+    ) -> Result<()> {
+        let mut staged = BTreeMap::new();
+        for (pos, target) in requests {
+            staged
+                .entry(pos)
+                .and_modify(|stage: &mut GenerationStage| *stage = (*stage).max(target))
+                .or_insert(target);
+            for (radius, &needed) in target.accumulated().iter().enumerate().skip(1) {
+                let r = i32::try_from(radius)?;
+                for dz in -r..=r {
+                    for dx in -r..=r {
+                        if dx.abs().max(dz.abs()) != r {
+                            continue;
+                        }
+                        let neighbor = ChunkPos {
+                            x: pos
+                                .x
+                                .checked_add(dx)
+                                .context("generation chunk X overflow")?,
+                            z: pos
+                                .z
+                                .checked_add(dz)
+                                .context("generation chunk Z overflow")?,
+                        };
+                        staged
+                            .entry(neighbor)
+                            .and_modify(|stage| *stage = (*stage).max(needed))
+                            .or_insert(needed);
                     }
-                    let neighbor = ChunkPos {
-                        x: pos
-                            .x
-                            .checked_add(dx)
-                            .context("generation chunk X overflow")?,
-                        z: pos
-                            .z
-                            .checked_add(dz)
-                            .context("generation chunk Z overflow")?,
-                    };
-                    staged.insert(neighbor, needed);
                 }
             }
+        }
+        if staged.is_empty() {
+            return Ok(());
         }
         let mut changed = Vec::new();
         for (pos, needed) in staged {
@@ -279,6 +300,9 @@ impl GenerationSchedule {
     }
     pub(super) fn revision(&self) -> u64 {
         self.revision
+    }
+    pub(super) fn requirements(&self) -> impl Iterator<Item = (ChunkPos, GenerationStage)> + '_ {
+        self.required.iter().map(|(&pos, &stage)| (pos, stage))
     }
     pub fn required(&self, pos: ChunkPos) -> Option<GenerationStage> {
         self.required.get(&pos).copied()
@@ -829,6 +853,39 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn overlapping_requests_are_batched_without_partial_updates() {
+        let requests = [
+            (ChunkPos { x: -2, z: 1 }, Features),
+            (ChunkPos { x: 0, z: 0 }, InitializeLight),
+            (ChunkPos { x: -2, z: 1 }, Terrain),
+            (ChunkPos { x: 3, z: -1 }, StructureReferences),
+        ];
+        let mut sequential = GenerationSchedule::new();
+        for (pos, stage) in requests {
+            sequential.request(pos, stage).unwrap();
+        }
+        let mut combined = GenerationSchedule::new();
+        combined.request_many(requests).unwrap();
+        assert_eq!(combined.required, sequential.required);
+        assert_eq!(combined.ready, sequential.ready);
+        let before = combined.required.clone();
+        let ready = combined.ready.clone();
+        let revision = combined.revision;
+        assert!(
+            combined
+                .request_many([
+                    (ChunkPos { x: 100, z: 100 }, Features),
+                    (ChunkPos { x: i32::MAX, z: 0 }, Features),
+                ])
+                .is_err()
+        );
+        assert_eq!(combined.required, before);
+        assert_eq!(combined.ready, ready);
+        assert_eq!(combined.revision, revision);
+        combined.request_many([]).unwrap();
+        assert_eq!(combined.revision, revision);
     }
     #[test]
     fn steps_require_neighbor_completion_and_requests_are_transactional() {

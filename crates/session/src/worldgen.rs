@@ -6740,16 +6740,12 @@ mod tests {
         let rules = StructureBiomes::load(&mut data, [structure.clone()]).unwrap();
         let mut structures =
             structure_batch::StructureGenerationBatch::new(generator, rules, vec![set]).unwrap();
-        for dz in -2..=2 {
-            for dx in -2..=2 {
-                structures
-                    .request_references(ChunkPos {
-                        x: x + dx,
-                        z: z + dz,
-                    })
-                    .unwrap();
-            }
-        }
+        let preparation = structure_batch::StructurePreparationPlan::new([(
+            target,
+            schedule::GenerationStage::Features,
+        )])
+        .unwrap();
+        preparation.request_structures(&mut structures).unwrap();
         while structures
             .step(&mut data, &mut |value| {
                 let name = value.as_str().unwrap();
@@ -6763,15 +6759,6 @@ mod tests {
             .unwrap()
             .is_some()
         {}
-        let positions: Vec<_> = (-1..=1)
-            .flat_map(|dz| {
-                (-1..=1).map(move |dx| ChunkPos {
-                    x: x + dx,
-                    z: z + dz,
-                })
-            })
-            .collect();
-        let order = structures.unambiguous_terrain_orders(positions).unwrap();
         let blocks: BTreeSet<_> = [
             "air", "cave_air", "void_air", "bedrock", "stone", "dirt", "water", "lava", "sand",
             "chest",
@@ -6780,13 +6767,9 @@ mod tests {
         .map(|name| format!("minecraft:{name}"))
         .collect();
         let tags = CarverBlockTags::load(&mut data, &blocks).unwrap();
-        let mut batch = FreshTerrainBatch::new_with_prepared_structures(
-            structures,
-            order,
-            tags,
-            "minecraft:overworld",
-        )
-        .unwrap();
+        let mut batch = preparation
+            .into_terrain_batch(structures, tags, "minecraft:overworld")
+            .unwrap();
         assert_eq!(
             batch.structure_starts(target).unwrap()[&structure]
                 .bounds

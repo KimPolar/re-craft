@@ -46,6 +46,7 @@ mod ore;
 pub mod postprocessing;
 mod postprocessing_world;
 pub mod schedule;
+pub mod structure_batch;
 pub mod structure_references;
 mod terrain_batch;
 pub mod tick_index;
@@ -6367,6 +6368,7 @@ mod tests {
             structure_biomes::StructureBiomes,
             structure_placement::{StructureSetCache, StructureSetStart},
         };
+        use native_world::loaded::ChunkPos;
         struct StructureData(BTreeMap<String, Vec<u8>>);
         impl ResourceProvider for StructureData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -6435,6 +6437,78 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(existing, StructureSetStart::Existing));
+
+        // Exercise the same generator through the actual stage planner. A
+        // sparse set keeps this fixture fast while still producing a start.
+        data.0.insert(
+            "data/example/worldgen/structure_set/sparse.json".into(),
+            serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap(),
+        );
+        let sparse = ResourceId::parse("example:sparse").unwrap();
+        let [x, z] = cache
+            .load(&mut data, &sparse)
+            .unwrap()
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let mut batch =
+            super::structure_batch::StructureGenerationBatch::new(generator, rules, vec![sparse])
+                .unwrap();
+        batch.request_references(target).unwrap();
+        assert!(batch.references(target).is_none());
+        let mut operations = 0;
+        while batch
+            .step(&mut data, &mut |v| {
+                let id = v.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: id == "minecraft:air",
+                    blocks_motion: id == "minecraft:stone",
+                    blocks_motion_no_leaves: id == "minecraft:stone",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {
+            operations += 1;
+        }
+        assert_eq!(operations, 290);
+        assert!(batch.is_complete());
+        assert!(batch.starts(target).unwrap().contains_key(&structure_id));
+        let packed = ((z as u32 as u64) << 32 | x as u32 as u64) as i64;
+        assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+
+        data.0.insert(
+            "data/example/worldgen/structure/pyramid.json".into(),
+            serde_json::to_vec(
+                &json!({"type":"minecraft:stronghold","biomes":["minecraft:plains"]}),
+            )
+            .unwrap(),
+        );
+        let generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let rules = StructureBiomes::load(&mut data, [structure_id]).unwrap();
+        let mut failing = super::structure_batch::StructureGenerationBatch::new(
+            generator,
+            rules,
+            vec![ResourceId::parse("example:sparse").unwrap()],
+        )
+        .unwrap();
+        failing.request_references(target).unwrap();
+        let error = loop {
+            match failing.step(&mut data, &mut |_| {
+                panic!("unsupported structure must fail before classification")
+            }) {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("unsupported structure was silently skipped"),
+                Err(error) => break error,
+            }
+        };
+        assert!(format!("{error:#}").contains("unsupported simple structure"));
+        assert!(!failing.is_complete());
+        assert!(failing.starts(target).is_none());
+        assert!(failing.references(target).is_none());
+        assert!(failing.request_references(target).is_err());
     }
 
     #[test]

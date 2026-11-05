@@ -7,6 +7,8 @@ use native_resources::{
     structure_placement::{StructureSetCache, StructureSetStart},
 };
 use native_session::worldgen::TerrainGenerator;
+use native_session::worldgen::structure_batch::StructureGenerationBatch;
+use native_world::loaded::ChunkPos;
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 fn run(c: &mut Command) -> String {
@@ -118,6 +120,7 @@ fn structure_starts_use_vanilla_biomes_and_base_heights() {
     let mut evaluator = DensityEvaluator::default();
     let mut generated = 0;
     let mut generated_by_type = std::collections::BTreeMap::new();
+    let mut batch_sample = None;
     for (case, line) in cases.iter().zip(lines) {
         let words: Vec<_> = line.split_whitespace().collect();
         let x = case["x"].as_i64().unwrap() as i32;
@@ -160,6 +163,14 @@ fn structure_starts_use_vanilla_biomes_and_base_heights() {
                 assert_eq!(start.generation_point, [n(5), n(6), n(7)], "{line}");
                 assert_eq!(start.bounds.min, [n(9), n(10), n(11)], "{line}");
                 assert_eq!(start.bounds.max, [n(12), n(13), n(14)], "{line}");
+                if batch_sample.is_none() {
+                    batch_sample = Some((
+                        set.clone(),
+                        structure.clone(),
+                        ChunkPos { x, z },
+                        start.clone(),
+                    ));
+                }
                 let dir = start
                     .orientation
                     .map(|d| format!("{d:?}").to_uppercase())
@@ -175,4 +186,32 @@ fn structure_starts_use_vanilla_biomes_and_base_heights() {
         4,
         "each type needs a valid example: {generated_by_type:?}"
     );
+    let (set, structure, target, expected_start) = batch_sample.unwrap();
+    let mut batch = StructureGenerationBatch::new(generator, rules, vec![set]).unwrap();
+    batch.request_references(target).unwrap();
+    let mut operations = 0;
+    while batch
+        .step(&mut resources, &mut |v| {
+            let name = v
+                .as_str()
+                .or_else(|| v.get("id").and_then(Value::as_str))
+                .unwrap();
+            Ok(BlockHeightFlags {
+                is_air: name == "minecraft:air",
+                blocks_motion: name == "minecraft:stone",
+                blocks_motion_no_leaves: name == "minecraft:stone",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        })
+        .unwrap()
+        .is_some()
+    {
+        operations += 1;
+    }
+    assert_eq!(operations, 290);
+    let start = &batch.starts(target).unwrap()[&structure];
+    assert_eq!(start.generation_point, expected_start.generation_point);
+    assert_eq!(start.bounds, expected_start.bounds);
+    let packed = ((target.z as u32 as u64) << 32 | target.x as u32 as u64) as i64;
+    assert!(batch.references(target).unwrap()[&structure].contains(&packed));
 }

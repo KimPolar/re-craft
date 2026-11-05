@@ -57,6 +57,7 @@ trait PlannedHutPlacement {
         key: &super::structure_batch::TerrainStartKey,
         start: &mut native_resources::structure_start::SimpleStructureStart,
         clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
     ) -> Result<()>;
 }
 
@@ -81,6 +82,7 @@ where
             &World,
             &Value,
             native_core::beardifier::BoundingBox,
+            &[super::structure_batch::StructurePieceRevision],
         ) -> Result<bool>,
 {
     fn place(
@@ -89,6 +91,7 @@ where
         key: &super::structure_batch::TerrainStartKey,
         start: &mut native_resources::structure_start::SimpleStructureStart,
         clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
     ) -> Result<()> {
         let state = self
             .states
@@ -99,6 +102,7 @@ where
             &key.0,
             state,
             clip,
+            revisions,
             self.random,
             self.variants,
             self.construct,
@@ -1296,6 +1300,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
@@ -1331,6 +1336,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
@@ -1376,6 +1382,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
@@ -1421,6 +1428,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
@@ -1464,6 +1472,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         ensure!(
@@ -1662,17 +1671,19 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     }
                     DecorationAction::Structure(index) => {
                         let mut random = plan[index].entry.random(self.plan.decoration_seed());
-                        for start in &mut updated[index] {
+                        for start_index in 0..updated[index].len() {
+                            let start = &updated[index][start_index];
                             let intersects = (0..3).all(|axis| {
                                 start.bounds.max[axis] >= clip.min[axis]
                                     && start.bounds.min[axis] <= clip.max[axis]
                             });
                             if intersects {
                                 match start.kind {
-                                    native_resources::structure_start::SimpleStructureKind::BuriedTreasure => { region.place_buried_treasure(start, clip, &mut random)?; }
+                                    native_resources::structure_start::SimpleStructureKind::BuriedTreasure => { region.place_buried_treasure(&mut updated[index][start_index], clip, &mut random)?; }
                                     native_resources::structure_start::SimpleStructureKind::SwampHut => {
                                         let key = (plan[index].entry.id.clone(), ChunkPos { x: start.chunk[0], z: start.chunk[1] });
-                                        huts.as_mut().context("swamp hut decoration context is missing")?.place(&mut region, &key, start, clip)?;
+                                        let revisions: Vec<_> = plan.iter().zip(updated.iter()).flat_map(|(entry, starts)| starts.iter().map(|start| ((entry.entry.id.clone(), ChunkPos { x: start.chunk[0], z: start.chunk[1] }), start.bounds))).collect();
+                                        huts.as_mut().context("swamp hut decoration context is missing")?.place(&mut region, &key, &mut updated[index][start_index], clip, &revisions)?;
                                     }
                                     _ => bail!("unsupported structure decoration"),
                                 }
@@ -7340,7 +7351,8 @@ mod tests {
              _: [i32; 3],
              _: &World,
              value: &serde_json::Value,
-             bounds: native_core::beardifier::BoundingBox| {
+             bounds: native_core::beardifier::BoundingBox,
+             _: &[crate::worldgen::structure_batch::StructurePieceRevision]| {
                 assert_eq!(
                     *key,
                     (
@@ -7361,6 +7373,7 @@ mod tests {
                     &ResourceId::parse("example:hut").unwrap(),
                     &mut actual_state,
                     clip,
+                    &[],
                     &mut random,
                     &variants,
                     &mut construct,
@@ -7380,6 +7393,7 @@ mod tests {
                     &ResourceId::parse("example:hut").unwrap(),
                     &mut saved,
                     clip,
+                    &[],
                     &mut random,
                     &variants,
                     &mut construct,
@@ -7425,7 +7439,8 @@ mod tests {
              _: [i32; 3],
              _: &World,
              _: &serde_json::Value,
-             _: native_core::beardifier::BoundingBox|
+             _: native_core::beardifier::BoundingBox,
+             _: &[crate::worldgen::structure_batch::StructurePieceRevision]|
              -> Result<bool> { anyhow::bail!("missing structure context") };
         let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert!(
@@ -7435,6 +7450,7 @@ mod tests {
                     &ResourceId::parse("example:hut").unwrap(),
                     &mut actual_state,
                     clip,
+                    &[],
                     &mut random,
                     &variants,
                     &mut construct,
@@ -20996,7 +21012,7 @@ mod tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 Ok((path == "data/minecraft/cat_variant/black.json")
-                    .then(|| br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec()))
+                    .then(|| br#"{"spawn_conditions":[{"condition":{"type":"minecraft:structure","structures":"minecraft:buried_treasure"},"priority":0}]}"#.to_vec()))
             }
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
                 Ok(vec![ResourceId::parse(match folder {
@@ -21013,6 +21029,8 @@ mod tests {
             [
                 "minecraft:water",
                 "minecraft:lava",
+                "minecraft:sand",
+                "minecraft:chest",
                 "minecraft:spruce_planks",
                 "minecraft:oak_log",
                 "minecraft:oak_fence",
@@ -21030,7 +21048,20 @@ mod tests {
         let entry = StructureDecorationEntry {
             id: ResourceId::parse("minecraft:swamp_hut").unwrap(),
             step: 0,
+            index: 1,
+        };
+        let treasure_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:buried_treasure").unwrap(),
+            step: 0,
             index: 0,
+        };
+        let treasure = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            orientation: None,
+            bounds: BoundingBox::new([8, 14, 8], [8, 14, 8]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
         };
         let hut = SimpleStructureStart {
             kind: SimpleStructureKind::SwampHut,
@@ -21049,10 +21080,16 @@ mod tests {
             key.clone(),
             super::super::SavedSwampHutPiece::capture(&hut, state).unwrap(),
         )]);
-        let structures = [PlannedStructureDecoration {
-            entry: &entry,
-            starts: vec![&hut],
-        }];
+        let structures = [
+            PlannedStructureDecoration {
+                entry: &treasure_entry,
+                starts: vec![&treasure],
+            },
+            PlannedStructureDecoration {
+                entry: &entry,
+                starts: vec![&hut],
+            },
+        ];
         let make_construct = || {
             |mob| {
                 let (id, seed) = match mob {
@@ -21063,12 +21100,21 @@ mod tests {
             }
         };
         let mut construct = make_construct();
-        let mut condition = |_: &crate::worldgen::structure_batch::TerrainStartKey,
-                             _: [i32; 3],
-                             _: &World,
-                             _: &Value,
-                             _: native_core::beardifier::BoundingBox|
-         -> Result<bool> { anyhow::bail!("unexpected condition") };
+        let mut condition =
+            |_: &crate::worldgen::structure_batch::TerrainStartKey,
+             _: [i32; 3],
+             _: &World,
+             _: &Value,
+             _: native_core::beardifier::BoundingBox,
+             revisions: &[crate::worldgen::structure_batch::StructurePieceRevision]|
+             -> Result<bool> {
+                let (_, bounds) = revisions
+                    .iter()
+                    .find(|(key, _)| key.0 == treasure_entry.id)
+                    .context("treasure revision missing")?;
+                assert_ne!(bounds.min[1], treasure.bounds.min[1]);
+                Ok(true)
+            };
         let mut states = initial.clone();
         let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
         let (mut terrain, _, _, _) = fixture();
@@ -21083,7 +21129,7 @@ mod tests {
                 &mut condition,
             )
             .unwrap();
-        assert_eq!(updated[0][0].bounds, hut.bounds);
+        assert_eq!(updated[1][0].bounds, hut.bounds);
         assert!(states[&key].state.spawned_witch && states[&key].state.spawned_cat);
         assert_eq!(
             terrain
@@ -21100,13 +21146,17 @@ mod tests {
         let bad_entry = StructureDecorationEntry {
             id: ResourceId::parse("minecraft:desert_pyramid").unwrap(),
             step: 0,
-            index: 1,
+            index: 2,
         };
         let bad_start = SimpleStructureStart {
             kind: SimpleStructureKind::DesertPyramid,
             ..hut.clone()
         };
         let structures = [
+            PlannedStructureDecoration {
+                entry: &treasure_entry,
+                starts: vec![&treasure],
+            },
             PlannedStructureDecoration {
                 entry: &entry,
                 starts: vec![&hut],
@@ -21279,7 +21329,8 @@ mod tests {
                  _: [i32; 3],
                  _: &World,
                  _: &Value,
-                 _: native_core::beardifier::BoundingBox|
+                 _: native_core::beardifier::BoundingBox,
+                 _: &[crate::worldgen::structure_batch::StructurePieceRevision]|
                  -> Result<bool> { anyhow::bail!("unexpected condition") };
             let result = if staged {
                 let mut engine = StagedGenerationLightEngine::new(tracker);

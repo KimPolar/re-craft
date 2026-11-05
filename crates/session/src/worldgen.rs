@@ -6733,7 +6733,9 @@ mod tests {
             structure_piece::swamp_hut::HutMob, structure_placement::StructureSetCache,
         };
         use native_world::loaded::{BlockState, ChunkPos};
-        struct HutData;
+        struct HutData {
+            predicate: &'static str,
+        }
         impl ResourceProvider for HutData {
             fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
                 Ok(None)
@@ -6749,9 +6751,20 @@ mod tests {
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
                     ),
-                    "data/minecraft/cat_variant/black.json" => Some(
-                        json!({"spawn_conditions":[{"condition":{"type":"minecraft:structure","structures":"example:hut"},"priority":0}]}),
-                    ),
+                    "data/minecraft/cat_variant/black.json" => Some(json!({})),
+                    "data/example/cat_variant/structure_cat.json" => {
+                        let condition = match self.predicate {
+                            "structure" => {
+                                json!({"type":"minecraft:structure","structures":"example:hut"})
+                            }
+                            "biome" => json!({"type":"biome","biomes":"minecraft:plains"}),
+                            "moon" => {
+                                json!({"type":"minecraft:moon_brightness","range":{"min":0.9}})
+                            }
+                            _ => unreachable!(),
+                        };
+                        Some(json!({"spawn_conditions":[{"condition":condition,"priority":0}]}))
+                    }
                     "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                     | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
                         Some(json!({"values":["minecraft:stone","minecraft:dirt"]}))
@@ -6766,14 +6779,24 @@ mod tests {
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
                 match folder {
                     "worldgen/structure" => Ok(vec![ResourceId::parse("example:hut")?]),
-                    "cat_variant" => Ok(vec![ResourceId::parse("minecraft:black")?]),
+                    "cat_variant" => Ok(vec![
+                        ResourceId::parse("minecraft:black")?,
+                        ResourceId::parse("example:structure_cat")?,
+                    ]),
                     "cat_sound_variant" => Ok(vec![ResourceId::parse("minecraft:classic")?]),
                     _ => Data.list_data(folder),
                 }
             }
         }
-        for fail_mob in [false, true] {
-            let mut data = HutData;
+        for (fail_mob, native_conditions, predicate, phase, expected_variant) in [
+            (false, false, "structure", 0, "example:structure_cat"),
+            (true, false, "structure", 0, "example:structure_cat"),
+            (false, true, "structure", 0, "example:structure_cat"),
+            (false, true, "biome", 0, "example:structure_cat"),
+            (false, true, "moon", 0, "example:structure_cat"),
+            (false, true, "moon", 4, "minecraft:black"),
+        ] {
+            let mut data = HutData { predicate };
             let mut config = definition();
             config["settings"]["noise"]["height"] = json!(96);
             config["settings"]["material_rule"] =
@@ -6871,6 +6894,7 @@ mod tests {
                 batch.request_features(pos).unwrap();
             }
             let variants = CatSpawnVariants::load_active(&mut data).unwrap();
+            let conditions = variants.prepare_world_conditions(&mut data).unwrap();
             let mut construct = |mob| {
                 ensure!(!fail_mob, "injected mob initialization failure");
                 let (id, seed) = match mob {
@@ -6879,42 +6903,58 @@ mod tests {
                 };
                 FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
             };
-            let mut condition = |key: &crate::worldgen::structure_batch::TerrainStartKey,
-                                 pos: [i32; 3],
-                                 _: &native_world::loaded::World,
-                                 value: &Value,
-                                 bounds: native_core::beardifier::BoundingBox|
-             -> Result<bool> {
-                assert_eq!(key, &(structure.clone(), target));
-                assert_eq!(value["type"], "minecraft:structure");
-                assert_ne!(bounds.min[1], before.min[1]);
-                assert!(
-                    (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&pos[axis]))
-                );
-                Ok(true)
-            };
+            let mut condition =
+                |key: &crate::worldgen::structure_batch::TerrainStartKey,
+                 pos: [i32; 3],
+                 _: &native_world::loaded::World,
+                 value: &Value,
+                 bounds: native_core::beardifier::BoundingBox,
+                 _: &[crate::worldgen::structure_batch::StructurePieceRevision]|
+                 -> Result<bool> {
+                    assert_eq!(key, &(structure.clone(), target));
+                    assert_eq!(value["type"], "minecraft:structure");
+                    assert_ne!(bounds.min[1], before.min[1]);
+                    assert!(
+                        (0..3)
+                            .all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&pos[axis]))
+                    );
+                    Ok(true)
+                };
             let mut saw_failure = false;
             loop {
                 let previous = batch.snapshot();
-                let result = batch.step_with_hut_support(
-                    &mut data,
-                    &mut |value| {
-                        let name = value.as_str().unwrap();
-                        Ok(CarverBlockState {
-                            is_air: name == "minecraft:air",
-                            has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
-                        })
-                    },
-                    &mut |value| {
-                        Ok(BlockState {
-                            name: value.as_str().unwrap().into(),
-                            properties: BTreeMap::new(),
-                        })
-                    },
-                    &variants,
-                    &mut construct,
-                    &mut condition,
-                );
+                let mut classify = |value: &Value| {
+                    let name = value.as_str().unwrap();
+                    Ok(CarverBlockState {
+                        is_air: name == "minecraft:air",
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                };
+                let mut resolve = |value: &Value| {
+                    Ok(BlockState {
+                        name: value.as_str().unwrap().into(),
+                        properties: BTreeMap::new(),
+                    })
+                };
+                let result = if native_conditions {
+                    batch.step_with_native_hut_support(
+                        &mut data,
+                        &mut classify,
+                        &mut resolve,
+                        &variants,
+                        &conditions,
+                        phase,
+                    )
+                } else {
+                    batch.step_with_hut_support(
+                        &mut data,
+                        &mut classify,
+                        &mut resolve,
+                        &variants,
+                        &mut construct,
+                        &mut condition,
+                    )
+                };
                 match result {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
@@ -6941,6 +6981,11 @@ mod tests {
                 .map(|&pos| batch.recorded_generated_entities(pos).unwrap().len())
                 .sum();
             assert_eq!(entity_count, 2);
+            let cats: Vec<_> = requested.iter().flat_map(|&pos| batch.recorded_generated_entities(pos).unwrap().iter()).filter(|entity| matches!(entity.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:cat"))).collect();
+            assert_eq!(cats.len(), 1);
+            assert!(
+                matches!(cats[0].get("variant"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(expected_variant))
+            );
             let world = batch.snapshot().unwrap();
             assert!((start.bounds.min[0]..=start.bounds.max[0]).any(|x| {
                 (start.bounds.min[1]..=start.bounds.max[1]).any(|y| {

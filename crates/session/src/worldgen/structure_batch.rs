@@ -38,6 +38,9 @@ pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
 
+/// A structure start's current single-piece bounds during a decoration pass.
+pub type StructurePieceRevision = (TerrainStartKey, native_core::beardifier::BoundingBox);
+
 /// A registry-indexed structure with its referenced starts in Java's set
 /// order. All starts share the random stream seeded by `entry`.
 pub struct PlannedStructureDecoration<'a> {

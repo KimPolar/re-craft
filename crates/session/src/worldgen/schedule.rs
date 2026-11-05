@@ -41,6 +41,8 @@ pub(super) trait HutFeatureRunner {
         states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
+        all_structures: &super::structure_batch::PreparedStructureStages,
+        biomes: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>>;
 }
 
@@ -63,6 +65,7 @@ where
             &native_world::loaded::World,
             &serde_json::Value,
             native_core::beardifier::BoundingBox,
+            &[crate::worldgen::structure_batch::StructurePieceRevision],
         ) -> Result<bool>,
 {
     fn execute(
@@ -73,6 +76,8 @@ where
         states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
+        _all_structures: &super::structure_batch::PreparedStructureStages,
+        _biomes: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
         let (_, updated) = match lighting {
             StructureFeatureLighting::Visible(light) => prepared.execute_huts_with_visible_light(
@@ -111,6 +116,128 @@ where
                 )?,
         };
         Ok(updated)
+    }
+}
+
+/// Evaluate cat conditions against the currently prepared generation state.
+pub(super) struct NativeHutFeatureRunner<'a> {
+    pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
+    pub conditions: &'a native_resources::cat_variants::CatWorldConditions,
+    pub moon_phase: u8,
+}
+
+impl HutFeatureRunner for NativeHutFeatureRunner<'_> {
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        all_structures: &super::structure_batch::PreparedStructureStages,
+        biomes: &super::BiomeNeighborhood,
+    ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
+        use native_resources::cat_variants::CatSpawnContext;
+        use native_resources::structure_piece::swamp_hut::HutMob;
+        let conditions = self.conditions;
+        let moon_phase = self.moon_phase;
+        let mut construct = |mob| {
+            let id = match mob {
+                HutMob::Witch => "minecraft:witch",
+                HutMob::Cat => "minecraft:cat",
+            };
+            super::FreshCreatureRandom::from_entropy(&native_resources::packs::ResourceId::parse(
+                id,
+            )?)
+        };
+        let mut condition = |key: &super::structure_batch::TerrainStartKey,
+                             pos: [i32; 3],
+                             _: &native_world::loaded::World,
+                             value: &serde_json::Value,
+                             bounds: native_core::beardifier::BoundingBox,
+                             revisions: &[super::structure_batch::StructurePieceRevision]|
+         -> Result<bool> {
+            let kind = native_resources::packs::ResourceId::parse(
+                value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .context("cat condition type missing")?,
+            )?;
+            let mut matching = BTreeSet::new();
+            let is_biome = kind.namespace == "minecraft" && kind.path == "biome";
+            let is_structure = kind.namespace == "minecraft" && kind.path == "structure";
+            let biome = if is_biome {
+                Some(biomes.biome_at_block(pos[0], pos[1], pos[2])?)
+            } else {
+                None
+            };
+            if is_structure {
+                let chunk = ChunkPos {
+                    x: pos[0].div_euclid(16),
+                    z: pos[2].div_euclid(16),
+                };
+                let references = all_structures
+                    .references
+                    .get(&chunk)
+                    .context("cat spawn chunk structure references unavailable")?;
+                for (id, sources) in references.membership() {
+                    for &packed in sources {
+                        let bits = packed as u64;
+                        let source = ChunkPos {
+                            x: bits as u32 as i32,
+                            z: (bits >> 32) as u32 as i32,
+                        };
+                        let candidate = (id.clone(), source);
+                        let start = all_structures
+                            .starts
+                            .get(&source)
+                            .and_then(|starts| starts.get(id))
+                            .context("cat spawn referenced structure is missing")?;
+                        ensure!(
+                            start.chunk == [source.x, source.z],
+                            "cat spawn structure source differs"
+                        );
+                        let piece = if &candidate == key {
+                            bounds
+                        } else {
+                            revisions
+                                .iter()
+                                .find(|(revision, _)| revision == &candidate)
+                                .map_or(start.bounds, |(_, bounds)| *bounds)
+                        };
+                        if (0..3)
+                            .all(|axis| (piece.min[axis]..=piece.max[axis]).contains(&pos[axis]))
+                        {
+                            matching.insert(id.clone());
+                        }
+                    }
+                }
+            }
+            conditions.matches(
+                value,
+                &CatSpawnContext {
+                    biome,
+                    moon_phase: Some(moon_phase),
+                    structures_with_piece: is_structure.then_some(&matching),
+                },
+            )
+        };
+        HutFeatureCallbacks {
+            variants: self.variants,
+            construct: &mut construct,
+            condition: &mut condition,
+        }
+        .execute(
+            terrain,
+            prepared,
+            structures,
+            states,
+            random,
+            lighting,
+            all_structures,
+            biomes,
+        )
     }
 }
 impl GenerationStage {
@@ -790,13 +917,24 @@ impl GenerationSchedule {
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
         runner: &mut dyn HutFeatureRunner,
+        all_structures: &super::structure_batch::PreparedStructureStages,
+        biomes: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
         let center = prepared.center_chunk();
         ensure!(
             self.ready(center, Features),
             "features dependencies are incomplete"
         );
-        let updated = runner.execute(terrain, prepared, structures, states, random, lighting)?;
+        let updated = runner.execute(
+            terrain,
+            prepared,
+            structures,
+            states,
+            random,
+            lighting,
+            all_structures,
+            biomes,
+        )?;
         self.complete(center, Features)?;
         Ok(updated)
     }

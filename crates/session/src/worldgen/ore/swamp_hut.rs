@@ -95,6 +95,7 @@ impl DecorationRegion<'_> {
         structure_id: &native_resources::packs::ResourceId,
         saved: &mut super::super::SavedSwampHutPiece,
         clip: BoundingBox,
+        revisions: &[super::super::structure_batch::StructurePieceRevision],
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         cat_variants: &native_resources::cat_variants::CatSpawnVariants,
         construct: &mut C,
@@ -109,6 +110,7 @@ impl DecorationRegion<'_> {
                 &World,
                 &serde_json::Value,
                 BoundingBox,
+                &[super::super::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         let mut staged_piece = piece.clone();
@@ -121,6 +123,7 @@ impl DecorationRegion<'_> {
             structure_id,
             &mut staged_state,
             clip,
+            revisions,
             &mut staged_random,
             cat_variants,
             &mut staged_construct,
@@ -155,6 +158,7 @@ impl DecorationRegion<'_> {
         structure_id: &native_resources::packs::ResourceId,
         state: &mut SwampHutState,
         clip: BoundingBox,
+        revisions: &[super::super::structure_batch::StructurePieceRevision],
         random: &mut native_resources::worldgen_region_random::RegionRandom,
         cat_variants: &native_resources::cat_variants::CatSpawnVariants,
         construct: &mut C,
@@ -169,6 +173,7 @@ impl DecorationRegion<'_> {
                 &World,
                 &serde_json::Value,
                 BoundingBox,
+                &[super::super::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         use native_resources::worldgen_region_random::finalize_mob_base;
@@ -198,7 +203,7 @@ impl DecorationRegion<'_> {
                     )?,
                     HutMob::Cat => {
                         let cat = cat_variants.finalize_hut_cat(&mut next_random, |condition| {
-                            next_condition_matches(&key, pos, world, condition, bounds)
+                            next_condition_matches(&key, pos, world, condition, bounds, revisions)
                         })?;
                         super::super::draft_fresh_hut_cat(uuid, pos, &cat)?
                     }

@@ -23,7 +23,7 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        StructureFeatureLighting,
+        NativeHutFeatureRunner, StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3311,6 +3311,7 @@ impl FreshTerrainBatch {
                 &World,
                 &Value,
                 native_core::beardifier::BoundingBox,
+                &[crate::worldgen::structure_batch::StructurePieceRevision],
             ) -> Result<bool>,
     {
         let mut callbacks = HutFeatureCallbacks {
@@ -3319,6 +3320,27 @@ impl FreshTerrainBatch {
             condition,
         };
         self.step_inner(provider, classify, resolve, Some(&mut callbacks))
+    }
+
+    /// Perform one operation using active cat predicates and generated biome
+    /// and structure data. The caller supplies the actual level moon phase.
+    /// Missing referenced chunks fail rather than selecting a guessed variant.
+    pub fn step_with_native_hut_support(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon_phase: u8,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>> {
+        ensure!(moon_phase < 8, "invalid moon phase");
+        let mut runner = NativeHutFeatureRunner {
+            variants,
+            conditions,
+            moon_phase,
+        };
+        self.step_inner(provider, classify, resolve, Some(&mut runner))
     }
 
     fn step_inner(
@@ -3475,6 +3497,8 @@ impl FreshTerrainBatch {
                                 &mut region_random,
                                 lighting,
                                 runner,
+                                structures,
+                                &self.biomes,
                             )
                         } else {
                             self.schedule.run_features_with_structures(

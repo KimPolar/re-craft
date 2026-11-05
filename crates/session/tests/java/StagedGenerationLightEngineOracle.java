@@ -27,6 +27,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean sparseShadow;
     boolean sparseMany;
     boolean blockCase;
+    boolean stairCase;
     boolean tallSky;
     public int getMinY(){ return 0; }
     public int getHeight(){ return tallSky ? 64 : 16; }
@@ -59,7 +60,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
             if(x==1 && z==0 && !blockCase && !magmaOnly && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
-            if(x==0 && z==0 && blockCase){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
+            if(x==0 && z==0 && blockCase){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); if(!stairCase)f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
             if(x==1 && z==0 && blockCase) for(var entry:edits.entrySet())
                 if(Math.floorDiv(entry.getKey().getX(),16)==1 && Math.floorDiv(entry.getKey().getZ(),16)==0 && entry.getValue().getLightEmission()>0) f.accept(entry.getKey(),entry.getValue());
             if(x==1 && z==0 && lateFar) f.accept(new BlockPos(31,10,8),Blocks.TORCH.defaultBlockState());
@@ -130,6 +131,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean leafMany=args.length>1 && args[1].equals("leaf_active_many");
         boolean blockCase=args.length>1 && args[1].startsWith("block_incremental_");
         w.blockCase=blockCase;
+        w.stairCase=blockCase && args[1].startsWith("block_incremental_stair_");
         boolean skyMany=args.length>1 && (args[1].equals("sky_inactive_many") || args[1].equals("sky_inactive_activate_many"));
         boolean skyActivate=args.length>1 && args[1].startsWith("sky_inactive_activate");
         w.tallSky=args.length>1 && args[1].equals("sky_inactive_activate_tall");
@@ -204,7 +206,22 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 fake.section.setBlockState(0,10,8,initial);
                 w.edits.put(new BlockPos(16,10,8),initial);
             }
-            if(blockCase && x==0 && z==0){ fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState()); fake.section.setBlockState(14,10,8,Blocks.TORCH.defaultBlockState()); }
+            if(blockCase && x==0 && z==0){
+                fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState()); fake.section.setBlockState(14,10,8,Blocks.TORCH.defaultBlockState());
+                if(args[1].startsWith("block_incremental_stair_")){
+                    for(int lx=11;lx<=15;lx++) for(int y=9;y<=11;y++) for(int lz=7;lz<=9;lz++) {
+                        var p=new BlockPos(lx,y,lz);
+                        var block=(y==10 && lz==8)?Blocks.AIR.defaultBlockState():Blocks.STONE.defaultBlockState();
+                        fake.section.setBlockState(lx,y,lz,block);w.edits.put(p,block);
+                    }
+                    fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState());w.edits.put(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState());
+                    var stair=Blocks.OAK_STAIRS.defaultBlockState();
+                    fake.section.setBlockState(13,10,8,stair);
+                    w.edits.put(new BlockPos(13,10,8),stair);
+                    var neighbor=stair.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,Direction.SOUTH);
+                    fake.section.setBlockState(14,10,8,neighbor);w.edits.put(new BlockPos(14,10,8),neighbor);
+                }
+            }
             if(x==1 && z==0 && w.lateFar) fake.section.setBlockState(15,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && existing){
                 var initial=Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,false);
@@ -248,12 +265,16 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             String mode=args[1];
             int[][] positions=mode.equals("block_incremental_activate_many") ? new int[][]{{16,10,8},{17,10,8},{30,10,4}} :
                 mode.equals("block_incremental_many") ? new int[][]{{14,10,8},{15,10,8},{16,10,8}} :
+                mode.startsWith("block_incremental_stair_") ? new int[][]{{13,10,8}} :
                 mode.equals("block_incremental_remove") ? new int[][]{{14,10,8}} :
                 mode.equals("block_incremental_obstruct") ? new int[][]{{15,10,8}} :
                 mode.equals("block_incremental_add_active") ? new int[][]{{13,10,9}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); var fake=p[0]<16 ? centerSection : eastSection;
-                BlockState state=(p[0]==14 && p[2]==8) ? Blocks.AIR.defaultBlockState() :
+                BlockState state=mode.startsWith("block_incremental_stair_") ? Blocks.OAK_STAIRS.defaultBlockState().setValue(
+                    net.minecraft.world.level.block.state.properties.BlockStateProperties.STAIRS_SHAPE,
+                    mode.endsWith("outer") ? net.minecraft.world.level.block.state.properties.StairsShape.OUTER_LEFT : net.minecraft.world.level.block.state.properties.StairsShape.INNER_RIGHT) :
+                    (p[0]==14 && p[2]==8) ? Blocks.AIR.defaultBlockState() :
                     (p[0]==15 && p[2]==8) ? Blocks.STONE.defaultBlockState() : Blocks.TORCH.defaultBlockState();
                 var old=fake.section.setBlockState(Math.floorMod(p[0],16),p[1],p[2],state); w.edits.put(pos,state);
                 if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing block light check");

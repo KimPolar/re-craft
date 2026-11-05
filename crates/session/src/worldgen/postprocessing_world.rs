@@ -991,20 +991,8 @@ impl GeneratedBlockView<'_> {
                 flags == 276 && *next == expected,
                 "unsupported generated stair write"
             );
-            let same_light = native_world::block_light::same_light_behavior(&old, next)
-                .context("stair light behavior unavailable")?;
-            ensure!(
-                native_world::sky_light::same_sky_behavior(&old, next) == Some(true),
-                "stair shape changes direct sky sources"
-            );
-            if !same_light {
-                let change = native_world::block_light::light_change(&old, next)
-                    .context("stair light change unavailable")?;
-                ensure!(
-                    change.radius() == 0,
-                    "stair shape requires light propagation during postprocessing"
-                );
-            }
+            // LevelChunk queues lighting checks. The batch drains them after
+            // postprocessing at an explicitly chosen light-engine boundary.
             return self.write_postprocessed_state(pos, &old, next);
         }
         ensure!(
@@ -2136,6 +2124,33 @@ mod tests {
                     world.set_block_id(8, 7, 8, air).unwrap();
                 }
             }
+            case if case.starts_with("marked_stair_corner_") => {
+                let parts: Vec<_> = case["marked_stair_corner_".len()..].split('_').collect();
+                assert_eq!(parts.len(), 5);
+                let make_stair = |facing: &str, wet: bool| BlockState {
+                    name: "minecraft:oak_stairs".into(),
+                    properties: BTreeMap::from([
+                        ("facing".into(), facing.into()),
+                        ("half".into(), parts[2].into()),
+                        ("shape".into(), "straight".into()),
+                        ("waterlogged".into(), wet.to_string()),
+                    ]),
+                };
+                let center = world.intern_state(make_stair(parts[0], parts[3] == "true"));
+                let neighbor = world.intern_state(make_stair(parts[1], false));
+                world.set_block_id(8, 8, 8, center).unwrap();
+                let (dx, dz) = match parts[0] {
+                    "north" => (0, -1),
+                    "south" => (0, 1),
+                    "west" => (-1, 0),
+                    "east" => (1, 0),
+                    _ => panic!("invalid facing"),
+                };
+                let sign = if parts[4] == "front" { 1 } else { -1 };
+                world
+                    .set_block_id(8 + sign * dx, 8, 8 + sign * dz, neighbor)
+                    .unwrap();
+            }
             case if case.starts_with("marked_stair_variant_") => {
                 let parts: Vec<_> = case["marked_stair_variant_".len()..].split('_').collect();
                 assert_eq!(parts.len(), 3);
@@ -2395,6 +2410,11 @@ mod tests {
                     "stair {x},{y},{z} {} {} {}",
                     state.properties["facing"], state.properties["half"], state.properties["shape"]
                 ));
+            }
+        }
+        if case.starts_with("marked_stair_corner_") {
+            for check in &result.light_checks {
+                trace.push(format!("light {},{},{}", check.x, check.y, check.z));
             }
         }
         for change in &result.edits {
@@ -2663,6 +2683,24 @@ mod tests {
     }
 
     #[test]
+    fn postprocessed_stair_corners_update_shape_and_queue_light() {
+        let outer = water_spread_trace("marked_stair_corner_north_west_bottom_false_front");
+        assert!(
+            outer
+                .iter()
+                .any(|line| line == "stair 8,8,8 north bottom outer_left")
+        );
+        assert!(outer.iter().any(|line| line == "light 8,8,8"));
+        let inner = water_spread_trace("marked_stair_corner_north_west_bottom_false_back");
+        assert!(
+            inner
+                .iter()
+                .any(|line| line == "stair 8,8,8 north bottom inner_left")
+        );
+        assert!(inner.iter().any(|line| line == "light 8,8,8"));
+    }
+
+    #[test]
     fn marked_waterlogged_leaves_schedule_fluid_and_leaf_ticks_without_spreading() {
         let dry = water_spread_trace("marked_leaf_dry");
         assert!(!dry.iter().any(|line| line.starts_with("fluid ")));
@@ -2770,6 +2808,19 @@ mod tests {
                     expected.extend(water_spread_trace(&format!(
                         "marked_stair_variant_{facing}_{half}_{wet}"
                     )));
+                }
+            }
+        }
+        for facing in ["north", "south", "west", "east"] {
+            for neighbor in ["north", "south", "west", "east"] {
+                for half in ["bottom", "top"] {
+                    for wet in [false, true] {
+                        for side in ["front", "back"] {
+                            expected.extend(water_spread_trace(&format!(
+                                "marked_stair_corner_{facing}_{neighbor}_{half}_{wet}_{side}"
+                            )));
+                        }
+                    }
                 }
             }
         }

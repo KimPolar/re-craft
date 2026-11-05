@@ -6863,6 +6863,8 @@ mod tests {
             String::from_utf8_lossy(&compile.stderr)
         );
         for mode in [
+            "block_incremental_stair_outer",
+            "block_incremental_stair_inner",
             "block_incremental_remove",
             "block_incremental_obstruct",
             "block_incremental_add_active",
@@ -6906,6 +6908,28 @@ mod tests {
             let stone = world.intern_state(state("stone"));
             world.set_block_id(12, 10, 8, torch).unwrap();
             world.set_block_id(14, 10, 8, torch).unwrap();
+            if mode.starts_with("block_incremental_stair_") {
+                for x in 11..=15 {
+                    for y in 9..=11 {
+                        for z in 7..=9 {
+                            world
+                                .set_block_id(x, y, z, if y == 10 && z == 8 { air } else { stone })
+                                .unwrap();
+                        }
+                    }
+                }
+                world.set_block_id(12, 10, 8, torch).unwrap();
+                let mut neighbor = state("oak_stairs");
+                neighbor.properties = [
+                    ("facing".into(), "south".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "straight".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into();
+                let neighbor = world.intern_state(neighbor);
+                world.set_block_id(14, 10, 8, neighbor).unwrap();
+            }
             let positions: Vec<[i32; 3]> = match mode {
                 "block_incremental_remove" => vec![[14, 10, 8]],
                 "block_incremental_obstruct" => vec![[15, 10, 8]],
@@ -6913,10 +6937,31 @@ mod tests {
                 "block_incremental_add_inactive" => vec![[16, 10, 8]],
                 "block_incremental_activate" => vec![[16, 10, 8]],
                 "block_incremental_activate_many" => vec![[16, 10, 8], [17, 10, 8], [30, 10, 4]],
+                "block_incremental_stair_outer" | "block_incremental_stair_inner" => {
+                    vec![[13, 10, 8]]
+                }
                 _ => vec![[14, 10, 8], [15, 10, 8], [16, 10, 8], [14, 10, 8]],
             };
             for &[x, y, z] in &positions {
-                let id = if x == 14 && z == 8 {
+                let id = if mode.starts_with("block_incremental_stair_") {
+                    let mut stair = state("oak_stairs");
+                    stair.properties = [
+                        ("facing".into(), "north".into()),
+                        ("half".into(), "bottom".into()),
+                        (
+                            "shape".into(),
+                            if mode.ends_with("outer") {
+                                "outer_left"
+                            } else {
+                                "inner_right"
+                            }
+                            .into(),
+                        ),
+                        ("waterlogged".into(), "false".into()),
+                    ]
+                    .into();
+                    world.intern_state(stair)
+                } else if x == 14 && z == 8 {
                     air
                 } else if x == 15 && z == 8 {
                     stone
@@ -7034,7 +7079,8 @@ mod tests {
             assert_eq!(
                 changed == 0,
                 mode == "block_incremental_add_inactive"
-                    || mode.starts_with("block_incremental_activate"),
+                    || mode.starts_with("block_incremental_activate")
+                    || mode == "block_incremental_stair_inner",
                 "{mode}"
             );
         }

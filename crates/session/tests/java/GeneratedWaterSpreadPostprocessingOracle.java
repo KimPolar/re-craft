@@ -21,12 +21,14 @@ import net.minecraft.world.level.block.state.properties.Half;
 import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.material.*;
+import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.redstone.*;
 import net.minecraft.world.ticks.*;
 
 public class GeneratedWaterSpreadPostprocessingOracle {
     static BlockPos pos = new BlockPos(8,8,8);
     static final Map<BlockPos, BlockState> blocks = new HashMap<>();
+    static final List<BlockPos> lightChecks = new ArrayList<>();
     static LevelTicks<Block> blockAccess;
     static LevelTicks<Fluid> fluidAccess;
     static long counter;
@@ -58,6 +60,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         @Override public void neighborShapeChanged(Direction dir,BlockPos target,BlockPos source,BlockState state,int flags,int depth){updater.shapeUpdate(dir,state,target,source,flags,depth);}
         @Override public boolean setBlock(BlockPos p,BlockState state,int flags,int depth){
             var old=get(p);if(old==state)return false;blocks.put(p.immutable(),state);
+            if(LightEngine.hasDifferentLightProperties(old,state))lightChecks.add(p.immutable());
             if((flags&512)==0)state.onPlace(this,p,old,false);
             if((flags&1)!=0)updater.updateNeighborsAtExceptFromFacing(p,old.getBlock(),null,null);
             if((flags&16)==0 && depth>0){int next=flags&-34;old.updateIndirectNeighbourShapes(this,p,next,depth-1);state.updateNeighbourShapes(this,p,next,depth-1);state.updateIndirectNeighbourShapes(this,p,next,depth-1);}
@@ -106,11 +109,16 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         for(var facing:List.of("north","south","west","east"))
             for(var half:List.of("bottom","top"))
                 for(var wet:List.of(false,true)) scenarios.add("marked_stair_variant_"+facing+"_"+half+"_"+wet);
+        for(var facing:List.of("north","south","west","east"))
+            for(var neighbor:List.of("north","south","west","east"))
+                for(var half:List.of("bottom","top"))
+                    for(var wet:List.of(false,true))
+                        for(var side:List.of("front","back")) scenarios.add("marked_stair_corner_"+facing+"_"+neighbor+"_"+half+"_"+wet+"_"+side);
         for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off"),null);
-            blocks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
+            blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("down_wet_slab")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
             if(scenario.equals("down_sand"))blocks.put(pos.below().east(),Blocks.SAND.defaultBlockState());
             if(scenario.equals("down_wet_slab"))blocks.put(pos.below().east(),Blocks.STONE_SLAB.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true));
@@ -140,7 +148,19 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 blocks.put(pos.east(),Blocks.OAK_STAIRS.defaultBlockState().setValue(BlockStateProperties.HALF,scenario.equals("stair_top")?Half.TOP:Half.BOTTOM));
                 blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
             }
-            if(scenario.startsWith("marked_stair_variant_")) {
+            if(scenario.startsWith("marked_stair_corner_")) {
+                var parts=scenario.substring("marked_stair_corner_".length()).split("_");
+                var facing=Direction.byName(parts[0]);
+                var half=parts[2].equals("top")?Half.TOP:Half.BOTTOM;
+                blocks.put(pos,Blocks.OAK_STAIRS.defaultBlockState()
+                    .setValue(BlockStateProperties.HORIZONTAL_FACING,facing)
+                    .setValue(BlockStateProperties.HALF,half)
+                    .setValue(BlockStateProperties.WATERLOGGED,Boolean.parseBoolean(parts[3])));
+                blocks.put(pos.relative(parts[4].equals("front")?facing:facing.getOpposite()),
+                    Blocks.OAK_STAIRS.defaultBlockState()
+                        .setValue(BlockStateProperties.HORIZONTAL_FACING,Direction.byName(parts[1]))
+                        .setValue(BlockStateProperties.HALF,half));
+            } else if(scenario.startsWith("marked_stair_variant_")) {
                 var parts=scenario.substring("marked_stair_variant_".length()).split("_");
                 blocks.put(pos,Blocks.OAK_STAIRS.defaultBlockState()
                     .setValue(BlockStateProperties.HORIZONTAL_FACING,Direction.byName(parts[0]))
@@ -191,6 +211,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock || state.getBlock() instanceof LeavesBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
             }
+            if(scenario.startsWith("marked_stair_corner_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:ft.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}

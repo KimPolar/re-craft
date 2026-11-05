@@ -91,6 +91,17 @@ pub struct StructureRegionPreview {
     pub poi_regions: usize,
 }
 
+/// Structure-aware region drafts prepared from a self-contained selection.
+/// These drafts are intermediate and do not authorize world publication.
+pub struct PreparedStructureRegions {
+    pub chunk_count: usize,
+    pub referenced_start_chunks: BTreeSet<ChunkPos>,
+    pub regions: BTreeMap<
+        (native_persistence::save::FreshRegionKind, i32, i32),
+        native_persistence::save::FreshRegionDraft,
+    >,
+}
+
 /// A sealed proof of the inputs used by one completed postprocessing pass.
 /// The region remains owned by the caller and is unchanged on a failed rebase.
 pub struct PostprocessingExpansionCheckpoint {
@@ -3058,6 +3069,38 @@ impl FreshTerrainBatch {
         positions: impl IntoIterator<Item = ChunkPos>,
         timestamp: u32,
     ) -> Result<StructureRegionPreview> {
+        let prepared = self.prepare_structure_region_drafts(processed, positions, timestamp)?;
+        use native_persistence::save::FreshRegionKind;
+        Ok(StructureRegionPreview {
+            chunk_count: prepared.chunk_count,
+            referenced_start_chunks: prepared.referenced_start_chunks,
+            terrain_regions: prepared
+                .regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Terrain)
+                .count(),
+            entity_regions: prepared
+                .regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Entities)
+                .count(),
+            poi_regions: prepared
+                .regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Poi)
+                .count(),
+        })
+    }
+
+    /// Prepare self-contained terrain, entity and POI regions in memory.
+    /// Validated structure references do not establish the remaining world
+    /// initialization requirements; these drafts must not be published.
+    pub fn prepare_structure_region_drafts(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        timestamp: u32,
+    ) -> Result<PreparedStructureRegions> {
         ensure!(
             self.structures.is_some(),
             "structure generation is disabled"
@@ -3079,22 +3122,10 @@ impl FreshTerrainBatch {
         )?;
         let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
         let regions = group_fresh_regions(chunks, poi, timestamp)?;
-        use native_persistence::save::FreshRegionKind;
-        Ok(StructureRegionPreview {
+        Ok(PreparedStructureRegions {
             chunk_count: selected.len(),
             referenced_start_chunks,
-            terrain_regions: regions
-                .keys()
-                .filter(|(kind, _, _)| *kind == FreshRegionKind::Terrain)
-                .count(),
-            entity_regions: regions
-                .keys()
-                .filter(|(kind, _, _)| *kind == FreshRegionKind::Entities)
-                .count(),
-            poi_regions: regions
-                .keys()
-                .filter(|(kind, _, _)| *kind == FreshRegionKind::Poi)
-                .count(),
+            regions,
         })
     }
 

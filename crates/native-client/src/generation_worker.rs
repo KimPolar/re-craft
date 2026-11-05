@@ -4584,7 +4584,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn structured_worker_decorates_hut_using_initial_clocks() -> Result<()> {
         use native_resources::{
             carver::tags::CarverBlockTags,
@@ -4759,7 +4759,8 @@ mod tests {
                 })
             })
             .collect();
-        let worker = GenerationWorker::start_with_structures(prepare, targets, 71, 0, IVec3::ZERO)?;
+        let worker =
+            GenerationWorker::start_with_structures(prepare, targets.clone(), 71, 0, IVec3::ZERO)?;
         let mut ready = match worker
             .result
             .recv_timeout(std::time::Duration::from_secs(180))?
@@ -4812,15 +4813,17 @@ mod tests {
         drop(cats);
         drop(records);
         let mob_chunk = mob_chunk.context("hut entity chunk missing")?;
-        ready.batch.request_spawn_without_mobs(mob_chunk, false)?;
-        assert_eq!(
-            ready.batch.step(
-                &mut Data,
-                &mut |_| anyhow::bail!("unexpected terrain"),
-                &mut |_| anyhow::bail!("unexpected state")
-            )?,
-            Some((mob_chunk, GenerationStage::Spawn))
-        );
+        for &pos in &targets {
+            ready.batch.request_spawn_without_mobs(pos, false)?;
+            assert_eq!(
+                ready.batch.step(
+                    &mut Data,
+                    &mut |_| anyhow::bail!("unexpected terrain"),
+                    &mut |_| anyhow::bail!("unexpected state")
+                )?,
+                Some((pos, GenerationStage::Spawn))
+            );
+        }
         assert_eq!(
             ready
                 .batch
@@ -4830,16 +4833,19 @@ mod tests {
             2
         );
         ready.batch.spawned_block_entity_data(mob_chunk)?;
-        let mut stage = ready
-            .batch
-            .begin_generated_postprocessing([mob_chunk], 0, 0)?;
+        let mut stage =
+            ready
+                .batch
+                .begin_generated_postprocessing(targets.iter().copied(), 0, 0)?;
         stage.set_water_source_conversion(false)?;
-        while !stage.poll(mob_chunk, 256)? {}
+        for &pos in &targets {
+            while !stage.poll(pos, 256)? {}
+        }
         let region = stage.finish()?;
         let drafts = ready
             .batch
-            .postprocessed_chunk_drafts(&region, [mob_chunk])?;
-        assert_eq!(drafts.len(), 1);
+            .postprocessed_chunk_drafts(&region, targets.iter().copied())?;
+        assert_eq!(drafts.len(), targets.len());
         let draft = &drafts[&mob_chunk];
         assert_eq!(
             draft.entity_records.as_deref().map(Vec::len),
@@ -4850,6 +4856,97 @@ mod tests {
         assert_eq!(
             draft.chunk.value.get("structures"),
             Some(&ready.batch.structure_data(mob_chunk)?)
+        );
+        let preview = ready
+            .batch
+            .preview_structure_regions(&region, targets.iter().copied(), 1)?;
+        assert_eq!(preview.chunk_count, targets.len());
+        assert!(preview.referenced_start_chunks.contains(&target));
+        assert!(preview.entity_regions > 0);
+        let prepared =
+            ready
+                .batch
+                .prepare_structure_region_drafts(&region, targets.iter().copied(), 1)?;
+        assert_eq!(prepared.chunk_count, preview.chunk_count);
+        assert_eq!(
+            prepared.referenced_start_chunks,
+            preview.referenced_start_chunks
+        );
+        let directory = tempfile::tempdir()?;
+        for ((kind, rx, rz), region) in &prepared.regions {
+            use native_persistence::save::FreshRegionKind;
+            let folder = match kind {
+                FreshRegionKind::Terrain => "region",
+                FreshRegionKind::Entities => "entities",
+                FreshRegionKind::Poi => "poi",
+            };
+            let folder = directory.path().join(folder);
+            std::fs::create_dir_all(&folder)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(folder.join(format!("r.{rx}.{rz}.mca")))?;
+            ensure!(
+                region.write_staged(&mut file)?.is_empty(),
+                "unexpected external chunk"
+            );
+        }
+        std::fs::write(
+            directory.path().join("terrain.nbt"),
+            native_persistence::nbt::write(&drafts[&target].chunk)?,
+        )?;
+        std::fs::write(
+            directory.path().join("entities.nbt"),
+            native_persistence::nbt::write(draft.entity_chunk.as_ref().unwrap())?,
+        )?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), directory.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = directory.path().join("GeneratedHutRegionsOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedHutRegionsOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("GeneratedHutRegionsOracle")
+            .arg(directory.path())
+            .args([target.x, target.z, mob_chunk.x, mob_chunk.z].map(|n| n.to_string()))
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java hut region verification failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
         assert!(ready.hut_generation.is_some());
         ready.start_session(native_session::PlayerState {

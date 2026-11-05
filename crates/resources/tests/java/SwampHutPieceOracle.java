@@ -15,6 +15,7 @@ import net.minecraft.world.level.levelgen.structure.structures.SwampHutPiece;
 public class SwampHutPieceOracle {
     static final List<String> events=new ArrayList<>();
     static final Map<BlockPos,BlockState> blocks=new HashMap<>();
+    static int surfaceHeight=64;
     static void set(Object obj,String name,Object value)throws Exception{
         for(var type=obj.getClass();type!=null;type=type.getSuperclass())try{
             var field=type.getDeclaredField(name);field.setAccessible(true);field.set(obj,value);return;
@@ -44,12 +45,13 @@ public class SwampHutPieceOracle {
     }
     public static void main(String[] args)throws Exception{
         var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
+        if(args.length>0 && args[0].equals("natural-height"))surfaceHeight=63;
         var f=sun.misc.Unsafe.class.getDeclaredField("theUnsafe");f.setAccessible(true);
         var unsafe=(sun.misc.Unsafe)f.get(null);
         var chunk=(TracedChunk)unsafe.allocateInstance(TracedChunk.class);
         var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
             switch(m.getName()){
-                case "getHeightmapPos": {var p=(BlockPos)a[1];return new BlockPos(p.getX(),64,p.getZ());}
+                case "getHeightmapPos": {var p=(BlockPos)a[1];return new BlockPos(p.getX(),surfaceHeight,p.getZ());}
                 case "getMinY": return -64;
                 case "setBlock": {var p=((BlockPos)a[0]).immutable();var state=(BlockState)a[1];
                     if(!a[2].equals(2))throw new AssertionError("incorrect update flags");

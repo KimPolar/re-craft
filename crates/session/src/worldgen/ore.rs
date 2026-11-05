@@ -48,6 +48,7 @@ use super::{
 };
 
 mod buried_treasure;
+mod swamp_hut;
 
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
@@ -6746,6 +6747,381 @@ mod tests {
         assert_eq!(random.next_long(), expected_random.next_long());
         assert!(region.finish().is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn swamp_hut_draft_updates_blocks_marks_and_entities_transactionally() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::nbt::Tag;
+        use native_resources::structure_piece::swamp_hut::{HutMob, SwampHutState};
+        use native_resources::structure_start::{
+            HorizontalDirection, SimpleStructureKind, SimpleStructureStart,
+        };
+        let make_piece = || SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 64, 3], [9, 70, 11]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let (mut terrain, tags, _, _) = fixture();
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "water",
+            "lava",
+            "spruce_planks",
+            "oak_log",
+            "oak_fence",
+            "spruce_stairs",
+            "potted_red_mushroom",
+            "crafting_table",
+            "cauldron",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let world = Arc::make_mut(&mut terrain.world);
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        for y in 4..8 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    world.set_block_id(x, y, z, water).unwrap();
+                }
+            }
+        }
+        let before = terrain.snapshot();
+        let writable = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+        let clip = BoundingBox::new([0, -64, 0], [15, 100, 15]).unwrap();
+        let mut piece = make_piece();
+        let mut state = SwampHutState::default();
+        let mut order = Vec::new();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, writable.clone())
+            .unwrap();
+        assert!(
+            region
+                .place_swamp_hut(&mut piece, &mut state, clip, |mob, pos, world| {
+                    assert_eq!(
+                        world.block(pos[0], pos[1], pos[2]).unwrap().name,
+                        "minecraft:air"
+                    );
+                    order.push((mob, pos));
+                    Ok(Some(super::super::GeneratedEntityRecord::Saved(
+                        Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String(
+                                match mob {
+                                    HutMob::Witch => "minecraft:witch",
+                                    HutMob::Cat => "minecraft:cat",
+                                }
+                                .into(),
+                            ),
+                        )]),
+                    )))
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            order,
+            [(HutMob::Witch, [5, 10, 8]), (HutMob::Cat, [5, 10, 8])]
+        );
+        assert!(state.spawned_witch && state.spawned_cat);
+        region.finish().unwrap();
+        assert_eq!(before.block(4, 7, 5).unwrap().name, "minecraft:water");
+        assert_eq!(
+            terrain.snapshot().block(4, 7, 5).unwrap().name,
+            "minecraft:oak_log"
+        );
+        assert_eq!(
+            terrain.snapshot().block(4, 3, 5).unwrap().name,
+            "minecraft:stone"
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        let marks = &terrain.feature_postprocessing[&center];
+        let unpacked: Vec<_> = marks.sections()[0]
+            .iter()
+            .map(|&packed| marks.unpack(0, packed, 0, 0).unwrap())
+            .collect();
+        assert_eq!(unpacked, [[5, 11, 5], [6, 11, 10], [4, 10, 4], [8, 10, 4]]);
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap()[0].get("id"),
+            Some(&Tag::String("minecraft:witch".into()))
+        );
+        assert_eq!(
+            terrain.recorded_generated_entities(center).unwrap()[1].get("id"),
+            Some(&Tag::String("minecraft:cat".into()))
+        );
+        assert!(
+            terrain
+                .snapshot()
+                .saved_fluid_ticks
+                .get(&center)
+                .is_none_or(Vec::is_empty)
+        );
+
+        let before = terrain.snapshot();
+        let prior_entities = Arc::clone(&terrain.generated_entities);
+        let mut second = make_piece();
+        let mut second_state = SwampHutState::default();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let result = region.place_swamp_hut(&mut second, &mut second_state, clip, |mob, _, _| {
+            if mob == HutMob::Cat {
+                anyhow::bail!("cat creation unavailable");
+            }
+            Ok(Some(super::super::GeneratedEntityRecord::Saved(
+                Tag::Compound(vec![]),
+            )))
+        });
+        assert!(result.is_err());
+        assert_eq!(second.bounds, make_piece().bounds);
+        assert_eq!(second_state, SwampHutState::default());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.snapshot(), &before));
+        assert!(Arc::ptr_eq(&terrain.generated_entities, &prior_entities));
+
+        let world = Arc::make_mut(&mut terrain.world);
+        let beacon = world.intern_state(self::state("beacon"));
+        world.set_block_id(4, 9, 4, beacon).unwrap();
+        let before = terrain.snapshot();
+        let mut piece = make_piece();
+        let mut saved = SwampHutState::default();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        assert!(
+            region
+                .place_swamp_hut(&mut piece, &mut saved, clip, |_, _, _| Ok(None))
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert_eq!(piece.bounds, make_piece().bounds);
+        assert_eq!(saved, SwampHutState::default());
+        assert!(Arc::ptr_eq(&terrain.snapshot(), &before));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_swamp_hut_blocks_and_marks_match_java() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_piece::swamp_hut::SwampHutState;
+        use native_resources::structure_start::{
+            HorizontalDirection, SimpleStructureKind, SimpleStructureStart,
+        };
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path)
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("SwampHutPieceOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/SwampHutPieceOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("SwampHutPieceOracle")
+            .arg("natural-height"));
+        let mut expected: Vec<BTreeMap<[i32; 3], String>> =
+            (0..4).map(|_| BTreeMap::new()).collect();
+        let mut expected_marks: Vec<Vec<[i32; 3]>> = (0..4).map(|_| Vec::new()).collect();
+        let mut selected = None;
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.first() == Some(&"C") {
+                let direction: usize = fields[1].parse().unwrap();
+                selected = (fields[2] == "0" && fields[3] == "0").then_some(direction);
+            } else if let Some(direction) = selected {
+                if fields.first() == Some(&"W") || fields.first() == Some(&"M") {
+                    let p: Vec<i32> = fields[1].split(',').map(|v| v.parse().unwrap()).collect();
+                    let p = [p[0], p[1], p[2]];
+                    if fields[0] == "W" {
+                        expected[direction].insert(p, fields[2].to_owned());
+                    } else {
+                        expected_marks[direction].push(p);
+                    }
+                }
+            }
+        }
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "water",
+            "lava",
+            "spruce_planks",
+            "oak_log",
+            "oak_fence",
+            "spruce_stairs",
+            "potted_red_mushroom",
+            "crafting_table",
+            "cauldron",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        for (index, orientation) in [
+            HorizontalDirection::North,
+            HorizontalDirection::East,
+            HorizontalDirection::South,
+            HorizontalDirection::West,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(!expected[index].is_empty());
+            let (mut terrain, tags, _, _) = fixture();
+            terrain.height = 96;
+            let world = Arc::make_mut(&mut terrain.world);
+            let air = world.intern_state(state("air"));
+            let stone = world.intern_state(state("stone"));
+            let water = world.intern_state(BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            });
+            for c in world.chunks.values_mut() {
+                let c = Arc::make_mut(c);
+                c.sections.clear();
+                for section in 0..6 {
+                    let mut blocks = Box::new([air; BLOCK_COUNT]);
+                    for y in 0..16 {
+                        let id = if section * 16 + y < 60 {
+                            stone
+                        } else if section * 16 + y < 63 {
+                            water
+                        } else {
+                            air
+                        };
+                        blocks[y as usize * 256..(y as usize + 1) * 256].fill(id);
+                    }
+                    c.sections.insert(
+                        section as i8,
+                        Arc::new(Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    );
+                }
+            }
+            let max = if index % 2 == 0 { [9, 11] } else { [11, 9] };
+            let mut piece = SimpleStructureStart {
+                kind: SimpleStructureKind::SwampHut,
+                chunk: [0, 0],
+                generation_point: [0, 0, 0],
+                orientation: Some(orientation),
+                bounds: BoundingBox::new([3, 64, 3], [max[0], 70, max[1]]).unwrap(),
+                terrain_adjustment: TerrainAdjustment::None,
+            };
+            let mut saved = SwampHutState {
+                spawned_witch: true,
+                spawned_cat: true,
+                ..Default::default()
+            };
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            assert!(
+                region
+                    .place_swamp_hut(
+                        &mut piece,
+                        &mut saved,
+                        BoundingBox::new([0, -64, 0], [15, 319, 15]).unwrap(),
+                        |_, _, _| panic!("unexpected mob")
+                    )
+                    .unwrap()
+            );
+            region.finish().unwrap();
+            let snapshot = terrain.snapshot();
+            for y in 0..96 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let p = [x, y, z];
+                        let block = snapshot.block(x, y, z).unwrap();
+                        let mut actual = block.name.strip_prefix("minecraft:").unwrap().to_owned();
+                        if actual == "spruce_stairs" {
+                            actual = format!(
+                                "{actual}:{}:{}",
+                                block.properties["facing"].to_uppercase(),
+                                block.properties["shape"]
+                            );
+                        }
+                        let fallback = if y < 60 {
+                            "stone"
+                        } else if y < 63 {
+                            "water"
+                        } else {
+                            "air"
+                        };
+                        assert_eq!(
+                            actual,
+                            expected[index].get(&p).map_or(fallback, String::as_str),
+                            "orientation {index} at {p:?}"
+                        );
+                    }
+                }
+            }
+            let marks = &terrain.feature_postprocessing[&ChunkPos { x: 0, z: 0 }];
+            let actual: Vec<_> = marks
+                .sections()
+                .iter()
+                .enumerate()
+                .flat_map(|(section, values)| {
+                    values
+                        .iter()
+                        .map(move |&packed| marks.unpack(section, packed, 0, 0).unwrap())
+                })
+                .collect();
+            assert_eq!(actual, expected_marks[index]);
+        }
     }
 
     #[test]

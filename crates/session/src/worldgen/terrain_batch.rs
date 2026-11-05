@@ -238,6 +238,35 @@ fn group_fresh_regions(
     Ok(regions)
 }
 
+/// Attach only structure data produced by this generation batch. The chunk
+/// remains an in-memory draft and this does not establish save completeness.
+fn attach_generated_structure_data(
+    mut chunk: native_persistence::nbt::NamedTag,
+    structures: native_persistence::nbt::Tag,
+) -> Result<native_persistence::nbt::NamedTag> {
+    use native_persistence::nbt::Tag;
+    let Tag::Compound(fields) = &mut chunk.value else {
+        bail!("generated chunk root is not a compound")
+    };
+    let mut matching = fields
+        .iter_mut()
+        .filter(|(name, _)| name.matches("structures"));
+    let (_, value) = matching
+        .next()
+        .context("generated chunk structures are missing")?;
+    ensure!(
+        matching.next().is_none(),
+        "duplicate generated chunk structures"
+    );
+    ensure!(
+        matches!(value, Tag::Compound(_)) && matches!(structures, Tag::Compound(_)),
+        "invalid generated structure data"
+    );
+    *value = structures;
+    native_persistence::nbt::write(&chunk)?;
+    Ok(chunk)
+}
+
 pub(super) fn updated_postprocessing_sky_sources(
     before: &World,
     after: &World,
@@ -639,9 +668,26 @@ impl GeneratedEntitySources {
     fn contains_complete_spawn(&self, pos: ChunkPos) -> bool {
         !self.untracked && self.complete_spawns.contains(&pos)
     }
+
+    fn complete_entity_coverage(
+        &self,
+        pos: ChunkPos,
+        structures_enabled: bool,
+        features_entity_free: bool,
+    ) -> bool {
+        !structures_enabled && features_entity_free && self.contains_complete_spawn(pos)
+    }
 }
 
 impl FreshTerrainBatch {
+    #[cfg(test)]
+    pub(super) fn set_structure_stages_for_test(
+        &mut self,
+        structures: Option<PreparedStructureStages>,
+    ) {
+        self.structures = structures;
+    }
+
     /// Structure starts remain intermediate and do not authorize saving.
     pub fn structure_starts(&self, pos: ChunkPos) -> Option<&super::structure_batch::SimpleStarts> {
         (!self.failed)
@@ -937,9 +983,11 @@ impl FreshTerrainBatch {
             "entity completeness requires a spawn-complete chunk"
         );
         let decoration = self.decoration.as_ref().context("decoration is missing")?;
-        if !self.entity_sources.contains_complete_spawn(pos)
-            || !decoration.features_cannot_spawn_entities
-        {
+        if !self.entity_sources.complete_entity_coverage(
+            pos,
+            self.structures.is_some(),
+            decoration.features_cannot_spawn_entities,
+        ) {
             return Ok(None);
         }
         Ok(Some(self.recorded_generated_entities(pos)?))
@@ -2653,6 +2701,11 @@ impl FreshTerrainBatch {
                         block_entities: components.block_entities,
                     },
                 )?;
+                let chunk = if self.structures.is_some() {
+                    attach_generated_structure_data(chunk, self.structure_data(pos)?)?
+                } else {
+                    chunk
+                };
                 Ok((
                     pos,
                     PostprocessedChunkDraft {
@@ -2738,7 +2791,7 @@ impl FreshTerrainBatch {
         let block_entities = self.spawned_block_entity_data(pos)?;
         let (block_ticks, fluid_ticks) = self.spawned_tick_data(pos)?;
         let postprocessing = self.spawned_postprocessing_data(pos)?;
-        native_persistence::generated_chunk::assemble_spawn_chunk(
+        let chunk = native_persistence::generated_chunk::assemble_spawn_chunk(
             native_persistence::generated_chunk::SpawnChunkComponents {
                 position: pos,
                 min_y: self.generator.min_y,
@@ -2752,7 +2805,12 @@ impl FreshTerrainBatch {
                 block_entities,
                 entities,
             },
-        )
+        )?;
+        if self.structures.is_some() {
+            attach_generated_structure_data(chunk, self.structure_data(pos)?)
+        } else {
+            Ok(chunk)
+        }
     }
 
     /// Use records captured by implemented generation paths. Other feature or
@@ -3248,6 +3306,70 @@ mod region_draft_tests {
     }
 
     #[test]
+    fn attaching_structure_data_preserves_the_chunk_and_rejects_invalid_drafts() {
+        let structures = Tag::Compound(vec![
+            (
+                "starts".into(),
+                Tag::Compound(vec![(
+                    "example:treasure".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("example:treasure".into())),
+                        ("ChunkX".into(), Tag::Int(-1)),
+                    ]),
+                )]),
+            ),
+            (
+                "References".into(),
+                Tag::Compound(vec![(
+                    "example:treasure".into(),
+                    Tag::LongArray(vec![-1, 0]),
+                )]),
+            ),
+        ]);
+        let empty = Tag::Compound(vec![
+            ("starts".into(), Tag::Compound(vec![])),
+            ("References".into(), Tag::Compound(vec![])),
+        ]);
+        for status in ["minecraft:spawn", "minecraft:full"] {
+            let draft = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("Status".into(), Tag::String(status.into())),
+                    ("structures".into(), empty.clone()),
+                    ("xPos".into(), Tag::Int(-1)),
+                ]),
+            };
+            let result = attach_generated_structure_data(draft, structures.clone()).unwrap();
+            assert_eq!(result.value.get("structures"), Some(&structures));
+            assert_eq!(result.value.get("xPos"), Some(&Tag::Int(-1)));
+            assert_eq!(
+                result.value.get("Status"),
+                Some(&Tag::String(status.into()))
+            );
+            let bytes = native_persistence::nbt::write(&result).unwrap();
+            assert_eq!(native_persistence::nbt::read(&bytes).unwrap(), result);
+        }
+        let missing = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        };
+        assert!(attach_generated_structure_data(missing, structures.clone()).is_err());
+        let duplicate = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("structures".into(), empty.clone()),
+                ("structures".into(), empty.clone()),
+            ]),
+        };
+        assert!(attach_generated_structure_data(duplicate, structures).is_err());
+        let malformed = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("structures".into(), empty)]),
+        };
+        assert!(attach_generated_structure_data(malformed, Tag::Int(0)).is_err());
+    }
+
+    #[test]
     fn generated_region_grouping_requires_complete_coverage_and_keeps_storage_separate() {
         let west = ChunkPos { x: -1, z: 0 };
         let east = ChunkPos { x: 0, z: 0 };
@@ -3494,6 +3616,9 @@ mod entity_source_tests {
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[local]);
         assert!(evidence.contains_complete_spawn(chunk));
+        assert!(evidence.complete_entity_coverage(chunk, false, true));
+        assert!(!evidence.complete_entity_coverage(chunk, true, true));
+        assert!(!evidence.complete_entity_coverage(chunk, false, false));
         evidence.complete_spawn(ChunkPos { x: 1, z: 0 }, &[neighbor]);
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[]);

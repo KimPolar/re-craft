@@ -5107,6 +5107,58 @@ mod tests {
             Some(&native_persistence::nbt::Tag::Byte(1))
         );
         assert!(full.chunk.value.get("entities").is_none());
+        // Exercise structure serialization through both actual chunk draft paths.
+        let structure_id = ResourceId::parse("example:treasure").unwrap();
+        let point = [center.x * 16 + 9, 8, center.z * 16 + 9];
+        let structure = native_resources::structure_start::SimpleStructureStart {
+            kind: native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
+            chunk: [center.x, center.z],
+            generation_point: [center.x * 16 + 8, 8, center.z * 16 + 8],
+            orientation: None,
+            bounds: native_core::beardifier::BoundingBox::new(point, point).unwrap(),
+            terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+        };
+        let bounds = structure_references::StructureStartBounds::from_simple(
+            structure_id.clone(),
+            &structure,
+        )
+        .unwrap();
+        let references =
+            structure_references::collect_ordered_structure_references(center, |source| {
+                Ok(if source == center {
+                    vec![bounds.clone()]
+                } else {
+                    vec![]
+                })
+            })
+            .unwrap();
+        batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
+            starts: BTreeMap::from([(center, BTreeMap::from([(structure_id, structure)]))]),
+            references: BTreeMap::from([(center, references)]),
+            terrain: BTreeMap::new(),
+        }));
+        let structure_nbt = batch.structure_data(center).unwrap();
+        let spawn_with_structures = batch.spawned_chunk_draft(center, 42, vec![]).unwrap();
+        assert_eq!(
+            spawn_with_structures.value.get("structures"),
+            Some(&structure_nbt)
+        );
+        let full_with_structures = batch
+            .postprocessed_chunk_drafts(&processed, [center])
+            .unwrap()
+            .remove(&center)
+            .unwrap();
+        assert_eq!(
+            full_with_structures.chunk.value.get("structures"),
+            Some(&structure_nbt)
+        );
+        assert!(full_with_structures.entity_records.is_none());
+        assert!(
+            batch
+                .postprocessed_region_drafts(&processed, [center], 0)
+                .is_err()
+        );
+        batch.set_structure_stages_for_test(None);
         assert_eq!(full.entity_records, component.entity_records);
         let expected_entities = full.entity_records.as_ref().map(|records| {
             native_persistence::generated_chunk::assemble_entity_chunk(center, records).unwrap()

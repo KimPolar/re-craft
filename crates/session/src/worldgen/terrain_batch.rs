@@ -784,6 +784,12 @@ impl FreshTerrainBatch {
     /// The returned data does not establish that the world is safe to save.
     pub fn structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
         self.structure_reference_sources(pos)?;
+        self.pack_validated_structure_data(pos)
+    }
+
+    // Only used after checking this chunk's references against this immutable
+    // batch. The public structure_data entry point always performs that check.
+    fn pack_validated_structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
         let structures = self
             .structures
             .as_ref()
@@ -2900,6 +2906,15 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
+        self.postprocessed_chunk_drafts_with_validated_structures(processed, positions, None)
+    }
+
+    fn postprocessed_chunk_drafts_with_validated_structures(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        validated: Option<&BTreeSet<ChunkPos>>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
         let time = processed.ticks.game_time();
         self.postprocessed_chunk_components(processed, positions)?
             .into_iter()
@@ -2925,7 +2940,12 @@ impl FreshTerrainBatch {
                     },
                 )?;
                 let chunk = if self.structures.is_some() {
-                    attach_generated_structure_data(chunk, self.structure_data(pos)?)?
+                    let data = if validated.is_some_and(|selection| selection.contains(&pos)) {
+                        self.pack_validated_structure_data(pos)?
+                    } else {
+                        self.structure_data(pos)?
+                    };
+                    attach_generated_structure_data(chunk, data)?
                 } else {
                     chunk
                 };
@@ -3004,7 +3024,11 @@ impl FreshTerrainBatch {
         let referenced_start_chunks = require_selected_structure_sources(&selected, |pos| {
             self.structure_reference_sources(pos)
         })?;
-        let chunks = self.postprocessed_chunk_drafts(processed, positions.iter().copied())?;
+        let chunks = self.postprocessed_chunk_drafts_with_validated_structures(
+            processed,
+            positions.iter().copied(),
+            Some(&selected),
+        )?;
         let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
         let regions = group_fresh_regions(chunks, poi, timestamp)?;
         use native_persistence::save::FreshRegionKind;

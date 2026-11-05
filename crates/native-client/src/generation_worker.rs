@@ -4180,6 +4180,24 @@ mod tests {
         assert!(!preview.referenced_start_chunks.is_empty());
         assert!(preview.referenced_start_chunks.is_subset(selected));
         if verify_java {
+            assert_eq!(
+                preview,
+                player_ready.batch.preview_structure_regions(
+                    &processed.region,
+                    selected.iter().rev().copied(),
+                    1,
+                )?
+            );
+            let duplicate = selected
+                .iter()
+                .copied()
+                .chain(selected.iter().next().copied());
+            assert!(
+                player_ready
+                    .batch
+                    .preview_structure_regions(&processed.region, duplicate, 1,)
+                    .is_err()
+            );
             verify_generated_structure_region_with_java(
                 &game,
                 temp.path(),

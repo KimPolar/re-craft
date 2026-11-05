@@ -58,6 +58,50 @@ pub struct RuinDataMarker {
     pub metadata: native_persistence::nbt::JavaString,
 }
 
+/// World-dependent parts of structure drowned initialization. Implementations
+/// must isolate their state when cloned; the enclosing decoration attempt must
+/// also stage the context until the whole region is published.
+pub trait DrownedMarkerContext: Clone {
+    fn special_multiplier(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<f32>;
+    fn halloween(&mut self) -> Result<bool>;
+    fn try_existing_chicken(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<bool>;
+    fn spawn_chicken_jockey(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+    ) -> Result<bool>;
+    /// Return the final item-stack NBT after the active enchantment provider.
+    fn enchant_weapon(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        weapon: native_resources::drowned_spawn::MainHandRoll,
+        special: f32,
+    ) -> Result<Tag>;
+    fn more_frequent_drowned_biome(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<bool>;
+    fn spawn_zombie_nautilus(
+        &mut self,
+        position: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        persistent: bool,
+    ) -> Result<bool>;
+}
+
 impl PreparedPiece {
     /// Java creates a fresh position-seeded random source each time it chooses
     /// a palette, including for the later marker pass.

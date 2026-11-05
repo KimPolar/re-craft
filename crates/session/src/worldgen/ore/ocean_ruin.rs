@@ -1,6 +1,13 @@
 //! Access the current decoration region for ocean-ruin floor adjustment.
 use super::*;
+use native_persistence::nbt::Tag;
 use native_resources::ocean_ruin::{DataMarkerKind, FloorWorld, MarkerWorld, handle_data_marker};
+use native_resources::{
+    drowned_spawn::{
+        MainHandRoll, NautilusJockeyWorld, StructureDrownedWorld, initialize_structure_drowned,
+    },
+    worldgen_region_random::RegionRandom,
+};
 
 fn fluid_in_water_tag(state: &BlockState, water_fluids: &BTreeSet<String>) -> Result<bool> {
     let fluid =
@@ -58,6 +65,110 @@ impl DecorationRegion<'_> {
     where
         F: Clone + FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
     {
+        let mut next_spawn = spawn.clone();
+        self.handle_ocean_ruin_marker_inner(
+            marker,
+            large,
+            sea_level,
+            water_fluids,
+            registry,
+            random,
+            &mut next_spawn,
+        )?;
+        *spawn = next_spawn;
+        Ok(())
+    }
+
+    /// Initialize and save a structure drowned using separate region and
+    /// entity random sources. The constructor returns None when Java's entity
+    /// factory returns null. Mounted drowned fail closed until their vehicle
+    /// and passenger serialization is supported.
+    /// All callback state must be cloned independently and staged again by
+    /// the caller until the enclosing decoration region is committed.
+    pub fn handle_ocean_ruin_marker_with_initialized_drowned<C, W>(
+        &mut self,
+        marker: &super::super::ocean_ruin::RuinDataMarker,
+        large: bool,
+        sea_level: i32,
+        water_fluids: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        decoration_random: &mut DecorationRandom,
+        region_random: &mut RegionRandom,
+        construct: &mut C,
+        context: &mut W,
+    ) -> Result<()>
+    where
+        C: Clone + FnMut() -> Result<Option<super::super::FreshCreatureRandom>>,
+        W: super::super::ocean_ruin::DrownedMarkerContext,
+    {
+        let mut next_random = region_random.clone();
+        let mut next_construct = construct.clone();
+        let mut next_context = context.clone();
+        let mut spawn = |position, world: &World| {
+            let Some(mut creature) = next_construct()? else {
+                return Ok(None);
+            };
+            ensure!(
+                creature.construction.chicken_egg_time.is_none(),
+                "invalid drowned construction"
+            );
+            let special = next_context.special_multiplier(position, world)?;
+            let halloween = next_context.halloween()?;
+            let mut adapter = DrownedMarkerAdapter {
+                position,
+                world,
+                context: &mut next_context,
+                enchanted_hand: None,
+            };
+            let initialized = initialize_structure_drowned(
+                &mut adapter,
+                &mut next_random,
+                &mut creature.random,
+                special,
+                halloween,
+            )?;
+            let main_hand = match (initialized.main_hand, adapter.enchanted_hand) {
+                (MainHandRoll::Unchanged, None) => None,
+                (MainHandRoll::Trident, None) => Some(default_hand("minecraft:trident")),
+                (MainHandRoll::FishingRod, None) => Some(default_hand("minecraft:fishing_rod")),
+                (_, Some(tag)) => Some(tag),
+            };
+            let tag = super::super::draft_fresh_structure_drowned(
+                creature.construction.uuid,
+                position,
+                &initialized,
+                main_hand,
+            )?;
+            Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
+        };
+        self.handle_ocean_ruin_marker_inner(
+            marker,
+            large,
+            sea_level,
+            water_fluids,
+            registry,
+            decoration_random,
+            &mut spawn,
+        )?;
+        *region_random = next_random;
+        *construct = next_construct;
+        *context = next_context;
+        Ok(())
+    }
+
+    fn handle_ocean_ruin_marker_inner<F>(
+        &mut self,
+        marker: &super::super::ocean_ruin::RuinDataMarker,
+        large: bool,
+        sea_level: i32,
+        water_fluids: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        random: &mut DecorationRandom,
+        spawn: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+    {
         ensure!(!self.failed, "generation attempt previously failed");
         let kind = if marker.metadata.matches("chest") {
             DataMarkerKind::Chest
@@ -67,7 +178,6 @@ impl DecorationRegion<'_> {
             DataMarkerKind::Other
         };
         let mut next_random = random.clone();
-        let mut next_spawn = spawn.clone();
         self.failed = true;
         handle_data_marker(
             &mut RuinMarkerRegion {
@@ -75,7 +185,7 @@ impl DecorationRegion<'_> {
                 registry,
                 water_fluids,
                 sea_level,
-                spawn: &mut next_spawn,
+                spawn,
             },
             &mut next_random,
             kind,
@@ -83,8 +193,64 @@ impl DecorationRegion<'_> {
             large,
         )?;
         *random = next_random;
-        *spawn = next_spawn;
         self.failed = false;
+        Ok(())
+    }
+}
+
+fn default_hand(id: &str) -> Tag {
+    Tag::Compound(vec![
+        ("id".into(), Tag::String(id.into())),
+        ("count".into(), Tag::Int(1)),
+    ])
+}
+
+struct DrownedMarkerAdapter<'a, W> {
+    position: [i32; 3],
+    world: &'a World,
+    context: &'a mut W,
+    enchanted_hand: Option<Tag>,
+}
+
+impl<W: super::super::ocean_ruin::DrownedMarkerContext> NautilusJockeyWorld
+    for DrownedMarkerAdapter<'_, W>
+{
+    fn more_frequent_drowned_biome(&mut self) -> Result<bool> {
+        self.context
+            .more_frequent_drowned_biome(self.position, self.world)
+    }
+    fn spawn_zombie_nautilus(
+        &mut self,
+        random: &mut RegionRandom,
+        persistent: bool,
+    ) -> Result<bool> {
+        self.context
+            .spawn_zombie_nautilus(self.position, self.world, random, persistent)
+    }
+}
+impl<W: super::super::ocean_ruin::DrownedMarkerContext> StructureDrownedWorld
+    for DrownedMarkerAdapter<'_, W>
+{
+    fn try_existing_chicken(&mut self) -> Result<bool> {
+        self.context.try_existing_chicken(self.position, self.world)
+    }
+    fn spawn_chicken_jockey(&mut self, random: &mut RegionRandom) -> Result<bool> {
+        self.context
+            .spawn_chicken_jockey(self.position, self.world, random)
+    }
+    fn enchant_weapon(
+        &mut self,
+        random: &mut RegionRandom,
+        weapon: MainHandRoll,
+        special: f32,
+    ) -> Result<()> {
+        self.enchanted_hand = Some(self.context.enchant_weapon(
+            self.position,
+            self.world,
+            random,
+            weapon,
+            special,
+        )?);
         Ok(())
     }
 }
@@ -238,6 +404,75 @@ mod tests {
         ocean_ruin::{Piece, Rotation},
         packs::ResourceProvider,
     };
+
+    #[derive(Clone, Default, Debug, PartialEq)]
+    struct DrownedContext {
+        calls: usize,
+        enchants: usize,
+        invalid_difficulty: bool,
+    }
+    impl super::super::super::ocean_ruin::DrownedMarkerContext for DrownedContext {
+        fn special_multiplier(&mut self, _: [i32; 3], _: &World) -> Result<f32> {
+            self.calls += 1;
+            Ok(if self.invalid_difficulty {
+                f32::NAN
+            } else {
+                1.0
+            })
+        }
+        fn halloween(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+        fn try_existing_chicken(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+            self.calls += 1;
+            Ok(false)
+        }
+        fn spawn_chicken_jockey(
+            &mut self,
+            _: [i32; 3],
+            _: &World,
+            _: &mut RegionRandom,
+        ) -> Result<bool> {
+            self.calls += 1;
+            Ok(false)
+        }
+        fn enchant_weapon(
+            &mut self,
+            _: [i32; 3],
+            _: &World,
+            random: &mut RegionRandom,
+            weapon: MainHandRoll,
+            _: f32,
+        ) -> Result<Tag> {
+            self.calls += 1;
+            self.enchants += 1;
+            let id = match weapon {
+                MainHandRoll::Trident => "minecraft:trident",
+                MainHandRoll::FishingRod => "minecraft:fishing_rod",
+                MainHandRoll::Unchanged => bail!("unexpected empty weapon"),
+            };
+            let Tag::Compound(mut fields) = default_hand(id) else {
+                unreachable!()
+            };
+            fields.push(("test_enchantment".into(), Tag::Long(random.next_long())));
+            Ok(Tag::Compound(fields))
+        }
+        fn more_frequent_drowned_biome(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+            self.calls += 1;
+            Ok(false)
+        }
+        fn spawn_zombie_nautilus(
+            &mut self,
+            _: [i32; 3],
+            _: &World,
+            _: &mut RegionRandom,
+            persistent: bool,
+        ) -> Result<bool> {
+            ensure!(persistent, "structure nautilus must be persistent");
+            self.calls += 1;
+            Ok(false)
+        }
+    }
 
     struct IceTag(bool);
     impl ResourceProvider for IceTag {
@@ -454,6 +689,178 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn initialized_drowned_marker_composes_rng_equipment_and_rolls_back() -> Result<()> {
+        use super::super::super::{
+            FreshCreatureRandom,
+            ocean_ruin::{DrownedMarkerContext, RuinDataMarker},
+        };
+        use native_core::random::LegacyRandom;
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let (mut terrain, region_tags, _, _) = super::super::tests::fixture();
+        let ids = [
+            "minecraft:stone",
+            "minecraft:air",
+            "minecraft:water",
+            "minecraft:chest",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let motion = HeightmapTags::load(&mut MotionTags, &ids)?;
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&region_tags, &motion, writable)?;
+        let water = BTreeSet::from([
+            "minecraft:water".to_owned(),
+            "minecraft:flowing_water".to_owned(),
+        ]);
+        let position = [8, 8, 8];
+        let marker = RuinDataMarker {
+            source_index: 0,
+            position,
+            metadata: "drowned".into(),
+        };
+        let drowned = ResourceId::parse("minecraft:drowned")?;
+        let mut decoration = DecorationRandom::new(8123);
+        let mut expected_decoration = decoration.clone();
+        let mut context = DrownedContext::default();
+        for i in 0..512_i64 {
+            let entity_seed = i * 98317 + 3329;
+            let mut construct = || Ok(Some(FreshCreatureRandom::from_seed(&drowned, entity_seed)?));
+            let mut random = RegionRandom::Legacy(LegacyRandom::new(i * 671231 - 12345));
+            let mut expected_random = random.clone();
+            let mut expected_context = context.clone();
+            let mut creature = construct()?.unwrap();
+            let special = expected_context.special_multiplier(position, &region.world)?;
+            let halloween = expected_context.halloween()?;
+            let mut adapter = DrownedMarkerAdapter {
+                position,
+                world: &region.world,
+                context: &mut expected_context,
+                enchanted_hand: None,
+            };
+            let initialized = initialize_structure_drowned(
+                &mut adapter,
+                &mut expected_random,
+                &mut creature.random,
+                special,
+                halloween,
+            )?;
+            let hand = match (initialized.main_hand, adapter.enchanted_hand) {
+                (MainHandRoll::Unchanged, None) => None,
+                (MainHandRoll::Trident, None) => Some(default_hand("minecraft:trident")),
+                (MainHandRoll::FishingRod, None) => Some(default_hand("minecraft:fishing_rod")),
+                (_, Some(tag)) => Some(tag),
+            };
+            let expected = super::super::super::draft_fresh_structure_drowned(
+                creature.construction.uuid,
+                position,
+                &initialized,
+                hand,
+            )?;
+            region.handle_ocean_ruin_marker_with_initialized_drowned(
+                &marker,
+                false,
+                63,
+                &water,
+                &registry,
+                &mut decoration,
+                &mut random,
+                &mut construct,
+                &mut context,
+            )?;
+            assert_eq!(context, expected_context);
+            assert_eq!(random.next_long(), expected_random.next_long());
+            let records = region.generated_entities.get(&chunk(position)).unwrap();
+            assert_eq!(records.last(), Some(&expected));
+            assert_eq!(records.len(), (i + 1) as usize);
+        }
+        assert!(
+            context.enchants > 0,
+            "sample must exercise enchantment provider"
+        );
+        assert_eq!(decoration.next_long(), expected_decoration.next_long());
+        assert_eq!(
+            OreWorld::block(&mut region, position)?.name,
+            "minecraft:water"
+        );
+
+        let before_count = region
+            .generated_entities
+            .get(&chunk(position))
+            .unwrap()
+            .len();
+        let mut null_factory = || -> Result<Option<FreshCreatureRandom>> { Ok(None) };
+        let mut region_random = RegionRandom::Legacy(LegacyRandom::new(91));
+        let mut untouched_random = region_random.clone();
+        let before_context = context.clone();
+        region.handle_ocean_ruin_marker_with_initialized_drowned(
+            &marker,
+            false,
+            63,
+            &water,
+            &registry,
+            &mut decoration,
+            &mut region_random,
+            &mut null_factory,
+            &mut context,
+        )?;
+        assert_eq!(context, before_context);
+        assert_eq!(region_random.next_long(), untouched_random.next_long());
+        assert_eq!(
+            region
+                .generated_entities
+                .get(&chunk(position))
+                .unwrap()
+                .len(),
+            before_count
+        );
+
+        let mut context = DrownedContext {
+            invalid_difficulty: true,
+            ..Default::default()
+        };
+        let before_context = context.clone();
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(42));
+        let mut before_random = random.clone();
+        let mut before_decoration = decoration.clone();
+        let mut construct = || Ok(Some(FreshCreatureRandom::from_seed(&drowned, 123)?));
+        assert!(
+            region
+                .handle_ocean_ruin_marker_with_initialized_drowned(
+                    &marker,
+                    false,
+                    63,
+                    &water,
+                    &registry,
+                    &mut decoration,
+                    &mut random,
+                    &mut construct,
+                    &mut context
+                )
+                .is_err()
+        );
+        assert_eq!(context, before_context);
+        assert_eq!(random.next_long(), before_random.next_long());
+        assert_eq!(decoration.next_long(), before_decoration.next_long());
+        assert_eq!(
+            region
+                .generated_entities
+                .get(&chunk(position))
+                .unwrap()
+                .len(),
+            before_count
+        );
+        assert!(region.failed);
         Ok(())
     }
 }

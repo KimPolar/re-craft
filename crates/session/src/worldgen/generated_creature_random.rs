@@ -1,4 +1,4 @@
-//! The independent entity RNG used during fresh animal construction.
+//! The independent entity RNG used during fresh creature construction.
 use anyhow::{Context, Result, ensure};
 use native_core::random::LegacyRandom;
 use native_resources::packs::ResourceId;
@@ -69,7 +69,15 @@ fn validate_entity(entity: &ResourceId) -> Result<()> {
         entity.namespace == "minecraft"
             && matches!(
                 entity.path.as_str(),
-                "sheep" | "pig" | "cow" | "chicken" | "horse" | "donkey" | "witch" | "cat"
+                "sheep"
+                    | "pig"
+                    | "cow"
+                    | "chicken"
+                    | "horse"
+                    | "donkey"
+                    | "witch"
+                    | "cat"
+                    | "drowned"
             ),
         "unsupported creature construction"
     );
@@ -94,5 +102,93 @@ mod tests {
             FreshCreatureRandom::from_seed(&ResourceId::parse("minecraft:llama").unwrap(), 42)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn drowned_constructor_matches_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let shared = temp.path().join("StructureDrownedOracle.java");
+        let source = temp.path().join("DrownedConstructionOracle.java");
+        std::fs::write(
+            &shared,
+            include_str!("../../../resources/tests/java/StructureDrownedOracle.java"),
+        )?;
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/DrownedConstructionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&shared)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("DrownedConstructionOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let entity = ResourceId::parse("minecraft:drowned")?;
+        let mut count = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("C\t")) {
+            let values = line.split('\t').collect::<Vec<_>>();
+            ensure!(values.len() == 5, "bad Java output");
+            let mut fresh = FreshCreatureRandom::from_seed(&entity, values[0].parse()?)?;
+            let most = values[1].parse::<i64>()? as u64;
+            let least = values[2].parse::<i64>()? as u64;
+            assert_eq!(
+                fresh.construction.uuid,
+                [
+                    (most >> 32) as i32,
+                    most as i32,
+                    (least >> 32) as i32,
+                    least as i32
+                ]
+            );
+            assert_eq!(
+                fresh.initial_yaw.to_bits(),
+                values[3].parse::<i32>()? as u32
+            );
+            assert_eq!(fresh.random.next_long(), values[4].parse::<i64>()?);
+            count += 1;
+        }
+        assert_eq!(count, 256);
+        Ok(())
     }
 }

@@ -2,22 +2,28 @@
 //!
 //! This batch produces intermediate structure data only. It does not place
 //! blocks, persist chunks, or make a world safe to open.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail, ensure};
+use native_core::beardifier::{Beardifier, TerrainAdjustment};
 use native_persistence::heightmap::BlockHeightFlags;
 use native_resources::{
+    carver::{schedule::CarverCache, tags::CarverBlockTags},
     density::DensityEvaluator,
     packs::{ResourceId, ResourceProvider},
     structure_biomes::StructureBiomes,
     structure_placement::{StructureSetCache, StructureSetStart},
     structure_start::SimpleStructureStart,
+    surface_pass::SurfaceStageChunk,
 };
 use native_world::loaded::ChunkPos;
 use serde_json::Value;
 
 use super::{
-    TerrainGenerator,
+    BiomeNeighborhood, CarverBlockState, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
     structure_references::{
         StructureReferences, StructureStartBounds, collect_structure_references,
@@ -26,6 +32,9 @@ use super::{
 
 /// Supported simple starts by structure key for a single source chunk.
 pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
+
+/// Identity of a referenced structure start, including its source chunk.
+pub type TerrainStartKey = (ResourceId, ChunkPos);
 
 /// The caller must supply the complete active structure-set list in registry
 /// order, matching the generator, biome rules and resource stack. Unsupported
@@ -81,6 +90,94 @@ impl StructureGenerationBatch {
 
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
         (!self.failed).then(|| self.references.get(&pos)).flatten()
+    }
+
+    /// All referenced starts with terrain adaptation. The sorted result is a
+    /// membership set, not Java's hash-map and hash-set iteration order.
+    pub fn terrain_start_keys(&self, pos: ChunkPos) -> Result<BTreeSet<TerrainStartKey>> {
+        let refs = self
+            .references(pos)
+            .context("structure references are unavailable")?;
+        let mut keys = BTreeSet::new();
+        for (structure, chunks) in refs {
+            for &packed in chunks {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                let start = self
+                    .starts(source)
+                    .and_then(|starts| starts.get(structure))
+                    .context("referenced structure start is missing")?;
+                if start.terrain_adjustment != TerrainAdjustment::None {
+                    keys.insert((structure.clone(), source));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The caller must supply Java's start iteration order, including every
+    /// key returned by `terrain_start_keys` exactly once. This matters when
+    /// floating-point contributions from several structures are combined.
+    pub fn beardifier_for_chunk(
+        &self,
+        pos: ChunkPos,
+        order: &[TerrainStartKey],
+    ) -> Result<Arc<Beardifier>> {
+        let expected = self.terrain_start_keys(pos)?;
+        let supplied: BTreeSet<_> = order.iter().cloned().collect();
+        ensure!(
+            order.len() == supplied.len() && supplied == expected,
+            "structure terrain order does not cover references exactly"
+        );
+        let mut pieces = Vec::with_capacity(order.len());
+        for (structure, source) in order {
+            let start = self
+                .starts(*source)
+                .and_then(|starts| starts.get(structure))
+                .context("referenced structure start is missing")?;
+            pieces.push(start.terrain_piece());
+        }
+        Ok(Arc::new(
+            Beardifier::for_chunk([pos.x, pos.z], &pieces).map_err(anyhow::Error::msg)?,
+        ))
+    }
+
+    /// Generate intermediate terrain using the referenced simple pieces. The
+    /// biome neighborhood, carver tags, cache and provider must belong to the
+    /// same seed, dimension and immutable data-pack stack as this batch.
+    /// Structure blocks, decoration, lighting and persistence remain separate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_carved_surface<P: ResourceProvider>(
+        &mut self,
+        provider: &mut P,
+        pos: ChunkPos,
+        neighborhood: &BiomeNeighborhood,
+        tags: &CarverBlockTags,
+        cache: &mut CarverCache,
+        order: &[TerrainStartKey],
+        classify: impl FnMut(&Value) -> Result<CarverBlockState>,
+    ) -> Result<SurfaceStageChunk> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        let beardifier = self.beardifier_for_chunk(pos, order)?;
+        let result = self
+            .generator
+            .generate_carved_surface_with_structure_context(
+                provider,
+                &mut self.evaluator,
+                cache,
+                [pos.x, pos.z],
+                neighborhood,
+                tags,
+                beardifier,
+                classify,
+            );
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 
     /// Generate one ready start or reference stage. A failure poisons this

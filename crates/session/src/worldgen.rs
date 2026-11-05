@@ -6389,7 +6389,7 @@ mod tests {
             ("data/example/worldgen/structure/pyramid.json".into(),serde_json::to_vec(&json!({"type":"minecraft:desert_pyramid","biomes":["minecraft:plains"],"terrain_adaptation":"bury"})).unwrap()),
             ("data/example/worldgen/structure_set/pyramid.json".into(),serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap()),
         ]));
-        let generator =
+        let mut generator =
             TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
         let structure_id = ResourceId::parse("example:pyramid").unwrap();
         let rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
@@ -6451,6 +6451,18 @@ mod tests {
             .placement
             .potential_chunk(42, [0, 0]);
         let target = ChunkPos { x, z };
+        let mut neighborhood = generator.biome_neighborhood().unwrap();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                neighborhood
+                    .insert(Arc::new(
+                        generator
+                            .generate_biomes([x + dx, z + dz], &mut evaluator)
+                            .unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
         let mut batch =
             super::structure_batch::StructureGenerationBatch::new(generator, rules, vec![sparse])
                 .unwrap();
@@ -6477,6 +6489,139 @@ mod tests {
         assert!(batch.starts(target).unwrap().contains_key(&structure_id));
         let packed = ((z as u32 as u64) << 32 | x as u32 as u64) as i64;
         assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+        let order: Vec<_> = batch
+            .terrain_start_keys(target)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(order.contains(&(structure_id.clone(), target)));
+        assert!(batch.beardifier_for_chunk(target, &[]).is_err());
+        let mut duplicates = order.clone();
+        duplicates.push(order[0].clone());
+        assert!(batch.beardifier_for_chunk(target, &duplicates).is_err());
+        let context = batch.beardifier_for_chunk(target, &order).unwrap();
+        assert!(context.sample(x * 16, 64, z * 16) > 0.0);
+        let registry = ["air", "stone", "water", "lava", "dirt"]
+            .into_iter()
+            .map(|s| format!("minecraft:{s}"))
+            .collect();
+        let tags =
+            native_resources::carver::tags::CarverBlockTags::load(&mut data, &registry).unwrap();
+        let classify = |v: &Value| {
+            Ok(CarverBlockState {
+                is_air: v.as_str() == Some("minecraft:air"),
+                has_fluid: matches!(v.as_str(), Some("minecraft:water" | "minecraft:lava")),
+            })
+        };
+        let mut direct =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let expected = direct
+            .generate_carved_surface_with_structure_context(
+                &mut data,
+                &mut DensityEvaluator::default(),
+                &mut CarverCache::default(),
+                [x, z],
+                &neighborhood,
+                &tags,
+                context,
+                classify,
+            )
+            .unwrap();
+        let actual = batch
+            .generate_carved_surface(
+                &mut data,
+                target,
+                &neighborhood,
+                &tags,
+                &mut CarverCache::default(),
+                &order,
+                classify,
+            )
+            .unwrap();
+        assert_eq!(actual.states, expected.states);
+        assert_eq!(actual.fluid_updates, expected.fluid_updates);
+
+        // Make the structure's initial Y=64 piece overlap generated terrain
+        // and let a material rule depend on the beardifier contribution.
+        let mut tall = definition();
+        tall["settings"]["noise"]["height"] = json!(96);
+        tall["settings"]["material_rule"] = json!({
+            "type":"ore_vein", "density":{"type":"beardifier"}, "richness":1,
+            "filler_gap":-1, "raw_ore_chance":1, "ore_block":"minecraft:dirt",
+            "raw_ore_block":"minecraft:dirt", "filler_block":"minecraft:dirt"
+        });
+        let mut tall_generator =
+            TerrainGenerator::with_structure_context(&mut data, &tall, 42, 0, 96).unwrap();
+        let mut tall_neighborhood = tall_generator.biome_neighborhood().unwrap();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                tall_neighborhood
+                    .insert(Arc::new(
+                        tall_generator
+                            .generate_biomes([x + dx, z + dz], &mut DensityEvaluator::default())
+                            .unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let tall_rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+        let mut tall_batch = super::structure_batch::StructureGenerationBatch::new(
+            tall_generator,
+            tall_rules,
+            vec![ResourceId::parse("example:sparse").unwrap()],
+        )
+        .unwrap();
+        tall_batch.request_references(target).unwrap();
+        while tall_batch
+            .step(&mut data, &mut |v| {
+                let id = v.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: id == "minecraft:air",
+                    blocks_motion: id == "minecraft:stone",
+                    blocks_motion_no_leaves: id == "minecraft:stone",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        let tall_order: Vec<_> = tall_batch
+            .terrain_start_keys(target)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let with_structure = tall_batch
+            .generate_carved_surface(
+                &mut data,
+                target,
+                &tall_neighborhood,
+                &tags,
+                &mut CarverCache::default(),
+                &tall_order,
+                classify,
+            )
+            .unwrap();
+        let mut without =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &tall, 42, 0, 96).unwrap();
+        let without_structure = without
+            .generate_carved_surface(
+                &mut data,
+                &mut DensityEvaluator::default(),
+                &mut CarverCache::default(),
+                [x, z],
+                &tall_neighborhood,
+                &tags,
+                classify,
+            )
+            .unwrap();
+        assert!(
+            with_structure
+                .states
+                .iter()
+                .zip(&without_structure.states)
+                .any(|(a, b)| a != b),
+            "generated structure must change terrain material"
+        );
 
         data.0.insert(
             "data/example/worldgen/structure/pyramid.json".into(),

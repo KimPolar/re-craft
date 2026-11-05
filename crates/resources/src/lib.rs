@@ -48,6 +48,7 @@ pub mod mob_spawn_placement;
 pub mod mob_spawns;
 pub mod models;
 pub mod monster_room;
+pub mod moon_phase;
 pub mod multiface_growth;
 pub mod noise;
 pub mod noise_router;

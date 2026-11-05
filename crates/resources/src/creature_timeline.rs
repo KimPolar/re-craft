@@ -291,13 +291,13 @@ impl Track {
 }
 
 #[derive(Clone, Copy)]
-enum Easing {
+pub(crate) enum Easing {
     Linear,
     Constant,
     Cubic { x: [f32; 3], y: [f32; 3] },
 }
 impl Easing {
-    fn parse(value: Option<&Value>) -> Result<Self> {
+    pub(crate) fn parse(value: Option<&Value>) -> Result<Self> {
         match value {
             None => Ok(Self::Linear),
             Some(Value::String(name)) if name == "linear" => Ok(Self::Linear),
@@ -325,7 +325,7 @@ impl Easing {
             }
         }
     }
-    fn apply(self, input: f32) -> f32 {
+    pub(crate) fn apply(self, input: f32) -> f32 {
         match self {
             Self::Linear => input,
             Self::Constant => 0.0,

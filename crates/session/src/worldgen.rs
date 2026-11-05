@@ -6788,13 +6788,14 @@ mod tests {
                 }
             }
         }
-        for (fail_mob, native_conditions, predicate, phase, expected_variant) in [
-            (false, false, "structure", 0, "example:structure_cat"),
-            (true, false, "structure", 0, "example:structure_cat"),
-            (false, true, "structure", 0, "example:structure_cat"),
-            (false, true, "biome", 0, "example:structure_cat"),
-            (false, true, "moon", 0, "example:structure_cat"),
-            (false, true, "moon", 4, "minecraft:black"),
+        for (fail_mob, native_conditions, predicate, phase, fail_clock, expected_variant) in [
+            (false, false, "structure", 0, false, "example:structure_cat"),
+            (true, false, "structure", 0, false, "example:structure_cat"),
+            (false, true, "structure", 0, false, "example:structure_cat"),
+            (false, true, "biome", 0, false, "example:structure_cat"),
+            (false, true, "moon", 0, false, "example:structure_cat"),
+            (false, true, "moon", 4, false, "minecraft:black"),
+            (false, true, "moon", 0, true, "minecraft:black"),
         ] {
             let mut data = HutData { predicate };
             let mut config = definition();
@@ -6895,6 +6896,20 @@ mod tests {
             }
             let variants = CatSpawnVariants::load_active(&mut data).unwrap();
             let conditions = variants.prepare_world_conditions(&mut data).unwrap();
+            let moon = native_resources::moon_phase::Environment {
+                base: native_resources::moon_phase::Phase::FullMoon,
+                biomes: BTreeMap::from([("minecraft:plains".into(), Some(Some(native_resources::moon_phase::Phase::ThirdQuarter)))]),
+                has_biome_layer: true,
+                tracks: vec![native_resources::moon_phase::Track::parse(&json!({"clock":"example:clock", "period_ticks":20}), &json!({"keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]})).unwrap()],
+            };
+            let clocks = if fail_clock {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(
+                    ResourceId::parse("example:clock").unwrap(),
+                    if phase == 4 { 10 } else { 0 },
+                )])
+            };
             let mut construct = |mob| {
                 ensure!(!fail_mob, "injected mob initialization failure");
                 let (id, seed) = match mob {
@@ -6936,7 +6951,17 @@ mod tests {
                         properties: BTreeMap::new(),
                     })
                 };
-                let result = if native_conditions {
+                let result = if native_conditions && predicate == "moon" {
+                    batch.step_with_hut_clocks(
+                        &mut data,
+                        &mut classify,
+                        &mut resolve,
+                        &variants,
+                        &conditions,
+                        &moon,
+                        &clocks,
+                    )
+                } else if native_conditions {
                     batch.step_with_native_hut_support(
                         &mut data,
                         &mut classify,
@@ -6959,10 +6984,15 @@ mod tests {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(error) => {
-                        assert!(fail_mob, "unexpected generation failure: {error:#}");
                         assert!(
-                            format!("{error:#}").contains("injected mob initialization failure")
+                            fail_mob || fail_clock,
+                            "unexpected generation failure: {error:#}"
                         );
+                        assert!(format!("{error:#}").contains(if fail_mob {
+                            "injected mob initialization failure"
+                        } else {
+                            "moon phase environment or world clock unavailable"
+                        }));
                         assert!(Arc::ptr_eq(&previous.unwrap(), &batch.snapshot().unwrap()));
                         assert!(batch.structure_starts(target).is_none());
                         saw_failure = true;
@@ -6970,7 +7000,7 @@ mod tests {
                     }
                 }
             }
-            if fail_mob {
+            if fail_mob || fail_clock {
                 assert!(saw_failure);
                 continue;
             }

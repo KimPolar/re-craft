@@ -123,7 +123,7 @@ where
 pub(super) struct NativeHutFeatureRunner<'a> {
     pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
     pub conditions: &'a native_resources::cat_variants::CatWorldConditions,
-    pub moon_phase: u8,
+    pub moon_phase_at: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
 }
 
 impl HutFeatureRunner for NativeHutFeatureRunner<'_> {
@@ -141,7 +141,7 @@ impl HutFeatureRunner for NativeHutFeatureRunner<'_> {
         use native_resources::cat_variants::CatSpawnContext;
         use native_resources::structure_piece::swamp_hut::HutMob;
         let conditions = self.conditions;
-        let moon_phase = self.moon_phase;
+        let moon_phase_at = self.moon_phase_at;
         let mut construct = |mob| {
             let id = match mob {
                 HutMob::Witch => "minecraft:witch",
@@ -167,6 +167,7 @@ impl HutFeatureRunner for NativeHutFeatureRunner<'_> {
             let mut matching = BTreeSet::new();
             let is_biome = kind.namespace == "minecraft" && kind.path == "biome";
             let is_structure = kind.namespace == "minecraft" && kind.path == "structure";
+            let is_moon = kind.namespace == "minecraft" && kind.path == "moon_brightness";
             let biome = if is_biome {
                 Some(biomes.biome_at_block(pos[0], pos[1], pos[2])?)
             } else {
@@ -214,11 +215,18 @@ impl HutFeatureRunner for NativeHutFeatureRunner<'_> {
                     }
                 }
             }
+            let moon_phase = if is_moon {
+                let phase = moon_phase_at(pos, biomes)?;
+                ensure!(phase < 8, "invalid moon phase at cat spawn");
+                Some(phase)
+            } else {
+                None
+            };
             conditions.matches(
                 value,
                 &CatSpawnContext {
                     biome,
-                    moon_phase: Some(moon_phase),
+                    moon_phase,
                     structures_with_piece: is_structure.then_some(&matching),
                 },
             )

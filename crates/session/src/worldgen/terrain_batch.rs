@@ -3322,9 +3322,9 @@ impl FreshTerrainBatch {
         self.step_inner(provider, classify, resolve, Some(&mut callbacks))
     }
 
-    /// Perform one operation using active cat predicates and generated biome
-    /// and structure data. The caller supplies the actual level moon phase.
-    /// Missing referenced chunks fail rather than selecting a guessed variant.
+    /// Perform one operation with a moon phase known to be constant across
+    /// the whole operation. For positional attributes, use
+    /// `step_with_hut_environment` instead.
     pub fn step_with_native_hut_support(
         &mut self,
         provider: &mut impl ResourceProvider,
@@ -3335,12 +3335,69 @@ impl FreshTerrainBatch {
         moon_phase: u8,
     ) -> Result<Option<(ChunkPos, GenerationStage)>> {
         ensure!(moon_phase < 8, "invalid moon phase");
+        self.step_with_hut_environment(
+            provider,
+            classify,
+            resolve,
+            variants,
+            conditions,
+            &|_, _| Ok(moon_phase),
+        )
+    }
+
+    /// Evaluate moon phase at the actual spawn position using the active
+    /// dimension, biome attributes, timelines and world-clock state supplied
+    /// by the caller. The callback runs only for moon-dependent selectors.
+    /// Missing inputs must return an error, rather than a guessed phase.
+    pub fn step_with_hut_environment(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon_phase_at: &dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>> {
         let mut runner = NativeHutFeatureRunner {
             variants,
             conditions,
-            moon_phase,
+            moon_phase_at,
         };
         self.step_inner(provider, classify, resolve, Some(&mut runner))
+    }
+
+    /// Evaluate the active moon-phase environment against a snapshot of the
+    /// actual world clocks and the generated biome at each cat spawn position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_hut_clocks(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon: &native_resources::moon_phase::Environment,
+        clocks: &BTreeMap<ResourceId, i64>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>> {
+        self.step_with_hut_environment(
+            provider,
+            classify,
+            resolve,
+            variants,
+            conditions,
+            &|pos, biomes| {
+                let biome = if moon.has_biome_layer {
+                    let id = biomes.biome_at_block(pos[0], pos[1], pos[2])?;
+                    Some(format!("{}:{}", id.namespace, id.path))
+                } else {
+                    None
+                };
+                let phase = moon
+                    .sample(biome.as_deref(), |id| clocks.get(id).copied())
+                    .context("moon phase environment or world clock unavailable")?;
+                Ok(phase.index() as u8)
+            },
+        )
     }
 
     fn step_inner(

@@ -4,6 +4,7 @@
 //! write chunks, or establish that structure generation is complete.
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::structure_hash_order::{Insertion, StructureIdentityMap};
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::{BoundingBox, TerrainAdjustment, structure_start_bounds};
 use native_resources::packs::ResourceId;
@@ -47,6 +48,7 @@ pub type StructureReferences = BTreeMap<ResourceId, BTreeSet<i64>>;
 pub struct OrderedStructureReferences {
     membership: StructureReferences,
     ordered: BTreeMap<ResourceId, Vec<i64>>,
+    structure_order: Option<Vec<ResourceId>>,
 }
 
 impl OrderedStructureReferences {
@@ -56,6 +58,11 @@ impl OrderedStructureReferences {
 
     pub fn order(&self, structure: &ResourceId) -> Option<&[i64]> {
         self.ordered.get(structure).map(Vec::as_slice)
+    }
+
+    /// Present only when the caller supplied the Java structure identity hashes.
+    pub fn structure_order(&self) -> Option<&[ResourceId]> {
+        self.structure_order.as_deref()
     }
 
     pub(super) fn into_membership(self) -> StructureReferences {
@@ -141,7 +148,25 @@ pub fn collect_structure_references(
 /// Preserve the per-structure reference order used by Java's fastutil set.
 pub fn collect_ordered_structure_references(
     target: ChunkPos,
+    starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
+) -> Result<OrderedStructureReferences> {
+    collect_with_hashes(target, starts, None)
+}
+
+/// Reproduce Java's structure-key map order with hashes observed from the same
+/// Java process. Starts for each source must be supplied in insertion order.
+pub fn collect_references_with_identity_hashes(
+    target: ChunkPos,
+    starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
+    hashes: &BTreeMap<ResourceId, i32>,
+) -> Result<OrderedStructureReferences> {
+    collect_with_hashes(target, starts, Some(hashes))
+}
+
+fn collect_with_hashes(
+    target: ChunkPos,
     mut starts: impl FnMut(ChunkPos) -> Result<Vec<StructureStartBounds>>,
+    hashes: Option<&BTreeMap<ResourceId, i32>>,
 ) -> Result<OrderedStructureReferences> {
     let min_x = target.x.checked_sub(8).context("chunk X underflow")?;
     let max_x = target.x.checked_add(8).context("chunk X overflow")?;
@@ -152,10 +177,31 @@ pub fn collect_ordered_structure_references(
     let end_x = block_x.checked_add(15).context("block X overflow")?;
     let end_z = block_z.checked_add(15).context("block Z overflow")?;
     let mut references = BTreeMap::<ResourceId, ReferenceSet>::new();
+    let mut identities = hashes.map(StructureIdentityMap::new);
     for x in min_x..=max_x {
         for z in min_z..=max_z {
             let source = ChunkPos { x, z };
-            for start in starts(source).with_context(|| format!("missing starts at {x}, {z}"))? {
+            let source_starts =
+                starts(source).with_context(|| format!("missing starts at {x}, {z}"))?;
+            let source_starts = if let Some(hashes) = hashes {
+                let mut index = StructureIdentityMap::new(hashes);
+                let mut by_key = BTreeMap::new();
+                for start in source_starts {
+                    index.insert(&start.structure, Insertion::Put)?;
+                    ensure!(
+                        by_key.insert(start.structure.clone(), start).is_none(),
+                        "duplicate structure start for one source chunk"
+                    );
+                }
+                index
+                    .order()
+                    .into_iter()
+                    .map(|id| by_key.remove(&id).expect("indexed structure start"))
+                    .collect()
+            } else {
+                source_starts
+            };
+            for start in source_starts {
                 ensure!(
                     (0..3).all(|axis| start.bounds.min[axis] <= start.bounds.max[axis]),
                     "invalid structure start bounds at {x}, {z}"
@@ -165,6 +211,9 @@ pub fn collect_ordered_structure_references(
                     && start.bounds.max[2] >= block_z
                     && start.bounds.min[2] <= end_z
                 {
+                    if let Some(identities) = &mut identities {
+                        identities.insert(&start.structure, Insertion::ComputeIfAbsent)?;
+                    }
                     // ChunkPos.pack keeps X in the low 32 bits and Z in the high 32.
                     let packed = ((z as u32 as u64) << 32 | x as u32 as u64) as i64;
                     references
@@ -185,6 +234,7 @@ pub fn collect_ordered_structure_references(
     Ok(OrderedStructureReferences {
         membership,
         ordered,
+        structure_order: identities.map(|map| map.order()),
     })
 }
 

@@ -53,6 +53,7 @@ public class StructureReferencesOracle {
                 var structure = registries.lookupOrThrow(Registries.STRUCTURE)
                         .getOrThrow(ResourceKey.create(Registries.STRUCTURE,id)).value();
                 structureIds.put(structure, id);
+                out.println("HASH " + id + " " + System.identityHashCode(structure));
                 int x=s.get("x").getAsInt(), z=s.get("z").getAsInt();
                 List<StructurePiece> pieces = new ArrayList<>();
                 for (var pieceElement : s.getAsJsonArray("pieces")) {
@@ -77,6 +78,7 @@ public class StructureReferencesOracle {
             generator.createReferences(world,new StructureManager(null,null,null),result);
             for (var entry : result.getAllReferences().entrySet()) {
                 var id=structureIds.get(entry.getKey());
+                out.println("KEY " + id);
                 for (long packed : entry.getValue())
                     out.println("REF " + id + " " + packed);
             }

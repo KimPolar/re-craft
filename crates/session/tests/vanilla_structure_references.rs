@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command};
 use native_core::beardifier::{BoundingBox, TerrainAdjustment};
 use native_resources::packs::ResourceId;
 use native_session::worldgen::structure_references::{
-    StructureStartBounds, collect_ordered_structure_references, collect_structure_references,
+    StructureStartBounds, collect_ordered_structure_references,
+    collect_references_with_identity_hashes, collect_structure_references,
 };
 use native_world::loaded::ChunkPos;
 use serde_json::{Value, json};
@@ -149,6 +150,37 @@ fn generated_structure_references_match_java() {
     }
     cases.push(json!({"x":0,"z":0,"starts":records}));
     expected_inputs.push((target, starts));
+    // Exercise multiple structure identity keys in each source chunk and in
+    // the target's reference map, with different source insertion histories.
+    let names = [
+        ("minecraft:buried_treasure", TerrainAdjustment::None),
+        ("minecraft:stronghold", TerrainAdjustment::Bury),
+        ("minecraft:village_plains", TerrainAdjustment::BeardThin),
+        ("minecraft:ancient_city", TerrainAdjustment::BeardBox),
+        ("minecraft:trial_chambers", TerrainAdjustment::Encapsulate),
+    ];
+    let mut starts: BTreeMap<ChunkPos, Vec<StructureStartBounds>> = BTreeMap::new();
+    let mut records = Vec::new();
+    for x in -2i32..=2 {
+        for z in -2i32..=2 {
+            let source = ChunkPos { x, z };
+            for i in 0..names.len() {
+                let (name, adjustment) = names[(i + (x + z).rem_euclid(5) as usize) % names.len()];
+                let bounds = BoundingBox::new([0, -10, 0], [15, 10, 15]).unwrap();
+                starts.entry(source).or_default().push(
+                    StructureStartBounds::from_pieces(
+                        ResourceId::parse(name).unwrap(),
+                        &[bounds],
+                        adjustment,
+                    )
+                    .unwrap(),
+                );
+                records.push(json!({"x":x,"z":z,"id":name,"pieces":[[0,-10,0,15,10,15]]}));
+            }
+        }
+    }
+    cases.push(json!({"x":0,"z":0,"starts":records}));
+    expected_inputs.push((target, starts));
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     let output = run(Command::new(java.join("java.exe"))
@@ -160,11 +192,23 @@ fn generated_structure_references_match_java() {
     let mut java_refs = BTreeMap::<ResourceId, std::collections::BTreeSet<i64>>::new();
     let mut ordered_groups = Vec::new();
     let mut java_order = BTreeMap::<ResourceId, Vec<i64>>::new();
+    let mut hash_groups = Vec::new();
+    let mut java_hashes = BTreeMap::<ResourceId, i32>::new();
+    let mut key_groups = Vec::new();
+    let mut java_keys = Vec::<ResourceId>::new();
     let mut bounding_groups = Vec::new();
     let mut java_bounds = BTreeMap::<(ChunkPos, ResourceId), BoundingBox>::new();
     for line in output.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.first() == Some(&"BOUND") {
+        if parts.first() == Some(&"HASH") {
+            let id = ResourceId::parse(parts[1]).unwrap();
+            let hash = parts[2].parse().unwrap();
+            if let Some(previous) = java_hashes.insert(id, hash) {
+                assert_eq!(previous, hash);
+            }
+        } else if parts.first() == Some(&"KEY") {
+            java_keys.push(ResourceId::parse(parts[1]).unwrap());
+        } else if parts.first() == Some(&"BOUND") {
             let number = |index: usize| parts[index].parse::<i32>().unwrap();
             let pos = ChunkPos {
                 x: number(1),
@@ -189,6 +233,8 @@ fn generated_structure_references_match_java() {
         } else if parts.first() == Some(&"END") {
             groups.push(std::mem::take(&mut java_refs));
             ordered_groups.push(std::mem::take(&mut java_order));
+            hash_groups.push(std::mem::take(&mut java_hashes));
+            key_groups.push(std::mem::take(&mut java_keys));
             bounding_groups.push(std::mem::take(&mut java_bounds));
         }
     }
@@ -207,11 +253,14 @@ fn generated_structure_references_match_java() {
             "missing fixture for {name}"
         );
     }
-    for ((((target, starts), expected), expected_bounds), expected_order) in expected_inputs
-        .into_iter()
-        .zip(groups)
-        .zip(bounding_groups)
-        .zip(ordered_groups)
+    for ((((((target, starts), expected), expected_bounds), expected_order), hashes), key_order) in
+        expected_inputs
+            .into_iter()
+            .zip(groups)
+            .zip(bounding_groups)
+            .zip(ordered_groups)
+            .zip(hash_groups)
+            .zip(key_groups)
     {
         assert!(!expected.is_empty());
         let actual_bounds: BTreeMap<_, _> = starts
@@ -235,12 +284,25 @@ fn generated_structure_references_match_java() {
             Ok(starts.get(&source).cloned().unwrap_or_default())
         })
         .unwrap();
+        let with_hashes = collect_references_with_identity_hashes(
+            target,
+            |source| Ok(starts.get(&source).cloned().unwrap_or_default()),
+            &hashes,
+        )
+        .unwrap();
+        assert_eq!(
+            with_hashes.structure_order(),
+            Some(key_order.as_slice()),
+            "structure identity order at {target:?}"
+        );
+        assert_eq!(with_hashes.membership(), &expected);
         for (id, java) in expected_order {
             assert_eq!(
                 ordered.order(&id),
                 Some(java.as_slice()),
                 "reference order for {id:?} at {target:?}"
             );
+            assert_eq!(with_hashes.order(&id), Some(java.as_slice()));
         }
     }
 }

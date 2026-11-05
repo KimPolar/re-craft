@@ -27,7 +27,7 @@ use super::{
     schedule::{GenerationSchedule, GenerationStage},
     structure_references::{
         OrderedStructureReferences, StructureReferences, StructureStartBounds,
-        collect_ordered_structure_references,
+        collect_ordered_structure_references, collect_references_with_identity_hashes,
     },
 };
 
@@ -217,6 +217,38 @@ impl StructureGenerationBatch {
             "structure terrain order does not cover references exactly"
         );
         Ok(result)
+    }
+
+    /// Recover the full Java order when the structure identity hashes from the
+    /// corresponding Java process are available. Hashes are not seed-derived.
+    pub fn terrain_start_order_with_identity_hashes(
+        &self,
+        pos: ChunkPos,
+        hashes: &BTreeMap<ResourceId, i32>,
+    ) -> Result<Vec<TerrainStartKey>> {
+        let original = self
+            .references(pos)
+            .context("structure references are unavailable")?;
+        let ordered = collect_references_with_identity_hashes(
+            pos,
+            |source| {
+                self.bounds
+                    .get(&source)
+                    .cloned()
+                    .context("structure starts are missing")
+            },
+            hashes,
+        )?;
+        ensure!(
+            ordered.membership() == original,
+            "structure references changed"
+        );
+        self.terrain_start_order(
+            pos,
+            ordered
+                .structure_order()
+                .context("structure key order is missing")?,
+        )
     }
 
     /// The caller must supply Java's start iteration order, including every

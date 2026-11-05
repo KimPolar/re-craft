@@ -47,6 +47,7 @@ pub mod postprocessing;
 mod postprocessing_world;
 pub mod schedule;
 pub mod structure_batch;
+mod structure_hash_order;
 pub mod structure_references;
 mod terrain_batch;
 pub mod tick_index;
@@ -6661,6 +6662,20 @@ mod tests {
         let java_order = batch
             .terrain_start_order(target, std::slice::from_ref(&structure_id))
             .unwrap();
+        assert_eq!(
+            batch
+                .terrain_start_order_with_identity_hashes(
+                    target,
+                    &BTreeMap::from([(structure_id.clone(), 1234)])
+                )
+                .unwrap(),
+            java_order,
+        );
+        assert!(
+            batch
+                .terrain_start_order_with_identity_hashes(target, &BTreeMap::new())
+                .is_err()
+        );
         assert_eq!(
             java_order
                 .iter()

@@ -1737,8 +1737,11 @@ impl CarvedTerrainWorld {
                 let is_entity = match resolved[id.0 as usize] {
                     Some(value) => value,
                     None => {
-                        let value = has_entity(state)
-                            .context("generated block entity classification is unknown")?;
+                        let value = has_entity(state).with_context(|| {
+                            format!(
+                                "generated block entity classification is unknown for {state:?}"
+                            )
+                        })?;
                         resolved[id.0 as usize] = Some(value);
                         value
                     }

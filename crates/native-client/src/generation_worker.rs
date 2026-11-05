@@ -4616,6 +4616,13 @@ mod tests {
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
                     ),
                     "data/minecraft/tags/block/uncarvable.json" => Some(json!({"values":[]})),
+                    "data/minecraft/tags/block/fences.json" => {
+                        Some(json!({"values":["minecraft:oak_fence"]}))
+                    }
+                    "data/minecraft/tags/block/wooden_fences.json" => {
+                        Some(json!({"values":["minecraft:oak_fence"]}))
+                    }
+                    "data/minecraft/tags/block/shulker_boxes.json" => Some(json!({"values":[]})),
                     "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                     | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
                         Some(json!({"values":["minecraft:stone"]}))
@@ -4821,6 +4828,28 @@ mod tests {
                 .context("hut entity coverage incomplete")?
                 .len(),
             2
+        );
+        ready.batch.spawned_block_entity_data(mob_chunk)?;
+        let mut stage = ready
+            .batch
+            .begin_generated_postprocessing([mob_chunk], 0, 0)?;
+        stage.set_water_source_conversion(false)?;
+        while !stage.poll(mob_chunk, 256)? {}
+        let region = stage.finish()?;
+        let drafts = ready
+            .batch
+            .postprocessed_chunk_drafts(&region, [mob_chunk])?;
+        assert_eq!(drafts.len(), 1);
+        let draft = &drafts[&mob_chunk];
+        assert_eq!(
+            draft.entity_records.as_deref().map(Vec::len),
+            Some(2),
+            "hut entity records must survive postprocessing"
+        );
+        assert!(draft.entity_chunk.is_some());
+        assert_eq!(
+            draft.chunk.value.get("structures"),
+            Some(&ready.batch.structure_data(mob_chunk)?)
         );
         assert!(ready.hut_generation.is_some());
         ready.start_session(native_session::PlayerState {

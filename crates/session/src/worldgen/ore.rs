@@ -46,6 +46,8 @@ use super::{
     CarvedTerrainWorld, DecorationPlan, FreshGenerationLightTracker, StagedGenerationLightEngine,
 };
 
+mod buried_treasure;
+
 /// An unpublished generation attempt. Dropping it, or any failed placement,
 /// leaves the original terrain and its snapshots untouched.
 pub struct DecorationRegion<'a> {
@@ -6357,6 +6359,389 @@ mod tests {
             generated_entities: Arc::new(BTreeMap::new()),
         };
         (result, tags, motion, feature)
+    }
+
+    #[test]
+    fn buried_treasure_updates_generated_chunks_and_rolls_back_on_unknown_blocks() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_piece::BuriedTreasureOutcome;
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        let make_piece = || SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            orientation: None,
+            bounds: BoundingBox::new([9, 90, 9], [9, 90, 9]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "water",
+            "lava",
+            "sand",
+            "chest",
+            "beacon",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let (mut terrain, tags, _, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut random = DecorationRandom::new(19);
+        let mut expected_random = random.clone();
+        let expected_seed = expected_random.next_long();
+        let mut piece = make_piece();
+        let outcome = region
+            .place_buried_treasure(&mut piece, clip, &mut random)
+            .unwrap();
+        assert!(
+            matches!(outcome, BuriedTreasureOutcome::Found { position: [9, 8, 9], chest_placed: true, loot_seed: Some(seed), .. } if seed == expected_seed)
+        );
+        assert_eq!(piece.bounds.min, [9, 8, 9]);
+        assert_eq!(random.next_long(), expected_random.next_long());
+        region.finish().unwrap();
+        assert_eq!(
+            terrain.snapshot().block(9, 8, 9).unwrap().name,
+            "minecraft:chest"
+        );
+        let chest = terrain.generated_monster_entities().next().unwrap();
+        let super::super::GeneratedMonsterRoomEntity::Chest(chest) = chest else {
+            panic!("missing treasure chest")
+        };
+        assert_eq!(chest.loot_seed, expected_seed);
+        assert!(
+            matches!(chest.block_entity().get("LootTable"), Some(native_persistence::nbt::Tag::String(table)) if table.matches("minecraft:chests/buried_treasure"))
+        );
+        assert_eq!(terrain.generated_monster_entities().count(), 1);
+
+        let (mut terrain, tags, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let beacon = world.intern_state(state("beacon"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[9 + 8 * 16 + 8 * 256] = beacon;
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut piece = make_piece();
+        let mut random = DecorationRandom::new(19);
+        let mut expected_random = random.clone();
+        assert!(
+            region
+                .place_buried_treasure(&mut piece, clip, &mut random)
+                .is_err()
+        );
+        assert_eq!(piece.bounds.min, [9, 90, 9]);
+        assert_eq!(random.next_long(), expected_random.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
+
+        let (mut terrain, tags, _, _) = fixture();
+        let before = terrain.snapshot();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::new())
+            .unwrap();
+        let mut piece = make_piece();
+        let mut random = DecorationRandom::new(19);
+        let mut expected_random = random.clone();
+        assert!(
+            region
+                .place_buried_treasure(&mut piece, clip, &mut random)
+                .is_err()
+        );
+        assert_eq!(piece.bounds.min, [9, 90, 9]);
+        assert_eq!(random.next_long(), expected_random.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_region_buried_treasure_matches_java() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("BuriedTreasureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../resources/tests/java/BuriedTreasureOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let positions = [
+            [9, 6, 9],
+            [9, 7, 9],
+            [9, 4, 9],
+            [9, 6, 8],
+            [10, 6, 9],
+            [9, 6, 10],
+            [8, 6, 9],
+            [9, 5, 8],
+            [10, 5, 9],
+            [9, 5, 10],
+            [8, 5, 9],
+        ];
+        let palette = [
+            "air", "water", "lava", "sand", "gravel", "dirt", "stone", "chest",
+        ];
+        let mut random_bits = 3_886_719_021u64;
+        let mut fixtures = Vec::new();
+        for id in 0..40 {
+            let mut blocks = vec![json!({"position":[9,5,9],"state":"minecraft:stone"})];
+            for position in positions {
+                random_bits = random_bits
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                blocks.push(json!({"position":position,"state":format!("minecraft:{}", palette[(random_bits >> 32) as usize % palette.len()])}));
+            }
+            let seed = [0, -1, 12345, i64::MIN, i64::MAX][id % 5];
+            fixtures.push(json!({"id":id,"seed":seed,"mode":2,"entity":true,
+                "clip_min":[0,0,0],"clip_max":[if id%7==0 {8}else{15},15,15],"blocks":blocks}));
+        }
+        let input = temp.path().join("cases.json");
+        std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("BuriedTreasureOracle")
+            .arg(&input));
+        let mut lines = output.lines().filter(|line| {
+            ["S ", "W ", "B ", "C ", "R "]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        });
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let generated = resources.vanilla_generated_block_registry().unwrap();
+        let registry = resources.vanilla_block_ids().unwrap();
+        let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut chests = 0;
+        let mut materialized_chests = 0;
+        let mut unsupported_copied_chests = 0;
+        for case in fixtures {
+            let id = case["id"].as_i64().unwrap();
+            assert_eq!(lines.next().unwrap(), format!("S {id}"));
+            let (mut terrain, tags, _, _) = fixture();
+            let mut expected = BTreeMap::<[i32; 3], (String, Option<String>)>::new();
+            let world = Arc::make_mut(&mut terrain.world);
+            let air = world.intern_state(state("air"));
+            let mut inputs = Vec::new();
+            for block in case["blocks"].as_array().unwrap() {
+                let p = std::array::from_fn(|i| block["position"][i].as_i64().unwrap() as i32);
+                let name = block["state"].as_str().unwrap();
+                let value = super::super::resolve_generated_terrain_state(&json!(name), &generated)
+                    .unwrap();
+                let block_id = world.intern_state(value);
+                inputs.push((p, block_id));
+                expected.insert(
+                    p,
+                    (
+                        name.to_owned(),
+                        (name == "minecraft:chest").then(|| "north".into()),
+                    ),
+                );
+            }
+            let chunk = Arc::make_mut(world.chunks.get_mut(&center).unwrap());
+            let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+            let blocks = section.blocks.as_mut().unwrap();
+            blocks.fill(air);
+            for (p, block) in inputs {
+                blocks[(p[0] + p[2] * 16 + p[1] * 256) as usize] = block;
+            }
+            terrain
+                .ore_ocean_floor_heights
+                .insert(center, Arc::new([12; 256]));
+            let mut expected_bounds: Option<([i32; 3], [i32; 3])> = None;
+            let mut expected_chest: Option<([i32; 3], String, i64)> = None;
+            let expected_next = loop {
+                let line = lines.next().unwrap();
+                let words: Vec<_> = line.split_whitespace().collect();
+                match words[0] {
+                    "W" => {
+                        let p = [
+                            words[1].parse().unwrap(),
+                            words[2].parse().unwrap(),
+                            words[3].parse().unwrap(),
+                        ];
+                        expected.insert(
+                            p,
+                            (
+                                words[4].to_owned(),
+                                (words[5] != "-").then(|| words[5].to_owned()),
+                            ),
+                        );
+                    }
+                    "B" => {
+                        expected_bounds = Some((
+                            [
+                                words[1].parse().unwrap(),
+                                words[2].parse().unwrap(),
+                                words[3].parse().unwrap(),
+                            ],
+                            [
+                                words[4].parse().unwrap(),
+                                words[5].parse().unwrap(),
+                                words[6].parse().unwrap(),
+                            ],
+                        ))
+                    }
+                    "C" => {
+                        expected_chest = Some((
+                            [
+                                words[1].parse().unwrap(),
+                                words[2].parse().unwrap(),
+                                words[3].parse().unwrap(),
+                            ],
+                            words[4].to_owned(),
+                            words[5].parse::<i64>().unwrap(),
+                        ))
+                    }
+                    "R" => break words[1].parse::<i64>().unwrap(),
+                    _ => panic!("unexpected oracle output"),
+                }
+            };
+            let mut piece = SimpleStructureStart {
+                kind: SimpleStructureKind::BuriedTreasure,
+                chunk: [0, 0],
+                generation_point: [8, 10, 8],
+                orientation: None,
+                bounds: BoundingBox::new([9, 90, 9], [9, 90, 9]).unwrap(),
+                terrain_adjustment: TerrainAdjustment::None,
+            };
+            let clip = BoundingBox::new(
+                [0, 0, 0],
+                [case["clip_max"][0].as_i64().unwrap() as i32, 15, 15],
+            )
+            .unwrap();
+            let mut random = DecorationRandom::new(case["seed"].as_i64().unwrap());
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+            if let Err(error) = region.place_buried_treasure(&mut piece, clip, &mut random) {
+                assert!(
+                    format!("{error:#}")
+                        .contains("unsupported treasure replacement effects: minecraft:chest"),
+                    "fixture {id}: {error:#}"
+                );
+                unsupported_copied_chests += 1;
+                assert_eq!(piece.bounds.min, [9, 90, 9]);
+                let mut original = DecorationRandom::new(case["seed"].as_i64().unwrap());
+                assert_eq!(random.next_long(), original.next_long());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                continue;
+            }
+            region.finish().unwrap();
+            assert_eq!(
+                (piece.bounds.min, piece.bounds.max),
+                expected_bounds.unwrap(),
+                "fixture {id}"
+            );
+            assert_eq!(random.next_long(), expected_next, "fixture {id}");
+            let snapshot = terrain.snapshot();
+            for y in 0..16 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let block = snapshot.block(x, y, z).unwrap();
+                        let fallback = ("minecraft:air".to_owned(), None);
+                        let (name, facing) = expected.get(&[x, y, z]).unwrap_or(&fallback);
+                        assert_eq!(&block.name, name, "fixture {id} at {x},{y},{z}");
+                        if let Some(facing) = facing {
+                            assert_eq!(block.properties.get("facing"), Some(facing));
+                        }
+                    }
+                }
+            }
+            let actual_chests: Vec<_> = terrain.generated_monster_entities().collect();
+            if let Some((position, table, seed)) = expected_chest {
+                chests += 1;
+                assert_eq!(actual_chests.len(), 1);
+                let super::super::GeneratedMonsterRoomEntity::Chest(chest) = actual_chests[0]
+                else {
+                    panic!("unexpected block entity")
+                };
+                assert_eq!(chest.position, position);
+                assert_eq!(chest.loot_seed, seed);
+                assert!(
+                    matches!(chest.block_entity().get("LootTable"), Some(native_persistence::nbt::Tag::String(value)) if value.matches(&table))
+                );
+                if expected
+                    .values()
+                    .filter(|(name, _)| name == "minecraft:chest")
+                    .count()
+                    == 1
+                {
+                    let native_persistence::nbt::Tag::List { values, .. } = terrain
+                        .generated_block_entity_data(center, &generated)
+                        .unwrap()
+                    else {
+                        panic!("missing block entity list")
+                    };
+                    assert_eq!(values, vec![chest.block_entity()]);
+                    materialized_chests += 1;
+                }
+            } else {
+                assert!(actual_chests.is_empty());
+            }
+        }
+        assert!(chests > 0, "oracle cases must include generated chests");
+        assert!(
+            materialized_chests > 0,
+            "oracle cases must include a fully tracked chest"
+        );
+        assert!(
+            unsupported_copied_chests > 0,
+            "oracle cases must exercise copied chest rejection"
+        );
+        eprintln!(
+            "Java treasure cases matched: {}, safely rejected copied chests: {unsupported_copied_chests}",
+            40 - unsupported_copied_chests
+        );
+        assert!(lines.next().is_none());
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub mod postprocessing;
 mod postprocessing_world;
 pub mod schedule;
 pub mod structure_batch;
+mod structure_data;
 mod structure_hash_order;
 pub mod structure_references;
 mod terrain_batch;
@@ -6786,6 +6787,23 @@ mod tests {
                 .unwrap()
                 .name,
             "minecraft:chest"
+        );
+        let data = batch.structure_data(target).unwrap();
+        let start_tag = data.get("starts").unwrap().get("example:treasure").unwrap();
+        let children = match start_tag.get("Children").unwrap() {
+            native_persistence::nbt::Tag::List { values, .. } => values,
+            _ => panic!("structure children are not a list"),
+        };
+        assert_eq!(
+            children[0].get("BB"),
+            Some(&native_persistence::nbt::Tag::IntArray(
+                start
+                    .bounds
+                    .min
+                    .into_iter()
+                    .chain(start.bounds.max)
+                    .collect()
+            ))
         );
         assert!(batch.into_parts().is_err());
     }

@@ -648,6 +648,33 @@ impl FreshTerrainBatch {
             .then(|| self.structures.as_ref()?.starts.get(&pos))
             .flatten()
     }
+
+    /// Build intermediate 26.3 structure NBT after the batch finishes FEATURES.
+    /// The returned data does not establish that the world is safe to save.
+    pub fn structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        ensure!(self.is_complete(), "terrain batch is incomplete or failed");
+        ensure!(
+            self.schedule
+                .completed(pos)
+                .is_some_and(|stage| stage >= GenerationStage::Features),
+            "structure data requires completed features"
+        );
+        let structures = self
+            .structures
+            .as_ref()
+            .context("structure generation is disabled")?;
+        super::structure_data::pack_structure_data(
+            pos,
+            structures
+                .starts
+                .get(&pos)
+                .context("structure starts are missing")?,
+            structures
+                .references
+                .get(&pos)
+                .context("structure references are missing")?,
+        )
+    }
     /// The data-pack tag used for leaf distance checks in this batch.
     pub fn leaf_support_tags(&self) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
         self.decoration.as_ref()?.leaf_tags.clone()

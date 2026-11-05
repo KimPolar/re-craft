@@ -32,7 +32,7 @@ pub struct FreshGenerationSettings {
 
 type Classifier = Box<dyn FnMut(&Value) -> Result<CarverBlockState> + Send>;
 type Resolver = Box<dyn FnMut(&Value) -> Result<BlockState> + Send>;
-type HeightClassifier =
+pub(crate) type HeightClassifier =
     Box<dyn FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags> + Send>;
 type StructuredConfigurer =
     Box<dyn FnOnce(&mut FreshTerrainBatch, &mut ResourceStack) -> Result<()> + Send>;
@@ -43,6 +43,27 @@ pub(crate) type PreparedStructuredGeneration = crate::generation_worker::Structu
     HeightClassifier,
     StructuredConfigurer,
 >;
+
+pub(crate) fn height_classifier(
+    registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
+    tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+) -> HeightClassifier {
+    Box::new(move |value| {
+        let block = resolve_generated_terrain_state(value, &registry)?;
+        let motion = tags.for_block(&block.name)?;
+        Ok(native_persistence::heightmap::BlockHeightFlags {
+            is_air: matches!(
+                block.name.as_str(),
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ),
+            blocks_motion: motion.blocks_motion,
+            blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
+            has_fluid: FluidState::from_block(&block)
+                .map_err(anyhow::Error::msg)?
+                .is_some(),
+        })
+    })
+}
 
 pub struct PreparedFreshGeneration {
     pub lighting: GeneratedDimensionLighting,
@@ -600,23 +621,7 @@ pub(crate) fn prepare_with_structures(
                 .is_some(),
         })
     });
-    let for_height = Arc::clone(&registry);
-    let classifier_tags = Arc::clone(&height_tags);
-    let classify_height: HeightClassifier = Box::new(move |value| {
-        let block = resolve_generated_terrain_state(value, &for_height)?;
-        let motion = classifier_tags.for_block(&block.name)?;
-        Ok(native_persistence::heightmap::BlockHeightFlags {
-            is_air: matches!(
-                block.name.as_str(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            ),
-            blocks_motion: motion.blocks_motion,
-            blocks_motion_no_leaves: motion.blocks_motion_no_leaves,
-            has_fluid: FluidState::from_block(&block)
-                .map_err(anyhow::Error::msg)?
-                .is_some(),
-        })
-    });
+    let classify_height = height_classifier(Arc::clone(&registry), Arc::clone(&height_tags));
     let for_resolve = Arc::clone(&registry);
     let resolve: Resolver =
         Box::new(move |value| resolve_generated_terrain_state(value, &for_resolve));

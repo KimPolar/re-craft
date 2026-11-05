@@ -1375,6 +1375,7 @@ impl GenerationWorker {
                     &mut construct,
                     spawn_mobs,
                     height_tags,
+                    None,
                     biome_blend,
                     ceiling_spawn_height,
                     border,
@@ -1473,6 +1474,230 @@ impl GenerationWorker {
             }
             Ok(Some(ready))
         })
+    }
+
+    /// Complete creature and collision-checked player spawning in a
+    /// structure-aware intermediate batch, using its original pack snapshot.
+    /// The caller's creature builder must use the same world clock settings.
+    pub(crate) fn complete_structured_player_spawn<C, R, M, K, F>(
+        mut ready: GenerationReady,
+        prepare: F,
+        spawn_mobs: bool,
+        water_source_conversion: bool,
+        border: native_session::respawn::RespawnBorder,
+        player: InitialPlayerSpawnOptions,
+        ceiling_spawn_height: Option<i32>,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(native_resources::packs::ResourceStack, C, R, M, K)>
+            + Send
+            + 'static,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        M: FnMut(
+            &FreshTerrainBatch,
+            &mut native_resources::packs::ResourceStack,
+            ChunkPos,
+        ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+        K: FnMut(
+            &native_resources::packs::ResourceId,
+        ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+    {
+        Self::spawn(move |cancelled, progress| {
+            ensure!(
+                ready.batch.supports_structure_expansion(),
+                "structure expansion is unavailable"
+            );
+            ensure!(
+                ready.player_spawn.is_none(),
+                "player spawn was already selected"
+            );
+            ensure!(player.radius >= 0, "player spawn radius is invalid");
+            if let Some(level) = &ready.level_settings {
+                ensure!(
+                    player.adventure == (level.session.mode == native_session::GameMode::Adventure),
+                    "player spawn game mode differs from the frozen world settings"
+                );
+            }
+            ensure!(
+                ready
+                    .worldgen_settings_draft
+                    .as_ref()
+                    .and_then(|settings| settings.value.get("data"))
+                    .and_then(|data| data.get("bonus_chest"))
+                    == Some(&native_persistence::nbt::Tag::Byte(0)),
+                "initial bonus chest requires postprocessing before player spawn"
+            );
+            let saved_border = validated_initial_border(border, player.saved_border)?;
+            let targets = checked_spawn_targets(&mut ready)?;
+            ensure!(
+                targets
+                    .iter()
+                    .all(|&pos| ready.batch.schedule().completed(pos)
+                        == Some(GenerationStage::Light)),
+                "player spawn requires targets before creature spawning"
+            );
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let (mut provider, mut classify, mut resolve, mut build, mut construct) = prepare()?;
+            let snapshot = provider.data_pack_snapshot();
+            ensure!(
+                match (&ready.pack_snapshot, &snapshot) {
+                    (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "player spawn requires the original data-pack snapshot"
+            );
+            if let Some(snapshot) = &snapshot {
+                snapshot.verify()?;
+            }
+            let blocks = provider.vanilla_block_ids()?;
+            let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut provider,
+                &blocks,
+            )?);
+            let registry = Arc::new(provider.vanilla_generated_block_registry()?);
+            let mut classify_height =
+                crate::fresh_generation::height_classifier(registry, Arc::clone(&tags));
+            if ready.entity_collision_registry.is_none() {
+                ready.entity_collision_registry = provider
+                    .vanilla_entity_collision_registry()
+                    .ok()
+                    .map(Arc::new);
+            }
+            if !complete_creature_spawning_with_inputs(
+                &mut ready,
+                &targets,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                &mut build,
+                &mut construct,
+                spawn_mobs,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
+            }
+            let next_revision = ready
+                .mesh
+                .revision
+                .checked_add(1)
+                .context("mesh revision overflow")?;
+            let postprocessor = Self::postprocess(
+                ready,
+                targets.iter().copied().collect(),
+                0,
+                0,
+                water_source_conversion,
+                next_revision,
+            )?;
+            set_phase(progress, GenerationPhase::Postprocessing);
+            let ready = loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    postprocessor.cancel();
+                }
+                match postprocessor
+                    .result
+                    .recv_timeout(std::time::Duration::from_millis(25))
+                {
+                    Ok(GenerationResult::Ready(result)) => break result,
+                    Ok(GenerationResult::Cancelled) => return Ok(None),
+                    Ok(GenerationResult::Failed(error)) => return Err(error),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("initial postprocessing worker stopped unexpectedly")
+                    }
+                }
+            };
+            let Some(mut ready) = complete_player_spawn(
+                ready,
+                &mut provider,
+                &mut classify,
+                &mut resolve,
+                &mut build,
+                &mut construct,
+                spawn_mobs,
+                Arc::clone(&tags),
+                Some(&mut classify_height),
+                biome_blend,
+                ceiling_spawn_height,
+                border,
+                player,
+                cancelled,
+                progress,
+            )?
+            else {
+                return Ok(None);
+            };
+            ready.initial_respawn = saved_border.map(|border| InitialRespawnSettings {
+                border,
+                radius: player.radius,
+                adventure: player.adventure,
+                ceiling_spawn_height,
+                height_tags: tags,
+            });
+            if let Some(snapshot) = snapshot {
+                snapshot.verify()?;
+            }
+            Ok(Some(ready))
+        })
+    }
+
+    /// Use creature spawning rules resolved from the captured pack stack.
+    /// A missing creature configuration is accepted only when the generator
+    /// or game rule disables mob generation.
+    pub(crate) fn complete_structured_player_spawn_from_packs<C, R, F>(
+        ready: GenerationReady,
+        prepare: F,
+        spawn_mobs: bool,
+        water_source_conversion: bool,
+        border: native_session::respawn::RespawnBorder,
+        player: InitialPlayerSpawnOptions,
+        ceiling_spawn_height: Option<i32>,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<(
+                native_resources::packs::ResourceStack,
+                C,
+                R,
+                Option<crate::fresh_generation::PreparedCreatureSpawning>,
+            )> + Send
+            + 'static,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+    {
+        Self::complete_structured_player_spawn(
+            ready,
+            move || {
+                let (provider, classify, resolve, spawn) = prepare()?;
+                let build = move |batch: &FreshTerrainBatch,
+                                  provider: &mut native_resources::packs::ResourceStack,
+                                  pos| {
+                    spawn
+                        .as_ref()
+                        .context("creature spawn inputs are unavailable")?
+                        .build_spawner(batch, provider, pos)
+                };
+                let construct = |id: &native_resources::packs::ResourceId| {
+                    Ok(
+                        native_session::worldgen::FreshCreatureRandom::from_entropy(id)?
+                            .construction,
+                    )
+                };
+                Ok((provider, classify, resolve, build, construct))
+            },
+            spawn_mobs,
+            water_source_conversion,
+            border,
+            player,
+            ceiling_spawn_height,
+            biome_blend,
+        )
     }
 
     /// Construct the batch and its resources on the worker thread. They must
@@ -2144,6 +2369,9 @@ fn complete_player_spawn<P, C, R, M, K>(
     construct: &mut K,
     spawn_mobs: bool,
     tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    mut structure_height: Option<
+        &mut dyn FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    >,
     biome_blend: u8,
     ceiling_spawn_height: Option<i32>,
     border: native_session::respawn::RespawnBorder,
@@ -2260,6 +2488,18 @@ where
             .revision
             .checked_add(1)
             .context("mesh revision overflow")?;
+        if let Some(classify_height) = &mut structure_height {
+            if !prepare_structure_expansion(
+                &mut ready.batch,
+                needed,
+                provider,
+                classify_height,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
+            }
+        }
         let Some(mut expanded) = expand_with_inputs(
             ready,
             needed,
@@ -3103,51 +3343,70 @@ mod tests {
                 .is_empty(),
             "data pack selection changed"
         );
-        let blocks = spawn_resources.vanilla_block_ids()?;
-        let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
-            &mut spawn_resources,
-            &blocks,
-        )?);
         let targets = spawned.mesh.targets.as_deref().unwrap().clone();
-        for pos in &targets {
-            spawned.batch.request_spawn_without_mobs(*pos, false)?;
-            let step = generation_step(
-                &mut spawned.batch,
-                &mut spawn_resources,
-                &mut |_: &Value| -> Result<CarverBlockState> {
-                    anyhow::bail!("unexpected classification")
-                },
-                &mut |_: &Value| -> Result<BlockState> { anyhow::bail!("unexpected resolution") },
-            )?;
-            assert_eq!(step, Some((*pos, GenerationStage::Spawn)));
-            assert_eq!(
-                spawned.batch.complete_generated_entity_records(*pos)?,
-                Some([].as_slice())
-            );
-        }
         let suggestion = spawned.suggested_spawn.unwrap();
         let origin = IVec3::new(24, suggestion.y, 8);
         spawned.suggested_spawn = Some(origin);
-        let player = native_session::PlayerState {
-            position: (origin - spawned.mesh.origin).as_vec3() + glam::Vec3::new(0.5, 0.0, 0.5),
-            yaw: 0.0,
-            pitch: 0.0,
-            vertical_velocity: 0.0,
-            on_ground: false,
-            pose: native_session::PlayerPose::Standing,
-        };
-        let candidates =
-            native_session::world_spawn::WorldSpawnCandidates::new(origin, 0, 100.0, 0)?;
-        let (session, mut search) = spawned.start_player_spawn_search(
-            player,
-            tags,
-            std::iter::empty(),
-            Some(candidates),
+        let radius = 0;
+        let random_seed = 0;
+        let registry = Arc::new(spawn_resources.vanilla_generated_block_registry()?);
+        let player_worker = GenerationWorker::complete_structured_player_spawn_from_packs(
+            spawned,
+            move || {
+                use native_session::worldgen::resolve_generated_terrain_state;
+                use native_world::fluid::FluidState;
+                let for_classify = Arc::clone(&registry);
+                let classify = move |value: &Value| {
+                    let block = resolve_generated_terrain_state(value, &for_classify)?;
+                    Ok(CarverBlockState {
+                        is_air: matches!(
+                            block.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ),
+                        has_fluid: FluidState::from_block(&block)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    })
+                };
+                let resolve =
+                    move |value: &Value| resolve_generated_terrain_state(value, &registry);
+                Ok((spawn_resources, classify, resolve, None))
+            },
+            true,
+            true,
+            native_session::respawn::RespawnBorder {
+                min_x: -100.0,
+                max_x: 100.0,
+                min_z: -100.0,
+                max_z: 100.0,
+            },
+            InitialPlayerSpawnOptions {
+                radius,
+                adventure: false,
+                random_seed,
+                saved_border: None,
+            },
+            None,
+            0,
         )?;
-        assert!(matches!(
-            spawned.poll_player_spawn(&session, &mut search, None, 256)?,
-            native_session::loaded::GeneratedPlayerSpawnProgress::Found(_)
-        ));
+        let player_ready = match player_worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(120))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("structure player spawn cancelled"),
+        };
+        assert!(player_ready.player_spawn.is_some());
+        assert_eq!(player_ready.mesh.targets.as_deref(), Some(&targets));
+        assert!(player_ready.postprocessed.is_some());
+        assert!(player_ready.pack_snapshot.as_ref().is_some());
+        for pos in targets {
+            assert_eq!(
+                player_ready.batch.complete_generated_entity_records(pos)?,
+                Some([].as_slice())
+            );
+        }
         let worker = GenerationWorker::start_selected_structures_at_spawn(
             crate::fresh_generation::FreshGenerationSettings {
                 minecraft_dir: game.clone(),
@@ -4473,6 +4732,7 @@ mod tests {
             &mut construct,
             false,
             inputs.height_tags,
+            None,
             0,
             None,
             border,

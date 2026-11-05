@@ -1167,6 +1167,10 @@ impl FreshTerrainBatch {
         plan.request_structures(structures)
     }
 
+    pub fn supports_structure_expansion(&self) -> bool {
+        self.structure_continuation.is_some()
+    }
+
     pub fn step_structure_expansion<P: ResourceProvider>(
         &mut self,
         provider: &mut P,

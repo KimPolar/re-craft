@@ -21,13 +21,17 @@ use std::{
 use super::{
     BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
-    schedule::{GenerationSchedule, GenerationStage, StructureFeatureLighting},
+    schedule::{
+        GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
+        StructureFeatureLighting,
+    },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
 
 /// A single-threaded, incrementally driven batch for fresh generation.
 /// Its generator, provider, block registry and tags must belong to the same
-/// immutable pack stack. Structure-aware batches support buried treasure only;
+/// immutable pack stack. Structure-aware batches support buried treasure and,
+/// when explicitly supplied with complete spawn context, swamp huts;
 /// old-chunk blending and saving generated structures are not supported.
 /// Its deterministic work order has not been proven to match Java's thread
 /// scheduling for climate ties. Outputs remain intermediate and unsaveable.
@@ -3276,6 +3280,45 @@ impl FreshTerrainBatch {
         classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Option<(ChunkPos, GenerationStage)>> {
+        self.step_inner(provider, classify, resolve, None)
+    }
+
+    /// Perform one operation with hut mob initialization and cat conditions.
+    /// Callers must supply the active pack's variants and complete world
+    /// context. Callback clones must not share externally mutable state.
+    /// Generated structures and entities remain intermediate and unsaveable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_hut_support<C, P>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
+        let mut callbacks = HutFeatureCallbacks {
+            variants,
+            construct,
+            condition,
+        };
+        self.step_inner(provider, classify, resolve, Some(&mut callbacks))
+    }
+
+    fn step_inner(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        mut hut_runner: Option<&mut dyn HutFeatureRunner>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
         let Some((pos, stage)) = self.schedule.next_ready() else {
             if self.schedule.is_complete() {
@@ -3353,6 +3396,7 @@ impl FreshTerrainBatch {
             })(),
             GenerationStage::Features => (|| {
                 self.check_write_area(pos, 0)?;
+                let mut region_random = self.generator.region_random(pos);
                 let config = self
                     .decoration
                     .as_ref()
@@ -3401,28 +3445,46 @@ impl FreshTerrainBatch {
                                 .collect()
                         })
                         .collect();
+                    // Only huts referenced by this decoration pass can change.
+                    let mut hut_states = hut_runner.as_ref().map(|_| {
+                        keys.iter()
+                            .flatten()
+                            .filter_map(|key| {
+                                structures.huts.get(key).map(|state| (key.clone(), *state))
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    });
+                    let mut run = |lighting| {
+                        if let (Some(runner), Some(states)) =
+                            (hut_runner.as_deref_mut(), hut_states.as_mut())
+                        {
+                            self.schedule.run_features_with_huts(
+                                terrain,
+                                &prepared,
+                                &planned,
+                                states,
+                                &mut region_random,
+                                lighting,
+                                runner,
+                            )
+                        } else {
+                            self.schedule.run_features_with_structures(
+                                terrain, &prepared, &planned, lighting,
+                            )
+                        }
+                    };
                     let updated = if let Some(engine) = &mut self.light_engine {
                         let registry = self
                             .light_registry
                             .as_ref()
                             .context("light registry is missing")?;
-                        self.schedule.run_features_with_structures(
-                            terrain,
-                            &prepared,
-                            &planned,
-                            StructureFeatureLighting::Staged(engine, registry),
-                        )?
+                        run(StructureFeatureLighting::Staged(engine, registry))?
                     } else if let Some(tracker) = &mut self.light_tracker {
                         let registry = self
                             .light_registry
                             .as_ref()
                             .context("light registry is missing")?;
-                        self.schedule.run_features_with_structures(
-                            terrain,
-                            &prepared,
-                            &planned,
-                            StructureFeatureLighting::Fresh(tracker, registry),
-                        )?
+                        run(StructureFeatureLighting::Fresh(tracker, registry))?
                     } else {
                         let mut covered = Vec::with_capacity(9);
                         for dz in -1i32..=1 {
@@ -3440,15 +3502,10 @@ impl FreshTerrainBatch {
                             covered,
                         )
                         .context("invalid initial light columns")?;
-                        self.schedule.run_features_with_structures(
-                            terrain,
-                            &prepared,
-                            &planned,
-                            StructureFeatureLighting::Visible(&light),
-                        )?
+                        run(StructureFeatureLighting::Visible(&light))?
                     };
                     drop(planned);
-                    structures.commit_decorated_starts(keys, updated, None)?;
+                    structures.commit_decorated_starts(keys, updated, hut_states.as_ref())?;
                 } else if let Some(engine) = &mut self.light_engine {
                     let registry = self
                         .light_registry

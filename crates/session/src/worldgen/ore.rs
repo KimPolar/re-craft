@@ -1284,7 +1284,43 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
-            terrain, structures, states, random, variants, construct, condition, None,
+            terrain, structures, states, random, variants, construct, condition, None, None,
+        )
+    }
+
+    /// Execute huts against the initial immutable light revision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_huts_with_visible_light<C, P>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
+        self.execute_huts_with_optional_light(
+            terrain,
+            structures,
+            states,
+            random,
+            variants,
+            construct,
+            condition,
+            None,
+            Some(light),
         )
     }
 
@@ -1322,6 +1358,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             construct,
             condition,
             Some(DecorationLightTracking::Fresh(tracker, registry)),
+            None,
         )
     }
 
@@ -1359,6 +1396,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             construct,
             condition,
             Some(DecorationLightTracking::Staged(engine, registry)),
+            None,
         )
     }
 
@@ -1373,6 +1411,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         construct: &mut C,
         condition: &mut P,
         tracking: Option<DecorationLightTracking<'_>>,
+        visible: Option<&native_world::generation_light::VisibleLightSnapshot>,
     ) -> Result<(
         Vec<bool>,
         Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
@@ -1400,15 +1439,36 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             construct: &mut next_construct,
             condition: &mut next_condition,
         };
-        let features = match tracking {
-            Some(tracking) => self.execute_with_light_tracking(
+        let features = match (tracking, visible) {
+            (Some(tracking), None) => self.execute_with_light_tracking(
                 terrain,
                 true,
                 tracking,
                 Some((structures, &mut updated)),
                 Some(&mut huts),
             )?,
-            None => self.execute_inner(
+            (None, Some(light)) => {
+                let block = |p| {
+                    light
+                        .block_light(p)
+                        .context("block-light column not captured")
+                };
+                let raw = |_: &World, p| {
+                    light
+                        .raw_brightness(p, 0)
+                        .context("raw-brightness column not captured")
+                };
+                self.execute_inner(
+                    terrain,
+                    true,
+                    Some(&block),
+                    Some(&raw),
+                    None,
+                    Some((structures, &mut updated)),
+                    Some(&mut huts),
+                )?
+            }
+            (None, None) => self.execute_inner(
                 terrain,
                 true,
                 None,
@@ -1417,6 +1477,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 Some((structures, &mut updated)),
                 Some(&mut huts),
             )?,
+            (Some(_), Some(_)) => unreachable!("lighting modes are mutually exclusive"),
         };
         *states = next_states;
         *random = next_random;

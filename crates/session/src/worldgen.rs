@@ -6726,6 +6726,226 @@ mod tests {
     }
 
     #[test]
+    fn fresh_structure_batch_runs_hut_features_and_retains_mobs() {
+        use native_resources::{
+            carver::tags::CarverBlockTags, cat_variants::CatSpawnVariants,
+            dimension_lighting::GeneratedDimensionLighting, structure_biomes::StructureBiomes,
+            structure_piece::swamp_hut::HutMob, structure_placement::StructureSetCache,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        struct HutData;
+        impl ResourceProvider for HutData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/example/worldgen/structure/hut.json" => Some(
+                        json!({"type":"minecraft:swamp_hut","biomes":["minecraft:plains"],"step":"surface_structures"}),
+                    ),
+                    "data/example/worldgen/structure_set/hut.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:hut","weight":1}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    "data/minecraft/cat_variant/black.json" => {
+                        Some(json!({"spawn_conditions":[{"priority":0}]}))
+                    }
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        Some(json!({"values":["minecraft:stone","minecraft:dirt"]}))
+                    }
+                    _ => None,
+                };
+                match value {
+                    Some(value) => Ok(Some(serde_json::to_vec(&value)?)),
+                    None => Data.read_data(path),
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                match folder {
+                    "worldgen/structure" => Ok(vec![ResourceId::parse("example:hut")?]),
+                    "cat_variant" => Ok(vec![ResourceId::parse("minecraft:black")?]),
+                    "cat_sound_variant" => Ok(vec![ResourceId::parse("minecraft:classic")?]),
+                    _ => Data.list_data(folder),
+                }
+            }
+        }
+        for fail_mob in [false, true] {
+            let mut data = HutData;
+            let mut config = definition();
+            config["settings"]["noise"]["height"] = json!(96);
+            config["settings"]["material_rule"] =
+                json!({"type":"block","result_state":"minecraft:stone"});
+            config["settings"]["noise_router"]["final_density"] = json!({"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1});
+            let (generator, terrain_generator) =
+                TerrainGenerator::paired_with_structure_context(&mut data, &config, 42, 0, 96)
+                    .unwrap();
+            let structure = ResourceId::parse("example:hut").unwrap();
+            let set = ResourceId::parse("example:hut").unwrap();
+            let [x, z] = StructureSetCache::default()
+                .load(&mut data, &set)
+                .unwrap()
+                .placement
+                .potential_chunk(42, [0, 0]);
+            let target = ChunkPos { x, z };
+            let requested: Vec<_> = (-1..=1)
+                .flat_map(|dz| {
+                    (-1..=1).map(move |dx| ChunkPos {
+                        x: x + dx,
+                        z: z + dz,
+                    })
+                })
+                .collect();
+            let rules = StructureBiomes::load(&mut data, [structure.clone()]).unwrap();
+            let mut structures =
+                structure_batch::StructureGenerationBatch::new(generator, rules, vec![set])
+                    .unwrap();
+            let preparation = structure_batch::StructurePreparationPlan::new(
+                requested
+                    .iter()
+                    .copied()
+                    .map(|pos| (pos, schedule::GenerationStage::Features)),
+            )
+            .unwrap();
+            preparation.request_structures(&mut structures).unwrap();
+            while structures
+                .step(&mut data, &mut |value| {
+                    let name = value.as_str().unwrap();
+                    Ok(BlockHeightFlags {
+                        is_air: name == "minecraft:air",
+                        blocks_motion: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                        blocks_motion_no_leaves: matches!(
+                            name,
+                            "minecraft:stone" | "minecraft:dirt"
+                        ),
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                })
+                .unwrap()
+                .is_some()
+            {}
+            let blocks: BTreeSet<_> = [
+                "air",
+                "cave_air",
+                "void_air",
+                "bedrock",
+                "stone",
+                "dirt",
+                "water",
+                "lava",
+                "spruce_planks",
+                "oak_log",
+                "oak_fence",
+                "spruce_stairs",
+                "potted_red_mushroom",
+                "crafting_table",
+                "cauldron",
+            ]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+            let tags = CarverBlockTags::load(&mut data, &blocks).unwrap();
+            let mut batch = preparation
+                .into_expandable_terrain_batch(
+                    structures,
+                    terrain_generator,
+                    tags,
+                    "minecraft:overworld",
+                )
+                .unwrap();
+            let before = batch.structure_starts(target).unwrap()[&structure].bounds;
+            let lighting = GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+                dimension_type: None,
+                min_y: 0,
+                height: 96,
+                has_skylight: true,
+                ambient_light: Some(0.0),
+            };
+            batch
+                .enable_decoration(&mut data, &BTreeSet::new(), blocks, &lighting)
+                .unwrap();
+            for &pos in &requested {
+                batch.request_features(pos).unwrap();
+            }
+            let variants = CatSpawnVariants::load_active(&mut data).unwrap();
+            let mut construct = |mob| {
+                ensure!(!fail_mob, "injected mob initialization failure");
+                let (id, seed) = match mob {
+                    HutMob::Witch => ("minecraft:witch", 1),
+                    HutMob::Cat => ("minecraft:cat", 2),
+                };
+                FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
+            };
+            let mut condition =
+                |_: [i32; 3], _: &native_world::loaded::World, _: &Value| -> Result<bool> {
+                    anyhow::bail!("unexpected condition")
+                };
+            let mut saw_failure = false;
+            loop {
+                let previous = batch.snapshot();
+                let result = batch.step_with_hut_support(
+                    &mut data,
+                    &mut |value| {
+                        let name = value.as_str().unwrap();
+                        Ok(CarverBlockState {
+                            is_air: name == "minecraft:air",
+                            has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                        })
+                    },
+                    &mut |value| {
+                        Ok(BlockState {
+                            name: value.as_str().unwrap().into(),
+                            properties: BTreeMap::new(),
+                        })
+                    },
+                    &variants,
+                    &mut construct,
+                    &mut condition,
+                );
+                match result {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        assert!(fail_mob, "unexpected generation failure: {error:#}");
+                        assert!(
+                            format!("{error:#}").contains("injected mob initialization failure")
+                        );
+                        assert!(Arc::ptr_eq(&previous.unwrap(), &batch.snapshot().unwrap()));
+                        assert!(batch.structure_starts(target).is_none());
+                        saw_failure = true;
+                        break;
+                    }
+                }
+            }
+            if fail_mob {
+                assert!(saw_failure);
+                continue;
+            }
+            let start = &batch.structure_starts(target).unwrap()[&structure];
+            assert_ne!(start.bounds.min[1], before.min[1]);
+            let entity_count: usize = requested
+                .iter()
+                .map(|&pos| batch.recorded_generated_entities(pos).unwrap().len())
+                .sum();
+            assert_eq!(entity_count, 2);
+            let world = batch.snapshot().unwrap();
+            assert!((start.bounds.min[0]..=start.bounds.max[0]).any(|x| {
+                (start.bounds.min[1]..=start.bounds.max[1]).any(|y| {
+                    (start.bounds.min[2]..=start.bounds.max[2]).any(|z| {
+                        world
+                            .block(x, y, z)
+                            .is_some_and(|block| block.name == "minecraft:spruce_planks")
+                    })
+                })
+            }));
+            assert!(batch.structure_data(target).is_err());
+        }
+    }
+
+    #[test]
     fn fresh_structure_batch_decorates_and_retains_buried_treasure_start() {
         use native_resources::{
             carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,

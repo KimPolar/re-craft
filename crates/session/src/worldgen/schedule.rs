@@ -31,6 +31,81 @@ pub(super) enum StructureFeatureLighting<'a> {
         &'a native_resources::block_registry::GeneratedBlockRegistry,
     ),
 }
+
+pub(super) trait HutFeatureRunner {
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>>;
+}
+
+pub(super) struct HutFeatureCallbacks<'a, C, P> {
+    pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
+    pub construct: &'a mut C,
+    pub condition: &'a mut P,
+}
+
+impl<C, P> HutFeatureRunner for HutFeatureCallbacks<'_, C, P>
+where
+    C: Clone
+        + FnMut(
+            native_resources::structure_piece::swamp_hut::HutMob,
+        ) -> Result<super::FreshCreatureRandom>,
+    P: Clone + FnMut([i32; 3], &native_world::loaded::World, &serde_json::Value) -> Result<bool>,
+{
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
+        let (_, updated) = match lighting {
+            StructureFeatureLighting::Visible(light) => prepared.execute_huts_with_visible_light(
+                terrain,
+                structures,
+                states,
+                random,
+                self.variants,
+                self.construct,
+                self.condition,
+                light,
+            )?,
+            StructureFeatureLighting::Fresh(tracker, registry) => prepared
+                .execute_huts_with_tracked_light(
+                    terrain,
+                    structures,
+                    states,
+                    random,
+                    self.variants,
+                    self.construct,
+                    self.condition,
+                    tracker,
+                    registry,
+                )?,
+            StructureFeatureLighting::Staged(engine, registry) => prepared
+                .execute_huts_with_staged_light(
+                    terrain,
+                    structures,
+                    states,
+                    random,
+                    self.variants,
+                    self.construct,
+                    self.condition,
+                    engine,
+                    registry,
+                )?,
+        };
+        Ok(updated)
+    }
+}
 impl GenerationStage {
     pub const ALL: [Self; 10] = [
         Empty,
@@ -693,6 +768,28 @@ impl GenerationSchedule {
             StructureFeatureLighting::Staged(engine, registry) => prepared
                 .execute_structures_with_staged_light(terrain, structures, engine, registry)?,
         };
+        self.complete(center, Features)?;
+        Ok(updated)
+    }
+
+    /// Complete FEATURES only after the hut-aware pass succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_features_with_huts(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        runner: &mut dyn HutFeatureRunner,
+    ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let updated = runner.execute(terrain, prepared, structures, states, random, lighting)?;
         self.complete(center, Features)?;
         Ok(updated)
     }

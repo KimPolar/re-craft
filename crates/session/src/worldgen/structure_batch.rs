@@ -135,6 +135,36 @@ pub struct StructureGenerationBatch {
 }
 
 impl StructureGenerationBatch {
+    /// Validate an observed Java normal-generator order against the complete
+    /// registry and possible biomes before attempting any structure starts.
+    /// Unsupported starts still fail when a candidate is generated.
+    pub fn from_registry_order(
+        generator: TerrainGenerator,
+        provider: &mut impl ResourceProvider,
+        sets: Vec<ResourceId>,
+    ) -> Result<Self> {
+        ensure!(
+            generator.structure_context,
+            "generator lacks structure context"
+        );
+        let mut cache = StructureSetCache::default();
+        let (eligible, biome_rules) =
+            cache.possible_registry_membership(provider, generator.possible_biomes())?;
+        ensure!(
+            sets.len() == eligible.len()
+                && sets.iter().cloned().collect::<BTreeSet<_>>() == eligible,
+            "structure set order does not cover the eligible registry exactly"
+        );
+        let mut batch = Self::new(generator, biome_rules, sets)?;
+        batch.cache = cache;
+        Ok(batch)
+    }
+
+    /// Registry-ordered sets selected for this generator's biome source.
+    pub fn structure_sets(&self) -> &[ResourceId] {
+        &self.sets
+    }
+
     /// Freeze completed structure stages and transfer their generator to the
     /// terrain batch. Orders must be Java's actual start iteration order.
     pub(super) fn into_terrain_stages(

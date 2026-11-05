@@ -82,6 +82,9 @@ mod tests {
             Ok(self.0.get(p).cloned().unwrap_or_default())
         }
         fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+            if folder == "worldgen/structure_set" {
+                return Ok(vec![ResourceId::parse("example:custom")?]);
+            }
             anyhow::ensure!(folder == "worldgen/biome", "unexpected registry");
             ["example:a", "example:b"]
                 .into_iter()
@@ -125,6 +128,39 @@ mod tests {
         assert!(!rules.set_has_possible_biome(&entries, &a_only).unwrap());
         assert!(rules.set_has_possible_biome(&entries, &b_only).unwrap());
         let mut cache = crate::structure_placement::StructureSetCache::default();
+        let (selected, selected_rules) = cache
+            .possible_registry_membership(&mut data, &b_only)
+            .unwrap();
+        assert_eq!(selected, BTreeSet::from([id.clone()]));
+        assert!(
+            selected_rules
+                .permits(&id, b_only.iter().next().unwrap())
+                .unwrap()
+        );
+        assert!(
+            cache
+                .possible_registry_membership(&mut data, &a_only)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let repeated = [id.clone(), id.clone()];
+        assert_eq!(
+            cache
+                .possible_sets(&mut data, &repeated, &b_only)
+                .unwrap()
+                .0,
+            repeated
+        );
+        assert!(
+            cache
+                .possible_sets(
+                    &mut data,
+                    &[ResourceId::parse("example:missing").unwrap()],
+                    &b_only
+                )
+                .is_err()
+        );
         assert!(
             !cache
                 .is_structure_chunk_for_biomes(&mut data, &rules, &a_only, &id, 42, [0, 0])

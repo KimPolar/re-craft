@@ -6886,6 +6886,11 @@ mod tests {
                         ResourceId::parse("example:pyramid")?,
                         ResourceId::parse("example:absent")?,
                     ])
+                } else if folder == "worldgen/structure_set" {
+                    Ok(vec![
+                        ResourceId::parse("example:sparse")?,
+                        ResourceId::parse("example:pyramid")?,
+                    ])
                 } else {
                     Data.list_data(folder)
                 }
@@ -6950,6 +6955,39 @@ mod tests {
         data.0.insert(
             "data/example/worldgen/structure_set/sparse.json".into(),
             serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap(),
+        );
+        let selected_generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let order = vec![
+            ResourceId::parse("example:sparse").unwrap(),
+            ResourceId::parse("example:pyramid").unwrap(),
+        ];
+        let selected = structure_batch::StructureGenerationBatch::from_registry_order(
+            selected_generator,
+            &mut data,
+            order.clone(),
+        )
+        .unwrap();
+        assert_eq!(selected.structure_sets(), order);
+        let incomplete_generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        assert!(
+            structure_batch::StructureGenerationBatch::from_registry_order(
+                incomplete_generator,
+                &mut data,
+                vec![order[0].clone()]
+            )
+            .is_err()
+        );
+        let duplicate_generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        assert!(
+            structure_batch::StructureGenerationBatch::from_registry_order(
+                duplicate_generator,
+                &mut data,
+                vec![order[0].clone(), order[0].clone()]
+            )
+            .is_err()
         );
         let sparse = ResourceId::parse("example:sparse").unwrap();
         let [x, z] = cache

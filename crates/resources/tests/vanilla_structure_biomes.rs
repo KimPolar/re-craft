@@ -3,7 +3,7 @@ use native_resources::{
     biome_source::BiomeSource,
     packs::{ResourceId, ResourceProvider, ResourceStack},
     structure_biomes::StructureBiomes,
-    structure_placement::{StructureEntry, decode_structure_entries},
+    structure_placement::{StructureEntry, StructureSetCache, decode_structure_entries},
 };
 use serde_json::Value;
 use std::{
@@ -91,6 +91,8 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
     }
     let biome_rules = StructureBiomes::load(&mut resources, all).unwrap();
     let mut java_biomes = BTreeMap::<String, BTreeSet<ResourceId>>::new();
+    let mut java_selected = BTreeMap::<String, Vec<ResourceId>>::new();
+    let mut java_candidates = BTreeMap::<String, Vec<ResourceId>>::new();
     let mut checks = 0;
     let mut set_checks = 0;
     for line in output.lines() {
@@ -104,6 +106,16 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
             }
             Some("S") => {
                 let id = ResourceId::parse(p[2]).unwrap();
+                java_candidates
+                    .entry(p[1].to_owned())
+                    .or_default()
+                    .push(id.clone());
+                if p[3] == "true" {
+                    java_selected
+                        .entry(p[1].to_owned())
+                        .or_default()
+                        .push(id.clone());
+                }
                 assert_eq!(
                     biome_rules
                         .set_has_possible_biome(&sets[&id], &possible[p[1]])
@@ -131,6 +143,24 @@ fn structure_biome_sets_match_java_in_all_dimensions() {
         }
     }
     assert_eq!(java_biomes, possible);
+    for (dimension, biomes) in &possible {
+        let mut cache = StructureSetCache::default();
+        let (selected, _) = cache
+            .possible_registry_membership(&mut resources, biomes)
+            .unwrap();
+        assert_eq!(
+            selected,
+            java_selected[dimension].iter().cloned().collect(),
+            "registry membership in {dimension}"
+        );
+        let (ordered, _) = cache
+            .possible_sets(&mut resources, &java_candidates[dimension], biomes)
+            .unwrap();
+        assert_eq!(
+            ordered, java_selected[dimension],
+            "observed registry order in {dimension}"
+        );
+    }
     assert!(set_checks >= 60);
     assert!(checks >= 1000);
 }

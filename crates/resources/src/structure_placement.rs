@@ -529,6 +529,52 @@ fn missing_ring_positions<P: ResourceProvider>(
     )
 }
 impl StructureSetCache {
+    /// Find the registry sets compatible with the generator's possible biomes.
+    /// Membership is independent of Java's process-specific registry order.
+    /// The cache and biome rules belong to this exact data-pack stack.
+    pub fn possible_registry_membership(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        possible_biomes: &BTreeSet<ResourceId>,
+    ) -> Result<(
+        BTreeSet<ResourceId>,
+        crate::structure_biomes::StructureBiomes,
+    )> {
+        let candidates = provider.list_registry_data("worldgen/structure_set")?;
+        let (selected, rules) = self.possible_sets(provider, &candidates, possible_biomes)?;
+        Ok((selected.into_iter().collect(), rules))
+    }
+
+    /// Select an explicit ordered stream, as used by flat-world overrides.
+    /// Repeated candidates remain repeated, matching Java's stream filtering.
+    pub fn possible_sets(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        candidates: &[ResourceId],
+        possible_biomes: &BTreeSet<ResourceId>,
+    ) -> Result<(Vec<ResourceId>, crate::structure_biomes::StructureBiomes)> {
+        let mut structures = BTreeSet::new();
+        for id in candidates {
+            structures.extend(
+                self.load_set(provider, id)?
+                    .structures()
+                    .iter()
+                    .map(|entry| entry.id.clone()),
+            );
+        }
+        let rules = crate::structure_biomes::StructureBiomes::load(provider, structures)?;
+        let mut selected = Vec::new();
+        for id in candidates {
+            if rules.set_has_possible_biome(
+                self.load_set(provider, id)?.structures(),
+                possible_biomes,
+            )? {
+                selected.push(id.clone());
+            }
+        }
+        Ok((selected, rules))
+    }
+
     /// The cached ring list belongs to this cache's biome source and pack stack.
     pub fn cached_ring_positions(&self, id: &ResourceId, seed: i64) -> Option<&[[i32; 2]]> {
         self.rings.get(&(id.clone(), seed)).map(AsRef::as_ref)

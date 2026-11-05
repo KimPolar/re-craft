@@ -271,6 +271,14 @@ impl StructureGenerationBatch {
         &self.sets
     }
 
+    /// Compute the generator's initial origin before preparing its structures.
+    /// The provider must be the same unchanged data-pack stack as this batch.
+    pub fn spawn_origin(&self, provider: &mut impl ResourceProvider) -> Result<ChunkPos> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        let [x, z] = self.generator.spawn_origin(provider)?;
+        Ok(ChunkPos { x, z })
+    }
+
     /// Freeze completed structure stages and transfer their generator to the
     /// terrain batch. Orders must be Java's actual start iteration order.
     pub(super) fn into_terrain_stages(

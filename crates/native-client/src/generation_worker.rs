@@ -1510,17 +1510,68 @@ impl GenerationWorker {
         H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
         K: FnOnce(&mut FreshTerrainBatch, &mut P) -> Result<()>,
     {
+        Self::start_structured(
+            prepare,
+            GenerationTargets::Explicit { targets, origin },
+            revision,
+            biome_blend,
+        )
+    }
+
+    /// Compute the generator's initial spawn origin before preparing the
+    /// structures and lighting needed for that chunk.
+    pub(crate) fn start_with_structures_at_spawn<P, C, R, H, K, F>(
+        prepare: F,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<StructuredGenerationInputs<P, C, R, H, K>> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+        K: FnOnce(&mut FreshTerrainBatch, &mut P) -> Result<()>,
+    {
+        Self::start_structured(
+            prepare,
+            GenerationTargets::SpawnOrigin,
+            revision,
+            biome_blend,
+        )
+    }
+
+    fn start_structured<P, C, R, H, K, F>(
+        prepare: F,
+        selection: GenerationTargets,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<StructuredGenerationInputs<P, C, R, H, K>> + Send + 'static,
+        P: ResourceProvider,
+        C: FnMut(&Value) -> Result<CarverBlockState>,
+        R: FnMut(&Value) -> Result<BlockState>,
+        H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+        K: FnOnce(&mut FreshTerrainBatch, &mut P) -> Result<()>,
+    {
         Self::spawn(move |cancelled, progress| {
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            let initialized = initialized_neighbors(&targets)?;
-            let plan = StructurePreparationPlan::new(
-                initialized
-                    .iter()
-                    .copied()
-                    .map(|pos| (pos, GenerationStage::InitializeLight)),
-            )?;
+            let explicit = match selection {
+                GenerationTargets::Explicit { targets, origin } => {
+                    let initialized = initialized_neighbors(&targets)?;
+                    let plan = StructurePreparationPlan::new(
+                        initialized
+                            .iter()
+                            .copied()
+                            .map(|pos| (pos, GenerationStage::InitializeLight)),
+                    )?;
+                    Some((targets, origin, initialized, plan))
+                }
+                GenerationTargets::SpawnOrigin => None,
+            };
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(None);
             }
@@ -1538,6 +1589,29 @@ impl GenerationWorker {
                 structures.is_complete(),
                 "structure batch has unfinished or failed work"
             );
+            let (targets, origin, initialized, plan, spawn_origin) =
+                if let Some((targets, origin, initialized, plan)) = explicit {
+                    (targets, origin, initialized, plan, None)
+                } else {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let spawn = structures.spawn_origin(&mut provider)?;
+                    let origin = IVec3::new(
+                        spawn.x.checked_mul(16).context("spawn origin X overflow")?,
+                        0,
+                        spawn.z.checked_mul(16).context("spawn origin Z overflow")?,
+                    );
+                    let targets = BTreeSet::from([spawn]);
+                    let initialized = initialized_neighbors(&targets)?;
+                    let plan = StructurePreparationPlan::new(
+                        initialized
+                            .iter()
+                            .copied()
+                            .map(|pos| (pos, GenerationStage::InitializeLight)),
+                    )?;
+                    (targets, origin, initialized, plan, Some(spawn))
+                };
             plan.request_structures(&mut structures)?;
             set_phase(progress, GenerationPhase::Generating);
             while let Some((pos, stage)) = {
@@ -1553,7 +1627,7 @@ impl GenerationWorker {
             }
             let mut batch = plan.into_terrain_batch(structures, terrain_tags, &dimension)?;
             configure_terrain(&mut batch, &mut provider)?;
-            generate_targets(
+            let Some(mut ready) = generate_targets(
                 batch,
                 &mut provider,
                 &mut classify,
@@ -1565,7 +1639,12 @@ impl GenerationWorker {
                 origin,
                 cancelled,
                 progress,
-            )
+            )?
+            else {
+                return Ok(None);
+            };
+            ready.spawn_origin = spawn_origin;
+            Ok(Some(ready))
         })
     }
 
@@ -2750,7 +2829,7 @@ mod tests {
                         json!({"type":"minecraft:buried_treasure","biomes":["minecraft:plains"],"step":"surface_structures"}),
                     ),
                     "data/example/worldgen/structure_set/treasure.json" => Some(
-                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}),
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}),
                     ),
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
@@ -2787,16 +2866,38 @@ mod tests {
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let registry = ResourceStack::open(&game)?.vanilla_generated_block_registry()?;
         let blocks: BTreeSet<_> = registry.ids().map(str::to_owned).collect();
-        let worker = GenerationWorker::start_with_structures(
-            move || {
+        assert_eq!(target, ChunkPos { x: 0, z: 0 });
+        let mut baseline: Option<(
+            Arc<native_world::loaded::World>,
+            native_persistence::nbt::Tag,
+        )> = None;
+        for mode in 0..4 {
+            let from_spawn = mode != 0;
+            let missing_spawn = mode == 2;
+            let cancel_during_setup = mode == 3;
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let registry = registry.clone();
+            let blocks = blocks.clone();
+            let prepare = move || {
+                if cancel_during_setup {
+                    entered_tx.send(())?;
+                    release_rx.recv()?;
+                }
                 let mut provider = Data;
-                let definition = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"},"settings":{
+                let mut definition = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"},"settings":{
                     "noise":{"min_y":80,"height":16},"legacy_random_source":false,"sea_level":88,
-                    "default_block":"minecraft:stone","default_fluid":"minecraft:water",
+                    "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
                     "material_rule":{"type":"block","result_state":"minecraft:stone"},
                     "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":80,"to_coordinate":96,"from_value":1,"to_value":-1},
                         "temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":88}
                 }});
+                if missing_spawn {
+                    definition["settings"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("spawn_target");
+                }
                 let generator = TerrainGenerator::with_structure_context(
                     &mut provider,
                     &definition,
@@ -2863,49 +2964,96 @@ mod tests {
                     dimension: "minecraft:overworld".into(),
                     configure_terrain,
                 })
-            },
-            BTreeSet::from([target]),
-            71,
-            0,
-            IVec3::ZERO,
-        )?;
-        let ready = match worker
-            .result
-            .recv_timeout(std::time::Duration::from_secs(120))?
-        {
-            GenerationResult::Ready(ready) => ready,
-            GenerationResult::Failed(error) => return Err(error),
-            GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
-        };
-        let id = ResourceId::parse("example:treasure")?;
-        let start = &ready
-            .batch
-            .structure_starts(target)
-            .context("structure starts missing")?[&id];
-        assert_ne!(start.bounds.min[1], 90);
-        assert_eq!(
-            ready
-                .mesh
-                .world
-                .block(
-                    start.bounds.min[0],
-                    start.bounds.min[1],
-                    start.bounds.min[2]
-                )
-                .unwrap()
-                .name,
-            "minecraft:chest"
-        );
-        assert!(
-            ready
+            };
+            let worker = if from_spawn {
+                GenerationWorker::start_with_structures_at_spawn(prepare, 71, 0)?
+            } else {
+                GenerationWorker::start_with_structures(
+                    prepare,
+                    BTreeSet::from([target]),
+                    71,
+                    0,
+                    IVec3::ZERO,
+                )?
+            };
+            if cancel_during_setup {
+                entered_rx.recv_timeout(std::time::Duration::from_secs(10))?;
+                worker.cancel();
+                release_tx.send(())?;
+            }
+            let outcome = worker
+                .result
+                .recv_timeout(std::time::Duration::from_secs(120))?;
+            if cancel_during_setup {
+                assert!(matches!(outcome, GenerationResult::Cancelled));
+                assert_eq!(worker.progress().completed_steps, 0);
+                continue;
+            }
+            if missing_spawn {
+                let GenerationResult::Failed(error) = outcome else {
+                    anyhow::bail!("missing spawn target was accepted")
+                };
+                assert!(format!("{error:#}").contains("spawn_target"));
+                assert_eq!(worker.progress().completed_steps, 0);
+                continue;
+            }
+            let ready = match outcome {
+                GenerationResult::Ready(ready) => ready,
+                GenerationResult::Failed(error) => return Err(error),
+                GenerationResult::Cancelled => anyhow::bail!("structure generation cancelled"),
+            };
+            assert_eq!(ready.spawn_origin, from_spawn.then_some(target));
+            assert_eq!(
+                ready.mesh.targets.as_deref(),
+                Some(&BTreeSet::from([target]))
+            );
+            let id = ResourceId::parse("example:treasure")?;
+            let start = &ready
                 .batch
-                .structure_data(target)?
-                .get("starts")
-                .unwrap()
-                .get("example:treasure")
-                .is_some()
-        );
-        assert!(ready.batch.into_parts().is_err());
+                .structure_starts(target)
+                .context("structure starts missing")?[&id];
+            assert_ne!(start.bounds.min[1], 90);
+            assert_eq!(
+                ready
+                    .mesh
+                    .world
+                    .block(
+                        start.bounds.min[0],
+                        start.bounds.min[1],
+                        start.bounds.min[2]
+                    )
+                    .unwrap()
+                    .name,
+                "minecraft:chest"
+            );
+            let structure_data = ready.batch.structure_data(target)?;
+            assert!(
+                structure_data
+                    .get("starts")
+                    .unwrap()
+                    .get("example:treasure")
+                    .is_some()
+            );
+            if let Some((world, expected_structures)) = &baseline {
+                assert_eq!(&structure_data, expected_structures);
+                for y in 80..96 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            assert_eq!(ready.mesh.world.block(x, y, z), world.block(x, y, z));
+                            for sky in [false, true] {
+                                assert_eq!(
+                                    ready.mesh.world.light(x, y, z, sky),
+                                    world.light(x, y, z, sky)
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                baseline = Some((Arc::clone(&ready.mesh.world), structure_data));
+            }
+            assert!(ready.batch.into_parts().is_err());
+        }
         Ok(())
     }
 

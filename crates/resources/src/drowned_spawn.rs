@@ -1,8 +1,8 @@
-//! Java 26.3 drowned spawn draws, before enchantments and jockey handling.
+//! Java 26.3 drowned spawn draws and structure initialization order.
 use anyhow::{Result, ensure};
 use native_core::random::LegacyRandom;
 
-use crate::worldgen_region_random::RegionRandom;
+use crate::worldgen_region_random::{MobBaseInitialization, RegionRandom, finalize_mob_base};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainHandRoll {
@@ -32,6 +32,7 @@ pub trait NautilusJockeyWorld {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DrownedPostInitialization {
+    /// Java equips the shell and marks its offhand drop as guaranteed.
     pub give_nautilus_shell: bool,
     pub spawned_nautilus: bool,
 }
@@ -86,6 +87,120 @@ pub struct DrownedAttributes {
     pub zombie_follow_range_bonus: Option<f64>,
     pub leader_reinforcement_bonus: Option<f64>,
     pub leader_health_bonus: Option<f64>,
+}
+
+/// The caller resolves live chicken availability, initializes a newly created
+/// jockey, and applies the active data pack's mob-spawn enchantment provider.
+pub trait StructureDrownedWorld: NautilusJockeyWorld {
+    /// Search in Java order and attempt riding the first unmounted chicken.
+    fn try_existing_chicken(&mut self) -> Result<bool>;
+    /// Create, initialize, mount and add a chicken jockey when available.
+    fn spawn_chicken_jockey(&mut self, random: &mut RegionRandom) -> Result<bool>;
+    /// Apply MOB_SPAWN_EQUIPMENT to the current main-hand item.
+    fn enchant_weapon(
+        &mut self,
+        random: &mut RegionRandom,
+        weapon: MainHandRoll,
+        special: f32,
+    ) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChickenJockey {
+    None,
+    Existing,
+    Created,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HalloweenHelmet {
+    CarvedPumpkin,
+    JackOLantern,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StructureDrownedInitialization {
+    pub mob: MobBaseInitialization,
+    pub can_pick_up_loot: bool,
+    pub baby: bool,
+    pub chicken_jockey: ChickenJockey,
+    pub can_break_doors: bool,
+    pub main_hand: MainHandRoll,
+    /// A holiday helmet has a zero equipment drop chance.
+    pub helmet: Option<HalloweenHelmet>,
+    pub attributes: DrownedAttributes,
+    pub post: DrownedPostInitialization,
+}
+
+/// Initialize a newly constructed structure drowned with empty equipment and
+/// no group data. This composes both independent random streams in Java order.
+/// The world draft, callback-owned state, and both RNGs must be discarded on
+/// any error; the caller creates the entity and applies/serializes these fields.
+pub fn initialize_structure_drowned(
+    world: &mut impl StructureDrownedWorld,
+    region_random: &mut RegionRandom,
+    entity_random: &mut LegacyRandom,
+    special_multiplier: f32,
+    halloween: bool,
+) -> Result<StructureDrownedInitialization> {
+    ensure!(
+        special_multiplier.is_finite() && (0.0..=1.0).contains(&special_multiplier),
+        "invalid special difficulty multiplier"
+    );
+    let mob = finalize_mob_base(region_random, false);
+    let can_pick_up_loot = region_random.next_float() < 0.55_f32 * special_multiplier;
+    let baby = region_random.next_float() < 0.05_f32;
+    let mut chicken_jockey = ChickenJockey::None;
+    if baby {
+        if f64::from(region_random.next_float()) < 0.05_f64 {
+            if world.try_existing_chicken()? {
+                chicken_jockey = ChickenJockey::Existing;
+            }
+        } else if f64::from(region_random.next_float()) < 0.05_f64
+            && world.spawn_chicken_jockey(region_random)?
+        {
+            chicken_jockey = ChickenJockey::Created;
+        }
+    }
+    let mut can_break_doors = region_random.next_float() < special_multiplier * 0.1_f32;
+    let main_hand = populate_main_hand(region_random);
+    if main_hand != MainHandRoll::Unchanged
+        && region_random.next_float() < 0.25_f32 * special_multiplier
+    {
+        world.enchant_weapon(region_random, main_hand, special_multiplier)?;
+    }
+    let helmet = if halloween && region_random.next_float() < 0.25_f32 {
+        Some(if region_random.next_float() < 0.1_f32 {
+            HalloweenHelmet::JackOLantern
+        } else {
+            HalloweenHelmet::CarvedPumpkin
+        })
+    } else {
+        None
+    };
+    let attributes = roll_attributes(entity_random, special_multiplier)?;
+    if attributes.leader_health_bonus.is_some() {
+        can_break_doors = true;
+    }
+    let post = finalize_after_zombie(
+        region_random,
+        world,
+        true,
+        main_hand == MainHandRoll::Trident,
+        baby,
+        DrownedSpawnReason::Structure,
+    )?;
+    Ok(StructureDrownedInitialization {
+        mob,
+        can_pick_up_loot,
+        baby,
+        chicken_jockey,
+        can_break_doors,
+        main_hand,
+        helmet,
+        attributes,
+        post,
+    })
 }
 
 /// Apply the fresh zombie attribute rolls used by drowned, retaining the
@@ -145,6 +260,24 @@ mod tests {
             Ok(true)
         }
     }
+    impl StructureDrownedWorld for World {
+        fn try_existing_chicken(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+        fn spawn_chicken_jockey(&mut self, random: &mut RegionRandom) -> Result<bool> {
+            random.next_int();
+            Ok(true)
+        }
+        fn enchant_weapon(
+            &mut self,
+            random: &mut RegionRandom,
+            _: MainHandRoll,
+            _: f32,
+        ) -> Result<()> {
+            random.next_int();
+            Ok(())
+        }
+    }
     #[test]
     fn invalid_difficulty_does_not_consume_entity_random() {
         let mut random = LegacyRandom::new(42);
@@ -152,6 +285,38 @@ mod tests {
         assert!(roll_attributes(&mut random, f32::NAN).is_err());
         assert!(roll_attributes(&mut random, 1.1).is_err());
         assert_eq!(random.state(), before);
+        let mut region = RegionRandom::Legacy(LegacyRandom::new(77));
+        let mut reference = region.clone();
+        let mut world = World::default();
+        assert!(
+            initialize_structure_drowned(&mut world, &mut region, &mut random, f32::NAN, false)
+                .is_err()
+        );
+        assert_eq!(random.state(), before);
+        assert_eq!(region.next_long(), reference.next_long());
+    }
+
+    #[test]
+    fn structure_drowned_handles_successful_chicken_and_halloween() {
+        let mut found_chicken = false;
+        let mut found_pumpkin = false;
+        for seed in 0..100_000 {
+            let mut region = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mut entity = LegacyRandom::new(seed.wrapping_add(100));
+            let mut world = World::default();
+            let initialized =
+                initialize_structure_drowned(&mut world, &mut region, &mut entity, 1.0, true)
+                    .unwrap();
+            if initialized.chicken_jockey == ChickenJockey::Created {
+                assert!(initialized.baby);
+                found_chicken = true;
+            }
+            found_pumpkin |= initialized.helmet.is_some();
+            if found_chicken && found_pumpkin {
+                break;
+            }
+        }
+        assert!(found_chicken && found_pumpkin);
     }
 
     #[test]

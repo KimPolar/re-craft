@@ -15,6 +15,7 @@ use native_resources::{
     density::DensityEvaluator,
     packs::{ResourceId, ResourceProvider},
     structure_biomes::StructureBiomes,
+    structure_decoration::{StructureDecorationEntry, StructureDecorationSchedule},
     structure_placement::{StructureSetCache, StructureSetStart},
     structure_start::SimpleStructureStart,
     surface_pass::SurfaceStageChunk,
@@ -36,6 +37,13 @@ pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
+
+/// A registry-indexed structure with its referenced starts in Java's set
+/// order. All starts share the random stream seeded by `entry`.
+pub struct PlannedStructureDecoration<'a> {
+    pub entry: &'a StructureDecorationEntry,
+    pub starts: Vec<&'a SimpleStructureStart>,
+}
 
 /// One structure kind has a known per-kind reference order. Two total
 /// contributions also commute under Java's finite IEEE-754 addition.
@@ -159,6 +167,50 @@ impl StructureGenerationBatch {
                     .and_then(|refs| refs.order(structure))
             })
             .flatten()
+    }
+
+    /// Prepare the structures that actually have starts in this chunk. The
+    /// schedule must cover the complete registry, including absent starts,
+    /// so each selected entry retains Java's per-step seed index.
+    pub fn decoration_plan<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
+        let refs = self
+            .references(pos)
+            .context("structure references are unavailable")?;
+        let registered: BTreeSet<_> = schedule
+            .steps()
+            .iter()
+            .flatten()
+            .map(|entry| &entry.id)
+            .collect();
+        ensure!(
+            refs.keys().all(|id| registered.contains(id)),
+            "structure reference is absent from decoration registry"
+        );
+        let mut result = Vec::new();
+        for entry in schedule.steps().iter().flatten() {
+            let Some(references) = self.reference_order(pos, &entry.id) else {
+                continue;
+            };
+            let mut starts = Vec::with_capacity(references.len());
+            for &packed in references {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                starts.push(
+                    self.starts(source)
+                        .and_then(|starts| starts.get(&entry.id))
+                        .context("referenced structure start is missing")?,
+                );
+            }
+            result.push(PlannedStructureDecoration { entry, starts });
+        }
+        Ok(result)
     }
 
     /// All referenced starts with terrain adaptation. The sorted result is a

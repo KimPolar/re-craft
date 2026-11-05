@@ -64,6 +64,7 @@ pub mod spawn_origin;
 pub mod spring_feature;
 pub mod sprites;
 pub mod structure_biomes;
+pub mod structure_decoration;
 pub mod structure_piece;
 pub mod structure_placement;
 pub mod structure_start;

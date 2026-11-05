@@ -2169,6 +2169,42 @@ pub struct DecorationPlan<'a> {
     generator_height: i32,
     sea_level: i32,
 }
+
+/// Indices into the referenced-structure plan and selected-feature list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecorationAction {
+    Structure(usize),
+    Feature(usize),
+}
+
+fn ordered_decoration_actions(
+    structures: &[(i32, i32)],
+    features: &[(i32, i32)],
+) -> Result<Vec<DecorationAction>> {
+    for entries in [structures, features] {
+        ensure!(
+            entries.iter().all(|&(step, index)| step >= 0 && index >= 0),
+            "negative decoration index"
+        );
+        ensure!(
+            entries.windows(2).all(|pair| pair[0] < pair[1]),
+            "decoration entries are not strictly ordered"
+        );
+    }
+    let mut output = Vec::with_capacity(structures.len() + features.len());
+    let (mut s, mut f) = (0, 0);
+    while s < structures.len() || f < features.len() {
+        if s < structures.len() && (f == features.len() || structures[s].0 <= features[f].0) {
+            output.push(DecorationAction::Structure(s));
+            s += 1;
+        } else {
+            output.push(DecorationAction::Feature(f));
+            f += 1;
+        }
+    }
+    Ok(output)
+}
+
 impl DecorationPlan<'_> {
     pub fn origin(&self) -> [i32; 3] {
         self.origin
@@ -2184,6 +2220,30 @@ impl DecorationPlan<'_> {
         let mut random = DecorationRandom::new(0);
         random.set_feature_seed(self.decoration_seed, feature.index, feature.step);
         random
+    }
+
+    /// Java places all referenced structures before selected features in each
+    /// decoration step, retaining their separate registry-derived seed indices.
+    pub fn actions_with_structures(
+        &self,
+        structures: &[structure_batch::PlannedStructureDecoration<'_>],
+    ) -> Result<Vec<DecorationAction>> {
+        ensure!(
+            structures
+                .iter()
+                .all(|structure| !structure.starts.is_empty()),
+            "planned structure has no starts"
+        );
+        let structures = structures
+            .iter()
+            .map(|structure| (structure.entry.step, structure.entry.index))
+            .collect::<Vec<_>>();
+        let features = self
+            .features
+            .iter()
+            .map(|feature| (feature.step, feature.index))
+            .collect::<Vec<_>>();
+        ordered_decoration_actions(&structures, &features)
     }
 }
 impl BiomeNeighborhood {
@@ -5968,6 +6028,33 @@ mod tests {
     }
 
     #[test]
+    fn decoration_actions_keep_structure_and_feature_step_order() {
+        use DecorationAction::{Feature, Structure};
+        assert_eq!(
+            ordered_decoration_actions(
+                &[(0, 2), (3, 0), (3, 5), (7, 1)],
+                &[(0, 0), (2, 3), (3, 0), (3, 4), (11, 0)]
+            )
+            .unwrap(),
+            vec![
+                Structure(0),
+                Feature(0),
+                Feature(1),
+                Structure(1),
+                Structure(2),
+                Feature(2),
+                Feature(3),
+                Structure(3),
+                Feature(4)
+            ]
+        );
+        assert_eq!(ordered_decoration_actions(&[], &[]).unwrap(), vec![]);
+        assert!(ordered_decoration_actions(&[(2, 1), (2, 1)], &[]).is_err());
+        assert!(ordered_decoration_actions(&[(3, 0), (2, 1)], &[]).is_err());
+        assert!(ordered_decoration_actions(&[], &[(0, -1)]).is_err());
+    }
+
+    #[test]
     fn decoration_plan_checks_neighborhood_and_source() {
         let generator = TerrainGenerator::without_terrain_adjustments(
             &mut PlanningData,
@@ -5988,6 +6075,32 @@ mod tests {
             .decoration_plan(&schedule, &neighborhood, [-2, 3])
             .unwrap();
         assert_eq!(plan.origin, [-32, -16, 48]);
+        let entry = native_resources::structure_decoration::StructureDecorationEntry {
+            id: ResourceId::parse("test:structure").unwrap(),
+            step: 0,
+            index: 5,
+        };
+        let start = SimpleStructureStart {
+            kind: native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
+            chunk: [-2, 3],
+            generation_point: [-24, 0, 56],
+            orientation: None,
+            bounds: native_core::beardifier::BoundingBox::new([-23, 0, 57], [-23, 0, 57]).unwrap(),
+            terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+        };
+        let structure = structure_batch::PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&start],
+        };
+        let actions = plan.actions_with_structures(&[structure]).unwrap();
+        assert_eq!(actions.first(), Some(&DecorationAction::Structure(0)));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, DecorationAction::Feature(_)))
+                .count(),
+            plan.features.len()
+        );
         let names: Vec<_> = plan.features.iter().map(|f| f.feature).collect();
         assert!(
             !names.contains(&&native_resources::feature_order::FeatureKey::Registered(
@@ -6531,11 +6644,19 @@ mod tests {
                 }
             }
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
-                Data.list_data(folder)
+                if folder == "worldgen/structure" {
+                    Ok(vec![
+                        ResourceId::parse("example:pyramid")?,
+                        ResourceId::parse("example:absent")?,
+                    ])
+                } else {
+                    Data.list_data(folder)
+                }
             }
         }
         let mut data=StructureData(BTreeMap::from([
-            ("data/example/worldgen/structure/pyramid.json".into(),serde_json::to_vec(&json!({"type":"minecraft:desert_pyramid","biomes":["minecraft:plains"],"terrain_adaptation":"bury"})).unwrap()),
+            ("data/example/worldgen/structure/pyramid.json".into(),serde_json::to_vec(&json!({"type":"minecraft:desert_pyramid","biomes":["minecraft:plains"],"step":"surface_structures","terrain_adaptation":"bury"})).unwrap()),
+            ("data/example/worldgen/structure/absent.json".into(),serde_json::to_vec(&json!({"type":"minecraft:desert_pyramid","biomes":["minecraft:plains"],"step":"surface_structures"})).unwrap()),
             ("data/example/worldgen/structure_set/pyramid.json".into(),serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap()),
         ]));
         let mut generator =
@@ -6636,6 +6757,26 @@ mod tests {
         assert_eq!(operations, 290);
         assert!(batch.is_complete());
         assert!(batch.starts(target).unwrap().contains_key(&structure_id));
+        let decoration_schedule =
+            native_resources::structure_decoration::StructureDecorationSchedule::load(&mut data)
+                .unwrap();
+        let plan = batch.decoration_plan(target, &decoration_schedule).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            (&plan[0].entry.id, plan[0].entry.step, plan[0].entry.index),
+            (&structure_id, 4, 1)
+        );
+        let source_order: Vec<_> = plan[0].starts.iter().map(|start| start.chunk).collect();
+        let expected_source_order: Vec<_> = batch
+            .reference_order(target, &structure_id)
+            .unwrap()
+            .iter()
+            .map(|&packed| {
+                let bits = packed as u64;
+                [bits as u32 as i32, (bits >> 32) as u32 as i32]
+            })
+            .collect();
+        assert_eq!(source_order, expected_source_order);
         let packed = ((z as u32 as u64) << 32 | x as u32 as u64) as i64;
         assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
         assert!(

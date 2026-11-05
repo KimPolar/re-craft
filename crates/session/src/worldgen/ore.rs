@@ -110,7 +110,7 @@ enum DecorationLightTracking<'a> {
 struct FreezeContext<'a> {
     biomes: &'a super::BiomeNeighborhood,
     climates: &'a BTreeMap<ResourceId, native_resources::biome_climate::BiomeClimate>,
-    support: &'a native_resources::respawn_tags::SnowSupportTags,
+    support: Option<&'a native_resources::respawn_tags::SnowSupportTags>,
     sea_level: i32,
     block_light: Option<&'a dyn Fn([i32; 3]) -> Result<u8>>,
 }
@@ -277,17 +277,59 @@ impl ConfiguredDecoration {
             _ => false,
         }
     }
-    fn needs_freeze(&self) -> bool {
+    fn needs_freeze(&self, water_fluids: &BTreeSet<String>) -> bool {
         match self {
             Self::Freeze => true,
-            Self::VegetationPatch(_, nested) => nested.needs_freeze(),
-            Self::RootSystem(_, nested) => nested.needs_freeze(),
-            Self::Selector(values) => values.iter().any(PlacedDecorationFeature::needs_freeze),
-            Self::BooleanSelector(a, b) => a.needs_freeze() || b.needs_freeze(),
-            Self::WeightedSelector(values, default) => {
-                default.needs_freeze() || values.iter().any(|(_, v)| v.needs_freeze())
+            Self::Lake(lake) => lake.possible_fluid_states().into_iter().any(|state| {
+                match native_world::fluid::FluidState::from_block(state) {
+                    Ok(Some(fluid)) => {
+                        let (source, flowing) = match fluid.kind {
+                            native_world::fluid::FluidKind::Water => {
+                                ("minecraft:water", "minecraft:flowing_water")
+                            }
+                            native_world::fluid::FluidKind::Lava => {
+                                ("minecraft:lava", "minecraft:flowing_lava")
+                            }
+                        };
+                        water_fluids.contains(source) || water_fluids.contains(flowing)
+                    }
+                    Ok(None) => water_fluids.contains("minecraft:empty"),
+                    Err(_) => true,
+                }
+            }),
+            Self::VegetationPatch(_, nested) => nested.needs_freeze(water_fluids),
+            Self::RootSystem(_, nested) => nested.needs_freeze(water_fluids),
+            Self::Selector(values) => values.iter().any(|v| v.needs_freeze(water_fluids)),
+            Self::BooleanSelector(a, b) => {
+                a.needs_freeze(water_fluids) || b.needs_freeze(water_fluids)
             }
-            Self::WeightedListSelector(values, _) => values.iter().any(|(_, v)| v.needs_freeze()),
+            Self::WeightedSelector(values, default) => {
+                default.needs_freeze(water_fluids)
+                    || values.iter().any(|(_, v)| v.needs_freeze(water_fluids))
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.needs_freeze(water_fluids))
+            }
+            _ => false,
+        }
+    }
+    fn needs_snow_support(&self) -> bool {
+        match self {
+            Self::Freeze => true,
+            Self::VegetationPatch(_, nested) | Self::RootSystem(_, nested) => {
+                nested.feature.needs_snow_support()
+            }
+            Self::Selector(values) => values.iter().any(|v| v.feature.needs_snow_support()),
+            Self::BooleanSelector(a, b) => {
+                a.feature.needs_snow_support() || b.feature.needs_snow_support()
+            }
+            Self::WeightedSelector(values, default) => {
+                default.feature.needs_snow_support()
+                    || values.iter().any(|(_, v)| v.feature.needs_snow_support())
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.feature.needs_snow_support())
+            }
             _ => false,
         }
     }
@@ -731,7 +773,7 @@ pub struct PreparedDecoration<'p, 's> {
 
 struct PreparedFreeze {
     climates: BTreeMap<ResourceId, native_resources::biome_climate::BiomeClimate>,
-    support: native_resources::respawn_tags::SnowSupportTags,
+    support: Option<native_resources::respawn_tags::SnowSupportTags>,
 }
 
 impl<'p, 's> PreparedDecoration<'p, 's> {
@@ -754,7 +796,6 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let mut needs_sugar_cane = false;
         let mut needs_cactus = false;
         let mut needs_water_fluids = false;
-        let mut needs_freeze = false;
         let mut needs_tree_edges = false;
         for selected in &plan.features {
             let step = usize::try_from(selected.step).context("invalid feature step")?;
@@ -782,7 +823,6 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 needs_cactus |= feature.placed.needs_survival("cactus")
                     || feature.placed.feature.needs_root_system();
                 needs_water_fluids |= feature.placed.needs_water_fluids();
-                needs_freeze |= feature.placed.needs_freeze();
                 needs_tree_edges |= feature.placed.feature.needs_tree_edges();
                 for id in blocks {
                     ensure!(
@@ -807,6 +847,15 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         let lake_water_fluids = needs_water_fluids
             .then(|| native_resources::fluid_tags::load_water(provider))
             .transpose()?;
+        let empty_fluids = BTreeSet::new();
+        let needs_freeze = features.values().any(|feature| {
+            feature
+                .placed
+                .needs_freeze(lake_water_fluids.as_ref().unwrap_or(&empty_fluids))
+        });
+        let needs_snow_support = features
+            .values()
+            .any(|feature| feature.placed.feature.needs_snow_support());
         let bubble_column_fluids = needs_tree_edges
             .then(|| native_resources::fluid_tags::load_bubble_column_occupiable(provider))
             .transpose()?;
@@ -827,10 +876,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
             Some(PreparedFreeze {
                 climates,
-                support: native_resources::respawn_tags::SnowSupportTags::load(
-                    provider,
-                    block_registry,
-                )?,
+                support: needs_snow_support
+                    .then(|| {
+                        native_resources::respawn_tags::SnowSupportTags::load(
+                            provider,
+                            block_registry,
+                        )
+                    })
+                    .transpose()?,
             })
         } else {
             None
@@ -1086,7 +1139,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         region.freeze_context = self.freeze.as_ref().map(|v| FreezeContext {
             biomes: self.plan.biomes,
             climates: &v.climates,
-            support: &v.support,
+            support: v.support.as_ref(),
             sea_level: self.plan.sea_level,
             block_light,
         });
@@ -1632,8 +1685,8 @@ impl PlacedDecorationFeature {
     fn needs_water_fluids(&self) -> bool {
         self.feature.needs_water_fluids()
     }
-    fn needs_freeze(&self) -> bool {
-        self.feature.needs_freeze()
+    fn needs_freeze(&self, water_fluids: &BTreeSet<String>) -> bool {
+        self.feature.needs_freeze(water_fluids)
     }
 }
 
@@ -3603,6 +3656,7 @@ impl native_resources::freeze_feature::FreezeWorld for DecorationRegion<'_> {
             .as_ref()
             .context("snow support tags are unavailable")?
             .support
+            .context("snow support tags are unavailable")?
             .support_override(&below.name)
         {
             return Ok(result);
@@ -5308,8 +5362,18 @@ impl LakeWorld for DecorationRegion<'_> {
         }
         result
     }
-    fn should_freeze_lake(&mut self, _: [i32; 3]) -> Result<bool> {
-        bail!("lake biome freezing is not yet available")
+    fn should_freeze_lake(&mut self, pos: [i32; 3]) -> Result<bool> {
+        use native_resources::freeze_feature::FreezeWorld;
+        let climate = FreezeWorld::biome(self, pos)?;
+        let sea_level = FreezeWorld::sea_level(self)?;
+        if !climate.cold_enough_to_snow(pos[0], pos[1], pos[2], sea_level)
+            || !FreezeWorld::inside_build_height(self, pos[1])
+            || FreezeWorld::block_light(self, pos)? >= 10
+        {
+            return Ok(false);
+        }
+        let block = FreezeWorld::block(self, pos)?;
+        FreezeWorld::freezable_water(self, pos, &block)
     }
 }
 
@@ -18508,6 +18572,268 @@ mod tests {
             terrain.snapshot().block(9, 8, 8).unwrap().name,
             "minecraft:red_mushroom"
         );
+    }
+
+    #[test]
+    fn lake_climate_requirements_follow_selected_fluid_and_active_tag() {
+        let make_lake = |fluid: &str| {
+            ConfiguredDecoration::Lake(LakeFeature::decode(&json!({
+                "type":"minecraft:lake", "fluid":{"id":fluid}, "barrier":{"id":"minecraft:stone"},
+                "can_place_feature":{"type":"minecraft:true"},
+                "can_replace_with_air_or_fluid":{"type":"minecraft:true"},
+                "can_replace_with_barrier":{"type":"minecraft:true"}
+            }), &mut resolve_test).unwrap())
+        };
+        let water = make_lake("minecraft:water");
+        let lava = make_lake("minecraft:lava");
+        let ordinary = BTreeSet::from([
+            "minecraft:water".to_owned(),
+            "minecraft:flowing_water".to_owned(),
+        ]);
+        let custom = BTreeSet::from(["minecraft:lava".to_owned()]);
+        assert!(water.needs_freeze(&ordinary));
+        assert!(!lava.needs_freeze(&ordinary));
+        assert!(!water.needs_freeze(&custom));
+        assert!(lava.needs_freeze(&custom));
+        assert!(!water.needs_snow_support());
+        assert!(!lava.needs_snow_support());
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_water_lake_freezing_matches_java_and_rolls_back_without_light() {
+        use std::{path::PathBuf, process::Command};
+        struct WaterLakeData(f32);
+        impl ResourceProvider for WaterLakeData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(&json!({
+                        "has_precipitation":true, "temperature":self.0,
+                        "features":[[{"feature":{
+                            "type":"minecraft:lake", "fluid":{"id":"minecraft:water"},
+                            "barrier":{"id":"minecraft:stone"},
+                            "can_place_feature":{"type":"minecraft:true"},
+                            "can_replace_with_air_or_fluid":{"type":"minecraft:true"},
+                            "can_replace_with_barrier":{"type":"minecraft:true"}
+                        },"placement":[{"type":"minecraft:offset","x":0,"y":12,"z":0}]}]]
+                    }))?));
+                }
+                if path == "data/minecraft/tags/fluid/water.json" {
+                    return Ok(Some(
+                        br#"{"values":["minecraft:water","minecraft:flowing_water"]}"#.to_vec(),
+                    ));
+                }
+                Data.read_data(path)
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("WaterLakeFreezeOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/WaterLakeFreezeOracle.java"),
+        )
+        .unwrap();
+        let run = |cmd: &mut Command| {
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("WaterLakeFreezeOracle"));
+        let mut water = BTreeSet::new();
+        let mut expected: BTreeMap<String, BTreeMap<(i32, i32, i32), String>> = BTreeMap::new();
+        let mut next_random = BTreeMap::new();
+        let mut current = String::new();
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["P", x, z] => {
+                    water.insert((x.parse::<i32>().unwrap(), z.parse::<i32>().unwrap()));
+                }
+                ["R", name, "true", next] => {
+                    current = (*name).into();
+                    next_random.insert(current.clone(), next.parse::<i64>().unwrap());
+                }
+                ["B", x, y, z, name] => {
+                    expected.entry(current.clone()).or_default().insert(
+                        (x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap()),
+                        (*name).into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(!water.is_empty());
+        assert!(water.iter().any(|&(x, z)| (x + 2 * z).rem_euclid(5) == 0));
+        assert!(water.iter().any(|&(x, z)| (x + 2 * z).rem_euclid(5) != 0));
+        assert!(
+            expected.contains_key("cold") && expected.contains_key("warm"),
+            "unexpected Java results: {:?}",
+            output
+                .lines()
+                .filter(|line| line.starts_with("R "))
+                .collect::<Vec<_>>()
+        );
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
+        let light = |p: [i32; 3]| {
+            Ok(if (p[0] + 2 * p[2]).rem_euclid(5) == 0 {
+                10
+            } else {
+                9
+            })
+        };
+        for (name, temperature) in [("cold", 0.0), ("warm", 0.8)] {
+            let schedule = FeatureSchedule::load(
+                &mut WaterLakeData(temperature),
+                std::slice::from_ref(&plains),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            let plan = fixture_plan(&schedule, &neighborhood);
+            let mut registry = batch_registry();
+            registry.extend([
+                "minecraft:water".into(),
+                "minecraft:lava".into(),
+                "minecraft:ice".into(),
+            ]);
+            let prepared = PreparedDecoration::load(
+                &mut WaterLakeData(temperature),
+                &plan,
+                &registry,
+                &mut |v| {
+                    let mut block = resolve_test(v)?;
+                    if block.name == "minecraft:water" {
+                        block.properties.insert("level".into(), "0".into());
+                    }
+                    Ok(block)
+                },
+            )
+            .unwrap();
+            assert!(prepared.freeze.is_some());
+            assert!(prepared.freeze.as_ref().unwrap().support.is_none());
+            let make_terrain = || {
+                let (mut terrain, tags, motion, _) = fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                for x in -8..8 {
+                    for z in -8..8 {
+                        for y in 8..12 {
+                            region
+                                .set_section_block([x, y, z], &state("stone"))
+                                .unwrap();
+                        }
+                    }
+                }
+                let mut source = state("water");
+                source.properties.insert("level".into(), "0".into());
+                for &(x, z) in &water {
+                    region.set_section_block([x, 12, z], &source).unwrap();
+                }
+                region.finish().unwrap();
+                terrain
+            };
+            let mut without_light = make_terrain();
+            let before = without_light.snapshot();
+            if name == "cold" {
+                assert!(prepared.execute(&mut without_light, false).is_err());
+                assert!(Arc::ptr_eq(&before, &without_light.snapshot()));
+            } else {
+                assert_eq!(prepared.execute(&mut without_light, false).unwrap(), [true]);
+            }
+            let mut terrain = make_terrain();
+            assert_eq!(
+                prepared
+                    .execute_with_block_light(&mut terrain, false, &light)
+                    .unwrap(),
+                [true]
+            );
+            let world = terrain.snapshot();
+            let mut ice_count = 0;
+            for x in -8..8 {
+                for z in -8..8 {
+                    for y in 8..16 {
+                        let block = world.block(x, y, z).unwrap();
+                        let actual = block.name.strip_prefix("minecraft:").unwrap();
+                        assert_eq!(actual, expected[name][&(x, y, z)], "{name} at {x},{y},{z}");
+                        ice_count += usize::from(actual == "ice");
+                    }
+                }
+            }
+            assert_eq!(ice_count > 0, name == "cold");
+            if name == "cold" {
+                for &(x, z) in &water {
+                    let expected_state = if (x + 2 * z).rem_euclid(5) == 0 {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:ice"
+                    };
+                    assert_eq!(
+                        world.block(x, 12, z).unwrap().name,
+                        expected_state,
+                        "light threshold at {x},{z}"
+                    );
+                }
+            }
+            let mut direct = make_terrain();
+            let writable = direct.snapshot().chunks.keys().copied().collect();
+            let mut region = direct
+                .decoration_region(&prepared.tags, &prepared.motion, writable)
+                .unwrap();
+            let freeze = prepared.freeze.as_ref().unwrap();
+            region.lake_water_fluids = prepared.lake_water_fluids.as_ref();
+            region.freeze_context = Some(FreezeContext {
+                biomes: &neighborhood,
+                climates: &freeze.climates,
+                support: freeze.support.as_ref(),
+                sea_level: plan.sea_level,
+                block_light: Some(&light),
+            });
+            let mut random = plan.feature_random(&plan.features[0]);
+            let feature = &prepared.features[plan.features[0].feature].placed.feature;
+            assert!(
+                feature
+                    .place(&mut region, &mut random, [0, 12, 0], 0, 16)
+                    .unwrap()
+            );
+            assert_eq!(random.next_long(), next_random[name], "random state {name}");
+            region.finish().unwrap();
+        }
     }
 
     #[test]

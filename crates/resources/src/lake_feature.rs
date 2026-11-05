@@ -77,6 +77,13 @@ impl<S: Clone + Eq> LakeFeature<S> {
         self.barrier.blocks(&mut v);
         v
     }
+    /// States which the configured fluid provider can select. Integer
+    /// properties may still vary when the provider is evaluated.
+    pub fn possible_fluid_states(&self) -> Vec<&S> {
+        let mut states = Vec::new();
+        self.fluid.states(&mut states);
+        states
+    }
     pub fn needs_survival(&self, name: &str) -> bool {
         self.can_place.needs_survival(name)
             || self.replace.needs_survival(name)

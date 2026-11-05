@@ -15,6 +15,7 @@ pub mod random_sequences;
 pub mod save;
 mod save_transaction;
 pub mod snbt;
+pub mod structure_template;
 pub mod world;
 pub mod world_creation;
 pub mod worldgen_settings;

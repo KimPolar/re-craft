@@ -6,7 +6,7 @@ use native_persistence::nbt::Tag;
 use native_persistence::structure_template::StructureTemplate;
 use native_resources::{
     block_registry::GeneratedBlockRegistry,
-    ocean_ruin::{self, Piece, Settings},
+    ocean_ruin::{self, Piece, Settings, Temperature},
     packs::{ResourceId, ResourceProvider},
 };
 use serde_json::Value;
@@ -34,6 +34,20 @@ pub enum PreparedPaletteState {
 pub struct FirstPassBlock {
     pub source_index: usize,
     pub position: [i32; 3],
+}
+
+/// The replacement produced by the ruin's capped archaeology processor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArchaeologyReplacement {
+    pub state: native_world::loaded::BlockState,
+    /// Template block-entity data with the loot fields applied.
+    pub nbt: Tag,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessedRuinBlock {
+    pub original: FirstPassBlock,
+    pub archaeology: Option<ArchaeologyReplacement>,
 }
 
 impl PreparedPiece {
@@ -181,6 +195,100 @@ impl PreparedPiece {
             });
         }
         Ok(surviving)
+    }
+
+    /// Apply the ruin's capped archaeology rule to the complete piece.
+    /// This does not clip or place blocks, nor process structure markers.
+    pub fn process_blocks(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        palette_index: usize,
+        world_seed: i64,
+        temperature: Temperature,
+    ) -> Result<Vec<ProcessedRuinBlock>> {
+        let palette = self.transformed_palette(registry, palette_index)?;
+        self.process_blocks_with_palette(palette_index, &palette, world_seed, temperature)
+    }
+
+    fn process_blocks_with_palette(
+        &self,
+        palette_index: usize,
+        palette: &[PreparedPaletteState],
+        world_seed: i64,
+        temperature: Temperature,
+    ) -> Result<Vec<ProcessedRuinBlock>> {
+        use native_core::{
+            normal_noise::{NoiseSeedFactory, NoiseSeedSource},
+            random::LegacyRandom,
+        };
+        use native_resources::blockstates::positional_seed;
+
+        let mut blocks: Vec<_> = self
+            .first_pass_with_palette(palette_index, palette)?
+            .into_iter()
+            .map(|original| ProcessedRuinBlock {
+                original,
+                archaeology: None,
+            })
+            .collect();
+        if blocks.is_empty() {
+            return Ok(blocks);
+        }
+        let len = i32::try_from(blocks.len()).context("too many ruin blocks")?;
+        let [x, y, z] = self.selection.position;
+        let mut random = LegacyRandom::new(world_seed)
+            .fork_noise_factory()
+            .at(x, y, z);
+        let mut indices: Vec<usize> = (0..blocks.len()).collect();
+        for end in (2..=len).rev() {
+            let other = random.next_int_bound(end).expect("positive shuffle bound") as usize;
+            indices.swap(end as usize - 1, other);
+        }
+        let (input, output, table) = match temperature {
+            Temperature::Warm => (
+                "minecraft:sand",
+                "minecraft:suspicious_sand",
+                "minecraft:archaeology/ocean_ruin_warm",
+            ),
+            Temperature::Cold => (
+                "minecraft:gravel",
+                "minecraft:suspicious_gravel",
+                "minecraft:archaeology/ocean_ruin_cold",
+            ),
+        };
+        let mut replaced = 0;
+        for index in indices {
+            let block = &mut blocks[index];
+            let source = &self.template.blocks[block.original.source_index];
+            let PreparedPaletteState::Block(state) = &palette[source.state] else {
+                continue;
+            };
+            if state.name != input {
+                continue;
+            }
+            let [x, y, z] = block.original.position;
+            let seed = LegacyRandom::new(positional_seed(x, y, z)).next_long();
+            let mut entries = match &source.nbt {
+                Some(Tag::Compound(entries)) => entries.clone(),
+                Some(_) => anyhow::bail!("invalid template block entity NBT"),
+                None => Vec::new(),
+            };
+            entries.retain(|(key, _)| !key.matches("LootTable") && !key.matches("LootTableSeed"));
+            entries.push(("LootTable".into(), Tag::String(table.into())));
+            entries.push(("LootTableSeed".into(), Tag::Long(seed)));
+            block.archaeology = Some(ArchaeologyReplacement {
+                state: native_world::loaded::BlockState {
+                    name: output.into(),
+                    properties: BTreeMap::from([("dusted".into(), "0".into())]),
+                },
+                nbt: Tag::Compound(entries),
+            });
+            replaced += 1;
+            if replaced == 5 {
+                break;
+            }
+        }
+        Ok(blocks)
     }
 }
 
@@ -441,6 +549,106 @@ mod tests {
     }
 
     #[test]
+    fn archaeology_caps_replacements_and_preserves_other_nbt() {
+        use native_persistence::structure_template::TemplateBlock;
+        use native_resources::structure_transform::Rotation;
+        use native_world::loaded::BlockState;
+        let palette: Vec<_> = ["sand", "gravel", "stone_bricks"]
+            .into_iter()
+            .map(|name| {
+                PreparedPaletteState::Block(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::new(),
+                })
+            })
+            .collect();
+        let blocks = (0..11)
+            .map(|x| TemplateBlock {
+                position: [x, 0, 0],
+                state: if x < 8 {
+                    0
+                } else if x < 10 {
+                    1
+                } else {
+                    2
+                },
+                nbt: Some(Tag::Compound(vec![
+                    ("Keep".into(), Tag::Int(x)),
+                    ("LootTable".into(), Tag::String("old".into())),
+                    ("LootTableSeed".into(), Tag::Long(123)),
+                ])),
+            })
+            .collect();
+        let piece = PreparedPiece {
+            selection: Piece {
+                template: "minecraft:test".into(),
+                position: [-20, 40, 9],
+                rotation: Rotation::None,
+                integrity: 1.0,
+                large: false,
+            },
+            template: Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [11, 1, 1],
+                palettes: vec![vec![Tag::Compound(vec![]); 3]],
+                blocks,
+                entities: vec![],
+            }),
+            bounds: native_core::beardifier::BoundingBox {
+                min: [0; 3],
+                max: [0; 3],
+            },
+        };
+        let run = |temperature| {
+            piece
+                .process_blocks_with_palette(0, &palette, 42, temperature)
+                .unwrap()
+        };
+        let warm = run(Temperature::Warm);
+        assert_eq!(warm, run(Temperature::Warm));
+        let replacements: Vec<_> = warm
+            .iter()
+            .filter_map(|block| {
+                block
+                    .archaeology
+                    .as_ref()
+                    .map(|replacement| (block, replacement))
+            })
+            .collect();
+        assert_eq!(replacements.len(), 5);
+        for (block, replacement) in replacements {
+            assert_eq!(replacement.state.name, "minecraft:suspicious_sand");
+            assert_eq!(
+                replacement.nbt.get("Keep"),
+                Some(&Tag::Int(block.original.source_index as i32))
+            );
+            assert!(
+                matches!(replacement.nbt.get("LootTable"), Some(Tag::String(id)) if id.matches("minecraft:archaeology/ocean_ruin_warm"))
+            );
+            assert!(matches!(
+                replacement.nbt.get("LootTableSeed"),
+                Some(Tag::Long(_))
+            ));
+        }
+        let cold = run(Temperature::Cold);
+        let replacements: Vec<_> = cold
+            .iter()
+            .filter_map(|block| block.archaeology.as_ref())
+            .collect();
+        assert_eq!(replacements.len(), 2);
+        assert!(
+            replacements
+                .iter()
+                .all(|replacement| replacement.state.name == "minecraft:suspicious_gravel")
+        );
+        assert!(replacements.iter().all(|replacement| matches!(replacement.nbt.get("LootTable"), Some(Tag::String(id)) if id.matches("minecraft:archaeology/ocean_ruin_cold"))));
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn prepares_selected_vanilla_ocean_ruin_templates() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -489,6 +697,16 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn vanilla_ruin_first_pass_matches_java() -> Result<()> {
+        compare_vanilla_ruin_processors(false)
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn vanilla_ruin_archaeology_matches_java() -> Result<()> {
+        compare_vanilla_ruin_processors(true)
+    }
+
+    fn compare_vanilla_ruin_processors(archaeology: bool) -> Result<()> {
         use native_resources::structure_transform::{Mirror, Rotation};
         use std::{path::PathBuf, process::Command};
 
@@ -517,11 +735,19 @@ mod tests {
             }
         }
         let classpath = std::env::join_paths(paths)?;
-        let source = temp.path().join("OceanRuinFirstPassOracle.java");
-        std::fs::write(
-            &source,
-            include_str!("../../tests/java/OceanRuinFirstPassOracle.java"),
-        )?;
+        let (class, code) = if archaeology {
+            (
+                "OceanRuinArchaeologyOracle",
+                include_str!("../../tests/java/OceanRuinArchaeologyOracle.java"),
+            )
+        } else {
+            (
+                "OceanRuinFirstPassOracle",
+                include_str!("../../tests/java/OceanRuinFirstPassOracle.java"),
+            )
+        };
+        let source = temp.path().join(format!("{class}.java"));
+        std::fs::write(&source, code)?;
         let compiled = Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
@@ -549,7 +775,7 @@ mod tests {
         let output = Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(classpath)
-            .arg("OceanRuinFirstPassOracle")
+            .arg(class)
             .args(&names)
             .output()?;
         ensure!(
@@ -559,9 +785,9 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let output = String::from_utf8(output.stdout)?;
-        let mut rows = output
-            .lines()
-            .filter(|line| line.starts_with("T\t") || line.starts_with("B\t"));
+        let mut rows = output.lines().filter(|line| {
+            line.starts_with("T\t") || line.starts_with("B\t") || line.starts_with("A\t")
+        });
         let mut resources = native_resources::packs::ResourceStack::open(&game)?;
         let registry = resources.vanilla_generated_block_registry()?;
         let rotations = [
@@ -572,6 +798,7 @@ mod tests {
         ];
         let integrities = [0.5, 0.7, 0.8, 0.9];
         let mut total = 0;
+        let mut replaced = 0;
         for (i, name) in names.iter().enumerate() {
             let header = rows.next().context("missing Java template")?;
             let mut fields = header.split('\t');
@@ -605,34 +832,82 @@ mod tests {
                 bounds,
             };
             let palette = piece.transformed_palette(&registry, 0)?;
-            let blocks = piece.first_pass_blocks(&registry, 0)?;
+            let blocks = if archaeology {
+                let temperature = if name.contains("warm") {
+                    Temperature::Warm
+                } else {
+                    Temperature::Cold
+                };
+                let seed = (i as i64 * 1_234_567_891_011) ^ -982_451_653;
+                piece.process_blocks(&registry, 0, seed, temperature)?
+            } else {
+                piece
+                    .first_pass_blocks(&registry, 0)?
+                    .into_iter()
+                    .map(|original| ProcessedRuinBlock {
+                        original,
+                        archaeology: None,
+                    })
+                    .collect()
+            };
             assert_eq!(blocks.len(), count, "{name}");
             for block in blocks {
                 let row = rows.next().context("missing Java block")?;
                 let mut fields = row.split('\t');
-                ensure!(fields.next() == Some("B"), "unexpected Java row {row}");
+                let kind = fields.next().context("missing row kind")?;
                 let position: [i32; 3] = [
                     fields.next().context("x")?.parse()?,
                     fields.next().context("y")?.parse()?,
                     fields.next().context("z")?.parse()?,
                 ];
                 let id = fields.next().context("block ID")?;
-                let nbt: bool = fields.next().context("NBT flag")?.parse()?;
-                let original = &piece.template.blocks[block.source_index];
+                let original = &piece.template.blocks[block.original.source_index];
                 let PreparedPaletteState::Block(state) = &palette[original.state] else {
                     anyhow::bail!("marker survived first pass")
                 };
-                assert_eq!(block.position, position, "{name}");
-                assert_eq!(state.name, id, "{name}");
-                assert_eq!(original.nbt.is_some(), nbt, "{name}");
+                assert_eq!(block.original.position, position, "{name}");
+                if let Some(replacement) = block.archaeology {
+                    assert_eq!(kind, "A", "{name}");
+                    assert_eq!(replacement.state.name, id, "{name}");
+                    let table = fields.next().context("loot table")?;
+                    let seed: i64 = fields.next().context("loot seed")?.parse()?;
+                    let dusted = fields.next().context("dusted")?;
+                    assert!(
+                        matches!(replacement.nbt.get("LootTable"), Some(Tag::String(value)) if value.matches(table)),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        replacement.nbt.get("LootTableSeed"),
+                        Some(&Tag::Long(seed)),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        replacement
+                            .state
+                            .properties
+                            .get("dusted")
+                            .map(String::as_str),
+                        Some(dusted),
+                        "{name}"
+                    );
+                    replaced += 1;
+                } else {
+                    assert_eq!(kind, "B", "{name}");
+                    let nbt: bool = fields.next().context("NBT flag")?.parse()?;
+                    assert_eq!(state.name, id, "{name}");
+                    assert_eq!(original.nbt.is_some(), nbt, "{name}");
+                }
                 total += 1;
             }
         }
         assert!(rows.next().is_none());
         println!(
-            "verified {total} first-pass blocks across {} ruins",
+            "verified {total} processed blocks and {replaced} archaeology replacements across {} ruins",
             names.len()
         );
+        if archaeology {
+            assert!(replaced > 0);
+        }
         Ok(())
     }
 

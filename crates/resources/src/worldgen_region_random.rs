@@ -159,6 +159,30 @@ pub struct AnimalBaseInitialization {
     pub left_handed: bool,
 }
 
+/// The common Mob.finalizeSpawn changes, independent of animal age.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MobBaseInitialization {
+    pub follow_range_bonus: Option<f64>,
+    pub left_handed: bool,
+}
+
+/// Apply Mob.finalizeSpawn using the generation region's random source.
+pub fn finalize_mob_base(
+    random: &mut RegionRandom,
+    has_follow_range_bonus: bool,
+) -> MobBaseInitialization {
+    let follow_range_bonus = if has_follow_range_bonus {
+        None
+    } else {
+        Some(0.0 + 0.11485000000000001 * (random.next_double() - random.next_double()))
+    };
+    let left_handed = random.next_float() < 0.05_f32;
+    MobBaseInitialization {
+        follow_range_bonus,
+        left_handed,
+    }
+}
+
 /// The group state created by Horse.finalizeSpawn. The first horse selects a
 /// coat shared by the group; markings and attributes are drawn per horse.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -331,22 +355,27 @@ pub fn finalize_animal_base(
     let set_baby_age =
         group.should_spawn_baby && group.size > 0 && random.next_float() <= group.baby_spawn_chance;
     group.size = group.size.wrapping_add(1);
-    let follow_range_bonus = if has_follow_range_bonus {
-        None
-    } else {
-        Some(0.0 + 0.11485000000000001 * (random.next_double() - random.next_double()))
-    };
-    let left_handed = random.next_float() < 0.05_f32;
+    let mob = finalize_mob_base(random, has_follow_range_bonus);
     AnimalBaseInitialization {
         set_baby_age,
-        follow_range_bonus,
-        left_handed,
+        follow_range_bonus: mob.follow_range_bonus,
+        left_handed: mob.left_handed,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mob_finalization_keeps_existing_modifier_and_consumes_only_handedness() {
+        let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, -13, 17);
+        let mut expected = random.clone();
+        let initialization = finalize_mob_base(&mut random, true);
+        assert_eq!(initialization.follow_range_bonus, None);
+        assert_eq!(initialization.left_handed, expected.next_float() < 0.05);
+        assert_eq!(random.next_long(), expected.next_long());
+    }
 
     #[test]
     fn sheep_biome_tags_follow_layering_nested_tags_and_registry() {

@@ -7114,7 +7114,7 @@ mod tests {
         // Java retained the terrain-stage maps before this direct section write.
         assert_eq!(region.ocean_floor_height(3, 4).unwrap(), 8);
         assert_eq!(region.world_surface_height(3, 4).unwrap(), 8);
-        assert_eq!(region.final_height(0, 3, 4).unwrap(), 13);
+        assert_eq!(region.final_height(0, 3, 4).unwrap(), 8);
         region.finish().unwrap();
         let encoded = terrain.generated_heightmap_data(center).unwrap();
         let column = 3 + 4 * 16;
@@ -7126,10 +7126,14 @@ mod tests {
         };
         assert_eq!(read("WORLD_SURFACE_WG"), 8);
         assert_eq!(read("OCEAN_FLOOR_WG"), 8);
-        assert_eq!(read("WORLD_SURFACE"), 13);
-        assert!(encoded.get("OCEAN_FLOOR").is_none());
-        assert!(encoded.get("MOTION_BLOCKING").is_none());
-        assert!(encoded.get("MOTION_BLOCKING_NO_LEAVES").is_none());
+        for name in [
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+        ] {
+            assert_eq!(read(name), 8, "{name}");
+        }
         assert!(
             terrain
                 .initialize_worldgen_heightmaps(center, &motion)

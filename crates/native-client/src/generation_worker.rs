@@ -176,14 +176,6 @@ impl GenerationReady {
             self.postprocessed.is_some(),
             "initial world has not been postprocessed"
         );
-        ensure!(
-            self.worldgen_settings_draft
-                .as_ref()
-                .and_then(|draft| draft.value.get("data"))
-                .and_then(|data| data.get("bonus_chest"))
-                != Some(&native_persistence::nbt::Tag::Byte(1)),
-            "bonus world heightmap history is not yet verified for saving"
-        );
         let initial = self.start_initial_player_session(last_played_ms)?;
         let snapshot = initial.session.snapshot();
         ensure!(snapshot.tick == 0, "initial session has already advanced");
@@ -3042,21 +3034,15 @@ mod tests {
             pack.join("data/example/worldgen/world_preset/bonus.json"),
             serde_json::to_vec(&bonus_preset)?,
         )?;
-        // A normal WorldGenLevel write primes all final heightmaps in this
-        // fixture. The worker rejects chunks missing that generation history.
-        let mut bonus_biome = biome.clone();
-        bonus_biome["features"] = json!([[{
-            "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:short_grass"}},
-            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
-        }]]);
-        std::fs::write(
-            pack.join("data/example/worldgen/biome/flat.json"),
-            serde_json::to_vec(&bonus_biome)?,
-        )?;
         let bonus_game = game.clone();
         let bonus_world = world.clone();
         let bonus_worker = GenerationWorker::start_initial_world_impl(
             move || {
+                let packs = DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/compact".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                };
                 let prepared = prepare(crate::fresh_generation::FreshGenerationSettings {
                     minecraft_dir: bonus_game,
                     preset: "example:bonus".into(),
@@ -3064,16 +3050,9 @@ mod tests {
                     seed: 42,
                     bonus_chest: true,
                     structures_enabled: false,
-                    data_packs: Some((
-                        bonus_world,
-                        DataPackSettings {
-                            enabled: vec!["vanilla".into(), "file/compact".into()],
-                            disabled: vec![],
-                            enabled_features: vec!["minecraft:vanilla".into()],
-                        },
-                    )),
+                    data_packs: Some((bonus_world, packs.clone())),
                 })?;
-                prepared.into_new_world_inputs(
+                let mut inputs = prepared.into_new_world_inputs(
                     native_session::respawn::RespawnBorder {
                         min_x: -100.0,
                         max_x: 100.0,
@@ -3082,7 +3061,19 @@ mod tests {
                     },
                     false,
                     true,
-                )
+                )?;
+                inputs.set_level_settings(crate::world_creation::FrozenLevelSettings {
+                    name: "Bonus World".into(),
+                    session: crate::world_creation::InitialSessionSettings {
+                        seed: 42,
+                        mode: native_session::GameMode::Survival,
+                        difficulty: native_persistence::world::Difficulty::Normal,
+                        hardcore: false,
+                        allow_commands: false,
+                    },
+                    packs: Some(packs),
+                })?;
+                Ok(inputs)
             },
             70,
             0,
@@ -3090,7 +3081,7 @@ mod tests {
             None,
             Some(native_core::random::LegacyRandom::new(1)),
         )?;
-        let mut bonus_ready = match bonus_worker.result.recv_timeout(Duration::from_secs(120))? {
+        let bonus_ready = match bonus_worker.result.recv_timeout(Duration::from_secs(120))? {
             GenerationResult::Ready(ready) => ready,
             GenerationResult::Failed(error) => return Err(error),
             GenerationResult::Cancelled => anyhow::bail!("bonus world generation cancelled"),
@@ -3122,18 +3113,25 @@ mod tests {
             native_core::random::LegacyRandom::new(1).state()
         );
         assert!(bonus_ready.player_spawn.is_none());
-        assert!(
-            bonus_ready
-                .stage_initial_world(temp.path(), 123, 1)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("heightmap history")
-        );
-        std::fs::write(
-            pack.join("data/example/worldgen/biome/flat.json"),
-            serde_json::to_vec(&biome)?,
-        )?;
+        let chunk = processed
+            .chunks
+            .get(&ChunkPos {
+                x: chest.x.div_euclid(16),
+                z: chest.z.div_euclid(16),
+            })
+            .context("bonus chunk draft is missing")?;
+        let Some(native_persistence::nbt::Tag::List { values, .. }) =
+            chunk.chunk.value.get("block_entities")
+        else {
+            anyhow::bail!("saved bonus block entities are missing");
+        };
+        assert!(values.iter().any(|entity| {
+            matches!(entity.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:chest"))
+                && entity.get("x") == Some(&native_persistence::nbt::Tag::Int(chest.x))
+                && entity.get("y") == Some(&native_persistence::nbt::Tag::Int(chest.y))
+                && entity.get("z") == Some(&native_persistence::nbt::Tag::Int(chest.z))
+                && matches!(entity.get("LootTable"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:chests/spawn_bonus_chest"))
+        }));
         for (spawn_mobs, disabled, species, feature_kind) in [
             (false, false, "minecraft:sheep", 0),
             (true, true, "minecraft:sheep", 0),

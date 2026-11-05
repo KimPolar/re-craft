@@ -126,6 +126,12 @@ public class TerrainChunkOracle {
       dump("surface",chunk,dim.minY(),dim.height());
       method("generateCarvers").invoke(generator,chunk,Blender.empty(),noise,random,biomeManager,null,rule);
       dump("carvers",chunk,dim.minY(),dim.height());
+      if (Boolean.getBoolean("recraft.primeFinalHeightmaps")) {
+        Heightmap.primeHeightmaps(chunk, EnumSet.of(Heightmap.Types.WORLD_SURFACE,
+          Heightmap.Types.OCEAN_FLOOR, Heightmap.Types.MOTION_BLOCKING,
+          Heightmap.Types.MOTION_BLOCKING_NO_LEAVES));
+        dump("terrain",chunk,dim.minY(),dim.height());
+      }
     }
     }
     for(var block:BuiltInRegistries.BLOCK)out.println("R "+key(block.defaultBlockState()));

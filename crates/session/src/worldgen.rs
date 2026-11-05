@@ -1080,9 +1080,9 @@ impl StagedGenerationLightEngine {
 }
 
 impl CarvedTerrainWorld {
-    /// Capture the two world-generation maps immediately after the terrain
-    /// stage, before any neighboring feature can write into this chunk.
-    /// Direct section writes during later features must leave them unchanged.
+    /// Capture both world-generation maps and the four final maps immediately
+    /// after terrain, before neighboring features can mutate this chunk.
+    /// Direct feature section writes intentionally leave all six maps stale.
     pub fn initialize_worldgen_heightmaps(
         &mut self,
         pos: native_world::loaded::ChunkPos,
@@ -1091,7 +1091,8 @@ impl CarvedTerrainWorld {
         use native_world::loaded::BlockStateId;
         ensure!(
             !self.ore_ocean_floor_heights.contains_key(&pos)
-                && !self.feature_world_surface_heights.contains_key(&pos),
+                && !self.feature_world_surface_heights.contains_key(&pos)
+                && !self.final_heightmaps.contains_key(&pos),
             "generation heightmaps were already initialized"
         );
         let base_x = pos.x.checked_mul(16).context("chunk X overflow")?;
@@ -1115,9 +1116,13 @@ impl CarvedTerrainWorld {
         let mut surface = [self.min_y; 256];
         let mut need_surface = [true; 256];
         let mut need_ocean = [true; 256];
-        let mut remaining = 512;
-        let mut cache = BTreeMap::<BlockStateId, (bool, bool)>::new();
-        let mut classify = |id: BlockStateId| -> Result<(bool, bool)> {
+        let mut motion = [self.min_y; 256];
+        let mut no_leaves = [self.min_y; 256];
+        let mut need_motion = [true; 256];
+        let mut need_no_leaves = [true; 256];
+        let mut remaining = 1024;
+        let mut cache = BTreeMap::<BlockStateId, (bool, bool, bool, bool)>::new();
+        let mut classify = |id: BlockStateId| -> Result<(bool, bool, bool, bool)> {
             if let Some(flags) = cache.get(&id) {
                 return Ok(*flags);
             }
@@ -1129,13 +1134,22 @@ impl CarvedTerrainWorld {
                 state.name.as_str(),
                 "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
             );
-            let motion = tags.for_block(&state.name)?.blocks_motion;
+            let motion_tags = tags.for_block(&state.name)?;
+            let has_fluid = native_world::fluid::FluidState::from_block(state)
+                .map_err(anyhow::Error::msg)?
+                .is_some();
             ensure!(
-                !air || !motion,
+                !air || !motion_tags.blocks_motion,
                 "air in the heightmap motion tag is unsupported"
             );
-            cache.insert(id, (air, motion));
-            Ok((air, motion))
+            let flags = (
+                air,
+                motion_tags.blocks_motion,
+                motion_tags.blocks_motion_no_leaves,
+                has_fluid,
+            );
+            cache.insert(id, flags);
+            Ok(flags)
         };
         for section_y in (self.min_y.div_euclid(16)..max_y.div_euclid(16)).rev() {
             let section = chunk
@@ -1151,11 +1165,16 @@ impl CarvedTerrainWorld {
                 continue;
             }
             for column in 0..256 {
-                if !need_surface[column] && !need_ocean[column] {
+                if !need_surface[column]
+                    && !need_ocean[column]
+                    && !need_motion[column]
+                    && !need_no_leaves[column]
+                {
                     continue;
                 }
                 for local_y in (0..16usize).rev() {
-                    let (is_air, blocks_motion) = classify(blocks[column + local_y * 256])?;
+                    let (is_air, blocks_motion, blocks_motion_no_leaves, has_fluid) =
+                        classify(blocks[column + local_y * 256])?;
                     let first_available = section_y * 16 + local_y as i32 + 1;
                     if need_surface[column] && !is_air {
                         surface[column] = first_available;
@@ -1167,7 +1186,22 @@ impl CarvedTerrainWorld {
                         need_ocean[column] = false;
                         remaining -= 1;
                     }
-                    if !need_surface[column] && !need_ocean[column] {
+                    // Java's priming loop skips air before applying any predicate.
+                    if !is_air && need_motion[column] && (blocks_motion || has_fluid) {
+                        motion[column] = first_available;
+                        need_motion[column] = false;
+                        remaining -= 1;
+                    }
+                    if !is_air && need_no_leaves[column] && (blocks_motion_no_leaves || has_fluid) {
+                        no_leaves[column] = first_available;
+                        need_no_leaves[column] = false;
+                        remaining -= 1;
+                    }
+                    if !need_surface[column]
+                        && !need_ocean[column]
+                        && !need_motion[column]
+                        && !need_no_leaves[column]
+                    {
                         break;
                     }
                 }
@@ -1176,6 +1210,13 @@ impl CarvedTerrainWorld {
                 break;
             }
         }
+        self.final_heightmaps.insert(
+            pos,
+            Arc::new(ore::FinalHeightmaps {
+                values: Box::new([surface, ocean, motion, no_leaves]),
+                primed: 0b1111,
+            }),
+        );
         self.ore_ocean_floor_heights.insert(pos, Arc::new(ocean));
         self.feature_world_surface_heights
             .insert(pos, Arc::new(surface));

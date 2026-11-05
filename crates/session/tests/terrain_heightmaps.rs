@@ -1,4 +1,4 @@
-//! World-generation heightmaps from real 26.3 terrain before decoration.
+//! World-generation and final heightmaps from real 26.3 terrain before decoration.
 use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 
 use anyhow::{Context, Result};
@@ -72,6 +72,7 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
         .arg("-cp")
         .arg(&cp)
         .arg("-Drecraft.heightmaps=true")
+        .arg("-Drecraft.primeFinalHeightmaps=true")
         .arg(format!("-Drecraft.heightmapTags={}", tag_file.display()))
         .arg("TerrainChunkOracle")
         .args([
@@ -124,7 +125,7 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
             );
         }
     }
-    assert_eq!(stages.len(), 15);
+    assert_eq!(stages.len(), 20);
     let preset: Value = serde_json::from_slice(
         &resources
             .read_builtin_data("data/minecraft/worldgen/world_preset/normal.json")?
@@ -204,7 +205,7 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
         let (surface, ocean) = terrain
             .worldgen_heightmaps(chunk_pos)
             .context("missing maps")?;
-        let expected = &stages[index * 3 + 2];
+        let expected = &stages[index * 4 + 2];
         assert_eq!(
             Some(surface.as_slice()),
             expected.get("WORLD_SURFACE_WG").map(Vec::as_slice),
@@ -216,11 +217,18 @@ fn terrain_stage_heightmaps_match_java_before_features() -> Result<()> {
             "{dimension} {seed} {pos:?}"
         );
         let encoded = terrain.generated_heightmap_data(chunk_pos)?;
-        for name in ["WORLD_SURFACE_WG", "OCEAN_FLOOR_WG"] {
+        for name in [
+            "WORLD_SURFACE_WG",
+            "OCEAN_FLOOR_WG",
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+        ] {
             assert_eq!(
                 encoded.get(name),
                 Some(&native_persistence::nbt::Tag::LongArray(
-                    raw_stages[index * 3 + 2][name].clone()
+                    raw_stages[index * 4 + 3][name].clone()
                 )),
                 "{dimension} {seed} {pos:?} {name}"
             );

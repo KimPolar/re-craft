@@ -28,6 +28,7 @@ pub mod datapacks;
 pub mod density;
 pub mod dimension_lighting;
 pub mod disk_feature;
+pub mod drowned_spawn;
 pub mod enchantments;
 pub mod entity_category;
 pub mod entity_collision;

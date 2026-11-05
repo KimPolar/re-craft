@@ -995,10 +995,6 @@ impl GenerationWorker {
             "initial world spawn requires the overworld"
         );
         ensure!(
-            !frozen.generation.bonus_chest,
-            "initial bonus chest is not yet supported for structures"
-        );
-        ensure!(
             options.player.adventure
                 == (frozen.level.session.mode == native_session::GameMode::Adventure),
             "player spawn game mode differs from frozen settings"
@@ -1636,15 +1632,16 @@ impl GenerationWorker {
                     "player spawn game mode differs from the frozen world settings"
                 );
             }
-            ensure!(
-                ready
-                    .worldgen_settings_draft
-                    .as_ref()
-                    .and_then(|settings| settings.value.get("data"))
-                    .and_then(|data| data.get("bonus_chest"))
-                    == Some(&native_persistence::nbt::Tag::Byte(0)),
-                "initial bonus chest requires postprocessing before player spawn"
-            );
+            let bonus_enabled = match ready
+                .worldgen_settings_draft
+                .as_ref()
+                .and_then(|settings| settings.value.get("data"))
+                .and_then(|data| data.get("bonus_chest"))
+            {
+                Some(native_persistence::nbt::Tag::Byte(0)) => false,
+                Some(native_persistence::nbt::Tag::Byte(1)) => true,
+                _ => anyhow::bail!("initial bonus chest setting is missing or invalid"),
+            };
             let saved_border = validated_initial_border(border, player.saved_border)?;
             let targets = checked_spawn_targets(&mut ready)?;
             ensure!(
@@ -1670,6 +1667,13 @@ impl GenerationWorker {
             if let Some(snapshot) = &snapshot {
                 snapshot.verify()?;
             }
+            let bonus_feature = if bonus_enabled {
+                Some(native_resources::bonus_chest::BonusChestFeature::load(
+                    &mut provider,
+                )?)
+            } else {
+                None
+            };
             let blocks = provider.vanilla_block_ids()?;
             let tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
                 &mut provider,
@@ -1703,14 +1707,35 @@ impl GenerationWorker {
                 .revision
                 .checked_add(1)
                 .context("mesh revision overflow")?;
-            let postprocessor = Self::postprocess(
-                ready,
-                targets.iter().copied().collect(),
-                0,
-                0,
-                water_source_conversion,
-                next_revision,
-            )?;
+            if bonus_enabled {
+                for &pos in &targets {
+                    require_initial_heightmaps(pos, &ready.batch.spawned_heightmap_data(pos)?)?;
+                }
+            }
+            let positions = targets.iter().copied().collect();
+            let postprocessor = if let Some(feature) = bonus_feature {
+                Self::postprocess_with_initial_bonus_chest(
+                    ready,
+                    positions,
+                    0,
+                    0,
+                    water_source_conversion,
+                    next_revision,
+                    InitialBonusChestRequest {
+                        feature,
+                        level_random: native_session::fresh_level_random(),
+                    },
+                )?
+            } else {
+                Self::postprocess(
+                    ready,
+                    positions,
+                    0,
+                    0,
+                    water_source_conversion,
+                    next_revision,
+                )?
+            };
             set_phase(progress, GenerationPhase::Postprocessing);
             let ready = loop {
                 if cancelled.load(Ordering::Relaxed) {
@@ -3463,9 +3488,6 @@ mod tests {
         frozen.level.session.seed ^= 1;
         assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
         let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
-        frozen.generation.bonus_chest = true;
-        assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
-        let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
         frozen.generation.structures_enabled = false;
         assert!(GenerationWorker::start_structured_initial_world(frozen, options(), 1, 0).is_err());
         let frozen = creation.freeze(std::path::PathBuf::new(), None);
@@ -3540,6 +3562,18 @@ mod tests {
             preset_path.with_file_name("spawn.json"),
             serde_json::to_vec(&spawn_preset)?,
         )?;
+        let mut bonus_preset = spawn_preset.clone();
+        bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["sea_level"] =
+            json!(80);
+        bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["noise_router"]
+            ["final_density"] = json!({
+            "type":"gradient", "axis":"y", "from_coordinate":80,
+            "to_coordinate":96, "from_value":1, "to_value":-1
+        });
+        std::fs::write(
+            preset_path.with_file_name("bonus_spawn.json"),
+            serde_json::to_vec(&bonus_preset)?,
+        )?;
         let selection = DataPackSettings {
             enabled: vec!["vanilla".into(), "file/structures".into()],
             disabled: vec![],
@@ -3548,8 +3582,9 @@ mod tests {
         let mut creation =
             crate::world_creation::WorldCreationSettings::new("Structured test".into());
         creation.seed = crate::chat_input::ChatInput::field("42");
-        creation.preset = ResourceId::parse("example:spawn")?;
+        creation.preset = ResourceId::parse("example:bonus_spawn")?;
         creation.mode = crate::world_creation::GameMode::Creative;
+        creation.bonus_chest = true;
         let frozen = creation.freeze(game.clone(), Some((world.clone(), selection)));
         let saved_border = native_persistence::world::SavedWorldBorder::default();
         let initial_worker = GenerationWorker::start_structured_initial_world(
@@ -3588,6 +3623,38 @@ mod tests {
         );
         assert!(!initial_ready.initial_clocks.as_ref().unwrap().advance_time);
         assert!(initial_ready.postprocessed.is_some());
+        let processed = initial_ready.postprocessed.as_ref().unwrap();
+        let pos = processed
+            .initial_bonus_chest_position()
+            .flatten()
+            .context("bonus chest was not placed")?;
+        assert_eq!(
+            processed
+                .region
+                .world
+                .block(pos.x, pos.y, pos.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        let chest_chunk = processed
+            .chunks
+            .get(&ChunkPos {
+                x: pos.x.div_euclid(16),
+                z: pos.z.div_euclid(16),
+            })
+            .context("bonus chest chunk is missing")?;
+        let Some(native_persistence::nbt::Tag::List { values, .. }) =
+            chest_chunk.chunk.value.get("block_entities")
+        else {
+            anyhow::bail!("bonus chest block entity is missing");
+        };
+        assert!(values.iter().any(|entity| {
+            entity.get("x") == Some(&native_persistence::nbt::Tag::Int(pos.x))
+                && entity.get("y") == Some(&native_persistence::nbt::Tag::Int(pos.y))
+                && entity.get("z") == Some(&native_persistence::nbt::Tag::Int(pos.z))
+                && matches!(entity.get("LootTable"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:chests/spawn_bonus_chest"))
+        }));
         assert!(initial_ready.pack_snapshot.is_some());
         assert!(initial_ready.player_spawn.is_some());
         let initial = initial_ready.start_initial_player_session(123)?;

@@ -5158,8 +5158,15 @@ mod tests {
                 })
             })
             .unwrap();
+        let mut starts = BTreeMap::new();
+        for x in center.x - 8..=center.x + 8 {
+            for z in center.z - 8..=center.z + 8 {
+                starts.insert(ChunkPos { x, z }, BTreeMap::new());
+            }
+        }
+        starts.insert(center, BTreeMap::from([(structure_id, structure)]));
         batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
-            starts: BTreeMap::from([(center, BTreeMap::from([(structure_id, structure)]))]),
+            starts,
             references: BTreeMap::from([(center, references)]),
             terrain: BTreeMap::new(),
         }));

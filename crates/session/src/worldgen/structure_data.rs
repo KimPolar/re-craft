@@ -3,9 +3,100 @@ use anyhow::{Context, Result, ensure};
 use native_persistence::nbt::{Tag, TagType};
 use native_resources::structure_start::SimpleStructureKind;
 use native_world::loaded::ChunkPos;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{structure_batch::SimpleStarts, structure_references::OrderedStructureReferences};
+use super::{
+    structure_batch::SimpleStarts,
+    structure_references::{
+        OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
+    },
+};
+
+/// Verify that the saved reference index exactly reflects all starts in the
+/// reference radius. Return source chunks that a later save plan must retain.
+/// This is evidence for a save plan, not authorization to write a world.
+pub(super) fn referenced_start_chunks(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    references: &OrderedStructureReferences,
+) -> Result<BTreeSet<ChunkPos>> {
+    let recomputed = collect_ordered_structure_references(pos, |source| {
+        all_starts
+            .get(&source)
+            .with_context(|| format!("structure starts are missing at {}, {}", source.x, source.z))?
+            .iter()
+            .map(|(id, start)| {
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "structure start belongs to another chunk"
+                );
+                StructureStartBounds::from_simple(id.clone(), start)
+            })
+            .collect()
+    })?;
+    ensure!(
+        recomputed.membership() == references.membership(),
+        "structure references differ from generated starts"
+    );
+    let mut required = BTreeSet::new();
+    for (id, sources) in references.membership() {
+        ensure!(
+            references.order(id) == recomputed.order(id),
+            "structure reference order differs from generated starts"
+        );
+        for &packed in sources {
+            let bits = packed as u64;
+            let source = ChunkPos {
+                x: bits as u32 as i32,
+                z: (bits >> 32) as u32 as i32,
+            };
+            let start = all_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id))
+                .context("referenced structure start is missing")?;
+            validate_buried_treasure_start(source, start)?;
+            required.insert(source);
+        }
+    }
+    Ok(required)
+}
+
+fn validate_buried_treasure_start(
+    pos: ChunkPos,
+    start: &native_resources::structure_start::SimpleStructureStart,
+) -> Result<()> {
+    ensure!(
+        start.kind == SimpleStructureKind::BuriedTreasure,
+        "unsupported structure start serialization"
+    );
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "structure start belongs to another chunk"
+    );
+    ensure!(
+        start.orientation.is_none(),
+        "buried treasure has an unexpected orientation"
+    );
+    ensure!(
+        start.bounds.min == start.bounds.max,
+        "buried treasure has an invalid bounding box"
+    );
+    let x = pos
+        .x
+        .checked_mul(16)
+        .and_then(|v| v.checked_add(9))
+        .context("structure X overflow")?;
+    let z = pos
+        .z
+        .checked_mul(16)
+        .and_then(|v| v.checked_add(9))
+        .context("structure Z overflow")?;
+    ensure!(
+        start.bounds.min[0] == x && start.bounds.min[2] == z,
+        "buried treasure has an invalid position"
+    );
+    Ok(())
+}
 
 /// Serialize fresh starts and ordered references belonging to one chunk.
 /// Only buried treasure is supported; existing-world data must not use this.
@@ -16,36 +107,7 @@ pub(super) fn pack_structure_data(
 ) -> Result<Tag> {
     let mut packed_starts = Vec::with_capacity(starts.len());
     for (id, start) in starts {
-        ensure!(
-            start.kind == SimpleStructureKind::BuriedTreasure,
-            "unsupported structure start serialization"
-        );
-        ensure!(
-            start.chunk == [pos.x, pos.z],
-            "structure start belongs to another chunk"
-        );
-        ensure!(
-            start.orientation.is_none(),
-            "buried treasure has an unexpected orientation"
-        );
-        ensure!(
-            start.bounds.min == start.bounds.max,
-            "buried treasure has an invalid bounding box"
-        );
-        let x = pos
-            .x
-            .checked_mul(16)
-            .and_then(|v| v.checked_add(9))
-            .context("structure X overflow")?;
-        let z = pos
-            .z
-            .checked_mul(16)
-            .and_then(|v| v.checked_add(9))
-            .context("structure Z overflow")?;
-        ensure!(
-            start.bounds.min[0] == x && start.bounds.min[2] == z,
-            "buried treasure has an invalid position"
-        );
+        validate_buried_treasure_start(pos, start)?;
         let name = format!("{}:{}", id.namespace, id.path);
         let p = start.bounds.min;
         let piece = Tag::Compound(vec![
@@ -147,6 +209,60 @@ mod tests {
         starts.get_mut(&id).unwrap().kind = SimpleStructureKind::BuriedTreasure;
         starts.get_mut(&id).unwrap().bounds.max[1] += 1;
         assert!(pack_structure_data(pos, &starts, &references).is_err());
+    }
+
+    #[test]
+    fn referenced_sources_require_complete_consistent_generated_starts() {
+        let pos = ChunkPos { x: -17, z: 23 };
+        let id = ResourceId::parse("example:treasure").unwrap();
+        let (start, _) = fixture(pos, -27, true);
+        let mut all = BTreeMap::new();
+        for x in pos.x - 8..=pos.x + 8 {
+            for z in pos.z - 8..=pos.z + 8 {
+                all.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        all.insert(pos, start);
+        let references = collect_ordered_structure_references(pos, |source| {
+            all[&source]
+                .iter()
+                .map(|(id, start)| StructureStartBounds::from_simple(id.clone(), start))
+                .collect()
+        })
+        .unwrap();
+        assert_eq!(
+            referenced_start_chunks(pos, &all, &references).unwrap(),
+            BTreeSet::from([pos])
+        );
+        let mut missing = all.clone();
+        missing.remove(&ChunkPos {
+            x: pos.x - 8,
+            z: pos.z + 8,
+        });
+        assert!(referenced_start_chunks(pos, &missing, &references).is_err());
+        let mut missing_start = all.clone();
+        missing_start.get_mut(&pos).unwrap().clear();
+        assert!(referenced_start_chunks(pos, &missing_start, &references).is_err());
+        let empty_refs = collect_ordered_structure_references(pos, |_| Ok(vec![])).unwrap();
+        assert!(referenced_start_chunks(pos, &all, &empty_refs).is_err());
+        assert!(
+            referenced_start_chunks(pos, &missing_start, &empty_refs)
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong_kind = all.clone();
+        wrong_kind.get_mut(&pos).unwrap().get_mut(&id).unwrap().kind =
+            SimpleStructureKind::SwampHut;
+        assert!(referenced_start_chunks(pos, &wrong_kind, &references).is_err());
+        let mut wrong_position = all.clone();
+        wrong_position
+            .get_mut(&pos)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .bounds
+            .min[1] -= 1;
+        assert!(referenced_start_chunks(pos, &wrong_position, &references).is_err());
     }
 
     fn canonical(tag: Tag) -> Tag {

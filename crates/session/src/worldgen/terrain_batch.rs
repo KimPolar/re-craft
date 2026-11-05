@@ -756,6 +756,27 @@ impl FreshTerrainBatch {
     /// Build intermediate 26.3 structure NBT after the batch finishes FEATURES.
     /// The returned data does not establish that the world is safe to save.
     pub fn structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        self.structure_reference_sources(pos)?;
+        let structures = self
+            .structures
+            .as_ref()
+            .context("structure generation is disabled")?;
+        super::structure_data::pack_structure_data(
+            pos,
+            structures
+                .starts
+                .get(&pos)
+                .context("structure starts are missing")?,
+            structures
+                .references
+                .get(&pos)
+                .context("structure references are missing")?,
+        )
+    }
+
+    /// Identify generated source chunks referenced by this chunk. A save plan
+    /// must retain them and prove the remaining world data separately.
+    pub fn structure_reference_sources(&self, pos: ChunkPos) -> Result<BTreeSet<ChunkPos>> {
         ensure!(self.is_complete(), "terrain batch is incomplete or failed");
         ensure!(
             self.schedule
@@ -767,12 +788,9 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::pack_structure_data(
+        super::structure_data::referenced_start_chunks(
             pos,
-            structures
-                .starts
-                .get(&pos)
-                .context("structure starts are missing")?,
+            &structures.starts,
             structures
                 .references
                 .get(&pos)

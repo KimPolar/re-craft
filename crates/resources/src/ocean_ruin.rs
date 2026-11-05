@@ -3,6 +3,7 @@ use anyhow::{Result, ensure};
 use native_core::random::LegacyRandom;
 use serde_json::Value;
 
+pub use crate::structure_transform::Rotation;
 use crate::{packs::ResourceId, structure_placement::large_feature};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,33 +54,6 @@ impl Settings {
             large_probability: probability("large_probability")?,
             cluster_probability: probability("cluster_probability")?,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Rotation {
-    None,
-    Clockwise90,
-    Clockwise180,
-    Counterclockwise90,
-}
-
-impl Rotation {
-    fn random(random: &mut LegacyRandom) -> Self {
-        match random.next_int_bound(4).unwrap() {
-            0 => Self::None,
-            1 => Self::Clockwise90,
-            2 => Self::Clockwise180,
-            _ => Self::Counterclockwise90,
-        }
-    }
-    fn transform(self, [x, z]: [i32; 2]) -> [i32; 2] {
-        match self {
-            Self::None => [x, z],
-            Self::Clockwise90 => [z.wrapping_neg(), x],
-            Self::Clockwise180 => [x.wrapping_neg(), z.wrapping_neg()],
-            Self::Counterclockwise90 => [z, x.wrapping_neg()],
-        }
     }
 }
 
@@ -184,7 +158,7 @@ pub fn select_pieces(
     }
 
     let base = [origin[0], origin[2]];
-    let offset = rotation.transform([15, 15]);
+    let offset = rotation.transform_horizontal([15, 15]);
     let other = [
         base[0].wrapping_add(offset[0]),
         base[1].wrapping_add(offset[1]),
@@ -214,7 +188,7 @@ pub fn select_pieces(
         let selected = random.next_int_bound(positions.len() as i32).unwrap() as usize;
         let pos = positions.remove(selected);
         let rotation = Rotation::random(random);
-        let offset = rotation.transform([5, 6]);
+        let offset = rotation.transform_horizontal([5, 6]);
         let end = [
             pos[0].wrapping_add(offset[0]),
             pos[1].wrapping_add(offset[1]),

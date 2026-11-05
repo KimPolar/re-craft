@@ -3612,6 +3612,7 @@ mod tests {
             suggested_spawn: None,
             player_spawn: None,
             initial_clocks: Some(Arc::clone(&initial_clocks)),
+            hut_generation: None,
             entity_collision_registry: None,
             level_settings: Some(crate::world_creation::FrozenLevelSettings {
                 name: "World".into(),

@@ -60,6 +60,8 @@ pub struct GenerationReady {
     pub player_spawn: Option<IVec3>,
     /// Starting clock ticks from the same pack stack, when prepared for a new world.
     pub initial_clocks: Option<Arc<crate::fresh_generation::InitialWorldClocks>>,
+    /// Frozen at new-world time zero; this is not a running-session clock.
+    pub(crate) hut_generation: Option<Arc<crate::fresh_generation::InitialHutGeneration>>,
     pub entity_collision_registry:
         Option<Arc<native_resources::entity_collision::EntityCollisionRegistry>>,
     pub level_settings: Option<crate::world_creation::FrozenLevelSettings>,
@@ -85,6 +87,7 @@ pub(crate) struct StructuredGenerationInputs<P, C, R, H, F> {
     pub configure_terrain: F,
     pub worldgen_settings_draft: Option<native_persistence::nbt::NamedTag>,
     pub pack_snapshot: Option<Arc<native_resources::datapack_snapshot::DataPackSnapshot>>,
+    pub hut_generation: Option<Arc<crate::fresh_generation::InitialHutGeneration>>,
 }
 
 pub struct PostprocessedGeneration {
@@ -518,6 +521,7 @@ impl GenerationReady {
         }
         let mut session = self.start_session_inner(player)?;
         self.install_spawn_heightmaps(&mut session, tags)?;
+        self.hut_generation = None;
         Ok(session)
     }
 
@@ -571,6 +575,7 @@ impl GenerationReady {
             let tags = Arc::clone(&initial.height_tags);
             self.install_spawn_heightmaps(&mut session, tags)?;
         }
+        self.hut_generation = None;
         Ok(session)
     }
 
@@ -1062,6 +1067,12 @@ impl GenerationWorker {
                 disabled,
                 options.advance_time,
             )?;
+            if let Some(hut) = &ready.hut_generation {
+                ensure!(
+                    hut.clocks == context.clocks.ticks,
+                    "hut generation clocks differ from initial world clocks"
+                );
+            }
             let registry = Arc::new(resources.vanilla_generated_block_registry()?);
             let (classify, resolve) = crate::fresh_generation::block_classifiers(registry);
             ready.initial_clocks = Some(context.clocks);
@@ -2002,6 +2013,7 @@ impl GenerationWorker {
                 configure_terrain,
                 worldgen_settings_draft,
                 pack_snapshot,
+                hut_generation,
             } = prepare()?;
             ensure!(
                 structures.is_complete(),
@@ -2061,6 +2073,7 @@ impl GenerationWorker {
                 origin,
                 cancelled,
                 progress,
+                hut_generation,
             )?
             else {
                 return Ok(None);
@@ -2333,6 +2346,7 @@ impl GenerationWorker {
                 origin,
                 cancelled,
                 progress,
+                None,
             )
         })
     }
@@ -2497,7 +2511,13 @@ where
             }
             spawner.schedule_spawn(&mut ready.batch)?;
         }
-        let completed = generation_step(&mut ready.batch, provider, classify, resolve)?;
+        let completed = generation_step(
+            &mut ready.batch,
+            provider,
+            classify,
+            resolve,
+            ready.hut_generation.as_deref(),
+        )?;
         ensure!(
             completed == Some((pos, GenerationStage::Spawn)),
             "unexpected generation step after creature spawning"
@@ -3256,6 +3276,7 @@ fn generate_targets(
     origin: IVec3,
     cancelled: &AtomicBool,
     progress: &Mutex<GenerationProgress>,
+    hut_generation: Option<Arc<crate::fresh_generation::InitialHutGeneration>>,
 ) -> Result<Option<GenerationReady>> {
     ensure!(
         batch.is_complete() && batch.schedule().requested_chunks() == 0,
@@ -3270,7 +3291,13 @@ fn generate_targets(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(
+            &mut batch,
+            provider,
+            classify,
+            resolve,
+            hut_generation.as_deref(),
+        )?
     } {
         note_step(progress, pos, stage);
     }
@@ -3286,7 +3313,13 @@ fn generate_targets(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(
+            &mut batch,
+            provider,
+            classify,
+            resolve,
+            hut_generation.as_deref(),
+        )?
     } {
         note_step(progress, pos, stage);
     }
@@ -3304,6 +3337,7 @@ fn generate_targets(
         suggested_spawn: None,
         player_spawn: None,
         initial_clocks: None,
+        hut_generation,
         entity_collision_registry: None,
         level_settings: None,
         initial_respawn: None,
@@ -3341,7 +3375,7 @@ fn generate_spawn_origin(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(&mut batch, provider, classify, resolve, None)?
     } {
         note_step(progress, pos, stage);
     }
@@ -3355,7 +3389,7 @@ fn generate_spawn_origin(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(&mut batch, provider, classify, resolve, None)?
     } {
         note_step(progress, pos, stage);
     }
@@ -3373,6 +3407,7 @@ fn generate_spawn_origin(
         suggested_spawn: None,
         player_spawn: None,
         initial_clocks: None,
+        hut_generation: None,
         entity_collision_registry: None,
         level_settings: None,
         initial_respawn: None,
@@ -3400,6 +3435,7 @@ fn expand_with_inputs(
         worldgen_settings_draft,
         pack_snapshot,
         initial_clocks,
+        hut_generation,
         entity_collision_registry,
         level_settings,
         initial_respawn,
@@ -3447,7 +3483,13 @@ fn expand_with_inputs(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(
+            &mut batch,
+            provider,
+            classify,
+            resolve,
+            hut_generation.as_deref(),
+        )?
     } {
         note_step(progress, pos, stage);
     }
@@ -3468,7 +3510,13 @@ fn expand_with_inputs(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(
+            &mut batch,
+            provider,
+            classify,
+            resolve,
+            hut_generation.as_deref(),
+        )?
     } {
         note_step(progress, pos, stage);
     }
@@ -3486,7 +3534,13 @@ fn expand_with_inputs(
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        generation_step(&mut batch, provider, classify, resolve)?
+        generation_step(
+            &mut batch,
+            provider,
+            classify,
+            resolve,
+            hut_generation.as_deref(),
+        )?
     } {
         note_step(progress, pos, stage);
     }
@@ -3504,6 +3558,7 @@ fn expand_with_inputs(
         suggested_spawn: None,
         player_spawn: None,
         initial_clocks,
+        hut_generation,
         entity_collision_registry,
         level_settings,
         initial_respawn,
@@ -3532,11 +3587,23 @@ fn generation_step(
     provider: &mut impl ResourceProvider,
     classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
     resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    hut: Option<&crate::fresh_generation::InitialHutGeneration>,
 ) -> Result<Option<(ChunkPos, GenerationStage)>> {
     let next = batch.schedule().next_ready();
-    batch
-        .step(provider, classify, resolve)
-        .with_context(|| format!("generation step {next:?} failed"))
+    let result = if let Some(hut) = hut {
+        batch.step_with_hut_clocks(
+            provider,
+            classify,
+            resolve,
+            &hut.variants,
+            &hut.conditions,
+            &hut.moon,
+            &hut.clocks,
+        )
+    } else {
+        batch.step(provider, classify, resolve)
+    };
+    result.with_context(|| format!("generation step {next:?} failed"))
 }
 
 impl Drop for GenerationWorker {
@@ -4518,6 +4585,218 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn structured_worker_decorates_hut_using_initial_clocks() -> Result<()> {
+        use native_resources::{
+            carver::tags::CarverBlockTags,
+            cat_variants::CatSpawnVariants,
+            dimension_lighting::GeneratedDimensionLighting,
+            packs::{ResourceId, ResourceStack},
+            structure_placement::StructureSetCache,
+        };
+        use native_session::worldgen::{TerrainGenerator, resolve_generated_terrain_state};
+        use native_world::fluid::FluidState;
+        use serde_json::json;
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.starts_with("data/minecraft/worldgen/noise/") {
+                    return Ok(Some(br#"{"base_octave":-4,"octave_count":2}"#.to_vec()));
+                }
+                let value = match path {
+                    "data/example/worldgen/structure/hut.json" => Some(
+                        json!({"type":"minecraft:swamp_hut","biomes":["minecraft:plains"],"step":"surface_structures"}),
+                    ),
+                    "data/example/worldgen/structure_set/hut.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:hut","weight":1}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    "data/minecraft/tags/block/uncarvable.json" => Some(json!({"values":[]})),
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        Some(json!({"values":["minecraft:stone"]}))
+                    }
+                    "data/minecraft/cat_variant/black.json" => Some(json!({})),
+                    "data/example/cat_variant/moon_cat.json" => Some(
+                        json!({"spawn_conditions":[{"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}},"priority":0}]}),
+                    ),
+                    _ => None,
+                };
+                value
+                    .map(|v| serde_json::to_vec(&v).map_err(Into::into))
+                    .transpose()
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                let names: &[&str] = match folder {
+                    "worldgen/biome" => &["minecraft:plains"],
+                    "worldgen/structure_set" | "worldgen/structure" => &["example:hut"],
+                    "cat_variant" => &["minecraft:black", "example:moon_cat"],
+                    "cat_sound_variant" => &["minecraft:classic"],
+                    _ => &[],
+                };
+                names.iter().map(|id| ResourceId::parse(id)).collect()
+            }
+        }
+        let set = ResourceId::parse("example:hut")?;
+        let [x, z] = StructureSetCache::default()
+            .load(&mut Data, &set)?
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let prepare = move || {
+            let mut provider = Data;
+            let definition = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"},"settings":{
+                "noise":{"min_y":0,"height":96},"legacy_random_source":false,"sea_level":48,
+                "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
+                "material_rule":{"type":"block","result_state":"minecraft:stone"},
+                "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1},"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":48}
+            }});
+            let generator =
+                TerrainGenerator::with_structure_context(&mut provider, &definition, 42, 0, 96)?;
+            let structures = StructureGenerationBatch::from_registry(generator, &mut provider)?;
+            let terrain_tags = CarverBlockTags::load(&mut provider, &blocks)?;
+            let variants = CatSpawnVariants::load_active(&mut provider)?;
+            let conditions = variants.prepare_world_conditions(&mut provider)?;
+            let clock = ResourceId::parse("example:clock")?;
+            let moon = native_resources::moon_phase::Environment {
+                base: native_resources::moon_phase::Phase::NewMoon,
+                biomes: BTreeMap::new(),
+                has_biome_layer: false,
+                tracks: vec![native_resources::moon_phase::Track::parse(
+                    &json!({"clock":"example:clock","period_ticks":20}),
+                    &json!({"keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]}),
+                )?],
+            };
+            let hut_generation = Some(Arc::new(crate::fresh_generation::InitialHutGeneration {
+                variants,
+                conditions,
+                moon,
+                clocks: BTreeMap::from([(clock, 0)]),
+            }));
+            let registry = Arc::new(registry);
+            let for_height = Arc::clone(&registry);
+            let classify_height = move |value: &Value| {
+                let state = resolve_generated_terrain_state(value, &for_height)?;
+                let is_air = matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                );
+                let has_fluid = FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some();
+                Ok(native_persistence::heightmap::BlockHeightFlags {
+                    is_air,
+                    blocks_motion: !is_air && !has_fluid,
+                    blocks_motion_no_leaves: !is_air && !has_fluid,
+                    has_fluid,
+                })
+            };
+            let for_classify = Arc::clone(&registry);
+            let classify = move |value: &Value| {
+                let state = resolve_generated_terrain_state(value, &for_classify)?;
+                Ok(CarverBlockState {
+                    is_air: matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    has_fluid: FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some(),
+                })
+            };
+            let for_resolve = Arc::clone(&registry);
+            let resolve = move |value: &Value| resolve_generated_terrain_state(value, &for_resolve);
+            let configure_terrain = move |batch: &mut FreshTerrainBatch, provider: &mut Data| {
+                let lighting = GeneratedDimensionLighting {
+                    dimension: ResourceId::parse("minecraft:overworld")?,
+                    dimension_type: None,
+                    min_y: 0,
+                    height: 96,
+                    has_skylight: true,
+                    ambient_light: Some(0.0),
+                };
+                batch.enable_decoration(provider, &BTreeSet::new(), blocks, &lighting)?;
+                batch.enable_light_initialization((*registry).clone())
+            };
+            Ok(StructuredGenerationInputs {
+                structures,
+                terrain_generator: None,
+                height_tags: None,
+                provider,
+                classify,
+                resolve,
+                classify_height,
+                terrain_tags,
+                dimension: "minecraft:overworld".into(),
+                configure_terrain,
+                worldgen_settings_draft: None,
+                pack_snapshot: None,
+                hut_generation,
+            })
+        };
+        let worker = GenerationWorker::start_with_structures(
+            prepare,
+            BTreeSet::from([target]),
+            71,
+            0,
+            IVec3::ZERO,
+        )?;
+        let mut ready = match worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(180))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("hut generation cancelled"),
+        };
+        let mut records = Vec::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                records.extend(
+                    ready
+                        .batch
+                        .recorded_generated_entities(ChunkPos {
+                            x: x + dx,
+                            z: z + dz,
+                        })?
+                        .iter(),
+                );
+            }
+        }
+        let cats: Vec<_> = records.iter().filter(|record| matches!(record.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:cat"))).collect();
+        assert_eq!(cats.len(), 1);
+        assert!(
+            matches!(cats[0].get("variant"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("example:moon_cat"))
+        );
+        assert_eq!(records.len(), 2);
+        assert!(ready.batch.structure_data(target).is_err());
+        drop(cats);
+        drop(records);
+        assert!(ready.hut_generation.is_some());
+        ready.start_session(native_session::PlayerState {
+            position: glam::Vec3::new((x * 16 + 8) as f32 + 0.5, 80.0, (z * 16 + 8) as f32 + 0.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        })?;
+        assert!(ready.hut_generation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn worker_prepares_structures_before_lit_terrain() -> Result<()> {
         use native_resources::{
             carver::tags::CarverBlockTags,
@@ -4691,6 +4970,7 @@ mod tests {
                     configure_terrain,
                     worldgen_settings_draft: Some(worker_settings),
                     pack_snapshot: Some(worker_snapshot),
+                    hut_generation: None,
                 })
             };
             let worker = if from_spawn {

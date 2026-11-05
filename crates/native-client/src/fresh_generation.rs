@@ -159,6 +159,33 @@ pub struct InitialWorldClocks {
     pub fluid_environment: InitialFluidEnvironment,
 }
 
+/// Data-pack inputs and immutable time-zero clocks for initial generation.
+pub(crate) struct InitialHutGeneration {
+    pub variants: native_resources::cat_variants::CatSpawnVariants,
+    pub conditions: native_resources::cat_variants::CatWorldConditions,
+    pub moon: native_resources::moon_phase::Environment,
+    pub clocks: BTreeMap<ResourceId, i64>,
+}
+
+impl InitialHutGeneration {
+    fn load(resources: &mut ResourceStack, dimension_type: &ResourceId) -> Result<Self> {
+        let clocks = native_resources::world_clock::registered_clocks(resources)?
+            .into_iter()
+            .map(|id| (id, 0))
+            .collect();
+        let variants = native_resources::cat_variants::CatSpawnVariants::load_active(resources)?;
+        let conditions = variants.prepare_world_conditions(resources)?;
+        let name = format!("{}:{}", dimension_type.namespace, dimension_type.path);
+        let moon = native_resources::moon_phase::Environment::load(resources, &name)?;
+        Ok(Self {
+            variants,
+            conditions,
+            moon,
+            clocks,
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct InitialFluidEnvironment {
     pub fast_lava: Option<Arc<native_resources::fluid_environment::FastLavaEnvironment>>,
@@ -659,6 +686,11 @@ pub(crate) fn prepare_with_structures(
         &settings.preset,
         &settings.dimension,
     )?;
+    let hut_generation = lighting
+        .dimension_type
+        .as_ref()
+        .map(|dimension| InitialHutGeneration::load(&mut resources, dimension).map(Arc::new))
+        .transpose()?;
     let blocks = resources.vanilla_block_ids()?;
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let height_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
@@ -698,6 +730,7 @@ pub(crate) fn prepare_with_structures(
         configure_terrain,
         worldgen_settings_draft: Some(worldgen_settings),
         pack_snapshot,
+        hut_generation,
     })
 }
 

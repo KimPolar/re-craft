@@ -6863,6 +6863,8 @@ mod tests {
             String::from_utf8_lossy(&compile.stderr)
         );
         for mode in [
+            "block_incremental_stair_sky_outer",
+            "block_incremental_stair_sky_inner",
             "block_incremental_stair_outer",
             "block_incremental_stair_inner",
             "block_incremental_remove",
@@ -6908,7 +6910,36 @@ mod tests {
             let stone = world.intern_state(state("stone"));
             world.set_block_id(12, 10, 8, torch).unwrap();
             world.set_block_id(14, 10, 8, torch).unwrap();
-            if mode.starts_with("block_incremental_stair_") {
+            if mode.starts_with("block_incremental_stair_sky_") {
+                for x in 11..=15 {
+                    for y in 9..=11 {
+                        for z in 7..=9 {
+                            world
+                                .set_block_id(
+                                    x,
+                                    y,
+                                    z,
+                                    if (y == 10 && z == 8) || (x == 12 && y == 11 && z == 8) {
+                                        air
+                                    } else {
+                                        stone
+                                    },
+                                )
+                                .unwrap();
+                        }
+                    }
+                }
+                let mut neighbor = state("oak_stairs");
+                neighbor.properties = [
+                    ("facing".into(), "south".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "straight".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into();
+                let neighbor = world.intern_state(neighbor);
+                world.set_block_id(14, 10, 8, neighbor).unwrap();
+            } else if mode.starts_with("block_incremental_stair_") {
                 for x in 11..=15 {
                     for y in 9..=11 {
                         for z in 7..=9 {
@@ -6930,6 +6961,21 @@ mod tests {
                 let neighbor = world.intern_state(neighbor);
                 world.set_block_id(14, 10, 8, neighbor).unwrap();
             }
+            let original_world = if mode.starts_with("block_incremental_stair_sky_") {
+                let mut stair = state("oak_stairs");
+                stair.properties = [
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "straight".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into();
+                let id = world.intern_state(stair);
+                world.set_block_id(13, 10, 8, id).unwrap();
+                Some(world.clone())
+            } else {
+                None
+            };
             let positions: Vec<[i32; 3]> = match mode {
                 "block_incremental_remove" => vec![[14, 10, 8]],
                 "block_incremental_obstruct" => vec![[15, 10, 8]],
@@ -6937,7 +6983,10 @@ mod tests {
                 "block_incremental_add_inactive" => vec![[16, 10, 8]],
                 "block_incremental_activate" => vec![[16, 10, 8]],
                 "block_incremental_activate_many" => vec![[16, 10, 8], [17, 10, 8], [30, 10, 4]],
-                "block_incremental_stair_outer" | "block_incremental_stair_inner" => {
+                "block_incremental_stair_outer"
+                | "block_incremental_stair_inner"
+                | "block_incremental_stair_sky_outer"
+                | "block_incremental_stair_sky_inner" => {
                     vec![[13, 10, 8]]
                 }
                 _ => vec![[14, 10, 8], [15, 10, 8], [16, 10, 8], [14, 10, 8]],
@@ -6991,6 +7040,108 @@ mod tests {
             }
             let bounds = native_world::block_light::LightBounds::new(0, 16).unwrap();
             let active = BTreeSet::from([ChunkPos { x: 0, z: 0 }]);
+            if mode.starts_with("block_incremental_stair_sky_") {
+                let mut sky_before = VisibleLightSnapshot::new(true, true);
+                let original_world = original_world.as_ref().unwrap();
+                let mut original_sources = BTreeMap::new();
+                for z in -2..=2 {
+                    for x in -2..=2 {
+                        let pos = ChunkPos { x, z };
+                        let index = ((z + 2) * 5 + x + 2) as usize;
+                        let mut sky_layers = BTreeMap::new();
+                        let mut block_layers = BTreeMap::new();
+                        for sy in -1..=1 {
+                            let mut sky_layer = [0u8; native_world::loaded::LIGHT_BYTES];
+                            let mut block_layer = [0u8; native_world::loaded::LIGHT_BYTES];
+                            for i in 0..4096usize {
+                                let layer_index = ((sy + 1) as usize) * 4096 + i;
+                                sky_layer[i / 2] |=
+                                    expected[0][index][1][layer_index] << ((i % 2) * 4);
+                                block_layer[i / 2] |=
+                                    expected[0][index][0][layer_index] << ((i % 2) * 4);
+                            }
+                            sky_layers.insert(sy, Arc::new(sky_layer));
+                            block_layers.insert(sy, Arc::new(block_layer));
+                        }
+                        sky_before.insert_complete_column(
+                            pos,
+                            VisibleLightColumn::new(block_layers, sky_layers),
+                        );
+                        original_sources.insert(
+                            pos,
+                            Arc::from(
+                                native_world::sky_light::generated_chunk_sky_sources(
+                                    original_world,
+                                    bounds,
+                                    pos,
+                                )
+                                .unwrap(),
+                            ),
+                        );
+                    }
+                }
+                let checks: Vec<_> = positions
+                    .iter()
+                    .map(|&[x, y, z]| native_world::loaded::BlockPosition { x, y, z })
+                    .collect();
+                let sources = crate::worldgen::terrain_batch::updated_postprocessing_sky_sources(
+                    original_world,
+                    world,
+                    &checks,
+                    bounds,
+                    &original_sources,
+                )
+                .unwrap()
+                .expect("stair light properties changed");
+                let sky_after = crate::worldgen::postprocessing_world::drain_postprocessing_light(
+                    world,
+                    bounds,
+                    &sky_before,
+                    &active,
+                    &sources,
+                    &positions,
+                )
+                .expect("complete postprocessing light inputs");
+                let mut sky_changed = 0usize;
+                for z in -2..=2 {
+                    for x in -2..=2 {
+                        let index = ((z + 2) * 5 + x + 2) as usize;
+                        for y in -16..32 {
+                            for lz in 0..16 {
+                                for lx in 0..16 {
+                                    let i = ((y + 16) * 256 + lz * 16 + lx) as usize;
+                                    let p = [x * 16 + lx, y, z * 16 + lz];
+                                    assert_eq!(
+                                        sky_before.sky_light(p),
+                                        Some(expected[0][index][1][i]),
+                                        "sky before {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        expected[0][index][1][i], expected[1][index][1][i],
+                                        "sky pending {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        sky_after.sky_light(p),
+                                        Some(expected[2][index][1][i]),
+                                        "sky after {mode} {p:?}"
+                                    );
+                                    assert_eq!(
+                                        sky_after.block_light(p),
+                                        Some(expected[2][index][0][i]),
+                                        "block after combined drain {mode} {p:?}"
+                                    );
+                                    sky_changed += usize::from(
+                                        expected[0][index][1][i] != expected[2][index][1][i],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if mode.ends_with("outer") {
+                    assert!(sky_changed > 0, "sky fixture did not change light: {mode}");
+                }
+            }
             assert!(
                 native_world::generation_block_light::check_generated_block_light(
                     world,
@@ -7080,6 +7231,7 @@ mod tests {
                 changed == 0,
                 mode == "block_incremental_add_inactive"
                     || mode.starts_with("block_incremental_activate")
+                    || mode.starts_with("block_incremental_stair_sky_")
                     || mode == "block_incremental_stair_inner",
                 "{mode}"
             );

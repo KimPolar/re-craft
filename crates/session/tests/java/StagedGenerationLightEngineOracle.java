@@ -28,6 +28,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
     boolean sparseMany;
     boolean blockCase;
     boolean stairCase;
+    boolean stairSky;
     boolean tallSky;
     public int getMinY(){ return 0; }
     public int getHeight(){ return tallSky ? 64 : 16; }
@@ -60,7 +61,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         public ChunkSkyLightSources getSkyLightSources(){ return sources; }
         public void findBlockLightSources(BiConsumer<BlockPos,BlockState> f){
             if(x==1 && z==0 && !blockCase && !magmaOnly && !emptyEast) f.accept(new BlockPos(17,10,8),Blocks.TORCH.defaultBlockState());
-            if(x==0 && z==0 && blockCase){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); if(!stairCase)f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
+            if(x==0 && z==0 && blockCase && !stairSky){ f.accept(new BlockPos(12,10,8),Blocks.TORCH.defaultBlockState()); if(!stairCase)f.accept(new BlockPos(14,10,8),Blocks.TORCH.defaultBlockState()); }
             if(x==1 && z==0 && blockCase) for(var entry:edits.entrySet())
                 if(Math.floorDiv(entry.getKey().getX(),16)==1 && Math.floorDiv(entry.getKey().getZ(),16)==0 && entry.getValue().getLightEmission()>0) f.accept(entry.getKey(),entry.getValue());
             if(x==1 && z==0 && lateFar) f.accept(new BlockPos(31,10,8),Blocks.TORCH.defaultBlockState());
@@ -132,6 +133,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean blockCase=args.length>1 && args[1].startsWith("block_incremental_");
         w.blockCase=blockCase;
         w.stairCase=blockCase && args[1].startsWith("block_incremental_stair_");
+        w.stairSky=w.stairCase && args[1].contains("_sky_");
         boolean skyMany=args.length>1 && (args[1].equals("sky_inactive_many") || args[1].equals("sky_inactive_activate_many"));
         boolean skyActivate=args.length>1 && args[1].startsWith("sky_inactive_activate");
         w.tallSky=args.length>1 && args[1].equals("sky_inactive_activate_tall");
@@ -208,7 +210,17 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
             if(blockCase && x==0 && z==0){
                 fake.section.setBlockState(12,10,8,Blocks.TORCH.defaultBlockState()); fake.section.setBlockState(14,10,8,Blocks.TORCH.defaultBlockState());
-                if(args[1].startsWith("block_incremental_stair_")){
+                if(w.stairSky){
+                    for(int lx=11;lx<=15;lx++) for(int y=9;y<=11;y++) for(int lz=7;lz<=9;lz++) {
+                        var p=new BlockPos(lx,y,lz);
+                        var block=((y==10 && lz==8) || (lx==12 && y==11 && lz==8))?Blocks.AIR.defaultBlockState():Blocks.STONE.defaultBlockState();
+                        fake.section.setBlockState(lx,y,lz,block);w.edits.put(p,block);
+                    }
+                    var stair=Blocks.OAK_STAIRS.defaultBlockState();
+                    fake.section.setBlockState(13,10,8,stair);w.edits.put(new BlockPos(13,10,8),stair);
+                    var neighbor=stair.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,Direction.SOUTH);
+                    fake.section.setBlockState(14,10,8,neighbor);w.edits.put(new BlockPos(14,10,8),neighbor);
+                } else if(w.stairCase){
                     for(int lx=11;lx<=15;lx++) for(int y=9;y<=11;y++) for(int lz=7;lz<=9;lz++) {
                         var p=new BlockPos(lx,y,lz);
                         var block=(y==10 && lz==8)?Blocks.AIR.defaultBlockState():Blocks.STONE.defaultBlockState();

@@ -502,6 +502,56 @@ impl GenerationSchedule {
         result
     }
 
+    /// Run the terrain stage with a context frozen from verified starts and
+    /// references. This remains an intermediate, unsaveable terrain chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_terrain_with_prepared_structure<
+        P: native_resources::packs::ResourceProvider,
+    >(
+        &mut self,
+        generator: &mut super::TerrainGenerator,
+        provider: &mut P,
+        evaluator: &mut native_resources::density::DensityEvaluator,
+        cache: &mut native_resources::carver::schedule::CarverCache,
+        neighborhood: &super::BiomeNeighborhood,
+        tags: &native_resources::carver::tags::CarverBlockTags,
+        assembled: &mut Option<super::CarvedTerrainWorld>,
+        pos: ChunkPos,
+        dimension: &str,
+        structure: std::sync::Arc<native_core::beardifier::Beardifier>,
+        classify: impl FnMut(&serde_json::Value) -> Result<super::CarverBlockState>,
+        resolve: impl FnMut(&serde_json::Value) -> Result<native_world::loaded::BlockState>,
+    ) -> Result<()> {
+        ensure!(
+            self.ready(pos, Terrain),
+            "terrain dependencies are incomplete"
+        );
+        ensure!(
+            generator.structure_context,
+            "generator lacks structure context"
+        );
+        self.validate_terrain_inputs(generator, neighborhood, assembled.as_ref(), pos, dimension)?;
+        let biome = neighborhood
+            .chunk([pos.x, pos.z])
+            .context("terrain biome chunk missing")?;
+        let chunk = generator.generate_carved_surface_with_structure_context(
+            provider,
+            evaluator,
+            cache,
+            [pos.x, pos.z],
+            neighborhood,
+            tags,
+            structure,
+            classify,
+        )?;
+        let terrain = super::materialize_carved_terrain(chunk, biome, dimension, resolve)?;
+        match assembled {
+            Some(world) => world.insert(&terrain)?,
+            None => *assembled = Some(super::CarvedTerrainWorld::new(terrain)),
+        }
+        self.complete(pos, Terrain)
+    }
+
     fn validate_terrain_inputs(
         &self,
         generator: &super::TerrainGenerator,

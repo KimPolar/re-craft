@@ -546,6 +546,61 @@ fn terrain_matches_java_before_and_after_carvers() {
             assert!(light.is_none());
             let scheduled = scheduled_world.unwrap().snapshot();
             assert_eq!(schedule.completed(center), Some(GenerationStage::Terrain));
+            // An empty active set isolates the structure-aware batch plumbing
+            // while retaining the same vanilla terrain as this Java fixture.
+            let structure_generator = TerrainGenerator::with_structure_context(
+                &mut resources,
+                &generator_definition,
+                seed,
+                min_y,
+                height,
+            )
+            .unwrap();
+            let structure_biomes = native_resources::structure_biomes::StructureBiomes::load(
+                &mut resources,
+                std::iter::empty(),
+            )
+            .unwrap();
+            let mut structures =
+                native_session::worldgen::structure_batch::StructureGenerationBatch::new(
+                    structure_generator,
+                    structure_biomes,
+                    vec![],
+                )
+                .unwrap();
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    structures
+                        .request_references(ChunkPos {
+                            x: center.x + dx,
+                            z: center.z + dz,
+                        })
+                        .unwrap();
+                }
+            }
+            while structures
+                .step(&mut resources, &mut |_| {
+                    panic!("empty structure sets must not classify blocks")
+                })
+                .unwrap()
+                .is_some()
+            {}
+            let structure_tags = CarverBlockTags::load(&mut resources, &registry).unwrap();
+            let mut structure_terrain = FreshTerrainBatch::new_with_prepared_structures(
+                structures,
+                BTreeMap::from([(center, vec![])]),
+                structure_tags,
+                dimension,
+            )
+            .unwrap();
+            structure_terrain.request(center).unwrap();
+            while structure_terrain
+                .step(&mut resources, &mut classifier, &mut resolver)
+                .unwrap()
+                .is_some()
+            {}
+            assert!(structure_terrain.is_complete());
+            let structure_scheduled = structure_terrain.snapshot().unwrap();
             for y in min_y..min_y + height {
                 for z in bz..bz + 16 {
                     for x in bx..bx + 16 {
@@ -558,6 +613,16 @@ fn terrain_matches_java_before_and_after_carvers() {
                             scheduled.biome(x, y, z),
                             generated.world().biome(x, y, z),
                             "scheduled biome at {x},{y},{z}"
+                        );
+                        assert_eq!(
+                            structure_scheduled.block(x, y, z),
+                            generated.world().block(x, y, z),
+                            "structure-aware terrain at {x},{y},{z}"
+                        );
+                        assert_eq!(
+                            structure_scheduled.biome(x, y, z),
+                            generated.world().biome(x, y, z),
+                            "structure-aware biome at {x},{y},{z}"
                         );
                     }
                 }

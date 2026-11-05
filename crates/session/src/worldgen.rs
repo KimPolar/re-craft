@@ -6807,6 +6807,87 @@ mod tests {
         }
         assert!(adjusted_blocks > 0);
 
+        // Transfer the actual structure generator and verified intermediate
+        // stages into the same terrain batch used by the client.
+        let fresh_tags =
+            native_resources::carver::tags::CarverBlockTags::load(&mut data, &registry).unwrap();
+        let mut fresh = FreshTerrainBatch::new_with_prepared_structures(
+            tall_batch,
+            BTreeMap::from([(target, tall_order)]),
+            fresh_tags,
+            "minecraft:overworld",
+        )
+        .unwrap();
+        fresh.request(target).unwrap();
+        while fresh
+            .step(&mut data, &mut |value| classify(value), &mut |value| {
+                Ok(native_world::loaded::BlockState {
+                    name: value.as_str().unwrap().into(),
+                    properties: BTreeMap::new(),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        assert!(fresh.is_complete());
+        let actual_world = fresh.snapshot().unwrap();
+        for local_z in 0..16usize {
+            for local_x in 0..16usize {
+                for y in 0..96usize {
+                    let wx = x * 16 + local_x as i32;
+                    let wz = z * 16 + local_z as i32;
+                    assert_eq!(
+                        actual_world.block(wx, y as i32, wz),
+                        tall_snapshot.block(wx, y as i32, wz)
+                    );
+                }
+            }
+        }
+        assert!(fresh.request_features(target).is_err());
+        assert!(fresh.into_parts().is_err());
+
+        // A single reference stage does not cover the larger terrain plan.
+        // Reject that request before recording any generation work.
+        let generator =
+            TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16).unwrap();
+        let rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+        let mut partial = super::structure_batch::StructureGenerationBatch::new(
+            generator,
+            rules,
+            vec![ResourceId::parse("example:sparse").unwrap()],
+        )
+        .unwrap();
+        partial.request_references(target).unwrap();
+        while partial
+            .step(&mut data, &mut |v| {
+                let id = v.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: id == "minecraft:air",
+                    blocks_motion: id == "minecraft:stone",
+                    blocks_motion_no_leaves: id == "minecraft:stone",
+                    has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        let partial_order = partial
+            .terrain_start_keys(target)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let partial_tags =
+            native_resources::carver::tags::CarverBlockTags::load(&mut data, &registry).unwrap();
+        let mut partial_fresh = FreshTerrainBatch::new_with_prepared_structures(
+            partial,
+            BTreeMap::from([(target, partial_order)]),
+            partial_tags,
+            "minecraft:overworld",
+        )
+        .unwrap();
+        assert!(partial_fresh.request(target).is_err());
+        assert_eq!(partial_fresh.schedule().requested_chunks(), 0);
+
         data.0.insert(
             "data/example/worldgen/structure/pyramid.json".into(),
             serde_json::to_vec(

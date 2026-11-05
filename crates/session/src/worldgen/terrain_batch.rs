@@ -1,4 +1,4 @@
-//! Incremental execution of fresh terrain generation without structures.
+//! Incremental execution of intermediate fresh terrain generation.
 use anyhow::{Context, Result, bail, ensure};
 use native_resources::{
     block_registry::GeneratedBlockRegistry,
@@ -21,16 +21,19 @@ use super::{
     BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
+    structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
 
 /// A single-threaded, incrementally driven batch for fresh generation.
 /// Its generator, provider, block registry and tags must belong to the same
-/// immutable pack stack. No old-chunk blending or structures are supported.
+/// immutable pack stack. Structure-aware batches stop at intermediate terrain;
+/// old-chunk blending, structure placement and saving are not supported.
 /// Its deterministic work order has not been proven to match Java's thread
 /// scheduling for climate ties. Outputs remain intermediate and unsaveable.
 pub struct FreshTerrainBatch {
     schedule: GenerationSchedule,
     generator: TerrainGenerator,
+    structures: Option<PreparedStructureStages>,
     evaluator: DensityEvaluator,
     carvers: CarverCache,
     biomes: BiomeNeighborhood,
@@ -870,11 +873,34 @@ impl FreshTerrainBatch {
             !generator.structure_context,
             "structure-adjusted terrain is not supported by this batch"
         );
+        Self::new_inner(generator, tags, dimension, None)
+    }
+
+    /// Consume completed structure stages and their generator for an
+    /// intermediate terrain-only batch. The caller supplies the actual Java
+    /// iteration order for every terrain chunk it will request.
+    pub fn new_with_prepared_structures(
+        structures: StructureGenerationBatch,
+        orders: BTreeMap<ChunkPos, Vec<TerrainStartKey>>,
+        tags: CarverBlockTags,
+        dimension: &str,
+    ) -> Result<Self> {
+        let (generator, structures) = structures.into_terrain_stages(orders)?;
+        Self::new_inner(generator, tags, dimension, Some(structures))
+    }
+
+    fn new_inner(
+        generator: TerrainGenerator,
+        tags: CarverBlockTags,
+        dimension: &str,
+        structures: Option<PreparedStructureStages>,
+    ) -> Result<Self> {
         let id = ResourceId::parse(dimension)?;
         let biomes = generator.biome_neighborhood()?;
         Ok(Self {
             schedule: GenerationSchedule::new(),
             generator,
+            structures,
             evaluator: DensityEvaluator::default(),
             carvers: CarverCache::default(),
             biomes,
@@ -903,6 +929,10 @@ impl FreshTerrainBatch {
         block_registry: BTreeSet<String>,
         lighting: &GeneratedDimensionLighting,
     ) -> Result<()> {
+        ensure!(
+            self.structures.is_none(),
+            "structure placement is not implemented"
+        );
         ensure!(
             !self.failed && self.schedule.requested_chunks() == 0 && self.decoration.is_none(),
             "decoration must be configured before requests"
@@ -1017,12 +1047,52 @@ impl FreshTerrainBatch {
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
+        if let Some(structures) = &self.structures {
+            ensure!(
+                structures.terrain.contains_key(&pos),
+                "prepared structure terrain order is missing"
+            );
+            for (radius, &needed) in GenerationStage::Terrain.accumulated().iter().enumerate() {
+                let r = i32::try_from(radius)?;
+                for dz in -r..=r {
+                    for dx in -r..=r {
+                        if dx.abs().max(dz.abs()) != r {
+                            continue;
+                        }
+                        let source = ChunkPos {
+                            x: pos
+                                .x
+                                .checked_add(dx)
+                                .context("generation chunk X overflow")?,
+                            z: pos
+                                .z
+                                .checked_add(dz)
+                                .context("generation chunk Z overflow")?,
+                        };
+                        ensure!(
+                            structures.starts.contains_key(&source),
+                            "prepared structure starts are missing for {source:?}"
+                        );
+                        if needed >= GenerationStage::StructureReferences {
+                            ensure!(
+                                structures.references.contains_key(&source),
+                                "prepared structure references are missing for {source:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         self.check_writes(pos, 0)?;
         self.schedule.request(pos, GenerationStage::Terrain)
     }
 
     /// Request terrain and supported FEATURES for one chunk.
     pub fn request_features(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            self.structures.is_none(),
+            "structure placement is not implemented"
+        );
         ensure!(
             !self.failed,
             "generation batch failed and must be discarded"
@@ -2402,9 +2472,9 @@ impl FreshTerrainBatch {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }
 
-    /// Perform one ready operation. No-op structure stages represent the
-    /// explicitly disabled structure setting. A failed operation poisons the
-    /// batch because generator or cache search history may have advanced.
+    /// Perform one ready operation. Structure stages are either explicitly
+    /// disabled or verified against the frozen structure batch. A failed
+    /// operation poisons the batch because search history may have advanced.
     pub fn step(
         &mut self,
         provider: &mut impl ResourceProvider,
@@ -2420,9 +2490,18 @@ impl FreshTerrainBatch {
             bail!("terrain generation plan has unfinished steps but no ready work");
         };
         let result = match stage {
-            GenerationStage::StructureStarts | GenerationStage::StructureReferences => {
+            GenerationStage::StructureStarts | GenerationStage::StructureReferences => (|| {
+                if let Some(structures) = &self.structures {
+                    let exists = if stage == GenerationStage::StructureStarts {
+                        structures.starts.contains_key(&pos)
+                    } else {
+                        structures.references.contains_key(&pos)
+                    };
+                    ensure!(exists, "prepared structure stage is missing for {pos:?}");
+                }
                 self.schedule.complete(pos, stage)
-            }
+            })(
+            ),
             GenerationStage::Biomes => self.schedule.run_biomes(
                 &mut self.generator,
                 &mut self.evaluator,
@@ -2431,20 +2510,42 @@ impl FreshTerrainBatch {
             ),
             GenerationStage::Terrain => (|| {
                 self.check_write_area(pos, 0)?;
-                self.schedule.run_terrain(
-                    &mut self.generator,
-                    provider,
-                    &mut self.evaluator,
-                    &mut self.carvers,
-                    &self.biomes,
-                    &self.tags,
-                    &mut self.terrain,
-                    pos,
-                    &self.dimension,
-                    false,
-                    classify,
-                    resolve,
-                )?;
+                if let Some(structures) = &self.structures {
+                    let context = structures
+                        .terrain
+                        .get(&pos)
+                        .cloned()
+                        .context("prepared structure terrain order is missing")?;
+                    self.schedule.run_terrain_with_prepared_structure(
+                        &mut self.generator,
+                        provider,
+                        &mut self.evaluator,
+                        &mut self.carvers,
+                        &self.biomes,
+                        &self.tags,
+                        &mut self.terrain,
+                        pos,
+                        &self.dimension,
+                        context,
+                        classify,
+                        resolve,
+                    )?;
+                } else {
+                    self.schedule.run_terrain(
+                        &mut self.generator,
+                        provider,
+                        &mut self.evaluator,
+                        &mut self.carvers,
+                        &self.biomes,
+                        &self.tags,
+                        &mut self.terrain,
+                        pos,
+                        &self.dimension,
+                        false,
+                        classify,
+                        resolve,
+                    )?;
+                }
                 if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
                     terrain.initialize_worldgen_heightmaps(pos, &config.heightmap_tags)?;
                     if terrain.world.dimension_type != config.dimension_type {
@@ -2589,7 +2690,8 @@ impl FreshTerrainBatch {
     }
 
     /// Transfer the complete registration history together with the terrain;
-    /// preserve it before later light propagation or decoration.
+    /// preserve it before later light propagation or decoration. Structure-aware
+    /// batches cannot be transferred until structure persistence is supported.
     pub fn into_parts(
         self,
     ) -> Result<(
@@ -2599,6 +2701,10 @@ impl FreshTerrainBatch {
         Option<(FreshBatchLight, GeneratedBlockRegistry)>,
     )> {
         ensure!(self.is_complete(), "terrain batch is incomplete or failed");
+        ensure!(
+            self.structures.is_none(),
+            "structure data cannot yet be transferred for saving"
+        );
         let light = match (self.light_tracker, self.light_engine, self.light_registry) {
             (Some(tracker), None, Some(registry)) => {
                 Some((FreshBatchLight::Initialized(tracker), registry))

@@ -36,6 +36,13 @@ pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
 
+/// Validated structure stages retained for an intermediate terrain batch.
+pub(super) struct PreparedStructureStages {
+    pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
+    pub(super) references: BTreeMap<ChunkPos, StructureReferences>,
+    pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
+}
+
 /// The caller must supply the complete active structure-set list in registry
 /// order, matching the generator, biome rules and resource stack. Unsupported
 /// structure attempts fail the batch; they are never recorded as absent.
@@ -53,6 +60,34 @@ pub struct StructureGenerationBatch {
 }
 
 impl StructureGenerationBatch {
+    /// Freeze completed structure stages and transfer their generator to the
+    /// terrain batch. Orders must be Java's actual start iteration order.
+    pub(super) fn into_terrain_stages(
+        self,
+        orders: BTreeMap<ChunkPos, Vec<TerrainStartKey>>,
+    ) -> Result<(TerrainGenerator, PreparedStructureStages)> {
+        ensure!(
+            self.is_complete(),
+            "structure batch has unfinished or failed work"
+        );
+        ensure!(
+            self.generator.structure_context,
+            "generator lacks structure context"
+        );
+        let mut terrain = BTreeMap::new();
+        for (pos, order) in orders {
+            terrain.insert(pos, self.beardifier_for_chunk(pos, &order)?);
+        }
+        Ok((
+            self.generator,
+            PreparedStructureStages {
+                starts: self.starts,
+                references: self.references,
+                terrain,
+            },
+        ))
+    }
+
     pub(super) fn generator(&self) -> &TerrainGenerator {
         &self.generator
     }

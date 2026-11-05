@@ -67,7 +67,12 @@ impl SwampHutWorld for World {
         self.blocks.insert(p, HutBlock::OakLog);
         Ok(())
     }
-    fn spawn_structure_mob(&mut self, _: HutMob, _: [i32; 3]) -> anyhow::Result<()> {
+    fn spawn_structure_mob(
+        &mut self,
+        _: HutMob,
+        _: [i32; 3],
+        _: BoundingBox,
+    ) -> anyhow::Result<()> {
         panic!("fixture mobs already spawned")
     }
 }

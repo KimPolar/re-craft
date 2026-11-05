@@ -6749,9 +6749,9 @@ mod tests {
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
                     ),
-                    "data/minecraft/cat_variant/black.json" => {
-                        Some(json!({"spawn_conditions":[{"priority":0}]}))
-                    }
+                    "data/minecraft/cat_variant/black.json" => Some(
+                        json!({"spawn_conditions":[{"condition":{"type":"minecraft:structure","structures":"example:hut"},"priority":0}]}),
+                    ),
                     "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                     | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
                         Some(json!({"values":["minecraft:stone","minecraft:dirt"]}))
@@ -6879,10 +6879,20 @@ mod tests {
                 };
                 FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
             };
-            let mut condition =
-                |_: [i32; 3], _: &native_world::loaded::World, _: &Value| -> Result<bool> {
-                    anyhow::bail!("unexpected condition")
-                };
+            let mut condition = |key: &crate::worldgen::structure_batch::TerrainStartKey,
+                                 pos: [i32; 3],
+                                 _: &native_world::loaded::World,
+                                 value: &Value,
+                                 bounds: native_core::beardifier::BoundingBox|
+             -> Result<bool> {
+                assert_eq!(key, &(structure.clone(), target));
+                assert_eq!(value["type"], "minecraft:structure");
+                assert_ne!(bounds.min[1], before.min[1]);
+                assert!(
+                    (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&pos[axis]))
+                );
+                Ok(true)
+            };
             let mut saw_failure = false;
             loop {
                 let previous = batch.snapshot();

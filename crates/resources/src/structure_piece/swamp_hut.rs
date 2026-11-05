@@ -38,7 +38,12 @@ pub trait SwampHutWorld {
     fn place_support_log(&mut self, position: [i32; 3]) -> Result<()>;
     /// Attempt Java's persistent STRUCTURE spawn, including initialization.
     /// An unavailable entity type can return success without adding an entity.
-    fn spawn_structure_mob(&mut self, mob: HutMob, position: [i32; 3]) -> Result<()>;
+    fn spawn_structure_mob(
+        &mut self,
+        mob: HutMob,
+        position: [i32; 3],
+        piece_bounds: BoundingBox,
+    ) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -188,11 +193,11 @@ pub fn place_swamp_hut(
     if inside(clip, mob_pos) {
         if !state.spawned_witch {
             state.spawned_witch = true;
-            world.spawn_structure_mob(HutMob::Witch, mob_pos)?;
+            world.spawn_structure_mob(HutMob::Witch, mob_pos, piece.bounds)?;
         }
         if !state.spawned_cat {
             state.spawned_cat = true;
-            world.spawn_structure_mob(HutMob::Cat, mob_pos)?;
+            world.spawn_structure_mob(HutMob::Cat, mob_pos, piece.bounds)?;
         }
     }
     Ok(true)
@@ -226,7 +231,7 @@ mod tests {
             self.writes.push((p, HutBlock::OakLog));
             Ok(())
         }
-        fn spawn_structure_mob(&mut self, mob: HutMob, p: [i32; 3]) -> Result<()> {
+        fn spawn_structure_mob(&mut self, mob: HutMob, p: [i32; 3], _: BoundingBox) -> Result<()> {
             self.mobs.push((mob, p));
             Ok(())
         }

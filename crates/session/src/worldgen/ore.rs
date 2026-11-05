@@ -74,7 +74,14 @@ where
         + FnMut(
             native_resources::structure_piece::swamp_hut::HutMob,
         ) -> Result<super::FreshCreatureRandom>,
-    P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    P: Clone
+        + FnMut(
+            &crate::worldgen::structure_batch::TerrainStartKey,
+            [i32; 3],
+            &World,
+            &Value,
+            native_core::beardifier::BoundingBox,
+        ) -> Result<bool>,
 {
     fn place(
         &mut self,
@@ -89,6 +96,7 @@ where
             .context("swamp hut piece state is missing")?;
         region.resume_swamp_hut_with_initialized_mobs(
             start,
+            &key.0,
             state,
             clip,
             self.random,
@@ -1281,7 +1289,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
             terrain, structures, states, random, variants, construct, condition, None, None,
@@ -1309,7 +1324,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
             terrain,
@@ -1347,7 +1369,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
             terrain,
@@ -1385,7 +1414,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         self.execute_huts_with_optional_light(
             terrain,
@@ -1421,7 +1457,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         ensure!(
             !terrain.has_published_light,
@@ -7292,9 +7335,22 @@ mod tests {
         let mut random = RegionRandom::new(42, WorldgenRandom::Xoroshiro, 0, 0);
         let mut expected_random = random.clone();
         let mut construct = make_construct();
-        let mut matching = |_: [i32; 3], _: &World, value: &serde_json::Value| {
-            Ok(value["type"] == "minecraft:structure")
-        };
+        let mut matching =
+            |key: &crate::worldgen::structure_batch::TerrainStartKey,
+             _: [i32; 3],
+             _: &World,
+             value: &serde_json::Value,
+             bounds: native_core::beardifier::BoundingBox| {
+                assert_eq!(
+                    *key,
+                    (
+                        ResourceId::parse("example:hut").unwrap(),
+                        ChunkPos { x: 0, z: 0 }
+                    )
+                );
+                assert_eq!(bounds, BoundingBox::new([3, 8, 3], [9, 14, 11]).unwrap());
+                Ok(value["type"] == "minecraft:structure")
+            };
         let mut region = terrain
             .decoration_region(&tags, &motion, writable.clone())
             .unwrap();
@@ -7302,6 +7358,7 @@ mod tests {
             region
                 .place_swamp_hut_with_initialized_mobs(
                     &mut actual_piece,
+                    &ResourceId::parse("example:hut").unwrap(),
                     &mut actual_state,
                     clip,
                     &mut random,
@@ -7320,6 +7377,7 @@ mod tests {
             region
                 .resume_swamp_hut_with_initialized_mobs(
                     &mut actual_piece,
+                    &ResourceId::parse("example:hut").unwrap(),
                     &mut saved,
                     clip,
                     &mut random,
@@ -7362,14 +7420,19 @@ mod tests {
         let mut random = RegionRandom::new(42, WorldgenRandom::Xoroshiro, 0, 0);
         let mut untouched = random.clone();
         let mut construct = make_construct();
-        let mut missing_context = |_: [i32; 3], _: &World, _: &serde_json::Value| -> Result<bool> {
-            anyhow::bail!("missing structure context")
-        };
+        let mut missing_context =
+            |_: &crate::worldgen::structure_batch::TerrainStartKey,
+             _: [i32; 3],
+             _: &World,
+             _: &serde_json::Value,
+             _: native_core::beardifier::BoundingBox|
+             -> Result<bool> { anyhow::bail!("missing structure context") };
         let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         assert!(
             region
                 .place_swamp_hut_with_initialized_mobs(
                     &mut actual_piece,
+                    &ResourceId::parse("example:hut").unwrap(),
                     &mut actual_state,
                     clip,
                     &mut random,
@@ -21000,9 +21063,12 @@ mod tests {
             }
         };
         let mut construct = make_construct();
-        let mut condition = |_: [i32; 3], _: &World, _: &Value| -> Result<bool> {
-            anyhow::bail!("unexpected condition")
-        };
+        let mut condition = |_: &crate::worldgen::structure_batch::TerrainStartKey,
+                             _: [i32; 3],
+                             _: &World,
+                             _: &Value,
+                             _: native_core::beardifier::BoundingBox|
+         -> Result<bool> { anyhow::bail!("unexpected condition") };
         let mut states = initial.clone();
         let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
         let (mut terrain, _, _, _) = fixture();
@@ -21208,9 +21274,13 @@ mod tests {
                 };
                 super::super::FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
             };
-            let mut condition = |_: [i32; 3], _: &World, _: &Value| -> Result<bool> {
-                anyhow::bail!("unexpected condition")
-            };
+            let mut condition =
+                |_: &crate::worldgen::structure_batch::TerrainStartKey,
+                 _: [i32; 3],
+                 _: &World,
+                 _: &Value,
+                 _: native_core::beardifier::BoundingBox|
+                 -> Result<bool> { anyhow::bail!("unexpected condition") };
             let result = if staged {
                 let mut engine = StagedGenerationLightEngine::new(tracker);
                 engine

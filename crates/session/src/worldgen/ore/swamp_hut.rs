@@ -92,6 +92,7 @@ impl DecorationRegion<'_> {
     pub fn resume_swamp_hut_with_initialized_mobs<C, P>(
         &mut self,
         piece: &mut SimpleStructureStart,
+        structure_id: &native_resources::packs::ResourceId,
         saved: &mut super::super::SavedSwampHutPiece,
         clip: BoundingBox,
         random: &mut native_resources::worldgen_region_random::RegionRandom,
@@ -101,7 +102,14 @@ impl DecorationRegion<'_> {
     ) -> Result<bool>
     where
         C: Clone + FnMut(HutMob) -> Result<super::super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &serde_json::Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &super::super::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &serde_json::Value,
+                BoundingBox,
+            ) -> Result<bool>,
     {
         let mut staged_piece = piece.clone();
         let mut staged_state = saved.restore(&mut staged_piece)?;
@@ -110,6 +118,7 @@ impl DecorationRegion<'_> {
         let mut staged_conditions = condition_matches.clone();
         let result = self.place_swamp_hut_with_initialized_mobs(
             &mut staged_piece,
+            structure_id,
             &mut staged_state,
             clip,
             &mut staged_random,
@@ -135,13 +144,15 @@ impl DecorationRegion<'_> {
     /// Place a hut and initialize its witch and cat against one region RNG.
     /// `construct` must return the independently seeded constructor state for
     /// the requested species. `condition_matches` must use the active world,
-    /// complete structure pieces, data packs, and environment at `pos`.
+    /// complete structure pieces, data packs, and environment at `pos`. It
+    /// receives this start's key and its current ground-aligned bounds.
     /// Both callbacks must own their state so cloning isolates a failed try.
     /// The caller must also stage these inputs for the entire region and only
     /// publish them after `DecorationRegion::finish` succeeds.
     pub fn place_swamp_hut_with_initialized_mobs<C, P>(
         &mut self,
         piece: &mut SimpleStructureStart,
+        structure_id: &native_resources::packs::ResourceId,
         state: &mut SwampHutState,
         clip: BoundingBox,
         random: &mut native_resources::worldgen_region_random::RegionRandom,
@@ -151,34 +162,49 @@ impl DecorationRegion<'_> {
     ) -> Result<bool>
     where
         C: Clone + FnMut(HutMob) -> Result<super::super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &serde_json::Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &super::super::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &serde_json::Value,
+                BoundingBox,
+            ) -> Result<bool>,
     {
         use native_resources::worldgen_region_random::finalize_mob_base;
         let mut next_random = random.clone();
         let mut next_construct = construct.clone();
         let mut next_condition_matches = condition_matches.clone();
-        let result = self.place_swamp_hut(piece, state, clip, |mob, pos, world| {
-            let construction = next_construct(mob)?;
-            ensure!(
-                construction.construction.chicken_egg_time.is_none(),
-                "invalid hut mob construction"
-            );
-            let uuid = construction.construction.uuid;
-            let tag = match mob {
-                HutMob::Witch => super::super::draft_fresh_hut_witch(
-                    uuid,
-                    pos,
-                    finalize_mob_base(&mut next_random, false),
-                )?,
-                HutMob::Cat => {
-                    let cat = cat_variants.finalize_hut_cat(&mut next_random, |condition| {
-                        next_condition_matches(pos, world, condition)
-                    })?;
-                    super::super::draft_fresh_hut_cat(uuid, pos, &cat)?
-                }
-            };
-            Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
-        })?;
+        let key = (
+            structure_id.clone(),
+            ChunkPos {
+                x: piece.chunk[0],
+                z: piece.chunk[1],
+            },
+        );
+        let result =
+            self.place_swamp_hut_with_piece(piece, state, clip, |mob, pos, world, bounds| {
+                let construction = next_construct(mob)?;
+                ensure!(
+                    construction.construction.chicken_egg_time.is_none(),
+                    "invalid hut mob construction"
+                );
+                let uuid = construction.construction.uuid;
+                let tag = match mob {
+                    HutMob::Witch => super::super::draft_fresh_hut_witch(
+                        uuid,
+                        pos,
+                        finalize_mob_base(&mut next_random, false),
+                    )?,
+                    HutMob::Cat => {
+                        let cat = cat_variants.finalize_hut_cat(&mut next_random, |condition| {
+                            next_condition_matches(&key, pos, world, condition, bounds)
+                        })?;
+                        super::super::draft_fresh_hut_cat(uuid, pos, &cat)?
+                    }
+                };
+                Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
+            })?;
         *random = next_random;
         *construct = next_construct;
         *condition_matches = next_condition_matches;
@@ -197,6 +223,26 @@ impl DecorationRegion<'_> {
     ) -> Result<bool>
     where
         F: FnMut(HutMob, [i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+    {
+        self.place_swamp_hut_with_piece(piece, state, clip, |mob, pos, world, _| {
+            spawn(mob, pos, world)
+        })
+    }
+
+    fn place_swamp_hut_with_piece<F>(
+        &mut self,
+        piece: &mut SimpleStructureStart,
+        state: &mut SwampHutState,
+        clip: BoundingBox,
+        mut spawn: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(
+            HutMob,
+            [i32; 3],
+            &World,
+            BoundingBox,
+        ) -> Result<Option<super::super::GeneratedEntityRecord>>,
     {
         ensure!(!self.failed, "generation attempt previously failed");
         let mut next_piece = piece.clone();
@@ -240,7 +286,12 @@ impl<F> HutRegion<'_, '_, F> {
 
 impl<F> SwampHutWorld for HutRegion<'_, '_, F>
 where
-    F: FnMut(HutMob, [i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+    F: FnMut(
+        HutMob,
+        [i32; 3],
+        &World,
+        BoundingBox,
+    ) -> Result<Option<super::super::GeneratedEntityRecord>>,
 {
     fn motion_blocking_no_leaves(&mut self, x: i32, z: i32) -> Result<i32> {
         self.region.final_height(3, x, z)
@@ -284,12 +335,17 @@ where
     fn place_support_log(&mut self, pos: [i32; 3]) -> Result<()> {
         self.write(pos, HutBlock::OakLog)
     }
-    fn spawn_structure_mob(&mut self, mob: HutMob, pos: [i32; 3]) -> Result<()> {
+    fn spawn_structure_mob(
+        &mut self,
+        mob: HutMob,
+        pos: [i32; 3],
+        bounds: BoundingBox,
+    ) -> Result<()> {
         ensure!(
             self.region.writable.contains(&chunk(pos)) && !self.region.is_outside(pos[1]),
             "hut entity outside writable generation bounds"
         );
-        if let Some(record) = (self.spawn)(mob, pos, &self.region.world)? {
+        if let Some(record) = (self.spawn)(mob, pos, &self.region.world, bounds)? {
             self.region.record_generated_entity(pos, record)?;
         }
         Ok(())

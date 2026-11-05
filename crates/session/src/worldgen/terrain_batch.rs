@@ -3285,7 +3285,9 @@ impl FreshTerrainBatch {
 
     /// Perform one operation with hut mob initialization and cat conditions.
     /// Callers must supply the active pack's variants and complete world
-    /// context. Callback clones must not share externally mutable state.
+    /// context. The condition callback receives the current start key and
+    /// its ground-aligned piece bounds, even before the batch commits them.
+    /// Callback clones must not share externally mutable state.
     /// Generated structures and entities remain intermediate and unsaveable.
     #[allow(clippy::too_many_arguments)]
     pub fn step_with_hut_support<C, P>(
@@ -3302,7 +3304,14 @@ impl FreshTerrainBatch {
             + FnMut(
                 native_resources::structure_piece::swamp_hut::HutMob,
             ) -> Result<super::FreshCreatureRandom>,
-        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+        P: Clone
+            + FnMut(
+                &crate::worldgen::structure_batch::TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+            ) -> Result<bool>,
     {
         let mut callbacks = HutFeatureCallbacks {
             variants,

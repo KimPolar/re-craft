@@ -56,7 +56,14 @@ where
         + FnMut(
             native_resources::structure_piece::swamp_hut::HutMob,
         ) -> Result<super::FreshCreatureRandom>,
-    P: Clone + FnMut([i32; 3], &native_world::loaded::World, &serde_json::Value) -> Result<bool>,
+    P: Clone
+        + FnMut(
+            &crate::worldgen::structure_batch::TerrainStartKey,
+            [i32; 3],
+            &native_world::loaded::World,
+            &serde_json::Value,
+            native_core::beardifier::BoundingBox,
+        ) -> Result<bool>,
 {
     fn execute(
         &mut self,

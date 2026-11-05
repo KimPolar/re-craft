@@ -2759,8 +2759,19 @@ impl TerrainGenerator {
                     .with_context(|| format!("missing structure {path}"))?;
                 let definition: Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("invalid structure {path}"))?;
-                let structure = SimpleStructure::decode(&definition)
+                let center_heightmap =
+                    native_resources::structure_start::template_structure_center_heightmap(
+                        &definition,
+                    )
                     .with_context(|| format!("in structure {path}"))?;
+                let structure = if center_heightmap.is_none() {
+                    Some(
+                        SimpleStructure::decode(&definition)
+                            .with_context(|| format!("in structure {path}"))?,
+                    )
+                } else {
+                    None
+                };
                 if flags.is_none() {
                     flags = Some([
                         classify(self.noise.default_block())?,
@@ -2781,6 +2792,19 @@ impl TerrainGenerator {
                     flags: flags.as_ref().unwrap(),
                     min_y: self.min_y,
                     max_y,
+                };
+                if let Some(heightmap) = center_heightmap
+                    && native_resources::structure_start::center_generation_point(
+                        &mut env, chunk, heightmap,
+                    )?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let structure = match structure {
+                    Some(structure) => structure,
+                    None => SimpleStructure::decode(&definition)
+                        .with_context(|| format!("in structure {path}"))?,
                 };
                 structure.generate(&mut env, self.seed, chunk)
             },
@@ -7400,6 +7424,34 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(existing, StructureSetStart::Existing));
+
+        // An eligible template-based structure must still stop generation
+        // until its pieces are supported, even when its center check passes.
+        let path = "data/example/worldgen/structure/pyramid.json";
+        let original = data.0.get(path).unwrap().clone();
+        for definition in [
+            json!({"type":"minecraft:shipwreck","biomes":["minecraft:plains"],"is_beached":true}),
+            json!({"type":"minecraft:igloo","biomes":["minecraft:plains"]}),
+            json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9}),
+        ] {
+            data.0
+                .insert(path.into(), serde_json::to_vec(&definition).unwrap());
+            let error = generator
+                .try_generate_simple_structure_set(
+                    &mut data,
+                    &mut evaluator,
+                    &mut cache,
+                    &rules,
+                    &set_id,
+                    [0, 0],
+                    |_| Ok(false),
+                    classify,
+                )
+                .err()
+                .expect("eligible unsupported structure must fail");
+            assert!(format!("{error:#}").contains("unsupported simple structure"));
+        }
+        data.0.insert(path.into(), original);
 
         // Exercise the same generator through the actual stage planner. A
         // sparse set keeps this fixture fast while still producing a start.

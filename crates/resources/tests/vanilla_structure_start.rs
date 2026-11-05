@@ -1,7 +1,7 @@
 //! Compare simple structure generation stubs and piece bounds with Java 26.3.
 use native_resources::structure_start::{
     BiomeQuery, Heightmap, HorizontalDirection, SimpleStructure, SimpleStructureKind,
-    StartEnvironment,
+    StartEnvironment, center_generation_point,
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
@@ -128,4 +128,33 @@ fn simple_starts_match_java_generation_stubs() {
         count += 1;
     }
     assert_eq!(count, 4 * 6 * 31 * 4);
+    let mut center_structures = 0;
+    for line in output.lines().filter(|s| s.starts_with("W ")) {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let map = if matches!(words[1], "0" | "3") {
+            Heightmap::OceanFloor
+        } else {
+            Heightmap::WorldSurface
+        };
+        let x: i32 = words[2].parse().unwrap();
+        let z: i32 = words[3].parse().unwrap();
+        let mode: i32 = words[4].parse().unwrap();
+        let actual =
+            center_generation_point(&mut Environment { mode, checks: 0 }, [x, z], map).unwrap();
+        if words[5] == "X" {
+            assert!(actual.is_none(), "{line}");
+        } else {
+            assert_eq!(
+                actual,
+                Some([
+                    words[6].parse().unwrap(),
+                    words[7].parse().unwrap(),
+                    words[8].parse().unwrap()
+                ]),
+                "{line}"
+            );
+        }
+        center_structures += 1;
+    }
+    assert_eq!(center_structures, 4 * 31 * 4);
 }

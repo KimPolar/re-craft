@@ -30,6 +30,109 @@ pub trait StartEnvironment {
     fn biome_allowed(&mut self, quart: [i32; 3], query: BiomeQuery) -> Result<bool>;
 }
 
+/// Center-column and final biome checks for structures using Java's
+/// onTopOfChunkCenter. A point does not imply that its pieces are supported.
+pub fn center_generation_point(
+    env: &mut impl StartEnvironment,
+    chunk: [i32; 2],
+    map: Heightmap,
+) -> Result<Option<[i32; 3]>> {
+    let (min_y, max_y) = env.vertical_bounds();
+    ensure!(
+        min_y <= max_y && i64::from(max_y) - i64::from(min_y) <= 4096,
+        "invalid dimension bounds"
+    );
+    let x = chunk[0]
+        .checked_mul(16)
+        .and_then(|x| x.checked_add(8))
+        .context("chunk X overflow")?;
+    let z = chunk[1]
+        .checked_mul(16)
+        .and_then(|z| z.checked_add(8))
+        .context("chunk Z overflow")?;
+    let (qx, qz) = (x.div_euclid(4), z.div_euclid(4));
+    let mut possible = false;
+    for qy in min_y.wrapping_sub(1).div_euclid(4)..=max_y.div_euclid(4) {
+        if env.biome_allowed([qx, qy, qz], BiomeQuery::Column)? {
+            possible = true;
+            break;
+        }
+    }
+    if !possible {
+        return Ok(None);
+    }
+    let y = env.first_occupied_height(x, z, map)?;
+    if !env.biome_allowed([qx, y.div_euclid(4), qz], BiomeQuery::Point)? {
+        return Ok(None);
+    }
+    Ok(Some([x, y, z]))
+}
+
+/// Identify supported prechecks for template-based structures. A positive
+/// candidate still needs its structure implementation before it can generate.
+pub fn template_structure_center_heightmap(value: &Value) -> Result<Option<Heightmap>> {
+    let id = ResourceId::parse(
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .context("missing structure type")?,
+    )?;
+    let map = match (id.namespace.as_str(), id.path.as_str()) {
+        ("minecraft", "shipwreck") => {
+            if value
+                .get("is_beached")
+                .and_then(Value::as_bool)
+                .context("invalid shipwreck settings")?
+            {
+                Heightmap::WorldSurface
+            } else {
+                Heightmap::OceanFloor
+            }
+        }
+        ("minecraft", "igloo") => Heightmap::WorldSurface,
+        ("minecraft", "ocean_ruin") => {
+            ensure!(
+                matches!(
+                    value.get("biome_temp").and_then(Value::as_str),
+                    Some("warm" | "cold")
+                ),
+                "invalid ocean ruin biome temperature"
+            );
+            for key in ["large_probability", "cluster_probability"] {
+                let probability = value
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .with_context(|| format!("invalid ocean ruin {key}"))?
+                    as f32;
+                ensure!(
+                    probability.is_finite() && (0.0..=1.0).contains(&probability),
+                    "invalid ocean ruin {key}"
+                );
+            }
+            Heightmap::OceanFloor
+        }
+        _ => return Ok(None),
+    };
+    decode_terrain_adjustment(value)?;
+    Ok(Some(map))
+}
+
+fn decode_terrain_adjustment(value: &Value) -> Result<TerrainAdjustment> {
+    let adjustment = value
+        .get("terrain_adaptation")
+        .map(|v| v.as_str().context("invalid terrain adaptation"))
+        .transpose()?
+        .unwrap_or("none");
+    match adjustment {
+        "none" => Ok(TerrainAdjustment::None),
+        "bury" => Ok(TerrainAdjustment::Bury),
+        "beard_thin" => Ok(TerrainAdjustment::BeardThin),
+        "beard_box" => Ok(TerrainAdjustment::BeardBox),
+        "encapsulate" => Ok(TerrainAdjustment::Encapsulate),
+        _ => bail!("unsupported terrain adaptation {adjustment}"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimpleStructureKind {
     DesertPyramid,
@@ -92,19 +195,7 @@ impl SimpleStructure {
             ("minecraft", "buried_treasure") => SimpleStructureKind::BuriedTreasure,
             _ => bail!("unsupported simple structure {}:{}", id.namespace, id.path),
         };
-        let adjustment = value
-            .get("terrain_adaptation")
-            .map(|v| v.as_str().context("invalid terrain adaptation"))
-            .transpose()?
-            .unwrap_or("none");
-        let terrain_adjustment = match adjustment {
-            "none" => TerrainAdjustment::None,
-            "bury" => TerrainAdjustment::Bury,
-            "beard_thin" => TerrainAdjustment::BeardThin,
-            "beard_box" => TerrainAdjustment::BeardBox,
-            "encapsulate" => TerrainAdjustment::Encapsulate,
-            _ => bail!("unsupported terrain adaptation {adjustment}"),
-        };
+        let terrain_adjustment = decode_terrain_adjustment(value)?;
         Ok(Self {
             kind,
             terrain_adjustment,
@@ -246,6 +337,31 @@ mod tests {
             self.calls.push((query, quart));
             Ok(true)
         }
+    }
+    #[test]
+    fn template_prechecks_validate_type_specific_and_common_settings() {
+        assert_eq!(
+            template_structure_center_heightmap(&json!({"type":"shipwreck","is_beached":false}))
+                .unwrap(),
+            Some(Heightmap::OceanFloor)
+        );
+        assert_eq!(
+            template_structure_center_heightmap(&json!({"type":"minecraft:igloo"})).unwrap(),
+            Some(Heightmap::WorldSurface)
+        );
+        assert!(template_structure_center_heightmap(&json!({"type":"shipwreck"})).is_err());
+        assert!(
+            template_structure_center_heightmap(
+                &json!({"type":"shipwreck","is_beached":false,"terrain_adaptation":"invalid"})
+            )
+            .is_err()
+        );
+        assert_eq!(template_structure_center_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9})).unwrap(), Some(Heightmap::OceanFloor));
+        assert!(template_structure_center_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":1.1,"cluster_probability":0.9})).is_err());
+        assert_eq!(
+            template_structure_center_heightmap(&json!({"type":"minecraft:village"})).unwrap(),
+            None
+        );
     }
     #[test]
     fn resolves_generation_biome_and_initial_piece_without_placing_blocks() {

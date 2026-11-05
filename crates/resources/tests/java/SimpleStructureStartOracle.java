@@ -47,5 +47,16 @@ public class SimpleStructureStartOracle {
       var s=stub.get();var piece=s.getPiecesBuilder().build().pieces().get(0);var box=piece.getBoundingBox();var pos=s.position();
       out.printf("%sP %d %d %d %s %d %d %d %d %d %d%n",prefix,pos.getX(),pos.getY(),pos.getZ(),piece.getOrientation()==null?"NONE":piece.getOrientation().name(),box.minX(),box.minY(),box.minZ(),box.maxX(),box.maxY(),box.maxZ());
     }
+    for(int beached=0;beached<4;beached++)for(int index=0;index<31;index++)for(int mode=0;mode<4;mode++){
+      int x=index*17-251,z=193-index*13,base=mode==1?60:75;
+      var generator=new Generator(source,base);var random=new WorldgenRandom(new LegacyRandomSource(0));random.setLargeFeatureSeed(42,x,z);
+      final int m=mode;BiomeResolver resolver=(qx,qy,qz)->m==3?bad:good;
+      var ctx=new Structure.GenerationContext(null,generator,source,null,resolver,null,null,random,42,new ChunkPos(x,z),LevelHeightAccessor.create(-64,384),h->m!=2&&h==good);
+      Structure structure=beached==3?new OceanRuinStructure(settings,OceanRuinStructure.Type.WARM,0.3f,0.9f):beached==2?new IglooStructure(settings):new ShipwreckStructure(settings,beached!=0);
+      var stub=structure.findValidGenerationPoint(ctx);
+      String prefix="W "+beached+" "+x+" "+z+" "+mode+" ";
+      if(stub.isEmpty()){out.println(prefix+"X");continue;}
+      var pos=stub.get().position();out.printf("%sP %d %d %d%n",prefix,pos.getX(),pos.getY(),pos.getZ());
+    }
   }
 }

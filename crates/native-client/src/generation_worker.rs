@@ -1972,9 +1972,22 @@ where
                 ),
             }
         };
-        checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
-        previous_search = Some(search);
+        // A newly postprocessed neighbor can update blocks across a chunk
+        // boundary. Restart that search unless its postprocessed inputs are
+        // explicitly compared; the ordinary protochunk checkpoint is not enough.
+        if ready.postprocessed.is_none() {
+            checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
+            previous_search = Some(search);
+        }
         drop(session);
+        let postprocessed = if let Some(processed) = ready.postprocessed.take() {
+            let checkpoint = ready
+                .batch
+                .checkpoint_postprocessing_expansion(&processed.region)?;
+            Some((processed, checkpoint))
+        } else {
+            None
+        };
         let revision = ready
             .mesh
             .revision
@@ -2009,6 +2022,58 @@ where
             progress,
         )? {
             return Ok(None);
+        }
+        if let Some((mut processed, checkpoint)) = postprocessed {
+            expanded
+                .batch
+                .rebase_postprocessing_after_expansion(&mut processed.region, &checkpoint)?;
+            let mut stage = expanded
+                .batch
+                .resume_generated_postprocessing(&processed.region)?;
+            expanded
+                .batch
+                .register_generated_postprocessing_chunk(&mut stage, needed)?;
+            set_phase(progress, GenerationPhase::Postprocessing);
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if stage.poll(needed, 256)? {
+                    break;
+                }
+            }
+            let region = stage.finish()?;
+            let targets = expanded
+                .mesh
+                .targets
+                .as_deref()
+                .context("generated session targets missing")?;
+            ensure!(
+                targets.is_subset(&region.chunks),
+                "expanded postprocessing is missing a target"
+            );
+            let revision = expanded
+                .mesh
+                .revision
+                .checked_add(1)
+                .context("postprocessed mesh revision overflow")?;
+            let mesh = MeshJob::for_postprocessed(
+                &expanded.batch,
+                &region,
+                targets.clone(),
+                revision,
+                expanded.mesh.biome_blend,
+                expanded.mesh.origin,
+            )?;
+            processed.chunks = expanded
+                .batch
+                .postprocessed_chunk_drafts(&region, region.chunks.iter().copied())?;
+            processed.activated_ticks = region.ticks().activated_snapshot();
+            processed.sealed_world = Arc::clone(&region.world);
+            processed.sealed_mesh = Some(mesh.clone());
+            processed.mesh = Some(mesh);
+            processed.region = region;
+            expanded.postprocessed = Some(processed);
         }
         ready = expanded;
     }
@@ -3132,6 +3197,143 @@ mod tests {
                 && entity.get("z") == Some(&native_persistence::nbt::Tag::Int(chest.z))
                 && matches!(entity.get("LootTable"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:chests/spawn_bonus_chest"))
         }));
+        let original_bonus_entities = values.clone();
+        // Force the first player candidate outside the already postprocessed
+        // targets so the real spawn worker must extend the same bonus world.
+        let targets = bonus_ready.mesh.targets.as_ref().unwrap().as_ref().clone();
+        let suggestion = bonus_ready.suggested_spawn.unwrap();
+        let radius = 24;
+        let border = native_session::respawn::RespawnBorder {
+            min_x: -100.0,
+            max_x: 100.0,
+            min_z: -100.0,
+            max_z: 100.0,
+        };
+        let distance = (f64::from(suggestion.x) - border.min_x)
+            .min(border.max_x - f64::from(suggestion.x))
+            .min(f64::from(suggestion.z) - border.min_z)
+            .min(border.max_z - f64::from(suggestion.z));
+        let count = native_session::world_spawn::WorldSpawnCandidates::new(
+            suggestion, radius, distance, 0,
+        )?
+        .candidate_count();
+        let random_seed = (0..10_000)
+            .find(|&seed| {
+                let mut random = native_core::random::LegacyRandom::new(seed);
+                let offset = random.next_int_bound(count).unwrap();
+                let (x, z) = native_session::world_spawn::WorldSpawnCandidates::new(
+                    suggestion, radius, distance, offset,
+                )
+                .unwrap()
+                .next()
+                .unwrap();
+                !targets.contains(&ChunkPos {
+                    x: x.div_euclid(16),
+                    z: z.div_euclid(16),
+                })
+            })
+            .context("no seed requests an ungenerated spawn chunk")?;
+        let bonus_random_state = processed
+            .initial_bonus_chest
+            .as_ref()
+            .unwrap()
+            .level_random
+            .state();
+        let inputs = prepare(crate::fresh_generation::FreshGenerationSettings {
+            minecraft_dir: game.clone(),
+            preset: "example:bonus".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            bonus_chest: true,
+            structures_enabled: false,
+            data_packs: Some((
+                world.clone(),
+                DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/compact".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                },
+            )),
+        })?
+        .into_new_world_inputs(border, false, true)?;
+        let mut resources = inputs.resources;
+        let mut classify = inputs.classify;
+        let mut resolve = inputs.resolve;
+        let mut build =
+            |_: &FreshTerrainBatch, _: &mut native_resources::packs::ResourceStack, _: ChunkPos| {
+                anyhow::bail!("mob spawning should be disabled")
+            };
+        let mut construct = |_: &native_resources::packs::ResourceId| {
+            anyhow::bail!("mob spawning should be disabled")
+        };
+        let progress = Mutex::new(GenerationProgress {
+            phase: GenerationPhase::Planning,
+            completed_steps: 0,
+            last_step: None,
+            spawn_search_resumptions: 0,
+            player_spawn_search_resumptions: 0,
+        });
+        let expanded = complete_player_spawn(
+            bonus_ready,
+            &mut resources,
+            &mut classify,
+            &mut resolve,
+            &mut build,
+            &mut construct,
+            false,
+            inputs.height_tags,
+            0,
+            None,
+            border,
+            InitialPlayerSpawnOptions {
+                radius,
+                adventure: false,
+                random_seed,
+                saved_border: None,
+            },
+            &AtomicBool::new(false),
+            &progress,
+        )?
+        .context("postprocessed player spawn was cancelled")?;
+        assert!(expanded.player_spawn.is_some());
+        assert!(expanded.mesh.targets.as_ref().unwrap().len() > targets.len());
+        let processed = expanded.postprocessed.as_ref().unwrap();
+        assert_eq!(processed.initial_bonus_chest_position(), Some(Some(chest)));
+        assert_eq!(
+            processed
+                .initial_bonus_chest
+                .as_ref()
+                .unwrap()
+                .level_random
+                .state(),
+            bonus_random_state
+        );
+        assert_eq!(
+            processed
+                .region
+                .world
+                .block(chest.x, chest.y, chest.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        let bonus_chunk = ChunkPos {
+            x: chest.x.div_euclid(16),
+            z: chest.z.div_euclid(16),
+        };
+        let Some(native_persistence::nbt::Tag::List { values, .. }) = processed.chunks
+            [&bonus_chunk]
+            .chunk
+            .value
+            .get("block_entities")
+        else {
+            anyhow::bail!("expanded bonus block entities are missing");
+        };
+        assert_eq!(values, &original_bonus_entities);
+        assert_eq!(
+            processed.chunks.len(),
+            expanded.mesh.targets.as_ref().unwrap().len()
+        );
         for (spawn_mobs, disabled, species, feature_kind) in [
             (false, false, "minecraft:sheep", 0),
             (true, true, "minecraft:sheep", 0),

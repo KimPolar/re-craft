@@ -2173,7 +2173,7 @@ impl FreshTerrainBatch {
     }
 
     /// Rebase an isolated pass after generation only if every old input and
-    /// captured light column is unchanged. Errors leave `processed` untouched.
+    /// previously active light column is unchanged. Errors leave `processed` untouched.
     /// Newly generated chunks are not yet converted or registered.
     pub fn rebase_postprocessing_after_expansion(
         &self,
@@ -2229,13 +2229,21 @@ impl FreshTerrainBatch {
             "previously active light chunks were removed"
         );
         let light = self.light_snapshot(checkpoint.light_positions.iter().copied())?;
+        // The halo was captured for a future drain, not read by this pass:
+        // no light checkpoint has been drained and postprocessing can only
+        // read the selected chunk columns. Newly initialized halo columns use
+        // their current light and sky sources when those checks are drained.
+        let observed_light: BTreeSet<_> = checkpoint
+            .active_light
+            .union(&checkpoint.chunks)
+            .copied()
+            .collect();
         ensure!(
             unchanged_visible_light(
                 &checkpoint.light,
                 &light,
-                &checkpoint.light_positions,
-            ) && checkpoint
-                .light_positions
+                &observed_light,
+            ) && observed_light
                 .iter()
                 .all(|pos| checkpoint.sky_sources.get(pos) == engine.fresh.sky_sources.get(pos)),
             "existing generation lighting changed during expansion"

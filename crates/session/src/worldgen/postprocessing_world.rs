@@ -143,6 +143,7 @@ pub struct GeneratedPostprocessing {
     water_source_conversion: Option<bool>,
     edits: Vec<BlockPosition>,
     read_chunks: RefCell<BTreeSet<ChunkPos>>,
+    light_reads: RefCell<BTreeSet<ChunkPos>>,
     pub(super) light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
@@ -161,6 +162,8 @@ pub struct PostprocessedGeneratedRegion {
     pub edits: Vec<BlockPosition>,
     pub(super) read_chunks: BTreeSet<ChunkPos>,
     pub(super) sealed_read_chunks: BTreeSet<ChunkPos>,
+    pub(super) light_reads: BTreeSet<ChunkPos>,
+    pub(super) sealed_light_reads: BTreeSet<ChunkPos>,
     /// These light checks must be processed before publishing the result.
     pub light_checks: Vec<BlockPosition>,
     /// Updated FULL maps; other chunk and world validation remains necessary.
@@ -285,6 +288,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: None,
             edits: Vec::new(),
             read_chunks: RefCell::new(BTreeSet::new()),
+            light_reads: RefCell::new(BTreeSet::new()),
             light_checks: Vec::new(),
             heightmaps,
             heightmap_tags,
@@ -358,6 +362,7 @@ impl GeneratedPostprocessing {
         stage.water_source_conversion = completed.water_source_conversion;
         stage.edits = completed.edits.clone();
         stage.read_chunks = RefCell::new(completed.read_chunks.clone());
+        stage.light_reads = RefCell::new(completed.light_reads.clone());
         stage.light_checks = completed.light_checks.clone();
         stage.block_entities = completed.block_entities.clone();
         stage.block_entity_edits = completed.block_entity_edits.clone();
@@ -510,6 +515,7 @@ impl GeneratedPostprocessing {
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
+            light_reads: &self.light_reads,
             min_y: self.min_y,
             max_y: self.max_y,
             ticks: &mut self.region.ticks,
@@ -574,6 +580,7 @@ impl GeneratedPostprocessing {
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
+            light_reads: &self.light_reads,
             min_y: self.min_y,
             max_y: self.max_y,
             ticks: &mut self.region.ticks,
@@ -603,6 +610,7 @@ impl GeneratedPostprocessing {
             "generated postprocessing is incomplete"
         );
         let read_chunks = self.read_chunks.into_inner();
+        let light_reads = self.light_reads.into_inner();
         Ok(PostprocessedGeneratedRegion {
             sealed_world: Arc::clone(&self.world),
             world: self.world,
@@ -613,6 +621,8 @@ impl GeneratedPostprocessing {
             edits: self.edits,
             sealed_read_chunks: read_chunks.clone(),
             read_chunks,
+            sealed_light_reads: light_reads.clone(),
+            light_reads,
             sealed_checks: self.light_checks.clone(),
             light_checks: self.light_checks,
             heightmaps: self.heightmaps,
@@ -635,6 +645,7 @@ struct GeneratedBlockView<'a> {
     block_entity_edits: &'a mut BTreeMap<BlockPosition, (BlockState, BlockState)>,
     world: &'a mut Arc<World>,
     read_chunks: &'a RefCell<BTreeSet<ChunkPos>>,
+    light_reads: &'a RefCell<BTreeSet<ChunkPos>>,
     min_y: i32,
     max_y: i32,
     ticks: &'a mut RegionTicks,
@@ -1324,6 +1335,10 @@ impl GeneratedBlockView<'_> {
         {
             return Ok(true);
         }
+        self.light_reads.borrow_mut().insert(ChunkPos {
+            x: pos[0].div_euclid(16),
+            z: pos[2].div_euclid(16),
+        });
         let brightness = self
             .light
             .context("mushroom lighting unavailable")?
@@ -3438,6 +3453,15 @@ mod tests {
         );
         while !stage.poll(pos, 1).unwrap() {}
         let result = stage.finish().unwrap();
+        assert_eq!(
+            result.light_reads,
+            if tagged {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([pos])
+            }
+        );
+        assert_eq!(result.light_reads, result.sealed_light_reads);
         assert_eq!(source.block(8, 8, 8).unwrap().name, id(mushroom));
         let state = &result.world.block(8, 8, 8).unwrap().name;
         let removed = state == "minecraft:air";

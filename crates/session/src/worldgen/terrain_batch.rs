@@ -86,9 +86,9 @@ pub struct PostprocessingExpansionCheckpoint {
     chunks: BTreeSet<ChunkPos>,
     edits: Vec<native_world::loaded::BlockPosition>,
     read_chunks: BTreeSet<ChunkPos>,
+    light_reads: BTreeSet<ChunkPos>,
     light_checks: Vec<native_world::loaded::BlockPosition>,
     inputs: BTreeMap<ChunkPos, PostprocessingSourceInputs>,
-    light_positions: BTreeSet<ChunkPos>,
     active_light: BTreeSet<ChunkPos>,
     light: VisibleLightSnapshot,
     sky_sources: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
@@ -2375,6 +2375,7 @@ impl FreshTerrainBatch {
             Arc::ptr_eq(&processed.world, &processed.sealed_world)
                 && processed.edits == processed.sealed_edits
                 && processed.read_chunks == processed.sealed_read_chunks
+                && processed.light_reads == processed.sealed_light_reads
                 && processed.light_checks == processed.sealed_checks
                 && processed.chunks == processed.sealed_chunks,
             "postprocessing result was modified"
@@ -2417,11 +2418,9 @@ impl FreshTerrainBatch {
             .light_engine
             .as_ref()
             .context("light propagation is not sealed")?;
-        let mut light_positions = engine.active.clone();
-        light_positions.extend(processed.chunks.iter().copied());
-        extend_postprocessing_light_coverage(&mut light_positions, &processed.light_checks)?;
-        let light = self.light_snapshot(light_positions.iter().copied())?;
-        let sky_sources = light_positions
+        let light = self.light_snapshot(processed.light_reads.iter().copied())?;
+        let sky_sources = processed
+            .light_reads
             .iter()
             .filter_map(|pos| {
                 engine
@@ -2444,17 +2443,17 @@ impl FreshTerrainBatch {
             chunks: processed.chunks.clone(),
             edits: processed.edits.clone(),
             read_chunks: processed.read_chunks.clone(),
+            light_reads: processed.light_reads.clone(),
             light_checks: processed.light_checks.clone(),
             inputs,
-            light_positions,
             active_light: engine.active.clone(),
             light,
             sky_sources,
         })
     }
 
-    /// Rebase an isolated pass after generation only if every old input and
-    /// previously active light column is unchanged. Errors leave `processed` untouched.
+    /// Rebase an isolated pass only if its old inputs and observed light
+    /// columns are unchanged. Errors leave `processed` untouched.
     /// Newly generated chunks are not yet converted or registered.
     pub fn rebase_postprocessing_after_expansion(
         &self,
@@ -2480,6 +2479,8 @@ impl FreshTerrainBatch {
                 && processed.edits == processed.sealed_edits
                 && processed.read_chunks == checkpoint.read_chunks
                 && processed.read_chunks == processed.sealed_read_chunks
+                && processed.light_reads == checkpoint.light_reads
+                && processed.light_reads == processed.sealed_light_reads
                 && processed.light_checks == checkpoint.light_checks
                 && processed.light_checks == processed.sealed_checks
                 && processed.light_checkpoint.is_none(),
@@ -2519,21 +2520,16 @@ impl FreshTerrainBatch {
             checkpoint.active_light.is_subset(&engine.active),
             "previously active light chunks were removed"
         );
-        let light = self.light_snapshot(checkpoint.light_positions.iter().copied())?;
-        // The halo was captured for a future drain, not read by this pass:
-        // no light checkpoint has been drained and postprocessing can only
-        // read the selected chunk columns. Newly initialized halo columns use
-        // their current light and sky sources when those checks are drained.
-        let observed_light: BTreeSet<_> = checkpoint
-            .active_light
-            .union(&checkpoint.chunks)
-            .copied()
-            .collect();
+        let light = self.light_snapshot(checkpoint.light_reads.iter().copied())?;
+        // Only columns actually read by callbacks affect completed results.
+        // Other columns and sky sources are taken from the expanded engine
+        // when pending postprocessing light checks are drained.
+        let observed_light = &checkpoint.light_reads;
         ensure!(
             unchanged_visible_light(
                 &checkpoint.light,
                 &light,
-                &observed_light,
+                observed_light,
             ) && observed_light
                 .iter()
                 .all(|pos| checkpoint.sky_sources.get(pos) == engine.fresh.sky_sources.get(pos)),
@@ -4088,6 +4084,9 @@ mod expansion_checkpoint_tests {
                 VisibleLayers::new(),
             ),
         );
+        // An unobserved change can be incorporated when the new light is
+        // drained, but a callback that read this column must still restart.
+        assert!(unchanged_visible_light(&allocated, &lit, &BTreeSet::new()));
         assert!(!unchanged_visible_light(&allocated, &lit, &positions));
     }
 }

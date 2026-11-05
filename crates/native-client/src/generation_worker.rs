@@ -3520,6 +3520,10 @@ mod tests {
                 json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
             ),
             (
+                "data/example/worldgen/biome/bonus.json",
+                json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+            ),
+            (
                 "data/example/worldgen/structure/treasure.json",
                 json!({"type":"minecraft:buried_treasure","biomes":["example:test"],"step":"surface_structures"}),
             ),
@@ -3563,13 +3567,12 @@ mod tests {
             serde_json::to_vec(&spawn_preset)?,
         )?;
         let mut bonus_preset = spawn_preset.clone();
+        bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["biome_source"]["biome"] =
+            json!("example:bonus");
         bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["sea_level"] =
             json!(80);
         bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["noise_router"]
-            ["final_density"] = json!({
-            "type":"gradient", "axis":"y", "from_coordinate":80,
-            "to_coordinate":96, "from_value":1, "to_value":-1
-        });
+            ["final_density"]["min_inclusive"] = json!(32);
         std::fs::write(
             preset_path.with_file_name("bonus_spawn.json"),
             serde_json::to_vec(&bonus_preset)?,

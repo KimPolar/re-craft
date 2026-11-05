@@ -177,8 +177,18 @@ impl PendingPositions {
                     self.buckets[index] = Bin::Empty;
                 }
             }
-            // Tree deletion changes both tree structure and linked iteration order.
-            Bin::Tree(_) | Bin::Empty => self.exact = false,
+            Bin::Tree(tree) => match tree.remove(pos) {
+                Ok(Some(chain)) => {
+                    self.buckets[index] = if chain.is_empty() {
+                        Bin::Empty
+                    } else {
+                        Bin::List(chain)
+                    };
+                }
+                Ok(None) => {}
+                Err(_) => self.exact = false,
+            },
+            Bin::Empty => self.exact = false,
         }
     }
 
@@ -306,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_tree_removal_fails_closed_until_no_pending_entities_remain() {
+    fn pending_tree_removal_keeps_remaining_positions() {
         let mut pending = PendingPositions::default();
         let positions: Vec<_> = (-10000..10000)
             .map(|y| [0, y, 0])
@@ -325,10 +335,11 @@ mod tests {
                 .is_ok()
         );
         pending.remove(positions[0]);
+        assert_eq!(pending.positions().unwrap().len(), positions.len() - 1);
         assert!(
             LivePositions::default()
                 .saving_order_with_pending(Some(&pending))
-                .is_err()
+                .is_ok()
         );
         for &pos in &positions[1..] {
             pending.remove(pos);
@@ -537,6 +548,109 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(";");
             assert_eq!(actual, expected, "mixed operation {index}: {op} {p:?}");
+        }
+
+        // Drive pending bins through treeification, deletion, untreeification,
+        // subsequent insertions, and table splits. Inspect the HashMap order
+        // directly as well as the final copied HashSet order.
+        let collision: Vec<_> = (-30000..30000)
+            .map(|y| [0, y, 0])
+            .filter(|&p| {
+                let h = hash(p);
+                (h ^ (h >> 16)) & 63 == 0
+            })
+            .take(120)
+            .collect();
+        assert_eq!(collision.len(), 120);
+        let mut operations = Vec::new();
+        for &p in &collision[..40] {
+            operations.push(('P', p));
+        }
+        for &p in collision[..40].iter().step_by(2) {
+            operations.push(('X', p));
+        }
+        for &p in &collision[40..100] {
+            operations.push(('P', p));
+        }
+        for &p in collision[1..100].iter().step_by(3) {
+            operations.push(('C', p));
+        }
+        for &p in collision[..100].iter().rev() {
+            operations.push(('X', p));
+        }
+        for &p in &collision[100..] {
+            operations.push(('P', p));
+        }
+        for &p in collision[100..].iter().step_by(2) {
+            operations.push(('C', p));
+        }
+        for &p in &collision {
+            operations.push(('X', p));
+            operations.push(('R', p));
+        }
+        for round in 0..4 {
+            for i in 0..120 {
+                operations.push(('P', collision[(i * 37 + round * 13) % 120]));
+            }
+            for i in 0..120 {
+                let p = collision[(i * 53 + round * 17) % 120];
+                operations.push((if i % 3 == 0 { 'C' } else { 'X' }, p));
+                if i % 7 == 0 {
+                    operations.push(('P', p));
+                }
+            }
+            for &p in &collision {
+                operations.push(('X', p));
+                operations.push(('R', p));
+            }
+        }
+        std::fs::write(
+            &input,
+            operations
+                .iter()
+                .map(|(op, p)| format!("{op} {} {} {}\n", p[0], p[1], p[2]))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let expected = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedEntityOrderOracle")
+            .arg(&input)
+            .arg("--pending"));
+        let rows: Vec<_> = expected.lines().collect();
+        assert_eq!(rows.len(), operations.len());
+        let mut live = LivePositions::default();
+        let mut live_members = BTreeSet::new();
+        let mut pending = PendingPositions::default();
+        let format_positions = |positions: Vec<Pos>| {
+            positions
+                .iter()
+                .map(|p| format!("{},{},{}", p[0], p[1], p[2]))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        for (index, ((op, p), expected)) in operations.into_iter().zip(rows).enumerate() {
+            match op {
+                'P' if !live_members.contains(&p) => pending.insert(p),
+                'C' => {
+                    pending.remove(p);
+                    live.insert(p);
+                    live_members.insert(p);
+                }
+                'X' => pending.remove(p),
+                'R' => {
+                    live.remove(p);
+                    live_members.remove(&p);
+                }
+                _ => {}
+            }
+            let actual = format!(
+                "{}|{}",
+                format_positions(live.saving_order_with_pending(Some(&pending)).unwrap()),
+                format_positions(pending.positions().unwrap())
+            );
+            assert_eq!(actual, expected, "collision operation {index}: {op} {p:?}");
         }
     }
 }

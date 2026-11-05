@@ -22,7 +22,13 @@ public class GeneratedEntityOrderOracle {
             ordered.addAll(live.keySet());
             var values = new ArrayList<String>();
             for (var p : ordered) values.add(p.getX()+","+p.getY()+","+p.getZ());
-            System.out.println(String.join(";", values));
+            String result = String.join(";", values);
+            if (args.length > 1 && args[1].equals("--pending")) {
+                var remaining = new ArrayList<String>();
+                for (var p : pending.keySet()) remaining.add(p.getX()+","+p.getY()+","+p.getZ());
+                result += "|" + String.join(";", remaining);
+            }
+            System.out.println(result);
         }
     }
 }

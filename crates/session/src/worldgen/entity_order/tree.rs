@@ -1,5 +1,5 @@
 //! Red-black collision bins for Java's position HashSet.
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 use super::{Pos, hash};
 
@@ -23,6 +23,7 @@ struct Node {
 #[derive(Clone, Debug)]
 pub(super) struct TreeBin {
     nodes: Vec<Node>,
+    free: Vec<usize>,
     root: usize,
     head: Option<usize>,
     tail: Option<usize>,
@@ -32,6 +33,7 @@ impl TreeBin {
     pub(super) fn from_chain(positions: Vec<Pos>) -> Result<Self> {
         let mut tree = Self {
             nodes: Vec::new(),
+            free: Vec::new(),
             root: 0,
             head: None,
             tail: None,
@@ -68,6 +70,162 @@ impl TreeBin {
         Ok(())
     }
 
+    /// Remove a key, returning a list when Java converts this bin back to a list.
+    pub(super) fn remove(&mut self, pos: Pos) -> Result<Option<Vec<Pos>>> {
+        let mut index = self.root;
+        loop {
+            let node = &self.nodes[index];
+            if node.pos == pos {
+                break;
+            }
+            let side = usize::from(key(pos) > node.key);
+            ensure!(
+                key(pos) != node.key,
+                "Java block entity identity hash ordering is unavailable"
+            );
+            index = node.children[side]
+                .ok_or_else(|| anyhow::anyhow!("pending tree position is missing"))?;
+        }
+
+        // The linked list is independent of the tree and is visited on save.
+        self.unlink(index);
+        if self.head.is_none() {
+            return Ok(Some(Vec::new()));
+        }
+        let root = &self.nodes[self.root];
+        if root.children[1].is_none()
+            || root.children[0].is_none_or(|left| self.nodes[left].children[0].is_none())
+        {
+            return Ok(Some(self.positions().collect()));
+        }
+
+        let mut removed = index;
+        if let [Some(_), Some(right)] = self.nodes[index].children {
+            let mut successor = right;
+            while let Some(left) = self.nodes[successor].children[0] {
+                successor = left;
+            }
+            // Keep the successor at its original linked-list location while
+            // swapping only keys in the tree. The node to delete moves down.
+            self.replace_link(successor, index);
+            let (new_pos, new_key) = (self.nodes[successor].pos, self.nodes[successor].key);
+            self.nodes[successor].pos = self.nodes[index].pos;
+            self.nodes[successor].key = self.nodes[index].key;
+            self.nodes[index].pos = new_pos;
+            self.nodes[index].key = new_key;
+            removed = successor;
+        }
+        let child = self.nodes[removed].children[0].or(self.nodes[removed].children[1]);
+        let replacement = child.unwrap_or(removed);
+        if child.is_some() {
+            let parent = self.nodes[removed].parent;
+            self.nodes[replacement].parent = parent;
+            if let Some(parent) = parent {
+                let side = usize::from(self.nodes[parent].children[1] == Some(removed));
+                self.nodes[parent].children[side] = Some(replacement);
+            } else {
+                self.root = replacement;
+                self.nodes[replacement].red = false;
+            }
+            self.nodes[removed].parent = None;
+            self.nodes[removed].children = [None, None];
+        }
+        if !self.nodes[removed].red {
+            self.rebalance_after_removal(replacement);
+        }
+        if replacement == removed {
+            if let Some(parent) = self.nodes[removed].parent {
+                let side = usize::from(self.nodes[parent].children[1] == Some(removed));
+                self.nodes[parent].children[side] = None;
+            }
+            self.nodes[removed].parent = None;
+        }
+        self.free.push(removed);
+        self.move_root_first();
+        Ok(None)
+    }
+
+    fn unlink(&mut self, index: usize) {
+        let (prev, next) = (self.nodes[index].prev, self.nodes[index].next);
+        if let Some(prev) = prev {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.nodes[index].prev = None;
+        self.nodes[index].next = None;
+    }
+
+    fn replace_link(&mut self, old: usize, new: usize) {
+        let (prev, next) = (self.nodes[old].prev, self.nodes[old].next);
+        if let Some(prev) = prev {
+            self.nodes[prev].next = Some(new);
+        } else {
+            self.head = Some(new);
+        }
+        if let Some(next) = next {
+            self.nodes[next].prev = Some(new);
+        } else {
+            self.tail = Some(new);
+        }
+        self.nodes[new].prev = prev;
+        self.nodes[new].next = next;
+        self.nodes[old].prev = None;
+        self.nodes[old].next = None;
+    }
+
+    fn rebalance_after_removal(&mut self, mut node: usize) {
+        while node != self.root && !self.nodes[node].red {
+            let Some(parent) = self.nodes[node].parent else {
+                break;
+            };
+            let side = usize::from(self.nodes[parent].children[1] == Some(node));
+            let other = 1 - side;
+            let Some(mut sibling) = self.nodes[parent].children[other] else {
+                node = parent;
+                continue;
+            };
+            if self.nodes[sibling].red {
+                self.nodes[sibling].red = false;
+                self.nodes[parent].red = true;
+                self.rotate(parent, other);
+                let Some(updated) = self.nodes[parent].children[other] else {
+                    node = parent;
+                    continue;
+                };
+                sibling = updated;
+            }
+            let near = self.nodes[sibling].children[side];
+            let far = self.nodes[sibling].children[other];
+            if !near.is_some_and(|i| self.nodes[i].red) && !far.is_some_and(|i| self.nodes[i].red) {
+                self.nodes[sibling].red = true;
+                node = parent;
+                continue;
+            }
+            if !far.is_some_and(|i| self.nodes[i].red) {
+                if let Some(near) = near {
+                    self.nodes[near].red = false;
+                }
+                self.nodes[sibling].red = true;
+                self.rotate(sibling, side);
+                sibling = self.nodes[parent].children[other].expect("sibling after rotation");
+            }
+            self.nodes[sibling].red = self.nodes[parent].red;
+            self.nodes[parent].red = false;
+            if let Some(far) = self.nodes[sibling].children[other] {
+                self.nodes[far].red = false;
+            }
+            self.rotate(parent, other);
+            node = self.root;
+        }
+        self.nodes[node].red = false;
+    }
+
     fn attach(&mut self, pos: Pos) -> Result<(usize, Option<usize>)> {
         let value = key(pos);
         let mut parent = None;
@@ -90,8 +248,7 @@ impl TreeBin {
                 }
             }
         }
-        let node = self.nodes.len();
-        self.nodes.push(Node {
+        let value = Node {
             pos,
             key: value,
             parent,
@@ -99,7 +256,14 @@ impl TreeBin {
             prev: None,
             next: None,
             red: true,
-        });
+        };
+        let node = if let Some(index) = self.free.pop() {
+            self.nodes[index] = value;
+            index
+        } else {
+            self.nodes.push(value);
+            self.nodes.len() - 1
+        };
         if let Some(parent) = parent {
             self.nodes[parent].children[direction] = Some(node);
         } else {

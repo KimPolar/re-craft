@@ -1001,36 +1001,10 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         tracker: &mut FreshGenerationLightTracker,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<Vec<bool>> {
-        let center = ChunkPos {
-            x: self.plan.origin[0].div_euclid(16),
-            z: self.plan.origin[2].div_euclid(16),
-        };
-        let mut covered = BTreeSet::new();
-        for dz in -1i32..=1 {
-            for dx in -1i32..=1 {
-                covered.insert(ChunkPos {
-                    x: center.x.checked_add(dx).context("light X overflow")?,
-                    z: center.z.checked_add(dz).context("light Z overflow")?,
-                });
-            }
-        }
-        let light = tracker.snapshot(terrain, covered, registry)?;
-        let block = |p| {
-            light
-                .block_light(p)
-                .context("block-light column not captured")
-        };
-        let raw = |_: &World, p| {
-            light
-                .raw_brightness(p, 0)
-                .context("raw-brightness column not captured")
-        };
-        self.execute_inner(
+        self.execute_with_light_tracking(
             terrain,
             structures_enabled,
-            Some(&block),
-            Some(&raw),
-            Some(DecorationLightTracking::Fresh(tracker, registry)),
+            DecorationLightTracking::Fresh(tracker, registry),
             None,
         )
     }
@@ -1044,6 +1018,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         engine: &mut StagedGenerationLightEngine,
         registry: &native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<Vec<bool>> {
+        self.execute_with_light_tracking(
+            terrain,
+            structures_enabled,
+            DecorationLightTracking::Staged(engine, registry),
+            None,
+        )
+    }
+
+    fn execute_with_light_tracking(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures_enabled: bool,
+        tracking: DecorationLightTracking<'_>,
+        structures: Option<(
+            &[PlannedStructureDecoration<'_>],
+            &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+        )>,
+    ) -> Result<Vec<bool>> {
         let center = self.center_chunk();
         let mut covered = BTreeSet::new();
         for dz in -1i32..=1 {
@@ -1054,7 +1046,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 });
             }
         }
-        let light = engine.snapshot(terrain, covered, registry)?;
+        let light = match &tracking {
+            DecorationLightTracking::Fresh(tracker, registry) => {
+                tracker.snapshot(terrain, covered, registry)?
+            }
+            DecorationLightTracking::Staged(engine, registry) => {
+                engine.snapshot(terrain, covered, registry)?
+            }
+        };
         let block = |p| {
             light
                 .block_light(p)
@@ -1070,9 +1069,66 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(&block),
             Some(&raw),
-            Some(DecorationLightTracking::Staged(engine, registry)),
-            None,
+            Some(tracking),
+            structures,
         )
+    }
+
+    /// Execute a complete structure plan against an unpropagated light tracker.
+    /// Unsupported changes roll back both terrain and structure start updates.
+    pub fn execute_structures_with_tracked_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        tracker: &mut FreshGenerationLightTracker,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        self.execute_structures_with_light_tracking(
+            terrain,
+            structures,
+            DecorationLightTracking::Fresh(tracker, registry),
+        )
+    }
+
+    /// Execute a complete structure plan against a staged light engine.
+    /// Unsupported changes roll back both terrain and structure start updates.
+    pub fn execute_structures_with_staged_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        engine: &mut StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        self.execute_structures_with_light_tracking(
+            terrain,
+            structures,
+            DecorationLightTracking::Staged(engine, registry),
+        )
+    }
+
+    fn execute_structures_with_light_tracking(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        tracking: DecorationLightTracking<'_>,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        let mut updated = clone_structure_starts(structures);
+        let features = self.execute_with_light_tracking(
+            terrain,
+            true,
+            tracking,
+            Some((structures, &mut updated)),
+        )?;
+        Ok((features, updated))
     }
 
     /// Execute the selected features and buried-treasure starts in Java's
@@ -1092,16 +1148,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             !terrain.has_published_light,
             "structure decoration requires unpublished lighting"
         );
-        let mut updated: Vec<Vec<_>> = structures
-            .iter()
-            .map(|structure| {
-                structure
-                    .starts
-                    .iter()
-                    .map(|start| (*start).clone())
-                    .collect()
-            })
-            .collect();
+        let mut updated = clone_structure_starts(structures);
         let features = self.execute_inner(
             terrain,
             true,
@@ -1276,6 +1323,21 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain.completed_decoration.insert(center);
         Ok(results)
     }
+}
+
+fn clone_structure_starts(
+    structures: &[PlannedStructureDecoration<'_>],
+) -> Vec<Vec<native_resources::structure_start::SimpleStructureStart>> {
+    structures
+        .iter()
+        .map(|structure| {
+            structure
+                .starts
+                .iter()
+                .map(|start| (*start).clone())
+                .collect()
+        })
+        .collect()
 }
 
 fn finish_decoration_with_light(
@@ -19966,6 +20028,136 @@ mod tests {
             .unwrap();
         assert_eq!(starts[0][0].bounds.min, [9, 90, 9]);
         assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn structure_decoration_uses_tracked_light_and_rolls_back_on_failure() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            structure_decoration::StructureDecorationEntry,
+            structure_start::{SimpleStructureKind, SimpleStructureStart},
+        };
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let light_registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut blocks = batch_registry();
+        blocks.extend(
+            [
+                "minecraft:sand",
+                "minecraft:chest",
+                "minecraft:water",
+                "minecraft:lava",
+            ]
+            .map(str::to_owned),
+        );
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &blocks, &mut resolve_test).unwrap();
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:buried_treasure").unwrap(),
+            step: 0,
+            index: 1,
+        };
+        let make_start = |x| SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            orientation: None,
+            bounds: BoundingBox::new([x, 14, 9], [x, 14, 9]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let first = make_start(9);
+        let second = make_start(4);
+        let center = ChunkPos { x: 0, z: 0 };
+        for (staged, active_x, fail) in [
+            (false, 1, false),
+            (false, 1, true),
+            (true, 2, false),
+            (true, 1, false),
+            (true, 2, true),
+        ] {
+            let east = ChunkPos { x: active_x, z: 0 };
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=4 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            if fail {
+                let beacon = world.intern_state(state("beacon"));
+                world.set_block_id(4, 8, 9, beacon).unwrap();
+            }
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker
+                .initialize_chunk(&terrain, east, &light_registry)
+                .unwrap();
+            let starts = if fail {
+                vec![&first, &second]
+            } else {
+                vec![&first]
+            };
+            let structures = [PlannedStructureDecoration {
+                entry: &entry,
+                starts,
+            }];
+            let before = terrain.snapshot();
+            let result = if staged {
+                let mut engine = StagedGenerationLightEngine::new(tracker);
+                engine
+                    .activate(&terrain, east, [center], &light_registry)
+                    .unwrap();
+                let result = prepared.execute_structures_with_staged_light(
+                    &mut terrain,
+                    &structures,
+                    &mut engine,
+                    &light_registry,
+                );
+                engine
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            } else {
+                let result = prepared.execute_structures_with_tracked_light(
+                    &mut terrain,
+                    &structures,
+                    &mut tracker,
+                    &light_registry,
+                );
+                tracker
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            };
+            if fail || (staged && active_x == 1) {
+                assert!(result.is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(terrain.generated_monster_entities().count(), 0);
+            } else {
+                let (features, updated) = result.unwrap();
+                assert_eq!(features.len(), plan.features.len());
+                assert_eq!(updated[0][0].bounds.min, [9, 8, 9]);
+                assert_eq!(
+                    terrain.snapshot().block(9, 8, 9).unwrap().name,
+                    "minecraft:chest"
+                );
+                assert_eq!(terrain.generated_monster_entities().count(), 1);
+            }
+            assert_eq!(first.bounds.min, [9, 14, 9]);
+            assert_eq!(second.bounds.min, [4, 14, 9]);
+        }
     }
 
     #[test]

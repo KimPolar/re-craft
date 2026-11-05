@@ -6464,6 +6464,102 @@ mod tests {
     }
 
     #[test]
+    fn buried_treasure_preserves_copied_chest_states_as_pending() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_piece::BuriedTreasureOutcome;
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "water",
+            "lava",
+            "sand",
+            "chest",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        for facing in ["north", "south", "east", "west"] {
+            for chest_type in ["single", "left", "right"] {
+                for waterlogged in ["true", "false"] {
+                    let (mut terrain, tags, _, _) = fixture();
+                    let original = BlockState {
+                        name: "minecraft:chest".into(),
+                        properties: BTreeMap::from([
+                            ("facing".into(), facing.into()),
+                            ("type".into(), chest_type.into()),
+                            ("waterlogged".into(), waterlogged.into()),
+                        ]),
+                    };
+                    let world = Arc::make_mut(&mut terrain.world);
+                    let id = world.intern_state(original.clone());
+                    let chunk =
+                        Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+                    let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+                    section.blocks.as_mut().unwrap()[9 + 9 * 16 + 8 * 256] = id;
+                    let writable = terrain.snapshot().chunks.keys().copied().collect();
+                    let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+                    let mut piece = SimpleStructureStart {
+                        kind: SimpleStructureKind::BuriedTreasure,
+                        chunk: [0, 0],
+                        generation_point: [8, 8, 8],
+                        orientation: None,
+                        bounds: BoundingBox::new([9, 90, 9], [9, 90, 9]).unwrap(),
+                        terrain_adjustment: TerrainAdjustment::None,
+                    };
+                    let mut random = DecorationRandom::new(19);
+                    let mut expected_random = random.clone();
+                    let outcome = region
+                        .place_buried_treasure(
+                            &mut piece,
+                            BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap(),
+                            &mut random,
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        outcome,
+                        BuriedTreasureOutcome::Found {
+                            chest_placed: false,
+                            ..
+                        }
+                    ));
+                    assert_eq!(random.next_long(), expected_random.next_long());
+                    region.finish().unwrap();
+                    let copied: Vec<_> = terrain.generated_monster_entities().collect();
+                    assert_eq!(copied.len(), 5);
+                    for entry in copied {
+                        let super::super::GeneratedMonsterRoomEntity::PendingChest {
+                            position,
+                            state,
+                        } = entry
+                        else {
+                            panic!("copied chest must remain pending")
+                        };
+                        assert_eq!(state, &original);
+                        assert_eq!(
+                            terrain
+                                .snapshot()
+                                .block(position[0], position[1], position[2]),
+                            Some(state)
+                        );
+                    }
+                    assert!(
+                        terrain
+                            .generated_block_entity_data_with(ChunkPos { x: 0, z: 0 }, |_| Some(
+                                true
+                            ))
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn generated_region_buried_treasure_matches_java() {
         use native_core::beardifier::{BoundingBox, TerrainAdjustment};
@@ -6561,7 +6657,7 @@ mod tests {
         let center = ChunkPos { x: 0, z: 0 };
         let mut chests = 0;
         let mut materialized_chests = 0;
-        let mut unsupported_copied_chests = 0;
+        let mut pending_chest_cases = 0;
         for case in fixtures {
             let id = case["id"].as_i64().unwrap();
             assert_eq!(lines.next().unwrap(), format!("S {id}"));
@@ -6597,6 +6693,7 @@ mod tests {
                 .insert(center, Arc::new([12; 256]));
             let mut expected_bounds: Option<([i32; 3], [i32; 3])> = None;
             let mut expected_chest: Option<([i32; 3], String, i64)> = None;
+            let mut expected_pending = BTreeSet::<[i32; 3]>::new();
             let expected_next = loop {
                 let line = lines.next().unwrap();
                 let words: Vec<_> = line.split_whitespace().collect();
@@ -6607,6 +6704,11 @@ mod tests {
                             words[2].parse().unwrap(),
                             words[3].parse().unwrap(),
                         ];
+                        if words[4] == "minecraft:chest" {
+                            expected_pending.insert(p);
+                        } else {
+                            expected_pending.remove(&p);
+                        }
                         expected.insert(
                             p,
                             (
@@ -6661,20 +6763,9 @@ mod tests {
             let before = terrain.snapshot();
             let writable = before.chunks.keys().copied().collect();
             let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
-            if let Err(error) = region.place_buried_treasure(&mut piece, clip, &mut random) {
-                assert!(
-                    format!("{error:#}")
-                        .contains("unsupported treasure replacement effects: minecraft:chest"),
-                    "fixture {id}: {error:#}"
-                );
-                unsupported_copied_chests += 1;
-                assert_eq!(piece.bounds.min, [9, 90, 9]);
-                let mut original = DecorationRandom::new(case["seed"].as_i64().unwrap());
-                assert_eq!(random.next_long(), original.next_long());
-                assert!(region.finish().is_err());
-                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
-                continue;
-            }
+            region
+                .place_buried_treasure(&mut piece, clip, &mut random)
+                .unwrap_or_else(|error| panic!("fixture {id}: {error:#}"));
             region.finish().unwrap();
             assert_eq!(
                 (piece.bounds.min, piece.bounds.max),
@@ -6696,14 +6787,28 @@ mod tests {
                     }
                 }
             }
-            let actual_chests: Vec<_> = terrain.generated_monster_entities().collect();
+            let mut actual_chests = Vec::new();
+            let mut actual_pending = BTreeSet::new();
+            for entity in terrain.generated_monster_entities() {
+                match entity {
+                    super::super::GeneratedMonsterRoomEntity::Chest(chest) => {
+                        actual_chests.push(chest)
+                    }
+                    super::super::GeneratedMonsterRoomEntity::PendingChest { position, state } => {
+                        assert_eq!(
+                            snapshot.block(position[0], position[1], position[2]),
+                            Some(state)
+                        );
+                        actual_pending.insert(*position);
+                    }
+                    _ => panic!("unexpected generated block entity"),
+                }
+            }
             if let Some((position, table, seed)) = expected_chest {
                 chests += 1;
+                expected_pending.remove(&position);
                 assert_eq!(actual_chests.len(), 1);
-                let super::super::GeneratedMonsterRoomEntity::Chest(chest) = actual_chests[0]
-                else {
-                    panic!("unexpected block entity")
-                };
+                let chest = actual_chests[0];
                 assert_eq!(chest.position, position);
                 assert_eq!(chest.loot_seed, seed);
                 assert!(
@@ -6727,6 +6832,20 @@ mod tests {
             } else {
                 assert!(actual_chests.is_empty());
             }
+            assert_eq!(
+                actual_pending, expected_pending,
+                "pending chest positions in fixture {id}"
+            );
+            if !actual_pending.is_empty() {
+                pending_chest_cases += 1;
+                let error = terrain
+                    .generated_block_entity_data(center, &generated)
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}")
+                        .contains("pending generated chest serialization is not implemented")
+                );
+            }
         }
         assert!(chests > 0, "oracle cases must include generated chests");
         assert!(
@@ -6734,12 +6853,11 @@ mod tests {
             "oracle cases must include a fully tracked chest"
         );
         assert!(
-            unsupported_copied_chests > 0,
-            "oracle cases must exercise copied chest rejection"
+            pending_chest_cases > 0,
+            "oracle cases must exercise pending copied chests"
         );
         eprintln!(
-            "Java treasure cases matched: {}, safely rejected copied chests: {unsupported_copied_chests}",
-            40 - unsupported_copied_chests
+            "Java treasure cases matched: 40, including {pending_chest_cases} with pending chests"
         );
         assert!(lines.next().is_none());
     }
@@ -15385,6 +15503,9 @@ mod tests {
                                 RoomMob::Zombie => "minecraft:zombie",
                                 RoomMob::Spider => "minecraft:spider",
                             };
+                        }
+                        super::super::GeneratedMonsterRoomEntity::PendingChest { .. } => {
+                            panic!("monster rooms should resolve generated chests")
                         }
                     }
                 }

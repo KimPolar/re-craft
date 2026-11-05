@@ -80,6 +80,11 @@ pub use terrain_batch::{
 pub enum GeneratedMonsterRoomEntity {
     Chest(GeneratedLootChest),
     Spawner(GeneratedMonsterSpawner),
+    /// A protochunk DUMMY chest not yet materialized by getBlockEntity.
+    PendingChest {
+        position: [i32; 3],
+        state: native_world::loaded::BlockState,
+    },
 }
 
 /// Result of serializing one generation-time entity. Java does not add a
@@ -1504,7 +1509,8 @@ impl CarvedTerrainWorld {
         self.generated_bee_nests.values()
     }
 
-    /// Known monster-room entities; these chunks are not yet ready to save.
+    /// Known generated chests and spawners, including unresolved chest
+    /// placeholders. These intermediate chunks are not yet ready to save.
     pub fn generated_monster_entities(&self) -> impl Iterator<Item = &GeneratedMonsterRoomEntity> {
         self.generated_monster_entities
             .values()
@@ -1629,6 +1635,9 @@ impl CarvedTerrainWorld {
                         },
                         spawner.block_entity(),
                     )
+                }
+                GeneratedMonsterRoomEntity::PendingChest { .. } => {
+                    bail!("pending generated chest serialization is not implemented")
                 }
             };
             ensure!(

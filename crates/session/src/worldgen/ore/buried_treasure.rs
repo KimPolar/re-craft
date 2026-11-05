@@ -104,12 +104,23 @@ impl TreasureWorld for DecorationRegion<'_> {
             !is_air(&state)
                 && !matches!(
                     state.name.as_str(),
-                    "minecraft:water" | "minecraft:lava" | "minecraft:chest" | "minecraft:spawner"
+                    "minecraft:water" | "minecraft:lava" | "minecraft:spawner"
                 ),
             "unsupported treasure replacement effects: {}",
             state.name
         );
-        self.set_proto_block(position, &state)
+        self.set_proto_block(position, &state)?;
+        if state.name == "minecraft:chest" {
+            ensure!(
+                !self.monster_entities.contains_key(&position),
+                "existing block entity cannot be replaced"
+            );
+            Arc::make_mut(&mut self.monster_entities).insert(
+                position,
+                Some(super::super::GeneratedMonsterRoomEntity::PendingChest { position, state }),
+            );
+        }
+        Ok(())
     }
 
     fn set_chest(&mut self, position: [i32; 3], facing: HorizontalDirection) -> Result<bool> {

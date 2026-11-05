@@ -13,6 +13,8 @@ use native_core::{
 };
 use serde_json::Value;
 
+pub mod swamp_hut;
+
 /// Decoration passes use `DecorationRandom` seeded for the current feature;
 /// direct random sources are useful for callers that already have one.
 pub trait TreasureRandom {

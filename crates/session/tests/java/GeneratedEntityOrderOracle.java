@@ -16,6 +16,14 @@ public class GeneratedEntityOrderOracle {
                 case "P" -> { if (!live.containsKey(pos)) pending.put(pos, true); }
                 case "C" -> { pending.remove(pos); live.put(pos, true); }
                 case "X" -> pending.remove(pos);
+                case "V" -> {
+                    var nextLive = new Object2ObjectOpenHashMap<BlockPos, Boolean>();
+                    for (var entry : live.object2ObjectEntrySet()) nextLive.put(entry.getKey(), entry.getValue());
+                    var nextPending = new HashMap<BlockPos, Boolean>();
+                    nextPending.putAll(pending);
+                    live = nextLive;
+                    pending = nextPending;
+                }
                 default -> throw new IllegalArgumentException(parts[0]);
             }
             var ordered = new HashSet<BlockPos>(pending.keySet());

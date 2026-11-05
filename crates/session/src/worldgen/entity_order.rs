@@ -37,6 +37,15 @@ impl Default for LivePositions {
 }
 
 impl LivePositions {
+    /// LevelChunk inserts the protochunk's fastutil values into a new map.
+    pub(super) fn converted_copy(&self) -> Self {
+        let mut converted = Self::default();
+        for pos in self.slots.iter().rev().flatten().copied() {
+            converted.insert(pos);
+        }
+        converted
+    }
+
     fn find(&self, pos: Pos) -> usize {
         let mask = self.slots.len() - 1;
         let mut i = fast_hash(pos) as usize & mask;
@@ -151,6 +160,35 @@ impl Default for PendingPositions {
 }
 
 impl PendingPositions {
+    /// LevelChunk copies the pending map with HashMap.putAll, which sizes its
+    /// initially empty table from the number of entries before inserting them.
+    pub(super) fn converted_copy(&self) -> Result<Self> {
+        let positions = self.positions()?;
+        if positions.is_empty() {
+            return Ok(Self::default());
+        }
+        let capacity = positions
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(2))
+            .map(|n| n / 3)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| anyhow::anyhow!("pending block entity map is too large"))?;
+        let mut result = Self {
+            buckets: vec![Bin::default(); capacity],
+            members: BTreeSet::new(),
+            exact: true,
+        };
+        for pos in positions {
+            result.insert(pos);
+        }
+        ensure!(
+            result.exact,
+            "converted pending block entity order is unavailable"
+        );
+        Ok(result)
+    }
+
     pub(super) fn insert(&mut self, pos: Pos) {
         if self.members.insert(pos) && self.exact {
             let mut size = self.members.len() - 1;
@@ -196,7 +234,7 @@ impl PendingPositions {
         &self.members
     }
 
-    fn positions(&self) -> Result<Vec<Pos>> {
+    pub(super) fn positions(&self) -> Result<Vec<Pos>> {
         if self.members.is_empty() {
             return Ok(Vec::new());
         }
@@ -584,6 +622,7 @@ mod tests {
         for &p in collision[100..].iter().step_by(2) {
             operations.push(('C', p));
         }
+        operations.push(('V', [0, 0, 0]));
         for &p in &collision {
             operations.push(('X', p));
             operations.push(('R', p));
@@ -591,6 +630,9 @@ mod tests {
         for round in 0..4 {
             for i in 0..120 {
                 operations.push(('P', collision[(i * 37 + round * 13) % 120]));
+                if matches!(i, 0 | 1 | 2 | 11 | 12 | 23 | 24 | 47 | 48) {
+                    operations.push(('V', [0, 0, 0]));
+                }
             }
             for i in 0..120 {
                 let p = collision[(i * 53 + round * 17) % 120];
@@ -642,6 +684,10 @@ mod tests {
                 'R' => {
                     live.remove(p);
                     live_members.remove(&p);
+                }
+                'V' => {
+                    live = live.converted_copy();
+                    pending = pending.converted_copy().unwrap();
                 }
                 _ => {}
             }

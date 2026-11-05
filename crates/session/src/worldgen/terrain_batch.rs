@@ -1738,10 +1738,20 @@ impl FreshTerrainBatch {
             game_time,
             next_sub_tick,
         )?;
-        // All generated block entities in this path are materialized live;
-        // a missing or unsupported record cannot be treated as no entity.
+        let terrain = self
+            .terrain
+            .as_ref()
+            .context("generated terrain is missing")?;
+        let mut block_entities = BTreeMap::new();
         for &pos in &positions {
-            self.spawned_block_entity_data(pos)?;
+            block_entities.insert(
+                pos,
+                super::postprocessing_world::ConvertedBlockEntities::from_proto(
+                    self.spawned_block_entity_data(pos)?,
+                    terrain.generated_entity_order.get(&pos).map(Arc::as_ref),
+                    terrain.generated_pending_order.get(&pos).map(Arc::as_ref),
+                )?,
+            );
         }
         let world = self.snapshot().context("generated terrain is missing")?;
         // Most generated chunks do not contain mushrooms. Avoid preparing a
@@ -1788,6 +1798,7 @@ impl FreshTerrainBatch {
             heightmaps,
             Some(heightmap_tags),
         );
+        stage.set_block_entities(block_entities)?;
         stage.bind_batch_revision(self.schedule.revision());
         stage.set_leaf_tags(
             self.decoration
@@ -2200,7 +2211,7 @@ impl FreshTerrainBatch {
                         fluid_ticks: native_persistence::generated_ticks::encode_level_fluid_ticks(
                             pos, &fluids,
                         )?,
-                        block_entities: self.spawned_block_entity_data(pos)?,
+                        block_entities: processed.block_entity_data(pos)?,
                         entity_records: self.complete_generated_entity_records_shared(pos)?,
                     },
                 ))

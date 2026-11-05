@@ -16,11 +16,109 @@ use native_world::{
 
 use super::{
     chunk_ticks::{RegionTicks, ScheduleOutcome, TickRegistry},
+    entity_order::{LivePositions, PendingPositions},
     postprocessing::{
         ConvertedPostprocessingRegion, PostprocessingChunk, PostprocessingWorld,
         update_from_neighbor_shapes,
     },
 };
+
+/// Block entities owned by the converted LevelChunk, isolated from the protochunk.
+#[derive(Default)]
+pub(super) struct ConvertedBlockEntities {
+    records: BTreeMap<[i32; 3], native_persistence::nbt::Tag>,
+    pending: PendingPositions,
+    live: LivePositions,
+}
+
+impl ConvertedBlockEntities {
+    pub(super) fn from_proto(
+        data: native_persistence::nbt::Tag,
+        live: Option<&LivePositions>,
+        pending: Option<&PendingPositions>,
+    ) -> Result<Self> {
+        use native_persistence::nbt::Tag;
+        let Tag::List { values, .. } = data else {
+            bail!("invalid generated block entity list")
+        };
+        let mut records = BTreeMap::new();
+        let mut pending_keys = BTreeSet::new();
+        for tag in values {
+            let number = |name| match tag.get(name) {
+                Some(Tag::Int(value)) => Ok(*value),
+                _ => bail!("generated block entity coordinate is missing"),
+            };
+            let pos = [number("x")?, number("y")?, number("z")?];
+            if matches!(tag.get("id"), Some(Tag::String(id)) if id.matches("DUMMY")) {
+                pending_keys.insert(pos);
+            }
+            ensure!(
+                records.insert(pos, tag).is_none(),
+                "duplicate generated block entity"
+            );
+        }
+        ensure!(
+            pending.map_or(pending_keys.is_empty(), |history| history.members()
+                == &pending_keys),
+            "pending block entities do not match history"
+        );
+        let pending = pending
+            .map(PendingPositions::converted_copy)
+            .transpose()?
+            .unwrap_or_default();
+        let live = live.map(LivePositions::converted_copy).unwrap_or_default();
+        let live_keys: BTreeSet<_> = live.saving_order()?.into_iter().collect();
+        ensure!(
+            live_keys.len() + pending_keys.len() == records.len()
+                && live_keys
+                    .iter()
+                    .all(|pos| records.contains_key(pos) && !pending_keys.contains(pos)),
+            "materialized block entities do not match history"
+        );
+        Ok(Self {
+            records,
+            pending,
+            live,
+        })
+    }
+
+    fn saved(&self) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::nbt::{Tag, TagType};
+        ensure!(
+            self.pending.members().is_empty(),
+            "postprocessed block entities remain pending"
+        );
+        let values = self
+            .live
+            .saving_order()?
+            .into_iter()
+            .map(|pos| {
+                let mut data = self
+                    .records
+                    .get(&pos)
+                    .context("postprocessed block entity is missing")?
+                    .clone();
+                let Tag::Compound(fields) = &mut data else {
+                    bail!("invalid postprocessed block entity")
+                };
+                ensure!(
+                    !fields.iter().any(|(name, _)| name.matches("keepPacked")),
+                    "duplicate keepPacked field"
+                );
+                fields.push(("keepPacked".into(), Tag::Byte(0)));
+                Ok(data)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            values.len() == self.records.len(),
+            "postprocessed block entity order is incomplete"
+        );
+        Ok(Tag::List {
+            element_type: TagType::Compound,
+            values,
+        })
+    }
+}
 
 /// An isolated attempt. The source snapshot is immutable, and no ticks are
 /// returned if a callback fails or if any chunk remains unfinished.
@@ -46,6 +144,7 @@ pub struct GeneratedPostprocessing {
     pub(super) light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
+    block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
 }
 
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
@@ -70,6 +169,7 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) max_y: i32,
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     water_source_conversion: Option<bool>,
+    block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
 }
 
 /// A completed explicit light drain and the world revision it covered.
@@ -82,6 +182,12 @@ pub(super) struct PostprocessingLightCheckpoint {
 }
 
 impl PostprocessedGeneratedRegion {
+    pub(super) fn block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        self.block_entities
+            .get(&pos)
+            .context("converted block entities are missing")?
+            .saved()
+    }
     /// Read the completed tick containers without changing their snapshot.
     pub fn ticks(&self) -> &RegionTicks {
         &self.ticks
@@ -133,6 +239,12 @@ impl GeneratedPostprocessing {
         heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
         heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
     ) -> Self {
+        let block_entities = region
+            .tasks
+            .keys()
+            .copied()
+            .map(|pos| (pos, ConvertedBlockEntities::default()))
+            .collect();
         Self {
             source: Arc::clone(&world),
             world,
@@ -155,7 +267,20 @@ impl GeneratedPostprocessing {
             light_checks: Vec::new(),
             heightmaps,
             heightmap_tags,
+            block_entities,
         }
+    }
+
+    pub(super) fn set_block_entities(
+        &mut self,
+        entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
+    ) -> Result<()> {
+        ensure!(
+            entities.keys().eq(self.region.tasks.keys()),
+            "converted block entity chunk set differs"
+        );
+        self.block_entities = entities;
+        Ok(())
     }
 
     pub(super) fn bind_batch_revision(&mut self, revision: u64) {
@@ -263,6 +388,11 @@ impl GeneratedPostprocessing {
         self.active = Some(pos);
         self.failed = true;
         let mut view = GeneratedBlockView {
+            chunk: pos,
+            block_entities: self
+                .block_entities
+                .get_mut(&pos)
+                .context("converted block entities are missing")?,
             world: &mut self.world,
             min_y: self.min_y,
             max_y: self.max_y,
@@ -311,11 +441,14 @@ impl GeneratedPostprocessing {
             max_y: self.max_y,
             light_checkpoint: self.light_checkpoint,
             water_source_conversion: self.water_source_conversion,
+            block_entities: self.block_entities,
         })
     }
 }
 
 struct GeneratedBlockView<'a> {
+    chunk: ChunkPos,
+    block_entities: &'a mut ConvertedBlockEntities,
     world: &'a mut Arc<World>,
     min_y: i32,
     max_y: i32,
@@ -1433,15 +1566,39 @@ impl crate::bubble_column::ColumnWorld for GeneratedBlockView<'_> {
 }
 
 impl PostprocessingChunk for GeneratedBlockView<'_> {
-    // Fresh generation tracks its materialized block entities separately; the
-    // caller validates the generated entity data before constructing this view.
     fn pending_block_entity_positions(&mut self) -> Result<Vec<[i32; 3]>> {
-        Ok(Vec::new())
+        self.block_entities.pending.positions()
     }
-    fn promote_pending_block_entity(&mut self, _: [i32; 3]) -> Result<()> {
-        bail!("unexpected pending generated block entity")
+    fn promote_pending_block_entity(&mut self, pos: [i32; 3]) -> Result<()> {
+        ensure!(
+            pos[0].div_euclid(16) == self.chunk.x && pos[2].div_euclid(16) == self.chunk.z,
+            "pending block entity belongs to another chunk"
+        );
+        ensure!(
+            self.block_entities.pending.members().contains(&pos),
+            "pending block entity is missing"
+        );
+        let state = self.read(pos)?;
+        ensure!(
+            state.name == "minecraft:chest",
+            "unsupported pending generated block entity"
+        );
+        let entity = super::GeneratedEmptyChest {
+            position: pos,
+            state,
+        };
+        self.block_entities.pending.remove(pos);
+        self.block_entities
+            .records
+            .insert(pos, entity.block_entity());
+        self.block_entities.live.insert(pos);
+        Ok(())
     }
     fn clear_pending_block_entities(&mut self) -> Result<()> {
+        ensure!(
+            self.block_entities.pending.members().is_empty(),
+            "pending generated block entities remain"
+        );
         Ok(())
     }
     fn apply_upgrade_data(&mut self) -> Result<()> {
@@ -1554,6 +1711,236 @@ mod tests {
             world,
             pos,
         )
+    }
+
+    #[test]
+    fn postprocessing_promotes_pending_chest_without_mutating_source() {
+        use native_persistence::nbt::{Tag, TagType};
+        let (mut stage, _, chunk) = fixture(false);
+        let position = [2, 8, 2];
+        let chest = BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "west".into()),
+                ("type".into(), "left".into()),
+                ("waterlogged".into(), "true".into()),
+            ]),
+        };
+        let world = Arc::make_mut(&mut stage.world);
+        let id = world.intern_state(chest.clone());
+        assert!(
+            world
+                .set_block_id(position[0], position[1], position[2], id)
+                .unwrap()
+        );
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.source);
+        let mut pending = PendingPositions::default();
+        pending.insert(position);
+        let dummy = Tag::Compound(vec![
+            ("id".into(), Tag::String("DUMMY".into())),
+            ("x".into(), Tag::Int(position[0])),
+            ("y".into(), Tag::Int(position[1])),
+            ("z".into(), Tag::Int(position[2])),
+        ]);
+        let input = Tag::List {
+            element_type: TagType::Compound,
+            values: vec![dummy.clone()],
+        };
+        assert!(ConvertedBlockEntities::from_proto(input.clone(), None, None).is_err());
+        let converted = ConvertedBlockEntities::from_proto(input, None, Some(&pending)).unwrap();
+        stage
+            .set_block_entities(BTreeMap::from([(chunk, converted)]))
+            .unwrap();
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert!(Arc::ptr_eq(&source, &result.world));
+        assert_eq!(
+            source.block(position[0], position[1], position[2]),
+            Some(&chest)
+        );
+        let Tag::List { values, .. } = result.block_entity_data(chunk).unwrap() else {
+            panic!("missing entities")
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0].get("id"),
+            Some(&Tag::String("minecraft:chest".into()))
+        );
+        assert_eq!(values[0].get("keepPacked"), Some(&Tag::Byte(0)));
+        assert!(
+            matches!(values[0].get("Items"), Some(Tag::List { values, .. }) if values.is_empty())
+        );
+        assert_eq!(dummy.get("id"), Some(&Tag::String("DUMMY".into())));
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn pending_chests_promote_like_java_level_chunk() {
+        use native_persistence::nbt::{self, Tag, TagType};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp
+            .path()
+            .join("GeneratedPendingPostprocessingOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/GeneratedPendingPostprocessingOracle.java"),
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source));
+        let output = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedPendingPostprocessingOracle")
+            .arg(temp.path()));
+        let parse = |prefix| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix))
+                .unwrap()
+                .split_whitespace()
+                .map(|p| {
+                    let values: Vec<i32> = p.split(',').map(|n| n.parse().unwrap()).collect();
+                    [values[0], values[1], values[2]]
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_pending = parse("P ");
+        let expected_order = parse("O ");
+        assert_eq!(expected_pending.len(), 12);
+        assert_eq!(expected_order.len(), 24);
+        for budget in [1, 100] {
+            let (mut stage, _, chunk) = fixture(false);
+            let state = BlockState {
+                name: "minecraft:chest".into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            };
+            let world = Arc::make_mut(&mut stage.world);
+            let id = world.intern_state(state.clone());
+            for i in 0..24 {
+                assert!(world.set_block_id(i % 16, 8, i / 16, id).unwrap());
+            }
+            stage.source = Arc::clone(&stage.world);
+            let mut pending = PendingPositions::default();
+            let mut live = LivePositions::default();
+            let mut values = Vec::new();
+            for i in 0..24 {
+                pending.insert([i % 16, 8, i / 16]);
+            }
+            for i in (0..24).step_by(2) {
+                let p = [i % 16, 8, i / 16];
+                pending.remove(p);
+                live.insert(p);
+            }
+            for i in 0..24 {
+                let p = [i % 16, 8, i / 16];
+                if i % 2 == 0 {
+                    values.push(
+                        super::super::GeneratedEmptyChest {
+                            position: p,
+                            state: state.clone(),
+                        }
+                        .block_entity(),
+                    );
+                } else {
+                    values.push(Tag::Compound(vec![
+                        ("id".into(), Tag::String("DUMMY".into())),
+                        ("x".into(), Tag::Int(p[0])),
+                        ("y".into(), Tag::Int(p[1])),
+                        ("z".into(), Tag::Int(p[2])),
+                    ]));
+                }
+            }
+            let converted = ConvertedBlockEntities::from_proto(
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values,
+                },
+                Some(&live),
+                Some(&pending),
+            )
+            .unwrap();
+            assert_eq!(converted.pending.positions().unwrap(), expected_pending);
+            stage
+                .set_block_entities(BTreeMap::from([(chunk, converted)]))
+                .unwrap();
+            while !stage.poll(chunk, budget).unwrap() {}
+            let result = stage.finish().unwrap();
+            let Tag::List { values, .. } = result.block_entity_data(chunk).unwrap() else {
+                panic!("missing entity list")
+            };
+            let coordinates = |tag: &Tag| {
+                let number = |name| match tag.get(name) {
+                    Some(Tag::Int(value)) => *value,
+                    _ => panic!("missing position"),
+                };
+                [number("x"), number("y"), number("z")]
+            };
+            assert_eq!(
+                values.iter().map(coordinates).collect::<Vec<_>>(),
+                expected_order
+            );
+            for actual in &values {
+                let p = coordinates(actual);
+                let expected = nbt::read(
+                    &std::fs::read(temp.path().join(format!("{}.nbt", p[0] + p[2] * 16))).unwrap(),
+                )
+                .unwrap()
+                .value;
+                let (Tag::Compound(a), Tag::Compound(b)) = (actual, &expected) else {
+                    panic!("invalid NBT")
+                };
+                let names_a: BTreeSet<_> =
+                    a.iter().map(|(name, _)| name.to_string_lossy()).collect();
+                let names_b: BTreeSet<_> =
+                    b.iter().map(|(name, _)| name.to_string_lossy()).collect();
+                assert_eq!(names_a, names_b, "fields at {p:?}");
+                for field in names_a {
+                    assert_eq!(
+                        actual.get(&field),
+                        expected.get(&field),
+                        "field {field} at {p:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn result_trace(budget: usize) -> Vec<String> {
@@ -2336,6 +2723,9 @@ mod tests {
                 east_chunk,
                 PostprocessingTask::new(Arc::new(empty), east_chunk),
             );
+            stage
+                .block_entities
+                .insert(east_chunk, ConvertedBlockEntities::default());
             chunks.insert(
                 east_chunk,
                 ConvertedChunkTicks {

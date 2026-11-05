@@ -736,6 +736,11 @@ fn liquid_state(state: &BlockState) -> Result<Option<native_world::fluid::FluidS
     native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)
 }
 
+fn bonus_water_shape_schedules(state: &BlockState) -> Result<bool> {
+    Ok(liquid_state(state)?
+        .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water && fluid.source))
+}
+
 impl GeneratedBlockView<'_> {
     fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
         if !state.name.starts_with("minecraft:")
@@ -1860,7 +1865,7 @@ impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
             },
             (old, state),
         );
-        self.update_snowy_bonus_support(pos)?;
+        self.update_bonus_neighbors(pos)?;
         Ok(())
     }
 
@@ -1919,7 +1924,7 @@ impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
         );
         self.check_bonus_neighbors(pos, true)?;
         self.write_postprocessed_state(pos, &old, &torch)?;
-        self.update_snowy_bonus_support(pos)
+        self.update_bonus_neighbors(pos)
     }
 }
 
@@ -1962,15 +1967,45 @@ impl GeneratedBlockView<'_> {
                     z: neighbor[2],
                 })
                 && state.name == "minecraft:chest";
+            let water = liquid_state(&state)?
+                .is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water);
             ensure!(
                 inert
                     || same_height_torch
                     || same_height_new_chest
+                    || water
                     || snowy_bonus_neighbor_inert(&state, dy)
                     || snowy_bonus_neighbor_changes(&state, dy),
                 "bonus chest neighbor shape callback is unsupported: {}",
                 state.name
             );
+        }
+        Ok(())
+    }
+
+    /// Apply shape callbacks in Java's neighbor-update order. A water source
+    /// schedules itself; flowing water sees a dry chest or torch and is inert.
+    fn update_bonus_neighbors(&mut self, pos: [i32; 3]) -> Result<()> {
+        for [dx, dy, dz] in [
+            [-1i32, 0i32, 0i32],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ] {
+            let neighbor = [
+                pos[0].wrapping_add(dx),
+                pos[1].wrapping_add(dy),
+                pos[2].wrapping_add(dz),
+            ];
+            let state = self.read(neighbor)?;
+            if bonus_water_shape_schedules(&state)? {
+                self.schedule_water(neighbor, &state)?;
+            }
+            if dy == -1 {
+                self.update_snowy_bonus_support(pos)?;
+            }
         }
         Ok(())
     }
@@ -2675,6 +2710,104 @@ mod tests {
         );
         assert!(matches!(values[0].get("LootTableSeed"), Some(Tag::Long(_))));
         assert_eq!(values[0].get("keepPacked"), Some(&Tag::Byte(0)));
+    }
+
+    #[test]
+    fn bonus_chest_schedules_adjacent_source_water_and_keeps_flowing_water_inert() {
+        use native_core::random::LegacyRandom;
+        let run = |water_level: Option<u8>| {
+            let (mut stage, _) = bonus_chest_fixture();
+            let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+            if let Some(level) = water_level {
+                // Seed 42 selects the same position in the unchanged flat fixture.
+                let (mut baseline, _) = bonus_chest_fixture();
+                for &chunk in &chunks {
+                    while !baseline.poll(chunk, 10).unwrap() {}
+                }
+                let pos = baseline
+                    .place_initial_bonus_chest(
+                        &native_resources::bonus_chest::BonusChestFeature,
+                        &mut LegacyRandom::new(42),
+                        [0, 8, 0],
+                    )
+                    .unwrap()
+                    .unwrap();
+                let world = Arc::make_mut(&mut stage.world);
+                let water = world.intern_state(BlockState {
+                    name: "minecraft:water".into(),
+                    properties: BTreeMap::from([("level".into(), level.to_string())]),
+                });
+                world
+                    .set_block_id(pos[0], pos[1] + 1, pos[2], water)
+                    .unwrap();
+                stage.source = Arc::clone(&stage.world);
+            }
+            for &chunk in &chunks {
+                while !stage.poll(chunk, 10).unwrap() {}
+            }
+            let mut random = LegacyRandom::new(42);
+            let chest = stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap()
+                .unwrap();
+            let result = stage.finish().unwrap();
+            (chest, random.state(), result.ticks.activated_snapshot())
+        };
+        let (pos, original_random, _) = run(None);
+        for level in [0, 1, 8, 15] {
+            let (chest, random, ticks) = run(Some(level));
+            assert_eq!(chest, pos);
+            assert_eq!(random, original_random);
+            let fluid_ticks: Vec<_> = ticks
+                .chunks
+                .values()
+                .flat_map(|chunk| &chunk.fluids)
+                .collect();
+            if level == 0 {
+                assert_eq!(fluid_ticks.len(), 1);
+                assert_eq!(fluid_ticks[0].kind, "minecraft:water");
+                assert_eq!(fluid_ticks[0].position, [pos[0], pos[1] + 1, pos[2]]);
+                assert_eq!(fluid_ticks[0].trigger, 5);
+            } else {
+                assert!(fluid_ticks.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn bonus_water_neighbor_callbacks_match_java() {
+        use native_core::random::LegacyRandom;
+        let rows = java_results(
+            "BonusWaterNeighborOracle",
+            include_str!("../../tests/java/BonusWaterNeighborOracle.java"),
+        );
+        assert_eq!(rows.len(), 16 * 6 * 2);
+        for row in rows {
+            let fields: Vec<_> = row.split_whitespace().collect();
+            assert_eq!(fields.len(), 6, "{row}");
+            let level: u8 = fields[0].parse().unwrap();
+            let state = BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), level.to_string())]),
+            };
+            assert_eq!(fields[3], "true", "{row}");
+            let expected_tick = if bonus_water_shape_schedules(&state).unwrap() {
+                "minecraft:water:5"
+            } else {
+                "none"
+            };
+            assert_eq!(fields[4], expected_tick, "{row}");
+            assert_eq!(
+                fields[5].parse::<i64>().unwrap(),
+                LegacyRandom::new(42).next_long(),
+                "{row}"
+            );
+        }
     }
 
     #[test]

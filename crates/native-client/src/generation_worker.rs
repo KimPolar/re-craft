@@ -1946,7 +1946,7 @@ where
             candidates.clone(),
         )?;
         let mut search = match (previous_search.take(), checkpoint.take()) {
-            (Some(search), Some(previous)) if previous.matches(&ready.batch)? => {
+            (Some(search), Some(previous)) if previous.matches(&ready)? => {
                 let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
                 progress.player_spawn_search_resumptions =
                     progress.player_spawn_search_resumptions.saturating_add(1);
@@ -1972,13 +1972,8 @@ where
                 ),
             }
         };
-        // A newly postprocessed neighbor can update blocks across a chunk
-        // boundary. Restart that search unless its postprocessed inputs are
-        // explicitly compared; the ordinary protochunk checkpoint is not enough.
-        if ready.postprocessed.is_none() {
-            checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
-            previous_search = Some(search);
-        }
+        checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
+        previous_search = Some(search);
         drop(session);
         let postprocessed = if let Some(processed) = ready.postprocessed.take() {
             let checkpoint = ready
@@ -2172,12 +2167,39 @@ struct InitialSearchCheckpoint {
 /// immutable entity records shared and compare their completeness and content.
 struct PlayerSearchCheckpoint {
     terrain: InitialSearchCheckpoint,
+    postprocessed: bool,
     entities: BTreeMap<ChunkPos, Option<Arc<Vec<native_persistence::nbt::Tag>>>>,
 }
 
 impl PlayerSearchCheckpoint {
     fn capture(ready: &GenerationReady) -> Result<Self> {
-        let terrain = InitialSearchCheckpoint::capture(ready)?;
+        let postprocessed = ready.postprocessed.is_some();
+        let terrain = if let Some(processed) = &ready.postprocessed {
+            let targets = ready
+                .mesh
+                .targets
+                .as_deref()
+                .context("search targets are unavailable")?;
+            let mut heightmaps = BTreeMap::new();
+            for &pos in targets {
+                ensure!(
+                    processed.region.world.chunks.contains_key(&pos),
+                    "search target is missing"
+                );
+                let maps = processed
+                    .region
+                    .heightmaps()
+                    .get(&pos)
+                    .context("postprocessed spawn heightmaps are missing")?;
+                heightmaps.insert(pos, Some(maps.spawn_heightmaps()));
+            }
+            InitialSearchCheckpoint {
+                world: Arc::clone(&processed.region.world),
+                heightmaps,
+            }
+        } else {
+            InitialSearchCheckpoint::capture(ready)?
+        };
         let mut entities = BTreeMap::new();
         for &pos in terrain.heightmaps.keys() {
             entities.insert(
@@ -2185,14 +2207,48 @@ impl PlayerSearchCheckpoint {
                 ready.batch.complete_generated_entity_records_shared(pos)?,
             );
         }
-        Ok(Self { terrain, entities })
+        Ok(Self {
+            terrain,
+            postprocessed,
+            entities,
+        })
     }
 
-    fn matches(&self, batch: &FreshTerrainBatch) -> Result<bool> {
-        if !self.terrain.matches(batch)? {
+    fn matches(&self, ready: &GenerationReady) -> Result<bool> {
+        let targets = ready
+            .mesh
+            .targets
+            .as_deref()
+            .context("search targets are unavailable")?;
+        if self
+            .terrain
+            .heightmaps
+            .keys()
+            .any(|pos| !targets.contains(pos))
+        {
             return Ok(false);
         }
-        self.entities_match(|pos| batch.complete_generated_entity_records_shared(pos))
+        let unchanged = match (self.postprocessed, &ready.postprocessed) {
+            (true, Some(processed)) => {
+                self.terrain
+                    .matches_snapshot(&processed.region.world, |pos| {
+                        Ok(Some(
+                            processed
+                                .region
+                                .heightmaps()
+                                .get(&pos)
+                                .context("postprocessed spawn heightmaps are missing")?
+                                .spawn_heightmaps(),
+                        ))
+                    })?
+            }
+            (false, None) => self.terrain.matches(&ready.batch)?,
+            _ => false,
+        };
+        if !unchanged {
+            return Ok(false);
+        }
+        self.entities_match(|pos| ready.batch.complete_generated_entity_records_shared(pos))
     }
 
     fn entities_match(
@@ -2899,6 +2955,7 @@ mod tests {
                 world: Arc::new(World::new("minecraft:overworld")),
                 heightmaps: BTreeMap::new(),
             },
+            postprocessed: false,
             entities: BTreeMap::from([(home, Some(Arc::clone(&records))), (unknown, None)]),
         };
         assert!(checkpoint.entities_match(|pos| Ok((pos == home).then(|| Arc::clone(&records))))?);
@@ -3239,6 +3296,7 @@ mod tests {
             .unwrap()
             .level_random
             .state();
+        let search_checkpoint = PlayerSearchCheckpoint::capture(&bonus_ready)?;
         let inputs = prepare(crate::fresh_generation::FreshGenerationSettings {
             minecraft_dir: game.clone(),
             preset: "example:bonus".into(),
@@ -3273,7 +3331,7 @@ mod tests {
             spawn_search_resumptions: 0,
             player_spawn_search_resumptions: 0,
         });
-        let expanded = complete_player_spawn(
+        let mut expanded = complete_player_spawn(
             bonus_ready,
             &mut resources,
             &mut classify,
@@ -3297,6 +3355,8 @@ mod tests {
         .context("postprocessed player spawn was cancelled")?;
         assert!(expanded.player_spawn.is_some());
         assert!(expanded.mesh.targets.as_ref().unwrap().len() > targets.len());
+        assert!(progress.lock().unwrap().player_spawn_search_resumptions > 0);
+        assert!(search_checkpoint.matches(&expanded)?);
         let processed = expanded.postprocessed.as_ref().unwrap();
         assert_eq!(processed.initial_bonus_chest_position(), Some(Some(chest)));
         assert_eq!(
@@ -3334,6 +3394,16 @@ mod tests {
             processed.chunks.len(),
             expanded.mesh.targets.as_ref().unwrap().len()
         );
+        let processed = expanded.postprocessed.as_mut().unwrap();
+        let original_world = Arc::clone(&processed.region.world);
+        let changed = Arc::make_mut(&mut processed.region.world);
+        let air = changed.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: Default::default(),
+        });
+        changed.set_block_id(chest.x, chest.y, chest.z, air)?;
+        assert!(!search_checkpoint.matches(&expanded)?);
+        expanded.postprocessed.as_mut().unwrap().region.world = original_world;
         for (spawn_mobs, disabled, species, feature_kind) in [
             (false, false, "minecraft:sheep", 0),
             (true, true, "minecraft:sheep", 0),

@@ -188,6 +188,8 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:cave_air"
         | "minecraft:void_air"
         | "minecraft:spore_blossom"
+        | "minecraft:cauldron"
+        | "minecraft:potted_red_mushroom"
             if state.properties.is_empty() =>
         {
             (0, 0)
@@ -722,6 +724,8 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
             "minecraft:air"
                 | "minecraft:cave_air"
                 | "minecraft:void_air"
+                | "minecraft:cauldron"
+                | "minecraft:potted_red_mushroom"
                 | "minecraft:cave_vines"
                 | "minecraft:cave_vines_plant"
                 | "minecraft:stone"
@@ -1278,6 +1282,20 @@ mod tests {
         assert!(same_light_behavior(&blossom, &state("air", None)).unwrap());
         blossom.properties.insert("unknown".into(), "true".into());
         assert!(light_properties(&blossom).is_none());
+    }
+
+    #[test]
+    fn hut_furnishings_transmit_light_and_reject_unknown_properties() {
+        for name in ["cauldron", "potted_red_mushroom"] {
+            let mut block = state(name, None);
+            assert_eq!(same_light_behavior(&block, &state("air", None)), Some(true));
+            assert_eq!(
+                skips_light_check_for_edit(&block, &state("air", None)),
+                Some(true)
+            );
+            block.properties.insert("unknown".into(), "true".into());
+            assert!(light_properties(&block).is_none());
+        }
     }
 
     #[test]
@@ -2757,6 +2775,8 @@ mod tests {
             "cave_air",
             "void_air",
             "spore_blossom",
+            "cauldron",
+            "potted_red_mushroom",
             "stone",
             "dirt",
             "sand",

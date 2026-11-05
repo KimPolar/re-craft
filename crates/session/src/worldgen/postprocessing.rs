@@ -65,6 +65,7 @@ pub trait PostprocessingWorld {
 /// The source list is immutable; the corresponding live section is cleared
 /// through the callback immediately after its entries succeed. This runner
 /// does not complete the remaining Java postprocessing steps.
+#[derive(Clone)]
 pub struct PostprocessingBlocks {
     marks: Arc<PostProcessing>,
     chunk: ChunkPos,
@@ -171,6 +172,7 @@ enum Phase {
 /// Complete the ordered post-generation pass in bounded work units. The
 /// caller must keep the world isolated until completion. Any callback error
 /// poisons this attempt because it may have already changed the world.
+#[derive(Clone)]
 pub struct PostprocessingTask {
     blocks: PostprocessingBlocks,
     phase: Phase,
@@ -189,6 +191,7 @@ pub struct ConvertedChunkPostprocessing {
 
 /// Converted chunks that share the server-level tick access. Each task uses
 /// the same tick containers, including those belonging to adjacent chunks.
+#[derive(Clone)]
 pub struct ConvertedPostprocessingRegion {
     pub tasks: std::collections::BTreeMap<ChunkPos, PostprocessingTask>,
     pub ticks: super::chunk_ticks::RegionTicks,

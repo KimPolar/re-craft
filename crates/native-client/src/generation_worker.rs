@@ -1707,68 +1707,63 @@ impl GenerationWorker {
             )? {
                 return Ok(None);
             }
-            let next_revision = ready
-                .mesh
-                .revision
-                .checked_add(1)
-                .context("mesh revision overflow")?;
             if bonus_enabled {
                 for &pos in &targets {
                     require_initial_heightmaps(pos, &ready.batch.spawned_heightmap_data(pos)?)?;
                 }
             }
-            let positions = targets.iter().copied().collect();
-            let postprocessor = if let Some(feature) = bonus_feature {
-                Self::postprocess_with_initial_bonus_chest(
-                    ready,
-                    positions,
-                    0,
-                    0,
-                    water_source_conversion,
-                    next_revision,
-                    InitialBonusChestRequest {
-                        feature,
-                        level_random: {
-                            #[cfg(test)]
-                            {
-                                initial_bonus_seed
-                                    .map(native_core::random::LegacyRandom::new)
-                                    .unwrap_or_else(native_session::fresh_level_random)
-                            }
-                            #[cfg(not(test))]
-                            {
-                                native_session::fresh_level_random()
-                            }
-                        },
-                    },
-                )?
-            } else {
-                Self::postprocess(
-                    ready,
-                    positions,
-                    0,
-                    0,
-                    water_source_conversion,
-                    next_revision,
-                )?
-            };
-            set_phase(progress, GenerationPhase::Postprocessing);
-            let ready = loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    postprocessor.cancel();
-                }
-                match postprocessor
-                    .result
-                    .recv_timeout(std::time::Duration::from_millis(25))
-                {
-                    Ok(GenerationResult::Ready(result)) => break result,
-                    Ok(GenerationResult::Cancelled) => return Ok(None),
-                    Ok(GenerationResult::Failed(error)) => return Err(error),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        anyhow::bail!("initial postprocessing worker stopped unexpectedly")
+            let ready = if let Some(feature) = bonus_feature {
+                let level_random = {
+                    #[cfg(test)]
+                    {
+                        initial_bonus_seed
+                            .map(native_core::random::LegacyRandom::new)
+                            .unwrap_or_else(native_session::fresh_level_random)
                     }
-                }
+                    #[cfg(not(test))]
+                    {
+                        native_session::fresh_level_random()
+                    }
+                };
+                let Some(result) = complete_structured_bonus_postprocessing(
+                    ready,
+                    feature,
+                    level_random,
+                    &mut provider,
+                    &mut classify,
+                    &mut resolve,
+                    &mut classify_height,
+                    &mut build,
+                    &mut construct,
+                    spawn_mobs,
+                    water_source_conversion,
+                    biome_blend,
+                    cancelled,
+                    progress,
+                )?
+                else {
+                    return Ok(None);
+                };
+                result
+            } else {
+                let next_revision = ready
+                    .mesh
+                    .revision
+                    .checked_add(1)
+                    .context("mesh revision overflow")?;
+                let postprocessor = Self::postprocess(
+                    ready,
+                    targets.iter().copied().collect(),
+                    0,
+                    0,
+                    water_source_conversion,
+                    next_revision,
+                )?;
+                let Some(result) = wait_nested_generation(postprocessor, cancelled, progress)?
+                else {
+                    return Ok(None);
+                };
+                result
             };
             let Some(mut ready) = complete_player_spawn(
                 ready,
@@ -2516,6 +2511,187 @@ where
         note_step(progress, pos, GenerationStage::Spawn);
     }
     Ok(true)
+}
+
+/// Complete an initial bonus attempt without committing a partial placement.
+/// Only a neighbor actually requested by the feature is generated and added.
+#[allow(clippy::too_many_arguments)]
+fn complete_structured_bonus_postprocessing<C, R, H, M, K>(
+    mut ready: GenerationReady,
+    feature: Option<native_resources::bonus_chest::BonusChestFeature>,
+    mut level_random: native_core::random::LegacyRandom,
+    provider: &mut native_resources::packs::ResourceStack,
+    classify: &mut C,
+    resolve: &mut R,
+    classify_height: &mut H,
+    build_spawner: &mut M,
+    construct: &mut K,
+    spawn_mobs: bool,
+    water_source_conversion: bool,
+    biome_blend: u8,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>>
+where
+    C: FnMut(&Value) -> Result<CarverBlockState>,
+    R: FnMut(&Value) -> Result<BlockState>,
+    H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    M: FnMut(
+        &FreshTerrainBatch,
+        &mut native_resources::packs::ResourceStack,
+        ChunkPos,
+    ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+    K: FnMut(
+        &native_resources::packs::ResourceId,
+    ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+{
+    use native_session::worldgen::InitialBonusChestAttempt;
+    let origin = ready
+        .suggested_spawn
+        .context("initial world spawn is missing")?;
+    let mut targets = checked_spawn_targets(&mut ready)?;
+    let mut stage = ready
+        .batch
+        .begin_generated_postprocessing(targets.iter().copied(), 0, 0)?;
+    stage.set_water_source_conversion(water_source_conversion)?;
+    set_phase(progress, GenerationPhase::Postprocessing);
+    for &pos in &targets {
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            if stage.poll(pos, 256)? {
+                break;
+            }
+        }
+        let mut state = progress.lock().unwrap_or_else(|error| error.into_inner());
+        state.completed_steps = state.completed_steps.saturating_add(1);
+    }
+    let position = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let Some(feature) = &feature else { break None };
+        match stage.try_place_initial_bonus_chest(feature, &mut level_random, origin.to_array())? {
+            InitialBonusChestAttempt::Complete(pos) => break pos.map(IVec3::from_array),
+            InitialBonusChestAttempt::NeedsChunk(needed) => {
+                ensure!(
+                    !targets.contains(&needed),
+                    "bonus chest requested an already converted chunk"
+                );
+                let mut completed = stage.finish()?;
+                let checkpoint = ready
+                    .batch
+                    .checkpoint_postprocessing_expansion(&completed)?;
+                let revision = ready
+                    .mesh
+                    .revision
+                    .checked_add(1)
+                    .context("mesh revision overflow")?;
+                if !prepare_structure_expansion(
+                    &mut ready.batch,
+                    needed,
+                    provider,
+                    classify_height,
+                    cancelled,
+                    progress,
+                )? {
+                    return Ok(None);
+                }
+                let Some(mut expanded) = expand_with_inputs(
+                    ready,
+                    needed,
+                    provider,
+                    classify,
+                    resolve,
+                    revision,
+                    biome_blend,
+                    cancelled,
+                    progress,
+                )?
+                else {
+                    return Ok(None);
+                };
+                expanded.suggested_spawn = Some(origin);
+                targets = checked_spawn_targets(&mut expanded)?;
+                if !complete_creature_spawning_with_inputs(
+                    &mut expanded,
+                    &targets,
+                    provider,
+                    classify,
+                    resolve,
+                    build_spawner,
+                    construct,
+                    spawn_mobs,
+                    cancelled,
+                    progress,
+                )? {
+                    return Ok(None);
+                }
+                require_initial_heightmaps(
+                    needed,
+                    &expanded.batch.spawned_heightmap_data(needed)?,
+                )?;
+                expanded
+                    .batch
+                    .rebase_postprocessing_after_expansion(&mut completed, &checkpoint)?;
+                stage = expanded.batch.resume_generated_postprocessing(&completed)?;
+                expanded
+                    .batch
+                    .register_generated_postprocessing_chunk(&mut stage, needed)?;
+                set_phase(progress, GenerationPhase::Postprocessing);
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if stage.poll(needed, 256)? {
+                        break;
+                    }
+                }
+                let mut state = progress.lock().unwrap_or_else(|error| error.into_inner());
+                state.completed_steps = state.completed_steps.saturating_add(1);
+                drop(state);
+                ready = expanded;
+            }
+        }
+    };
+    let region = stage.finish()?;
+    ensure!(
+        targets.is_subset(&region.chunks),
+        "bonus postprocessing is missing a target"
+    );
+    let chunks = ready
+        .batch
+        .postprocessed_chunk_drafts(&region, region.chunks.iter().copied())?;
+    let revision = ready
+        .mesh
+        .revision
+        .checked_add(1)
+        .context("mesh revision overflow")?;
+    let mesh = MeshJob::for_postprocessed(
+        &ready.batch,
+        &region,
+        targets,
+        revision,
+        ready.mesh.biome_blend,
+        ready.mesh.origin,
+    )?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    ready.postprocessed = Some(PostprocessedGeneration {
+        activated_ticks: region.ticks().activated_snapshot(),
+        sealed_world: Arc::clone(&region.world),
+        sealed_mesh: Some(mesh.clone()),
+        mesh: Some(mesh),
+        region,
+        chunks,
+        initial_bonus_chest: Some(InitialBonusChest {
+            position,
+            level_random,
+        }),
+    });
+    Ok(Some(ready))
 }
 
 /// Resolve the player after spawn-stage entity generation. Resume after
@@ -3624,7 +3800,7 @@ mod tests {
                     saved_border: Some(saved_border),
                 },
                 ceiling_spawn_height: None,
-                initial_bonus_seed: Some(1),
+                initial_bonus_seed: Some(42),
             },
             50,
             0,
@@ -3652,6 +3828,18 @@ mod tests {
             .initial_bonus_chest_position()
             .flatten()
             .context("bonus chest was not placed")?;
+        assert_eq!(pos.x.rem_euclid(16), 15);
+        assert!(
+            initial_ready
+                .mesh
+                .targets
+                .as_deref()
+                .unwrap()
+                .contains(&ChunkPos {
+                    x: pos.x.div_euclid(16) + 1,
+                    z: pos.z.div_euclid(16),
+                })
+        );
         assert_eq!(
             processed
                 .region
@@ -3660,6 +3848,15 @@ mod tests {
                 .unwrap()
                 .name,
             "minecraft:chest"
+        );
+        assert_eq!(
+            processed
+                .region
+                .world
+                .block(pos.x + 1, pos.y, pos.z)
+                .unwrap()
+                .name,
+            "minecraft:torch"
         );
         let chest_chunk = processed
             .chunks

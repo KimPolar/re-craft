@@ -72,7 +72,9 @@ pub use mob_spawner::{
 pub use ore::{
     DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
-pub use postprocessing_world::{GeneratedPostprocessing, PostprocessedGeneratedRegion};
+pub use postprocessing_world::{
+    GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
+};
 pub use terrain_batch::{
     FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,
     PostprocessingExpansionCheckpoint,

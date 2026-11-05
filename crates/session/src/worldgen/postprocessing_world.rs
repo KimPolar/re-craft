@@ -123,6 +123,7 @@ impl ConvertedBlockEntities {
 
 /// An isolated attempt. The source snapshot is immutable, and no ticks are
 /// returned if a callback fails or if any chunk remains unfinished.
+#[derive(Clone)]
 pub struct GeneratedPostprocessing {
     pub(super) world: Arc<World>,
     pub(super) source: Arc<World>,
@@ -151,6 +152,29 @@ pub struct GeneratedPostprocessing {
     block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
     bonus_chest_attempted: bool,
 }
+
+/// A bonus attempt either completed or needs another converted chunk. A
+/// missing chunk leaves both the postprocessing stage and RNG untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialBonusChestAttempt {
+    Complete(Option<[i32; 3]>),
+    NeedsChunk(ChunkPos),
+}
+
+#[derive(Debug)]
+struct MissingPostprocessingChunk(ChunkPos);
+
+impl std::fmt::Display for MissingPostprocessingChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "postprocessing neighbor is not converted: {}, {}",
+            self.0.x, self.0.z
+        )
+    }
+}
+
+impl std::error::Error for MissingPostprocessingChunk {}
 
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
 /// entity and world-save requirements must still be validated.
@@ -252,6 +276,34 @@ pub(super) fn drain_postprocessing_light(
 }
 
 impl GeneratedPostprocessing {
+    /// Attempt placement on an isolated fork. Missing neighbors are reported
+    /// without publishing partial blocks, ticks, block entities or RNG changes.
+    pub fn try_place_initial_bonus_chest<
+        R: native_resources::bonus_chest::BonusChestRandom + Clone,
+    >(
+        &mut self,
+        feature: &native_resources::bonus_chest::BonusChestFeature,
+        random: &mut R,
+        origin: [i32; 3],
+    ) -> Result<InitialBonusChestAttempt> {
+        let mut attempt = self.clone();
+        let mut trial_random = random.clone();
+        match attempt.place_initial_bonus_chest(feature, &mut trial_random, origin) {
+            Ok(pos) => {
+                *self = attempt;
+                *random = trial_random;
+                Ok(InitialBonusChestAttempt::Complete(pos))
+            }
+            Err(error) => {
+                if let Some(missing) = error.downcast_ref::<MissingPostprocessingChunk>() {
+                    Ok(InitialBonusChestAttempt::NeedsChunk(missing.0))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub(super) fn new(
         world: Arc<World>,
         min_y: i32,
@@ -803,10 +855,9 @@ impl GeneratedBlockView<'_> {
             z: pos[2].div_euclid(16),
         };
         self.read_chunks.borrow_mut().insert(chunk);
-        ensure!(
-            self.ticks.chunk(chunk).is_some(),
-            "postprocessing neighbor is not converted"
-        );
+        if self.ticks.chunk(chunk).is_none() {
+            return Err(MissingPostprocessingChunk(chunk).into());
+        }
         self.world
             .block(pos[0], pos[1], pos[2])
             .cloned()
@@ -2746,6 +2797,111 @@ mod tests {
     }
 
     #[test]
+    fn bonus_chest_missing_neighbor_can_retry_without_partial_effects() {
+        use native_core::random::LegacyRandom;
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let (mut stage, source) = bonus_chest_fixture();
+        let center_task = stage.region.tasks.remove(&center).unwrap();
+        let east_task = stage.region.tasks.remove(&east).unwrap();
+        let center_ticks = stage.region.ticks.chunk(center).unwrap().clone();
+        let east_ticks = stage.region.ticks.chunk(east).unwrap().clone();
+        let east_entities = stage.block_entities.remove(&east).unwrap();
+        let east_maps = stage.heightmaps.remove(&east).unwrap();
+        stage.region.tasks = BTreeMap::from([(center, center_task)]);
+        stage.region.ticks =
+            RegionTicks::new(BTreeMap::from([(center, center_ticks)]), 0, 0).unwrap();
+        stage.block_entities.retain(|pos, _| *pos == center);
+        stage.heightmaps.retain(|pos, _| *pos == center);
+        while !stage.poll(center, 10).unwrap() {}
+        let before_world = Arc::clone(&stage.world);
+        let before_ticks = stage.region.ticks.activated_snapshot();
+        let before_reads = stage.read_chunks.borrow().clone();
+        let mut random = LegacyRandom::new(4);
+        let before_random = random.state();
+        assert_eq!(
+            stage
+                .try_place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap(),
+            InitialBonusChestAttempt::NeedsChunk(east)
+        );
+        assert!(Arc::ptr_eq(&before_world, &stage.world));
+        assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
+        assert_eq!(*stage.read_chunks.borrow(), before_reads);
+        assert!(stage.edits.is_empty());
+        assert!(!stage.bonus_chest_attempted && !stage.failed);
+        assert_eq!(random.state(), before_random);
+        assert_eq!(source.block(14, 8, 7).unwrap().name, "minecraft:air");
+
+        stage
+            .register_converted_chunk(
+                east,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: east_task,
+                    ticks: east_ticks,
+                },
+                east_entities,
+                east_maps,
+                None,
+            )
+            .unwrap();
+        while !stage.poll(east, 10).unwrap() {}
+        assert_eq!(
+            stage
+                .try_place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap(),
+            InitialBonusChestAttempt::Complete(Some([14, 8, 7]))
+        );
+        let resumed = stage.finish().unwrap();
+        let (mut baseline, _) = bonus_chest_fixture();
+        let chunks: Vec<_> = baseline.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !baseline.poll(chunk, 10).unwrap() {}
+        }
+        let mut baseline_random = LegacyRandom::new(4);
+        assert_eq!(
+            baseline
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut baseline_random,
+                    [0, 8, 0],
+                )
+                .unwrap(),
+            Some([14, 8, 7])
+        );
+        let baseline = baseline.finish().unwrap();
+        assert_eq!(random.state(), baseline_random.state());
+        assert_eq!(resumed.edits, baseline.edits);
+        assert_eq!(resumed.light_checks, baseline.light_checks);
+        assert_eq!(
+            resumed.block_entity_data(center).unwrap(),
+            baseline.block_entity_data(center).unwrap()
+        );
+        let resumed_ticks = resumed.ticks.activated_snapshot();
+        let baseline_ticks = baseline.ticks.activated_snapshot();
+        assert_eq!(resumed_ticks.next_sub_tick, baseline_ticks.next_sub_tick);
+        assert_eq!(
+            resumed_ticks.chunks[&center],
+            baseline_ticks.chunks[&center]
+        );
+        assert_eq!(resumed_ticks.chunks[&east], baseline_ticks.chunks[&east]);
+        for edit in &resumed.edits {
+            assert_eq!(
+                resumed.world.block(edit.x, edit.y, edit.z),
+                baseline.world.block(edit.x, edit.y, edit.z)
+            );
+        }
+    }
+
+    #[test]
     fn bonus_chest_schedules_adjacent_source_water_and_keeps_flowing_water_inert() {
         use native_core::random::LegacyRandom;
         let run = |water_level: Option<u8>| {
@@ -2993,6 +3149,17 @@ mod tests {
         }
         let mut random = LegacyRandom::new(42);
         let state = random.state();
+        let error = stage
+            .try_place_initial_bonus_chest(
+                &native_resources::bonus_chest::BonusChestFeature,
+                &mut random,
+                [0, 8, 0],
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("neighbor shape callback"));
+        assert_eq!(random.state(), state);
+        assert!(!stage.failed);
+        assert!(Arc::ptr_eq(&stage.world, &source));
         let error = stage
             .place_initial_bonus_chest(
                 &native_resources::bonus_chest::BonusChestFeature,

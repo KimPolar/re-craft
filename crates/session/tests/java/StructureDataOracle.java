@@ -15,6 +15,7 @@ import net.minecraft.world.level.chunk.storage.SerializableChunkData;
 import net.minecraft.world.level.levelgen.structure.*;
 import net.minecraft.world.level.levelgen.structure.pieces.*;
 import net.minecraft.world.level.levelgen.structure.structures.BuriedTreasurePieces.BuriedTreasurePiece;
+import net.minecraft.world.level.levelgen.structure.structures.SwampHutPiece;
 
 public class StructureDataOracle {
     public static void main(String[] args) throws Exception {
@@ -23,11 +24,39 @@ public class StructureDataOracle {
         var lookup = VanillaRegistries.createWorldLookup();
         Structure structure = lookup.lookupOrThrow(Registries.STRUCTURE)
                 .getOrThrow(ResourceKey.create(Registries.STRUCTURE, Identifier.parse("minecraft:buried_treasure"))).value();
+        Structure hut = lookup.lookupOrThrow(Registries.STRUCTURE)
+                .getOrThrow(ResourceKey.create(Registries.STRUCTURE, Identifier.parse("minecraft:swamp_hut"))).value();
         var registry = new MappedRegistry<Structure>(Registries.STRUCTURE, Lifecycle.stable());
         Registry.register(registry, Identifier.parse("example:treasure"), structure);
+        Registry.register(registry, Identifier.parse("example:hut"), hut);
         registry.freeze();
         var access = new RegistryAccess.ImmutableRegistryAccess(List.of(registry));
         var context = new StructurePieceSerializationContext(null, access, null);
+        if (args.length > 1 && args[1].equals("verify_hut")) {
+            var readStarts = SerializableChunkData.class.getDeclaredMethod("unpackStructureStart",
+                    StructurePieceSerializationContext.class, net.minecraft.nbt.CompoundTag.class, long.class);
+            var readReferences = SerializableChunkData.class.getDeclaredMethod("unpackStructureReferences",
+                    RegistryAccess.class, ChunkPos.class, net.minecraft.nbt.CompoundTag.class);
+            var pack = SerializableChunkData.class.getDeclaredMethod("packStructureData",
+                    StructurePieceSerializationContext.class, ChunkPos.class, Map.class, Map.class);
+            readStarts.setAccessible(true); readReferences.setAccessible(true); pack.setAccessible(true);
+            var pos = new ChunkPos(-17, 23);
+            for (int i=0; i<16; i++) {
+                var tag = NbtIo.read(Path.of(args[0], "hut-rust-"+i+".nbt"));
+                var starts = (Map<?, ?>)readStarts.invoke(null, context, tag, 42L);
+                var references = (Map<?, ?>)readReferences.invoke(null, access, pos, tag);
+                var start = (StructureStart)starts.get(hut);
+                if (starts.size()!=1 || start==null || !start.getChunkPos().equals(pos)
+                        || start.getPieces().size()!=1 || !(start.getPieces().get(0) instanceof SwampHutPiece))
+                    throw new AssertionError("invalid hut start " + i);
+                var set = (it.unimi.dsi.fastutil.longs.LongSet)references.get(hut);
+                if (references.size()!=1 || set==null || set.size()!=1 || !set.contains(ChunkPos.pack(pos.x(), pos.z())))
+                    throw new AssertionError("invalid hut references " + i);
+                var repacked = (net.minecraft.nbt.CompoundTag)pack.invoke(null, context, pos, starts, references);
+                if (!tag.equals(repacked)) throw new AssertionError("hut changed in Java: " + i + " input=" + tag + " output=" + repacked);
+            }
+            return;
+        }
         if (args.length > 1 && args[1].equals("verify")) {
             var readStarts = SerializableChunkData.class.getDeclaredMethod("unpackStructureStart",
                     StructurePieceSerializationContext.class, net.minecraft.nbt.CompoundTag.class, long.class);

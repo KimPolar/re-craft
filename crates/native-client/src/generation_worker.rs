@@ -4779,7 +4779,26 @@ mod tests {
             matches!(cats[0].get("variant"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("example:moon_cat"))
         );
         assert_eq!(records.len(), 2);
-        assert!(ready.batch.structure_data(target).is_err());
+        let structure_data = ready.batch.structure_data(target)?;
+        let children = match structure_data
+            .get("starts")
+            .unwrap()
+            .get("example:hut")
+            .unwrap()
+            .get("Children")
+            .unwrap()
+        {
+            native_persistence::nbt::Tag::List { values, .. } => values,
+            _ => anyhow::bail!("hut children are not a list"),
+        };
+        assert_eq!(
+            children[0].get("Witch"),
+            Some(&native_persistence::nbt::Tag::Byte(1))
+        );
+        assert_eq!(
+            children[0].get("Cat"),
+            Some(&native_persistence::nbt::Tag::Byte(1))
+        );
         drop(cats);
         drop(records);
         assert!(ready.hut_generation.is_some());
@@ -4792,6 +4811,7 @@ mod tests {
             pose: native_session::PlayerPose::Standing,
         })?;
         assert!(ready.hut_generation.is_none());
+        assert!(ready.batch.into_parts().is_err());
         Ok(())
     }
 

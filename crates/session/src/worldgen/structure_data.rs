@@ -1,12 +1,13 @@
 //! Serialize supported fresh structure data without authorizing a world save.
 use anyhow::{Context, Result, ensure};
 use native_persistence::nbt::{Tag, TagType};
-use native_resources::structure_start::SimpleStructureKind;
+use native_resources::{packs::ResourceId, structure_start::SimpleStructureKind};
 use native_world::loaded::ChunkPos;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    structure_batch::SimpleStarts,
+    SavedSwampHutPiece,
+    structure_batch::{SimpleStarts, TerrainStartKey},
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
     },
@@ -19,6 +20,7 @@ pub(super) fn referenced_start_chunks(
     pos: ChunkPos,
     all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
     references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
     let recomputed = collect_ordered_structure_references(pos, |source| {
         all_starts
@@ -54,11 +56,46 @@ pub(super) fn referenced_start_chunks(
                 .get(&source)
                 .and_then(|starts| starts.get(id))
                 .context("referenced structure start is missing")?;
-            validate_buried_treasure_start(source, start)?;
+            validate_start(source, id, start, huts)?;
             required.insert(source);
         }
     }
     Ok(required)
+}
+
+fn validate_start(
+    pos: ChunkPos,
+    id: &ResourceId,
+    start: &native_resources::structure_start::SimpleStructureStart,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Option<SavedSwampHutPiece>> {
+    match start.kind {
+        SimpleStructureKind::BuriedTreasure => {
+            validate_buried_treasure_start(pos, start)?;
+            Ok(None)
+        }
+        SimpleStructureKind::SwampHut => {
+            ensure!(
+                start.chunk == [pos.x, pos.z],
+                "hut start belongs to another chunk"
+            );
+            let x = pos.x.checked_mul(16).context("hut X overflow")?;
+            let z = pos.z.checked_mul(16).context("hut Z overflow")?;
+            ensure!(
+                start.bounds.min[0] == x && start.bounds.min[2] == z,
+                "hut horizontal position differs from its start chunk"
+            );
+            let saved = *huts
+                .get(&(id.clone(), pos))
+                .context("hut piece state is missing")?;
+            ensure!(
+                SavedSwampHutPiece::capture(start, saved.state)? == saved,
+                "hut piece state differs from start"
+            );
+            Ok(Some(saved))
+        }
+        _ => anyhow::bail!("unsupported structure start serialization"),
+    }
 }
 
 fn validate_buried_treasure_start(
@@ -99,26 +136,32 @@ fn validate_buried_treasure_start(
 }
 
 /// Serialize fresh starts and ordered references belonging to one chunk.
-/// Only buried treasure is supported; existing-world data must not use this.
+/// Only fresh buried treasure and swamp huts are supported; existing-world
+/// data must not use this.
 pub(super) fn pack_structure_data(
     pos: ChunkPos,
     starts: &SimpleStarts,
     references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
     let mut packed_starts = Vec::with_capacity(starts.len());
     for (id, start) in starts {
-        validate_buried_treasure_start(pos, start)?;
+        let hut = validate_start(pos, id, start, huts)?;
         let name = format!("{}:{}", id.namespace, id.path);
         let p = start.bounds.min;
-        let piece = Tag::Compound(vec![
-            ("id".into(), Tag::String("minecraft:btp".into())),
-            (
-                "BB".into(),
-                Tag::IntArray(vec![p[0], p[1], p[2], p[0], p[1], p[2]]),
-            ),
-            ("O".into(), Tag::Int(-1)),
-            ("GD".into(), Tag::Int(0)),
-        ]);
+        let piece = if let Some(hut) = hut {
+            hut.to_tag()?
+        } else {
+            Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:btp".into())),
+                (
+                    "BB".into(),
+                    Tag::IntArray(vec![p[0], p[1], p[2], p[0], p[1], p[2]]),
+                ),
+                ("O".into(), Tag::Int(-1)),
+                ("GD".into(), Tag::Int(0)),
+            ])
+        };
         let value = Tag::Compound(vec![
             ("id".into(), Tag::String(name.as_str().into())),
             ("ChunkX".into(), Tag::Int(pos.x)),
@@ -200,15 +243,112 @@ mod tests {
         let pos = ChunkPos { x: -17, z: 23 };
         let (mut starts, references) = fixture(pos, -27, true);
         let id = ResourceId::parse("example:treasure").unwrap();
-        assert!(pack_structure_data(pos, &starts, &references).is_ok());
+        assert!(pack_structure_data(pos, &starts, &references, &BTreeMap::new()).is_ok());
         starts.get_mut(&id).unwrap().chunk[0] += 1;
-        assert!(pack_structure_data(pos, &starts, &references).is_err());
+        assert!(pack_structure_data(pos, &starts, &references, &BTreeMap::new()).is_err());
         starts.get_mut(&id).unwrap().chunk[0] -= 1;
         starts.get_mut(&id).unwrap().kind = SimpleStructureKind::SwampHut;
-        assert!(pack_structure_data(pos, &starts, &references).is_err());
+        assert!(pack_structure_data(pos, &starts, &references, &BTreeMap::new()).is_err());
         starts.get_mut(&id).unwrap().kind = SimpleStructureKind::BuriedTreasure;
         starts.get_mut(&id).unwrap().bounds.max[1] += 1;
-        assert!(pack_structure_data(pos, &starts, &references).is_err());
+        assert!(pack_structure_data(pos, &starts, &references, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn hut_structure_data_preserves_piece_state_and_rejects_mismatches() {
+        use native_resources::{
+            structure_piece::{ScatteredGroundHeight, swamp_hut::SwampHutState},
+            structure_start::HorizontalDirection,
+        };
+        let pos = ChunkPos { x: -17, z: 23 };
+        let id = ResourceId::parse("example:hut").unwrap();
+        let key = (id.clone(), pos);
+        for direction in [
+            HorizontalDirection::North,
+            HorizontalDirection::South,
+            HorizontalDirection::East,
+            HorizontalDirection::West,
+        ] {
+            let (width, depth) = match direction {
+                HorizontalDirection::North | HorizontalDirection::South => (7, 9),
+                _ => (9, 7),
+            };
+            let [x, z] = [pos.x * 16, pos.z * 16];
+            let start = SimpleStructureStart {
+                kind: SimpleStructureKind::SwampHut,
+                chunk: [pos.x, pos.z],
+                generation_point: [x + 8, 70, z + 8],
+                orientation: Some(direction),
+                bounds: BoundingBox::new([x, 70, z], [x + width - 1, 76, z + depth - 1]).unwrap(),
+                terrain_adjustment: TerrainAdjustment::None,
+            };
+            let mut all = BTreeMap::new();
+            for x in pos.x - 8..=pos.x + 8 {
+                for z in pos.z - 8..=pos.z + 8 {
+                    all.insert(ChunkPos { x, z }, SimpleStarts::new());
+                }
+            }
+            all.insert(pos, BTreeMap::from([(id.clone(), start.clone())]));
+            let references = collect_ordered_structure_references(pos, |source| {
+                all[&source]
+                    .iter()
+                    .map(|(id, start)| StructureStartBounds::from_simple(id.clone(), start))
+                    .collect()
+            })
+            .unwrap();
+            for witch in [false, true] {
+                for cat in [false, true] {
+                    let state = SwampHutState {
+                        ground: ScatteredGroundHeight::from_saved(70),
+                        spawned_witch: witch,
+                        spawned_cat: cat,
+                    };
+                    let saved = SavedSwampHutPiece::capture(&start, state).unwrap();
+                    let huts = BTreeMap::from([(key.clone(), saved)]);
+                    assert_eq!(
+                        referenced_start_chunks(pos, &all, &references, &huts).unwrap(),
+                        BTreeSet::from([pos])
+                    );
+                    let data = pack_structure_data(pos, &all[&pos], &references, &huts).unwrap();
+                    let piece = match data
+                        .get("starts")
+                        .unwrap()
+                        .get("example:hut")
+                        .unwrap()
+                        .get("Children")
+                        .unwrap()
+                    {
+                        Tag::List { values, .. } => &values[0],
+                        _ => panic!("missing hut piece"),
+                    };
+                    assert_eq!(SavedSwampHutPiece::from_tag(piece).unwrap(), saved);
+                    assert!(
+                        pack_structure_data(pos, &all[&pos], &references, &BTreeMap::new())
+                            .is_err()
+                    );
+                    let mut wrong = saved;
+                    wrong.bounds.min[1] += 1;
+                    assert!(
+                        pack_structure_data(
+                            pos,
+                            &all[&pos],
+                            &references,
+                            &BTreeMap::from([(key.clone(), wrong)])
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            let mut wrong = all.clone();
+            wrong
+                .get_mut(&pos)
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .bounds
+                .min[0] += 1;
+            assert!(pack_structure_data(pos, &wrong[&pos], &references, &BTreeMap::new()).is_err());
+        }
     }
 
     #[test]
@@ -231,7 +371,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            referenced_start_chunks(pos, &all, &references).unwrap(),
+            referenced_start_chunks(pos, &all, &references, &BTreeMap::new()).unwrap(),
             BTreeSet::from([pos])
         );
         let mut missing = all.clone();
@@ -239,21 +379,23 @@ mod tests {
             x: pos.x - 8,
             z: pos.z + 8,
         });
-        assert!(referenced_start_chunks(pos, &missing, &references).is_err());
+        assert!(referenced_start_chunks(pos, &missing, &references, &BTreeMap::new()).is_err());
         let mut missing_start = all.clone();
         missing_start.get_mut(&pos).unwrap().clear();
-        assert!(referenced_start_chunks(pos, &missing_start, &references).is_err());
-        let empty_refs = collect_ordered_structure_references(pos, |_| Ok(vec![])).unwrap();
-        assert!(referenced_start_chunks(pos, &all, &empty_refs).is_err());
         assert!(
-            referenced_start_chunks(pos, &missing_start, &empty_refs)
+            referenced_start_chunks(pos, &missing_start, &references, &BTreeMap::new()).is_err()
+        );
+        let empty_refs = collect_ordered_structure_references(pos, |_| Ok(vec![])).unwrap();
+        assert!(referenced_start_chunks(pos, &all, &empty_refs, &BTreeMap::new()).is_err());
+        assert!(
+            referenced_start_chunks(pos, &missing_start, &empty_refs, &BTreeMap::new())
                 .unwrap()
                 .is_empty()
         );
         let mut wrong_kind = all.clone();
         wrong_kind.get_mut(&pos).unwrap().get_mut(&id).unwrap().kind =
             SimpleStructureKind::SwampHut;
-        assert!(referenced_start_chunks(pos, &wrong_kind, &references).is_err());
+        assert!(referenced_start_chunks(pos, &wrong_kind, &references, &BTreeMap::new()).is_err());
         let mut wrong_position = all.clone();
         wrong_position
             .get_mut(&pos)
@@ -262,7 +404,9 @@ mod tests {
             .unwrap()
             .bounds
             .min[1] -= 1;
-        assert!(referenced_start_chunks(pos, &wrong_position, &references).is_err());
+        assert!(
+            referenced_start_chunks(pos, &wrong_position, &references, &BTreeMap::new()).is_err()
+        );
     }
 
     fn canonical(tag: Tag) -> Tag {
@@ -338,7 +482,7 @@ mod tests {
             (2, ChunkPos { x: -17, z: 23 }, -27, true),
         ] {
             let (starts, references) = fixture(pos, y, present);
-            let actual = pack_structure_data(pos, &starts, &references).unwrap();
+            let actual = pack_structure_data(pos, &starts, &references, &BTreeMap::new()).unwrap();
             let document = native_persistence::nbt::NamedTag {
                 name: "".into(),
                 value: actual.clone(),
@@ -361,5 +505,73 @@ mod tests {
             .arg("StructureDataOracle")
             .arg(temp.path())
             .arg("verify"));
+        use native_resources::{
+            structure_piece::{ScatteredGroundHeight, swamp_hut::SwampHutState},
+            structure_start::HorizontalDirection,
+        };
+        let pos = ChunkPos { x: -17, z: 23 };
+        let id = ResourceId::parse("example:hut").unwrap();
+        let [x, z] = [pos.x * 16, pos.z * 16];
+        let mut index = 0;
+        for direction in [
+            HorizontalDirection::North,
+            HorizontalDirection::South,
+            HorizontalDirection::East,
+            HorizontalDirection::West,
+        ] {
+            let (width, depth) = match direction {
+                HorizontalDirection::North | HorizontalDirection::South => (7, 9),
+                _ => (9, 7),
+            };
+            let start = SimpleStructureStart {
+                kind: SimpleStructureKind::SwampHut,
+                chunk: [pos.x, pos.z],
+                generation_point: [x + 8, 70, z + 8],
+                orientation: Some(direction),
+                bounds: BoundingBox::new([x, 70, z], [x + width - 1, 76, z + depth - 1]).unwrap(),
+                terrain_adjustment: TerrainAdjustment::None,
+            };
+            let references = collect_ordered_structure_references(pos, |source| {
+                if source == pos {
+                    Ok(vec![StructureStartBounds::from_simple(id.clone(), &start)?])
+                } else {
+                    Ok(vec![])
+                }
+            })
+            .unwrap();
+            for witch in [false, true] {
+                for cat in [false, true] {
+                    let state = SwampHutState {
+                        ground: ScatteredGroundHeight::from_saved(70),
+                        spawned_witch: witch,
+                        spawned_cat: cat,
+                    };
+                    let saved = SavedSwampHutPiece::capture(&start, state).unwrap();
+                    let data = pack_structure_data(
+                        pos,
+                        &BTreeMap::from([(id.clone(), start.clone())]),
+                        &references,
+                        &BTreeMap::from([((id.clone(), pos), saved)]),
+                    )
+                    .unwrap();
+                    let document = native_persistence::nbt::NamedTag {
+                        name: "".into(),
+                        value: data,
+                    };
+                    std::fs::write(
+                        temp.path().join(format!("hut-rust-{index}.nbt")),
+                        native_persistence::nbt::write(&document).unwrap(),
+                    )
+                    .unwrap();
+                    index += 1;
+                }
+            }
+        }
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("StructureDataOracle")
+            .arg(temp.path())
+            .arg("verify_hut"));
     }
 }

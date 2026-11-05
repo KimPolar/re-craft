@@ -7026,7 +7026,37 @@ mod tests {
                     })
                 })
             }));
-            assert!(batch.structure_data(target).is_err());
+            let structure_data = batch.structure_data(target).unwrap();
+            let children = match structure_data
+                .get("starts")
+                .unwrap()
+                .get("example:hut")
+                .unwrap()
+                .get("Children")
+                .unwrap()
+            {
+                native_persistence::nbt::Tag::List { values, .. } => values,
+                _ => panic!("hut children are not a list"),
+            };
+            assert_eq!(
+                children[0].get("Witch"),
+                Some(&native_persistence::nbt::Tag::Byte(1))
+            );
+            assert_eq!(
+                children[0].get("Cat"),
+                Some(&native_persistence::nbt::Tag::Byte(1))
+            );
+            assert_eq!(
+                children[0].get("BB"),
+                Some(&native_persistence::nbt::Tag::IntArray(
+                    start
+                        .bounds
+                        .min
+                        .into_iter()
+                        .chain(start.bounds.max)
+                        .collect()
+                ))
+            );
         }
     }
 

@@ -809,6 +809,7 @@ impl FreshTerrainBatch {
                 .references
                 .get(&pos)
                 .context("structure references are missing")?,
+            &structures.huts,
         )
     }
 
@@ -833,6 +834,7 @@ impl FreshTerrainBatch {
                 .references
                 .get(&pos)
                 .context("structure references are missing")?,
+            &structures.huts,
         )
     }
     /// The data-pack tag used for leaf distance checks in this batch.

@@ -1412,55 +1412,49 @@ impl GenerationWorker {
                 return Ok(None);
             }
             if player.is_some() || bonus_chest_feature.is_some() {
-                if bonus_chest_feature.is_some() {
+                if let Some(feature) = bonus_chest_feature {
                     for &pos in &targets {
-                        let maps = ready.batch.spawned_heightmap_data(pos)?;
-                        require_initial_heightmaps(pos, &maps)?;
+                        require_initial_heightmaps(pos, &ready.batch.spawned_heightmap_data(pos)?)?;
                     }
-                }
-                let positions = targets.iter().copied().collect();
-                let next_revision = ready
-                    .mesh
-                    .revision
-                    .checked_add(1)
-                    .context("mesh revision overflow")?;
-                let postprocessor = if let Some(feature) = bonus_chest_feature {
-                    Self::postprocess_with_initial_bonus_chest(
+                    let Some(result) = complete_bonus_postprocessing(
                         ready,
-                        positions,
+                        feature,
+                        initial_level_random.unwrap_or_else(native_session::fresh_level_random),
+                        &mut resources,
+                        &mut classify,
+                        &mut resolve,
+                        None::<&mut crate::fresh_generation::HeightClassifier>,
+                        &mut build,
+                        &mut construct,
+                        spawn_mobs,
+                        true,
+                        biome_blend,
+                        cancelled,
+                        progress,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    ready = result;
+                } else {
+                    let next_revision = ready
+                        .mesh
+                        .revision
+                        .checked_add(1)
+                        .context("mesh revision overflow")?;
+                    let postprocessor = Self::postprocess(
+                        ready,
+                        targets.iter().copied().collect(),
                         0,
                         0,
                         true,
                         next_revision,
-                        InitialBonusChestRequest {
-                            feature,
-                            level_random: initial_level_random
-                                .unwrap_or_else(native_session::fresh_level_random),
-                        },
-                    )?
-                } else {
-                    Self::postprocess(ready, positions, 0, 0, true, next_revision)?
-                };
-                set_phase(progress, GenerationPhase::Postprocessing);
-                loop {
-                    if cancelled.load(Ordering::Relaxed) {
-                        postprocessor.cancel();
-                    }
-                    match postprocessor
-                        .result
-                        .recv_timeout(std::time::Duration::from_millis(25))
-                    {
-                        Ok(GenerationResult::Ready(result)) => {
-                            ready = result;
-                            break;
-                        }
-                        Ok(GenerationResult::Cancelled) => return Ok(None),
-                        Ok(GenerationResult::Failed(error)) => return Err(error),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            anyhow::bail!("initial postprocessing worker stopped unexpectedly")
-                        }
-                    }
+                    )?;
+                    let Some(result) = wait_nested_generation(postprocessor, cancelled, progress)?
+                    else {
+                        return Ok(None);
+                    };
+                    ready = result;
                 }
             }
             if let Some(player) = player {
@@ -1725,14 +1719,14 @@ impl GenerationWorker {
                         native_session::fresh_level_random()
                     }
                 };
-                let Some(result) = complete_structured_bonus_postprocessing(
+                let Some(result) = complete_bonus_postprocessing(
                     ready,
                     feature,
                     level_random,
                     &mut provider,
                     &mut classify,
                     &mut resolve,
-                    &mut classify_height,
+                    Some(&mut classify_height),
                     &mut build,
                     &mut construct,
                     spawn_mobs,
@@ -2516,14 +2510,14 @@ where
 /// Complete an initial bonus attempt without committing a partial placement.
 /// Only a neighbor actually requested by the feature is generated and added.
 #[allow(clippy::too_many_arguments)]
-fn complete_structured_bonus_postprocessing<C, R, H, M, K>(
+fn complete_bonus_postprocessing<C, R, H, M, K>(
     mut ready: GenerationReady,
     feature: Option<native_resources::bonus_chest::BonusChestFeature>,
     mut level_random: native_core::random::LegacyRandom,
     provider: &mut native_resources::packs::ResourceStack,
     classify: &mut C,
     resolve: &mut R,
-    classify_height: &mut H,
+    mut structure_height: Option<&mut H>,
     build_spawner: &mut M,
     construct: &mut K,
     spawn_mobs: bool,
@@ -2546,6 +2540,10 @@ where
     ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
 {
     use native_session::worldgen::InitialBonusChestAttempt;
+    ensure!(
+        ready.batch.supports_structure_expansion() == structure_height.is_some(),
+        "bonus generation structure inputs do not match the batch"
+    );
     let origin = ready
         .suggested_spawn
         .context("initial world spawn is missing")?;
@@ -2588,15 +2586,17 @@ where
                     .revision
                     .checked_add(1)
                     .context("mesh revision overflow")?;
-                if !prepare_structure_expansion(
-                    &mut ready.batch,
-                    needed,
-                    provider,
-                    classify_height,
-                    cancelled,
-                    progress,
-                )? {
-                    return Ok(None);
+                if let Some(classify_height) = &mut structure_height {
+                    if !prepare_structure_expansion(
+                        &mut ready.batch,
+                        needed,
+                        provider,
+                        *classify_height,
+                        cancelled,
+                        progress,
+                    )? {
+                        return Ok(None);
+                    }
                 }
                 let Some(mut expanded) = expand_with_inputs(
                     ready,
@@ -5249,7 +5249,7 @@ mod tests {
             0,
             None,
             None,
-            Some(native_core::random::LegacyRandom::new(1)),
+            Some(native_core::random::LegacyRandom::new(42)),
         )?;
         let bonus_ready = match bonus_worker.result.recv_timeout(Duration::from_secs(120))? {
             GenerationResult::Ready(ready) => ready,
@@ -5264,6 +5264,19 @@ mod tests {
             .initial_bonus_chest_position()
             .flatten()
             .context("bonus chest missing")?;
+        assert_eq!(chest.x.rem_euclid(16), 15);
+        let neighbor = ChunkPos {
+            x: chest.x.div_euclid(16) + 1,
+            z: chest.z.div_euclid(16),
+        };
+        assert!(
+            bonus_ready
+                .mesh
+                .targets
+                .as_deref()
+                .unwrap()
+                .contains(&neighbor)
+        );
         assert_eq!(
             processed
                 .region
@@ -5273,6 +5286,15 @@ mod tests {
                 .name,
             "minecraft:chest"
         );
+        assert_eq!(
+            processed
+                .region
+                .world
+                .block(chest.x + 1, chest.y, chest.z)
+                .unwrap()
+                .name,
+            "minecraft:torch"
+        );
         assert_ne!(
             processed
                 .initial_bonus_chest
@@ -5280,7 +5302,7 @@ mod tests {
                 .unwrap()
                 .level_random
                 .state(),
-            native_core::random::LegacyRandom::new(1).state()
+            native_core::random::LegacyRandom::new(42).state()
         );
         assert!(bonus_ready.player_spawn.is_none());
         let chunk = processed

@@ -194,6 +194,19 @@ pub struct StagedInitialWorld {
     pub stage: native_persistence::save::FreshWorldStage,
 }
 
+/// A structure-aware staging tree for verification. Publication remains
+/// unavailable until all structure-world dependencies have been established.
+pub struct StagedStructureInitialWorld {
+    pub initial: GeneratedInitialPlayer,
+    stage: native_persistence::save::FreshWorldStage,
+}
+
+impl StagedStructureInitialWorld {
+    pub fn path(&self) -> &std::path::Path {
+        self.stage.path()
+    }
+}
+
 impl GenerationReady {
     /// Stage the exact postprocessed targets and a new player together.
     /// Pack files and remaining generation/save dependencies are not yet
@@ -204,6 +217,32 @@ impl GenerationReady {
         last_played_ms: i64,
         region_timestamp: u32,
     ) -> Result<StagedInitialWorld> {
+        self.stage_initial_world_impl(parent, last_played_ms, region_timestamp, false)
+    }
+
+    /// Stage a structure-aware world only for inspection. The private stage
+    /// cannot be published through this API.
+    pub fn stage_structure_initial_world(
+        &mut self,
+        parent: &std::path::Path,
+        last_played_ms: i64,
+        region_timestamp: u32,
+    ) -> Result<StagedStructureInitialWorld> {
+        let staged =
+            self.stage_initial_world_impl(parent, last_played_ms, region_timestamp, true)?;
+        Ok(StagedStructureInitialWorld {
+            initial: staged.initial,
+            stage: staged.stage,
+        })
+    }
+
+    fn stage_initial_world_impl(
+        &mut self,
+        parent: &std::path::Path,
+        last_played_ms: i64,
+        region_timestamp: u32,
+        structures: bool,
+    ) -> Result<StagedInitialWorld> {
         use native_persistence::{
             save::FreshWorldDraft,
             world::{DimensionId, SavedClock},
@@ -213,27 +252,40 @@ impl GenerationReady {
             self.postprocessed.is_some(),
             "initial world has not been postprocessed"
         );
-        let initial = self.start_initial_player_session(last_played_ms)?;
-        let snapshot = initial.session.snapshot();
-        ensure!(snapshot.tick == 0, "initial session has already advanced");
         let processed = self
             .postprocessed
             .as_ref()
             .context("initial world has not been postprocessed")?;
-        ensure!(
-            snapshot.game_time == processed.region.ticks().game_time(),
-            "initial session time differs from postprocessing"
-        );
+        let game_time = processed.region.ticks().game_time();
         let targets = self
             .mesh
             .targets
             .as_ref()
             .context("generated targets are missing")?;
-        let regions = self.batch.postprocessed_region_drafts(
-            &processed.region,
-            targets.iter().copied(),
-            region_timestamp,
-        )?;
+        let regions = if structures {
+            self.batch
+                .prepare_structure_region_drafts(
+                    &processed.region,
+                    targets.iter().copied(),
+                    region_timestamp,
+                )?
+                .regions
+        } else {
+            self.batch.postprocessed_region_drafts(
+                &processed.region,
+                targets.iter().copied(),
+                region_timestamp,
+            )?
+        };
+        // Validate the selected regions before starting a session, which can
+        // consume generation-only context such as the hut spawn inputs.
+        let initial = self.start_initial_player_session(last_played_ms)?;
+        let snapshot = initial.session.snapshot();
+        ensure!(snapshot.tick == 0, "initial session has already advanced");
+        ensure!(
+            snapshot.game_time == game_time,
+            "initial session time differs from postprocessing"
+        );
         let settings = self
             .level_settings
             .as_ref()
@@ -3916,7 +3968,7 @@ mod tests {
             ),
             (
                 "data/example/worldgen/structure/treasure.json",
-                json!({"type":"minecraft:buried_treasure","biomes":["example:test"],"step":"surface_structures"}),
+                json!({"type":"minecraft:buried_treasure","biomes":["example:test","example:bonus"],"step":"surface_structures"}),
             ),
             (
                 "data/example/worldgen/structure_set/treasure.json",
@@ -4071,6 +4123,7 @@ mod tests {
                 && entity.get("z") == Some(&native_persistence::nbt::Tag::Int(pos.z))
                 && matches!(entity.get("LootTable"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:chests/spawn_bonus_chest"))
         }));
+        let expected_block_entities = chest_chunk.chunk.value.get("block_entities").cloned();
         assert!(initial_ready.pack_snapshot.is_some());
         assert!(initial_ready.player_spawn.is_some());
         let initial = initial_ready.start_initial_player_session(123)?;
@@ -4086,11 +4139,63 @@ mod tests {
                 .and_then(|data| data.get("GameType")),
             Some(&native_persistence::nbt::Tag::Int(1))
         );
+        let error = initial_ready
+            .stage_initial_world(temp.path(), 123, 1)
+            .err()
+            .context("ordinary staging accepted a structure world")?;
+        assert!(format!("{error:#}").contains("structure world persistence is not yet supported"));
+        let staged = initial_ready.stage_structure_initial_world(temp.path(), 123, 1)?;
+        assert!(staged.path().join("level.dat").is_file());
         assert!(
-            initial_ready
-                .stage_initial_world(temp.path(), 123, 1)
-                .is_err()
+            staged
+                .path()
+                .join("datapacks/structures/data/example/worldgen/structure/treasure.json")
+                .is_file()
         );
+        let mut reader = native_persistence::world::WorldReader::open(
+            staged.path(),
+            native_persistence::world::DimensionId::parse("overworld")?,
+        )?;
+        assert_eq!(reader.saved_world_seed()?, Some(42));
+        assert_eq!(reader.singleplayer_uuid_words()?, Some(staged.initial.uuid));
+        let structure_chunk = initial_ready
+            .mesh
+            .targets
+            .as_deref()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|&chunk| {
+                initial_ready
+                    .batch
+                    .structure_starts(chunk)
+                    .is_some_and(|starts| {
+                        starts.contains_key(&ResourceId::parse("example:treasure").unwrap())
+                    })
+            })
+            .context("staged world contains no treasure structure start")?;
+        let stored_structure_chunk = reader
+            .read_chunk(structure_chunk.x, structure_chunk.z)?
+            .context("staged structure chunk is missing")?;
+        assert_eq!(
+            stored_structure_chunk.document.value.get("structures"),
+            Some(&initial_ready.batch.structure_data(structure_chunk)?)
+        );
+        let saved_chest_chunk = reader
+            .read_chunk(pos.x.div_euclid(16), pos.z.div_euclid(16))?
+            .context("staged bonus chest chunk is missing")?;
+        assert_eq!(
+            saved_chest_chunk
+                .document
+                .value
+                .get("block_entities")
+                .cloned(),
+            expected_block_entities
+        );
+        drop(reader);
+        let staged_path = staged.path().to_owned();
+        drop(staged);
+        assert!(!staged_path.exists());
         let spawn_worker = GenerationWorker::start_selected_structures_spawn_search(
             crate::fresh_generation::FreshGenerationSettings {
                 minecraft_dir: game.clone(),
@@ -6588,6 +6693,11 @@ mod tests {
                     .context("initial player worker did not postprocess its targets")?;
                 assert_eq!(automatic.region.chunks, targets);
                 assert_eq!(automatic.initial_bonus_chest_position(), None);
+                let error = ready
+                    .stage_structure_initial_world(temp.path(), 123, 1)
+                    .err()
+                    .context("structure staging accepted a structure-free world")?;
+                assert!(format!("{error:#}").contains("structure generation is disabled"));
                 let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
                 assert!(staged.stage.path().join("level.dat").is_file());
                 drop(staged);

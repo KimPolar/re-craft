@@ -43,7 +43,8 @@ use native_world::loaded::{
 use serde_json::Value;
 
 use super::{
-    CarvedTerrainWorld, DecorationPlan, FreshGenerationLightTracker, StagedGenerationLightEngine,
+    CarvedTerrainWorld, DecorationAction, DecorationPlan, FreshGenerationLightTracker,
+    StagedGenerationLightEngine, structure_batch::PlannedStructureDecoration,
 };
 
 mod buried_treasure;
@@ -912,7 +913,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None, None, None)
+        self.execute_inner(terrain, structures_enabled, None, None, None, None)
     }
 
     /// Supply the level light engine's block-light values for FEATURES-stage
@@ -923,7 +924,14 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures_enabled: bool,
         block_light: &dyn Fn([i32; 3]) -> Result<u8>,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, Some(block_light), None, None)
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            Some(block_light),
+            None,
+            None,
+            None,
+        )
     }
 
     /// Supply Java's raw brightness with zero sky subtraction for mushrooms.
@@ -939,6 +947,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             None,
             Some(raw_brightness),
+            None,
             None,
         )
     }
@@ -956,6 +965,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(block_light),
             Some(raw_brightness),
+            None,
             None,
         )
     }
@@ -1021,6 +1031,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&block),
             Some(&raw),
             Some(DecorationLightTracking::Fresh(tracker, registry)),
+            None,
         )
     }
 
@@ -1060,7 +1071,46 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&block),
             Some(&raw),
             Some(DecorationLightTracking::Staged(engine, registry)),
+            None,
         )
+    }
+
+    /// Execute the selected features and buried-treasure starts in Java's
+    /// interleaved step order. The caller must supply the complete validated
+    /// structure plan for this chunk. Updated starts are returned only after
+    /// terrain commits; an error leaves the supplied starts and terrain intact.
+    /// No lighting engine may have registered or propagated this terrain.
+    pub fn execute_with_structure_plan(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        ensure!(
+            !terrain.has_published_light,
+            "structure decoration requires unpublished lighting"
+        );
+        let mut updated: Vec<Vec<_>> = structures
+            .iter()
+            .map(|structure| {
+                structure
+                    .starts
+                    .iter()
+                    .map(|start| (*start).clone())
+                    .collect()
+            })
+            .collect();
+        let features = self.execute_inner(
+            terrain,
+            true,
+            None,
+            None,
+            None,
+            Some((structures, &mut updated)),
+        )?;
+        Ok((features, updated))
     }
 
     fn execute_inner(
@@ -1070,11 +1120,27 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         block_light: Option<&dyn Fn([i32; 3]) -> Result<u8>>,
         raw_brightness: Option<&dyn Fn(&World, [i32; 3]) -> Result<u8>>,
         mut light_tracking: Option<DecorationLightTracking<'_>>,
+        mut structures: Option<(
+            &[PlannedStructureDecoration<'_>],
+            &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+        )>,
     ) -> Result<Vec<bool>> {
         ensure!(
-            !structures_enabled,
+            structures_enabled == structures.is_some(),
             "structure decoration is not implemented"
         );
+        let actions = if let Some((plan, _)) = &structures {
+            for structure in *plan {
+                ensure!(
+                    structure.starts.iter().all(|start| start.kind
+                        == native_resources::structure_start::SimpleStructureKind::BuriedTreasure),
+                    "unsupported structure decoration"
+                );
+            }
+            Some(self.plan.actions_with_structures(plan)?)
+        } else {
+            None
+        };
         ensure!(
             terrain.seed == self.plan.biomes.seed
                 && terrain.min_y == self.plan.biomes.min_y
@@ -1147,12 +1213,64 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             block_light,
         });
         let mut results = Vec::with_capacity(self.plan.features.len());
-        for (index, selected) in self.plan.features.iter().enumerate() {
-            let ore = self
-                .features
-                .get(selected.feature)
-                .context("prepared ore is missing")?;
-            results.push(region.place_planned_auto(self.plan, index, ore)?);
+        if let Some(actions) = actions {
+            let (plan, updated) = structures.as_mut().context("structure plan is missing")?;
+            let min_y = self
+                .plan
+                .biomes
+                .min_y
+                .checked_add(1)
+                .context("structure min Y overflow")?;
+            let max_y = self
+                .plan
+                .biomes
+                .min_y
+                .checked_add(self.plan.biomes.height)
+                .and_then(|y| y.checked_sub(1))
+                .context("structure max Y overflow")?;
+            let max_x = self.plan.origin[0]
+                .checked_add(15)
+                .context("structure X overflow")?;
+            let max_z = self.plan.origin[2]
+                .checked_add(15)
+                .context("structure Z overflow")?;
+            let clip = native_core::beardifier::BoundingBox::new(
+                [self.plan.origin[0], min_y, self.plan.origin[2]],
+                [max_x, max_y, max_z],
+            )
+            .map_err(anyhow::Error::msg)?;
+            for action in actions {
+                match action {
+                    DecorationAction::Feature(index) => {
+                        let selected = &self.plan.features[index];
+                        let feature = self
+                            .features
+                            .get(selected.feature)
+                            .context("prepared feature is missing")?;
+                        results.push(region.place_planned_auto(self.plan, index, feature)?);
+                    }
+                    DecorationAction::Structure(index) => {
+                        let mut random = plan[index].entry.random(self.plan.decoration_seed());
+                        for start in &mut updated[index] {
+                            let intersects = (0..3).all(|axis| {
+                                start.bounds.max[axis] >= clip.min[axis]
+                                    && start.bounds.min[axis] <= clip.max[axis]
+                            });
+                            if intersects {
+                                region.place_buried_treasure(start, clip, &mut random)?;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (index, selected) in self.plan.features.iter().enumerate() {
+                let feature = self
+                    .features
+                    .get(selected.feature)
+                    .context("prepared feature is missing")?;
+                results.push(region.place_planned_auto(self.plan, index, feature)?);
+            }
         }
         finish_decoration_with_light(region, &mut light_tracking)?;
         terrain.completed_decoration.insert(center);
@@ -6725,10 +6843,28 @@ mod tests {
         let generated = resources.vanilla_generated_block_registry().unwrap();
         let registry = resources.vanilla_block_ids().unwrap();
         let motion = HeightmapTags::load(&mut resources, &registry).unwrap();
+        struct EmptyFeatures;
+        impl ResourceProvider for EmptyFeatures {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    Ok(Some(br#"{"features":[]}"#.to_vec()))
+                } else {
+                    Data.read_data(path)
+                }
+            }
+        }
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let empty_schedule =
+            FeatureSchedule::load(&mut EmptyFeatures, &[plains], &BTreeSet::new()).unwrap();
+        let (_, _, neighborhood) = scheduled_fixture(None);
         let center = ChunkPos { x: 0, z: 0 };
         let mut chests = 0;
         let mut materialized_chests = 0;
         let mut pending_chest_cases = 0;
+        let mut scheduled_cases = 0;
         for case in fixtures {
             let id = case["id"].as_i64().unwrap();
             assert_eq!(lines.next().unwrap(), format!("S {id}"));
@@ -6817,6 +6953,81 @@ mod tests {
                     _ => panic!("unexpected oracle output"),
                 }
             };
+            if case["clip_max"][0].as_i64() == Some(15) {
+                // The Java oracle calls postProcess directly, so use an
+                // in-range starting Y to exercise StructureStart's clip check.
+                let mut scheduled_terrain = fixture().0;
+                scheduled_terrain.world = Arc::clone(&terrain.world);
+                scheduled_terrain.ore_ocean_floor_heights = terrain.ore_ocean_floor_heights.clone();
+                let mut scheduled_plan = fixture_plan(&empty_schedule, &neighborhood);
+                scheduled_plan.decoration_seed = case["seed"].as_i64().unwrap();
+                let prepared = PreparedDecoration::load(
+                    &mut resources,
+                    &scheduled_plan,
+                    &registry,
+                    &mut |value| super::super::resolve_generated_terrain_state(value, &generated),
+                )
+                .unwrap();
+                let entry = native_resources::structure_decoration::StructureDecorationEntry {
+                    id: ResourceId::parse("minecraft:buried_treasure").unwrap(),
+                    step: 0,
+                    index: 0,
+                };
+                let start = SimpleStructureStart {
+                    kind: SimpleStructureKind::BuriedTreasure,
+                    chunk: [0, 0],
+                    generation_point: [8, 10, 8],
+                    orientation: None,
+                    bounds: BoundingBox::new([9, 14, 9], [9, 14, 9]).unwrap(),
+                    terrain_adjustment: TerrainAdjustment::None,
+                };
+                let planned = [PlannedStructureDecoration {
+                    entry: &entry,
+                    starts: vec![&start],
+                }];
+                let (features, updated) = prepared
+                    .execute_with_structure_plan(&mut scheduled_terrain, &planned)
+                    .unwrap_or_else(|error| panic!("scheduled fixture {id}: {error:#}"));
+                assert!(features.is_empty());
+                assert_eq!(
+                    (updated[0][0].bounds.min, updated[0][0].bounds.max),
+                    expected_bounds.unwrap()
+                );
+                let snapshot = scheduled_terrain.snapshot();
+                for y in 0..16 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let block = snapshot.block(x, y, z).unwrap();
+                            let fallback = ("minecraft:air".to_owned(), None);
+                            let (name, facing) = expected.get(&[x, y, z]).unwrap_or(&fallback);
+                            assert_eq!(&block.name, name, "scheduled fixture {id} at {x},{y},{z}");
+                            if let Some(facing) = facing {
+                                assert_eq!(block.properties.get("facing"), Some(facing));
+                            }
+                        }
+                    }
+                }
+                let actual: Vec<_> = scheduled_terrain
+                    .generated_monster_entities()
+                    .filter_map(|entity| match entity {
+                        super::super::GeneratedMonsterRoomEntity::Chest(chest) => Some(chest),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some((position, table, seed)) = &expected_chest {
+                    assert_eq!(actual.len(), 1);
+                    assert_eq!(
+                        (&actual[0].position, actual[0].loot_seed),
+                        (position, *seed)
+                    );
+                    assert!(
+                        matches!(actual[0].block_entity().get("LootTable"), Some(native_persistence::nbt::Tag::String(value)) if value.matches(table))
+                    );
+                } else {
+                    assert!(actual.is_empty());
+                }
+                scheduled_cases += 1;
+            }
             let mut piece = SimpleStructureStart {
                 kind: SimpleStructureKind::BuriedTreasure,
                 chunk: [0, 0],
@@ -6919,6 +7130,7 @@ mod tests {
             }
         }
         assert!(chests > 0, "oracle cases must include generated chests");
+        assert!(scheduled_cases > 0, "scheduled placement was not compared");
         assert!(
             materialized_chests > 0,
             "oracle cases must include a fully tracked chest"
@@ -19643,6 +19855,117 @@ mod tests {
         }));
         assert!(prepared.execute(&mut terrain, false).is_err());
         assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn prepared_decoration_places_buried_treasure_and_rolls_back_later_failure() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            structure_decoration::StructureDecorationEntry,
+            structure_start::{SimpleStructureKind, SimpleStructureStart},
+        };
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend(
+            [
+                "minecraft:sand",
+                "minecraft:chest",
+                "minecraft:water",
+                "minecraft:lava",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test).unwrap();
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:buried_treasure").unwrap(),
+            step: 0,
+            index: 1,
+        };
+        let make_start = |x| SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            orientation: None,
+            bounds: BoundingBox::new([x, 14, 9], [x, 14, 9]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let first = make_start(9);
+        let structures = [PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&first],
+        }];
+        let mut random = entry.random(plan.decoration_seed());
+        let expected_seed = random.next_long();
+        let (mut terrain, _, _, _) = fixture();
+        let (features, starts) = prepared
+            .execute_with_structure_plan(&mut terrain, &structures)
+            .unwrap();
+        assert_eq!(features.len(), plan.features.len());
+        assert_eq!(starts[0][0].bounds.min, [9, 8, 9]);
+        assert_eq!(first.bounds.min, [9, 14, 9]);
+        assert_eq!(
+            terrain.snapshot().block(9, 8, 9).unwrap().name,
+            "minecraft:chest"
+        );
+        let chest = terrain.generated_monster_entities().next().unwrap();
+        assert!(
+            matches!(chest, super::super::GeneratedMonsterRoomEntity::Chest(chest) if chest.loot_seed == expected_seed)
+        );
+
+        let second = make_start(4);
+        let structures = [PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&first, &second],
+        }];
+        let (mut terrain, _, _, _) = fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let beacon = world.intern_state(state("beacon"));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[4 + 9 * 16 + 8 * 256] = beacon;
+        let before = terrain.snapshot();
+        assert!(
+            prepared
+                .execute_with_structure_plan(&mut terrain, &structures)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
+        assert_eq!(first.bounds.min, [9, 14, 9]);
+        assert_eq!(second.bounds.min, [4, 14, 9]);
+
+        let unsupported = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            ..make_start(9)
+        };
+        let structures = [PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&unsupported],
+        }];
+        assert!(
+            prepared
+                .execute_with_structure_plan(&mut terrain, &structures)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+
+        let outside = SimpleStructureStart {
+            bounds: BoundingBox::new([9, 90, 9], [9, 90, 9]).unwrap(),
+            ..make_start(9)
+        };
+        let structures = [PlannedStructureDecoration {
+            entry: &entry,
+            starts: vec![&outside],
+        }];
+        let (mut terrain, _, _, _) = fixture();
+        let (_, starts) = prepared
+            .execute_with_structure_plan(&mut terrain, &structures)
+            .unwrap();
+        assert_eq!(starts[0][0].bounds.min, [9, 90, 9]);
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
     }
 
     #[test]

@@ -201,6 +201,67 @@ fn fresh_hut_cats_match_java_nbt_and_region_random() {
         }
     }
     cases[0]["piece_checks"] = json!(checks);
+    let mut huts = Vec::new();
+    for (direction, name) in [
+        (
+            native_resources::structure_start::HorizontalDirection::North,
+            "north",
+        ),
+        (
+            native_resources::structure_start::HorizontalDirection::East,
+            "east",
+        ),
+        (
+            native_resources::structure_start::HorizontalDirection::South,
+            "south",
+        ),
+        (
+            native_resources::structure_start::HorizontalDirection::West,
+            "west",
+        ),
+    ] {
+        let (x, z) = if matches!(
+            direction,
+            native_resources::structure_start::HorizontalDirection::North
+                | native_resources::structure_start::HorizontalDirection::South
+        ) {
+            (9, 11)
+        } else {
+            (11, 9)
+        };
+        for height in [-1, 64, -30] {
+            for flags in 0..4 {
+                let state = native_resources::structure_piece::swamp_hut::SwampHutState {
+                    ground: native_resources::structure_piece::ScatteredGroundHeight::from_saved(
+                        height,
+                    ),
+                    spawned_witch: flags & 1 != 0,
+                    spawned_cat: flags & 2 != 0,
+                };
+                let saved = native_session::worldgen::SavedSwampHutPiece {
+                    bounds: native_core::beardifier::BoundingBox::new([3, 64, 3], [x, 70, z])
+                        .unwrap(),
+                    orientation: direction,
+                    state,
+                };
+                let path = temp.path().join(format!("saved-hut-{}.nbt", huts.len()));
+                let output = temp
+                    .path()
+                    .join(format!("saved-hut-java-{}.nbt", huts.len()));
+                std::fs::write(
+                    &path,
+                    write(&NamedTag {
+                        name: "".into(),
+                        value: saved.to_tag().unwrap(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                huts.push((saved, json!({"path":path,"output":output,"direction":name})));
+            }
+        }
+    }
+    cases[0]["saved_huts"] = json!(huts.iter().map(|(_, value)| value).collect::<Vec<_>>());
     let input = temp.path().join("cases.json");
     std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
     let constructions = temp.path().join("constructions.json");
@@ -210,6 +271,16 @@ fn fresh_hut_cats_match_java_nbt_and_region_random() {
         .arg("GeneratedHutCatOracle")
         .arg(input)
         .arg(&constructions));
+    for (saved, item) in huts {
+        let java = native_persistence::nbt::read(
+            &std::fs::read(item["output"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            native_session::worldgen::SavedSwampHutPiece::from_tag(&java.value).unwrap(),
+            saved
+        );
+    }
     let observations: Value =
         serde_json::from_slice(&std::fs::read(constructions).unwrap()).unwrap();
     for case in observations.as_array().unwrap() {

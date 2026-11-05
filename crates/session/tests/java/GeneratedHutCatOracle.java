@@ -116,6 +116,13 @@ public class GeneratedHutCatOracle {
             var check=entry.getAsJsonObject();var point=new BlockPos(check.get("x").getAsInt(),check.get("y").getAsInt(),check.get("z").getAsInt());
             if(manager.structureHasPieceAt(point,start)!=check.get("expected").getAsBoolean())throw new AssertionError("structure piece condition differs: "+check);
         }
+        for(var entry:input.get(0).getAsJsonObject().getAsJsonArray("saved_huts")) {
+            var item=entry.getAsJsonObject();var path=Path.of(item.get("path").getAsString());var original=NbtIo.read(path);
+            var hut=new SwampHutPiece(original);
+            if(!hut.getOrientation().getSerializedName().equals(item.get("direction").getAsString()))throw new AssertionError("hut orientation differs: "+item);
+            var saved=hut.createTag(null);if(!saved.equals(original))throw new AssertionError("hut saved data differs: java="+saved+" rust="+original);
+            NbtIo.write(saved,Path.of(item.get("output").getAsString()));
+        }
         var seedField=LegacyRandomSource.class.getDeclaredField("seed");seedField.setAccessible(true);var constructions=new JsonArray();
         for(var type:List.of("cat","witch")) for(int index=0;index<32;index++) {
             Mob entity=type.equals("cat")?new ObserveCat(world):new ObserveWitch(world);

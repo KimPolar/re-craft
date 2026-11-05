@@ -37,6 +37,7 @@ mod generated_donkey;
 mod generated_farm_animal;
 mod generated_horse;
 mod generated_hut_mobs;
+mod generated_hut_piece;
 mod generated_sheep;
 mod generated_spawner;
 mod mob_collision;
@@ -61,6 +62,7 @@ pub use generated_donkey::draft_fresh_donkey;
 pub use generated_farm_animal::draft_fresh_farm_animal;
 pub use generated_horse::draft_fresh_horse;
 pub use generated_hut_mobs::{draft_fresh_hut_cat, draft_fresh_hut_witch};
+pub use generated_hut_piece::SavedSwampHutPiece;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
 pub use mob_placement::{

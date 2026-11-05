@@ -7019,11 +7019,15 @@ mod tests {
                 .unwrap()
         );
         let mut after_first = random.clone();
+        let saved = super::super::SavedSwampHutPiece::capture(&actual_piece, actual_state).unwrap();
+        let mut saved =
+            super::super::SavedSwampHutPiece::from_tag(&saved.to_tag().unwrap()).unwrap();
+        actual_piece = piece();
         assert!(
             region
-                .place_swamp_hut_with_initialized_mobs(
+                .resume_swamp_hut_with_initialized_mobs(
                     &mut actual_piece,
-                    &mut actual_state,
+                    &mut saved,
                     clip,
                     &mut random,
                     &variants,
@@ -7056,7 +7060,7 @@ mod tests {
             &[witch, cat]
         );
         assert_eq!(random.next_long(), expected_random.next_long());
-        assert!(actual_state.spawned_witch && actual_state.spawned_cat);
+        assert!(saved.state.spawned_witch && saved.state.spawned_cat);
 
         let (mut terrain, tags, _, _) = fixture();
         let before = terrain.snapshot();

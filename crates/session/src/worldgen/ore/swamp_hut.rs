@@ -86,6 +86,52 @@ struct HutRegion<'a, 'b, F> {
 }
 
 impl DecorationRegion<'_> {
+    /// Resume a saved hut piece in another decoration chunk. All state is
+    /// staged until this call succeeds; the caller must additionally stage it
+    /// until the enclosing decoration region is committed.
+    pub fn resume_swamp_hut_with_initialized_mobs<C, P>(
+        &mut self,
+        piece: &mut SimpleStructureStart,
+        saved: &mut super::super::SavedSwampHutPiece,
+        clip: BoundingBox,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        cat_variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition_matches: &mut P,
+    ) -> Result<bool>
+    where
+        C: Clone + FnMut(HutMob) -> Result<super::super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &serde_json::Value) -> Result<bool>,
+    {
+        let mut staged_piece = piece.clone();
+        let mut staged_state = saved.restore(&mut staged_piece)?;
+        let mut staged_random = random.clone();
+        let mut staged_construct = construct.clone();
+        let mut staged_conditions = condition_matches.clone();
+        let result = self.place_swamp_hut_with_initialized_mobs(
+            &mut staged_piece,
+            &mut staged_state,
+            clip,
+            &mut staged_random,
+            cat_variants,
+            &mut staged_construct,
+            &mut staged_conditions,
+        )?;
+        let updated = match super::super::SavedSwampHutPiece::capture(&staged_piece, staged_state) {
+            Ok(updated) => updated,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+        *piece = staged_piece;
+        *saved = updated;
+        *random = staged_random;
+        *construct = staged_construct;
+        *condition_matches = staged_conditions;
+        Ok(result)
+    }
+
     /// Place a hut and initialize its witch and cat against one region RNG.
     /// `construct` must return the independently seeded constructor state for
     /// the requested species. `condition_matches` must use the active world,

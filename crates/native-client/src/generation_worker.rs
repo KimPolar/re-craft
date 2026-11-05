@@ -176,6 +176,14 @@ impl GenerationReady {
             self.postprocessed.is_some(),
             "initial world has not been postprocessed"
         );
+        ensure!(
+            self.worldgen_settings_draft
+                .as_ref()
+                .and_then(|draft| draft.value.get("data"))
+                .and_then(|data| data.get("bonus_chest"))
+                != Some(&native_persistence::nbt::Tag::Byte(1)),
+            "bonus world heightmap history is not yet verified for saving"
+        );
         let initial = self.start_initial_player_session(last_played_ms)?;
         let snapshot = initial.session.snapshot();
         ensure!(snapshot.tick == 0, "initial session has already advanced");
@@ -250,6 +258,20 @@ impl GenerationReady {
         &mut self,
         last_played_ms: i64,
     ) -> Result<GeneratedInitialPlayer> {
+        if self
+            .worldgen_settings_draft
+            .as_ref()
+            .and_then(|draft| draft.value.get("data"))
+            .and_then(|data| data.get("bonus_chest"))
+            == Some(&native_persistence::nbt::Tag::Byte(1))
+        {
+            ensure!(
+                self.postprocessed
+                    .as_ref()
+                    .is_some_and(|processed| processed.initial_bonus_chest.is_some()),
+                "initial bonus chest has not been processed"
+            );
+        }
         let spawn = self.player_spawn.context("initial player spawn missing")?;
         ensure!(
             self.initial_respawn.is_some(),
@@ -1136,7 +1158,14 @@ impl GenerationWorker {
     where
         F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
     {
-        Self::start_initial_world_impl(prepare, revision, biome_blend, ceiling_spawn_height, None)
+        Self::start_initial_world_impl(
+            prepare,
+            revision,
+            biome_blend,
+            ceiling_spawn_height,
+            None,
+            None,
+        )
     }
 
     /// Also resolve the initial player's collision-checked position, expanding
@@ -1157,6 +1186,7 @@ impl GenerationWorker {
             biome_blend,
             ceiling_spawn_height,
             Some(player),
+            None,
         )
     }
 
@@ -1166,6 +1196,7 @@ impl GenerationWorker {
         biome_blend: u8,
         ceiling_spawn_height: Option<i32>,
         player: Option<InitialPlayerSpawnOptions>,
+        initial_level_random: Option<native_core::random::LegacyRandom>,
     ) -> Result<Self>
     where
         F: FnOnce() -> Result<crate::fresh_generation::PreparedInitialWorld> + Send + 'static,
@@ -1181,6 +1212,7 @@ impl GenerationWorker {
                 mut resolve,
                 height_tags,
                 worldgen_settings,
+                bonus_chest_feature,
                 creatures,
                 spawn_mobs,
                 border,
@@ -1247,6 +1279,52 @@ impl GenerationWorker {
                 progress,
             )? {
                 return Ok(None);
+            }
+            if let Some(feature) = bonus_chest_feature {
+                for &pos in &targets {
+                    let maps = ready.batch.spawned_heightmap_data(pos)?;
+                    require_initial_heightmaps(pos, &maps)?;
+                }
+                let positions = targets.iter().copied().collect();
+                let next_revision = ready
+                    .mesh
+                    .revision
+                    .checked_add(1)
+                    .context("mesh revision overflow")?;
+                let postprocessor = Self::postprocess_with_initial_bonus_chest(
+                    ready,
+                    positions,
+                    0,
+                    0,
+                    true,
+                    next_revision,
+                    InitialBonusChestRequest {
+                        feature,
+                        level_random: initial_level_random
+                            .unwrap_or_else(native_session::fresh_level_random),
+                    },
+                )?;
+                set_phase(progress, GenerationPhase::Postprocessing);
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        postprocessor.cancel();
+                    }
+                    match postprocessor
+                        .result
+                        .recv_timeout(std::time::Duration::from_millis(25))
+                    {
+                        Ok(GenerationResult::Ready(result)) => {
+                            ready = result;
+                            break;
+                        }
+                        Ok(GenerationResult::Cancelled) => return Ok(None),
+                        Ok(GenerationResult::Failed(error)) => return Err(error),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            anyhow::bail!("bonus chest postprocessing worker stopped unexpectedly")
+                        }
+                    }
+                }
             }
             if let Some(player) = player {
                 ensure!(player.radius >= 0, "player spawn radius is invalid");
@@ -1680,6 +1758,23 @@ impl GenerationWorker {
             }
         }
     }
+}
+
+fn require_initial_heightmaps(pos: ChunkPos, maps: &native_persistence::nbt::Tag) -> Result<()> {
+    for name in [
+        "WORLD_SURFACE",
+        "OCEAN_FLOOR",
+        "MOTION_BLOCKING",
+        "MOTION_BLOCKING_NO_LEAVES",
+    ] {
+        ensure!(
+            maps.get(name).is_some(),
+            "initial bonus chest requires generated {name} heightmap for chunk {}, {}",
+            pos.x,
+            pos.z
+        );
+    }
+    Ok(())
 }
 
 fn checked_spawn_targets(ready: &mut GenerationReady) -> Result<BTreeSet<ChunkPos>> {
@@ -2382,6 +2477,31 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bonus_generation_rejects_every_missing_final_heightmap() {
+        use native_persistence::nbt::Tag;
+        let pos = ChunkPos { x: -2, z: 3 };
+        let names = [
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+        ];
+        let all = || {
+            names
+                .iter()
+                .map(|&name| (name.into(), Tag::LongArray(vec![])))
+                .collect::<Vec<_>>()
+        };
+        assert!(require_initial_heightmaps(pos, &Tag::Compound(all())).is_ok());
+        for missing in 0..names.len() {
+            let mut entries = all();
+            entries.remove(missing);
+            let error = require_initial_heightmaps(pos, &Tag::Compound(entries)).unwrap_err();
+            assert!(error.to_string().contains(names[missing]));
+        }
+    }
     use std::time::Duration;
 
     #[test]
@@ -2911,6 +3031,108 @@ mod tests {
         std::fs::write(
             pack.join("data/minecraft/tags/block/animals_spawnable_on.json"),
             br#"{"replace":true,"values":["minecraft:dirt"]}"#,
+        )?;
+        let mut bonus_preset = preset.clone();
+        bonus_preset["dimensions"]["minecraft:overworld"]["generator"]["settings"]["noise_router"]
+            ["final_density"] = json!({
+                "type":"minecraft:gradient", "axis":"y",
+                "from_coordinate":0, "to_coordinate":16, "from_value":1, "to_value":-1
+        });
+        std::fs::write(
+            pack.join("data/example/worldgen/world_preset/bonus.json"),
+            serde_json::to_vec(&bonus_preset)?,
+        )?;
+        // A normal WorldGenLevel write primes all final heightmaps in this
+        // fixture. The worker rejects chunks missing that generation history.
+        let mut bonus_biome = biome.clone();
+        bonus_biome["features"] = json!([[{
+            "feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:short_grass"}},
+            "placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]
+        }]]);
+        std::fs::write(
+            pack.join("data/example/worldgen/biome/flat.json"),
+            serde_json::to_vec(&bonus_biome)?,
+        )?;
+        let bonus_game = game.clone();
+        let bonus_world = world.clone();
+        let bonus_worker = GenerationWorker::start_initial_world_impl(
+            move || {
+                let prepared = prepare(crate::fresh_generation::FreshGenerationSettings {
+                    minecraft_dir: bonus_game,
+                    preset: "example:bonus".into(),
+                    dimension: "minecraft:overworld".into(),
+                    seed: 42,
+                    bonus_chest: true,
+                    structures_enabled: false,
+                    data_packs: Some((
+                        bonus_world,
+                        DataPackSettings {
+                            enabled: vec!["vanilla".into(), "file/compact".into()],
+                            disabled: vec![],
+                            enabled_features: vec!["minecraft:vanilla".into()],
+                        },
+                    )),
+                })?;
+                prepared.into_new_world_inputs(
+                    native_session::respawn::RespawnBorder {
+                        min_x: -100.0,
+                        max_x: 100.0,
+                        min_z: -100.0,
+                        max_z: 100.0,
+                    },
+                    false,
+                    true,
+                )
+            },
+            70,
+            0,
+            None,
+            None,
+            Some(native_core::random::LegacyRandom::new(1)),
+        )?;
+        let mut bonus_ready = match bonus_worker.result.recv_timeout(Duration::from_secs(120))? {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("bonus world generation cancelled"),
+        };
+        let processed = bonus_ready
+            .postprocessed
+            .as_ref()
+            .context("bonus postprocessing missing")?;
+        let chest = processed
+            .initial_bonus_chest_position()
+            .flatten()
+            .context("bonus chest missing")?;
+        assert_eq!(
+            processed
+                .region
+                .world
+                .block(chest.x, chest.y, chest.z)
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert_ne!(
+            processed
+                .initial_bonus_chest
+                .as_ref()
+                .unwrap()
+                .level_random
+                .state(),
+            native_core::random::LegacyRandom::new(1).state()
+        );
+        assert!(bonus_ready.player_spawn.is_none());
+        assert!(
+            bonus_ready
+                .stage_initial_world(temp.path(), 123, 1)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("heightmap history")
+        );
+        std::fs::write(
+            pack.join("data/example/worldgen/biome/flat.json"),
+            serde_json::to_vec(&biome)?,
         )?;
         for (spawn_mobs, disabled, species, feature_kind) in [
             (false, false, "minecraft:sheep", 0),

@@ -50,6 +50,9 @@ pub struct PreparedInitialWorld {
     pub resolve: Resolver,
     pub height_tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
     pub worldgen_settings: native_persistence::nbt::NamedTag,
+    /// Outer option means the world requests a bonus; the feature itself can
+    /// be absent in the selected registry.
+    pub bonus_chest_feature: Option<Option<native_resources::bonus_chest::BonusChestFeature>>,
     pub creatures: Option<PreparedCreatureSpawning>,
     pub spawn_mobs: bool,
     pub border: native_session::respawn::RespawnBorder,
@@ -374,6 +377,19 @@ impl PreparedFreshGeneration {
                 &blocks,
             )?)
         };
+        let bonus_chest_feature = if self
+            .worldgen_settings
+            .value
+            .get("data")
+            .and_then(|data| data.get("bonus_chest"))
+            == Some(&native_persistence::nbt::Tag::Byte(1))
+        {
+            Some(native_resources::bonus_chest::BonusChestFeature::load(
+                &mut self.resources,
+            )?)
+        } else {
+            None
+        };
         Ok(PreparedInitialWorld {
             batch: self.batch,
             resources: self.resources,
@@ -381,6 +397,7 @@ impl PreparedFreshGeneration {
             resolve: self.resolve,
             height_tags,
             worldgen_settings: self.worldgen_settings,
+            bonus_chest_feature,
             creatures,
             spawn_mobs,
             border,
@@ -436,8 +453,8 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         "fresh generation with structures is not implemented"
     );
     ensure!(
-        !settings.bonus_chest,
-        "bonus chest generation is not implemented"
+        !settings.bonus_chest || settings.dimension == "minecraft:overworld",
+        "initial bonus chest requires the overworld"
     );
     let mut resources = ResourceStack::open(&settings.minecraft_dir)?;
     let pack_selection = settings
@@ -590,8 +607,10 @@ mod tests {
         let pack = world.join("datapacks/overrides");
         let dimension_dir = pack.join("data/minecraft/dimension_type");
         let tag_dir = pack.join("data/minecraft/tags/block");
+        let feature_dir = pack.join("data/minecraft/worldgen/feature");
         std::fs::create_dir_all(&dimension_dir)?;
         std::fs::create_dir_all(&tag_dir)?;
+        std::fs::create_dir_all(&feature_dir)?;
         std::fs::write(
             pack.join("pack.mcmeta"),
             br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
@@ -604,12 +623,16 @@ mod tests {
             tag_dir.join("blocks_motion_in_heightmap.json"),
             br#"{"replace":true,"values":["minecraft:grass_block"]}"#,
         )?;
+        std::fs::write(
+            feature_dir.join("bonus_chest.json"),
+            br#"{"type":"minecraft:bonus_chest","config":{}}"#,
+        )?;
         let prepared = prepare(FreshGenerationSettings {
             minecraft_dir: game,
             preset: "minecraft:normal".into(),
             dimension: "minecraft:overworld".into(),
             seed: 42,
-            bonus_chest: false,
+            bonus_chest: true,
             structures_enabled: false,
             data_packs: Some((
                 world,
@@ -623,6 +646,10 @@ mod tests {
         // Later source edits must not change data read by generation workers.
         std::fs::write(dimension_dir.join("overworld.json"), b"{}")?;
         std::fs::write(
+            feature_dir.join("bonus_chest.json"),
+            br#"{"type":"minecraft:flower","config":{}}"#,
+        )?;
+        std::fs::write(
             tag_dir.join("blocks_motion_in_heightmap.json"),
             br#"{"replace":true,"values":["minecraft:stone"]}"#,
         )?;
@@ -633,6 +660,7 @@ mod tests {
             max_z: 100.0,
         };
         let mut inputs = prepared.into_initial_world_inputs(border, clocks, true, true)?;
+        assert!(matches!(inputs.bonus_chest_feature.as_ref(), Some(Some(_))));
         let active: Value = serde_json::from_slice(
             &inputs
                 .resources
@@ -687,17 +715,17 @@ mod tests {
     }
 
     #[test]
-    fn bonus_chest_is_rejected_before_reading_files() {
+    fn bonus_chest_requires_the_overworld() {
         let result = prepare(FreshGenerationSettings {
             minecraft_dir: PathBuf::new(),
             preset: "minecraft:normal".into(),
-            dimension: "minecraft:overworld".into(),
+            dimension: "minecraft:the_nether".into(),
             seed: 1,
             bonus_chest: true,
             structures_enabled: false,
             data_packs: None,
         });
-        assert!(result.err().unwrap().to_string().contains("bonus chest"));
+        assert!(result.err().unwrap().to_string().contains("overworld"));
     }
 
     #[test]

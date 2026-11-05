@@ -241,6 +241,11 @@ fn fresh_session_seed() -> i64 {
     (unique ^ now) as i64
 }
 
+/// Construct a fresh server-level random stream before initial spawn features.
+pub fn fresh_level_random() -> native_core::random::LegacyRandom {
+    native_core::random::LegacyRandom::new(fresh_session_seed())
+}
+
 fn push_consume_particle(
     queue: &mut VecDeque<consume_particles::ConsumeParticleSpawn>,
     item: &Arc<inventory::ItemStack>,

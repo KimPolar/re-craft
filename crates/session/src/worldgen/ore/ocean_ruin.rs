@@ -30,6 +30,56 @@ struct RuinFloorWorld<'r, 'a, 't> {
 }
 
 impl DecorationRegion<'_> {
+    /// Apply one processed archaeology replacement and materialize its block
+    /// entity in Java's template-placement order. The caller must still run
+    /// the template fluid and shape passes and the later marker pass.
+    pub fn place_ocean_ruin_archaeology_block(
+        &mut self,
+        position: [i32; 3],
+        replacement: &super::super::ocean_ruin::ArchaeologyReplacement,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        self.failed = true;
+        ensure!(
+            self.writable.contains(&chunk(position)) && !self.is_outside(position[1]),
+            "archaeology block outside writable region"
+        );
+        let brushable = super::super::GeneratedBrushable::from_replacement(position, replacement)?;
+        ensure!(
+            registry.is_canonical_state(&brushable.state.name, &brushable.state.properties)
+                && registry.has_block_entity(&brushable.state.name) == Some(true),
+            "invalid archaeology block registry state"
+        );
+        let old = self.read(position)?;
+        ensure!(
+            registry.is_canonical_state(&old.name, &old.properties)
+                && registry.has_block_entity(&old.name) == Some(false)
+                && !self.monster_entities.contains_key(&position)
+                && !self.bee_nests.contains_key(&position),
+            "unsupported archaeology replacement source"
+        );
+        // StructureTemplate writes a barrier first whenever processed NBT is
+        // present, then writes the final state and resolves its block entity.
+        self.set_proto_block(
+            position,
+            &BlockState {
+                name: "minecraft:barrier".into(),
+                properties: BTreeMap::new(),
+            },
+        )?;
+        self.set_proto_block(position, &brushable.state)?;
+        Arc::make_mut(&mut self.monster_entities).insert(
+            position,
+            Some(super::super::GeneratedMonsterRoomEntity::Brushable(
+                brushable,
+            )),
+        );
+        Arc::make_mut(self.entity_order.entry(chunk(position)).or_default()).insert(position);
+        self.failed = false;
+        Ok(())
+    }
+
     /// Adjust a piece against this unpublished region using active data-pack
     /// ice and water tags. A failed read does not alter the piece origin.
     pub fn align_ocean_ruin(
@@ -861,6 +911,74 @@ mod tests {
             before_count
         );
         assert!(region.failed);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn archaeology_block_records_deferred_loot_and_rolls_back() -> Result<()> {
+        use super::super::super::ocean_ruin::ArchaeologyReplacement;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let ids = [
+            "minecraft:stone",
+            "minecraft:air",
+            "minecraft:chest",
+            "minecraft:barrier",
+            "minecraft:suspicious_sand",
+            "minecraft:suspicious_gravel",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let motion = HeightmapTags::load(&mut MotionTags, &ids)?;
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let replacement = |name: &str, seed| ArchaeologyReplacement {
+            state: BlockState {
+                name: name.into(),
+                properties: BTreeMap::from([("dusted".into(), "0".into())]),
+            },
+            nbt: Tag::Compound(vec![
+                (
+                    "LootTable".into(),
+                    Tag::String("minecraft:archaeology/ocean_ruin_warm".into()),
+                ),
+                ("LootTableSeed".into(), Tag::Long(seed)),
+            ]),
+        };
+        let sand = replacement("minecraft:suspicious_sand", 73);
+        let gravel = replacement("minecraft:suspicious_gravel", 0);
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        region.place_ocean_ruin_archaeology_block([8, 8, 8], &sand, &registry)?;
+        region.place_ocean_ruin_archaeology_block([9, 8, 8], &gravel, &registry)?;
+        region.finish()?;
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing entities")
+        };
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().any(|tag| tag.get("x") == Some(&Tag::Int(8))
+            && tag.get("LootTableSeed") == Some(&Tag::Long(73))));
+        assert!(values.iter().any(|tag| tag.get("x") == Some(&Tag::Int(9)) && tag.get("LootTableSeed").is_none()));
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        assert!(
+            region
+                .place_ocean_ruin_archaeology_block(
+                    [10, 8, 8],
+                    &replacement("minecraft:stone", 0),
+                    &registry
+                )
+                .is_err()
+        );
+        assert!(region.finish().is_err());
+        assert_eq!(terrain.snapshot().block(10, 8, 8), before.block(10, 8, 8));
         Ok(())
     }
 }

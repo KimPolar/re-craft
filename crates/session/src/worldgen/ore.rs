@@ -16818,7 +16818,8 @@ mod tests {
                             };
                         }
                         super::super::GeneratedMonsterRoomEntity::PendingChest { .. }
-                        | super::super::GeneratedMonsterRoomEntity::EmptyChest(_) => {
+                        | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
+                        | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }
                     }

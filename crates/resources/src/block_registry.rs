@@ -27,6 +27,7 @@ pub struct GeneratedBlockRegistry {
 enum StateSchema {
     Stateless,
     Snowy,
+    Dusted,
     Lit,
     Liquid,
     Axis,
@@ -155,6 +156,7 @@ impl StateSchema {
                 return properties;
             }
             Self::Snowy => ("snowy", "false"),
+            Self::Dusted => ("dusted", "0"),
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
@@ -275,6 +277,9 @@ impl StateSchema {
             Self::Snowy if name == "snowy" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
+            Self::Dusted if name == "dusted" => java_decimal(value)
+                .filter(|n| (0..=3).contains(n))
+                .map(|n| n.to_string()),
             Self::Lit if name == "lit" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
@@ -528,6 +533,7 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::HorizontalFacing)
                 }
                 "net/minecraft/world/level/block/SpawnerBlock" => Some(StateSchema::Stateless),
+                "net/minecraft/world/level/block/BrushableBlock" => Some(StateSchema::Dusted),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
                 }
@@ -641,7 +647,7 @@ impl GeneratedBlockRegistry {
             "unknown or noncanonical template state {id}"
         );
         let schema = self.states[id];
-        if matches!(schema, StateSchema::Stateless) {
+        if matches!(schema, StateSchema::Stateless | StateSchema::Dusted) {
             return Ok(properties.clone());
         }
         ensure!(
@@ -1027,6 +1033,34 @@ mod tests {
         assert!(registry.is_canonical_state("minecraft:spruce_stairs", &stairs));
         stairs.remove("half");
         assert!(!registry.is_canonical_state("minecraft:spruce_stairs", &stairs));
+    }
+
+    #[test]
+    fn brushable_states_cover_dusted_range_and_ignore_rotation() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:suspicious_sand".into(), StateSchema::Dusted)]),
+            block_entities: BTreeMap::new(),
+        };
+        for value in 0..=3 {
+            let state = BTreeMap::from([("dusted".into(), value.to_string())]);
+            assert!(registry.is_canonical_state("minecraft:suspicious_sand", &state));
+            assert_eq!(
+                registry
+                    .transform_template_state(
+                        "minecraft:suspicious_sand",
+                        &state,
+                        Mirror::FrontBack,
+                        Rotation::Clockwise90
+                    )
+                    .unwrap(),
+                state
+            );
+        }
+        assert!(!registry.is_canonical_state(
+            "minecraft:suspicious_sand",
+            &BTreeMap::from([("dusted".into(), "4".into())])
+        ));
     }
 
     #[test]

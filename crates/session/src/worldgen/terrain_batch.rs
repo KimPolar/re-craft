@@ -159,6 +159,23 @@ pub(super) fn updated_postprocessing_sky_sources(
     Ok(Some(sources))
 }
 
+fn extend_postprocessing_light_coverage(
+    covered: &mut BTreeSet<ChunkPos>,
+    checks: &[native_world::loaded::BlockPosition],
+) -> Result<()> {
+    for pos in checks {
+        for dz in -2i32..=2 {
+            for dx in -2i32..=2 {
+                covered.insert(ChunkPos {
+                    x: pos.chunk().x.checked_add(dx).context("light X overflow")?,
+                    z: pos.chunk().z.checked_add(dz).context("light Z overflow")?,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct SpawnStamp {
     world: Arc<World>,
     entities: Arc<BTreeMap<ChunkPos, Arc<Vec<native_persistence::nbt::Tag>>>>,
@@ -1723,6 +1740,69 @@ impl FreshTerrainBatch {
         Ok(stage)
     }
 
+    /// Drain the checks recorded so far at a caller-selected boundary between
+    /// postprocessing polls. A failed drain leaves the stage unchanged. The
+    /// caller must reproduce Java's actual lighting schedule; this API does not
+    /// infer when asynchronous engine work ran.
+    pub fn drain_generated_postprocessing_light(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+    ) -> Result<bool> {
+        ensure!(!stage.failed, "generated postprocessing attempt failed");
+        ensure!(
+            stage.batch_revision == Some(self.schedule.revision())
+                && self
+                    .snapshot()
+                    .is_some_and(|world| Arc::ptr_eq(&world, &stage.source)),
+            "postprocessing belongs to a different generation revision"
+        );
+        let engine = self
+            .light_engine
+            .as_ref()
+            .context("light propagation is not sealed")?;
+        let checkpoint = stage.light_checkpoint.as_ref();
+        let drained = checkpoint.map_or(0, |saved| saved.drained_checks);
+        let pending = stage
+            .light_checks
+            .get(drained..)
+            .context("invalid postprocessing light checkpoint")?;
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let mut covered: BTreeSet<_> = stage.region.tasks.keys().copied().collect();
+        extend_postprocessing_light_coverage(&mut covered, pending)?;
+        let before = self.postprocessing_light_input(checkpoint, covered)?;
+        stage.drain_recorded_light(before, &engine.active, &engine.fresh.sky_sources)
+    }
+
+    fn postprocessing_light_input(
+        &self,
+        checkpoint: Option<&super::postprocessing_world::PostprocessingLightCheckpoint>,
+        covered: BTreeSet<ChunkPos>,
+    ) -> Result<VisibleLightSnapshot> {
+        let Some(checkpoint) = checkpoint else {
+            return self.light_snapshot(covered);
+        };
+        let mut before = checkpoint.visible.clone();
+        let missing: BTreeSet<_> = covered
+            .into_iter()
+            .filter(|pos| before.complete_column(*pos).is_none())
+            .collect();
+        if !missing.is_empty() {
+            let fresh = self.light_snapshot(missing.iter().copied())?;
+            for pos in missing {
+                let column = fresh
+                    .complete_column(pos)
+                    .context("new postprocessing light column is missing")?;
+                ensure!(
+                    before.insert_complete_column(pos, column).is_none(),
+                    "postprocessing light column changed"
+                );
+            }
+        }
+        Ok(before)
+    }
+
     /// Check that a completed pass still belongs to this batch and was not changed.
     pub fn validate_postprocessing(
         &self,
@@ -1779,27 +1859,26 @@ impl FreshTerrainBatch {
             .as_ref()
             .context("light propagation is not sealed")?;
         covered.extend(processed.chunks.iter().copied());
-        let mut checks = Vec::with_capacity(processed.sealed_checks.len());
-        for pos in &processed.sealed_checks {
-            let p = [pos.x, pos.y, pos.z];
-            checks.push(p);
-            for dz in -2i32..=2 {
-                for dx in -2i32..=2 {
-                    covered.insert(ChunkPos {
-                        x: pos.chunk().x.checked_add(dx).context("light X overflow")?,
-                        z: pos.chunk().z.checked_add(dz).context("light Z overflow")?,
-                    });
-                }
-            }
-        }
-        let before = self.light_snapshot(covered)?;
+        let checkpoint = processed.light_checkpoint.as_ref();
+        let drained = checkpoint.map_or(0, |saved| saved.drained_checks);
+        let pending = processed
+            .sealed_checks
+            .get(drained..)
+            .context("invalid postprocessing light checkpoint")?;
+        extend_postprocessing_light_coverage(&mut covered, pending)?;
+        let checks: Vec<_> = pending.iter().map(|pos| [pos.x, pos.y, pos.z]).collect();
+        let before = self.postprocessing_light_input(checkpoint, covered)?;
+        let previous_world =
+            checkpoint.map_or(processed.source.as_ref(), |saved| saved.world.as_ref());
+        let previous_sources =
+            checkpoint.map_or(&engine.fresh.sky_sources, |saved| &saved.sky_sources);
         let updated_sources = if before.has_sky_channel() {
             updated_postprocessing_sky_sources(
-                &processed.source,
+                previous_world,
                 &processed.world,
-                &processed.sealed_checks,
+                pending,
                 bounds,
-                &engine.fresh.sky_sources,
+                previous_sources,
             )?
         } else {
             None
@@ -1809,9 +1888,7 @@ impl FreshTerrainBatch {
             bounds,
             &before,
             &engine.active,
-            updated_sources
-                .as_ref()
-                .unwrap_or(&engine.fresh.sky_sources),
+            updated_sources.as_ref().unwrap_or(previous_sources),
             &checks,
         )
     }

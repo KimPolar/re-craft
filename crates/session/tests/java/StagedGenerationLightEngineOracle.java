@@ -285,7 +285,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 var pos=new BlockPos(p[0],p[1],p[2]); var fake=p[0]<16 ? centerSection : eastSection;
                 BlockState state=mode.startsWith("block_incremental_stair_") ? Blocks.OAK_STAIRS.defaultBlockState().setValue(
                     net.minecraft.world.level.block.state.properties.BlockStateProperties.STAIRS_SHAPE,
-                    mode.endsWith("outer") ? net.minecraft.world.level.block.state.properties.StairsShape.OUTER_LEFT : net.minecraft.world.level.block.state.properties.StairsShape.INNER_RIGHT) :
+                    (mode.endsWith("outer") || mode.endsWith("sequence")) ? net.minecraft.world.level.block.state.properties.StairsShape.OUTER_LEFT : net.minecraft.world.level.block.state.properties.StairsShape.INNER_RIGHT) :
                     (p[0]==14 && p[2]==8) ? Blocks.AIR.defaultBlockState() :
                     (p[0]==15 && p[2]==8) ? Blocks.STONE.defaultBlockState() : Blocks.TORCH.defaultBlockState();
                 var old=fake.section.setBlockState(Math.floorMod(p[0],16),p[1],p[2],state); w.edits.put(pos,state);
@@ -295,6 +295,16 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
             if(mode.equals("block_incremental_many"))engine.checkBlock(new BlockPos(14,10,8));
             stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine));
+            if(mode.equals("block_incremental_stair_sequence")){
+                var pos=new BlockPos(13,10,8);
+                var state=Blocks.OAK_STAIRS.defaultBlockState().setValue(
+                    net.minecraft.world.level.block.state.properties.BlockStateProperties.STAIRS_SHAPE,
+                    net.minecraft.world.level.block.state.properties.StairsShape.INNER_RIGHT);
+                var old=centerSection.section.setBlockState(13,10,8,state);w.edits.put(pos,state);
+                if(!LightEngine.hasDifferentLightProperties(old,state))throw new AssertionError("missing second stair light check");
+                w.chunks.get(new ChunkPos(0,0)).sources.update(centerSection,13,10,8);
+                engine.checkBlock(pos);stages.add(captureWide(engine));drain(engine);stages.add(captureWide(engine));
+            }
             if(mode.startsWith("block_incremental_activate")){
                 engine.propagateLightSources(new ChunkPos(1,0)); stages.add(captureWide(engine));
                 drain(engine); stages.add(captureWide(engine));

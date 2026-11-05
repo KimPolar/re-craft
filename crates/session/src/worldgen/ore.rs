@@ -6863,6 +6863,7 @@ mod tests {
             String::from_utf8_lossy(&compile.stderr)
         );
         for mode in [
+            "block_incremental_stair_sequence",
             "block_incremental_stair_sky_outer",
             "block_incremental_stair_sky_inner",
             "block_incremental_stair_outer",
@@ -6961,7 +6962,9 @@ mod tests {
                 let neighbor = world.intern_state(neighbor);
                 world.set_block_id(14, 10, 8, neighbor).unwrap();
             }
-            let original_world = if mode.starts_with("block_incremental_stair_sky_") {
+            let original_world = if mode.starts_with("block_incremental_stair_sky_")
+                || mode == "block_incremental_stair_sequence"
+            {
                 let mut stair = state("oak_stairs");
                 stair.properties = [
                     ("facing".into(), "north".into()),
@@ -6986,7 +6989,8 @@ mod tests {
                 "block_incremental_stair_outer"
                 | "block_incremental_stair_inner"
                 | "block_incremental_stair_sky_outer"
-                | "block_incremental_stair_sky_inner" => {
+                | "block_incremental_stair_sky_inner"
+                | "block_incremental_stair_sequence" => {
                     vec![[13, 10, 8]]
                 }
                 _ => vec![[14, 10, 8], [15, 10, 8], [16, 10, 8], [14, 10, 8]],
@@ -6999,7 +7003,7 @@ mod tests {
                         ("half".into(), "bottom".into()),
                         (
                             "shape".into(),
-                            if mode.ends_with("outer") {
+                            if mode.ends_with("outer") || mode.ends_with("sequence") {
                                 "outer_left"
                             } else {
                                 "inner_right"
@@ -7235,6 +7239,119 @@ mod tests {
                     || mode == "block_incremental_stair_inner",
                 "{mode}"
             );
+            if mode == "block_incremental_stair_sequence" {
+                use crate::worldgen::{
+                    chunk_ticks::RegionTicks, postprocessing::ConvertedPostprocessingRegion,
+                    postprocessing_world::GeneratedPostprocessing,
+                };
+                let region = ConvertedPostprocessingRegion {
+                    tasks: BTreeMap::new(),
+                    ticks: RegionTicks::new(BTreeMap::new(), 0, 0).unwrap(),
+                };
+                let source = Arc::new(original_world.unwrap());
+                let mut stage = GeneratedPostprocessing::new(
+                    Arc::clone(&source),
+                    0,
+                    16,
+                    region,
+                    None,
+                    None,
+                    BTreeMap::new(),
+                    None,
+                );
+                stage.world = Arc::new(world.clone());
+                let check = native_world::loaded::BlockPosition { x: 13, y: 10, z: 8 };
+                stage.light_checks.push(check);
+                assert!(
+                    stage
+                        .drain_recorded_light(
+                            VisibleLightSnapshot::new(true, false),
+                            &active,
+                            &BTreeMap::new()
+                        )
+                        .is_err()
+                );
+                assert!(stage.light_checkpoint.is_none());
+                assert!(stage.light.is_none());
+                assert!(
+                    stage
+                        .drain_recorded_light(before.clone(), &active, &BTreeMap::new())
+                        .unwrap()
+                );
+                assert_eq!(stage.light_checkpoint.as_ref().unwrap().drained_checks, 1);
+                let first = stage.light.as_ref().unwrap().clone();
+                let mut next = state("oak_stairs");
+                next.properties = [
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "inner_right".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]
+                .into();
+                let next_world = Arc::make_mut(&mut stage.world);
+                let id = next_world.intern_state(next);
+                next_world.set_block_id(13, 10, 8, id).unwrap();
+                stage.light_checks.push(check);
+                assert!(
+                    stage
+                        .drain_recorded_light(
+                            VisibleLightSnapshot::new(true, false),
+                            &active,
+                            &BTreeMap::new()
+                        )
+                        .is_err()
+                );
+                assert_eq!(stage.light_checkpoint.as_ref().unwrap().drained_checks, 1);
+                assert_eq!(
+                    stage.light.as_ref().unwrap().block_light([13, 10, 8]),
+                    first.block_light([13, 10, 8])
+                );
+                assert!(
+                    stage
+                        .drain_recorded_light(first.clone(), &active, &BTreeMap::new())
+                        .unwrap()
+                );
+                assert_eq!(stage.light_checkpoint.as_ref().unwrap().drained_checks, 2);
+                let second = stage.light.as_ref().unwrap().clone();
+                assert!(
+                    !stage
+                        .drain_recorded_light(second.clone(), &active, &BTreeMap::new())
+                        .unwrap()
+                );
+                for z in -2..=2 {
+                    for x in -2..=2 {
+                        let index = ((z + 2) * 5 + x + 2) as usize;
+                        for y in -16..32 {
+                            for lz in 0..16 {
+                                for lx in 0..16 {
+                                    let i = ((y + 16) * 256 + lz * 16 + lx) as usize;
+                                    let p = [x * 16 + lx, y, z * 16 + lz];
+                                    assert_eq!(
+                                        first.block_light(p),
+                                        Some(expected[2][index][0][i]),
+                                        "first drain {p:?}"
+                                    );
+                                    assert_eq!(
+                                        expected[2][index][0][i], expected[3][index][0][i],
+                                        "second check should be queued {p:?}"
+                                    );
+                                    assert_eq!(
+                                        second.block_light(p),
+                                        Some(expected[4][index][0][i]),
+                                        "second drain {p:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                let finished = stage.finish().unwrap();
+                assert_eq!(finished.light_checkpoint.unwrap().drained_checks, 2);
+                assert_eq!(
+                    source.block(13, 10, 8).unwrap().properties["shape"],
+                    "straight"
+                );
+            }
         }
     }
 

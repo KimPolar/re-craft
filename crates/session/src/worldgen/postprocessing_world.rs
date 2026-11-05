@@ -25,16 +25,17 @@ use super::{
 /// An isolated attempt. The source snapshot is immutable, and no ticks are
 /// returned if a callback fails or if any chunk remains unfinished.
 pub struct GeneratedPostprocessing {
-    world: Arc<World>,
-    source: Arc<World>,
-    batch_revision: Option<u64>,
+    pub(super) world: Arc<World>,
+    pub(super) source: Arc<World>,
+    pub(super) batch_revision: Option<u64>,
     min_y: i32,
     max_y: i32,
-    region: ConvertedPostprocessingRegion,
+    pub(super) region: ConvertedPostprocessingRegion,
     completed: BTreeSet<ChunkPos>,
     active: Option<ChunkPos>,
-    failed: bool,
-    light: Option<VisibleLightSnapshot>,
+    pub(super) failed: bool,
+    pub(super) light: Option<VisibleLightSnapshot>,
+    pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
@@ -42,7 +43,7 @@ pub struct GeneratedPostprocessing {
     lava_fluids: Option<Arc<BTreeSet<String>>>,
     water_source_conversion: Option<bool>,
     edits: Vec<BlockPosition>,
-    light_checks: Vec<BlockPosition>,
+    pub(super) light_checks: Vec<BlockPosition>,
     heightmaps: BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<Arc<native_resources::heightmap_tags::HeightmapTags>>,
 }
@@ -67,7 +68,17 @@ pub struct PostprocessedGeneratedRegion {
     pub(super) batch_revision: Option<u64>,
     pub(super) min_y: i32,
     pub(super) max_y: i32,
+    pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     water_source_conversion: Option<bool>,
+}
+
+/// A completed explicit light drain and the world revision it covered.
+/// Positions before `drained_checks` must not be applied again.
+pub(super) struct PostprocessingLightCheckpoint {
+    pub(super) world: Arc<World>,
+    pub(super) visible: VisibleLightSnapshot,
+    pub(super) sky_sources: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    pub(super) drained_checks: usize,
 }
 
 impl PostprocessedGeneratedRegion {
@@ -133,6 +144,7 @@ impl GeneratedPostprocessing {
             active: None,
             failed: false,
             light,
+            light_checkpoint: None,
             mushroom_tags,
             leaf_tags: None,
             bubble_tags: None,
@@ -148,6 +160,53 @@ impl GeneratedPostprocessing {
 
     pub(super) fn bind_batch_revision(&mut self, revision: u64) {
         self.batch_revision = Some(revision);
+    }
+
+    /// `before` must include the last checkpoint plus every newly needed
+    /// column; callers are responsible for validating its batch revision.
+    pub(super) fn drain_recorded_light(
+        &mut self,
+        before: VisibleLightSnapshot,
+        active: &BTreeSet<ChunkPos>,
+        initial_sources: &BTreeMap<ChunkPos, Arc<[i32; 256]>>,
+    ) -> Result<bool> {
+        ensure!(!self.failed, "generated postprocessing attempt failed");
+        let checkpoint = self.light_checkpoint.as_ref();
+        let drained = checkpoint.map_or(0, |saved| saved.drained_checks);
+        let pending = self
+            .light_checks
+            .get(drained..)
+            .context("invalid postprocessing light checkpoint")?;
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let bounds = native_world::block_light::LightBounds::new(self.min_y, self.max_y)
+            .context("unsupported postprocessing light bounds")?;
+        let previous_world = checkpoint.map_or(self.source.as_ref(), |saved| saved.world.as_ref());
+        let previous_sources = checkpoint.map_or(initial_sources, |saved| &saved.sky_sources);
+        let updated_sources = if before.has_sky_channel() {
+            super::terrain_batch::updated_postprocessing_sky_sources(
+                previous_world,
+                &self.world,
+                pending,
+                bounds,
+                previous_sources,
+            )?
+        } else {
+            None
+        };
+        let sources = updated_sources.unwrap_or_else(|| previous_sources.clone());
+        let checks: Vec<_> = pending.iter().map(|pos| [pos.x, pos.y, pos.z]).collect();
+        let visible =
+            drain_postprocessing_light(&self.world, bounds, &before, active, &sources, &checks)?;
+        self.light = Some(visible.clone());
+        self.light_checkpoint = Some(PostprocessingLightCheckpoint {
+            world: Arc::clone(&self.world),
+            visible,
+            sky_sources: sources,
+            drained_checks: self.light_checks.len(),
+        });
+        Ok(true)
     }
 
     pub(super) fn set_leaf_tags(
@@ -250,6 +309,7 @@ impl GeneratedPostprocessing {
             batch_revision: self.batch_revision,
             min_y: self.min_y,
             max_y: self.max_y,
+            light_checkpoint: self.light_checkpoint,
             water_source_conversion: self.water_source_conversion,
         })
     }

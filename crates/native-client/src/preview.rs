@@ -3631,6 +3631,34 @@ mod tests {
                 pose: native_session::PlayerPose::Standing,
             })
             .unwrap();
+        let mut manual_postprocessing = ready
+            .batch
+            .begin_generated_postprocessing([center], 42, 7)
+            .unwrap();
+        manual_postprocessing
+            .set_water_source_conversion(true)
+            .unwrap();
+        assert!(
+            !ready
+                .batch
+                .drain_generated_postprocessing_light(&mut manual_postprocessing)
+                .unwrap()
+        );
+        while !manual_postprocessing.poll(center, 1).unwrap() {
+            ready
+                .batch
+                .drain_generated_postprocessing_light(&mut manual_postprocessing)
+                .unwrap();
+        }
+        ready
+            .batch
+            .drain_generated_postprocessing_light(&mut manual_postprocessing)
+            .unwrap();
+        let manual_postprocessed = manual_postprocessing.finish().unwrap();
+        let manual_light = ready
+            .batch
+            .postprocessed_light_snapshot(&manual_postprocessed)
+            .unwrap();
         let postprocessor = crate::generation_worker::GenerationWorker::postprocess(
             ready,
             vec![center],
@@ -3665,6 +3693,19 @@ mod tests {
         );
         assert_eq!(postprocessor.progress().completed_steps, 1);
         let output = ready.postprocessed.as_ref().unwrap();
+        let worker_light = ready
+            .batch
+            .postprocessed_light_snapshot(&output.region)
+            .unwrap();
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let p = [x, y, z];
+                    assert_eq!(manual_light.block_light(p), worker_light.block_light(p));
+                    assert_eq!(manual_light.sky_light(p), worker_light.sky_light(p));
+                }
+            }
+        }
         assert_eq!(output.region.chunks, BTreeSet::from([center]));
         assert_eq!(output.activated_ticks.game_time, 42);
         assert_eq!(

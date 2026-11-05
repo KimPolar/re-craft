@@ -266,10 +266,11 @@ impl PreparedStructureStages {
     }
     /// Check membership only; entity-source coverage does not depend on the
     /// structure decoration iteration order.
-    pub(super) fn only_buried_treasure_references(
+    pub(super) fn only_accounted_structure_references(
         &self,
         pos: ChunkPos,
         registered: &BTreeSet<&ResourceId>,
+        huts_recorded: bool,
     ) -> bool {
         self.references.get(&pos).is_some_and(|references| {
             references.membership().iter().all(|(id, positions)| {
@@ -277,8 +278,16 @@ impl PreparedStructureStages {
                     let bits = *packed as u64;
                     let source = ChunkPos { x: bits as u32 as i32, z: (bits >> 32) as u32 as i32 };
                     self.starts.get(&source).and_then(|starts| starts.get(id)).is_some_and(|start| {
-                        start.chunk == [source.x, source.z]
-                            && start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure
+                        if start.chunk != [source.x, source.z] { return false; }
+                        match start.kind {
+                            native_resources::structure_start::SimpleStructureKind::BuriedTreasure => true,
+                            native_resources::structure_start::SimpleStructureKind::SwampHut if huts_recorded => {
+                                self.huts.get(&(id.clone(), source)).is_some_and(|saved| {
+                                    super::SavedSwampHutPiece::capture(start, saved.state).ok().as_ref() == Some(saved)
+                                })
+                            }
+                            _ => false,
+                        }
                     })
                 })
             })

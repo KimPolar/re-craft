@@ -4656,7 +4656,7 @@ mod tests {
         let prepare = move || {
             let mut provider = Data;
             let definition = json!({"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"minecraft:plains"},"settings":{
-                "noise":{"min_y":0,"height":96},"legacy_random_source":false,"sea_level":48,
+                "noise":{"min_y":0,"height":96},"legacy_random_source":false,"sea_level":48,"disable_mob_generation":false,
                 "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
                 "material_rule":{"type":"block","result_state":"minecraft:stone"},
                 "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1},"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":48}
@@ -4744,13 +4744,15 @@ mod tests {
                 hut_generation,
             })
         };
-        let worker = GenerationWorker::start_with_structures(
-            prepare,
-            BTreeSet::from([target]),
-            71,
-            0,
-            IVec3::ZERO,
-        )?;
+        let targets: BTreeSet<_> = (-1..=1)
+            .flat_map(|dz| {
+                (-1..=1).map(move |dx| ChunkPos {
+                    x: x + dx,
+                    z: z + dz,
+                })
+            })
+            .collect();
+        let worker = GenerationWorker::start_with_structures(prepare, targets, 71, 0, IVec3::ZERO)?;
         let mut ready = match worker
             .result
             .recv_timeout(std::time::Duration::from_secs(180))?
@@ -4760,17 +4762,18 @@ mod tests {
             GenerationResult::Cancelled => anyhow::bail!("hut generation cancelled"),
         };
         let mut records = Vec::new();
+        let mut mob_chunk = None;
         for dz in -1..=1 {
             for dx in -1..=1 {
-                records.extend(
-                    ready
-                        .batch
-                        .recorded_generated_entities(ChunkPos {
-                            x: x + dx,
-                            z: z + dz,
-                        })?
-                        .iter(),
-                );
+                let pos = ChunkPos {
+                    x: x + dx,
+                    z: z + dz,
+                };
+                let entities = ready.batch.recorded_generated_entities(pos)?;
+                if !entities.is_empty() {
+                    assert!(mob_chunk.replace(pos).is_none());
+                }
+                records.extend(entities.iter());
             }
         }
         let cats: Vec<_> = records.iter().filter(|record| matches!(record.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:cat"))).collect();
@@ -4801,6 +4804,24 @@ mod tests {
         );
         drop(cats);
         drop(records);
+        let mob_chunk = mob_chunk.context("hut entity chunk missing")?;
+        ready.batch.request_spawn_without_mobs(mob_chunk, false)?;
+        assert_eq!(
+            ready.batch.step(
+                &mut Data,
+                &mut |_| anyhow::bail!("unexpected terrain"),
+                &mut |_| anyhow::bail!("unexpected state")
+            )?,
+            Some((mob_chunk, GenerationStage::Spawn))
+        );
+        assert_eq!(
+            ready
+                .batch
+                .complete_generated_entity_records(mob_chunk)?
+                .context("hut entity coverage incomplete")?
+                .len(),
+            2
+        );
         assert!(ready.hut_generation.is_some());
         ready.start_session(native_session::PlayerState {
             position: glam::Vec3::new((x * 16 + 8) as f32 + 0.5, 80.0, (z * 16 + 8) as f32 + 0.5),

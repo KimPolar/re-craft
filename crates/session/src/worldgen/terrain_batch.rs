@@ -714,14 +714,16 @@ fn features_cannot_spawn_entities(
 #[derive(Default)]
 struct GeneratedEntitySources {
     complete_spawns: BTreeSet<ChunkPos>,
+    recorded_hut_features: BTreeSet<ChunkPos>,
     untracked: bool,
 }
 
-fn structures_cannot_spawn_entities(
+fn structure_entities_are_accounted_for(
     structures: &PreparedStructureStages,
     registry: &StructureDecorationSchedule,
     pos: ChunkPos,
     completed: impl Fn(ChunkPos) -> bool,
+    recorded_huts: &BTreeSet<ChunkPos>,
 ) -> bool {
     let registered: BTreeSet<_> = registry
         .steps()
@@ -738,7 +740,12 @@ fn structures_cannot_spawn_entities(
                 return false;
             };
             let source = ChunkPos { x, z };
-            completed(source) && structures.only_buried_treasure_references(source, &registered)
+            completed(source)
+                && structures.only_accounted_structure_references(
+                    source,
+                    &registered,
+                    recorded_huts.contains(&source),
+                )
         })
     })
 }
@@ -762,10 +769,12 @@ impl GeneratedEntitySources {
     fn complete_entity_coverage(
         &self,
         pos: ChunkPos,
-        structures_entity_free: bool,
+        structure_entities_accounted_for: bool,
         features_entity_free: bool,
     ) -> bool {
-        structures_entity_free && features_entity_free && self.contains_complete_spawn(pos)
+        structure_entities_accounted_for
+            && features_entity_free
+            && self.contains_complete_spawn(pos)
     }
 }
 
@@ -1099,19 +1108,25 @@ impl FreshTerrainBatch {
             "entity completeness requires a spawn-complete chunk"
         );
         let decoration = self.decoration.as_ref().context("decoration is missing")?;
-        let structures_entity_free = match &self.structures {
+        let structure_entities_accounted_for = match &self.structures {
             None => true,
             Some(structures) => decoration.structures.as_ref().is_some_and(|registry| {
-                structures_cannot_spawn_entities(structures, registry, pos, |source| {
-                    self.schedule
-                        .completed(source)
-                        .is_some_and(|stage| stage >= GenerationStage::Features)
-                })
+                structure_entities_are_accounted_for(
+                    structures,
+                    registry,
+                    pos,
+                    |source| {
+                        self.schedule
+                            .completed(source)
+                            .is_some_and(|stage| stage >= GenerationStage::Features)
+                    },
+                    &self.entity_sources.recorded_hut_features,
+                )
             }),
         };
         if !self.entity_sources.complete_entity_coverage(
             pos,
-            structures_entity_free,
+            structure_entities_accounted_for,
             decoration.features_cannot_spawn_entities,
         ) {
             return Ok(None);
@@ -3598,6 +3613,9 @@ impl FreshTerrainBatch {
                     };
                     drop(planned);
                     structures.commit_decorated_starts(keys, updated, hut_states.as_ref())?;
+                    if hut_states.as_ref().is_some_and(|states| !states.is_empty()) {
+                        self.entity_sources.recorded_hut_features.insert(pos);
+                    }
                 } else if let Some(engine) = &mut self.light_engine {
                     let registry = self
                         .light_registry
@@ -3981,24 +3999,27 @@ mod entity_source_tests {
             }
         }
         assert!(!structures.references[&center].membership().is_empty());
-        assert!(structures_cannot_spawn_entities(
+        assert!(structure_entities_are_accounted_for(
             &structures,
             &registry,
             center,
-            |_| true
+            |_| true,
+            &BTreeSet::new()
         ));
-        assert!(!structures_cannot_spawn_entities(
+        assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             center,
-            |pos| pos != ChunkPos { x: 1, z: 0 }
+            |pos| pos != ChunkPos { x: 1, z: 0 },
+            &BTreeSet::new()
         ));
         structures.references.remove(&ChunkPos { x: -1, z: 0 });
-        assert!(!structures_cannot_spawn_entities(
+        assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             center,
-            |_| true
+            |_| true,
+            &BTreeSet::new()
         ));
         let refs = collect_ordered_structure_references(ChunkPos { x: -1, z: 0 }, |pos| {
             Ok(if pos == center {
@@ -4016,18 +4037,110 @@ mod entity_source_tests {
             .get_mut(&id)
             .unwrap()
             .kind = SimpleStructureKind::SwampHut;
-        assert!(!structures_cannot_spawn_entities(
+        assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             center,
-            |_| true
+            |_| true,
+            &BTreeSet::new()
         ));
-        assert!(!structures_cannot_spawn_entities(
+        assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             ChunkPos { x: i32::MAX, z: 0 },
-            |_| true
+            |_| true,
+            &BTreeSet::new()
         ));
+    }
+
+    #[test]
+    fn hut_entity_evidence_requires_recorded_feature_passes_and_consistent_state() {
+        use crate::worldgen::structure_references::{
+            StructureStartBounds, collect_ordered_structure_references,
+        };
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_start::{
+            HorizontalDirection, SimpleStructureKind, SimpleStructureStart,
+        };
+        struct Registry;
+        impl ResourceProvider for Registry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/hut.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:hut")?])
+            }
+        }
+        let registry = StructureDecorationSchedule::load(&mut Registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:hut").unwrap();
+        let key = (id.clone(), center);
+        let start = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [8, 64, 8],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([0, 64, 0], [6, 70, 8]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let bounds = StructureStartBounds::from_simple(id.clone(), &start).unwrap();
+        let saved = super::super::SavedSwampHutPiece::capture(&start, Default::default()).unwrap();
+        let mut structures = PreparedStructureStages::default();
+        structures
+            .starts
+            .insert(center, BTreeMap::from([(id.clone(), start)]));
+        structures.huts.insert(key.clone(), saved);
+        let mut recorded = BTreeSet::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let source = ChunkPos { x, z };
+                structures.references.insert(
+                    source,
+                    collect_ordered_structure_references(source, |pos| {
+                        Ok(if pos == center {
+                            vec![bounds.clone()]
+                        } else {
+                            vec![]
+                        })
+                    })
+                    .unwrap(),
+                );
+                recorded.insert(source);
+            }
+        }
+        let covered = |structures: &PreparedStructureStages, recorded: &BTreeSet<ChunkPos>| {
+            structure_entities_are_accounted_for(structures, &registry, center, |_| true, recorded)
+        };
+        assert!(covered(&structures, &recorded));
+        assert!(!structure_entities_are_accounted_for(
+            &structures,
+            &registry,
+            center,
+            |pos| pos != center,
+            &recorded
+        ));
+        recorded.remove(&center);
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(center);
+        structures.huts.remove(&key);
+        assert!(!covered(&structures, &recorded));
+        let mut wrong = saved;
+        wrong.bounds.min[1] += 1;
+        structures.huts.insert(key.clone(), wrong);
+        assert!(!covered(&structures, &recorded));
+        structures.huts.insert(key.clone(), saved);
+        structures
+            .starts
+            .get_mut(&center)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .kind = SimpleStructureKind::DesertPyramid;
+        assert!(!covered(&structures, &recorded));
     }
 
     #[test]

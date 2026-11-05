@@ -28,6 +28,14 @@ pub enum PreparedPaletteState {
     },
 }
 
+/// A surviving block after the ruin's per-block processors, before the
+/// archaeology processor, chunk clipping, and actual placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirstPassBlock {
+    pub source_index: usize,
+    pub position: [i32; 3],
+}
+
 impl PreparedPiece {
     pub fn block_position(
         &self,
@@ -112,12 +120,67 @@ impl PreparedPiece {
         // The supported ocean-ruin states have rotation-invariant static-full
         // classification, verified for all four template rotations.
         let palette = self.transformed_palette(registry, palette_index)?;
+        self.order_for_palette(palette_index, &palette)
+    }
+
+    fn order_for_palette(
+        &self,
+        palette_index: usize,
+        palette: &[PreparedPaletteState],
+    ) -> Result<Vec<usize>> {
         self.template.java_block_order(palette_index, |index, _| {
             let PreparedPaletteState::Block(state) = &palette[index] else {
                 anyhow::bail!("structure block without NBT needs collision classification")
             };
             ocean_template_static_full(state)
         })
+    }
+
+    /// Run Java's rot and air/structure-block ignore processors in load
+    /// order over the entire piece. The selection position must already be
+    /// adjusted to the ocean floor. Markers remain in the original template
+    /// for their separate post-placement pass.
+    pub fn first_pass_blocks(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        palette_index: usize,
+    ) -> Result<Vec<FirstPassBlock>> {
+        let palette = self.transformed_palette(registry, palette_index)?;
+        self.first_pass_with_palette(palette_index, &palette)
+    }
+
+    fn first_pass_with_palette(
+        &self,
+        palette_index: usize,
+        palette: &[PreparedPaletteState],
+    ) -> Result<Vec<FirstPassBlock>> {
+        use native_core::random::LegacyRandom;
+        use native_resources::blockstates::positional_seed;
+        ensure!(
+            self.selection.integrity.is_finite() && (0.0..=1.0).contains(&self.selection.integrity),
+            "invalid ocean ruin integrity"
+        );
+        let order = self.order_for_palette(palette_index, palette)?;
+        let mut surviving = Vec::with_capacity(order.len());
+        for source_index in order {
+            let block = &self.template.blocks[source_index];
+            let position = self.block_position(block);
+            let mut random =
+                LegacyRandom::new(positional_seed(position[0], position[1], position[2]));
+            if random.next_float() > self.selection.integrity {
+                continue;
+            }
+            match &palette[block.state] {
+                PreparedPaletteState::StructureMarker { .. } => continue,
+                PreparedPaletteState::Block(state) if state.name == "minecraft:air" => continue,
+                PreparedPaletteState::Block(_) => {}
+            }
+            surviving.push(FirstPassBlock {
+                source_index,
+                position,
+            });
+        }
+        Ok(surviving)
     }
 }
 
@@ -295,6 +358,89 @@ mod tests {
     }
 
     #[test]
+    fn first_pass_preserves_order_and_ignores_only_air_and_markers() {
+        use native_persistence::structure_template::TemplateBlock;
+        use native_resources::structure_transform::Rotation;
+        use native_world::loaded::BlockState;
+
+        let state = |name: &str| {
+            PreparedPaletteState::Block(BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            })
+        };
+        let palette = vec![
+            state("stone_bricks"),
+            state("air"),
+            state("cave_air"),
+            PreparedPaletteState::StructureMarker {
+                properties: BTreeMap::new(),
+            },
+        ];
+        let blocks = vec![
+            TemplateBlock {
+                position: [2, 0, 0],
+                state: 0,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [0, 0, 0],
+                state: 1,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [1, 0, 0],
+                state: 2,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [0, 1, 0],
+                state: 3,
+                nbt: Some(Tag::Compound(vec![])),
+            },
+        ];
+        let mut piece = PreparedPiece {
+            selection: Piece {
+                template: "minecraft:test".into(),
+                position: [10, 40, -5],
+                rotation: Rotation::Clockwise90,
+                integrity: 1.0,
+                large: false,
+            },
+            template: Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [3, 2, 1],
+                palettes: vec![vec![Tag::Compound(vec![]); 4]],
+                blocks,
+                entities: vec![],
+            }),
+            bounds: native_core::beardifier::BoundingBox {
+                min: [0; 3],
+                max: [0; 3],
+            },
+        };
+        assert_eq!(
+            piece.first_pass_with_palette(0, &palette).unwrap(),
+            vec![
+                FirstPassBlock {
+                    source_index: 0,
+                    position: [10, 40, -3]
+                },
+                FirstPassBlock {
+                    source_index: 2,
+                    position: [10, 40, -4]
+                },
+            ]
+        );
+        piece.selection.integrity = f32::NAN;
+        assert!(piece.first_pass_with_palette(0, &palette).is_err());
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn prepares_selected_vanilla_ocean_ruin_templates() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -337,6 +483,156 @@ mod tests {
         }
         assert!(markers > 0);
         assert!(glazed > 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn vanilla_ruin_first_pass_matches_java() -> Result<()> {
+        use native_resources::structure_transform::{Mirror, Rotation};
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = temp.path().join("OceanRuinFirstPassOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/OceanRuinFirstPassOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut names = Vec::new();
+        for prefix in ["brick", "cracked", "mossy", "warm"] {
+            for n in 1..=8 {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for prefix in ["big_brick", "big_cracked", "big_mossy"] {
+            for n in [1, 2, 3, 8] {
+                names.push(format!("underwater_ruin/{prefix}_{n}"));
+            }
+        }
+        for n in 4..=7 {
+            names.push(format!("underwater_ruin/big_warm_{n}"));
+        }
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("OceanRuinFirstPassOracle")
+            .args(&names)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let mut rows = output
+            .lines()
+            .filter(|line| line.starts_with("T\t") || line.starts_with("B\t"));
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let rotations = [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Clockwise180,
+            Rotation::Counterclockwise90,
+        ];
+        let integrities = [0.5, 0.7, 0.8, 0.9];
+        let mut total = 0;
+        for (i, name) in names.iter().enumerate() {
+            let header = rows.next().context("missing Java template")?;
+            let mut fields = header.split('\t');
+            ensure!(
+                fields.next() == Some("T") && fields.next() == Some(name.as_str()),
+                "unexpected template {header}"
+            );
+            let count: usize = fields.next().context("missing count")?.parse()?;
+            let position = [-101 + i as i32 * 7, 41 + i as i32 % 11, 207 - i as i32 * 13];
+            let rotation = rotations[i % 4];
+            let template = Arc::new(
+                StructureTemplate::load(&mut resources, &ResourceId::parse(name)?)?
+                    .context("missing template")?,
+            );
+            let bounds = native_resources::structure_transform::bounding_box(
+                template.size,
+                position,
+                Mirror::None,
+                rotation,
+                [0; 3],
+            )?;
+            let piece = PreparedPiece {
+                selection: Piece {
+                    template: format!("minecraft:{name}"),
+                    position,
+                    rotation,
+                    integrity: integrities[(i / 4) % 4],
+                    large: false,
+                },
+                template,
+                bounds,
+            };
+            let palette = piece.transformed_palette(&registry, 0)?;
+            let blocks = piece.first_pass_blocks(&registry, 0)?;
+            assert_eq!(blocks.len(), count, "{name}");
+            for block in blocks {
+                let row = rows.next().context("missing Java block")?;
+                let mut fields = row.split('\t');
+                ensure!(fields.next() == Some("B"), "unexpected Java row {row}");
+                let position: [i32; 3] = [
+                    fields.next().context("x")?.parse()?,
+                    fields.next().context("y")?.parse()?,
+                    fields.next().context("z")?.parse()?,
+                ];
+                let id = fields.next().context("block ID")?;
+                let nbt: bool = fields.next().context("NBT flag")?.parse()?;
+                let original = &piece.template.blocks[block.source_index];
+                let PreparedPaletteState::Block(state) = &palette[original.state] else {
+                    anyhow::bail!("marker survived first pass")
+                };
+                assert_eq!(block.position, position, "{name}");
+                assert_eq!(state.name, id, "{name}");
+                assert_eq!(original.nbt.is_some(), nbt, "{name}");
+                total += 1;
+            }
+        }
+        assert!(rows.next().is_none());
+        println!(
+            "verified {total} first-pass blocks across {} ruins",
+            names.len()
+        );
         Ok(())
     }
 

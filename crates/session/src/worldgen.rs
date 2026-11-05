@@ -46,6 +46,7 @@ mod ore;
 pub mod postprocessing;
 mod postprocessing_world;
 pub mod schedule;
+pub mod structure_references;
 mod terrain_batch;
 pub mod tick_index;
 pub use carving::CarverBlockState;

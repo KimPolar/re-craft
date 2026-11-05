@@ -5336,6 +5336,12 @@ mod tests {
             .unwrap()
             .is_some()
         {}
+        batch.request_spawn_without_mobs(distant, false).unwrap();
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
         assert!(batch.validate_postprocessing(&processed).is_err());
         batch
             .rebase_postprocessing_after_expansion(&mut processed, &checkpoint)
@@ -5351,6 +5357,19 @@ mod tests {
         );
         assert!(processed.world.chunks.contains_key(&far));
         assert!(batch.postprocessed_light_snapshot(&processed).is_ok());
+        let mut resumed = batch.resume_generated_postprocessing(&processed).unwrap();
+        assert!(resumed.poll(center, 256).is_err());
+        batch
+            .register_generated_postprocessing_chunk(&mut resumed, distant)
+            .unwrap();
+        while !resumed.poll(distant, 256).unwrap() {}
+        let extended = resumed.finish().unwrap();
+        batch.validate_postprocessing(&extended).unwrap();
+        assert!(extended.chunks.contains(&center));
+        assert!(extended.chunks.contains(&distant));
+        assert!(!processed.chunks.contains(&distant));
+        assert_eq!(extended.world.block(8, 8, 8).unwrap().name, "minecraft:air");
+        assert_eq!(extended.ticks().registration_order(), &[center, distant]);
         assert!(batch.request_spawn_without_mobs(center, false).is_err());
         let (schedule, _, terrain, light) = batch.into_parts().unwrap();
         assert_eq!(

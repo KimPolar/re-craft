@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Block entities owned by the converted LevelChunk, isolated from the protochunk.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ConvertedBlockEntities {
     records: BTreeMap<[i32; 3], native_persistence::nbt::Tag>,
     pending: PendingPositions,
@@ -173,10 +173,12 @@ pub struct PostprocessedGeneratedRegion {
     water_source_conversion: Option<bool>,
     block_entities: BTreeMap<ChunkPos, ConvertedBlockEntities>,
     block_entity_edits: BTreeMap<BlockPosition, (BlockState, BlockState)>,
+    bonus_chest_attempted: bool,
 }
 
 /// A completed explicit light drain and the world revision it covered.
 /// Positions before `drained_checks` must not be applied again.
+#[derive(Clone)]
 pub(super) struct PostprocessingLightCheckpoint {
     pub(super) world: Arc<World>,
     pub(super) visible: VisibleLightSnapshot,
@@ -301,6 +303,60 @@ impl GeneratedPostprocessing {
 
     pub(super) fn bind_batch_revision(&mut self, revision: u64) {
         self.batch_revision = Some(revision);
+    }
+
+    /// Restore the already completed chunks without running their callbacks a
+    /// second time. The caller validates the source and supplies its light.
+    pub(super) fn from_completed(
+        completed: &PostprocessedGeneratedRegion,
+        light: Option<VisibleLightSnapshot>,
+        mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+        heightmap_tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    ) -> Result<Self> {
+        let height = completed
+            .max_y
+            .checked_sub(completed.min_y)
+            .context("invalid postprocessing height")?;
+        let marks = Arc::new(
+            native_core::postprocessing::PostProcessing::new(completed.min_y, height)
+                .context("unsupported postprocessing height")?,
+        );
+        let tasks = completed
+            .chunks
+            .iter()
+            .copied()
+            .map(|pos| {
+                (
+                    pos,
+                    super::postprocessing::PostprocessingTask::new(Arc::clone(&marks), pos),
+                )
+            })
+            .collect();
+        let region = ConvertedPostprocessingRegion {
+            tasks,
+            ticks: completed.ticks.clone(),
+        };
+        let mut stage = Self::new(
+            Arc::clone(&completed.world),
+            completed.min_y,
+            completed.max_y,
+            region,
+            light,
+            mushroom_tags,
+            completed.heightmaps.clone(),
+            Some(heightmap_tags),
+        );
+        stage.source = Arc::clone(&completed.source);
+        stage.batch_revision = completed.batch_revision;
+        stage.completed = completed.chunks.clone();
+        stage.light_checkpoint = completed.light_checkpoint.clone();
+        stage.water_source_conversion = completed.water_source_conversion;
+        stage.edits = completed.edits.clone();
+        stage.light_checks = completed.light_checks.clone();
+        stage.block_entities = completed.block_entities.clone();
+        stage.block_entity_edits = completed.block_entity_edits.clone();
+        stage.bonus_chest_attempted = completed.bonus_chest_attempted;
+        Ok(stage)
     }
 
     pub(super) fn check_registration(&self, pos: ChunkPos) -> Result<()> {
@@ -557,6 +613,7 @@ impl GeneratedPostprocessing {
             water_source_conversion: self.water_source_conversion,
             block_entities: self.block_entities,
             block_entity_edits: self.block_entity_edits,
+            bonus_chest_attempted: self.bonus_chest_attempted,
         })
     }
 }
@@ -2243,6 +2300,7 @@ mod tests {
             BTreeMap::from([(first, first_maps)]),
             fixture.heightmap_tags.clone(),
         );
+        stage.set_water_source_conversion(false).unwrap();
         assert!(
             stage
                 .register_converted_chunk(
@@ -2335,6 +2393,83 @@ mod tests {
         assert!(
             matches!(result.block_entity_data(first).unwrap(), native_persistence::nbt::Tag::List { values, .. } if values.len() == 1)
         );
+        let original_entities = result.block_entity_data(first).unwrap();
+        let mut resumed = GeneratedPostprocessing::from_completed(
+            &result,
+            None,
+            None,
+            fixture.heightmap_tags.clone().unwrap(),
+        )
+        .unwrap();
+        assert!(resumed.poll(first, 20).is_err());
+        assert_eq!(resumed.water_source_conversion, Some(false));
+        let random_state = random.state();
+        assert!(
+            resumed
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .is_err()
+        );
+        assert_eq!(random.state(), random_state);
+        let third = ChunkPos { x: 0, z: -1 };
+        resumed
+            .register_converted_chunk(
+                third,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: task(third),
+                    ticks: empty_ticks(third),
+                },
+                ConvertedBlockEntities::default(),
+                fixture.heightmaps[&third].clone(),
+                None,
+            )
+            .unwrap();
+        while !resumed.poll(third, 20).unwrap() {}
+        let extended = resumed.finish().unwrap();
+        assert_eq!(
+            extended.ticks().registration_order(),
+            &[first, second, third]
+        );
+        assert_eq!(extended.ticks().next_sub_tick(), 9);
+        assert_eq!(
+            extended
+                .ticks()
+                .chunk(first)
+                .unwrap()
+                .blocks
+                .peek()
+                .unwrap()
+                .sub_tick,
+            7
+        );
+        assert_eq!(
+            extended
+                .ticks()
+                .chunk(second)
+                .unwrap()
+                .fluids
+                .peek()
+                .unwrap()
+                .sub_tick,
+            8
+        );
+        assert_eq!(
+            extended.block_entity_data(first).unwrap(),
+            original_entities
+        );
+        assert_eq!(
+            extended
+                .world
+                .block(chest[0], chest[1], chest[2])
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert_eq!(result.ticks().registration_order(), &[first, second]);
+        assert!(!result.chunks.contains(&third));
     }
 
     fn bonus_chest_snowy_surface(name: &str, snowy: bool) -> (GeneratedPostprocessing, Arc<World>) {

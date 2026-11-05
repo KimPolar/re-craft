@@ -192,6 +192,7 @@ impl ChunkTicks {
 }
 
 /// Tick containers for the converted chunk, kept separate by registry.
+#[derive(Clone)]
 pub struct ConvertedChunkTicks {
     pub blocks: ChunkTicks,
     pub fluids: ChunkTicks,
@@ -213,6 +214,7 @@ pub enum ScheduleOutcome {
 /// Tick access for an isolated converted region. All block and fluid
 /// callbacks share the level's sub-tick counter, including schedules rejected
 /// as duplicates or sent to a chunk without a registered tick container.
+#[derive(Clone)]
 pub struct RegionTicks {
     chunks: BTreeMap<ChunkPos, ConvertedChunkTicks>,
     game_time: i64,
@@ -221,6 +223,7 @@ pub struct RegionTicks {
     indexes: Option<RegionTickIndexes>,
 }
 
+#[derive(Clone)]
 struct RegionTickIndexes {
     blocks: super::tick_index::LevelTickIndex,
     fluids: super::tick_index::LevelTickIndex,

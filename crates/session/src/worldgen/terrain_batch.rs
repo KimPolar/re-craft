@@ -1976,6 +1976,43 @@ impl FreshTerrainBatch {
         stage.register_converted_chunk(pos, converted, entities, heightmaps, light)
     }
 
+    /// Reopen a completed pass against the same validated batch revision.
+    /// Previously completed callbacks, tick history and block entities are
+    /// retained; the source result remains unchanged if the new pass fails.
+    pub fn resume_generated_postprocessing(
+        &self,
+        completed: &super::PostprocessedGeneratedRegion,
+    ) -> Result<super::GeneratedPostprocessing> {
+        self.validate_postprocessing(completed)?;
+        ensure!(!completed.chunks.is_empty(), "no postprocessed chunks");
+        let config = self
+            .decoration
+            .as_ref()
+            .context("generation configuration is missing")?;
+        let light = if let Some(checkpoint) = &completed.light_checkpoint {
+            Some(checkpoint.visible.clone())
+        } else if completed.world.states().any(|(_, state)| {
+            matches!(
+                state.name.as_str(),
+                "minecraft:brown_mushroom" | "minecraft:red_mushroom"
+            )
+        }) {
+            Some(self.light_snapshot(completed.chunks.iter().copied())?)
+        } else {
+            None
+        };
+        let mut stage = super::GeneratedPostprocessing::from_completed(
+            completed,
+            light,
+            config.mushroom_tags.clone(),
+            Arc::new(config.heightmap_tags.clone()),
+        )?;
+        stage.set_leaf_tags(config.leaf_tags.clone());
+        stage.set_bubble_tags(config.bubble_tags.clone());
+        stage.set_fluid_tags(config.washed_blocks.clone(), config.lava_fluids.clone());
+        Ok(stage)
+    }
+
     /// Drain the checks recorded so far at a caller-selected boundary between
     /// postprocessing polls. A failed drain leaves the stage unchanged. The
     /// caller must reproduce Java's actual lighting schedule; this API does not

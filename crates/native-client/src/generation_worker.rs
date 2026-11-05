@@ -3650,6 +3650,9 @@ mod tests {
                         .is_err()
                 );
                 while !incremental.poll(positions[0], 256)? {}
+                let first_result = incremental.finish()?;
+                let mut incremental = ready.batch.resume_generated_postprocessing(&first_result)?;
+                assert!(incremental.poll(positions[0], 256).is_err());
                 ready
                     .batch
                     .register_generated_postprocessing_chunk(&mut incremental, positions[1])?;
@@ -3662,6 +3665,8 @@ mod tests {
                 while !incremental.poll(positions[1], 256)? {}
                 let incremental = incremental.finish()?;
                 ready.batch.validate_postprocessing(&incremental)?;
+                assert_eq!(first_result.ticks().registration_order(), &positions[..1]);
+                assert_eq!(first_result.chunks.len(), 1);
                 assert_eq!(incremental.ticks().registration_order(), &positions[..2]);
                 assert_eq!(incremental.chunks, positions[..2].iter().copied().collect());
                 let drafts = ready

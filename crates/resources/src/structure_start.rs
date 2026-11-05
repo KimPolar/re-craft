@@ -91,24 +91,7 @@ pub fn template_structure_center_heightmap(value: &Value) -> Result<Option<Heigh
         }
         ("minecraft", "igloo") => Heightmap::WorldSurface,
         ("minecraft", "ocean_ruin") => {
-            ensure!(
-                matches!(
-                    value.get("biome_temp").and_then(Value::as_str),
-                    Some("warm" | "cold")
-                ),
-                "invalid ocean ruin biome temperature"
-            );
-            for key in ["large_probability", "cluster_probability"] {
-                let probability = value
-                    .get(key)
-                    .and_then(Value::as_f64)
-                    .with_context(|| format!("invalid ocean ruin {key}"))?
-                    as f32;
-                ensure!(
-                    probability.is_finite() && (0.0..=1.0).contains(&probability),
-                    "invalid ocean ruin {key}"
-                );
-            }
+            crate::ocean_ruin::Settings::decode(value)?;
             Heightmap::OceanFloor
         }
         _ => return Ok(None),

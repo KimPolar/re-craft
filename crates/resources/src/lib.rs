@@ -53,6 +53,7 @@ pub mod multiface_growth;
 pub mod noise;
 pub mod noise_router;
 pub mod noise_stage;
+pub mod ocean_ruin;
 pub mod ore_feature;
 pub mod packs;
 pub mod placed_feature;

@@ -44,6 +44,7 @@ mod mob_collision;
 mod mob_obstruction;
 mod mob_placement;
 mod mob_spawner;
+pub mod ocean_ruin;
 mod ore;
 pub mod postprocessing;
 mod postprocessing_world;

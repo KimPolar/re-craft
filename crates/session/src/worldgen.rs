@@ -5174,6 +5174,7 @@ mod tests {
         starts.insert(center, BTreeMap::from([(structure_id, structure)]));
         batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
             starts,
+            huts: BTreeMap::new(),
             references: BTreeMap::from([(center, references)]),
             terrain: BTreeMap::new(),
         }));

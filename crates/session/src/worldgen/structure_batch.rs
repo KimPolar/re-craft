@@ -170,11 +170,97 @@ fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<
 #[derive(Default)]
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
+    pub(super) huts: BTreeMap<TerrainStartKey, super::SavedSwampHutPiece>,
     pub(super) references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
 }
 
 impl PreparedStructureStages {
+    /// Construct all state for a newly added start chunk before publishing it.
+    fn insert_starts(&mut self, pos: ChunkPos, starts: SimpleStarts) -> Result<()> {
+        ensure!(
+            !self.starts.contains_key(&pos),
+            "structure start chunk is already prepared"
+        );
+        let mut huts = BTreeMap::new();
+        for (id, start) in &starts {
+            ensure!(
+                start.chunk == [pos.x, pos.z],
+                "structure start belongs to another chunk"
+            );
+            if start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut {
+                let key = (id.clone(), pos);
+                ensure!(
+                    !self.huts.contains_key(&key),
+                    "swamp hut state is already prepared"
+                );
+                huts.insert(
+                    key,
+                    super::SavedSwampHutPiece::capture(start, Default::default())?,
+                );
+            }
+        }
+        self.huts.extend(huts);
+        self.starts.insert(pos, starts);
+        Ok(())
+    }
+
+    /// Validate the complete decoration result before publishing any start
+    /// or hut-state update. `hut_updates` can be the complete staged map.
+    pub(super) fn commit_decorated_starts(
+        &mut self,
+        keys: Vec<Vec<TerrainStartKey>>,
+        updated: Vec<Vec<SimpleStructureStart>>,
+        hut_updates: Option<&BTreeMap<TerrainStartKey, super::SavedSwampHutPiece>>,
+    ) -> Result<()> {
+        ensure!(
+            keys.len() == updated.len(),
+            "structure decoration result shape differs from plan"
+        );
+        let mut replacements = Vec::new();
+        let mut hut_replacements = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (keys, starts) in keys.into_iter().zip(updated) {
+            ensure!(
+                keys.len() == starts.len(),
+                "structure decoration start count differs from plan"
+            );
+            for (key, start) in keys.into_iter().zip(starts) {
+                ensure!(
+                    seen.insert(key.clone()),
+                    "duplicate decorated structure start"
+                );
+                let original = self
+                    .starts
+                    .get(&key.1)
+                    .and_then(|starts| starts.get(&key.0))
+                    .context("decorated structure start is missing")?;
+                ensure!(
+                    original.kind == start.kind && start.chunk == [key.1.x, key.1.z],
+                    "decorated structure identity changed"
+                );
+                if start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut {
+                    let source = hut_updates.unwrap_or(&self.huts);
+                    let saved = *source.get(&key).context("decorated hut state is missing")?;
+                    ensure!(
+                        super::SavedSwampHutPiece::capture(&start, saved.state)? == saved,
+                        "decorated hut state differs from its piece"
+                    );
+                    hut_replacements.push((key.clone(), saved));
+                }
+                replacements.push((key, start));
+            }
+        }
+        for (key, start) in replacements {
+            *self
+                .starts
+                .get_mut(&key.1)
+                .and_then(|starts| starts.get_mut(&key.0))
+                .expect("start was validated") = start;
+        }
+        self.huts.extend(hut_replacements);
+        Ok(())
+    }
     /// Check membership only; entity-source coverage does not depend on the
     /// structure decoration iteration order.
     pub(super) fn only_buried_treasure_references(
@@ -287,7 +373,7 @@ impl StructureGenerationBatch {
                 .starts(pos)
                 .context("structure starts required by plan are missing")?;
             if existing.is_none_or(|old| !old.starts.contains_key(&pos)) {
-                added.starts.insert(pos, starts.clone());
+                added.insert_starts(pos, starts.clone())?;
             }
         }
         for pos in plan.references() {
@@ -386,14 +472,15 @@ impl StructureGenerationBatch {
         for (pos, order) in orders {
             terrain.insert(pos, self.beardifier_for_chunk(pos, &order)?);
         }
-        Ok((
-            self.generator,
-            PreparedStructureStages {
-                starts: self.starts,
-                references: self.references,
-                terrain,
-            },
-        ))
+        let mut stages = PreparedStructureStages {
+            references: self.references,
+            terrain,
+            ..Default::default()
+        };
+        for (pos, starts) in self.starts {
+            stages.insert_starts(pos, starts)?;
+        }
+        Ok((self.generator, stages))
     }
 
     pub(super) fn generator(&self) -> &TerrainGenerator {
@@ -744,6 +831,113 @@ impl StructureGenerationBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_hut_states_survive_expansion_and_invalid_insertions() {
+        use native_core::beardifier::BoundingBox;
+        use native_resources::{
+            structure_piece::ScatteredGroundHeight,
+            structure_start::{HorizontalDirection, SimpleStructureKind},
+        };
+        let make_hut = |pos: ChunkPos| SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [pos.x, pos.z],
+            generation_point: [0, 64, 0],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new(
+                [pos.x * 16, 64, pos.z * 16],
+                [pos.x * 16 + 6, 70, pos.z * 16 + 8],
+            )
+            .unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        let id = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let mut stages = PreparedStructureStages::default();
+        stages
+            .insert_starts(first, BTreeMap::from([(id.clone(), make_hut(first))]))
+            .unwrap();
+        let first_key = (id.clone(), first);
+        let saved = stages.huts.get_mut(&first_key).unwrap();
+        saved.state.ground = ScatteredGroundHeight::from_saved(64);
+        saved.state.spawned_witch = true;
+        let original = *saved;
+        stages
+            .insert_starts(second, BTreeMap::from([(id.clone(), make_hut(second))]))
+            .unwrap();
+        assert_eq!(stages.huts[&first_key], original);
+        assert_eq!(stages.huts[&(id.clone(), second)].state, Default::default());
+        assert!(stages.insert_starts(first, BTreeMap::new()).is_err());
+        let third = ChunkPos { x: 2, z: 0 };
+        let mut bad = make_hut(third);
+        bad.bounds.max[0] += 1;
+        assert!(
+            stages
+                .insert_starts(third, BTreeMap::from([(id.clone(), bad)]))
+                .is_err()
+        );
+        assert!(!stages.starts.contains_key(&third));
+        assert!(!stages.huts.contains_key(&(id, third)));
+        assert_eq!(stages.huts[&first_key], original);
+    }
+
+    #[test]
+    fn decorated_hut_starts_and_states_commit_together() {
+        use native_core::beardifier::BoundingBox;
+        use native_resources::{
+            structure_piece::ScatteredGroundHeight,
+            structure_start::{HorizontalDirection, SimpleStructureKind},
+        };
+        let pos = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let key = (id.clone(), pos);
+        let start = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [0, 64, 0],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 64, 3], [9, 70, 11]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let mut stages = PreparedStructureStages::default();
+        stages
+            .insert_starts(pos, BTreeMap::from([(id.clone(), start.clone())]))
+            .unwrap();
+        let mut moved = start.clone();
+        moved.bounds = BoundingBox::new([3, 70, 3], [9, 76, 11]).unwrap();
+        let mut state = stages.huts[&key].state;
+        state.ground = ScatteredGroundHeight::from_saved(70);
+        state.spawned_witch = true;
+        let saved = super::super::SavedSwampHutPiece::capture(&moved, state).unwrap();
+        let updates = BTreeMap::from([(key.clone(), saved)]);
+        let missing = (ResourceId::parse("minecraft:missing").unwrap(), pos);
+        assert!(
+            stages
+                .commit_decorated_starts(
+                    vec![vec![key.clone(), missing]],
+                    vec![vec![moved.clone(), start.clone()]],
+                    Some(&updates)
+                )
+                .is_err()
+        );
+        assert_eq!(stages.starts[&pos][&id].bounds, start.bounds);
+        assert_eq!(stages.huts[&key].state, Default::default());
+        assert!(
+            stages
+                .commit_decorated_starts(vec![vec![key.clone()]], vec![vec![moved.clone()]], None)
+                .is_err()
+        );
+        stages
+            .commit_decorated_starts(
+                vec![vec![key.clone()]],
+                vec![vec![moved.clone()]],
+                Some(&updates),
+            )
+            .unwrap();
+        assert_eq!(stages.starts[&pos][&id].bounds, moved.bounds);
+        assert_eq!(stages.huts[&key], saved);
+    }
 
     #[test]
     fn preparation_plan_covers_spawn_light_neighborhood_and_rejects_overflow() {

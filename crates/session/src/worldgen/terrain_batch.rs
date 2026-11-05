@@ -1288,7 +1288,15 @@ impl FreshTerrainBatch {
             .as_mut()
             .context("structure stages are unavailable")?;
         let added = structures.prepare_additional_stages(plan, Some(existing))?;
+        ensure!(
+            added
+                .huts
+                .keys()
+                .all(|key| !existing.huts.contains_key(key)),
+            "expanded hut state already exists"
+        );
         existing.starts.extend(added.starts);
+        existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);
         Ok(())
@@ -3440,15 +3448,7 @@ impl FreshTerrainBatch {
                         )?
                     };
                     drop(planned);
-                    for (keys, starts) in keys.into_iter().zip(updated) {
-                        for ((id, source), start) in keys.into_iter().zip(starts) {
-                            *structures
-                                .starts
-                                .get_mut(&source)
-                                .and_then(|starts| starts.get_mut(&id))
-                                .expect("planned structure start was validated") = start;
-                        }
-                    }
+                    structures.commit_decorated_starts(keys, updated, None)?;
                 } else if let Some(engine) = &mut self.light_engine {
                     let registry = self
                         .light_registry

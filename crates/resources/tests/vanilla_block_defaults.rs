@@ -177,6 +177,7 @@ fn generated_block_defaults_match_java() {
         serde_json::json!("minecraft:nether_brick_fence"),
         serde_json::json!("minecraft:spruce_stairs"),
         serde_json::json!("minecraft:stone_stairs"),
+        serde_json::json!("minecraft:purple_glazed_terracotta"),
         serde_json::json!("minecraft:cauldron"),
         serde_json::json!("minecraft:potted_red_mushroom"),
         serde_json::json!("minecraft:chest"),

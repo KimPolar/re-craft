@@ -50,6 +50,7 @@ enum StateSchema {
     Chest,
     Fence,
     Stairs,
+    HorizontalFacing,
 }
 
 impl StateSchema {
@@ -83,6 +84,7 @@ impl StateSchema {
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
+            Self::HorizontalFacing => return BTreeMap::from([("facing".into(), "north".into())]),
             Self::Leaves => {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
@@ -167,6 +169,11 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::HorizontalFacing
+                if name == "facing" && matches!(value, "north" | "south" | "east" | "west") =>
+            {
+                Some(value.to_owned())
+            }
             Self::Fence
                 if matches!(name, "north" | "south" | "west" | "east" | "waterlogged")
                     && matches!(value, "true" | "false") =>
@@ -345,6 +352,8 @@ impl GeneratedBlockRegistry {
         const FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const KEY_FACTORY: &str = "(Lnet/minecraft/resources/ResourceKey;Ljava/util/function/Function;Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)Lnet/minecraft/world/level/block/Block;";
         const STAIR_FACTORY: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/Block;)Lnet/minecraft/world/level/block/Block;";
+        const COLOR_COLLECTION: &str = "net/minecraft/world/level/block/ColorCollection";
+        const COLOR_FACTORY: &str = "(Lnet/minecraft/world/level/block/ColorCollection;Lorg/apache/commons/lang3/function/TriFunction;Ljava/util/function/BiFunction;Ljava/util/function/Function;)Lnet/minecraft/world/level/block/ColorCollection;";
         const BASE: &str = "net/minecraft/world/level/block/Block";
         let mut load = |name: &str| -> Result<crate::item_registry::Class> {
             let bytes = read_class(&format!("{name}.class"))?
@@ -359,6 +368,7 @@ impl GeneratedBlockRegistry {
         let mut candidates = BTreeSet::new();
         let mut registration = None;
         let mut constructors = BTreeSet::new();
+        let mut color_factory = false;
         let mut registered_classes = BTreeMap::new();
         for ins in blocks.instructions()? {
             if ins.op == 0xba {
@@ -401,7 +411,62 @@ impl GeneratedBlockRegistry {
                 ensure!(registration.is_none(), "ambiguous block registration");
                 registration = Some(false);
                 constructors.insert("net/minecraft/world/level/block/StairBlock".to_owned());
+            } else if ins.op == 0xb8
+                && owner == COLOR_COLLECTION
+                && member == "registerBlocks"
+                && descriptor == COLOR_FACTORY
+            {
+                color_factory = true;
             } else if ins.op == 0xb3 && owner == BLOCKS {
+                let collection = match member {
+                    "GLAZED_TERRACOTTA" => Some((
+                        "glazed_terracotta",
+                        "net/minecraft/world/level/block/GlazedTerracottaBlock",
+                    )),
+                    "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
+                    _ => None,
+                };
+                if let Some((suffix, class)) = collection
+                    && color_factory
+                    && registration.is_none()
+                    && candidates.len() == 1
+                    && candidates
+                        .first()
+                        .is_some_and(|(owner, field)| owner == IDS && field == member)
+                {
+                    // The verified 26.3 color collections register these 16
+                    // Minecraft dye-color IDs using the indicated block class.
+                    for color in [
+                        "white",
+                        "orange",
+                        "magenta",
+                        "light_blue",
+                        "yellow",
+                        "lime",
+                        "pink",
+                        "gray",
+                        "light_gray",
+                        "cyan",
+                        "purple",
+                        "blue",
+                        "brown",
+                        "green",
+                        "red",
+                        "black",
+                    ] {
+                        ensure!(
+                            registered_classes
+                                .insert(format!("minecraft:{color}_{suffix}"), class.to_owned())
+                                .is_none(),
+                            "duplicate block registration"
+                        );
+                    }
+                    candidates.clear();
+                    constructors.clear();
+                    registration = None;
+                    color_factory = false;
+                    continue;
+                }
                 let class = match registration {
                     Some(true) => Some(BASE.to_owned()),
                     Some(false) if constructors.len() == 1 => constructors.first().cloned(),
@@ -421,6 +486,7 @@ impl GeneratedBlockRegistry {
                         candidates.clear();
                         constructors.clear();
                         registration = None;
+                        color_factory = false;
                         continue;
                     }
                     let id = ResourceId::parse(name)?;
@@ -438,6 +504,7 @@ impl GeneratedBlockRegistry {
                 candidates.clear();
                 constructors.clear();
                 registration = None;
+                color_factory = false;
             }
         }
         drop(load);
@@ -457,6 +524,9 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
                 "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
+                "net/minecraft/world/level/block/GlazedTerracottaBlock" => {
+                    Some(StateSchema::HorizontalFacing)
+                }
                 "net/minecraft/world/level/block/SpawnerBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {
                     Some(StateSchema::AmethystCluster)
@@ -554,6 +624,69 @@ impl GeneratedBlockRegistry {
                 defaults.contains_key(key)
                     && schema.parse_property(key, value).as_deref() == Some(value.as_str())
             })
+    }
+
+    /// Apply StructureTemplate's mirror-then-rotate order to verified states.
+    /// State classes whose transformation has not been checked are rejected.
+    pub fn transform_template_state(
+        &self,
+        id: &str,
+        properties: &BTreeMap<String, String>,
+        mirror: crate::structure_transform::Mirror,
+        rotation: crate::structure_transform::Rotation,
+    ) -> Result<BTreeMap<String, String>> {
+        use crate::structure_transform::{Mirror, Rotation};
+        ensure!(
+            self.is_canonical_state(id, properties),
+            "unknown or noncanonical template state {id}"
+        );
+        let schema = self.states[id];
+        if matches!(schema, StateSchema::Stateless) {
+            return Ok(properties.clone());
+        }
+        ensure!(
+            matches!(schema, StateSchema::HorizontalFacing | StateSchema::Stairs),
+            "template state transform is unsupported for {id}"
+        );
+        let mut result = properties.clone();
+        let facing = properties["facing"].as_str();
+        let affected = match mirror {
+            Mirror::None => false,
+            Mirror::LeftRight => matches!(facing, "north" | "south"),
+            Mirror::FrontBack => matches!(facing, "east" | "west"),
+        };
+        let mut index = match facing {
+            "north" => 0,
+            "east" => 1,
+            "south" => 2,
+            "west" => 3,
+            _ => unreachable!("canonical facing is horizontal"),
+        };
+        if affected {
+            index += 2;
+            if matches!(schema, StateSchema::Stairs) {
+                let shape = properties["shape"].as_str();
+                let mirrored = match (mirror, shape) {
+                    (_, "outer_left") => "outer_right",
+                    (_, "outer_right") => "outer_left",
+                    (Mirror::LeftRight, "inner_left") => "inner_right",
+                    (Mirror::LeftRight, "inner_right") => "inner_left",
+                    _ => shape,
+                };
+                result.insert("shape".into(), mirrored.into());
+            }
+        }
+        index += match rotation {
+            Rotation::None => 0,
+            Rotation::Clockwise90 => 1,
+            Rotation::Clockwise180 => 2,
+            Rotation::Counterclockwise90 => 3,
+        };
+        result.insert(
+            "facing".into(),
+            ["north", "east", "south", "west"][index % 4].into(),
+        );
+        Ok(result)
     }
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.states.keys().map(String::as_str)
@@ -808,6 +941,44 @@ pub fn load(minecraft_dir: &Path, directory: &Path) -> Result<DefaultProperties>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_state_transform_preserves_java_stair_mirror_asymmetry() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:stairs".into(), StateSchema::Stairs)]),
+            block_entities: BTreeMap::new(),
+        };
+        let mut state = StateSchema::Stairs.default_properties();
+        state.insert("facing".into(), "east".into());
+        state.insert("shape".into(), "inner_left".into());
+        let transformed = registry
+            .transform_template_state(
+                "minecraft:stairs",
+                &state,
+                Mirror::FrontBack,
+                Rotation::None,
+            )
+            .unwrap();
+        assert_eq!(transformed["facing"], "west");
+        assert_eq!(transformed["shape"], "inner_left");
+        state.insert("shape".into(), "outer_left".into());
+        let transformed = registry
+            .transform_template_state(
+                "minecraft:stairs",
+                &state,
+                Mirror::FrontBack,
+                Rotation::None,
+            )
+            .unwrap();
+        assert_eq!(transformed["shape"], "outer_right");
+        state.insert("shape".into(), "invalid".into());
+        assert!(
+            registry
+                .transform_template_state("minecraft:stairs", &state, Mirror::None, Rotation::None)
+                .is_err()
+        );
+    }
 
     const REPORT: &str = r#"{
       "minecraft:stone":{"states":[{"id":1,"default":true}]},

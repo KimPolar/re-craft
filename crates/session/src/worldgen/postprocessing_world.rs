@@ -746,6 +746,51 @@ enum DryBlock {
     Leaves,
 }
 
+// Full cubes whose block states have no properties and whose Java shape
+// callbacks are inert. Keep this explicit: other blocks can schedule ticks,
+// hold fluids, or expose non-full collision faces.
+fn inert_generated_full_cube(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:stone"
+            | "minecraft:granite"
+            | "minecraft:diorite"
+            | "minecraft:andesite"
+            | "minecraft:tuff"
+            | "minecraft:calcite"
+            | "minecraft:dripstone_block"
+            | "minecraft:cobblestone"
+            | "minecraft:mossy_cobblestone"
+            | "minecraft:dirt"
+            | "minecraft:coarse_dirt"
+            | "minecraft:rooted_dirt"
+            | "minecraft:clay"
+            | "minecraft:bedrock"
+            | "minecraft:netherrack"
+            | "minecraft:end_stone"
+            | "minecraft:blackstone"
+            | "minecraft:obsidian"
+            | "minecraft:crying_obsidian"
+            | "minecraft:coal_ore"
+            | "minecraft:iron_ore"
+            | "minecraft:copper_ore"
+            | "minecraft:gold_ore"
+            | "minecraft:lapis_ore"
+            | "minecraft:diamond_ore"
+            | "minecraft:emerald_ore"
+            | "minecraft:deepslate_coal_ore"
+            | "minecraft:deepslate_iron_ore"
+            | "minecraft:deepslate_copper_ore"
+            | "minecraft:deepslate_gold_ore"
+            | "minecraft:deepslate_lapis_ore"
+            | "minecraft:deepslate_diamond_ore"
+            | "minecraft:deepslate_emerald_ore"
+            | "minecraft:nether_gold_ore"
+            | "minecraft:nether_quartz_ore"
+            | "minecraft:ancient_debris"
+    )
+}
+
 fn leaf_distance(state: &BlockState) -> Result<Option<u8>> {
     if !matches!(
         state.name.as_str(),
@@ -798,8 +843,8 @@ fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     match state.name.as_str() {
         "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => Ok(DryBlock::Falling),
         "minecraft:brown_mushroom" | "minecraft:red_mushroom" => Ok(DryBlock::Mushroom),
-        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:stone"
-        | "minecraft:dirt" => Ok(DryBlock::Plain),
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => Ok(DryBlock::Plain),
+        name if inert_generated_full_cube(name) => Ok(DryBlock::Plain),
         _ => bail!("unsupported generated postprocessing block {}", state.name),
     }
 }
@@ -926,20 +971,11 @@ impl GeneratedBlockView<'_> {
         }
         match state.name.as_str() {
             "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => Cell::Air,
-            "minecraft:stone"
-            | "minecraft:dirt"
-            | "minecraft:coarse_dirt"
-            | "minecraft:rooted_dirt"
-            | "minecraft:deepslate"
-            | "minecraft:tuff"
-            | "minecraft:granite"
-            | "minecraft:diorite"
-            | "minecraft:andesite"
-            | "minecraft:bedrock"
+            "minecraft:deepslate"
             | "minecraft:sand"
             | "minecraft:red_sand"
-            | "minecraft:gravel"
-            | "minecraft:clay" => Cell::Solid,
+            | "minecraft:gravel" => Cell::Solid,
+            name if inert_generated_full_cube(name) => Cell::Solid,
             _ => Cell::Unknown,
         }
     }
@@ -2367,6 +2403,167 @@ mod tests {
         assert!(Arc::ptr_eq(&stage.world, &before_world));
         assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
         assert!(!stage.failed && stage.active.is_none());
+    }
+
+    fn inert_cube_postprocessing_trace() -> Vec<String> {
+        let names = [
+            "stone",
+            "granite",
+            "diorite",
+            "andesite",
+            "tuff",
+            "calcite",
+            "dripstone_block",
+            "cobblestone",
+            "mossy_cobblestone",
+            "dirt",
+            "coarse_dirt",
+            "rooted_dirt",
+            "clay",
+            "bedrock",
+            "netherrack",
+            "end_stone",
+            "blackstone",
+            "obsidian",
+            "crying_obsidian",
+            "coal_ore",
+            "iron_ore",
+            "copper_ore",
+            "gold_ore",
+            "lapis_ore",
+            "diamond_ore",
+            "emerald_ore",
+            "deepslate_coal_ore",
+            "deepslate_iron_ore",
+            "deepslate_copper_ore",
+            "deepslate_gold_ore",
+            "deepslate_lapis_ore",
+            "deepslate_diamond_ore",
+            "deepslate_emerald_ore",
+            "nether_gold_ore",
+            "nether_quartz_ore",
+            "ancient_debris",
+        ];
+        let mut trace = Vec::new();
+        for name in names {
+            for adjacent in ["stone", "air", "water"] {
+                let (mut stage, _, chunk) = fixture(false);
+                let world = Arc::make_mut(&mut stage.world);
+                let id = world.intern_state(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::new(),
+                });
+                let neighbor = world.intern_state(BlockState {
+                    name: format!("minecraft:{adjacent}"),
+                    properties: if adjacent == "water" {
+                        BTreeMap::from([("level".into(), "0".into())])
+                    } else {
+                        BTreeMap::new()
+                    },
+                });
+                world.set_block_id(8, 8, 8, id).unwrap();
+                for [x, y, z] in [
+                    [7, 8, 8],
+                    [9, 8, 8],
+                    [8, 7, 8],
+                    [8, 9, 8],
+                    [8, 8, 7],
+                    [8, 8, 9],
+                ] {
+                    world.set_block_id(x, y, z, neighbor).unwrap();
+                }
+                stage.source = Arc::clone(&stage.world);
+                let mut marks = PostProcessing::new(0, 16).unwrap();
+                marks.mark(8, 8, 8);
+                stage
+                    .region
+                    .tasks
+                    .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+                stage.region.ticks = RegionTicks::new(
+                    BTreeMap::from([(
+                        chunk,
+                        ConvertedChunkTicks {
+                            blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                            fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                        },
+                    )]),
+                    100,
+                    0,
+                )
+                .unwrap();
+                let before_ticks = stage.region.ticks.activated_snapshot();
+                let before_world = Arc::clone(&stage.world);
+                while !stage.poll(chunk, 1).unwrap() {}
+                let result = stage.finish().unwrap();
+                assert!(Arc::ptr_eq(&before_world, &result.world));
+                assert_eq!(before_ticks, result.ticks.activated_snapshot());
+                assert!(result.edits.is_empty());
+                assert!(inert_generated_full_cube(&format!("minecraft:{name}")));
+                trace.push(format!(
+                    "{name} {adjacent} 0 0 0 {}",
+                    native_core::random::LegacyRandom::new(42).next_long()
+                ));
+            }
+        }
+        trace
+    }
+
+    #[test]
+    fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
+        assert_eq!(inert_cube_postprocessing_trace().len(), 108);
+        assert!(!inert_generated_full_cube("minecraft:oak_log"));
+        let invalid = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::from([("extra".into(), "true".into())]),
+        };
+        assert!(supported_postprocessing_block(&invalid).is_err());
+    }
+
+    #[test]
+    fn natural_cubes_contain_generated_water_without_changing_ticks() {
+        for material in ["diamond_ore", "nether_quartz_ore", "obsidian"] {
+            let (mut stage, _, chunk) = fixture(false);
+            let world = Arc::make_mut(&mut stage.world);
+            let solid = world.intern_state(BlockState {
+                name: format!("minecraft:{material}"),
+                properties: BTreeMap::new(),
+            });
+            let water = world.intern_state(BlockState {
+                name: "minecraft:water".into(),
+                properties: BTreeMap::from([("level".into(), "0".into())]),
+            });
+            for [x, y, z] in [
+                [7, 8, 8],
+                [9, 8, 8],
+                [8, 7, 8],
+                [8, 9, 8],
+                [8, 8, 7],
+                [8, 8, 9],
+            ] {
+                world.set_block_id(x, y, z, solid).unwrap();
+            }
+            world.set_block_id(8, 8, 8, water).unwrap();
+            stage.source = Arc::clone(&stage.world);
+            stage.set_bubble_tags(Some(Arc::new(
+                native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    BTreeSet::from(["minecraft:water".into()]),
+                ),
+            )));
+            let mut marks = PostProcessing::new(0, 16).unwrap();
+            marks.mark(8, 8, 8);
+            stage
+                .region
+                .tasks
+                .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+            let before = stage.region.ticks.activated_snapshot();
+            let original = Arc::clone(&stage.world);
+            while !stage.poll(chunk, 1).unwrap() {}
+            let result = stage.finish().unwrap();
+            assert!(Arc::ptr_eq(&original, &result.world), "{material}");
+            assert_eq!(before, result.ticks.activated_snapshot(), "{material}");
+        }
     }
 
     fn bonus_chest_fixture() -> (GeneratedPostprocessing, Arc<World>) {
@@ -5412,6 +5609,16 @@ mod tests {
             .iter()
             .map(|line| (*line).to_owned())
             .collect()
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn inert_natural_cubes_match_java_postprocessing() {
+        let actual = java_results(
+            "GeneratedInertPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedInertPostprocessingOracle.java"),
+        );
+        assert_eq!(actual, inert_cube_postprocessing_trace());
     }
 
     #[test]

@@ -1754,6 +1754,7 @@ impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
             },
             (old, state),
         );
+        self.update_snowy_bonus_support(pos)?;
         Ok(())
     }
 
@@ -1811,7 +1812,8 @@ impl native_resources::bonus_chest::BonusChestWorld for GeneratedBlockView<'_> {
             "bonus torch replacement effects are unsupported"
         );
         self.check_bonus_neighbors(pos, true)?;
-        self.write_postprocessed_state(pos, &old, &torch)
+        self.write_postprocessed_state(pos, &old, &torch)?;
+        self.update_snowy_bonus_support(pos)
     }
 }
 
@@ -1855,13 +1857,94 @@ impl GeneratedBlockView<'_> {
                 })
                 && state.name == "minecraft:chest";
             ensure!(
-                inert || same_height_torch || same_height_new_chest,
+                inert
+                    || same_height_torch
+                    || same_height_new_chest
+                    || snowy_bonus_neighbor_inert(&state, dy)
+                    || snowy_bonus_neighbor_changes(&state, dy),
                 "bonus chest neighbor shape callback is unsupported: {}",
                 state.name
             );
         }
         Ok(())
     }
+
+    /// The placement's lower neighbor sees the new block on its upper face.
+    /// A snowy surface changes to false and performs its own shape updates.
+    fn update_snowy_bonus_support(&mut self, pos: [i32; 3]) -> Result<()> {
+        let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
+        let old = self.read(below)?;
+        if !snowy_bonus_neighbor_changes(&old, -1) {
+            return Ok(());
+        }
+        for [dx, dy, dz] in [
+            [-1i32, 0i32, 0i32],
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [0, -1, 0],
+            [0, 1, 0],
+        ] {
+            let p = [
+                below[0].wrapping_add(dx),
+                below[1].wrapping_add(dy),
+                below[2].wrapping_add(dz),
+            ];
+            let state = self.read(p)?;
+            let inert = matches!(
+                state.name.as_str(),
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:void_air"
+                    | "minecraft:stone"
+                    | "minecraft:dirt"
+                    | "minecraft:coarse_dirt"
+                    | "minecraft:rooted_dirt"
+                    | "minecraft:cobblestone"
+            ) && state.properties.is_empty();
+            let placed_above = p == pos
+                && dy == 1
+                && matches!(state.name.as_str(), "minecraft:chest" | "minecraft:torch");
+            ensure!(
+                inert || placed_above || snowy_bonus_neighbor_inert(&state, dy),
+                "snowy bonus support neighbor callback is unsupported: {}",
+                state.name
+            );
+        }
+        let mut next = old.clone();
+        next.properties.insert("snowy".into(), "false".into());
+        self.write_postprocessed_state(below, &old, &next)
+    }
+}
+
+/// SnowyBlock only changes its snowy flag when its upper neighbor changes.
+/// Both bonus chest and torch are non-snow blocks.
+fn snowy_bonus_neighbor_inert(state: &BlockState, dy: i32) -> bool {
+    if !matches!(
+        state.name.as_str(),
+        "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+    ) || state.properties.len() != 1
+    {
+        return false;
+    }
+    match state.properties.get("snowy").map(String::as_str) {
+        Some("false") => true,
+        Some("true") => dy != -1,
+        _ => false,
+    }
+}
+
+fn snowy_bonus_neighbor_changes(state: &BlockState, dy: i32) -> bool {
+    dy == -1
+        && matches!(
+            state.name.as_str(),
+            "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+        )
+        && state.properties.len() == 1
+        && state
+            .properties
+            .get("snowy")
+            .is_some_and(|value| value == "true")
 }
 
 #[cfg(test)]
@@ -1987,17 +2070,27 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:chest"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:chest","minecraft:grass_block","minecraft:podzol","minecraft:mycelium"]}"#.to_vec(),
                     ))
                 } else {
                     Ok(None)
                 }
             }
         }
-        let registry = ["air", "cave_air", "void_air", "stone", "chest", "torch"]
-            .into_iter()
-            .map(|name| format!("minecraft:{name}"))
-            .collect();
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "chest",
+            "torch",
+            "grass_block",
+            "podzol",
+            "mycelium",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
         let tags = Arc::new(HeightmapTags::load(&mut Tags, &registry).unwrap());
         let mut world = World::new("minecraft:overworld");
         let air = world.intern_state(BlockState {
@@ -2082,6 +2175,117 @@ mod tests {
             ),
             world,
         )
+    }
+
+    fn bonus_chest_snowy_surface(name: &str, snowy: bool) -> (GeneratedPostprocessing, Arc<World>) {
+        let (mut stage, _) = bonus_chest_fixture();
+        let world = Arc::make_mut(&mut stage.world);
+        let id = world.intern_state(BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::from([("snowy".into(), snowy.to_string())]),
+        });
+        for z in -16..32 {
+            for x in -16..32 {
+                world.set_block_id(x, 7, z, id).unwrap();
+            }
+        }
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.source);
+        (stage, source)
+    }
+
+    #[test]
+    fn bonus_chest_supports_unsnowed_natural_surfaces() {
+        use native_core::random::LegacyRandom;
+        for name in ["grass_block", "podzol", "mycelium"] {
+            let (mut stage, source) = bonus_chest_snowy_surface(name, false);
+            let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+            for chunk in chunks {
+                while !stage.poll(chunk, 10).unwrap() {}
+            }
+            let mut random = LegacyRandom::new(42);
+            let pos = stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap()
+                .unwrap();
+            let result = stage.finish().unwrap();
+            assert_eq!(
+                result.world.block(pos[0], 7, pos[2]),
+                source.block(pos[0], 7, pos[2])
+            );
+            assert_eq!(
+                result.world.block(pos[0], 8, pos[2]).unwrap().name,
+                "minecraft:chest"
+            );
+            assert_eq!(result.edits.len(), 5);
+        }
+    }
+
+    #[test]
+    fn snowy_neighbor_identifies_unknown_state_and_required_update() {
+        for name in ["grass_block", "podzol", "mycelium"] {
+            let mut state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::from([("snowy".into(), "true".into())]),
+            };
+            assert!(!snowy_bonus_neighbor_inert(&state, -1));
+            for dy in [0, 1] {
+                assert!(snowy_bonus_neighbor_inert(&state, dy));
+            }
+            state.properties.insert("snowy".into(), "false".into());
+            assert!(snowy_bonus_neighbor_inert(&state, -1));
+            state.properties.insert("snowy".into(), "invalid".into());
+            assert!(!snowy_bonus_neighbor_inert(&state, 0));
+        }
+    }
+
+    #[test]
+    fn bonus_chest_updates_snowy_support_without_changing_source() {
+        use native_core::random::LegacyRandom;
+        for name in ["grass_block", "podzol", "mycelium"] {
+            let (mut stage, source) = bonus_chest_snowy_surface(name, true);
+            let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+            for chunk in chunks {
+                while !stage.poll(chunk, 10).unwrap() {}
+            }
+            let mut random = LegacyRandom::new(42);
+            let p = stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
+                )
+                .unwrap()
+                .unwrap();
+            let result = stage.finish().unwrap();
+            assert_eq!(result.edits.len(), 10);
+            for [dx, dz] in [[0, 0], [0, -1], [1, 0], [0, 1], [-1, 0]] {
+                let [x, z] = [p[0] + dx, p[2] + dz];
+                assert_eq!(
+                    source
+                        .block(x, 7, z)
+                        .unwrap()
+                        .properties
+                        .get("snowy")
+                        .map(String::as_str),
+                    Some("true")
+                );
+                assert_eq!(
+                    result
+                        .world
+                        .block(x, 7, z)
+                        .unwrap()
+                        .properties
+                        .get("snowy")
+                        .map(String::as_str),
+                    Some("false")
+                );
+            }
+        }
     }
 
     #[test]
@@ -2242,63 +2446,162 @@ mod tests {
             .arg("-cp")
             .arg(&cp)
             .arg(&source));
-        let output = run(Command::new(java.join("java.exe"))
+        let snowy_source = temp.path().join("BonusChestSnowyOracle.java");
+        std::fs::write(
+            &snowy_source,
+            include_str!("../../tests/java/BonusChestSnowyOracle.java"),
+        )
+        .unwrap();
+        run(Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&cp)
-            .arg("BonusChestOracle")
-            .arg("flat"));
-        let line = output
+            .arg(&snowy_source));
+        let snowy_output = run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("BonusChestSnowyOracle"));
+        let rows: Vec<_> = snowy_output
             .lines()
-            .find(|line| line.starts_with("C 0 42 4 true true "))
-            .unwrap();
-        let (_, tail) = line.split_once(" W ").unwrap();
-        let (expected_writes, tail) = tail.split_once(" L ").unwrap();
-        let (expected_loot, expected_next) = tail.split_once(" R ").unwrap();
-        let (mut stage, _) = bonus_chest_fixture();
-        let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
-        for chunk in chunks {
-            while !stage.poll(chunk, 10).unwrap() {}
+            .filter(|line| line.starts_with("S "))
+            .collect();
+        assert_eq!(rows.len(), 72);
+        for line in rows {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let snowy: bool = fields[2].parse().unwrap();
+            let state = BlockState {
+                name: fields[1].into(),
+                properties: BTreeMap::from([("snowy".into(), snowy.to_string())]),
+            };
+            let dy = match fields[3] {
+                "up" => -1,
+                "down" => 1,
+                _ => 0,
+            };
+            assert_eq!(
+                snowy_bonus_neighbor_inert(&state, dy),
+                fields[5].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            assert_eq!(
+                native_world::collision::button_support_face(&state, glam::IVec3::Y),
+                Some(fields[6].parse::<bool>().unwrap()),
+                "{line}"
+            );
+            assert_eq!(
+                LegacyRandom::new(42).next_long(),
+                fields[7].parse::<i64>().unwrap(),
+                "{line}"
+            );
         }
-        let mut random = LegacyRandom::new(42);
-        let pos = stage
-            .place_initial_bonus_chest(
-                &native_resources::bonus_chest::BonusChestFeature,
-                &mut random,
-                [0, 8, 0],
-            )
-            .unwrap()
-            .unwrap();
-        let result = stage.finish().unwrap();
-        let writes = result
-            .edits
-            .iter()
-            .map(|p| {
-                let state = result.world.block(p.x, p.y, p.z).unwrap();
-                format!(
-                    "{},{},{},{}",
-                    p.x,
-                    p.y,
-                    p.z,
-                    state.name.strip_prefix("minecraft:").unwrap()
+        for (arg, name, mode, snowy) in [
+            ("flat", None, 4, false),
+            ("flat_grass", Some("grass_block"), 5, false),
+            ("flat_podzol", Some("podzol"), 6, false),
+            ("flat_mycelium", Some("mycelium"), 7, false),
+            ("flat_snowy_grass", Some("grass_block"), 8, true),
+            ("flat_snowy_podzol", Some("podzol"), 9, true),
+            ("flat_snowy_mycelium", Some("mycelium"), 10, true),
+        ] {
+            let output = run(Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BonusChestOracle")
+                .arg(arg));
+            if snowy {
+                let shape_next = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("T "))
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                assert_eq!(
+                    shape_next,
+                    LegacyRandom::new(13).next_long(),
+                    "shape callbacks consumed random state"
+                );
+            }
+            let prefix = format!("C 0 42 {mode} true true ");
+            let line = output
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap();
+            let (_, tail) = line.split_once(" W ").unwrap();
+            let (expected_writes, tail) = tail.split_once(" L ").unwrap();
+            let (expected_loot, expected_next) = tail.split_once(" R ").unwrap();
+            let (mut stage, _) = name.map_or_else(bonus_chest_fixture, |name| {
+                bonus_chest_snowy_surface(name, snowy)
+            });
+            let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+            for chunk in chunks {
+                while !stage.poll(chunk, 10).unwrap() {}
+            }
+            let mut random = LegacyRandom::new(42);
+            let pos = stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0],
                 )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        assert_eq!(writes, expected_writes);
-        let Tag::List { values, .. } = result.block_entity_data(ChunkPos { x: 0, z: 0 }).unwrap()
-        else {
-            panic!("missing block entity")
-        };
-        let seed = match values[0].get("LootTableSeed") {
-            Some(Tag::Long(seed)) => *seed,
-            None => 0,
-            _ => panic!("invalid loot seed"),
-        };
-        assert_eq!(
-            format!("{},{},{},{seed}", pos[0], pos[1], pos[2]),
-            expected_loot
-        );
-        assert_eq!(random.next_long(), expected_next.parse::<i64>().unwrap());
+                .unwrap()
+                .unwrap();
+            let result = stage.finish().unwrap();
+            if snowy {
+                let expected_snowy: Vec<bool> = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("G "))
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                let actual_snowy: Vec<bool> = [[0, 0], [0, -1], [1, 0], [0, 1], [-1, 0]]
+                    .into_iter()
+                    .map(|[dx, dz]| {
+                        result
+                            .world
+                            .block(pos[0] + dx, pos[1] - 1, pos[2] + dz)
+                            .unwrap()
+                            .properties["snowy"]
+                            .parse()
+                            .unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    actual_snowy, expected_snowy,
+                    "snowy support state for {arg}"
+                );
+            }
+            let writes = result
+                .edits
+                .iter()
+                .map(|p| {
+                    let state = result.world.block(p.x, p.y, p.z).unwrap();
+                    format!(
+                        "{},{},{},{}",
+                        p.x,
+                        p.y,
+                        p.z,
+                        state.name.strip_prefix("minecraft:").unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            assert_eq!(writes, expected_writes);
+            let Tag::List { values, .. } =
+                result.block_entity_data(ChunkPos { x: 0, z: 0 }).unwrap()
+            else {
+                panic!("missing block entity")
+            };
+            let seed = match values[0].get("LootTableSeed") {
+                Some(Tag::Long(seed)) => *seed,
+                None => 0,
+                _ => panic!("invalid loot seed"),
+            };
+            assert_eq!(
+                format!("{},{},{},{seed}", pos[0], pos[1], pos[2]),
+                expected_loot
+            );
+            assert_eq!(random.next_long(), expected_next.parse::<i64>().unwrap());
+        }
     }
 
     #[test]

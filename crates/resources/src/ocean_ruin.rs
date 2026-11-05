@@ -70,6 +70,62 @@ pub struct Piece {
     pub large: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataMarkerKind {
+    Chest,
+    Drowned,
+    Other,
+}
+
+/// World operations for an ocean ruin DATA marker, in Java call order.
+/// Spawn implementations create a persistent STRUCTURE drowned, finalize it
+/// against the current difficulty and add it with passengers before returning.
+pub trait MarkerWorld {
+    fn fluid_in_water_tag(&mut self, position: [i32; 3]) -> Result<bool>;
+    /// Attempt setBlock with the default chest state and Java flag 2.
+    fn set_default_chest(&mut self, position: [i32; 3], waterlogged: bool) -> Result<()>;
+    fn chest_entity_exists(&mut self, position: [i32; 3]) -> Result<bool>;
+    fn set_chest_loot(&mut self, position: [i32; 3], table: &str, seed: i64) -> Result<()>;
+    /// Returns false only when Java's entity creation returned null.
+    fn create_and_spawn_drowned(&mut self, position: [i32; 3]) -> Result<bool>;
+    fn sea_level(&mut self) -> Result<i32>;
+    /// Set default water or air with Java flag 2 after a successful spawn.
+    fn clear_drowned_marker(&mut self, position: [i32; 3], water: bool) -> Result<()>;
+}
+
+/// Execute one already-clipped DATA marker. Callers must discard their world
+/// draft and random state on error, including callback-owned spawn state.
+pub fn handle_data_marker(
+    world: &mut impl MarkerWorld,
+    random: &mut impl crate::structure_piece::TreasureRandom,
+    kind: DataMarkerKind,
+    position: [i32; 3],
+    large: bool,
+) -> Result<()> {
+    match kind {
+        DataMarkerKind::Chest => {
+            let waterlogged = world.fluid_in_water_tag(position)?;
+            world.set_default_chest(position, waterlogged)?;
+            if world.chest_entity_exists(position)? {
+                let table = if large {
+                    "minecraft:chests/underwater_ruin_big"
+                } else {
+                    "minecraft:chests/underwater_ruin_small"
+                };
+                world.set_chest_loot(position, table, random.next_long())?;
+            }
+        }
+        DataMarkerKind::Drowned => {
+            if world.create_and_spawn_drowned(position)? {
+                let water = position[1] <= world.sea_level()?;
+                world.clear_drowned_marker(position, water)?;
+            }
+        }
+        DataMarkerKind::Other => {}
+    }
+    Ok(())
+}
+
 /// Access to the current world used by Java's ocean-floor adjustment.
 pub trait FloorWorld {
     fn min_y(&self) -> i32;
@@ -287,6 +343,130 @@ pub fn select_for_chunk(seed: i64, chunk: [i32; 2], settings: Settings) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct MarkerTestWorld {
+        calls: Vec<String>,
+        water: bool,
+        chest: bool,
+        spawned: bool,
+        sea: i32,
+    }
+    impl MarkerWorld for MarkerTestWorld {
+        fn fluid_in_water_tag(&mut self, _: [i32; 3]) -> Result<bool> {
+            self.calls.push("fluid".into());
+            Ok(self.water)
+        }
+        fn set_default_chest(&mut self, _: [i32; 3], waterlogged: bool) -> Result<()> {
+            self.calls.push(format!("chest:{waterlogged}"));
+            Ok(())
+        }
+        fn chest_entity_exists(&mut self, _: [i32; 3]) -> Result<bool> {
+            self.calls.push("entity".into());
+            Ok(self.chest)
+        }
+        fn set_chest_loot(&mut self, _: [i32; 3], table: &str, seed: i64) -> Result<()> {
+            self.calls.push(format!("loot:{table}:{seed}"));
+            Ok(())
+        }
+        fn create_and_spawn_drowned(&mut self, _: [i32; 3]) -> Result<bool> {
+            self.calls.push("spawn".into());
+            Ok(self.spawned)
+        }
+        fn sea_level(&mut self) -> Result<i32> {
+            self.calls.push("sea".into());
+            Ok(self.sea)
+        }
+        fn clear_drowned_marker(&mut self, _: [i32; 3], water: bool) -> Result<()> {
+            self.calls.push(format!("clear:{water}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn marker_operations_preserve_java_order_and_random_consumption() {
+        let mut world = MarkerTestWorld {
+            water: true,
+            chest: true,
+            sea: 63,
+            ..Default::default()
+        };
+        let mut random = LegacyRandom::new(42);
+        let mut expected = random.clone();
+        let loot_seed = expected.next_long();
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Chest,
+            [3, 4, 5],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            world.calls,
+            [
+                "fluid".to_string(),
+                "chest:true".into(),
+                "entity".into(),
+                format!("loot:minecraft:chests/underwater_ruin_big:{loot_seed}")
+            ]
+        );
+        assert_eq!(random.next_long(), expected.next_long());
+        world.calls.clear();
+        world.chest = false;
+        let mut expected = random.clone();
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Chest,
+            [3, 4, 5],
+            false,
+        )
+        .unwrap();
+        assert_eq!(world.calls, ["fluid", "chest:true", "entity"]);
+        assert_eq!(random.next_long(), expected.next_long());
+        world.calls.clear();
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Drowned,
+            [3, 63, 5],
+            false,
+        )
+        .unwrap();
+        assert_eq!(world.calls, ["spawn"]);
+        world.calls.clear();
+        world.spawned = true;
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Drowned,
+            [3, 63, 5],
+            false,
+        )
+        .unwrap();
+        assert_eq!(world.calls, ["spawn", "sea", "clear:true"]);
+        world.calls.clear();
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Drowned,
+            [3, 64, 5],
+            false,
+        )
+        .unwrap();
+        assert_eq!(world.calls, ["spawn", "sea", "clear:false"]);
+        world.calls.clear();
+        handle_data_marker(
+            &mut world,
+            &mut random,
+            DataMarkerKind::Other,
+            [3, 4, 5],
+            false,
+        )
+        .unwrap();
+        assert!(world.calls.is_empty());
+    }
 
     struct Floor {
         height: i32,

@@ -76,6 +76,17 @@ pub struct PostprocessedChunkDraft {
     pub entity_chunk: Option<native_persistence::nbt::NamedTag>,
 }
 
+/// Summary of an in-memory structure-region preview. The underlying drafts
+/// are discarded and this value cannot publish or stage a world.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StructureRegionPreview {
+    pub chunk_count: usize,
+    pub referenced_start_chunks: BTreeSet<ChunkPos>,
+    pub terrain_regions: usize,
+    pub entity_regions: usize,
+    pub poi_regions: usize,
+}
+
 /// A sealed proof of the inputs used by one completed postprocessing pass.
 /// The region remains owned by the caller and is unchanged on a failed rebase.
 pub struct PostprocessingExpansionCheckpoint {
@@ -268,6 +279,22 @@ fn group_fresh_regions(
         }
     }
     Ok(regions)
+}
+
+fn require_selected_structure_sources(
+    selected: &BTreeSet<ChunkPos>,
+    mut references: impl FnMut(ChunkPos) -> Result<BTreeSet<ChunkPos>>,
+) -> Result<BTreeSet<ChunkPos>> {
+    ensure!(!selected.is_empty(), "no structure chunks selected");
+    let mut required = BTreeSet::new();
+    for &pos in selected {
+        required.extend(references(pos)?);
+    }
+    ensure!(
+        required.is_subset(selected),
+        "structure start chunks are missing from the selected region"
+    );
+    Ok(required)
 }
 
 /// Attach only structure data produced by this generation batch. The chunk
@@ -2954,6 +2981,51 @@ impl FreshTerrainBatch {
         Ok(output)
     }
 
+    /// Validate a self-contained structure selection and assemble its terrain,
+    /// entity and POI regions in memory. The drafts are discarded on return;
+    /// this preview does not authorize staging or publishing a world.
+    pub fn preview_structure_regions(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        timestamp: u32,
+    ) -> Result<StructureRegionPreview> {
+        ensure!(
+            self.structures.is_some(),
+            "structure generation is disabled"
+        );
+        self.validate_postprocessing(processed)?;
+        let positions: Vec<_> = positions.into_iter().collect();
+        let selected: BTreeSet<_> = positions.iter().copied().collect();
+        ensure!(
+            selected.len() == positions.len(),
+            "duplicate postprocessed chunk"
+        );
+        let referenced_start_chunks = require_selected_structure_sources(&selected, |pos| {
+            self.structure_reference_sources(pos)
+        })?;
+        let chunks = self.postprocessed_chunk_drafts(processed, positions.iter().copied())?;
+        let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
+        let regions = group_fresh_regions(chunks, poi, timestamp)?;
+        use native_persistence::save::FreshRegionKind;
+        Ok(StructureRegionPreview {
+            chunk_count: selected.len(),
+            referenced_start_chunks,
+            terrain_regions: regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Terrain)
+                .count(),
+            entity_regions: regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Entities)
+                .count(),
+            poi_regions: regions
+                .keys()
+                .filter(|(kind, _, _)| *kind == FreshRegionKind::Poi)
+                .count(),
+        })
+    }
+
     /// Prepare terrain, nonempty entity and POI regions from the same sealed
     /// postprocessing pass. No filesystem writes or world publication occur.
     pub fn postprocessed_region_drafts(
@@ -3503,6 +3575,33 @@ mod region_draft_tests {
             entity_records: entities.map(Arc::new),
             entity_chunk,
         }
+    }
+
+    #[test]
+    fn structure_preview_requires_every_referenced_start_in_the_selection() {
+        let a = ChunkPos { x: -1, z: 0 };
+        let b = ChunkPos { x: 0, z: 0 };
+        let c = ChunkPos { x: 1, z: 0 };
+        let refs = |pos| {
+            Ok(match pos {
+                p if p == a => BTreeSet::from([a, b]),
+                p if p == b => BTreeSet::from([c]),
+                _ => BTreeSet::new(),
+            })
+        };
+        assert!(require_selected_structure_sources(&BTreeSet::new(), refs).is_err());
+        assert!(require_selected_structure_sources(&BTreeSet::from([a]), refs).is_err());
+        assert!(require_selected_structure_sources(&BTreeSet::from([a, b]), refs).is_err());
+        assert_eq!(
+            require_selected_structure_sources(&BTreeSet::from([a, b, c]), refs).unwrap(),
+            BTreeSet::from([a, b, c])
+        );
+        assert!(
+            require_selected_structure_sources(&BTreeSet::from([a]), |_| anyhow::bail!(
+                "incomplete starts"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

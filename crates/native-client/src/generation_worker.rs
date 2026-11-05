@@ -172,6 +172,8 @@ pub(crate) struct StructuredInitialOptions {
     pub water_source_conversion: bool,
     pub player: InitialPlayerSpawnOptions,
     pub ceiling_spawn_height: Option<i32>,
+    #[cfg(test)]
+    initial_bonus_seed: Option<i64>,
 }
 
 /// A transient player and matching level metadata. This is not a completed
@@ -1068,6 +1070,8 @@ impl GenerationWorker {
             let child = Self::complete_structured_player_spawn_from_packs(
                 ready,
                 move || Ok((resources, classify, resolve, context.creatures)),
+                #[cfg(test)]
+                options.initial_bonus_seed,
                 options.spawn_mobs,
                 options.water_source_conversion,
                 options.border,
@@ -1594,6 +1598,7 @@ impl GenerationWorker {
     pub(crate) fn complete_structured_player_spawn<C, R, M, K, F>(
         mut ready: GenerationReady,
         prepare: F,
+        #[cfg(test)] initial_bonus_seed: Option<i64>,
         spawn_mobs: bool,
         water_source_conversion: bool,
         border: native_session::respawn::RespawnBorder,
@@ -1723,7 +1728,18 @@ impl GenerationWorker {
                     next_revision,
                     InitialBonusChestRequest {
                         feature,
-                        level_random: native_session::fresh_level_random(),
+                        level_random: {
+                            #[cfg(test)]
+                            {
+                                initial_bonus_seed
+                                    .map(native_core::random::LegacyRandom::new)
+                                    .unwrap_or_else(native_session::fresh_level_random)
+                            }
+                            #[cfg(not(test))]
+                            {
+                                native_session::fresh_level_random()
+                            }
+                        },
                     },
                 )?
             } else {
@@ -1794,6 +1810,7 @@ impl GenerationWorker {
     pub(crate) fn complete_structured_player_spawn_from_packs<C, R, F>(
         ready: GenerationReady,
         prepare: F,
+        #[cfg(test)] initial_bonus_seed: Option<i64>,
         spawn_mobs: bool,
         water_source_conversion: bool,
         border: native_session::respawn::RespawnBorder,
@@ -1832,6 +1849,8 @@ impl GenerationWorker {
                 };
                 Ok((provider, classify, resolve, build, construct))
             },
+            #[cfg(test)]
+            initial_bonus_seed,
             spawn_mobs,
             water_source_conversion,
             border,
@@ -3483,6 +3502,7 @@ mod tests {
                 saved_border: None,
             },
             ceiling_spawn_height: None,
+            initial_bonus_seed: None,
         };
         let mut frozen = creation.freeze(std::path::PathBuf::new(), None);
         frozen.level.session.seed ^= 1;
@@ -3604,6 +3624,7 @@ mod tests {
                     saved_border: Some(saved_border),
                 },
                 ceiling_spawn_height: None,
+                initial_bonus_seed: Some(1),
             },
             50,
             0,
@@ -3784,6 +3805,7 @@ mod tests {
                     move |value: &Value| resolve_generated_terrain_state(value, &registry);
                 Ok((spawn_resources, classify, resolve, None))
             },
+            None,
             true,
             true,
             native_session::respawn::RespawnBorder {
@@ -3821,6 +3843,23 @@ mod tests {
         assert!(player_ready.mesh.targets.as_deref().unwrap().len() > targets.len());
         assert!(player_ready.postprocessed.is_some());
         assert!(player_ready.pack_snapshot.as_ref().is_some());
+        let processed = player_ready.postprocessed.as_ref().unwrap();
+        let selected = player_ready.mesh.targets.as_deref().unwrap();
+        let preview = player_ready.batch.preview_structure_regions(
+            &processed.region,
+            selected.iter().copied(),
+            1,
+        )?;
+        assert_eq!(preview.chunk_count, selected.len());
+        assert!(preview.terrain_regions > 0);
+        assert!(!preview.referenced_start_chunks.is_empty());
+        assert!(preview.referenced_start_chunks.is_subset(selected));
+        assert!(
+            player_ready
+                .batch
+                .postprocessed_region_drafts(&processed.region, selected.iter().copied(), 1,)
+                .is_err()
+        );
         for pos in targets {
             assert_eq!(
                 player_ready.batch.complete_generated_entity_records(pos)?,

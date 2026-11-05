@@ -12,6 +12,23 @@ use serde_json::Value;
 pub struct PreparedPiece {
     pub selection: Piece,
     pub template: Arc<StructureTemplate>,
+    /// Initial Java template bounds, before ocean-floor postprocessing.
+    pub bounds: native_core::beardifier::BoundingBox,
+}
+
+impl PreparedPiece {
+    pub fn block_position(
+        &self,
+        block: &native_persistence::structure_template::TemplateBlock,
+    ) -> [i32; 3] {
+        native_resources::structure_transform::block_world_position(
+            block.position,
+            self.selection.position,
+            native_resources::structure_transform::Mirror::None,
+            self.selection.rotation,
+            [0; 3],
+        )
+    }
 }
 
 /// Read the exact selected templates from the same active data-pack stack.
@@ -42,9 +59,17 @@ pub fn prepare_pieces(
             templates.insert(selection.template.clone(), Arc::clone(&template));
             template
         };
+        let bounds = native_resources::structure_transform::bounding_box(
+            template.size,
+            selection.position,
+            native_resources::structure_transform::Mirror::None,
+            selection.rotation,
+            [0; 3],
+        )?;
         result.push(PreparedPiece {
             selection,
             template,
+            bounds,
         });
     }
     Ok(result)
@@ -149,6 +174,14 @@ mod tests {
                 let pieces = prepare_pieces(&mut data, &definition, seed, [-3, 2])?;
                 assert!(!pieces.is_empty());
                 assert!(pieces.iter().all(|piece| !piece.template.blocks.is_empty()));
+                for piece in &pieces {
+                    for block in &piece.template.blocks {
+                        let pos = piece.block_position(block);
+                        assert!((0..3).all(|axis| {
+                            (piece.bounds.min[axis]..=piece.bounds.max[axis]).contains(&pos[axis])
+                        }));
+                    }
+                }
             }
         }
         Ok(())

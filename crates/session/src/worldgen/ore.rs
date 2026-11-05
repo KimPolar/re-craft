@@ -1060,6 +1060,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             DecorationLightTracking::Fresh(tracker, registry),
             None,
+            None,
         )
     }
 
@@ -1077,6 +1078,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             DecorationLightTracking::Staged(engine, registry),
             None,
+            None,
         )
     }
 
@@ -1089,6 +1091,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             &[PlannedStructureDecoration<'_>],
             &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
         )>,
+        huts: Option<&mut dyn PlannedHutPlacement>,
     ) -> Result<Vec<bool>> {
         let center = self.center_chunk();
         let mut covered = BTreeSet::new();
@@ -1125,7 +1128,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&raw),
             Some(tracking),
             structures,
-            None,
+            huts,
         )
     }
 
@@ -1182,6 +1185,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             true,
             tracking,
             Some((structures, &mut updated)),
+            None,
         )?;
         Ok((features, updated))
     }
@@ -1279,6 +1283,107 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             ) -> Result<super::FreshCreatureRandom>,
         P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
     {
+        self.execute_huts_with_optional_light(
+            terrain, structures, states, random, variants, construct, condition, None,
+        )
+    }
+
+    /// Execute hut structures with a fresh light tracker. The caller must
+    /// supply the same registry and complete structure plan as the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_huts_with_tracked_light<C, P>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+        tracker: &mut FreshGenerationLightTracker,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
+        self.execute_huts_with_optional_light(
+            terrain,
+            structures,
+            states,
+            random,
+            variants,
+            construct,
+            condition,
+            Some(DecorationLightTracking::Fresh(tracker, registry)),
+        )
+    }
+
+    /// Execute hut structures with the staged light engine, preserving the
+    /// same transaction boundary as terrain and entity writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_huts_with_staged_light<C, P>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+        engine: &mut StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
+        self.execute_huts_with_optional_light(
+            terrain,
+            structures,
+            states,
+            random,
+            variants,
+            construct,
+            condition,
+            Some(DecorationLightTracking::Staged(engine, registry)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_huts_with_optional_light<C, P>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        states: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        construct: &mut C,
+        condition: &mut P,
+        tracking: Option<DecorationLightTracking<'_>>,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )>
+    where
+        C: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone + FnMut([i32; 3], &World, &Value) -> Result<bool>,
+    {
         ensure!(
             !terrain.has_published_light,
             "structure decoration requires unpublished lighting"
@@ -1295,15 +1400,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             construct: &mut next_construct,
             condition: &mut next_condition,
         };
-        let features = self.execute_inner(
-            terrain,
-            true,
-            None,
-            None,
-            None,
-            Some((structures, &mut updated)),
-            Some(&mut huts),
-        )?;
+        let features = match tracking {
+            Some(tracking) => self.execute_with_light_tracking(
+                terrain,
+                true,
+                tracking,
+                Some((structures, &mut updated)),
+                Some(&mut huts),
+            )?,
+            None => self.execute_inner(
+                terrain,
+                true,
+                None,
+                None,
+                None,
+                Some((structures, &mut updated)),
+                Some(&mut huts),
+            )?,
+        };
         *states = next_states;
         *random = next_random;
         *construct = next_construct;
@@ -20903,6 +21017,194 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn hut_decoration_preserves_fresh_and_staged_light_transactions() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            cat_variants::CatSpawnVariants,
+            density::WorldgenRandom,
+            structure_decoration::StructureDecorationEntry,
+            structure_piece::swamp_hut::{HutMob, SwampHutState},
+            structure_start::{HorizontalDirection, SimpleStructureKind, SimpleStructureStart},
+            worldgen_region_random::RegionRandom,
+        };
+        struct Cats;
+        impl ResourceProvider for Cats {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/cat_variant/black.json")
+                    .then(|| br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse(match folder {
+                    "cat_variant" => "minecraft:black",
+                    "cat_sound_variant" => "minecraft:classic",
+                    _ => anyhow::bail!("unexpected registry"),
+                })?])
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let light_registry = resources.vanilla_generated_block_registry().unwrap();
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut blocks = batch_registry();
+        blocks.extend(
+            [
+                "minecraft:water",
+                "minecraft:lava",
+                "minecraft:spruce_planks",
+                "minecraft:oak_log",
+                "minecraft:oak_fence",
+                "minecraft:spruce_stairs",
+                "minecraft:potted_red_mushroom",
+                "minecraft:crafting_table",
+                "minecraft:cauldron",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &blocks, &mut resolve_test).unwrap();
+        let variants = CatSpawnVariants::load_active(&mut Cats).unwrap();
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:swamp_hut").unwrap(),
+            step: 0,
+            index: 0,
+        };
+        let hut = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [3, 8, 3],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 8, 3], [9, 14, 11]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let state = SwampHutState {
+            ground: native_resources::structure_piece::ScatteredGroundHeight::from_saved(8),
+            ..Default::default()
+        };
+        let key = (entry.id.clone(), ChunkPos { x: 0, z: 0 });
+        let initial = BTreeMap::from([(
+            key.clone(),
+            super::super::SavedSwampHutPiece::capture(&hut, state).unwrap(),
+        )]);
+        let bad_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:desert_pyramid").unwrap(),
+            step: 0,
+            index: 1,
+        };
+        let bad_start = SimpleStructureStart {
+            kind: SimpleStructureKind::DesertPyramid,
+            ..hut.clone()
+        };
+        let center = ChunkPos { x: 0, z: 0 };
+        for (staged, fail) in [(false, false), (false, true), (true, false), (true, true)] {
+            let east = ChunkPos { x: 2, z: 0 };
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=4 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker
+                .initialize_chunk(&terrain, east, &light_registry)
+                .unwrap();
+            let mut structures = vec![PlannedStructureDecoration {
+                entry: &entry,
+                starts: vec![&hut],
+            }];
+            if fail {
+                structures.push(PlannedStructureDecoration {
+                    entry: &bad_entry,
+                    starts: vec![&bad_start],
+                });
+            }
+            let before = terrain.snapshot();
+            let mut states = initial.clone();
+            let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
+            let mut untouched = random.clone();
+            let mut construct = |mob| {
+                let (id, seed) = match mob {
+                    HutMob::Witch => ("minecraft:witch", 1),
+                    HutMob::Cat => ("minecraft:cat", 2),
+                };
+                super::super::FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
+            };
+            let mut condition = |_: [i32; 3], _: &World, _: &Value| -> Result<bool> {
+                anyhow::bail!("unexpected condition")
+            };
+            let result = if staged {
+                let mut engine = StagedGenerationLightEngine::new(tracker);
+                engine
+                    .activate(&terrain, east, [center], &light_registry)
+                    .unwrap();
+                let result = prepared.execute_huts_with_staged_light(
+                    &mut terrain,
+                    &structures,
+                    &mut states,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut condition,
+                    &mut engine,
+                    &light_registry,
+                );
+                engine
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            } else {
+                let result = prepared.execute_huts_with_tracked_light(
+                    &mut terrain,
+                    &structures,
+                    &mut states,
+                    &mut random,
+                    &variants,
+                    &mut construct,
+                    &mut condition,
+                    &mut tracker,
+                    &light_registry,
+                );
+                tracker
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            };
+            if fail {
+                assert!(result.is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(states, initial);
+                assert_eq!(random.next_long(), untouched.next_long());
+            } else {
+                result.unwrap();
+                assert!(states[&key].state.spawned_witch && states[&key].state.spawned_cat);
+                assert_eq!(
+                    terrain.recorded_generated_entities(center).unwrap().len(),
+                    2
+                );
+                assert_eq!(
+                    terrain.snapshot().block(5, 9, 4).unwrap().name,
+                    "minecraft:spruce_planks"
+                );
+            }
+        }
     }
 
     #[test]

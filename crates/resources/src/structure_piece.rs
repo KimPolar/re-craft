@@ -61,6 +61,128 @@ pub enum BuriedTreasureOutcome {
     },
 }
 
+/// Ground alignment saved by Java's scattered structure pieces as `HPos`.
+/// This adjusts the piece bounds only; block and entity placement must follow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScatteredGroundHeight {
+    height_position: i32,
+}
+
+impl Default for ScatteredGroundHeight {
+    fn default() -> Self {
+        Self {
+            height_position: -1,
+        }
+    }
+}
+
+impl ScatteredGroundHeight {
+    pub fn from_saved(height_position: i32) -> Self {
+        Self { height_position }
+    }
+
+    pub fn height_position(&self) -> i32 {
+        self.height_position
+    }
+
+    /// Match `updateAverageGroundHeight`: only columns inside `clip` at Y=64
+    /// are sampled, in Z-then-X order. A negative saved height is recomputed
+    /// on the next call, just as in Java.
+    pub fn update_average(
+        &mut self,
+        piece: &mut SimpleStructureStart,
+        clip: BoundingBox,
+        offset: i32,
+        mut motion_blocking_no_leaves: impl FnMut(i32, i32) -> Result<i32>,
+    ) -> Result<bool> {
+        if self.height_position >= 0 {
+            return Ok(true);
+        }
+        validate_scattered_bounds(piece)?;
+        let mut sum = 0i32;
+        let mut count = 0i32;
+        if clip.min[1] <= 64 && clip.max[1] >= 64 {
+            let min_x = piece.bounds.min[0].max(clip.min[0]);
+            let max_x = piece.bounds.max[0].min(clip.max[0]);
+            let min_z = piece.bounds.min[2].max(clip.min[2]);
+            let max_z = piece.bounds.max[2].min(clip.max[2]);
+            if min_x <= max_x && min_z <= max_z {
+                for z in min_z..=max_z {
+                    for x in min_x..=max_x {
+                        sum = sum.wrapping_add(motion_blocking_no_leaves(x, z)?);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            return Ok(false);
+        }
+        let height = sum / count;
+        self.apply(piece, height, offset);
+        Ok(true)
+    }
+
+    /// Match `updateHeightPositionToLowestGroundHeight`, including Java's
+    /// initial maximum-height bound and Z-then-X sampling order.
+    pub fn update_lowest(
+        &mut self,
+        piece: &mut SimpleStructureStart,
+        max_y: i32,
+        offset: i32,
+        mut motion_blocking_no_leaves: impl FnMut(i32, i32) -> Result<i32>,
+    ) -> Result<bool> {
+        if self.height_position >= 0 {
+            return Ok(true);
+        }
+        validate_scattered_bounds(piece)?;
+        let mut height = max_y.wrapping_add(1);
+        for z in piece.bounds.min[2]..=piece.bounds.max[2] {
+            for x in piece.bounds.min[0]..=piece.bounds.max[0] {
+                height = height.min(motion_blocking_no_leaves(x, z)?);
+            }
+        }
+        self.apply(piece, height, offset);
+        Ok(true)
+    }
+
+    fn apply(&mut self, piece: &mut SimpleStructureStart, height: i32, offset: i32) {
+        self.height_position = height;
+        let shift = height
+            .wrapping_sub(piece.bounds.min[1])
+            .wrapping_add(offset);
+        piece.bounds.min[1] = piece.bounds.min[1].wrapping_add(shift);
+        piece.bounds.max[1] = piece.bounds.max[1].wrapping_add(shift);
+    }
+}
+
+fn validate_scattered_bounds(piece: &SimpleStructureStart) -> Result<()> {
+    ensure!(
+        matches!(
+            piece.kind,
+            SimpleStructureKind::DesertPyramid
+                | SimpleStructureKind::JungleTemple
+                | SimpleStructureKind::SwampHut
+        ),
+        "piece is not a scattered structure"
+    );
+    let [min_x, min_y, min_z] = piece.bounds.min;
+    let [max_x, max_y, max_z] = piece.bounds.max;
+    ensure!(
+        min_x <= max_x && min_y <= max_y && min_z <= max_z,
+        "invalid scattered structure bounds"
+    );
+    let width = i64::from(max_x) - i64::from(min_x) + 1;
+    let depth = i64::from(max_z) - i64::from(min_z) + 1;
+    ensure!(
+        width
+            .checked_mul(depth)
+            .is_some_and(|area| area <= 1_000_000),
+        "scattered structure bounds are too large"
+    );
+    Ok(())
+}
+
 fn block_id(state: &Value) -> Result<ResourceId> {
     ResourceId::parse(
         state
@@ -348,5 +470,63 @@ mod tests {
         ));
         assert_eq!(clipped.loot, None);
         assert_eq!(random.next_long(), expected);
+    }
+
+    #[test]
+    fn scattered_height_uses_clip_and_reuses_nonnegative_result() {
+        let mut p = piece();
+        p.kind = SimpleStructureKind::SwampHut;
+        p.bounds = BoundingBox::new([-4, 40, 9], [2, 46, 17]).unwrap();
+        let mut state = ScatteredGroundHeight::default();
+        let clip = BoundingBox::new([-3, 64, 10], [-2, 64, 11]).unwrap();
+        let mut reads = Vec::new();
+        assert!(
+            state
+                .update_average(&mut p, clip, -2, |x, z| {
+                    reads.push([x, z]);
+                    Ok(70 + x + z)
+                })
+                .unwrap()
+        );
+        assert_eq!(reads, [[-3, 10], [-2, 10], [-3, 11], [-2, 11]]);
+        assert_eq!(state.height_position(), 78);
+        assert_eq!(p.bounds.min[1], 76);
+        assert_eq!(p.bounds.max[1], 82);
+        assert!(
+            state
+                .update_average(&mut p, clip, 30, |_, _| anyhow::bail!("unexpected read"))
+                .unwrap()
+        );
+        assert_eq!(p.bounds.min[1], 76);
+    }
+
+    #[test]
+    fn scattered_height_no_intersection_and_failures_leave_piece_unchanged() {
+        let mut p = piece();
+        p.kind = SimpleStructureKind::DesertPyramid;
+        p.bounds = BoundingBox::new([0, 40, 0], [2, 46, 2]).unwrap();
+        let original = p.bounds;
+        let mut state = ScatteredGroundHeight::default();
+        let clip = BoundingBox::new([0, 0, 0], [2, 63, 2]).unwrap();
+        assert!(
+            !state
+                .update_average(&mut p, clip, 0, |_, _| anyhow::bail!("unexpected read"))
+                .unwrap()
+        );
+        assert_eq!(p.bounds, original);
+        let clip = BoundingBox::new([0, 64, 0], [2, 64, 2]).unwrap();
+        assert!(
+            state
+                .update_average(&mut p, clip, 0, |x, _| if x == 1 {
+                    anyhow::bail!("missing height")
+                } else {
+                    Ok(75)
+                })
+                .is_err()
+        );
+        assert_eq!(state.height_position(), -1);
+        assert_eq!(p.bounds, original);
+        p.kind = SimpleStructureKind::BuriedTreasure;
+        assert!(state.update_lowest(&mut p, 319, 0, |_, _| Ok(75)).is_err());
     }
 }

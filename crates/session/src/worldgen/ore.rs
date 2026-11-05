@@ -1160,6 +1160,43 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         Ok((features, updated))
     }
 
+    /// Execute structures and features using an initial, immutable light
+    /// revision before any chunk has registered with the light engine.
+    pub fn execute_structures_with_visible_light(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedStructureDecoration<'_>],
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        ensure!(
+            !terrain.has_published_light,
+            "structure decoration requires unpublished lighting"
+        );
+        let block = |p| {
+            light
+                .block_light(p)
+                .context("block-light column not captured")
+        };
+        let raw = |_: &World, p| {
+            light
+                .raw_brightness(p, 0)
+                .context("raw-brightness column not captured")
+        };
+        let mut updated = clone_structure_starts(structures);
+        let features = self.execute_inner(
+            terrain,
+            true,
+            Some(&block),
+            Some(&raw),
+            None,
+            Some((structures, &mut updated)),
+        )?;
+        Ok((features, updated))
+    }
+
     fn execute_inner(
         &self,
         terrain: &mut CarvedTerrainWorld,
@@ -1177,13 +1214,6 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             "structure decoration is not implemented"
         );
         let actions = if let Some((plan, _)) = &structures {
-            for structure in *plan {
-                ensure!(
-                    structure.starts.iter().all(|start| start.kind
-                        == native_resources::structure_start::SimpleStructureKind::BuriedTreasure),
-                    "unsupported structure decoration"
-                );
-            }
             Some(self.plan.actions_with_structures(plan)?)
         } else {
             None
@@ -1304,6 +1334,10 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                     && start.bounds.min[axis] <= clip.max[axis]
                             });
                             if intersects {
+                                ensure!(
+                                    start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
+                                    "unsupported structure decoration"
+                                );
                                 region.place_buried_treasure(start, clip, &mut random)?;
                             }
                         }
@@ -20015,6 +20049,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
 
         let outside = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
             bounds: BoundingBox::new([9, 90, 9], [9, 90, 9]).unwrap(),
             ..make_start(9)
         };

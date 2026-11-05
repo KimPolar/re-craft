@@ -19,6 +19,18 @@ pub enum GenerationStage {
     Full,
 }
 use GenerationStage::*;
+
+pub(super) enum StructureFeatureLighting<'a> {
+    Visible(&'a native_world::generation_light::VisibleLightSnapshot),
+    Fresh(
+        &'a mut super::FreshGenerationLightTracker,
+        &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ),
+    Staged(
+        &'a mut super::StagedGenerationLightEngine,
+        &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ),
+}
 impl GenerationStage {
     pub const ALL: [Self; 10] = [
         Empty,
@@ -633,6 +645,32 @@ impl GenerationSchedule {
             prepared.execute_with_staged_light(terrain, structures_enabled, engine, registry)?;
         self.complete(center, Features)?;
         Ok(result)
+    }
+
+    /// Publish FEATURES only after the complete structure and feature pass succeeds.
+    pub(super) fn run_features_with_structures(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<native_resources::structure_start::SimpleStructureStart>>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let (_, updated) = match lighting {
+            StructureFeatureLighting::Visible(light) => {
+                prepared.execute_structures_with_visible_light(terrain, structures, light)?
+            }
+            StructureFeatureLighting::Fresh(tracker, registry) => prepared
+                .execute_structures_with_tracked_light(terrain, structures, tracker, registry)?,
+            StructureFeatureLighting::Staged(engine, registry) => prepared
+                .execute_structures_with_staged_light(terrain, structures, engine, registry)?,
+        };
+        self.complete(center, Features)?;
+        Ok(updated)
     }
 
     /// Apply features against a complete, immutable visible light revision.

@@ -59,6 +59,65 @@ pub(super) struct PreparedStructureStages {
     pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
 }
 
+impl PreparedStructureStages {
+    pub(super) fn decoration_plan<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
+        decoration_plan(&self.starts, &self.references, pos, schedule)
+    }
+}
+
+fn decoration_plan<'a>(
+    starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
+    references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
+    pos: ChunkPos,
+    schedule: &'a StructureDecorationSchedule,
+) -> Result<Vec<PlannedStructureDecoration<'a>>> {
+    let references = references_by_chunk
+        .get(&pos)
+        .context("structure references are unavailable")?;
+    let registered: BTreeSet<_> = schedule
+        .steps()
+        .iter()
+        .flatten()
+        .map(|entry| &entry.id)
+        .collect();
+    ensure!(
+        references
+            .membership()
+            .keys()
+            .all(|id| registered.contains(id)),
+        "structure reference is absent from decoration registry"
+    );
+    let mut result = Vec::new();
+    for entry in schedule.steps().iter().flatten() {
+        let Some(order) = references.order(&entry.id) else {
+            continue;
+        };
+        let mut starts = Vec::with_capacity(order.len());
+        for &packed in order {
+            let bits = packed as u64;
+            let source = ChunkPos {
+                x: bits as u32 as i32,
+                z: (bits >> 32) as u32 as i32,
+            };
+            let start = starts_by_chunk
+                .get(&source)
+                .and_then(|starts| starts.get(&entry.id))
+                .context("referenced structure start is missing")?;
+            ensure!(
+                start.chunk == [source.x, source.z],
+                "structure start source differs"
+            );
+            starts.push(start);
+        }
+        result.push(PlannedStructureDecoration { entry, starts });
+    }
+    Ok(result)
+}
+
 /// The caller must supply the complete active structure-set list in registry
 /// order, matching the generator, biome rules and resource stack. Unsupported
 /// structure attempts fail the batch; they are never recorded as absent.
@@ -177,40 +236,8 @@ impl StructureGenerationBatch {
         pos: ChunkPos,
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
-        let refs = self
-            .references(pos)
-            .context("structure references are unavailable")?;
-        let registered: BTreeSet<_> = schedule
-            .steps()
-            .iter()
-            .flatten()
-            .map(|entry| &entry.id)
-            .collect();
-        ensure!(
-            refs.keys().all(|id| registered.contains(id)),
-            "structure reference is absent from decoration registry"
-        );
-        let mut result = Vec::new();
-        for entry in schedule.steps().iter().flatten() {
-            let Some(references) = self.reference_order(pos, &entry.id) else {
-                continue;
-            };
-            let mut starts = Vec::with_capacity(references.len());
-            for &packed in references {
-                let bits = packed as u64;
-                let source = ChunkPos {
-                    x: bits as u32 as i32,
-                    z: (bits >> 32) as u32 as i32,
-                };
-                starts.push(
-                    self.starts(source)
-                        .and_then(|starts| starts.get(&entry.id))
-                        .context("referenced structure start is missing")?,
-                );
-            }
-            result.push(PlannedStructureDecoration { entry, starts });
-        }
-        Ok(result)
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        decoration_plan(&self.starts, &self.references, pos, schedule)
     }
 
     /// All referenced starts with terrain adaptation. The sorted result is a

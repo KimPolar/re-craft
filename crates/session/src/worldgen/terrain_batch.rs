@@ -8,6 +8,7 @@ use native_resources::{
     feature_order::{FeatureKey, FeatureSchedule, FeatureTags},
     packs::{ResourceId, ResourceProvider},
     placed_feature::PlacedFeature,
+    structure_decoration::StructureDecorationSchedule,
 };
 use native_world::generation_light::VisibleLightSnapshot;
 use native_world::loaded::{BlockState, ChunkPos, World};
@@ -20,14 +21,14 @@ use std::{
 use super::{
     BiomeNeighborhood, CarvedTerrainWorld, CarverBlockState, FreshGenerationLightTracker,
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
-    schedule::{GenerationSchedule, GenerationStage},
+    schedule::{GenerationSchedule, GenerationStage, StructureFeatureLighting},
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
 
 /// A single-threaded, incrementally driven batch for fresh generation.
 /// Its generator, provider, block registry and tags must belong to the same
-/// immutable pack stack. Structure-aware batches stop at intermediate terrain;
-/// old-chunk blending, structure placement and saving are not supported.
+/// immutable pack stack. Structure-aware batches support buried treasure only;
+/// old-chunk blending and saving generated structures are not supported.
 /// Its deterministic work order has not been proven to match Java's thread
 /// scheduling for climate ties. Outputs remain intermediate and unsaveable.
 pub struct FreshTerrainBatch {
@@ -305,6 +306,7 @@ pub enum FreshBatchLight {
 
 struct DecorationConfig {
     schedule: FeatureSchedule,
+    structures: Option<StructureDecorationSchedule>,
     features_cannot_spawn_entities: bool,
     block_registry: BTreeSet<String>,
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
@@ -640,6 +642,12 @@ impl GeneratedEntitySources {
 }
 
 impl FreshTerrainBatch {
+    /// Structure starts remain intermediate and do not authorize saving.
+    pub fn structure_starts(&self, pos: ChunkPos) -> Option<&super::structure_batch::SimpleStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.starts.get(&pos))
+            .flatten()
+    }
     /// The data-pack tag used for leaf distance checks in this batch.
     pub fn leaf_support_tags(&self) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
         self.decoration.as_ref()?.leaf_tags.clone()
@@ -1056,10 +1064,6 @@ impl FreshTerrainBatch {
         lighting: &GeneratedDimensionLighting,
     ) -> Result<()> {
         ensure!(
-            self.structures.is_none(),
-            "structure placement is not implemented"
-        );
-        ensure!(
             !self.failed && self.schedule.requested_chunks() == 0 && self.decoration.is_none(),
             "decoration must be configured before requests"
         );
@@ -1078,6 +1082,11 @@ impl FreshTerrainBatch {
             "invalid dimension ambient light"
         );
         let schedule = self.generator.feature_schedule(provider, placed_features)?;
+        let structures = self
+            .structures
+            .as_ref()
+            .map(|_| StructureDecorationSchedule::load(provider))
+            .transpose()?;
         let features_cannot_spawn_entities =
             features_cannot_spawn_entities(provider, &schedule, placed_features);
         let heightmap_tags =
@@ -1111,6 +1120,7 @@ impl FreshTerrainBatch {
             .map(Arc::new);
         self.decoration = Some(DecorationConfig {
             schedule,
+            structures,
             features_cannot_spawn_entities,
             block_registry,
             heightmap_tags,
@@ -1173,12 +1183,20 @@ impl FreshTerrainBatch {
     /// Add a terrain request; overlapping dependencies retain completed work.
     pub fn request(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
+        self.validate_structure_dependencies(pos, GenerationStage::Terrain)?;
+        self.check_writes(pos, 0)?;
+        self.schedule.request(pos, GenerationStage::Terrain)
+    }
+
+    fn validate_structure_dependencies(&self, pos: ChunkPos, stage: GenerationStage) -> Result<()> {
         if let Some(structures) = &self.structures {
-            ensure!(
-                structures.terrain.contains_key(&pos),
-                "prepared structure terrain order is missing"
-            );
-            for (radius, &needed) in GenerationStage::Terrain.accumulated().iter().enumerate() {
+            if stage >= GenerationStage::Terrain {
+                ensure!(
+                    structures.terrain.contains_key(&pos),
+                    "prepared structure terrain order is missing for {pos:?}"
+                );
+            }
+            for (radius, &needed) in stage.accumulated().iter().enumerate() {
                 let r = i32::try_from(radius)?;
                 for dz in -r..=r {
                     for dx in -r..=r {
@@ -1205,25 +1223,27 @@ impl FreshTerrainBatch {
                                 "prepared structure references are missing for {source:?}"
                             );
                         }
+                        if needed >= GenerationStage::Terrain {
+                            ensure!(
+                                structures.terrain.contains_key(&source),
+                                "prepared structure terrain order is missing for {source:?}"
+                            );
+                        }
                     }
                 }
             }
         }
-        self.check_writes(pos, 0)?;
-        self.schedule.request(pos, GenerationStage::Terrain)
+        Ok(())
     }
 
     /// Request terrain and supported FEATURES for one chunk.
     pub fn request_features(&mut self, pos: ChunkPos) -> Result<()> {
         ensure!(
-            self.structures.is_none(),
-            "structure placement is not implemented"
-        );
-        ensure!(
             !self.failed,
             "generation batch failed and must be discarded"
         );
         ensure!(self.decoration.is_some(), "decoration is not configured");
+        self.validate_structure_dependencies(pos, GenerationStage::Features)?;
         // The center must remain writable; actual cross-chunk feature writes
         // are validated transactionally against the staged light engine.
         self.check_writes(pos, 0)?;
@@ -1264,6 +1284,7 @@ impl FreshTerrainBatch {
             self.light_registry.is_some(),
             "light initialization is not configured"
         );
+        self.validate_structure_dependencies(pos, GenerationStage::InitializeLight)?;
         if self.light_engine.is_some() {
             ensure!(
                 !self.schedule.has_pending_stage(GenerationStage::Terrain)
@@ -2948,7 +2969,87 @@ impl FreshTerrainBatch {
                             .all(|chunk| !chunk.block_light_correct),
                     "feature batch light engine is not fresh"
                 );
-                if let Some(engine) = &mut self.light_engine {
+                if let Some(structures) = &mut self.structures {
+                    let registry = config
+                        .structures
+                        .as_ref()
+                        .context("structure decoration registry is missing")?;
+                    let planned = structures.decoration_plan(pos, registry)?;
+                    let keys: Vec<Vec<_>> = planned
+                        .iter()
+                        .map(|entry| {
+                            entry
+                                .starts
+                                .iter()
+                                .map(|start| {
+                                    (
+                                        entry.entry.id.clone(),
+                                        ChunkPos {
+                                            x: start.chunk[0],
+                                            z: start.chunk[1],
+                                        },
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let updated = if let Some(engine) = &mut self.light_engine {
+                        let registry = self
+                            .light_registry
+                            .as_ref()
+                            .context("light registry is missing")?;
+                        self.schedule.run_features_with_structures(
+                            terrain,
+                            &prepared,
+                            &planned,
+                            StructureFeatureLighting::Staged(engine, registry),
+                        )?
+                    } else if let Some(tracker) = &mut self.light_tracker {
+                        let registry = self
+                            .light_registry
+                            .as_ref()
+                            .context("light registry is missing")?;
+                        self.schedule.run_features_with_structures(
+                            terrain,
+                            &prepared,
+                            &planned,
+                            StructureFeatureLighting::Fresh(tracker, registry),
+                        )?
+                    } else {
+                        let mut covered = Vec::with_capacity(9);
+                        for dz in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                covered.push(ChunkPos {
+                                    x: pos.x.checked_add(dx).context("light X overflow")?,
+                                    z: pos.z.checked_add(dz).context("light Z overflow")?,
+                                });
+                            }
+                        }
+                        let light = VisibleLightSnapshot::fresh_after_section_updates(
+                            true,
+                            config.has_skylight,
+                            [],
+                            covered,
+                        )
+                        .context("invalid initial light columns")?;
+                        self.schedule.run_features_with_structures(
+                            terrain,
+                            &prepared,
+                            &planned,
+                            StructureFeatureLighting::Visible(&light),
+                        )?
+                    };
+                    drop(planned);
+                    for (keys, starts) in keys.into_iter().zip(updated) {
+                        for ((id, source), start) in keys.into_iter().zip(starts) {
+                            *structures
+                                .starts
+                                .get_mut(&source)
+                                .and_then(|starts| starts.get_mut(&id))
+                                .expect("planned structure start was validated") = start;
+                        }
+                    }
+                } else if let Some(engine) = &mut self.light_engine {
                     let registry = self
                         .light_registry
                         .as_ref()

@@ -6624,6 +6624,173 @@ mod tests {
     }
 
     #[test]
+    fn fresh_structure_batch_decorates_and_retains_buried_treasure_start() {
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+            structure_biomes::StructureBiomes, structure_placement::StructureSetCache,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        struct TreasureData;
+        impl ResourceProvider for TreasureData {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/example/worldgen/structure/treasure.json" => Some(
+                        json!({"type":"minecraft:buried_treasure","biomes":["minecraft:plains"],"step":"surface_structures"}),
+                    ),
+                    "data/example/worldgen/structure_set/treasure.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:treasure","weight":1}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        Some(
+                            json!({"values":["minecraft:stone","minecraft:dirt","minecraft:sand","minecraft:chest"]}),
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    Ok(Some(serde_json::to_vec(&value)?))
+                } else {
+                    Data.read_data(path)
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "worldgen/structure" {
+                    Ok(vec![ResourceId::parse("example:treasure")?])
+                } else {
+                    Data.list_data(folder)
+                }
+            }
+        }
+        let mut data = TreasureData;
+        let mut config = definition();
+        config["settings"]["noise"]["height"] = json!(96);
+        config["settings"]["material_rule"] =
+            json!({"type":"block","result_state":"minecraft:stone"});
+        config["settings"]["noise_router"]["final_density"] = json!({"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1});
+        let generator =
+            TerrainGenerator::with_structure_context(&mut data, &config, 42, 0, 96).unwrap();
+        let structure = ResourceId::parse("example:treasure").unwrap();
+        let set = ResourceId::parse("example:treasure").unwrap();
+        let [x, z] = StructureSetCache::default()
+            .load(&mut data, &set)
+            .unwrap()
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let rules = StructureBiomes::load(&mut data, [structure.clone()]).unwrap();
+        let mut structures =
+            structure_batch::StructureGenerationBatch::new(generator, rules, vec![set]).unwrap();
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                structures
+                    .request_references(ChunkPos {
+                        x: x + dx,
+                        z: z + dz,
+                    })
+                    .unwrap();
+            }
+        }
+        while structures
+            .step(&mut data, &mut |value| {
+                let name = value.as_str().unwrap();
+                Ok(BlockHeightFlags {
+                    is_air: name == "minecraft:air",
+                    blocks_motion: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    blocks_motion_no_leaves: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            })
+            .unwrap()
+            .is_some()
+        {}
+        let positions: Vec<_> = (-1..=1)
+            .flat_map(|dz| {
+                (-1..=1).map(move |dx| ChunkPos {
+                    x: x + dx,
+                    z: z + dz,
+                })
+            })
+            .collect();
+        let order = structures.unambiguous_terrain_orders(positions).unwrap();
+        let blocks: BTreeSet<_> = [
+            "air", "cave_air", "void_air", "bedrock", "stone", "dirt", "water", "lava", "sand",
+            "chest",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let tags = CarverBlockTags::load(&mut data, &blocks).unwrap();
+        let mut batch = FreshTerrainBatch::new_with_prepared_structures(
+            structures,
+            order,
+            tags,
+            "minecraft:overworld",
+        )
+        .unwrap();
+        assert_eq!(
+            batch.structure_starts(target).unwrap()[&structure]
+                .bounds
+                .min[1],
+            90
+        );
+        let lighting = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld").unwrap(),
+            dimension_type: None,
+            min_y: 0,
+            height: 96,
+            has_skylight: true,
+            ambient_light: Some(0.0),
+        };
+        batch
+            .enable_decoration(&mut data, &BTreeSet::new(), blocks, &lighting)
+            .unwrap();
+        batch.request_features(target).unwrap();
+        while batch
+            .step(
+                &mut data,
+                &mut |value| {
+                    let name = value.as_str().unwrap();
+                    Ok(CarverBlockState {
+                        is_air: name == "minecraft:air",
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                },
+                &mut |value| {
+                    Ok(BlockState {
+                        name: value.as_str().unwrap().into(),
+                        properties: BTreeMap::new(),
+                    })
+                },
+            )
+            .unwrap()
+            .is_some()
+        {}
+        let start = &batch.structure_starts(target).unwrap()[&structure];
+        assert_ne!(start.bounds.min[1], 90);
+        assert_eq!(
+            batch
+                .snapshot()
+                .unwrap()
+                .block(
+                    start.bounds.min[0],
+                    start.bounds.min[1],
+                    start.bounds.min[2]
+                )
+                .unwrap()
+                .name,
+            "minecraft:chest"
+        );
+        assert!(batch.into_parts().is_err());
+    }
+
+    #[test]
     fn simple_structure_set_uses_base_noise_and_fixed_biome() {
         use native_core::beardifier::Beardifier;
         use native_resources::{

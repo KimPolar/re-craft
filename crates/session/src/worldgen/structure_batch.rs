@@ -50,6 +50,28 @@ pub struct PlannedStructureDecoration<'a> {
     pub starts: Vec<&'a SimpleStructureStart>,
 }
 
+/// One referenced start, retaining all of its pieces and source metadata.
+#[derive(Clone, Copy)]
+pub enum PlannedStructureStart<'a> {
+    Simple(&'a SimpleStructureStart),
+    OceanRuin(&'a super::ocean_ruin::PreparedStart),
+}
+
+impl PlannedStructureStart<'_> {
+    pub fn chunk(&self) -> [i32; 2] {
+        match self {
+            Self::Simple(start) => start.chunk,
+            Self::OceanRuin(start) => start.chunk,
+        }
+    }
+}
+
+/// Starts for one registry entry in Java's reference-set order.
+pub struct PlannedMixedStructureDecoration<'a> {
+    pub entry: &'a StructureDecorationEntry,
+    pub starts: Vec<PlannedStructureStart<'a>>,
+}
+
 /// Structure and terrain coverage required by a set of later chunk stages.
 /// This uses the same dependency expansion as the generation scheduler.
 pub struct StructurePreparationPlan {
@@ -331,16 +353,57 @@ impl PreparedStructureStages {
         pos: ChunkPos,
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
-        decoration_plan(&self.starts, &self.references, pos, schedule)
+        decoration_plan(
+            &self.starts,
+            &self.ocean_starts,
+            &self.references,
+            pos,
+            schedule,
+        )
     }
 }
 
 fn decoration_plan<'a>(
     starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
+    ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
 ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
+    mixed_decoration_plan(
+        starts_by_chunk,
+        ocean_by_chunk,
+        references_by_chunk,
+        pos,
+        schedule,
+    )?
+    .into_iter()
+    .map(|entry| {
+        let starts = entry
+            .starts
+            .into_iter()
+            .map(|start| match start {
+                PlannedStructureStart::Simple(start) => Ok(start),
+                PlannedStructureStart::OceanRuin(_) => {
+                    bail!("ocean ruin decoration context is missing")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PlannedStructureDecoration {
+            entry: entry.entry,
+            starts,
+        })
+    })
+    .collect()
+}
+
+fn mixed_decoration_plan<'a>(
+    starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
+    ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
+    references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
+    pos: ChunkPos,
+    schedule: &'a StructureDecorationSchedule,
+) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
     let references = references_by_chunk
         .get(&pos)
         .context("structure references are unavailable")?;
@@ -369,17 +432,29 @@ fn decoration_plan<'a>(
                 x: bits as u32 as i32,
                 z: (bits >> 32) as u32 as i32,
             };
-            let start = starts_by_chunk
+            let simple = starts_by_chunk
                 .get(&source)
-                .and_then(|starts| starts.get(&entry.id))
-                .context("referenced structure start is missing")?;
+                .context("referenced structure start chunk is missing")?
+                .get(&entry.id);
+            let ocean = ocean_by_chunk
+                .get(&source)
+                .and_then(|starts| starts.get(&entry.id));
+            let start = match (simple, ocean) {
+                (Some(start), None) => PlannedStructureStart::Simple(start),
+                (None, Some(start)) => {
+                    ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
+                    PlannedStructureStart::OceanRuin(start)
+                }
+                (None, None) => bail!("referenced structure start is missing"),
+                (Some(_), Some(_)) => bail!("duplicate referenced structure start"),
+            };
             ensure!(
-                start.chunk == [source.x, source.z],
+                start.chunk() == [source.x, source.z],
                 "structure start source differs"
             );
             starts.push(start);
         }
-        result.push(PlannedStructureDecoration { entry, starts });
+        result.push(PlannedMixedStructureDecoration { entry, starts });
     }
     Ok(result)
 }
@@ -637,7 +712,29 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
-        decoration_plan(&self.starts, &self.references, pos, schedule)
+        decoration_plan(
+            &self.starts,
+            &self.ocean_starts,
+            &self.references,
+            pos,
+            schedule,
+        )
+    }
+
+    /// Prepare simple and ocean-ruin starts without losing reference order.
+    pub fn mixed_decoration_plan<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        mixed_decoration_plan(
+            &self.starts,
+            &self.ocean_starts,
+            &self.references,
+            pos,
+            schedule,
+        )
     }
 
     /// All referenced starts with terrain adaptation. The sorted result is a
@@ -967,6 +1064,110 @@ impl StructureGenerationBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_plan_rejects_missing_or_inconsistent_starts() -> Result<()> {
+        use native_core::beardifier::BoundingBox;
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            ocean_ruin::{Piece, Rotation, Temperature},
+            structure_start::SimpleStructureKind,
+        };
+        struct Data;
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/ruin.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/structure", "unexpected registry");
+                Ok(vec![ResourceId::parse("example:ruin")?])
+            }
+        }
+        let id = ResourceId::parse("example:ruin")?;
+        let pos = ChunkPos { x: 0, z: 0 };
+        let bounds = BoundingBox::new([1, 70, 1], [1, 70, 1]).unwrap();
+        let refs = collect_ordered_structure_references(pos, |source| {
+            Ok(if source == pos {
+                vec![StructureStartBounds {
+                    structure: id.clone(),
+                    bounds,
+                }]
+            } else {
+                vec![]
+            })
+        })?;
+        let references = BTreeMap::from([(pos, refs)]);
+        let schedule = StructureDecorationSchedule::load(&mut Data)?;
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [1, 1, 1],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let piece = super::super::ocean_ruin::PreparedPiece {
+            selection: Piece {
+                template: "minecraft:underwater_ruin/warm_1".into(),
+                position: [1, 70, 1],
+                rotation: Rotation::None,
+                integrity: 1.0,
+                large: false,
+            },
+            template,
+            bounds,
+        };
+        let start = super::super::ocean_ruin::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 70, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            temperature: Temperature::Warm,
+            pieces: vec![piece],
+        };
+        let mut ocean = BTreeMap::from([(pos, OceanRuinStarts::from([(id.clone(), start)]))]);
+        let mut simple = BTreeMap::new();
+        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        simple.insert(pos, SimpleStarts::new());
+        assert_eq!(
+            mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule)?[0]
+                .starts
+                .len(),
+            1
+        );
+        let backup = ocean[&pos][&id].clone();
+        ocean
+            .get_mut(&pos)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .pieces
+            .clear();
+        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        ocean.get_mut(&pos).unwrap().insert(id.clone(), backup);
+        simple.get_mut(&pos).unwrap().insert(
+            id,
+            SimpleStructureStart {
+                kind: SimpleStructureKind::BuriedTreasure,
+                chunk: [0, 0],
+                generation_point: [0, 0, 0],
+                orientation: None,
+                bounds,
+                terrain_adjustment: TerrainAdjustment::None,
+            },
+        );
+        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        Ok(())
+    }
 
     #[test]
     fn prepared_hut_states_survive_expansion_and_invalid_insertions() {

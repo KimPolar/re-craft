@@ -2271,6 +2271,29 @@ impl DecorationPlan<'_> {
             .collect::<Vec<_>>();
         ordered_decoration_actions(&structures, &features)
     }
+
+    /// Interleave a complete mixed structure plan with the selected features.
+    pub fn actions_with_mixed_structures(
+        &self,
+        structures: &[structure_batch::PlannedMixedStructureDecoration<'_>],
+    ) -> Result<Vec<DecorationAction>> {
+        ensure!(
+            structures
+                .iter()
+                .all(|structure| !structure.starts.is_empty()),
+            "planned structure has no starts"
+        );
+        let structures = structures
+            .iter()
+            .map(|structure| (structure.entry.step, structure.entry.index))
+            .collect::<Vec<_>>();
+        let features = self
+            .features
+            .iter()
+            .map(|feature| (feature.step, feature.index))
+            .collect::<Vec<_>>();
+        ordered_decoration_actions(&structures, &features)
+    }
 }
 impl BiomeNeighborhood {
     pub fn new(seed: i64, min_y: i32, height: i32) -> Result<Self> {
@@ -6336,6 +6359,11 @@ mod tests {
             starts: vec![&start],
         };
         let actions = plan.actions_with_structures(&[structure]).unwrap();
+        let mixed = [structure_batch::PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![structure_batch::PlannedStructureStart::Simple(&start)],
+        }];
+        assert_eq!(plan.actions_with_mixed_structures(&mixed).unwrap(), actions);
         assert_eq!(actions.first(), Some(&DecorationAction::Structure(0)));
         assert_eq!(
             actions
@@ -7597,7 +7625,7 @@ mod tests {
             encoder.write_all(&nbt::write(&template).unwrap()).unwrap();
             data.0
                 .insert("ruin-template".into(), encoder.finish().unwrap());
-            let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
+            let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"step":"surface_structures","biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
             data.0
                 .insert(path.into(), serde_json::to_vec(&ruin).unwrap());
             let result = generator
@@ -7666,6 +7694,34 @@ mod tests {
             let packed =
                 i64::from((target.x as u32 as u64 | ((target.z as u32 as u64) << 32)) as i64);
             assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+            let decoration_schedule =
+                native_resources::structure_decoration::StructureDecorationSchedule::load(
+                    &mut data,
+                )
+                .unwrap();
+            let mixed = batch
+                .mixed_decoration_plan(target, &decoration_schedule)
+                .unwrap();
+            assert_eq!(mixed.len(), 1);
+            assert_eq!(mixed[0].entry.id, structure_id);
+            assert_eq!(mixed[0].entry.index, 1);
+            let planned_chunks: Vec<_> = mixed[0]
+                .starts
+                .iter()
+                .map(|start| {
+                    assert!(matches!(
+                        start,
+                        structure_batch::PlannedStructureStart::OceanRuin(_)
+                    ));
+                    let [x, z] = start.chunk();
+                    (x as u32 as u64 | ((z as u32 as u64) << 32)) as i64
+                })
+                .collect();
+            assert_eq!(
+                planned_chunks,
+                batch.reference_order(target, &structure_id).unwrap()
+            );
+            assert!(batch.decoration_plan(target, &decoration_schedule).is_err());
             let order = batch
                 .unambiguous_terrain_start_order(target)
                 .unwrap()

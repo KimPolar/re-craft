@@ -11424,6 +11424,7 @@ mod tests {
         let mut settings = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: Some(ResourceId::parse("example:custom_sky").unwrap()),
+            inline_dimension_type: None,
             min_y: 0,
             height: 32,
             has_skylight: true,

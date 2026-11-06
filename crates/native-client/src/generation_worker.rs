@@ -3314,6 +3314,7 @@ impl InitialSearchCheckpoint {
     ) -> Result<bool> {
         if self.world.dimension != current.dimension
             || self.world.dimension_type != current.dimension_type
+            || self.world.inline_dimension_type != current.inline_dimension_type
             || !self
                 .world
                 .states()
@@ -3983,6 +3984,16 @@ mod tests {
             GenerationResult::Cancelled => anyhow::bail!("ocean generation cancelled"),
         };
         let records = ready.batch.recorded_generated_entities(target)?;
+        let inline: Value = serde_json::from_str(
+            ready
+                .mesh
+                .world
+                .inline_dimension_type
+                .as_deref()
+                .context("generated inline dimension type missing")?,
+        )?;
+        assert_eq!(inline["has_skylight"], true);
+        assert_eq!(inline["height"], 96);
         ensure!(records.iter().any(|entity| matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:drowned"))),
             "ocean ruin did not generate a drowned: {records:?}");
         Ok(())
@@ -5167,6 +5178,7 @@ mod tests {
                 let lighting = GeneratedDimensionLighting {
                     dimension: ResourceId::parse("minecraft:overworld")?,
                     dimension_type: None,
+                    inline_dimension_type: None,
                     min_y: 0,
                     height: 96,
                     has_skylight: true,
@@ -5556,6 +5568,7 @@ mod tests {
                         let lighting = GeneratedDimensionLighting {
                             dimension: ResourceId::parse("minecraft:overworld")?,
                             dimension_type: None,
+                            inline_dimension_type: None,
                             min_y: 80,
                             height: 16,
                             has_skylight: true,

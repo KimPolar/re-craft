@@ -119,6 +119,7 @@ pub fn restore_missing_for_changes(
 ) -> BTreeSet<ChunkPos> {
     if world.dimension != allocation_world.dimension
         || world.dimension_type != allocation_world.dimension_type
+        || world.inline_dimension_type != allocation_world.inline_dimension_type
     {
         return BTreeSet::new();
     }
@@ -416,6 +417,19 @@ mod tests {
     #[test]
     fn restores_proven_direct_and_dark_layers_without_guessing_unknown_neighbors() {
         let bounds = LightBounds::new(0, 64).unwrap();
+        let mut mismatch = fixture(false);
+        let allocation = mismatch.clone();
+        mismatch.inline_dimension_type = Some(Arc::from(r#"{"has_skylight":true}"#));
+        assert!(
+            restore_missing_for_changes(
+                &mut mismatch,
+                &allocation,
+                bounds,
+                &[wide_change()],
+                |_, _| Some(UNBOUNDED_SKY_SOURCE)
+            )
+            .is_empty()
+        );
         let mut open = fixture(false);
         open.chunks.remove(&ChunkPos { x: -2, z: -2 });
         let allocation = open.clone();

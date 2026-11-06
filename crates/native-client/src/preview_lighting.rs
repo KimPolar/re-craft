@@ -5,7 +5,7 @@ use native_persistence::world::{DimensionId, SavedDimensionType};
 use native_resources::packs::{ResourceId, ResourceProvider};
 use native_world::lighting::LightmapSettings;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Java GameRenderer.nightVisionScale, including the final 200-tick pulse.
 pub fn night_vision_scale(duration: Option<i32>, partial: f32) -> f32 {
@@ -183,11 +183,106 @@ enum GeneratorSettings {
 
 /// Java bakes the active data-pack dimension registry before falling back to
 /// the level stems stored in world_gen_settings.dat.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolvedDimensionType {
+    Named(String),
+    Inline(Arc<str>),
+}
+
+fn saved_inline_definition(value: &native_persistence::nbt::Tag) -> Result<Value> {
+    use native_persistence::nbt::Tag;
+    fn boolean_key(key: &str) -> bool {
+        matches!(
+            key,
+            "has_skylight"
+                | "has_ceiling"
+                | "has_fixed_time"
+                | "has_ender_dragon_fight"
+                | "destroy_on_use"
+                | "destroy_on_leave"
+                | "gameplay/fast_lava"
+                | "minecraft:gameplay/fast_lava"
+                | "gameplay/water_evaporates"
+                | "minecraft:gameplay/water_evaporates"
+                | "gameplay/respawn_anchor_works"
+                | "minecraft:gameplay/respawn_anchor_works"
+        )
+    }
+    fn convert(value: &Tag, boolean: bool, depth: usize, nodes: &mut usize) -> Result<Value> {
+        ensure!(depth <= 128, "inline dimension type is too deeply nested");
+        *nodes = nodes
+            .checked_add(1)
+            .context("inline dimension node count overflow")?;
+        ensure!(
+            *nodes <= 1_000_000,
+            "inline dimension type has too many values"
+        );
+        if boolean {
+            let numeric = match value {
+                Tag::Byte(v) => Some(f64::from(*v)),
+                Tag::Short(v) => Some(f64::from(*v)),
+                Tag::Int(v) => Some(f64::from(*v)),
+                Tag::Long(v) => Some(*v as f64),
+                Tag::Float(v) => Some(f64::from(*v)),
+                Tag::Double(v) => Some(*v),
+                _ => None,
+            };
+            if let Some(number) = numeric {
+                ensure!(number.is_finite(), "non-finite dimension boolean");
+                return Ok(Value::Bool(number != 0.0));
+            }
+        }
+        Ok(match value {
+            Tag::Byte(v) => Value::from(*v),
+            Tag::Short(v) => Value::from(*v),
+            Tag::Int(v) => Value::from(*v),
+            Tag::Long(v) => Value::from(*v),
+            Tag::Float(v) => Value::Number(
+                serde_json::Number::from_f64(f64::from(*v))
+                    .context("non-finite dimension value")?,
+            ),
+            Tag::Double(v) => Value::Number(
+                serde_json::Number::from_f64(*v).context("non-finite dimension value")?,
+            ),
+            Tag::String(v) => {
+                Value::String(String::from_utf16(&v.0).context("invalid inline dimension string")?)
+            }
+            Tag::List { values, .. } => Value::Array(
+                values
+                    .iter()
+                    .map(|v| convert(v, false, depth + 1, nodes))
+                    .collect::<Result<_>>()?,
+            ),
+            Tag::Compound(fields) => {
+                let mut result = serde_json::Map::new();
+                for (key, value) in fields {
+                    let key = String::from_utf16(&key.0).context("invalid inline dimension key")?;
+                    let is_boolean = boolean_key(&key) || (boolean && key == "argument");
+                    result.insert(key, convert(value, is_boolean, depth + 1, nodes)?);
+                }
+                Value::Object(result)
+            }
+            Tag::ByteArray(values) => {
+                Value::Array(values.iter().map(|v| Value::from(*v as i8)).collect())
+            }
+            Tag::IntArray(values) => Value::Array(values.iter().map(|v| Value::from(*v)).collect()),
+            Tag::LongArray(values) => {
+                Value::Array(values.iter().map(|v| Value::from(*v)).collect())
+            }
+        })
+    }
+    ensure!(
+        matches!(value, Tag::Compound(_)),
+        "inline dimension type must be a compound"
+    );
+    convert(value, false, 0, &mut 0)
+}
+
 pub fn resolve_dimension_type(
     source: &mut impl ResourceProvider,
     dimension: &DimensionId,
     saved: Option<&BTreeMap<DimensionId, SavedDimensionType>>,
-) -> Result<Option<String>> {
+) -> Result<Option<ResolvedDimensionType>> {
     let path = format!(
         "data/{}/dimension/{}.json",
         dimension.namespace, dimension.path
@@ -199,17 +294,32 @@ pub fn resolve_dimension_type(
             value.get("generator").is_some_and(Value::is_object),
             "dimension {path} has no generator"
         );
-        let name = value.get("type").and_then(Value::as_str).with_context(|| {
-            format!("inline or missing dimension type in {path} is not supported")
-        })?;
-        let id = ResourceId::parse(name)?;
-        return Ok(Some(format!("{}:{}", id.namespace, id.path)));
+        let definition = value
+            .get("type")
+            .with_context(|| format!("dimension type is missing in {path}"))?;
+        if let Some(name) = definition.as_str() {
+            let id = ResourceId::parse(name)?;
+            return Ok(Some(ResolvedDimensionType::Named(format!(
+                "{}:{}",
+                id.namespace, id.path
+            ))));
+        }
+        ensure!(
+            definition.is_object(),
+            "inline dimension type must be an object"
+        );
+        return Ok(Some(ResolvedDimensionType::Inline(Arc::from(
+            serde_json::to_string(definition)?,
+        ))));
     }
     match saved.and_then(|map| map.get(dimension)) {
-        Some(SavedDimensionType::Named(id)) => Ok(Some(format!("{}:{}", id.namespace, id.path))),
-        Some(SavedDimensionType::Inline(_)) => {
-            bail!("inline saved dimension types are not supported")
-        }
+        Some(SavedDimensionType::Named(id)) => Ok(Some(ResolvedDimensionType::Named(format!(
+            "{}:{}",
+            id.namespace, id.path
+        )))),
+        Some(SavedDimensionType::Inline(value)) => Ok(Some(ResolvedDimensionType::Inline(
+            Arc::from(serde_json::to_string(&saved_inline_definition(value)?)?),
+        ))),
         None => Ok(None),
     }
 }
@@ -244,15 +354,15 @@ pub fn weather_tick_order(
         return Ok(None);
     };
     let overworld = DimensionId::parse("minecraft:overworld")?;
-    if !saved.contains_key(current) || !saved.contains_key(&overworld) {
-        return Ok(None);
-    }
     let mut dimensions: std::collections::BTreeSet<_> = saved.keys().cloned().collect();
     for id in source.list_data("dimension")? {
         dimensions.insert(DimensionId::parse(&format!(
             "{}:{}",
             id.namespace, id.path
         ))?);
+    }
+    if !dimensions.contains(current) || !dimensions.contains(&overworld) {
+        return Ok(None);
     }
     let mut result = Vec::new();
     for id in dimensions {
@@ -262,7 +372,10 @@ pub fn weather_tick_order(
         let resolved = resolve_dimension_type(source, &id, Some(saved))?;
         let name = format!("{}:{}", id.namespace, id.path);
         let profile = match resolved {
-            Some(id) => PreviewLighting::load_type(source, &id)?,
+            Some(ResolvedDimensionType::Named(id)) => PreviewLighting::load_type(source, &id)?,
+            Some(ResolvedDimensionType::Inline(definition)) => {
+                PreviewLighting::from_json(definition.as_bytes())?
+            }
             None => PreviewLighting::load(source, &name)?,
         };
         match can_have_weather(&id, &profile) {
@@ -406,6 +519,16 @@ impl SkyTimeline {
         !self.tracks.is_empty()
     }
     pub fn load(source: &mut impl ResourceProvider, dimension_type: &str) -> Result<Self> {
+        let id = ResourceId::parse(dimension_type)?;
+        let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
+        let bytes = source
+            .read_data(&path)?
+            .with_context(|| format!("missing {path}"))?;
+        let definition: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
+        Self::from_definition(source, &definition)
+    }
+    pub fn from_definition(source: &mut impl ResourceProvider, definition: &Value) -> Result<Self> {
         for id in source.list_data("worldgen/biome")? {
             let path = format!("data/{}/worldgen/biome/{}.json", id.namespace, id.path);
             let bytes = source
@@ -432,8 +555,9 @@ impl SkyTimeline {
                 }
             }
         }
-        let timelines =
-            native_resources::fluid_environment::load_dimension_timelines(source, dimension_type)?;
+        let timelines = native_resources::fluid_environment::dimension_timelines_from_definition(
+            source, definition,
+        )?;
         let mut result = Self { tracks: Vec::new() };
         for timeline in timelines {
             let tracks = timeline
@@ -641,7 +765,7 @@ impl PreviewLighting {
         Self::from_json(&bytes)
     }
 
-    fn from_json(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self> {
         let json: Value = serde_json::from_slice(bytes).context("invalid dimension type JSON")?;
         let has_skylight = json
             .get("has_skylight")
@@ -1190,10 +1314,8 @@ mod tests {
             SavedDimensionType::Named(DimensionId::parse("minecraft:the_nether").unwrap()),
         )]);
         assert_eq!(
-            resolve_dimension_type(&mut Provider(None), &dimension, Some(&saved))
-                .unwrap()
-                .as_deref(),
-            Some("minecraft:the_nether")
+            resolve_dimension_type(&mut Provider(None), &dimension, Some(&saved)).unwrap(),
+            Some(ResolvedDimensionType::Named("minecraft:the_nether".into()))
         );
         let override_json =
             br#"{"type":"example:custom_type","generator":{"type":"minecraft:noise"}}"#;
@@ -1203,18 +1325,18 @@ mod tests {
                 &dimension,
                 Some(&saved)
             )
-            .unwrap()
-            .as_deref(),
-            Some("example:custom_type")
+            .unwrap(),
+            Some(ResolvedDimensionType::Named("example:custom_type".into()))
         );
-        assert!(
+        assert!(matches!(
             resolve_dimension_type(
                 &mut Provider(Some(br#"{"type":{},"generator":{}}"#.to_vec())),
                 &dimension,
                 Some(&saved)
             )
-            .is_err()
-        );
+            .unwrap(),
+            Some(ResolvedDimensionType::Inline(_))
+        ));
         assert!(
             resolve_dimension_type(
                 &mut Provider(Some(br#"{"type":"minecraft:overworld"}"#.to_vec())),
@@ -1227,6 +1349,177 @@ mod tests {
             resolve_dimension_type(&mut Provider(None), &dimension, None).unwrap(),
             None
         );
+        let inline = native_persistence::nbt::Tag::Compound(vec![
+            ("min_y".into(), native_persistence::nbt::Tag::Int(-64)),
+            ("height".into(), native_persistence::nbt::Tag::Int(384)),
+            ("has_skylight".into(), native_persistence::nbt::Tag::Int(1)),
+            ("has_ceiling".into(), native_persistence::nbt::Tag::Byte(0)),
+            (
+                "ambient_light".into(),
+                native_persistence::nbt::Tag::Float(0.1),
+            ),
+            (
+                "attributes".into(),
+                native_persistence::nbt::Tag::Compound(vec![
+                    (
+                        "minecraft:gameplay/fast_lava".into(),
+                        native_persistence::nbt::Tag::Compound(vec![
+                            (
+                                "modifier".into(),
+                                native_persistence::nbt::Tag::String("xor".into()),
+                            ),
+                            ("argument".into(), native_persistence::nbt::Tag::Byte(1)),
+                        ]),
+                    ),
+                    (
+                        "minecraft:gameplay/respawn_anchor_works".into(),
+                        native_persistence::nbt::Tag::Byte(1),
+                    ),
+                    (
+                        "minecraft:visual/sky_light_factor".into(),
+                        native_persistence::nbt::Tag::Byte(1),
+                    ),
+                ]),
+            ),
+        ]);
+        let saved_inline =
+            BTreeMap::from([(dimension.clone(), SavedDimensionType::Inline(inline))]);
+        let Some(ResolvedDimensionType::Inline(encoded)) =
+            resolve_dimension_type(&mut Provider(None), &dimension, Some(&saved_inline)).unwrap()
+        else {
+            panic!("inline type missing")
+        };
+        let parsed: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["has_skylight"], true);
+        assert_eq!(parsed["has_ceiling"], false);
+        assert_eq!(
+            parsed["attributes"]["minecraft:gameplay/fast_lava"]["argument"],
+            true
+        );
+        assert_eq!(
+            parsed["attributes"]["minecraft:gameplay/respawn_anchor_works"],
+            true
+        );
+        assert_eq!(parsed["attributes"]["minecraft:visual/sky_light_factor"], 1);
+        let profile = PreviewLighting::from_json(encoded.as_bytes()).unwrap();
+        assert_eq!(profile.build_bounds, Some((-64, 320)));
+        assert_eq!(profile.lightmap.sky_factor, 1.0);
+        assert!(matches!(
+            resolve_dimension_type(
+                &mut Provider(Some(override_json.to_vec())),
+                &dimension,
+                Some(&saved_inline)
+            )
+            .unwrap(),
+            Some(ResolvedDimensionType::Named(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3 and Java 25 JDK"]
+    fn saved_inline_types_match_java_dimension_codec() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = temp.path().join("InlineDimensionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/InlineDimensionOracle.java"),
+        )?;
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compile.status.success(),
+            "Java oracle failed to compile: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("InlineDimensionOracle")
+            .arg(temp.path())
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        for name in ["overworld", "the_nether", "the_end"] {
+            let document = native_persistence::nbt::read(&std::fs::read(
+                temp.path().join(format!("{name}.nbt")),
+            )?)?;
+            let definition = saved_inline_definition(&document.value)?;
+            let inline = PreviewLighting::from_json(&serde_json::to_vec(&definition)?)?;
+            let named = PreviewLighting::load_type(&mut resources, &format!("minecraft:{name}"))?;
+            assert_eq!(inline.has_skylight, named.has_skylight, "{name}");
+            assert_eq!(inline.has_ceiling, named.has_ceiling, "{name}");
+            assert_eq!(inline.build_bounds, named.build_bounds, "{name}");
+            assert_eq!(inline.nether_cardinal, named.nether_cardinal, "{name}");
+            assert_eq!(inline.lightmap, named.lightmap, "{name}");
+            let inline_lava =
+                native_resources::fluid_environment::fast_lava_environment_from_definition(
+                    &mut resources,
+                    &definition,
+                )?;
+            let named_lava = native_resources::fluid_environment::load_fast_lava_environment(
+                &mut resources,
+                &format!("minecraft:{name}"),
+            )?;
+            let inline_water =
+                native_resources::fluid_environment::water_evaporation_environment_from_definition(
+                    &mut resources,
+                    &definition,
+                )?;
+            let named_water =
+                native_resources::fluid_environment::load_water_evaporation_environment(
+                    &mut resources,
+                    &format!("minecraft:{name}"),
+                )?;
+            assert_eq!(
+                native_resources::world_clock::dimension_default_clock_from_definition(
+                    &definition
+                )?,
+                native_resources::world_clock::dimension_default_clock(
+                    &mut resources,
+                    &format!("minecraft:{name}")
+                )?
+            );
+            for tick in [0, 12000, 24000, 96000] {
+                assert_eq!(
+                    inline_lava.sample(|_| Some(tick)),
+                    named_lava.sample(|_| Some(tick)),
+                    "{name} tick {tick}"
+                );
+                assert_eq!(
+                    inline_water.sample(|_| Some(tick)),
+                    named_water.sample(|_| Some(tick)),
+                    "{name} tick {tick}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

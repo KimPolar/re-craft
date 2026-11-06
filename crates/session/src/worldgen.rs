@@ -1539,9 +1539,19 @@ impl CarvedTerrainWorld {
                 "lighting dimension type differs from terrain"
             );
         }
+        if let Some(existing) = &self.world.inline_dimension_type {
+            ensure!(
+                Some(existing) == settings.inline_dimension_type.as_ref(),
+                "inline lighting dimension type differs from terrain"
+            );
+        }
         self.initialize_generated_lighting(center, settings.has_skylight)?;
-        if self.world.dimension_type != name {
-            Arc::make_mut(&mut self.world).dimension_type = name;
+        if self.world.dimension_type != name
+            || self.world.inline_dimension_type != settings.inline_dimension_type
+        {
+            let world = Arc::make_mut(&mut self.world);
+            world.dimension_type = name;
+            world.inline_dimension_type = settings.inline_dimension_type.clone();
         }
         Ok(())
     }
@@ -3840,6 +3850,7 @@ mod tests {
             let lighting = GeneratedDimensionLighting {
                 dimension: ResourceId::parse("minecraft:overworld").unwrap(),
                 dimension_type: None,
+                inline_dimension_type: None,
                 min_y: 0,
                 height: 16,
                 has_skylight: true,
@@ -3995,6 +4006,7 @@ mod tests {
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
+            inline_dimension_type: None,
             min_y: 0,
             height: 16,
             has_skylight: false,
@@ -5858,6 +5870,7 @@ mod tests {
             let lighting = GeneratedDimensionLighting {
                 dimension: ResourceId::parse("minecraft:overworld").unwrap(),
                 dimension_type: Some(ResourceId::parse("example:custom_type").unwrap()),
+                inline_dimension_type: None,
                 min_y: 0,
                 height: 16,
                 has_skylight: has_sky,
@@ -7122,6 +7135,7 @@ mod tests {
             let lighting = GeneratedDimensionLighting {
                 dimension: ResourceId::parse("minecraft:overworld").unwrap(),
                 dimension_type: None,
+                inline_dimension_type: None,
                 min_y: 0,
                 height: 96,
                 has_skylight: true,
@@ -7584,6 +7598,7 @@ mod tests {
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld")?,
             dimension_type: None,
+            inline_dimension_type: None,
             min_y: 0,
             height: 96,
             has_skylight: true,
@@ -7872,6 +7887,7 @@ mod tests {
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
+            inline_dimension_type: None,
             min_y: 0,
             height: 96,
             has_skylight: true,

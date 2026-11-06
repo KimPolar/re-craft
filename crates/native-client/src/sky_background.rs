@@ -841,6 +841,16 @@ impl SkyBackground {
             .with_context(|| format!("missing {path}"))?;
         let dimension: Value =
             serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
+        Self::from_definition(source, &dimension, min_y, max_y)
+    }
+
+    pub fn from_definition(
+        source: &mut impl ResourceProvider,
+        dimension: &Value,
+        min_y: i32,
+        max_y: i32,
+    ) -> Result<Option<Self>> {
+        ensure!(min_y < max_y, "invalid dimension bounds");
         let ambient_light = match dimension.get("ambient_light") {
             None => 0.0,
             Some(value) => value.as_f64().context("invalid dimension ambient_light")? as f32,
@@ -1025,9 +1035,9 @@ impl SkyBackground {
         let mut fog_tracks = Some(Vec::new());
         let mut fog_sky_tracks = Some(Vec::new());
         let mut fog_color_tracks = Some(Vec::new());
-        for timeline in
-            native_resources::fluid_environment::load_dimension_timelines(source, dimension_type)?
-        {
+        for timeline in native_resources::fluid_environment::dimension_timelines_from_definition(
+            source, dimension,
+        )? {
             let entries = timeline
                 .get("tracks")
                 .and_then(Value::as_object)

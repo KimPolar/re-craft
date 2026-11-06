@@ -318,9 +318,10 @@ impl PreviewMaterials {
                 .insert(id.asset_path("textures", "png"), bytes);
             banner_sprites.insert(appearance.clone(), id);
         }
-        let lighting_result = match &world.dimension_type {
-            Some(id) => PreviewLighting::load_type(provider.inner, id),
-            None => PreviewLighting::load(provider.inner, &world.dimension),
+        let lighting_result = match (&world.dimension_type, &world.inline_dimension_type) {
+            (_, Some(definition)) => PreviewLighting::from_json(definition.as_bytes()),
+            (Some(id), None) => PreviewLighting::load_type(provider.inner, id),
+            (None, None) => PreviewLighting::load(provider.inner, &world.dimension),
         };
         let lighting = match lighting_result {
             Ok(lighting) => lighting,
@@ -914,6 +915,7 @@ impl PreviewScene {
 struct MaterialsKey {
     dimension: String,
     dimension_type: Option<String>,
+    inline_dimension_type: Option<Arc<str>>,
     max_atlas_side: u32,
     states: Vec<(BlockStateId, BlockState)>,
     biomes: Vec<(BiomeId, String)>,
@@ -1159,6 +1161,7 @@ impl IncrementalPreview {
         if let Some((old, _)) = &self.materials
             && old.dimension == world.dimension
             && old.dimension_type == world.dimension_type
+            && old.inline_dimension_type == world.inline_dimension_type
             && old.max_atlas_side == max_atlas_side
             && old
                 .states
@@ -1189,6 +1192,7 @@ impl IncrementalPreview {
             Ok(MaterialsKey {
                 dimension: world.dimension.clone(),
                 dimension_type: world.dimension_type.clone(),
+                inline_dimension_type: world.inline_dimension_type.clone(),
                 max_atlas_side,
                 banners: banners.clone(),
                 states: states
@@ -2118,8 +2122,19 @@ mod tests {
         world.dimension_type = Some("minecraft:overworld".into());
         cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
         assert_eq!(cache.generation, initial + 1);
+        world.dimension_type = None;
+        world.inline_dimension_type =
+            Some(Arc::from(r#"{"has_skylight":false,"has_ceiling":true}"#));
         cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
-        assert_eq!(cache.generation, initial + 1);
+        assert_eq!(cache.generation, initial + 2);
+        cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
+        assert_eq!(cache.generation, initial + 2);
+        world.inline_dimension_type =
+            Some(Arc::from(r#"{"has_skylight":true,"has_ceiling":false}"#));
+        cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
+        assert_eq!(cache.generation, initial + 3);
+        cache.prepare(&world, &mut Empty, IVec3::ZERO, 128).unwrap();
+        assert_eq!(cache.generation, initial + 3);
     }
 
     #[test]
@@ -2995,6 +3010,7 @@ mod tests {
         let lighting = GeneratedDimensionLighting {
             dimension: ResourceId::parse("minecraft:overworld").unwrap(),
             dimension_type: None,
+            inline_dimension_type: None,
             min_y: 0,
             height: 16,
             has_skylight: true,

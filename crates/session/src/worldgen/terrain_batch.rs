@@ -182,6 +182,7 @@ fn unchanged_generation_world_for(
 ) -> bool {
     if before.dimension != after.dimension
         || before.dimension_type != after.dimension_type
+        || before.inline_dimension_type != after.inline_dimension_type
         || before.biome_zoom_seed() != after.biome_zoom_seed()
         || !before
             .states()
@@ -459,6 +460,7 @@ struct DecorationConfig {
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
     dimension_type: Option<String>,
+    inline_dimension_type: Option<Arc<str>>,
     ambient_light: Option<f32>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -1624,6 +1626,7 @@ impl FreshTerrainBatch {
                 .dimension_type
                 .as_ref()
                 .map(|id| format!("{}:{}", id.namespace, id.path)),
+            inline_dimension_type: lighting.inline_dimension_type.clone(),
         });
         Ok(())
     }
@@ -3814,9 +3817,12 @@ impl FreshTerrainBatch {
                 }
                 if let (Some(config), Some(terrain)) = (&self.decoration, &mut self.terrain) {
                     terrain.initialize_worldgen_heightmaps(pos, &config.heightmap_tags)?;
-                    if terrain.world.dimension_type != config.dimension_type {
-                        Arc::make_mut(&mut terrain.world).dimension_type =
-                            config.dimension_type.clone();
+                    if terrain.world.dimension_type != config.dimension_type
+                        || terrain.world.inline_dimension_type != config.inline_dimension_type
+                    {
+                        let world = Arc::make_mut(&mut terrain.world);
+                        world.dimension_type = config.dimension_type.clone();
+                        world.inline_dimension_type = config.inline_dimension_type.clone();
                     }
                 }
                 self.lit_cache = None;
@@ -4897,6 +4903,9 @@ mod expansion_checkpoint_tests {
         assert!(!unchanged_generation_world(&before, &changed));
         let mut changed = expanded.clone();
         changed.dimension_type = Some("minecraft:overworld".into());
+        assert!(!unchanged_generation_world(&before, &changed));
+        let mut changed = expanded.clone();
+        changed.inline_dimension_type = Some(Arc::from(r#"{"has_skylight":false}"#));
         assert!(!unchanged_generation_world(&before, &changed));
         let mut changed = expanded.clone();
         changed.chunks.remove(&old_pos);

@@ -8,6 +8,8 @@ use serde_json::Value;
 pub struct GeneratedDimensionLighting {
     pub dimension: ResourceId,
     pub dimension_type: Option<ResourceId>,
+    /// Encoded inline definition for sharing with render snapshots.
+    pub inline_dimension_type: Option<std::sync::Arc<str>>,
     pub min_y: i32,
     pub height: i32,
     pub has_skylight: bool,
@@ -140,10 +142,16 @@ impl GeneratedDimensionLighting {
                 Ok(ambient)
             })
             .transpose()?;
+        let inline_dimension_type = if dimension_type.is_none() {
+            Some(std::sync::Arc::from(serde_json::to_string(&definition)?))
+        } else {
+            None
+        };
         Ok((
             Self {
                 dimension,
                 dimension_type,
+                inline_dimension_type,
                 min_y,
                 height,
                 has_skylight,

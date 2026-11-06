@@ -188,6 +188,9 @@ pub struct World {
     /// The resolved registry ID of this dimension's type, when available.
     /// This travels with snapshots so streamed mesh work uses the same type.
     pub dimension_type: Option<String>,
+    /// Inline dimension type JSON, shared with rendering snapshots when the
+    /// type is not a registry reference.
+    pub inline_dimension_type: Option<Arc<str>>,
     states: Registry<BlockState>,
     biomes: Registry<String>,
     pub chunks: BTreeMap<ChunkPos, Arc<Chunk>>,

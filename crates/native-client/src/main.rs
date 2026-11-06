@@ -931,16 +931,36 @@ fn prepare_existing_world(
     let saved_dimensions = reader
         .saved_dimension_types()
         .context("cannot read saved dimension mappings")?;
-    world.dimension_type = preview_lighting::resolve_dimension_type(
+    let resolved_dimension_type = preview_lighting::resolve_dimension_type(
         &mut resources,
         reader.dimension(),
         saved_dimensions.as_ref(),
     )
     .context("cannot resolve the world's dimension type")?;
+    match resolved_dimension_type {
+        Some(preview_lighting::ResolvedDimensionType::Named(name)) => {
+            world.dimension_type = Some(name)
+        }
+        Some(preview_lighting::ResolvedDimensionType::Inline(definition)) => {
+            world.inline_dimension_type = Some(definition)
+        }
+        None => {}
+    }
+    let inline_dimension: Option<serde_json::Value> = world
+        .inline_dimension_type
+        .as_ref()
+        .map(|value| serde_json::from_str(value))
+        .transpose()
+        .context("invalid inline dimension type")?;
     if play {
-        let profile = match &world.dimension_type {
-            Some(id) => preview_lighting::PreviewLighting::load_type(&mut resources, id),
-            None => preview_lighting::PreviewLighting::load(&mut resources, &world.dimension),
+        let profile = match (&world.dimension_type, &world.inline_dimension_type) {
+            (_, Some(definition)) => {
+                preview_lighting::PreviewLighting::from_json(definition.as_bytes())
+            }
+            (Some(id), None) => preview_lighting::PreviewLighting::load_type(&mut resources, id),
+            (None, None) => {
+                preview_lighting::PreviewLighting::load(&mut resources, &world.dimension)
+            }
         }
         .context("cannot determine dimension bounds for experimental play")?;
         let (min_y, max_y) = profile
@@ -969,50 +989,87 @@ fn prepare_existing_world(
                 None
             }
         };
-        let fast_lava = world.dimension_type.as_deref().and_then(|dimension_type| {
-            match native_resources::fluid_environment::load_fast_lava_environment(
+        let fast_lava = if let Some(definition) = &inline_dimension {
+            Some(
+                native_resources::fluid_environment::fast_lava_environment_from_definition(
+                    &mut resources,
+                    definition,
+                ),
+            )
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                native_resources::fluid_environment::load_fast_lava_environment(
+                    &mut resources,
+                    dimension_type,
+                )
+            })
+        }
+        .and_then(|result| match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!(
+                    "Fast lava environment is unavailable; using dimension fallback: {error:#}"
+                );
+                None
+            }
+        });
+        let water_evaporation = if let Some(definition) = &inline_dimension {
+            Some(
+                native_resources::fluid_environment::water_evaporation_environment_from_definition(
+                    &mut resources,
+                    definition,
+                ),
+            )
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                native_resources::fluid_environment::load_water_evaporation_environment(
+                    &mut resources,
+                    dimension_type,
+                )
+            })
+        }
+        .and_then(|result| match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("Water evaporation rules are unavailable: {error:#}");
+                None
+            }
+        });
+        let sky_timeline = if let Some(definition) = &inline_dimension {
+            Some(preview_lighting::SkyTimeline::from_definition(
                 &mut resources,
-                dimension_type,
-            ) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    eprintln!(
-                        "Fast lava environment is unavailable; using dimension fallback: {error:#}"
-                    );
-                    None
-                }
+                definition,
+            ))
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                preview_lighting::SkyTimeline::load(&mut resources, dimension_type)
+            })
+        }
+        .and_then(|result| match result {
+            Ok(timeline) if timeline.is_animated() => Some(timeline),
+            Ok(_) => None,
+            Err(error) => {
+                eprintln!("Sky light timeline unavailable: {error:#}");
+                None
             }
         });
-        let water_evaporation = world.dimension_type.as_deref().and_then(|dimension_type| {
-            match native_resources::fluid_environment::load_water_evaporation_environment(
+        let mut sky_background = if let Some(definition) = &inline_dimension {
+            Some(sky_background::SkyBackground::from_definition(
                 &mut resources,
-                dimension_type,
-            ) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    eprintln!("Water evaporation rules are unavailable: {error:#}");
-                    None
-                }
-            }
-        });
-        let sky_timeline = world.dimension_type.as_deref().and_then(|dimension_type| {
-            match preview_lighting::SkyTimeline::load(&mut resources, dimension_type) {
-                Ok(timeline) if timeline.is_animated() => Some(timeline),
-                Ok(_) => None,
-                Err(error) => {
-                    eprintln!("Sky light timeline unavailable: {error:#}");
-                    None
-                }
-            }
-        });
-        let mut sky_background = world.dimension_type.as_deref().and_then(|dimension_type| {
-            match sky_background::SkyBackground::load(&mut resources, dimension_type, min_y, max_y)
-            {
-                Ok(background) => background,
-                Err(error) => {
-                    eprintln!("Sky background is unavailable: {error:#}");
-                    None
-                }
+                definition,
+                min_y,
+                max_y,
+            ))
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                sky_background::SkyBackground::load(&mut resources, dimension_type, min_y, max_y)
+            })
+        }
+        .and_then(|result| match result {
+            Ok(background) => background,
+            Err(error) => {
+                eprintln!("Sky background is unavailable: {error:#}");
+                None
             }
         });
         if let Some(background) = &mut sky_background {
@@ -1066,22 +1123,33 @@ fn prepare_existing_world(
         } else {
             None
         };
-        let default_clock = world.dimension_type.as_deref().and_then(|dimension_type| {
-            match native_resources::world_clock::dimension_default_clock(
-                &mut resources,
-                dimension_type,
-            ) {
-                Ok(clock) => {
-                    let clock = clock.map(|id| native_persistence::world::DimensionId {
-                        namespace: id.namespace,
-                        path: id.path,
-                    });
-                    Some((Arc::<str>::from(dimension_type), clock))
-                }
-                Err(error) => {
-                    eprintln!("Dimension clock is unavailable: {error:#}");
-                    None
-                }
+        let default_clock = if let Some(definition) = &inline_dimension {
+            Some((
+                "[unregistered]",
+                native_resources::world_clock::dimension_default_clock_from_definition(definition),
+            ))
+        } else {
+            world.dimension_type.as_deref().map(|dimension_type| {
+                (
+                    dimension_type,
+                    native_resources::world_clock::dimension_default_clock(
+                        &mut resources,
+                        dimension_type,
+                    ),
+                )
+            })
+        }
+        .and_then(|(dimension_type, result)| match result {
+            Ok(clock) => {
+                let clock = clock.map(|id| native_persistence::world::DimensionId {
+                    namespace: id.namespace,
+                    path: id.path,
+                });
+                Some((Arc::<str>::from(dimension_type), clock))
+            }
+            Err(error) => {
+                eprintln!("Dimension clock is unavailable: {error:#}");
+                None
             }
         });
         // LoadedSession registers resident saved chunks in the world's map order.
@@ -1625,20 +1693,23 @@ fn prepare_existing_world(
                     if config.data.dimension != *reader.dimension() {
                         return Ok(None);
                     }
-                    let Some(dimension_type) = session
-                        .snapshot()
-                        .world
-                        .loaded()
-                        .and_then(|world| world.dimension_type.clone())
-                    else {
-                        return Ok(None);
-                    };
-                    let environment = Arc::new(
+                    let environment = if let Some(definition) = &inline_dimension {
+                        native_resources::respawn_environment::RespawnEnvironmentRegistry::from_definition(&mut resources, definition)?
+                    } else {
+                        let Some(dimension_type) = session
+                            .snapshot()
+                            .world
+                            .loaded()
+                            .and_then(|world| world.dimension_type.clone())
+                        else {
+                            return Ok(None);
+                        };
                         native_resources::respawn_environment::RespawnEnvironmentRegistry::load(
                             &mut resources,
                             &dimension_type,
-                        )?,
-                    );
+                        )?
+                    };
+                    let environment = Arc::new(environment);
                     let blocks = resources.vanilla_block_ids()?;
                     let tags = Arc::new(native_resources::respawn_tags::RespawnBlockTags::load(
                         &mut resources,
@@ -3406,6 +3477,7 @@ mod world_open_tests {
             (5, "minecraft:overworld", "minecraft:overworld", true),
             (6, "minecraft:overworld", "minecraft:overworld", true),
             (7, "minecraft:overworld", "minecraft:overworld", true),
+            (8, "example:custom/inline", "[unregistered]", false),
         ] {
             let root = parent.path().join(format!("world-{index}"));
             std::fs::create_dir_all(&root).unwrap();
@@ -3485,7 +3557,39 @@ mod world_open_tests {
                             Tag::Compound(vec![(
                                 name.into(),
                                 Tag::Compound(vec![
-                                    ("type".into(), Tag::String(expected_type.into())),
+                                    (
+                                        "type".into(),
+                                        if index == 8 {
+                                            Tag::Compound(vec![
+                                                ("min_y".into(), Tag::Int(0)),
+                                                ("height".into(), Tag::Int(256)),
+                                                ("has_skylight".into(), Tag::Byte(0)),
+                                                ("has_ceiling".into(), Tag::Byte(1)),
+                                                ("ambient_light".into(), Tag::Float(0.1)),
+                                                (
+                                                    "cardinal_light".into(),
+                                                    Tag::String("nether".into()),
+                                                ),
+                                                ("skybox".into(), Tag::String("none".into())),
+                                                (
+                                                    "attributes".into(),
+                                                    Tag::Compound(vec![
+                                                        (
+                                                            "minecraft:gameplay/fast_lava".into(),
+                                                            Tag::Byte(1),
+                                                        ),
+                                                        (
+                                                            "minecraft:gameplay/water_evaporates"
+                                                                .into(),
+                                                            Tag::Byte(1),
+                                                        ),
+                                                    ]),
+                                                ),
+                                            ])
+                                        } else {
+                                            Tag::String(expected_type.into())
+                                        },
+                                    ),
                                     ("generator".into(), Tag::Compound(vec![])),
                                 ]),
                             )]),
@@ -3638,13 +3742,28 @@ mod world_open_tests {
             let snapshot = prepared.session.snapshot();
             let loaded = snapshot.world.loaded().unwrap();
             assert_eq!(loaded.dimension, name);
-            assert_eq!(loaded.dimension_type.as_deref(), Some(expected_type));
-            let block_x = if index >= 5 {
+            if index == 8 {
+                assert!(loaded.dimension_type.is_none());
+                let definition: serde_json::Value =
+                    serde_json::from_str(loaded.inline_dimension_type.as_deref().unwrap()).unwrap();
+                assert_eq!(definition["has_skylight"], false);
+                assert_eq!(
+                    definition["attributes"]["minecraft:gameplay/fast_lava"],
+                    true
+                );
+                assert_eq!(
+                    definition["attributes"]["minecraft:gameplay/water_evaporates"],
+                    true
+                );
+            } else {
+                assert_eq!(loaded.dimension_type.as_deref(), Some(expected_type));
+            }
+            let block_x = if (5..=6).contains(&index) {
                 snapshot.player.position.x.floor() as i32
             } else {
                 0
             };
-            let block_z = if index >= 5 {
+            let block_z = if (5..=6).contains(&index) {
                 snapshot.player.position.z.floor() as i32
             } else {
                 0

@@ -268,6 +268,27 @@ pub struct RespawnEnvironmentRegistry {
 
 impl RespawnEnvironmentRegistry {
     pub fn load(provider: &mut impl ResourceProvider, dimension_type: &str) -> Result<Self> {
+        let dimension = RespawnEnvironmentLayer::load_dimension_type(provider, dimension_type)?;
+        Self::with_dimension(provider, dimension)
+    }
+
+    pub fn from_definition(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+    ) -> Result<Self> {
+        ensure!(definition.is_object(), "dimension type must be an object");
+        let dimension = definition
+            .get("attributes")
+            .map(RespawnEnvironmentLayer::from_attributes)
+            .transpose()?
+            .unwrap_or_default();
+        Self::with_dimension(provider, dimension)
+    }
+
+    fn with_dimension(
+        provider: &mut impl ResourceProvider,
+        dimension: RespawnEnvironmentLayer,
+    ) -> Result<Self> {
         for id in provider.list_data("timeline")? {
             let path = format!("data/{}/timeline/{}.json", id.namespace, id.path);
             let bytes = provider
@@ -293,7 +314,6 @@ impl RespawnEnvironmentRegistry {
                 );
             }
         }
-        let dimension = RespawnEnvironmentLayer::load_dimension_type(provider, dimension_type)?;
         let mut biomes = BTreeMap::new();
         for id in provider.list_data("worldgen/biome")? {
             let name = format!("{}:{}", id.namespace, id.path);

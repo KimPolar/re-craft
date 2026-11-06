@@ -22,6 +22,7 @@ impl DrownedSpawnEffects for NoPassengers {
         _: [i32; 3],
         _: &World,
         _: &mut RegionRandom,
+        _: &native_session::worldgen::BiomeNeighborhood,
     ) -> Result<bool> {
         bail!("unexpected chicken")
     }

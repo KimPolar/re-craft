@@ -277,9 +277,8 @@ impl GenerationReady {
                 region_timestamp,
             )?
         };
-        // Validate the selected regions before starting a session, which can
-        // consume generation-only context such as the hut spawn inputs.
-        let initial = self.start_initial_player_session(last_played_ms)?;
+        // Reject incomplete regions before constructing the initial session.
+        let initial = self.prepare_initial_player_session(last_played_ms)?;
         let snapshot = initial.session.snapshot();
         ensure!(snapshot.tick == 0, "initial session has already advanced");
         ensure!(
@@ -330,12 +329,23 @@ impl GenerationReady {
             (None, None) => {}
             _ => anyhow::bail!("generation data pack snapshot does not match level settings"),
         }
+        self.hut_generation = None;
         Ok(StagedInitialWorld { initial, stage })
     }
 
     /// Create the initial local player from the checked spawn, retaining one
     /// identity in both the player state and the matching level-data draft.
     pub fn start_initial_player_session(
+        &mut self,
+        last_played_ms: i64,
+    ) -> Result<GeneratedInitialPlayer> {
+        let initial = self.prepare_initial_player_session(last_played_ms)?;
+        self.hut_generation = None;
+        Ok(initial)
+    }
+
+    /// Keep generation inputs available until the complete operation succeeds.
+    fn prepare_initial_player_session(
         &mut self,
         last_played_ms: i64,
     ) -> Result<GeneratedInitialPlayer> {
@@ -375,7 +385,7 @@ impl GenerationReady {
             on_ground: false,
             pose: native_session::PlayerPose::Standing,
         };
-        let mut session = self.start_session(player)?;
+        let mut session = self.prepare_session(player)?;
         let targets = self
             .mesh
             .targets
@@ -632,12 +642,20 @@ impl GenerationReady {
         &mut self,
         player: native_session::PlayerState,
     ) -> Result<native_session::loaded::LoadedSession> {
+        let session = self.prepare_session(player)?;
+        self.hut_generation = None;
+        Ok(session)
+    }
+
+    fn prepare_session(
+        &mut self,
+        player: native_session::PlayerState,
+    ) -> Result<native_session::loaded::LoadedSession> {
         let mut session = self.start_session_inner(player)?;
         if let Some(initial) = &self.initial_respawn {
             let tags = Arc::clone(&initial.height_tags);
             self.install_spawn_heightmaps(&mut session, tags)?;
         }
-        self.hut_generation = None;
         Ok(session)
     }
 
@@ -4381,6 +4399,37 @@ mod tests {
         let expected_block_entities = chest_chunk.chunk.value.get("block_entities").cloned();
         assert!(initial_ready.pack_snapshot.is_some());
         assert!(initial_ready.player_spawn.is_some());
+        let generation = Arc::clone(initial_ready.hut_generation.as_ref().unwrap());
+        let original_spawn = initial_ready.player_spawn.unwrap();
+        initial_ready.player_spawn = Some(original_spawn - IVec3::Y);
+        let error = initial_ready
+            .start_initial_player_session(123)
+            .err()
+            .context("an obstructed spawn was accepted")?;
+        ensure!(
+            format!("{error:#}").contains("obstructed"),
+            "unexpected spawn failure: {error:#}"
+        );
+        assert!(Arc::ptr_eq(
+            initial_ready.hut_generation.as_ref().unwrap(),
+            &generation
+        ));
+        initial_ready.player_spawn = Some(original_spawn);
+        let missing_parent = temp.path().join("missing-stage-parent");
+        let error = initial_ready
+            .stage_structure_initial_world(&missing_parent, 123, 1)
+            .err()
+            .context("staging accepted a missing parent")?;
+        ensure!(
+            format!("{error:#}").contains("staging directory"),
+            "unexpected staging failure: {error:#}"
+        );
+        assert!(Arc::ptr_eq(
+            initial_ready.hut_generation.as_ref().unwrap(),
+            &generation
+        ));
+        let staged = initial_ready.stage_structure_initial_world(temp.path(), 123, 1)?;
+        assert!(initial_ready.hut_generation.is_none());
         let initial = initial_ready.start_initial_player_session(123)?;
         assert_eq!(
             native_session::GameSession::snapshot(&initial.session).game_mode,
@@ -4399,7 +4448,6 @@ mod tests {
             .err()
             .context("ordinary staging accepted a structure world")?;
         assert!(format!("{error:#}").contains("structure world persistence is not yet supported"));
-        let staged = initial_ready.stage_structure_initial_world(temp.path(), 123, 1)?;
         assert!(staged.path().join("level.dat").is_file());
         assert!(
             staged

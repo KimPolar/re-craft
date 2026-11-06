@@ -11,7 +11,10 @@ pub use graph::{
     MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,
     PlacedMineshaft,
 };
-pub use placement::{MineshaftPlacementOutcome, MineshaftPlacementWorld, place_room_or_stairs};
+pub use placement::{
+    MineshaftCrossingWorld, MineshaftPlacementOutcome, MineshaftPlacementWorld, place_crossing,
+    place_room_or_stairs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MineshaftVariant {

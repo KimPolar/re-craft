@@ -23,6 +23,7 @@ public class MineshaftCarveOracle {
         if (Math.floorMod(h, 29) == 0) return Blocks.OAK_PLANKS.defaultBlockState();
         if (Math.floorMod(h, 31) == 0) return Blocks.DARK_OAK_LOG.defaultBlockState();
         if (Math.floorMod(h, 37) == 0) return Blocks.IRON_CHAIN.defaultBlockState();
+        if (Math.floorMod(h, 41) == 0) return Blocks.AIR.defaultBlockState();
         return Blocks.STONE.defaultBlockState();
     }
     static void set(Object obj,String name,Object value)throws Exception {
@@ -48,14 +49,20 @@ public class MineshaftCarveOracle {
                 case "getBiome": events.add("B "+pos((BlockPos)a[0])); return scenario==1?blockingBiome:clearBiome;
                 case "getBlockState": { var p=(BlockPos)a[0]; events.add("R "+pos(p)); return at(p); }
                 case "setBlock": { var p=((BlockPos)a[0]).immutable(); var state=(BlockState)a[1];
-                    if(state.getBlock()!=Blocks.CAVE_AIR || !a[2].equals(2)) throw new AssertionError("unexpected write");
-                    events.add("W "+pos(p)); changed.put(p,state); return true; }
+                    if(!a[2].equals(2)) throw new AssertionError("unexpected write flags");
+                    if(state.getBlock()==Blocks.CAVE_AIR) events.add("W "+pos(p));
+                    else if(state.getBlock()==Blocks.OAK_PLANKS) events.add("P "+pos(p)+" oak");
+                    else if(state.getBlock()==Blocks.DARK_OAK_PLANKS) events.add("P "+pos(p)+" dark");
+                    else throw new AssertionError("unexpected block "+state);
+                    changed.put(p,state); return true; }
                 case "getFluidState": { var p=(BlockPos)a[0]; events.add("F "+pos(p)); return at(p).getFluidState(); }
+                case "getHeight": { int x=(int)a[1],z=(int)a[2]; int height=Math.floorMod(x*7+z*3,4)==0?29:35;
+                    events.add("H "+x+",0,"+z+" "+height); return height; }
                 default: throw new AssertionError("world callback "+m);
             }
         });
         var dirs=new Direction[]{Direction.NORTH,Direction.SOUTH,Direction.WEST,Direction.EAST};
-        for (int shift : new int[]{0,-20,16777216,-16777216}) for (int kind=0;kind<5;kind++)
+        for (int shift : new int[]{0,-20,16777216,-16777216}) for (int kind=0;kind<7;kind++)
             for (int c=0;c<3;c++) for (scenario=0;scenario<3;scenario++)
                 for (var variant : MineshaftStructure.Type.values()) {
                     int x=shift, z=shift;
@@ -68,10 +75,13 @@ public class MineshaftCarveOracle {
                         entrances.add(new BoundingBox(x+3,34,z,x+5,36,z+1));
                         entrances.add(new BoundingBox(x+7,33,z+4,x+8,35,z+6));
                         piece=room;
-                    } else {
+                    } else if(kind<=4) {
                         var d=dirs[kind-1]; boolean zAxis=d==Direction.NORTH||d==Direction.SOUTH;
                         var b=new BoundingBox(x+3,30,z+3,x+(zAxis?5:11),37,z+(zAxis?11:5));
                         piece=new MineshaftPieces.MineShaftStairs(3,b,d,variant);
+                    } else {
+                        var b=new BoundingBox(x+3,30,z+3,x+7,kind==5?32:36,z+7);
+                        piece=new MineshaftPieces.MineShaftCrossing(3,b,Direction.WEST,variant);
                     }
                     var clip=switch(c) {
                         case 0 -> new BoundingBox(x-2,28,z-2,x+16,42,z+16);

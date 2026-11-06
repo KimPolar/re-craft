@@ -1,14 +1,15 @@
-//! Compare room and stairs world callbacks with installed Minecraft 26.3.
+//! Compare room, stairs and crossing callbacks with installed Minecraft 26.3.
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 use native_resources::{
     mineshaft::{
-        MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftPlacementOutcome,
-        MineshaftPlacementWorld, MineshaftVariant, place_room_or_stairs,
+        MineshaftCrossingWorld, MineshaftGraphPiece, MineshaftGraphPieceKind,
+        MineshaftPlacementOutcome, MineshaftPlacementWorld, MineshaftVariant, place_crossing,
+        place_room_or_stairs,
     },
     structure_start::HorizontalDirection,
 };
 use serde_json::Value;
-use std::{collections::HashSet, path::PathBuf, process::Command};
+use std::{collections::HashMap, path::PathBuf, process::Command};
 
 fn run(command: &mut Command) -> String {
     let output = command.output().unwrap();
@@ -23,9 +24,20 @@ fn line(kind: &str, p: [i32; 3]) -> String {
     format!("{kind} {},{},{}", p[0], p[1], p[2])
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Block {
+    Air,
+    Oak,
+    DarkOak,
+    DarkLog,
+    Chain,
+    Water,
+    Stone,
+}
+
 struct World {
     scenario: i32,
-    changed: HashSet<[i32; 3]>,
+    changed: HashMap<[i32; 3], Block>,
     events: Vec<String>,
 }
 impl World {
@@ -34,9 +46,36 @@ impl World {
             .wrapping_add(p[1].wrapping_mul(17))
             .wrapping_add(p[2].wrapping_mul(13))
     }
-    fn read(&mut self, p: [i32; 3]) -> i32 {
+    fn state(&self, p: [i32; 3]) -> Block {
+        if let Some(block) = self.changed.get(&p) {
+            return *block;
+        }
+        let h = Self::hash(p);
+        if self.scenario == 2 && h.rem_euclid(23) == 0 {
+            Block::Water
+        } else if h.rem_euclid(29) == 0 {
+            Block::Oak
+        } else if h.rem_euclid(31) == 0 {
+            Block::DarkLog
+        } else if h.rem_euclid(37) == 0 {
+            Block::Chain
+        } else if h.rem_euclid(41) == 0 {
+            Block::Air
+        } else {
+            Block::Stone
+        }
+    }
+    fn read(&mut self, p: [i32; 3]) -> Block {
         self.events.push(line("R", p));
-        Self::hash(p)
+        self.state(p)
+    }
+    fn write_planks(&mut self, p: [i32; 3], variant: MineshaftVariant) {
+        let (name, block) = match variant {
+            MineshaftVariant::Normal => ("oak", Block::Oak),
+            MineshaftVariant::Mesa => ("dark", Block::DarkOak),
+        };
+        self.events.push(format!("{} {name}", line("P", p)));
+        self.changed.insert(p, block);
     }
 }
 impl MineshaftPlacementWorld for World {
@@ -45,33 +84,62 @@ impl MineshaftPlacementWorld for World {
         Ok(self.scenario == 1)
     }
     fn liquid_block(&mut self, p: [i32; 3]) -> anyhow::Result<bool> {
-        let h = self.read(p);
-        Ok(!self.changed.contains(&p) && self.scenario == 2 && h.rem_euclid(23) == 0)
+        Ok(self.read(p) == Block::Water)
     }
     fn protected_block(&mut self, p: [i32; 3], variant: MineshaftVariant) -> anyhow::Result<bool> {
-        let h = self.read(p);
-        if self.changed.contains(&p) || (self.scenario == 2 && h.rem_euclid(23) == 0) {
-            return Ok(false);
-        }
-        Ok(if h.rem_euclid(29) == 0 {
-            variant == MineshaftVariant::Normal
-        } else if h.rem_euclid(31) == 0 {
-            variant == MineshaftVariant::Mesa
-        } else {
-            h.rem_euclid(37) == 0
+        Ok(match self.read(p) {
+            Block::Oak => variant == MineshaftVariant::Normal,
+            Block::DarkOak | Block::DarkLog => variant == MineshaftVariant::Mesa,
+            Block::Chain => true,
+            _ => false,
         })
     }
     fn set_cave_air(&mut self, p: [i32; 3]) -> anyhow::Result<()> {
         self.events.push(line("W", p));
-        self.changed.insert(p);
+        self.changed.insert(p, Block::Air);
         self.events.push(line("F", p));
+        Ok(())
+    }
+}
+impl MineshaftCrossingWorld for World {
+    fn is_air(&mut self, p: [i32; 3]) -> anyhow::Result<bool> {
+        Ok(self.read(p) == Block::Air)
+    }
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> anyhow::Result<i32> {
+        let height = if x
+            .wrapping_mul(7)
+            .wrapping_add(z.wrapping_mul(3))
+            .rem_euclid(4)
+            == 0
+        {
+            29
+        } else {
+            35
+        };
+        self.events
+            .push(format!("{} {height}", line("H", [x, 0, z])));
+        Ok(height)
+    }
+    fn upper_face_sturdy(&mut self, p: [i32; 3]) -> anyhow::Result<bool> {
+        Ok(matches!(
+            self.read(p),
+            Block::Oak | Block::DarkOak | Block::DarkLog | Block::Stone
+        ))
+    }
+    fn set_piece_planks(&mut self, p: [i32; 3], variant: MineshaftVariant) -> anyhow::Result<()> {
+        self.write_planks(p, variant);
+        self.events.push(line("F", p));
+        Ok(())
+    }
+    fn set_floor_planks(&mut self, p: [i32; 3], variant: MineshaftVariant) -> anyhow::Result<()> {
+        self.write_planks(p, variant);
         Ok(())
     }
 }
 
 #[test]
 #[ignore = "requires installed Minecraft Java Edition 26.3 and a Java 25 JDK"]
-fn room_and_stairs_callbacks_match_java() {
+fn mineshaft_piece_callbacks_match_java() {
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -137,7 +205,7 @@ fn room_and_stairs_callbacks_match_java() {
                 None,
                 box_of([shift, 32, shift], [shift + 8, 38, shift + 10]),
             )
-        } else {
+        } else if kind <= 4 {
             let d = [
                 HorizontalDirection::North,
                 HorizontalDirection::South,
@@ -157,6 +225,17 @@ fn room_and_stairs_callbacks_match_java() {
                     ],
                 ),
             )
+        } else {
+            (
+                MineshaftGraphPieceKind::Crossing {
+                    two_floors: kind == 6,
+                },
+                Some(HorizontalDirection::West),
+                box_of(
+                    [shift + 3, 30, shift + 3],
+                    [shift + 7, if kind == 5 { 32 } else { 36 }, shift + 7],
+                ),
+            )
         };
         let clip = match c {
             0 => box_of([shift - 2, 28, shift - 2], [shift + 16, 42, shift + 16]),
@@ -171,10 +250,15 @@ fn room_and_stairs_callbacks_match_java() {
         };
         let mut world = World {
             scenario,
-            changed: HashSet::new(),
+            changed: HashMap::new(),
             events: vec![],
         };
-        let outcome = place_room_or_stairs(&piece, variant, &mut world, clip).unwrap();
+        let outcome = if kind <= 4 {
+            place_room_or_stairs(&piece, variant, &mut world, clip)
+        } else {
+            place_crossing(&piece, variant, &mut world, clip)
+        }
+        .unwrap();
         if scenario == 1 {
             assert_eq!(outcome, MineshaftPlacementOutcome::Blocked, "{header}");
         }
@@ -191,5 +275,5 @@ fn room_and_stairs_callbacks_match_java() {
         }
         cases += 1;
     }
-    assert_eq!(cases, 360);
+    assert_eq!(cases, 504);
 }

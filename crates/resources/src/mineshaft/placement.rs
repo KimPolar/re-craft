@@ -1,4 +1,4 @@
-//! Room and stairs carving in a caller-owned, unpublished generation draft.
+//! Mineshaft piece placement in a caller-owned, unpublished generation draft.
 use anyhow::{Result, ensure};
 use native_core::beardifier::BoundingBox;
 
@@ -14,6 +14,19 @@ pub trait MineshaftPlacementWorld {
     /// Match the variant's planks, log, fence and iron chain blocks.
     fn protected_block(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<bool>;
     fn set_cave_air(&mut self, position: [i32; 3]) -> Result<()>;
+}
+
+/// Additional world operations used by a crossing's supports and floor.
+pub trait MineshaftCrossingWorld: MineshaftPlacementWorld {
+    fn is_air(&mut self, position: [i32; 3]) -> Result<bool>;
+    /// Java's OCEAN_FLOOR_WG height, the first position above the floor.
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32>;
+    /// Read the existing block and test whether its upper face is sturdy.
+    fn upper_face_sturdy(&mut self, position: [i32; 3]) -> Result<bool>;
+    /// StructurePiece.placeBlock, including fluid and shape side effects.
+    fn set_piece_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<()>;
+    /// Direct WorldGenLevel.setBlock(..., 2), used for floor support.
+    fn set_floor_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +228,111 @@ pub fn place_room_or_stairs(
     Ok(MineshaftPlacementOutcome::Carved)
 }
 
+/// Place one single- or double-floor crossing. Its direction is saved
+/// separately, so its carving coordinates are already world coordinates.
+/// Discard the world draft if any callback fails.
+pub fn place_crossing(
+    piece: &MineshaftGraphPiece,
+    variant: MineshaftVariant,
+    world: &mut impl MineshaftCrossingWorld,
+    clip: BoundingBox,
+) -> Result<MineshaftPlacementOutcome> {
+    let b = piece.bounds;
+    let MineshaftGraphPieceKind::Crossing { two_floors } = piece.kind else {
+        anyhow::bail!("piece is not a mineshaft crossing");
+    };
+    ensure!(piece.direction.is_some(), "crossing direction is missing");
+    ensure!(
+        (0..3).all(|i| clip.min[i] <= clip.max[i])
+            && i64::from(b.max[0]) - i64::from(b.min[0]) == 4
+            && i64::from(b.max[2]) - i64::from(b.min[2]) == 4
+            && i64::from(b.max[1]) - i64::from(b.min[1]) == if two_floors { 6 } else { 2 }
+            && b.min[1] > i32::MIN
+            && b.max[1] < i32::MAX,
+        "invalid crossing bounds or clip"
+    );
+    if blocked(world, b, clip)? {
+        return Ok(MineshaftPlacementOutcome::Blocked);
+    }
+    let frame = StructureFrame {
+        bounds: b,
+        orientation: None,
+    };
+    let [x0, y0, z0] = b.min;
+    let [x1, y1, z1] = b.max;
+    let lower_top = if two_floors { y0 + 2 } else { y1 };
+    fill(
+        world,
+        frame,
+        clip,
+        variant,
+        [x0 + 1, y0, z0],
+        [x1 - 1, lower_top, z1],
+    )?;
+    fill(
+        world,
+        frame,
+        clip,
+        variant,
+        [x0, y0, z0 + 1],
+        [x1, lower_top, z1 - 1],
+    )?;
+    if two_floors {
+        fill(
+            world,
+            frame,
+            clip,
+            variant,
+            [x0 + 1, y1 - 2, z0],
+            [x1 - 1, y1, z1],
+        )?;
+        fill(
+            world,
+            frame,
+            clip,
+            variant,
+            [x0, y1 - 2, z0 + 1],
+            [x1, y1, z1 - 1],
+        )?;
+        fill(
+            world,
+            frame,
+            clip,
+            variant,
+            [x0 + 1, y0 + 3, z0 + 1],
+            [x1 - 1, y0 + 3, z1 - 1],
+        )?;
+    }
+    for (x, z) in [
+        (x0 + 1, z0 + 1),
+        (x0 + 1, z1 - 1),
+        (x1 - 1, z0 + 1),
+        (x1 - 1, z1 - 1),
+    ] {
+        let above = [x, y1 + 1, z];
+        if inside(clip, above) && !world.is_air(above)? {
+            for y in y0..=y1 {
+                let p = [x, y, z];
+                if inside(clip, p) && !world.protected_block(p, variant)? {
+                    world.set_piece_planks(p, variant)?;
+                }
+            }
+        }
+    }
+    for x in x0..=x1 {
+        for z in z0..=z1 {
+            let above = [x, y0, z];
+            if inside(clip, above) && y0 < world.ocean_floor_height(x, z)? {
+                let floor = [x, y0 - 1, z];
+                if !world.upper_face_sturdy(floor)? {
+                    world.set_floor_planks(floor, variant)?;
+                }
+            }
+        }
+    }
+    Ok(MineshaftPlacementOutcome::Carved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +359,48 @@ mod tests {
             self.writes += 1;
             Ok(())
         }
+    }
+    impl MineshaftCrossingWorld for World {
+        fn is_air(&mut self, _: [i32; 3]) -> Result<bool> {
+            Ok(false)
+        }
+        fn ocean_floor_height(&mut self, _: i32, _: i32) -> Result<i32> {
+            Ok(100)
+        }
+        fn upper_face_sturdy(&mut self, _: [i32; 3]) -> Result<bool> {
+            Ok(false)
+        }
+        fn set_piece_planks(&mut self, _: [i32; 3], _: MineshaftVariant) -> Result<()> {
+            self.writes += 1;
+            Ok(())
+        }
+        fn set_floor_planks(&mut self, p: [i32; 3], _: MineshaftVariant) -> Result<()> {
+            assert_eq!(p[1], 49);
+            self.writes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn crossing_floor_can_write_below_the_clip() {
+        let bounds = BoundingBox::new([0, 50, 0], [4, 52, 4]).unwrap();
+        let piece = MineshaftGraphPiece {
+            bounds,
+            direction: Some(HorizontalDirection::West),
+            depth: 1,
+            kind: MineshaftGraphPieceKind::Crossing { two_floors: false },
+        };
+        let mut world = World {
+            biome_blocked: false,
+            liquids: 0,
+            protected: 0,
+            writes: 0,
+        };
+        assert_eq!(
+            place_crossing(&piece, MineshaftVariant::Normal, &mut world, bounds).unwrap(),
+            MineshaftPlacementOutcome::Carved
+        );
+        assert_eq!(world.writes, 25);
     }
 
     #[test]

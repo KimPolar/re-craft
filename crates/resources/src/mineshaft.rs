@@ -5,10 +5,12 @@ use crate::structure_start::HorizontalDirection;
 use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
+mod biomes;
 mod corridor;
 mod graph;
 mod placement;
 mod support;
+pub use biomes::MineshaftBlockingBiomes;
 pub use corridor::{
     CorridorBlock, MineshaftCorridorGenerationWorld, MineshaftCorridorWorld,
     MineshaftMinecartWorld, place_corridor, place_corridor_beam, place_corridor_cobweb,

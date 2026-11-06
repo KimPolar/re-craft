@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::beardifier::BoundingBox;
 use native_resources::{
     jigsaw::{Connector, Joint, Orientation},
+    jigsaw_alias::PoolAliases,
     jigsaw_placement::AssemblyContext,
     packs::{ResourceId, ResourceProvider},
     structure_pool::{PoolElement, TemplatePool},
@@ -34,6 +35,22 @@ impl<'a, P: ResourceProvider, H> TemplateAssemblyContext<'a, P, H> {
             pools: BTreeMap::new(),
             templates: BTreeMap::new(),
         }
+    }
+
+    /// Resolve the structure's aliases once, using the sampled start position
+    /// and independent positional RNG, before any pool lookup or assembly.
+    pub fn for_structure_start(
+        provider: &'a mut P,
+        height: H,
+        aliases: &PoolAliases,
+        world_seed: i64,
+        position: [i32; 3],
+    ) -> Result<Self> {
+        Ok(Self::new(
+            provider,
+            height,
+            aliases.resolve(world_seed, position)?,
+        ))
     }
 
     fn template(&mut self, id: &ResourceId) -> Result<Arc<StructureTemplate>> {
@@ -198,6 +215,38 @@ mod tests {
             assert_eq!(context.surface_height(at)?, 64);
         }
         assert_eq!(provider.reads, 1);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn trial_aliases_resolve_against_active_template_pools() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let bytes = resources
+            .read_data("data/minecraft/worldgen/structure/trial_chambers.json")?
+            .context("trial chambers definition missing")?;
+        let definition: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let aliases = PoolAliases::decode(&definition["pool_aliases"])?;
+        let position = [-48, -27, 32];
+        let expected = aliases.resolve(42, position)?;
+        assert_eq!(expected.len(), 4);
+        let mut context = TemplateAssemblyContext::for_structure_start(
+            &mut resources,
+            |_| Ok(64),
+            &aliases,
+            42,
+            position,
+        )?;
+        for (alias, target) in expected {
+            assert_eq!(context.resolve_alias(&alias)?, target);
+            assert!(
+                context.pool(&target)?.is_some(),
+                "resolved trial pool is missing"
+            );
+        }
         Ok(())
     }
 

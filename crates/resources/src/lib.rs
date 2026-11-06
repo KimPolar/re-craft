@@ -45,6 +45,7 @@ pub mod heightmap_tags;
 pub mod huge_mushroom_feature;
 pub mod item_registry;
 pub mod jigsaw;
+pub mod jigsaw_alias;
 pub mod jigsaw_placement;
 pub mod lake_feature;
 pub mod loot;

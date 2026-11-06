@@ -1102,6 +1102,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             DecorationLightTracking::Fresh(tracker, registry),
             None,
             None,
+            None,
         )
     }
 
@@ -1120,6 +1121,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             DecorationLightTracking::Staged(engine, registry),
             None,
             None,
+            None,
         )
     }
 
@@ -1133,6 +1135,11 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
         )>,
         huts: Option<&mut dyn PlannedHutPlacement>,
+        mixed: Option<(
+            &[PlannedMixedStructureDecoration<'_>],
+            &mut Vec<Vec<PreparedStructureStart>>,
+            &mut dyn MixedOceanRuinPlacement,
+        )>,
     ) -> Result<Vec<bool>> {
         let center = self.center_chunk();
         let mut covered = BTreeSet::new();
@@ -1170,7 +1177,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(tracking),
             structures,
             huts,
-            None,
+            mixed,
         )
     }
 
@@ -1228,6 +1235,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             tracking,
             Some((structures, &mut updated)),
             None,
+            None,
         )?;
         Ok((features, updated))
     }
@@ -1272,10 +1280,74 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         structures: &[PlannedMixedStructureDecoration<'_>],
         ocean: &mut R,
     ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        self.execute_mixed_with_optional_light(terrain, structures, ocean, None, None)
+    }
+
+    /// Execute a mixed plan with an immutable visible light snapshot.
+    pub fn execute_mixed_with_visible_light<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        self.execute_mixed_with_optional_light(terrain, structures, ocean, None, Some(light))
+    }
+
+    /// Execute a mixed plan with a fresh, unpropagated light tracker.
+    pub fn execute_mixed_with_tracked_light<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+        tracker: &mut FreshGenerationLightTracker,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        self.execute_mixed_with_optional_light(
+            terrain,
+            structures,
+            ocean,
+            Some(DecorationLightTracking::Fresh(tracker, registry)),
+            None,
+        )
+    }
+
+    /// Execute a mixed plan against a staged light-engine revision.
+    pub fn execute_mixed_with_staged_light<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+        engine: &mut StagedGenerationLightEngine,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        self.execute_mixed_with_optional_light(
+            terrain,
+            structures,
+            ocean,
+            Some(DecorationLightTracking::Staged(engine, registry)),
+            None,
+        )
+    }
+
+    fn execute_mixed_with_optional_light<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+        tracking: Option<DecorationLightTracking<'_>>,
+        visible: Option<&native_world::generation_light::VisibleLightSnapshot>,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
         ensure!(
-            !terrain.has_published_light,
-            "structure decoration requires unpublished lighting"
+            tracking.is_none() || visible.is_none(),
+            "lighting modes are mutually exclusive"
         );
+        if tracking.is_none() {
+            ensure!(
+                !terrain.has_published_light,
+                "structure decoration requires unpublished lighting"
+            );
+        }
         let mut updated: Vec<Vec<_>> = structures
             .iter()
             .map(|entry| {
@@ -1294,16 +1366,49 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             })
             .collect();
         let mut staged_ocean = ocean.clone();
-        let features = self.execute_inner(
-            terrain,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some((structures, &mut updated, &mut staged_ocean)),
-        )?;
+        let features = match (tracking, visible) {
+            (Some(tracking), None) => self.execute_with_light_tracking(
+                terrain,
+                true,
+                tracking,
+                None,
+                None,
+                Some((structures, &mut updated, &mut staged_ocean)),
+            )?,
+            (None, Some(light)) => {
+                let block = |p| {
+                    light
+                        .block_light(p)
+                        .context("block-light column not captured")
+                };
+                let raw = |_: &World, p| {
+                    light
+                        .raw_brightness(p, 0)
+                        .context("raw-brightness column not captured")
+                };
+                self.execute_inner(
+                    terrain,
+                    true,
+                    Some(&block),
+                    Some(&raw),
+                    None,
+                    None,
+                    None,
+                    Some((structures, &mut updated, &mut staged_ocean)),
+                )?
+            }
+            (None, None) => self.execute_inner(
+                terrain,
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some((structures, &mut updated, &mut staged_ocean)),
+            )?,
+            (Some(_), Some(_)) => unreachable!("lighting modes checked"),
+        };
         *ocean = staged_ocean;
         Ok((features, updated))
     }
@@ -1575,6 +1680,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 tracking,
                 Some((structures, &mut updated)),
                 Some(&mut huts),
+                None,
             )?,
             (None, Some(light)) => {
                 let block = |p| {
@@ -21184,6 +21290,48 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&before, &failed.snapshot()));
         assert!(runner.draws.is_empty());
+        let covered = (-1..=1)
+            .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+            .collect::<Vec<_>>();
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                covered,
+            )
+            .context("initial light unavailable")?;
+        let (mut visible_terrain, _, _, _) = fixture();
+        let mut runner = Runner::default();
+        prepared.execute_mixed_with_visible_light(
+            &mut visible_terrain,
+            &structures,
+            &mut runner,
+            &light,
+        )?;
+        assert_eq!(runner.draws, expected_draws);
+        assert_eq!(
+            visible_terrain.snapshot().block(9, 8, 9).unwrap().name,
+            "minecraft:chest"
+        );
+        let (mut visible_failed, _, _, _) = fixture();
+        let before = visible_failed.snapshot();
+        let mut runner = Runner {
+            fail_at: Some(2),
+            ..Default::default()
+        };
+        assert!(
+            prepared
+                .execute_mixed_with_visible_light(
+                    &mut visible_failed,
+                    &structures,
+                    &mut runner,
+                    &light
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &visible_failed.snapshot()));
+        assert!(runner.draws.is_empty());
         Ok(())
     }
 
@@ -21821,6 +21969,148 @@ mod tests {
             }
             assert_eq!(first.bounds.min, [9, 14, 9]);
             assert_eq!(second.bounds.min, [4, 14, 9]);
+        }
+
+        // Mixed ruin callbacks share the same light transaction as earlier
+        // structure writes, including a failure after the treasure is placed.
+        #[derive(Clone, Default)]
+        struct Runner {
+            calls: usize,
+            fail: bool,
+        }
+        impl MixedOceanRuinPlacement for Runner {
+            fn place(
+                &mut self,
+                region: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                ensure!(
+                    region.read([9, 8, 9])?.name == "minecraft:chest",
+                    "treasure was not placed first"
+                );
+                self.calls += 1;
+                random.next_long();
+                ensure!(!self.fail, "injected ruin failure");
+                Ok(())
+            }
+        }
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::ocean_ruin::{Piece, Rotation, Temperature};
+        let ruin_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:ocean_ruin_warm").unwrap(),
+            step: 0,
+            index: 2,
+        };
+        let ruin = super::super::ocean_ruin::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            temperature: Temperature::Warm,
+            pieces: vec![super::super::ocean_ruin::PreparedPiece {
+                selection: Piece {
+                    template: "minecraft:underwater_ruin/warm_1".into(),
+                    position: [1, 14, 1],
+                    rotation: Rotation::None,
+                    integrity: 1.0,
+                    large: false,
+                },
+                template: Arc::new(StructureTemplate {
+                    document: NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![]),
+                    },
+                    data_version: Some(5023),
+                    size: [1, 1, 1],
+                    palettes: vec![],
+                    blocks: vec![],
+                    entities: vec![],
+                }),
+                bounds: BoundingBox::new([1, 14, 1], [1, 14, 1]).unwrap(),
+            }],
+        };
+        let mixed = [
+            PlannedMixedStructureDecoration {
+                entry: &entry,
+                starts: vec![PlannedStructureStart::Simple(&first)],
+            },
+            PlannedMixedStructureDecoration {
+                entry: &ruin_entry,
+                starts: vec![PlannedStructureStart::OceanRuin(&ruin)],
+            },
+        ];
+        for (staged, fail) in [(false, false), (false, true), (true, false), (true, true)] {
+            let east = ChunkPos { x: 2, z: 0 };
+            let (mut terrain, _, _, _) = fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=4 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            terrain.completed_decoration.insert(east);
+            let mut tracker = FreshGenerationLightTracker::new(&terrain, true).unwrap();
+            tracker
+                .initialize_chunk(&terrain, east, &light_registry)
+                .unwrap();
+            let before = terrain.snapshot();
+            let mut runner = Runner { calls: 0, fail };
+            let result = if staged {
+                let mut engine = StagedGenerationLightEngine::new(tracker);
+                engine
+                    .activate(&terrain, east, [center], &light_registry)
+                    .unwrap();
+                let result = prepared.execute_mixed_with_staged_light(
+                    &mut terrain,
+                    &mixed,
+                    &mut runner,
+                    &mut engine,
+                    &light_registry,
+                );
+                engine
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            } else {
+                let result = prepared.execute_mixed_with_tracked_light(
+                    &mut terrain,
+                    &mixed,
+                    &mut runner,
+                    &mut tracker,
+                    &light_registry,
+                );
+                tracker
+                    .snapshot(&terrain, [center, east], &light_registry)
+                    .unwrap();
+                result
+            };
+            if fail {
+                assert!(result.is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(runner.calls, 0);
+                assert_eq!(terrain.generated_monster_entities().count(), 0);
+            } else {
+                let (features, updated) = result.unwrap();
+                assert_eq!(features.len(), plan.features.len());
+                assert_eq!(runner.calls, 1);
+                assert!(
+                    matches!(&updated[0][0], PreparedStructureStart::Simple(start) if start.bounds.min == [9, 8, 9])
+                );
+                assert_eq!(
+                    terrain.snapshot().block(9, 8, 9).unwrap().name,
+                    "minecraft:chest"
+                );
+            }
         }
     }
 

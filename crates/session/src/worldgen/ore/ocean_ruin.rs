@@ -2471,6 +2471,66 @@ mod tests {
                 .len(),
             4
         );
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 2, z: 0 };
+        for staged in [false, true] {
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            let world = Arc::make_mut(&mut terrain.world);
+            let template = world.chunks[&center].as_ref().clone();
+            for z in -2..=2 {
+                for x in -2..=4 {
+                    let pos = ChunkPos { x, z };
+                    world.chunks.entry(pos).or_insert_with(|| {
+                        let mut chunk = template.clone();
+                        chunk.position = pos;
+                        Arc::new(chunk)
+                    });
+                }
+            }
+            terrain.completed_decoration.insert(east);
+            let mut tracker =
+                super::super::super::FreshGenerationLightTracker::new(&terrain, true)?;
+            tracker.initialize_chunk(&terrain, east, &registry)?;
+            let mut adapter = OceanRuinPlacementContext {
+                ice_tags: &ice,
+                water_fluids: &water,
+                bubble_fluids: &bubbles,
+                registry: &registry,
+                sea_level: 63,
+                region_random: RegionRandom::Legacy(LegacyRandom::new(12345)),
+                construct: make_constructor(),
+                context: DrownedContext::default(),
+            };
+            let (_, updated) = if staged {
+                let mut engine = super::super::super::StagedGenerationLightEngine::new(tracker);
+                engine.activate(&terrain, east, [center], &registry)?;
+                let result = prepared.execute_mixed_with_staged_light(
+                    &mut terrain,
+                    &structures,
+                    &mut adapter,
+                    &mut engine,
+                    &registry,
+                )?;
+                engine.snapshot(&terrain, [center, east], &registry)?;
+                result
+            } else {
+                let result = prepared.execute_mixed_with_tracked_light(
+                    &mut terrain,
+                    &structures,
+                    &mut adapter,
+                    &mut tracker,
+                    &registry,
+                )?;
+                tracker.snapshot(&terrain, [center, east], &registry)?;
+                result
+            };
+            assert_eq!(adapter.context.special_calls, 4);
+            assert!(
+                matches!(&updated[0][0], super::super::super::PreparedStructureStart::OceanRuin(start)
+                if start.pieces.iter().map(|piece| piece.selection.position[1]).collect::<Vec<_>>() == vec![8, 8, 15])
+            );
+            assert_eq!(terrain.recorded_generated_entities(center)?.len(), 4);
+        }
         Ok(())
     }
 }

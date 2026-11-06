@@ -61,6 +61,26 @@ impl<E: Environment> jigsaw_placement::StartEnvironment for StartAdapter<'_, E> 
 }
 
 impl PreparedStart {
+    /// Construct a fresh start tag only when every piece is preservable.
+    /// This does not authorize publishing it to a world.
+    pub fn to_tag(&self, structure: &ResourceId) -> Result<native_persistence::nbt::Tag> {
+        native_persistence::jigsaw_piece::SavedJigsawStart {
+            structure: structure.clone(),
+            chunk: self.chunk,
+            references: 0,
+            pieces: self
+                .pieces
+                .iter()
+                .cloned()
+                .map(|piece| native_persistence::jigsaw_piece::SavedJigsawPiece {
+                    piece,
+                    liquid_settings: self.liquid_settings,
+                })
+                .collect(),
+        }
+        .to_tag()
+    }
+
     /// Generate only after the caller has selected a structure-set entry.
     /// A failed final biome test never executes the lazy piece assembler.
     pub fn generate(
@@ -239,6 +259,11 @@ mod tests {
         };
         let start = PreparedStart::generate(resources, &definition, &mut terrain, seed, chunk)?
             .context("missing city")?;
+        let saved = native_persistence::jigsaw_piece::SavedJigsawStart::from_tag(
+            &start.to_tag(&ResourceId::parse("minecraft:ancient_city")?)?,
+        )?;
+        assert_eq!(saved.chunk, chunk);
+        assert_eq!(saved.pieces.len(), start.pieces.len());
         assert_eq!(terrain.queries.len(), 1);
         assert_eq!(
             terrain.queries[0],

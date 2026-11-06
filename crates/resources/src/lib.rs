@@ -75,6 +75,7 @@ pub mod structure_biomes;
 pub mod structure_decoration;
 pub mod structure_piece;
 pub mod structure_placement;
+pub mod structure_pool;
 pub mod structure_start;
 pub mod structure_transform;
 pub mod surface_biomes;

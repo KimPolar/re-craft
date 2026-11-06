@@ -406,15 +406,33 @@ fn write_png(
 }
 
 #[cfg(windows)]
-fn timestamp() -> String {
+fn local_system_time() -> windows_sys::Win32::Foundation::SYSTEMTIME {
     use windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::GetLocalTime};
     let mut time = SYSTEMTIME::default();
-    // GetLocalTime initializes the supplied structure synchronously.
+    // SAFETY: `time` is a valid, writable SYSTEMTIME for the duration of the call.
     unsafe { GetLocalTime(&mut time) };
+    time
+}
+
+#[cfg(windows)]
+fn timestamp() -> String {
+    let time = local_system_time();
     format!(
         "{:04}-{:02}-{:02}_{:02}.{:02}.{:02}",
         time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
     )
+}
+
+/// Java's SpecialDates checks the local calendar date on every call.
+#[cfg(windows)]
+pub(crate) fn is_halloween() -> anyhow::Result<bool> {
+    let time = local_system_time();
+    Ok(time.wMonth == 10 && time.wDay == 31)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_halloween() -> anyhow::Result<bool> {
+    anyhow::bail!("local calendar date is unavailable on this platform")
 }
 
 #[cfg(not(windows))]

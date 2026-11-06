@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use glam::IVec3;
-use native_resources::packs::ResourceProvider;
+use native_resources::packs::{ResourceId, ResourceProvider};
 use native_session::worldgen::{
     CarverBlockState, FreshTerrainBatch,
     schedule::GenerationStage,
@@ -3663,16 +3663,74 @@ fn generation_step(
     hut: Option<&crate::fresh_generation::InitialHutGeneration>,
 ) -> Result<Option<(ChunkPos, GenerationStage)>> {
     let next = batch.schedule().next_ready();
-    let result = if let Some(hut) = hut {
-        batch.step_with_hut_clocks(
-            provider,
-            classify,
-            resolve,
-            &hut.variants,
-            &hut.conditions,
-            &hut.moon,
-            &hut.clocks,
-        )
+    let result = if !next.is_some_and(|(_, stage)| stage == GenerationStage::Features) {
+        // Structure callbacks are consulted only by the FEATURES stage.
+        batch.step(provider, classify, resolve)
+    } else if let Some(hut) = hut {
+        if let (Some(ocean), Some(difficulty)) = (&hut.ocean, hut.difficulty) {
+            use native_session::worldgen::ocean_ruin::{
+                DrownedPlacementInputs, GenerationDifficultyEnvironment,
+            };
+            let environment = GenerationDifficultyEnvironment {
+                difficulty,
+                moon: &hut.moon,
+                clocks: &hut.clocks,
+            };
+            let drowned = ResourceId::parse("minecraft:drowned")?;
+            let mut inputs = DrownedPlacementInputs {
+                ice_tags: &ocean.ice_tags,
+                water_fluids: &ocean.water_fluids,
+                bubble_fluids: &ocean.bubble_fluids,
+                registry: &ocean.registry,
+                biome_tags: &ocean.biome_tags,
+                sea_level: batch.sea_level(),
+                construct: || {
+                    Ok(Some(
+                        native_session::worldgen::FreshCreatureRandom::from_entropy(&drowned)?,
+                    ))
+                },
+                effects: ocean.effects.clone(),
+                difficulty_at:
+                    |position,
+                     _: &native_world::loaded::World,
+                     biomes: &native_session::worldgen::BiomeNeighborhood| {
+                        environment.sample(position, biomes)
+                    },
+                halloween_at: crate::screenshot::is_halloween,
+                last_region_random: None,
+            };
+            batch.step_with_drowned_environment(
+                provider,
+                classify,
+                resolve,
+                &mut inputs,
+                &hut.variants,
+                &hut.conditions,
+                &|position, biomes| {
+                    let biome = if hut.moon.has_biome_layer {
+                        let id = biomes.biome_at_block(position[0], position[1], position[2])?;
+                        Some(format!("{}:{}", id.namespace, id.path))
+                    } else {
+                        None
+                    };
+                    Ok(hut
+                        .moon
+                        .sample(biome.as_deref(), |id| hut.clocks.get(id).copied())
+                        .context("moon phase environment or world clock unavailable")?
+                        .index() as u8)
+                },
+            )
+        } else {
+            batch.step_with_hut_clocks(
+                provider,
+                classify,
+                resolve,
+                &hut.variants,
+                &hut.conditions,
+                &hut.moon,
+                &hut.clocks,
+            )
+        }
     } else {
         batch.step(provider, classify, resolve)
     };
@@ -3752,6 +3810,165 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn structured_worker_generates_ocean_ruin_drowned() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{
+            datapacks::DataPackSettings, packs::ResourceStack,
+            structure_placement::StructureSetCache,
+        };
+        use serde_json::json;
+        use std::io::Write;
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/ocean");
+        let files = [
+            (
+                "pack.mcmeta",
+                json!({"pack":{"description":"test","min_format":121,"max_format":121}}),
+            ),
+            (
+                "data/example/worldgen/biome/ocean.json",
+                json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+            ),
+            (
+                "data/minecraft/tags/worldgen/biome/more_frequent_drowned_spawns.json",
+                json!({"replace":true,"values":["example:ocean"]}),
+            ),
+            (
+                "data/example/dimension_type/test.json",
+                json!({"min_y":0,"height":96,"has_skylight":true,"ambient_light":0.0}),
+            ),
+            (
+                "data/example/worldgen/structure/ruin.json",
+                json!({"type":"minecraft:ocean_ruin","biomes":["example:ocean"],"step":"surface_structures","biome_temp":"warm","large_probability":0.0,"cluster_probability":0.0}),
+            ),
+            (
+                "data/example/worldgen/structure_set/ruin.json",
+                json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:ruin","weight":1}]}),
+            ),
+            (
+                "data/example/worldgen/world_preset/ocean.json",
+                json!({"dimensions":{"minecraft:overworld":{
+                    "type":"example:test", "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:ocean"},"settings":{
+                        "noise":{"min_y":0,"height":96},"legacy_random_source":false,"sea_level":63,"disable_mob_generation":true,
+                        "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
+                        "material_rule":{"type":"block","result_state":"minecraft:stone"},
+                        "noise_router":{"final_density":{"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1},"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":48}
+                    }}
+                }}}),
+            ),
+        ];
+        for (path, value) in files {
+            let path = pack.join(path);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, serde_json::to_vec(&value)?)?;
+        }
+        let list = |element_type, values| Tag::List {
+            element_type,
+            values,
+        };
+        let template = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("size".into(), list(TagType::Int, vec![Tag::Int(1); 3])),
+                (
+                    "palette".into(),
+                    list(
+                        TagType::Compound,
+                        vec![Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:structure_block".into()),
+                        )])],
+                    ),
+                ),
+                (
+                    "blocks".into(),
+                    list(
+                        TagType::Compound,
+                        vec![Tag::Compound(vec![
+                            ("pos".into(), list(TagType::Int, vec![Tag::Int(0); 3])),
+                            ("state".into(), Tag::Int(0)),
+                            (
+                                "nbt".into(),
+                                Tag::Compound(vec![
+                                    ("mode".into(), Tag::String("DATA".into())),
+                                    ("metadata".into(), Tag::String("drowned".into())),
+                                ]),
+                            ),
+                        ])],
+                    ),
+                ),
+                ("entities".into(), list(TagType::Compound, vec![])),
+            ]),
+        };
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
+        compressed.write_all(&nbt::write(&template)?)?;
+        let compressed = compressed.finish()?;
+        let folder = pack.join("data/minecraft/structure/underwater_ruin");
+        std::fs::create_dir_all(&folder)?;
+        for i in 1..=8 {
+            std::fs::write(folder.join(format!("warm_{i}.nbt")), &compressed)?;
+        }
+        let selection = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/ocean".into()],
+            disabled: vec![],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        let mut resources = ResourceStack::open(&game)?;
+        ensure!(
+            resources
+                .configure_world_data(&world, &selection)?
+                .is_empty(),
+            "data pack selection failed"
+        );
+        let set = ResourceId::parse("example:ruin")?;
+        let [x, z] = StructureSetCache::default()
+            .load(&mut resources, &set)?
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let worker = GenerationWorker::start_with_structures(
+            move || {
+                crate::fresh_generation::prepare_with_structures_and_difficulty(
+                    crate::fresh_generation::FreshGenerationSettings {
+                        minecraft_dir: game,
+                        preset: "example:ocean".into(),
+                        dimension: "minecraft:overworld".into(),
+                        seed: 42,
+                        bonus_chest: false,
+                        structures_enabled: true,
+                        data_packs: Some((world, selection)),
+                    },
+                    Some(native_persistence::world::Difficulty::Hard),
+                )
+            },
+            BTreeSet::from([target]),
+            100,
+            0,
+            IVec3::new(x * 16, 0, z * 16),
+        )?;
+        let ready = match worker
+            .result
+            .recv_timeout(std::time::Duration::from_secs(180))?
+        {
+            GenerationResult::Ready(ready) => ready,
+            GenerationResult::Failed(error) => return Err(error),
+            GenerationResult::Cancelled => anyhow::bail!("ocean generation cancelled"),
+        };
+        let records = ready.batch.recorded_generated_entities(target)?;
+        ensure!(records.iter().any(|entity| matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:drowned"))),
+            "ocean ruin did not generate a drowned: {records:?}");
+        Ok(())
+    }
 
     #[test]
     fn nested_generation_propagates_cancellation_and_failure() -> Result<()> {
@@ -4098,6 +4315,14 @@ mod tests {
         assert_eq!(
             initial_ready.hut_generation.as_ref().unwrap().difficulty,
             Some(native_persistence::world::Difficulty::Hard)
+        );
+        assert!(
+            initial_ready
+                .hut_generation
+                .as_ref()
+                .unwrap()
+                .ocean
+                .is_some()
         );
         assert!(initial_ready.postprocessed.is_some());
         let processed = initial_ready.postprocessed.as_ref().unwrap();
@@ -4830,6 +5055,7 @@ mod tests {
                 moon,
                 clocks: BTreeMap::from([(clock, 0)]),
                 difficulty: None,
+                ocean: None,
             }));
             let registry = Arc::new(registry);
             let for_height = Arc::clone(&registry);

@@ -167,6 +167,125 @@ pub(crate) struct InitialHutGeneration {
     pub clocks: BTreeMap<ResourceId, i64>,
     /// Present only when generation is tied to frozen create-world settings.
     pub difficulty: Option<native_persistence::world::Difficulty>,
+    pub ocean: Option<InitialOceanGeneration>,
+}
+
+pub(crate) type ChickenConstructor =
+    fn() -> Result<Option<native_session::worldgen::FreshCreatureRandom>>;
+pub(crate) type OceanEffects = native_session::worldgen::ocean_ruin::DrownedEquipmentEffects<
+    native_session::worldgen::ocean_ruin::DrownedChickenEffects<
+        UnsupportedOceanEffects,
+        ChickenConstructor,
+    >,
+>;
+
+pub(crate) struct InitialOceanGeneration {
+    pub ice_tags: native_resources::ore_feature::OreBlockTags,
+    pub water_fluids: BTreeSet<String>,
+    pub bubble_fluids: BTreeSet<String>,
+    pub registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
+    pub biome_tags: native_resources::drowned_spawn::DrownedBiomeTags,
+    pub effects: OceanEffects,
+}
+
+#[derive(Clone)]
+pub(crate) struct UnsupportedOceanEffects;
+
+impl native_session::worldgen::ocean_ruin::DrownedSpawnEffects for UnsupportedOceanEffects {
+    fn try_existing_chicken(
+        &mut self,
+        _: [i32; 3],
+        _: &native_world::loaded::World,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    fn spawn_chicken_jockey(
+        &mut self,
+        _: [i32; 3],
+        _: &native_world::loaded::World,
+        _: &mut native_resources::worldgen_region_random::RegionRandom,
+        _: &native_session::worldgen::BiomeNeighborhood,
+    ) -> Result<bool> {
+        anyhow::bail!("chicken construction is unavailable")
+    }
+    fn enchant_weapon(
+        &mut self,
+        _: [i32; 3],
+        _: &native_world::loaded::World,
+        _: &mut native_resources::worldgen_region_random::RegionRandom,
+        _: native_resources::drowned_spawn::MainHandRoll,
+        _: f32,
+    ) -> Result<native_persistence::nbt::Tag> {
+        anyhow::bail!("drowned equipment provider is unavailable")
+    }
+    fn spawn_zombie_nautilus(
+        &mut self,
+        _: [i32; 3],
+        _: &native_world::loaded::World,
+        _: &mut native_resources::worldgen_region_random::RegionRandom,
+        _: bool,
+    ) -> Result<bool> {
+        anyhow::bail!("zombie nautilus generation is not implemented")
+    }
+}
+
+fn construct_chicken() -> Result<Option<native_session::worldgen::FreshCreatureRandom>> {
+    Ok(Some(
+        native_session::worldgen::FreshCreatureRandom::from_entropy(&ResourceId::parse(
+            "minecraft:chicken",
+        )?)?,
+    ))
+}
+
+impl InitialOceanGeneration {
+    fn load(
+        resources: &mut ResourceStack,
+        blocks: &BTreeSet<String>,
+        registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
+    ) -> Result<Self> {
+        use native_resources::{
+            animal_variants::{FarmAnimal, FarmAnimalSpawnVariants},
+            drowned_spawn::DrownedBiomeTags,
+            fluid_tags,
+            ore_feature::OreBlockTags,
+        };
+        use native_session::worldgen::ocean_ruin::{
+            DrownedChickenEffects, DrownedEquipmentEffects,
+        };
+        let ice_tags = OreBlockTags::load(
+            resources,
+            blocks,
+            &BTreeSet::from([ResourceId::parse("minecraft:ice")?]),
+        )?;
+        let water_fluids = fluid_tags::load_water(resources)?;
+        let bubble_fluids = fluid_tags::load_bubble_column_occupiable(resources)?;
+        let biome_tags = DrownedBiomeTags::load(resources)?;
+        let variants = Arc::new(FarmAnimalSpawnVariants::load_active(
+            resources,
+            FarmAnimal::Chicken,
+        )?);
+        let items = resources.vanilla_item_registry()?;
+        let known_items = items
+            .iter()
+            .map(|(id, _)| ResourceId::parse(id))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let chickens = DrownedChickenEffects::new(
+            variants,
+            construct_chicken as ChickenConstructor,
+            UnsupportedOceanEffects,
+        )?;
+        // Both vanilla item prototypes have enchantability one in Java 26.3.
+        let effects =
+            DrownedEquipmentEffects::load(resources, &known_items, Some(1), Some(1), chickens)?;
+        Ok(Self {
+            ice_tags,
+            water_fluids,
+            bubble_fluids,
+            registry,
+            biome_tags,
+            effects,
+        })
+    }
 }
 
 impl InitialHutGeneration {
@@ -174,6 +293,8 @@ impl InitialHutGeneration {
         resources: &mut ResourceStack,
         dimension_type: &ResourceId,
         difficulty: Option<native_persistence::world::Difficulty>,
+        blocks: &BTreeSet<String>,
+        registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
     ) -> Result<Self> {
         let clocks = native_resources::world_clock::registered_clocks(resources)?
             .into_iter()
@@ -183,12 +304,18 @@ impl InitialHutGeneration {
         let conditions = variants.prepare_world_conditions(resources)?;
         let name = format!("{}:{}", dimension_type.namespace, dimension_type.path);
         let moon = native_resources::moon_phase::Environment::load(resources, &name)?;
+        let ocean = if difficulty.is_some() {
+            Some(InitialOceanGeneration::load(resources, blocks, registry)?)
+        } else {
+            None
+        };
         Ok(Self {
             variants,
             conditions,
             moon,
             clocks,
             difficulty,
+            ocean,
         })
     }
 }
@@ -700,14 +827,22 @@ pub(crate) fn prepare_with_structures_and_difficulty(
         &settings.preset,
         &settings.dimension,
     )?;
+    let blocks = resources.vanilla_block_ids()?;
+    let registry = Arc::new(resources.vanilla_generated_block_registry()?);
     let hut_generation = lighting
         .dimension_type
         .as_ref()
         .map(|dimension| {
-            InitialHutGeneration::load(&mut resources, dimension, difficulty).map(Arc::new)
+            InitialHutGeneration::load(
+                &mut resources,
+                dimension,
+                difficulty,
+                &blocks,
+                Arc::clone(&registry),
+            )
+            .map(Arc::new)
         })
         .transpose()?;
-    let blocks = resources.vanilla_block_ids()?;
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let height_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
         &mut resources,
@@ -725,7 +860,6 @@ pub(crate) fn prepare_with_structures_and_difficulty(
         .list_data("worldgen/placed_feature")?
         .into_iter()
         .collect();
-    let registry = Arc::new(resources.vanilla_generated_block_registry()?);
     let (classify, resolve) = block_classifiers(Arc::clone(&registry));
     let classify_height = height_classifier(Arc::clone(&registry), Arc::clone(&height_tags));
     let configure_terrain: StructuredConfigurer = Box::new(move |batch, provider| {

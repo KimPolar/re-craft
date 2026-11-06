@@ -925,6 +925,7 @@ fn inert_generated_full_cube(name: &str) -> bool {
             | "minecraft:dirt"
             | "minecraft:coarse_dirt"
             | "minecraft:rooted_dirt"
+            | "minecraft:moss_block"
             | "minecraft:clay"
             | "minecraft:bedrock"
             | "minecraft:netherrack"
@@ -1472,8 +1473,13 @@ impl GeneratedBlockView<'_> {
         context: &str,
     ) -> anyhow::Error {
         if let native_world::fluid_sim::IncompleteTick::Unknown(pos) = error {
-            if let Err(cause) = self.read(pos.to_array()) {
-                return cause.context(context.to_owned());
+            match self.read(pos.to_array()) {
+                Err(cause) => return cause.context(context.to_owned()),
+                Ok(state) => {
+                    return anyhow::anyhow!(
+                        "{context} is incomplete at {pos:?}: unsupported block state {state:?}"
+                    );
+                }
             }
         }
         anyhow::anyhow!("{context} is incomplete: {error:?}")
@@ -3380,6 +3386,7 @@ mod tests {
             "dirt",
             "coarse_dirt",
             "rooted_dirt",
+            "moss_block",
             "clay",
             "bedrock",
             "netherrack",
@@ -3592,7 +3599,7 @@ mod tests {
 
     #[test]
     fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
-        assert_eq!(inert_cube_postprocessing_trace().len(), 108);
+        assert_eq!(inert_cube_postprocessing_trace().len(), 111);
         assert!(!inert_generated_full_cube("minecraft:oak_log"));
         let invalid = BlockState {
             name: "minecraft:stone".into(),
@@ -3607,6 +3614,7 @@ mod tests {
             ("diamond_ore", None),
             ("nether_quartz_ore", None),
             ("obsidian", None),
+            ("moss_block", None),
             ("deepslate", Some("y")),
             ("oak_log", Some("x")),
             ("warped_hyphae", Some("z")),
@@ -6470,7 +6478,10 @@ mod tests {
             Some(Arc::new(BTreeSet::from(["minecraft:lava".into()]))),
         );
         let error = stage.poll(chunk, 1).unwrap_err();
-        assert!(format!("{error:#}").contains("generated water path is incomplete"));
+        let message = format!("{error:#}");
+        assert!(message.contains("generated water path is incomplete"));
+        assert!(message.contains("minecraft:water"));
+        assert!(message.contains("IVec3(8, 8, 8)"));
         assert!(stage.finish().is_err());
         assert_eq!(original.block(8, 7, 8).unwrap().name, "minecraft:air");
     }

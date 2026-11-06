@@ -142,6 +142,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineSelf=vineActive && args[1].startsWith("vine_active_self_");
         boolean patchActive=vineActive && args[1].endsWith("_patch_water");
+        boolean magmaActive=vineActive && args[1].endsWith("_magma_block");
         boolean lichenActive=vineActive && args[1].endsWith("_lichen");
         boolean lakeActive=vineActive && args[1].contains("_lake_");
         boolean lakeMixed=lakeActive && args[1].endsWith("_mixed");
@@ -178,7 +179,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         w.wide=full || blockCase || skyActivate || stagedActivate || activeEmptyWide || vineSelf;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing") || args[1].equals("vine_active_self_existing"));
-        w.magmaOnly=magma;
+        w.magmaOnly=magma || magmaActive;
         boolean partial=args.length>1 && (args[1].equals("partial") || ore || normal || magma || (vine && !vineActive) || emptyPartialWide || (leafActive && !leafFull));
         boolean equivalent=args.length>1 && args[1].equals("equivalent");
         boolean late=args.length>1 && args[1].startsWith("late");
@@ -203,7 +204,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 fake.section.setBlockState(0,10,8,litter); w.edits.put(pos,litter);
             }
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
-            if(x==1 && z==0 && !blockCase && !magma && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
+            if(x==1 && z==0 && !blockCase && !magma && !magmaActive && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && lichenActive) {
                 var water=Blocks.WATER.defaultBlockState();
                 fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
@@ -266,6 +267,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 w.edits.put(new BlockPos(16,10,8),initial);
             }
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
+            if(x==1 && z==0 && magmaActive) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
             if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
             if((!partial && !w.mixed) || (x==1 && z==0 && !late) || ((w.mixed || emptyPartialWide) && x==0 && z==0)){
@@ -373,12 +375,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         }
         if(vineActive){
             engine.propagateLightSources(new ChunkPos(vineSelf?1:0,0)); drain(engine); stages.add(captureWide(engine));
-            int[][] positions=lakeMixed ? new int[][]{{16,10,8},{16,10,9},{16,9,8}} : vineActiveTransition ? new int[][]{{16,10,8},{16,10,8}} : vineActiveMany ? new int[][]{{16,10,8},{16,9,8},{16,8,8}} : new int[][]{{16,10,8}};
+            int[][] positions=magmaActive ? new int[][]{{16,7,8}} : lakeMixed ? new int[][]{{16,10,8},{16,10,9},{16,9,8}} : vineActiveTransition ? new int[][]{{16,10,8},{16,10,8}} : vineActiveMany ? new int[][]{{16,10,8},{16,9,8},{16,8,8}} : new int[][]{{16,10,8}};
             for(int i=0;i<positions.length;i++){
                 var p=positions[i]; var pos=new BlockPos(p[0],p[1],p[2]);
                 boolean berries=vineActiveTransition ? i==1 : vineActiveMany ? i!=1 : !plain;
                 var block=args[1].equals("vine_active_head") ? Blocks.CAVE_VINES : Blocks.CAVE_VINES_PLANT;
-                var state=patchActive ? Blocks.WATER.defaultBlockState() : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
+                var state=magmaActive ? Blocks.MAGMA_BLOCK.defaultBlockState() : patchActive ? Blocks.WATER.defaultBlockState() : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
                     ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true).setValue(net.minecraft.world.level.block.MultifaceBlock.getFaceProperty(net.minecraft.core.Direction.UP),true)
                     : block.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,berries);
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
@@ -387,7 +389,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
                 boolean changed=LightEngine.hasDifferentLightProperties(old,state);
-                if(changed!=(patchActive || (lakeActive && !lakeOre) || lichenActive || (!lakeActive && berries)))throw new AssertionError("unexpected active light check");
+                if(changed!=(magmaActive || patchActive || (lakeActive && !lakeOre) || lichenActive || (!lakeActive && berries)))throw new AssertionError("unexpected active light check");
                 if(changed)engine.checkBlock(pos);
             }
             stages.add(captureWide(engine)); drain(engine); stages.add(captureWide(engine));

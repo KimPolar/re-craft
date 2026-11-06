@@ -283,6 +283,7 @@ pub struct DecorationRegion<'a> {
     patch_block_write: bool,
     multiface_block_write: bool,
     lake_block_write: bool,
+    magma_block_write: bool,
     failed: bool,
 }
 
@@ -2764,6 +2765,7 @@ impl CarvedTerrainWorld {
             patch_block_write: false,
             multiface_block_write: false,
             lake_block_write: false,
+            magma_block_write: false,
             failed: false,
         })
     }
@@ -6307,7 +6309,10 @@ impl MagmaWorld for DecorationRegion<'_> {
                     disk_safe_solid(&self.read(pos)?.name).is_some(),
                     "unsupported magma source effects"
                 );
-                self.set_proto_block(pos, state)?;
+                self.magma_block_write = true;
+                let write = self.set_proto_block(pos, state);
+                self.magma_block_write = false;
+                write?;
             }
             self.mark_postprocessing([pos[0], pos[1].wrapping_add(1), pos[2]])?;
             Ok(true)
@@ -6594,12 +6599,19 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || (state.name == "minecraft:lava"
                                 && state.properties.len() == 1
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
+                    let magma_light_update = guard.require_unchanged_light
+                        && self.magma_block_write
+                        && old.name == "minecraft:stone"
+                        && old.properties.is_empty()
+                        && state.name == "minecraft:magma_block"
+                        && state.properties.is_empty();
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
+                                || magma_light_update
                                 || staged_patch_water
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
@@ -6618,6 +6630,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || vine_write
                             || water_lichen_write
                             || lake_light_update
+                            || magma_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {old:?} -> {state:?}"
@@ -6671,6 +6684,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || vine_check
                         || lichen_check
                         || lake_light_update
+                        || magma_light_update
                         || new_section
                     {
                         let guard = self.light_guard.as_mut().unwrap();
@@ -6678,6 +6692,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         if vine_write
                             || water_lichen_write
                             || lake_light_update
+                            || magma_light_update
                             || staged_patch_water
                         {
                             guard.vine_light_positions.insert(p);
@@ -6686,6 +6701,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || vine_check
                             || lichen_check
                             || lake_light_update
+                            || magma_light_update
                             || patch_check
                         {
                             guard.light_check_order.push(p);
@@ -10764,6 +10780,12 @@ mod tests {
         check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_underwater_magma_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&["vine_active_magma_block", "vine_active_self_magma_block"]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -10850,9 +10872,15 @@ mod tests {
                         .unwrap(),
                 );
                 section.blocks.as_mut().unwrap().fill(air);
-            } else {
+            } else if !mode.ends_with("_magma_block") {
                 let torch = world.intern_state(state("torch"));
                 world.set_block_id(17, 10, 8, torch).unwrap();
+            }
+            if mode.ends_with("_magma_block") {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let id = world.intern_state(water);
+                world.set_block_id(16, 8, 8, id).unwrap();
             }
             if mode.ends_with("_existing") {
                 let mut plain = state("cave_vines_plant");
@@ -10936,7 +10964,9 @@ mod tests {
                 new_nonempty_sections: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
-            let positions = if mode.contains("_lake_") && mode.ends_with("_mixed") {
+            let positions = if mode.ends_with("_magma_block") {
+                vec![[16, 7, 8]]
+            } else if mode.contains("_lake_") && mode.ends_with("_mixed") {
                 vec![[16, 10, 8], [16, 10, 9], [16, 9, 8]]
             } else if mode.ends_with("_plain_then_glowing") {
                 vec![[16, 10, 8], [16, 10, 8]]
@@ -10946,6 +10976,16 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.ends_with("_magma_block") {
+                    assert!(MagmaWorld::set_magma(&mut draft, p, &state("magma_block")).unwrap());
+                    let marks = &draft.feature_marks[&east];
+                    assert_eq!(marks.sections()[0].len(), 1);
+                    assert_eq!(
+                        marks.unpack(0, marks.sections()[0][0], east.x, east.z),
+                        Some([16, 8, 8])
+                    );
+                    continue;
+                }
                 if mode.ends_with("_patch_water") {
                     let mut water = state("water");
                     water.properties.insert("level".into(), "0".into());

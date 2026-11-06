@@ -79,9 +79,9 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         @Override public void upgrade(LevelChunk chunk){}
     }
     public static void main(String[] args)throws Exception {
-        try {run();} catch(Throwable error){error.printStackTrace(System.err);throw error;}
+        try {run(args);} catch(Throwable error){error.printStackTrace(System.err);throw error;}
     }
-    static void run()throws Exception {
+    static void run(String[] args)throws Exception {
         var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
         BuiltInRegistries.BLOCK.prepareTagReload(new TagLoader.LoadResult<>(Registries.BLOCK, Map.of(
             BlockTags.WASHED_AWAY_BY_FLUIDS,List.of(Blocks.AIR.builtInRegistryHolder(),Blocks.WATER.builtInRegistryHolder()),
@@ -108,6 +108,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         leafTypes.put("flowering_azalea_leaves",Blocks.FLOWERING_AZALEA_LEAVES);
         var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","stair_bottom","stair_top","stair_bottom_off","marked_stair_dry","marked_stair_wet","marked_stair_side","marked_stair_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
         scenarios.addAll(List.of("marked_fence_wet","marked_fence_side","marked_fence_down","marked_fence_disconnect","marked_fence_disconnect_sand","marked_fence_disconnect_water","marked_fence_disconnect_neighbor"));
+        scenarios.addAll(List.of("marked_lichen_wet","marked_lichen_side","marked_lichen_down","marked_lichen_sides","marked_lichen_mixed"));
         for(var name:leafTypes.keySet()) scenarios.add("marked_leaf_type_"+name);
         for(var facing:List.of("north","south","west","east"))
             for(var half:List.of("bottom","top"))
@@ -117,6 +118,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 for(var half:List.of("bottom","top"))
                     for(var wet:List.of(false,true))
                         for(var side:List.of("front","back")) scenarios.add("marked_stair_corner_"+facing+"_"+neighbor+"_"+half+"_"+wet+"_"+side);
+        if(args.length>0 && args[0].equals("lichen"))scenarios.removeIf(s -> !s.startsWith("marked_lichen_"));
         for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
@@ -154,6 +156,13 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(scenario.equals("marked_fence_disconnect_sand"))blocks.put(pos.north(),Blocks.SAND.defaultBlockState());
                 if(scenario.equals("marked_fence_disconnect_water"))blocks.put(pos.north(),Blocks.WATER.defaultBlockState());
                 if(scenario.equals("marked_fence_disconnect_neighbor"))blocks.put(pos.north(),Blocks.OAK_FENCE.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true));
+            }
+            if(scenario.startsWith("marked_lichen_")) {
+                blocks.put(pos,Blocks.GLOW_LICHEN.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true)
+                    .setValue(MultifaceBlock.getFaceProperty(Direction.WEST),true));
+                if(scenario.equals("marked_lichen_side") || scenario.equals("marked_lichen_sides") || scenario.equals("marked_lichen_mixed"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("marked_lichen_down") || scenario.equals("marked_lichen_mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
+                if(scenario.equals("marked_lichen_sides") || scenario.equals("marked_lichen_mixed"))for(var p:List.of(pos.north(),pos.south()))blocks.put(p,Blocks.AIR.defaultBlockState());
             }
             if(scenario.startsWith("stair_")) {
                 blocks.put(pos.east(),Blocks.OAK_STAIRS.defaultBlockState().setValue(BlockStateProperties.HALF,scenario.equals("stair_top")?Half.TOP:Half.BOTTOM));
@@ -219,7 +228,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             out.println("case "+scenario);
             for(var p:List.of(pos,pos.below(),pos.north(),pos.south(),pos.west(),pos.east())) {
                 var state=get(p);out.printf("state %d,%d,%d %s %s%n",p.getX(),p.getY(),p.getZ(),
-                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock || state.getBlock() instanceof LeavesBlock || state.getBlock() instanceof FenceBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
+                    BuiltInRegistries.BLOCK.getKey(state.getBlock()),state.getBlock()==Blocks.WATER?state.getValue(LiquidBlock.LEVEL).toString():(state.getBlock() instanceof SlabBlock || state.getBlock() instanceof StairBlock || state.getBlock() instanceof LeavesBlock || state.getBlock() instanceof FenceBlock || state.getBlock() instanceof MultifaceBlock)?state.getValue(BlockStateProperties.WATERLOGGED).toString():"-");
+                if(state.getBlock() instanceof MultifaceBlock)out.printf("lichen %d,%d,%d %s %s %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(MultifaceBlock.getFaceProperty(Direction.DOWN)),state.getValue(MultifaceBlock.getFaceProperty(Direction.UP)),state.getValue(MultifaceBlock.getFaceProperty(Direction.NORTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.SOUTH)),state.getValue(MultifaceBlock.getFaceProperty(Direction.WEST)),state.getValue(MultifaceBlock.getFaceProperty(Direction.EAST)));
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
                 if(state.getBlock() instanceof FenceBlock)out.printf("fence %d,%d,%d %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(FenceBlock.NORTH),state.getValue(FenceBlock.EAST),state.getValue(FenceBlock.SOUTH),state.getValue(FenceBlock.WEST));
             }

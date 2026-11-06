@@ -1175,10 +1175,6 @@ impl GeneratedBlockView<'_> {
         {
             return Ok(());
         }
-        ensure!(
-            !super::ore::valid_lichen(&self.read(pos)?),
-            "waterlogged lichen fluid spread is not yet supported"
-        );
         // Unknown rules must yield the same plan for both possible values.
         // Water's delay is fixed and never samples lava's delay RNG.
         let mut planned = None;
@@ -1590,6 +1586,14 @@ impl GeneratedBlockView<'_> {
                     self.write_postprocessed_state(p.to_array(), &state, &updated)?;
                     self.update_fence_shape_neighbors(p.to_array(), &updated, 512)?;
                 }
+            } else if super::ore::valid_lichen(&state) {
+                let direction = [-d[0], -d[1], -d[2]];
+                let updated =
+                    self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
+                ensure!(
+                    updated == state,
+                    "water-triggered lichen shape changes are not yet supported"
+                );
             } else if self.slab(&state).is_some_and(|(_, wet)| wet)
                 || self.stair(&state).is_some_and(|(_, wet)| wet)
             {
@@ -5601,6 +5605,46 @@ mod tests {
                     world.set_block_id(8, 8, 7, neighbor).unwrap();
                 }
             }
+            "marked_lichen_wet"
+            | "marked_lichen_side"
+            | "marked_lichen_down"
+            | "marked_lichen_sides"
+            | "marked_lichen_mixed" => {
+                let lichen = world.intern_state(BlockState {
+                    name: "minecraft:glow_lichen".into(),
+                    properties: [
+                        "down",
+                        "up",
+                        "north",
+                        "south",
+                        "west",
+                        "east",
+                        "waterlogged",
+                    ]
+                    .into_iter()
+                    .map(|key| {
+                        (
+                            key.into(),
+                            matches!(key, "west" | "waterlogged").to_string(),
+                        )
+                    })
+                    .collect(),
+                });
+                world.set_block_id(8, 8, 8, lichen).unwrap();
+                if matches!(
+                    case,
+                    "marked_lichen_side" | "marked_lichen_sides" | "marked_lichen_mixed"
+                ) {
+                    world.set_block_id(9, 8, 8, air).unwrap();
+                }
+                if matches!(case, "marked_lichen_down" | "marked_lichen_mixed") {
+                    world.set_block_id(8, 7, 8, air).unwrap();
+                }
+                if matches!(case, "marked_lichen_sides" | "marked_lichen_mixed") {
+                    world.set_block_id(8, 8, 7, air).unwrap();
+                    world.set_block_id(8, 8, 9, air).unwrap();
+                }
+            }
             case if case.starts_with("marked_leaf_") => {
                 let leaf = world.intern_state(BlockState {
                     name: format!(
@@ -5703,6 +5747,7 @@ mod tests {
             "oak_stairs",
             "oak_leaves",
             "oak_fence",
+            "glow_lichen",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
@@ -5838,6 +5883,17 @@ mod tests {
                     state.properties["east"],
                     state.properties["south"],
                     state.properties["west"]
+                ));
+            }
+            if state.name == "minecraft:glow_lichen" {
+                trace.push(format!(
+                    "lichen {x},{y},{z} {} {} {} {} {} {}",
+                    state.properties["down"],
+                    state.properties["up"],
+                    state.properties["north"],
+                    state.properties["south"],
+                    state.properties["west"],
+                    state.properties["east"]
                 ));
             }
         }
@@ -6231,6 +6287,57 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn waterlogged_lichen_spread_matches_java() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["lichen"],
+        );
+        let expected: Vec<_> = [
+            "marked_lichen_wet",
+            "marked_lichen_side",
+            "marked_lichen_down",
+            "marked_lichen_sides",
+            "marked_lichen_mixed",
+        ]
+        .into_iter()
+        .flat_map(water_spread_trace)
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn waterlogged_lichen_spreads_and_retains_its_supported_face() {
+        let side = water_spread_trace("marked_lichen_side");
+        assert!(
+            side.iter()
+                .any(|line| line == "state 8,8,8 minecraft:glow_lichen true")
+        );
+        assert!(
+            side.iter()
+                .any(|line| line == "lichen 8,8,8 false false false false true false")
+        );
+        assert!(
+            side.iter()
+                .any(|line| line.starts_with("state 9,8,8 minecraft:water "))
+        );
+        assert!(
+            side.iter()
+                .any(|line| line == "fluid minecraft:water 8,8,8 5")
+        );
+        let down = water_spread_trace("marked_lichen_down");
+        assert!(
+            down.iter()
+                .any(|line| line == "state 8,7,8 minecraft:water 8")
+        );
+        assert!(
+            down.iter()
+                .any(|line| line == "fluid minecraft:flowing_water 8,7,8 5")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn water_source_postprocessing_matches_java() {
         let actual = java_results(
             "GeneratedWaterSpreadPostprocessingOracle",
@@ -6281,6 +6388,11 @@ mod tests {
             "marked_fence_disconnect_sand",
             "marked_fence_disconnect_water",
             "marked_fence_disconnect_neighbor",
+            "marked_lichen_wet",
+            "marked_lichen_side",
+            "marked_lichen_down",
+            "marked_lichen_sides",
+            "marked_lichen_mixed",
         ] {
             expected.extend(water_spread_trace(case));
         }
@@ -6634,6 +6746,10 @@ mod tests {
     }
 
     fn java_results(class_name: &str, java_source: &str) -> Vec<String> {
+        java_results_with_args(class_name, java_source, &[])
+    }
+
+    fn java_results_with_args(class_name: &str, java_source: &str, args: &[&str]) -> Vec<String> {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -6675,6 +6791,7 @@ mod tests {
             .arg("-cp")
             .arg(classpath)
             .arg(class_name)
+            .args(args)
             .output()
             .unwrap();
         assert!(

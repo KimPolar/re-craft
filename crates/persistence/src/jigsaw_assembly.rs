@@ -319,6 +319,189 @@ mod tests {
         Ok(result)
     }
 
+    fn configured_city_lines(
+        resources: &mut native_resources::packs::ResourceStack,
+        seed: i64,
+        chunk: [i32; 2],
+    ) -> Result<VecDeque<String>> {
+        use native_resources::{
+            height_provider::HeightContext,
+            jigsaw_placement::{StartEnvironment, StartHeightmap},
+            jigsaw_structure::JigsawStructure,
+            structure_pool::Projection,
+        };
+        struct Terrain;
+        impl StartEnvironment for Terrain {
+            fn valid_column(&mut self, _: i32, _: i32, _: i32, _: i32) -> Result<bool> {
+                anyhow::bail!("city unexpectedly projected to terrain")
+            }
+            fn first_free_height(&mut self, _: i32, _: i32, _: StartHeightmap) -> Result<i32> {
+                anyhow::bail!("city unexpectedly sampled start terrain")
+            }
+        }
+        let bytes = resources
+            .read_data("data/minecraft/worldgen/structure/ancient_city.json")?
+            .context("missing city definition")?;
+        let mut definition: serde_json::Value = serde_json::from_slice(&bytes)?;
+        definition["size"] = serde_json::json!(2);
+        let settings = JigsawStructure::decode(&definition)?;
+        let mut seeded = settings.begin(
+            seed,
+            chunk,
+            HeightContext {
+                min_y: 0,
+                height: 0,
+                sea_level: 0,
+            },
+        )?;
+        let mut context =
+            TemplateAssemblyContext::new(resources, |_| Ok(-27), seeded.aliases.clone());
+        let prepared = seeded
+            .prepare(&settings, &mut context, &mut Terrain, -64, 319)?
+            .context("missing city start")?;
+        let point = prepared.position;
+        let pieces = prepared.assemble(&mut context, &mut |bound| {
+            seeded.random.next_int_bound(bound)
+        })?;
+        let mut result = VecDeque::new();
+        result.push_back(format!(
+            "C\t{seed}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            chunk[0],
+            chunk[1],
+            point[0],
+            point[1],
+            point[2],
+            pieces.len(),
+            seeded.random.next_long()
+        ));
+        for piece in pieces {
+            let rotation = match piece.rotation {
+                Rotation::None => 0,
+                Rotation::Clockwise90 => 1,
+                Rotation::Clockwise180 => 2,
+                Rotation::Counterclockwise90 => 3,
+            };
+            result.push_back(format!(
+                "P\t{rotation}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                piece.origin[0],
+                piece.origin[1],
+                piece.origin[2],
+                piece.bounds.min[0],
+                piece.bounds.min[1],
+                piece.bounds.min[2],
+                piece.bounds.max[0],
+                piece.bounds.max[1],
+                piece.bounds.max[2],
+                piece.ground_level_delta,
+                piece.junctions.len()
+            ));
+            for j in piece.junctions {
+                let projection = match j.destination_projection {
+                    Projection::Rigid => "rigid",
+                    Projection::TerrainMatching => "terrain_matching",
+                };
+                result.push_back(format!(
+                    "J\t{}\t{}\t{}\t{}\t{projection}",
+                    j.source_x, j.source_ground_y, j.source_z, j.delta_y
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn configured_city_start_and_graph_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home missing")?
+            .join("bin");
+        let shared = temp.path().join("JigsawPlacementOracle.java");
+        let source = temp.path().join("JigsawConfiguredCityOracle.java");
+        std::fs::write(
+            &shared,
+            include_str!("../../resources/tests/java/JigsawPlacementOracle.java"),
+        )?;
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/JigsawConfiguredCityOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&shared)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("JigsawConfiguredCityOracle")
+            .arg(version.join("26.3.jar"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let mut expected = VecDeque::new();
+        let mut cases = 0;
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some(rest) = line.strip_prefix("C\t") {
+                ensure!(
+                    expected.is_empty(),
+                    "previous configured graph was incomplete"
+                );
+                let fields: Vec<_> = rest.split('\t').collect();
+                ensure!(fields.len() == 8, "invalid configured graph header");
+                expected = configured_city_lines(
+                    &mut resources,
+                    fields[0].parse()?,
+                    [fields[1].parse()?, fields[2].parse()?],
+                )?;
+                cases += 1;
+            }
+            if line.starts_with("C\t") || line.starts_with("P\t") || line.starts_with("J\t") {
+                assert_eq!(
+                    expected.pop_front().context("extra Java graph output")?,
+                    line,
+                    "configured graph case {cases}"
+                );
+            }
+        }
+        assert_eq!(cases, 6);
+        assert!(expected.is_empty());
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn active_ancient_city_templates_form_a_piece_graph() -> Result<()> {

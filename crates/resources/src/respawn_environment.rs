@@ -257,13 +257,118 @@ impl RespawnEnvironment {
     }
 }
 
-/// Dimension and biome layers for a world whose active timelines do not modify
-/// respawn attributes. Timeline-driven rules are rejected until the clocks and
-/// keyframe samplers are available, rather than approximated with a fixed value.
+/// Dimension, biome and ordered active timeline layers for respawn attributes.
 #[derive(Clone, Debug)]
 pub struct RespawnEnvironmentRegistry {
     dimension: RespawnEnvironmentLayer,
     biomes: BTreeMap<String, RespawnEnvironmentLayer>,
+    tracks: Vec<RespawnTrack>,
+}
+
+#[derive(Clone, Debug)]
+struct RespawnTrack {
+    clock: ResourceId,
+    period: Option<i32>,
+    easing: crate::creature_timeline::Easing,
+    frames: Vec<(i32, RespawnEnvironmentLayer)>,
+}
+
+impl RespawnTrack {
+    fn parse(timeline: &Value, attribute: &str, track: &Value) -> Result<Self> {
+        let clock = ResourceId::parse(
+            timeline
+                .get("clock")
+                .and_then(Value::as_str)
+                .context("missing timeline clock")?,
+        )?;
+        let period = timeline
+            .get("period_ticks")
+            .map(|value| {
+                let period = value
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .context("invalid timeline period")?;
+                ensure!(period > 0, "timeline period must be positive");
+                Ok(period)
+            })
+            .transpose()?;
+        let easing = crate::creature_timeline::Easing::parse(track.get("ease"))?;
+        let modifier = track
+            .get("modifier")
+            .map(|v| v.as_str().context("invalid track modifier"))
+            .transpose()?
+            .unwrap_or("override");
+        let values = track
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .context("missing keyframes")?;
+        ensure!(!values.is_empty(), "empty keyframes");
+        let mut frames: Vec<(i32, RespawnEnvironmentLayer)> = Vec::with_capacity(values.len());
+        for frame in values {
+            let tick = frame
+                .get("ticks")
+                .and_then(Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+                .context("invalid keyframe tick")?;
+            if let Some(period) = period {
+                ensure!((0..=period).contains(&tick), "keyframe outside period");
+            }
+            if let Some((previous, _)) = frames.last() {
+                ensure!(tick >= *previous, "unordered keyframes");
+            }
+            if frames.len() >= 2 {
+                ensure!(
+                    frames[frames.len() - 2].0 != tick,
+                    "three identical keyframe ticks"
+                );
+            }
+            let argument = frame.get("value").context("missing keyframe value")?;
+            let attributes =
+                serde_json::json!({(attribute): {"modifier":modifier,"argument":argument}});
+            frames.push((tick, RespawnEnvironmentLayer::from_attributes(&attributes)?));
+        }
+        Ok(Self {
+            clock,
+            period,
+            easing,
+            frames,
+        })
+    }
+
+    fn sample(&self, ticks: i64) -> RespawnEnvironmentLayer {
+        let ticks = self
+            .period
+            .map_or(ticks, |period| ticks.rem_euclid(i64::from(period)));
+        let first = self.frames[0];
+        let last = self.frames[self.frames.len() - 1];
+        if self.frames.len() == 1 {
+            return first.1;
+        }
+        let before = self
+            .period
+            .map(|p| ((last.0.wrapping_sub(p), last.1), first));
+        let after = self
+            .period
+            .map(|p| (last, (first.0.wrapping_add(p), first.1)));
+        let segments = before
+            .into_iter()
+            .chain(self.frames.windows(2).map(|w| (w[0], w[1])))
+            .chain(after);
+        let ((start, a), (end, b)) = segments
+            .clone()
+            .find(|(_, end)| ticks < i64::from(end.0))
+            .unwrap_or_else(|| segments.last().expect("multiple keyframes"));
+        if ticks <= i64::from(start) {
+            return a;
+        }
+        if ticks >= i64::from(end) {
+            return b;
+        }
+        let alpha = self
+            .easing
+            .apply(ticks.wrapping_sub(i64::from(start)) as f32 / end.wrapping_sub(start) as f32);
+        if alpha >= 1.0 { b } else { a }
+    }
 }
 
 impl RespawnEnvironmentRegistry {
@@ -297,6 +402,7 @@ impl RespawnEnvironmentRegistry {
         dimension: RespawnEnvironmentLayer,
         definition: &Value,
     ) -> Result<Self> {
+        let mut collected_tracks = Vec::new();
         for timeline in
             crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
         {
@@ -304,18 +410,25 @@ impl RespawnEnvironmentRegistry {
                 .get("tracks")
                 .and_then(Value::as_object)
                 .context("invalid active timeline tracks")?;
-            for key in tracks.keys() {
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, value) in tracks {
                 let attr = ResourceId::parse(key)?;
                 ensure!(
-                    attr.namespace != "minecraft"
-                        || !matches!(
-                            attr.path.as_str(),
-                            "gameplay/bed_rule"
-                                | "gameplay/straw_bed_rule"
-                                | "gameplay/respawn_anchor_works"
-                        ),
-                    "active timeline modifies a respawn rule, which is not yet supported"
+                    seen.insert(attr.clone()),
+                    "duplicate timeline attribute {key}"
                 );
+                if attr.namespace == "minecraft"
+                    && matches!(
+                        attr.path.as_str(),
+                        "gameplay/bed_rule"
+                            | "gameplay/straw_bed_rule"
+                            | "gameplay/respawn_anchor_works"
+                    )
+                {
+                    // Keep the actual attribute ID for the layer parser.
+                    let parsed = RespawnTrack::parse(&timeline, key, value)?;
+                    collected_tracks.push(parsed);
+                }
             }
         }
         let mut biomes = BTreeMap::new();
@@ -328,10 +441,23 @@ impl RespawnEnvironmentRegistry {
             );
         }
         ensure!(!biomes.is_empty(), "biome registry is empty");
-        Ok(Self { dimension, biomes })
+        Ok(Self {
+            dimension,
+            biomes,
+            tracks: collected_tracks,
+        })
     }
 
     pub fn for_biome(&self, biome: &str) -> Result<RespawnEnvironment> {
+        ensure!(self.tracks.is_empty(), "respawn rules require world clocks");
+        self.for_biome_at(biome, |_| None)
+    }
+
+    pub fn for_biome_at(
+        &self,
+        biome: &str,
+        mut clock_ticks: impl FnMut(&ResourceId) -> Option<i64>,
+    ) -> Result<RespawnEnvironment> {
         let id = ResourceId::parse(biome)?;
         let name = format!("{}:{}", id.namespace, id.path);
         let layer = self
@@ -341,6 +467,22 @@ impl RespawnEnvironmentRegistry {
         let mut result = RespawnEnvironment::default();
         result.apply(self.dimension);
         result.apply(*layer);
+        let mut clocks = BTreeMap::new();
+        for track in &self.tracks {
+            let ticks = if let Some(&ticks) = clocks.get(&track.clock) {
+                ticks
+            } else {
+                let ticks = clock_ticks(&track.clock).with_context(|| {
+                    format!(
+                        "missing clock {}:{}",
+                        track.clock.namespace, track.clock.path
+                    )
+                })?;
+                clocks.insert(track.clock.clone(), ticks);
+                ticks
+            };
+            result.apply(track.sample(ticks));
+        }
         Ok(result)
     }
 }
@@ -431,6 +573,62 @@ mod tests {
                 .unwrap()
                 .anchor_works
         );
+    }
+
+    #[test]
+    fn respawn_timelines_follow_biome_and_require_clock_values() {
+        let mut source = Memory(BTreeMap::from([
+            (
+                "data/example/worldgen/biome/plain.json".into(),
+                json!({"attributes":{
+                    "gameplay/respawn_anchor_works":true,
+                    "gameplay/bed_rule":{"can_sleep":"always","can_set_spawn":"never"}
+                }}),
+            ),
+            (
+                "data/example/timeline/test.json".into(),
+                json!({"clock":"example:clock","period_ticks":20,"tracks":{
+                    "gameplay/respawn_anchor_works":{"modifier":"xor","keyframes":[{"ticks":0,"value":false},{"ticks":10,"value":true}]},
+                    "gameplay/bed_rule":{"keyframes":[
+                        {"ticks":0,"value":{"can_sleep":"never","can_set_spawn":"always"}},
+                        {"ticks":10,"value":{"can_sleep":"always","can_set_spawn":"never","destroy_on_use":true}}
+                    ]}
+                }}),
+            ),
+        ]));
+        let registry = RespawnEnvironmentRegistry::from_definition(
+            &mut source,
+            &json!({"timelines":["example:test"]}),
+        )
+        .unwrap();
+        assert!(registry.for_biome("example:plain").is_err());
+        assert!(registry.for_biome_at("example:plain", |_| None).is_err());
+        for (tick, anchor, spawn, destroy) in [
+            (0, true, BedCondition::Always, false),
+            (9, true, BedCondition::Always, false),
+            (10, false, BedCondition::Never, true),
+            (19, false, BedCondition::Never, true),
+            (20, true, BedCondition::Always, false),
+            (-1, false, BedCondition::Never, true),
+        ] {
+            let mut calls = 0;
+            let value = registry
+                .for_biome_at("example:plain", |id| {
+                    assert_eq!(id, &ResourceId::parse("example:clock").unwrap());
+                    calls += 1;
+                    Some(tick)
+                })
+                .unwrap();
+            assert_eq!(
+                (
+                    value.anchor_works,
+                    value.bed.can_set_spawn,
+                    value.bed.destroy_on_use
+                ),
+                (anchor, spawn, destroy)
+            );
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]

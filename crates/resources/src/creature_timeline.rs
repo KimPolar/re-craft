@@ -306,7 +306,7 @@ impl Track {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Easing {
     Linear,
     Constant,

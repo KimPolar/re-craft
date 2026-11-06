@@ -10168,7 +10168,12 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("saved respawn is unavailable"))?;
         let pos = IVec3::from_array(support.config.data.position);
         let biome = self.respawn_biome(pos)?;
-        let environment = support.environment.for_biome(biome)?;
+        let environment = support.environment.for_biome_at(biome, |id| {
+            self.world_clocks
+                .iter()
+                .find(|(clock, _)| clock.namespace == id.namespace && clock.path == id.path)
+                .map(|(_, clock)| clock.total_ticks)
+        })?;
         let state = self
             .world
             .state(self.respawn_state_id(pos)?)
@@ -54338,6 +54343,100 @@ pub(crate) mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn saved_anchor_respawn_samples_current_world_clock() {
+        use native_persistence::world::{
+            DimensionId, PlayerRespawnConfig, RespawnData, SavedClock, SavedWorldBorder,
+        };
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        use native_world::loaded::BIOME_COUNT;
+        struct Provider;
+        impl ResourceProvider for Provider {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/worldgen/biome/plains.json" => Some(br#"{}"#.to_vec()),
+                    "data/example/timeline/test.json" => Some(br#"{"clock":"example:clock","period_ticks":20,"tracks":{"gameplay/respawn_anchor_works":{"keyframes":[{"ticks":0,"value":false},{"ticks":10,"value":true}]}}}"#.to_vec()),
+                    _ => None,
+                })
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if folder == "worldgen/biome" {
+                    vec![ResourceId::parse("minecraft:plains")?]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let environment = Arc::new(
+            native_resources::respawn_environment::RespawnEnvironmentRegistry::from_definition(
+                &mut Provider,
+                &serde_json::json!({"timelines":["example:test"]}),
+            )
+            .unwrap(),
+        );
+        let (mut world, origin, player) = fixture();
+        let biome = world.intern_biome("minecraft:plains".into());
+        let pos = origin + IVec3::new(8, 1, 8);
+        let anchor = world.intern_state(state("minecraft:respawn_anchor", &[("charges", "4")]));
+        world.set_block_id(pos.x, pos.y, pos.z, anchor).unwrap();
+        let home = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&home).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .biomes = Some(Box::new([biome; BIOME_COUNT]));
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_saved_respawn_support(SavedRespawnSupport {
+                config: PlayerRespawnConfig {
+                    data: RespawnData {
+                        dimension: DimensionId::parse("overworld").unwrap(),
+                        position: pos.to_array(),
+                        yaw: 0.0,
+                        pitch: 0.0,
+                    },
+                    forced: false,
+                },
+                environment,
+                tags: Arc::new(respawn_tags(false)),
+                border: SavedWorldBorder::default(),
+                max_health: 20.0,
+            })
+            .unwrap();
+        assert!(session.prepare_saved_respawn().is_err());
+        let id = DimensionId::parse("example:clock").unwrap();
+        for (ticks, present) in [(0, false), (10, true), (20, false)] {
+            session.set_world_clocks(
+                BTreeMap::from([(
+                    id.clone(),
+                    SavedClock {
+                        total_ticks: ticks,
+                        ..Default::default()
+                    },
+                )]),
+                false,
+            );
+            assert_eq!(session.prepare_saved_respawn().unwrap().is_some(), present);
+        }
     }
 
     #[test]

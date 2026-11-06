@@ -488,7 +488,7 @@ fn fast_lava_checks_only_timelines_linked_by_active_tag() {
 
 #[test]
 #[ignore = "requires Minecraft 26.3"]
-fn runtime_respawn_environment_uses_biomes_and_rejects_timeline_changes() {
+fn runtime_respawn_environment_uses_biomes_and_active_timeline_changes() {
     use native_resources::datapacks::DataPackSettings;
     let game = std::env::var_os("MINECRAFT_DIR")
         .map(PathBuf::from)
@@ -529,5 +529,143 @@ fn runtime_respawn_environment_uses_biomes_and_rejects_timeline_changes() {
             },
         )
         .unwrap();
-    assert!(RespawnEnvironmentRegistry::load(&mut resources, "minecraft:overworld").is_err());
+    let registry = RespawnEnvironmentRegistry::load(&mut resources, "minecraft:overworld").unwrap();
+    assert!(registry.for_biome("minecraft:plains").is_err());
+    assert!(
+        registry
+            .for_biome_at("minecraft:plains", |_| Some(0))
+            .unwrap()
+            .anchor_works
+    );
+}
+
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn respawn_timelines_match_java_track_sampler() {
+    use native_resources::packs::ResourceId;
+    struct Data {
+        dimension: Value,
+        timeline: Value,
+    }
+    impl ResourceProvider for Data {
+        fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(match path {
+                "data/example/dimension_type/test.json" => {
+                    Some(serde_json::to_vec(&self.dimension)?)
+                }
+                "data/example/timeline/test.json" => Some(serde_json::to_vec(&self.timeline)?),
+                "data/example/worldgen/biome/plain.json" => Some(b"{}".to_vec()),
+                _ => None,
+            })
+        }
+        fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+            Ok(if folder == "worldgen/biome" {
+                vec![ResourceId::parse("example:plain")?]
+            } else {
+                vec![]
+            })
+        }
+    }
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+        .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+    let ticks = [
+        -41,
+        -20,
+        -19,
+        -1,
+        0,
+        1,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        19,
+        20,
+        21,
+        39,
+        40,
+        i64::MAX,
+        i64::MIN,
+    ];
+    let mut cases = Vec::new();
+    for looping in [false, true] {
+        for ease in ["linear", "constant"] {
+            for base in [false, true] {
+                for modifier in ["override", "and", "nand", "or", "nor", "xor", "xnor"] {
+                    let mut case = json!({"kind":"anchor","base":base,"ticks":ticks,"track":{"modifier":modifier,"ease":ease,"keyframes":[
+                        {"ticks":0,"value":false},{"ticks":5,"value":true},{"ticks":5,"value":false},{"ticks":9,"value":true}]}});
+                    if looping {
+                        case["period"] = json!(20);
+                    }
+                    cases.push(case);
+                }
+            }
+            let mut case = json!({"kind":"bed","ticks":ticks,"track":{"ease":ease,"keyframes":[
+                {"ticks":0,"value":{"can_sleep":"always","can_set_spawn":"never"}},
+                {"ticks":5,"value":{"can_sleep":"never","can_set_spawn":"always","destroy_on_use":true}},
+                {"ticks":5,"value":{"can_sleep":"when_dark","can_set_spawn":"always"}},
+                {"ticks":9,"value":{"can_sleep":"never","can_set_spawn":"never","destroy_on_leave":true}}]}});
+            if looping {
+                case["period"] = json!(20);
+            }
+            cases.push(case);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("RespawnTimelineOracle.java");
+    let input = temp.path().join("cases.json");
+    let output = temp.path().join("output.json");
+    std::fs::write(&source, include_str!("java/RespawnTimelineOracle.java")).unwrap();
+    std::fs::write(&input, serde_json::to_vec(&cases).unwrap()).unwrap();
+    let cp = classpath(&game, temp.path());
+    run(Command::new(java.join("javac"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg(&source));
+    run(Command::new(java.join("java"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg("RespawnTimelineOracle")
+        .arg(&input)
+        .arg(&output));
+    let expected: Vec<Vec<Value>> =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(expected.len(), cases.len());
+    for (case, expected) in cases.iter().zip(expected) {
+        let anchor = case["kind"] == "anchor";
+        let attr = if anchor {
+            "minecraft:gameplay/respawn_anchor_works"
+        } else {
+            "minecraft:gameplay/bed_rule"
+        };
+        let mut timeline = json!({"clock":"example:clock","tracks":{(attr):case["track"]}});
+        if let Some(period) = case.get("period") {
+            timeline["period_ticks"] = period.clone();
+        }
+        let mut provider = Data {
+            dimension: json!({"attributes":{"gameplay/respawn_anchor_works":case.get("base").and_then(Value::as_bool).unwrap_or(false)},"timelines":["example:test"]}),
+            timeline,
+        };
+        let environment = RespawnEnvironmentRegistry::load(&mut provider, "example:test").unwrap();
+        for (tick, expected) in ticks.into_iter().zip(expected) {
+            let value = environment
+                .for_biome_at("example:plain", |_| Some(tick))
+                .unwrap();
+            let actual = if anchor {
+                json!(value.anchor_works)
+            } else {
+                bed_json(value.bed)
+            };
+            assert_eq!(actual, expected, "{case} at {tick}");
+        }
+    }
 }

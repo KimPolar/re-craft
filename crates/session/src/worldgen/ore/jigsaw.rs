@@ -1,4 +1,4 @@
-//! Place supported rigid jigsaw templates in an unpublished decoration region.
+//! Place supported jigsaw templates in an unpublished decoration region.
 use super::*;
 use native_core::beardifier::BoundingBox;
 use native_persistence::nbt::Tag;
@@ -35,6 +35,9 @@ impl JigsawRegion<'_, '_, '_> {
 impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
     fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
         OreWorld::block(self.region, pos)
+    }
+    fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        self.region.world_surface_height(x, z)
     }
     fn fluid_at(&mut self, pos: [i32; 3]) -> Result<Option<FluidState>> {
         let state = self.block(pos)?;
@@ -147,7 +150,7 @@ impl DecorationRegion<'_> {
         result
     }
 
-    /// Place one supported rigid piece in this unpublished region. On failure,
+    /// Place one supported piece in this unpublished region. On failure,
     /// `finish` refuses to publish any of the region's intermediate writes.
     pub fn place_rigid_jigsaw_piece(
         &mut self,

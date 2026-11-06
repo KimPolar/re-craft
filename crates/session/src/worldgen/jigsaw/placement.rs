@@ -1,4 +1,4 @@
-//! Ordered placement of a rigid single jigsaw template into an isolated draft.
+//! Ordered placement of a single jigsaw template into an isolated draft.
 use super::*;
 use native_core::{beardifier::BoundingBox, random::DecorationRandom};
 use native_persistence::{jigsaw_template::ProcessedTemplateBlock, nbt::Tag};
@@ -9,6 +9,10 @@ use native_world::{fluid::FluidState, loaded::BlockState};
 /// after writes; the caller must discard that draft instead of publishing it.
 pub trait JigsawPlacementWorld {
     fn block(&mut self, position: [i32; 3]) -> Result<BlockState>;
+    /// First available block above WORLD_SURFACE_WG for the generation region.
+    fn world_surface_height(&mut self, _x: i32, _z: i32) -> Result<i32> {
+        anyhow::bail!("terrain-matching jigsaw heightmap is missing")
+    }
     fn fluid_at(&mut self, position: [i32; 3]) -> Result<Option<FluidState>>;
     fn fluid_of_state(&mut self, state: &BlockState) -> Result<Option<FluidState>>;
     /// Apply Java's NBT barrier and flag-18 block write; load the block entity
@@ -122,7 +126,7 @@ fn place_records(
 }
 
 impl PreparedTemplatePiece {
-    /// Process and place a rigid single element. The decoration RNG commits
+    /// Process and place a single element. The decoration RNG commits
     /// only on success; the caller must discard its unpublished world draft on
     /// every error, including failures in entity or marker processing.
     pub fn place(
@@ -144,9 +148,15 @@ impl PreparedTemplatePiece {
             return Ok(false);
         }
         let mut next_random = random.clone();
-        let records = self.process_blocks(registry, clip, is_static_full, &mut |position| {
-            world.block(position)
-        })?;
+        let shared = std::cell::RefCell::new(world);
+        let records = self.process_blocks_with_height(
+            registry,
+            clip,
+            is_static_full,
+            &mut |position| shared.borrow_mut().block(position),
+            &mut |x, z| shared.borrow_mut().world_surface_height(x, z),
+        )?;
+        let world = shared.into_inner();
         let liquids = self.override_liquid_settings.unwrap_or(inherited_liquids);
         place_records(
             &records,

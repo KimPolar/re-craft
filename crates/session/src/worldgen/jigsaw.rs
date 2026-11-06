@@ -245,7 +245,7 @@ fn prepare_placement_element(
     })
 }
 
-/// A rigid single-template piece with its active data and processors. This is
+/// A single-template piece with its active data and processors. This is
 /// still an intermediate result; placement and entities remain separate.
 #[derive(Clone)]
 pub struct PreparedTemplatePiece {
@@ -253,6 +253,7 @@ pub struct PreparedTemplatePiece {
     processors: Arc<native_persistence::structure_processors::PreparedProcessors>,
     origin: [i32; 3],
     rotation: native_resources::structure_transform::Rotation,
+    projection: Projection,
     legacy: bool,
     override_liquid_settings: Option<LiquidSettings>,
 }
@@ -285,10 +286,6 @@ impl PreparedTemplatePiece {
         else {
             anyhow::bail!("jigsaw piece is not a single template");
         };
-        ensure!(
-            *projection == Projection::Rigid,
-            "terrain-matching jigsaw projection is not yet supported"
-        );
         let PieceProcessors::Single(processors) = processors else {
             anyhow::bail!("jigsaw piece processors do not match its element");
         };
@@ -318,6 +315,7 @@ impl PreparedTemplatePiece {
             processors: Arc::clone(processors),
             origin: piece.origin,
             rotation: piece.rotation,
+            projection: *projection,
             legacy: *legacy,
             override_liquid_settings: *override_liquid_settings,
         })
@@ -330,6 +328,19 @@ impl PreparedTemplatePiece {
         clip: native_core::beardifier::BoundingBox,
         is_static_full: impl FnMut(&native_world::loaded::BlockState) -> Result<bool>,
         world: &mut impl FnMut([i32; 3]) -> Result<native_world::loaded::BlockState>,
+    ) -> Result<Vec<native_persistence::jigsaw_template::ProcessedTemplateBlock>> {
+        self.process_blocks_with_height(registry, clip, is_static_full, world, &mut |_, _| {
+            anyhow::bail!("terrain-matching jigsaw heightmap is missing")
+        })
+    }
+
+    fn process_blocks_with_height(
+        &self,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        clip: native_core::beardifier::BoundingBox,
+        is_static_full: impl FnMut(&native_world::loaded::BlockState) -> Result<bool>,
+        world: &mut impl FnMut([i32; 3]) -> Result<native_world::loaded::BlockState>,
+        height: &mut impl FnMut(i32, i32) -> Result<i32>,
     ) -> Result<Vec<native_persistence::jigsaw_template::ProcessedTemplateBlock>> {
         use native_persistence::jigsaw_template::{
             TemplateSettings, process_template, resolve_template_state,
@@ -348,7 +359,14 @@ impl PreparedTemplatePiece {
             |tag| resolve_template_state(tag, registry),
             is_static_full,
             world,
-            |_, block| Ok(Some(block)),
+            |original, mut block| {
+                if self.projection == Projection::TerrainMatching {
+                    block.position[1] = height(block.position[0], block.position[2])?
+                        .wrapping_sub(1)
+                        .wrapping_add(original.position[1]);
+                }
+                Ok(Some(block))
+            },
         )
     }
 }
@@ -585,6 +603,9 @@ mod tests {
                 properties: BTreeMap::new(),
             })
         }
+        fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
+            Ok(21 + (x + z).rem_euclid(5))
+        }
         fn fluid_at(&mut self, _: [i32; 3]) -> Result<Option<native_world::fluid::FluidState>> {
             anyhow::bail!("unexpected fluid query")
         }
@@ -744,7 +765,7 @@ mod tests {
                     }
                     defaults_checked = true;
                 }
-                ["CASE", rotation, clipped, count] => {
+                ["CASE", projection, rotation, clipped, count] => {
                     ensure!(expected.is_empty(), "previous case incomplete");
                     let rotation = rotations[rotation.parse::<usize>()?];
                     let clip = if *clipped == "0" {
@@ -759,7 +780,11 @@ mod tests {
                             legacy: false,
                             location: ResourceId::parse("minecraft:underwater_ruin/warm_1")?,
                             processors: holder.clone(),
-                            projection: Projection::Rigid,
+                            projection: if *projection == "0" {
+                                Projection::Rigid
+                            } else {
+                                Projection::TerrainMatching
+                            },
                             override_liquid_settings: None,
                         },
                         origin: [17, 20, -23],
@@ -769,7 +794,7 @@ mod tests {
                         junctions: Vec::new(),
                     };
                     let piece = PreparedTemplatePiece::load(&piece, &prepared, &mut data)?;
-                    let result = piece.process_blocks(
+                    let result = piece.process_blocks_with_height(
                         &registry,
                         clip,
                         super::super::ocean_ruin::ocean_template_static_full,
@@ -784,6 +809,7 @@ mod tests {
                                 properties: BTreeMap::new(),
                             })
                         },
+                        &mut |x, z| Ok(21 + (x + z).rem_euclid(5)),
                     )?;
                     ensure!(
                         result.len() == count.parse::<usize>()?,
@@ -840,7 +866,7 @@ mod tests {
         ensure!(expected.is_empty(), "last case incomplete");
         ensure!(expected_writes.is_empty(), "last write case incomplete");
         assert!(defaults_checked);
-        assert_eq!(cases, 8);
+        assert_eq!(cases, 16);
         assert!(checked > 100);
         Ok(())
     }

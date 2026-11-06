@@ -7783,6 +7783,7 @@ mod tests {
         struct FixtureData {
             vanilla: native_resources::packs::ResourceStack,
             template: Vec<u8>,
+            terrain_matching: bool,
         }
         impl ResourceProvider for FixtureData {
             fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -7797,7 +7798,7 @@ mod tests {
                         json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:test","weight":1}]}),
                     ),
                     "data/example/worldgen/template_pool/test.json" => Some(
-                        json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":{"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":"rigid"}}]}),
+                        json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":{"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":if self.terrain_matching { "terrain_matching" } else { "rigid" }}}]}),
                     ),
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
@@ -7830,7 +7831,9 @@ mod tests {
             element_type,
             values,
         };
-        for unsupported in [false, true] {
+        for (unsupported, terrain_matching) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut block = vec![
                 (
                     "pos".into(),
@@ -7876,6 +7879,7 @@ mod tests {
             let mut data = FixtureData {
                 vanilla,
                 template: encoder.finish()?,
+                terrain_matching,
             };
             let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
                 &mut data,
@@ -7917,9 +7921,12 @@ mod tests {
                 })?
                 .is_some()
             {}
-            let origin = structures.jigsaw_starts(target).context("missing jigsaw")?[&structure]
-                .pieces[0]
-                .origin;
+            let mut origin =
+                structures.jigsaw_starts(target).context("missing jigsaw")?[&structure].pieces[0]
+                    .origin;
+            if terrain_matching {
+                origin[1] = 15;
+            }
             let tags = CarverBlockTags::load(&mut data, &blocks)?;
             let mut batch = preparation.into_expandable_terrain_batch(
                 structures,

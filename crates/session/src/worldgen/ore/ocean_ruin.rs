@@ -34,6 +34,49 @@ struct RuinFloorWorld<'r, 'a, 't> {
     water_fluids: &'t BTreeSet<String>,
 }
 
+/// Complete caller-provided context for placing ruins in a mixed feature pass.
+/// The callbacks and their captured state must clone independently.
+#[derive(Clone)]
+pub struct OceanRuinPlacementContext<'a, C, W> {
+    pub ice_tags: &'a OreBlockTags,
+    pub water_fluids: &'a BTreeSet<String>,
+    pub bubble_fluids: &'a BTreeSet<String>,
+    pub registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    pub sea_level: i32,
+    pub region_random: RegionRandom,
+    pub construct: C,
+    pub context: W,
+}
+
+impl<C, W> super::MixedOceanRuinPlacement for OceanRuinPlacementContext<'_, C, W>
+where
+    C: Clone + FnMut() -> Result<Option<super::super::FreshCreatureRandom>>,
+    W: super::super::ocean_ruin::DrownedMarkerContext,
+{
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::super::ocean_ruin::PreparedStart,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        region.place_ocean_ruin_start_with_initialized_drowned(
+            start,
+            self.ice_tags,
+            self.water_fluids,
+            self.bubble_fluids,
+            self.registry,
+            self.sea_level,
+            clip,
+            random,
+            &mut self.region_random,
+            &mut self.construct,
+            &mut self.context,
+        )?;
+        Ok(())
+    }
+}
+
 impl DecorationRegion<'_> {
     /// Place the pieces of one ocean-ruin start in their generation order.
     /// Java checks each piece's current bounds against the chunk clip before
@@ -2353,6 +2396,80 @@ mod tests {
             failed_terrain
                 .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
                 .is_empty()
+        );
+
+        // Run the same real ruin adapter inside the mixed feature pass.
+        struct ActiveData<'a> {
+            synthetic: super::super::tests::ScheduledData,
+            vanilla: &'a mut native_resources::packs::ResourceStack,
+        }
+        impl ResourceProvider for ActiveData<'_> {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.vanilla.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.starts_with("data/minecraft/tags/") {
+                    return self.vanilla.read_data(path);
+                }
+                match self.synthetic.read_data(path)? {
+                    Some(bytes) => Ok(Some(bytes)),
+                    None => self.vanilla.read_data(path),
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                self.vanilla.list_data(folder)
+            }
+        }
+        let (synthetic, feature_schedule, neighborhood) =
+            super::super::tests::scheduled_fixture(None);
+        let plan = super::super::tests::fixture_plan(&feature_schedule, &neighborhood);
+        let mut data = ActiveData {
+            synthetic,
+            vanilla: &mut resources,
+        };
+        let prepared = super::super::PreparedDecoration::load(
+            &mut data,
+            &plan,
+            &ids,
+            &mut super::super::tests::resolve_test,
+        )?;
+        let entry = native_resources::structure_decoration::StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:ocean_ruin_warm")?,
+            step: 0,
+            index: 0,
+        };
+        let start = make_start();
+        let structures = [
+            super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                entry: &entry,
+                starts: vec![
+                    super::super::super::structure_batch::PlannedStructureStart::OceanRuin(&start),
+                ],
+            },
+        ];
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let mut adapter = OceanRuinPlacementContext {
+            ice_tags: &ice,
+            water_fluids: &water,
+            bubble_fluids: &bubbles,
+            registry: &registry,
+            sea_level: 63,
+            region_random: RegionRandom::Legacy(LegacyRandom::new(12345)),
+            construct: make_constructor(),
+            context: DrownedContext::default(),
+        };
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut adapter)?;
+        assert_eq!(adapter.context.special_calls, 4);
+        assert!(
+            matches!(&updated[0][0], super::super::super::PreparedStructureStart::OceanRuin(start)
+            if start.pieces.iter().map(|piece| piece.selection.position[1]).collect::<Vec<_>>() == vec![8, 8, 15])
+        );
+        assert_eq!(
+            terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                .len(),
+            4
         );
         Ok(())
     }

@@ -44,12 +44,28 @@ use serde_json::Value;
 
 use super::{
     CarvedTerrainWorld, DecorationAction, DecorationPlan, FreshGenerationLightTracker,
-    StagedGenerationLightEngine, structure_batch::PlannedStructureDecoration,
+    PreparedStructureStart, StagedGenerationLightEngine,
+    structure_batch::{
+        PlannedMixedStructureDecoration, PlannedStructureDecoration, PlannedStructureStart,
+    },
 };
 
 mod buried_treasure;
 mod ocean_ruin;
 mod swamp_hut;
+pub use ocean_ruin::OceanRuinPlacementContext;
+
+/// World-specific ocean-ruin effects used by a mixed decoration pass. Clones
+/// must isolate mutable state until the entire pass succeeds.
+pub trait MixedOceanRuinPlacement {
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()>;
+}
 
 trait PlannedHutPlacement {
     fn place(
@@ -977,7 +993,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         terrain: &mut CarvedTerrainWorld,
         structures_enabled: bool,
     ) -> Result<Vec<bool>> {
-        self.execute_inner(terrain, structures_enabled, None, None, None, None, None)
+        self.execute_inner(
+            terrain,
+            structures_enabled,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Supply the level light engine's block-light values for FEATURES-stage
@@ -992,6 +1017,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             terrain,
             structures_enabled,
             Some(block_light),
+            None,
             None,
             None,
             None,
@@ -1015,6 +1041,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1031,6 +1058,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             structures_enabled,
             Some(block_light),
             Some(raw_brightness),
+            None,
             None,
             None,
             None,
@@ -1142,6 +1170,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(tracking),
             structures,
             huts,
+            None,
         )
     }
 
@@ -1229,7 +1258,53 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             None,
             Some((structures, &mut updated)),
             None,
+            None,
         )?;
+        Ok((features, updated))
+    }
+
+    /// Execute mixed structures and selected features in one unpublished
+    /// decoration attempt. The caller supplies complete ocean-ruin effects;
+    /// a failed pass preserves the terrain, starts, and cloned callback state.
+    pub fn execute_with_mixed_structure_plan<R: MixedOceanRuinPlacement + Clone>(
+        &self,
+        terrain: &mut CarvedTerrainWorld,
+        structures: &[PlannedMixedStructureDecoration<'_>],
+        ocean: &mut R,
+    ) -> Result<(Vec<bool>, Vec<Vec<PreparedStructureStart>>)> {
+        ensure!(
+            !terrain.has_published_light,
+            "structure decoration requires unpublished lighting"
+        );
+        let mut updated: Vec<Vec<_>> = structures
+            .iter()
+            .map(|entry| {
+                entry
+                    .starts
+                    .iter()
+                    .map(|start| match start {
+                        PlannedStructureStart::Simple(start) => {
+                            PreparedStructureStart::Simple((*start).clone())
+                        }
+                        PlannedStructureStart::OceanRuin(start) => {
+                            PreparedStructureStart::OceanRuin((*start).clone())
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut staged_ocean = ocean.clone();
+        let features = self.execute_inner(
+            terrain,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some((structures, &mut updated, &mut staged_ocean)),
+        )?;
+        *ocean = staged_ocean;
         Ok((features, updated))
     }
 
@@ -1266,6 +1341,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             Some(&raw),
             None,
             Some((structures, &mut updated)),
+            None,
             None,
         )?;
         Ok((features, updated))
@@ -1519,6 +1595,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     None,
                     Some((structures, &mut updated)),
                     Some(&mut huts),
+                    None,
                 )?
             }
             (None, None) => self.execute_inner(
@@ -1529,6 +1606,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 None,
                 Some((structures, &mut updated)),
                 Some(&mut huts),
+                None,
             )?,
             (Some(_), Some(_)) => unreachable!("lighting modes are mutually exclusive"),
         };
@@ -1552,13 +1630,21 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             &mut Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
         )>,
         mut huts: Option<&mut dyn PlannedHutPlacement>,
+        mut mixed: Option<(
+            &[PlannedMixedStructureDecoration<'_>],
+            &mut Vec<Vec<PreparedStructureStart>>,
+            &mut dyn MixedOceanRuinPlacement,
+        )>,
     ) -> Result<Vec<bool>> {
         ensure!(
-            structures_enabled == structures.is_some(),
+            structures_enabled == (structures.is_some() || mixed.is_some())
+                && !(structures.is_some() && mixed.is_some()),
             "structure decoration is not implemented"
         );
         let actions = if let Some((plan, _)) = &structures {
             Some(self.plan.actions_with_structures(plan)?)
+        } else if let Some((plan, _, _)) = &mixed {
+            Some(self.plan.actions_with_mixed_structures(plan)?)
         } else {
             None
         };
@@ -1635,7 +1721,6 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         });
         let mut results = Vec::with_capacity(self.plan.features.len());
         if let Some(actions) = actions {
-            let (plan, updated) = structures.as_mut().context("structure plan is missing")?;
             let min_y = self
                 .plan
                 .biomes
@@ -1671,6 +1756,33 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                         results.push(region.place_planned_auto(self.plan, index, feature)?);
                     }
                     DecorationAction::Structure(index) => {
+                        if let Some((plan, updated, ocean)) = mixed.as_mut() {
+                            let mut random = plan[index].entry.random(self.plan.decoration_seed());
+                            for start in &mut updated[index] {
+                                match start {
+                                    PreparedStructureStart::Simple(start) => {
+                                        let intersects = (0..3).all(|axis| {
+                                            start.bounds.max[axis] >= clip.min[axis]
+                                                && start.bounds.min[axis] <= clip.max[axis]
+                                        });
+                                        if intersects {
+                                            match start.kind {
+                                                native_resources::structure_start::SimpleStructureKind::BuriedTreasure => { region.place_buried_treasure(start, clip, &mut random)?; }
+                                                _ => bail!("mixed structure decoration context is missing"),
+                                            }
+                                        }
+                                    }
+                                    PreparedStructureStart::OceanRuin(start) => {
+                                        let original = start.clone();
+                                        ocean.place(&mut region, start, clip, &mut random)?;
+                                        validate_decorated_ocean_start(&original, start)?;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        let (plan, updated) =
+                            structures.as_mut().context("structure plan is missing")?;
                         let mut random = plan[index].entry.random(self.plan.decoration_seed());
                         for start_index in 0..updated[index].len() {
                             let start = &updated[index][start_index];
@@ -1721,6 +1833,30 @@ fn clone_structure_starts(
                 .collect()
         })
         .collect()
+}
+
+fn validate_decorated_ocean_start(
+    original: &super::ocean_ruin::PreparedStart,
+    updated: &super::ocean_ruin::PreparedStart,
+) -> Result<()> {
+    ensure!(
+        original.chunk == updated.chunk
+            && original.generation_point == updated.generation_point
+            && original.terrain_adjustment == updated.terrain_adjustment
+            && original.temperature == updated.temperature
+            && original.pieces.len() == updated.pieces.len(),
+        "ocean ruin start identity changed"
+    );
+    for (before, after) in original.pieces.iter().zip(&updated.pieces) {
+        ensure!(
+            Arc::ptr_eq(&before.template, &after.template),
+            "ocean ruin template changed"
+        );
+        let saved = super::ocean_ruin::SavedOceanRuinPiece::capture(after, updated.temperature)?;
+        let mut restored = before.clone();
+        saved.restore(&mut restored, original.temperature)?;
+    }
+    Ok(())
 }
 
 fn finish_decoration_with_light(
@@ -13922,7 +14058,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
-    struct ScheduledData {
+    pub(super) struct ScheduledData {
         heightmap: Option<&'static str>,
     }
     impl ScheduledData {
@@ -13968,7 +14104,7 @@ mod tests {
             }
         }
     }
-    fn scheduled_fixture(
+    pub(super) fn scheduled_fixture(
         kind: Option<&'static str>,
     ) -> (
         ScheduledData,
@@ -14001,7 +14137,7 @@ mod tests {
         }
         (data, schedule, neighborhood)
     }
-    fn fixture_plan<'a>(
+    pub(super) fn fixture_plan<'a>(
         schedule: &'a FeatureSchedule,
         neighborhood: &'a super::super::BiomeNeighborhood,
     ) -> DecorationPlan<'a> {
@@ -14039,7 +14175,7 @@ mod tests {
         let mut outside = feature.positions([8, 3, 8], -64, 384).unwrap();
         assert_eq!(outside.next(&mut random, &mut env).unwrap(), None);
     }
-    fn resolve_test(v: &Value) -> Result<BlockState> {
+    pub(super) fn resolve_test(v: &Value) -> Result<BlockState> {
         Ok(state(
             v.as_str()
                 .or_else(|| v.get("id").and_then(Value::as_str))
@@ -20882,6 +21018,173 @@ mod tests {
         }));
         assert!(prepared.execute(&mut terrain, false).is_err());
         assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn mixed_decoration_shares_structure_random_and_rolls_back_callback_state() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            ocean_ruin::{Piece, Rotation, Temperature},
+            structure_decoration::StructureDecorationEntry,
+            structure_start::{SimpleStructureKind, SimpleStructureStart},
+        };
+        #[derive(Clone, Default)]
+        struct Runner {
+            draws: Vec<i64>,
+            fail_at: Option<usize>,
+            corrupt: bool,
+        }
+        impl MixedOceanRuinPlacement for Runner {
+            fn place(
+                &mut self,
+                region: &mut DecorationRegion<'_>,
+                start: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                ensure!(
+                    region.read([9, 8, 9])?.name == "minecraft:chest",
+                    "treasure did not run before ruin"
+                );
+                self.draws.push(random.next_long());
+                start.pieces[0].selection.position[1] = 8;
+                start.pieces[0].bounds.min[1] = 8;
+                start.pieces[0].bounds.max[1] = 8;
+                if self.corrupt {
+                    start.chunk[0] += 1;
+                }
+                ensure!(
+                    self.fail_at != Some(self.draws.len()),
+                    "injected ocean failure"
+                );
+                Ok(())
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut registry = batch_registry();
+        registry.extend(
+            [
+                "minecraft:sand",
+                "minecraft:chest",
+                "minecraft:water",
+                "minecraft:lava",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let prepared = PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test)?;
+        let ruin_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:ocean_ruin_warm")?,
+            step: 0,
+            index: 1,
+        };
+        let treasure_entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:buried_treasure")?,
+            step: 0,
+            index: 0,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [1, 1, 1],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let make_start = |chunk| super::super::ocean_ruin::PreparedStart {
+            chunk,
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            temperature: Temperature::Warm,
+            pieces: vec![super::super::ocean_ruin::PreparedPiece {
+                selection: Piece {
+                    template: "minecraft:underwater_ruin/warm_1".into(),
+                    position: [1, 14, 1],
+                    rotation: Rotation::None,
+                    integrity: 1.0,
+                    large: false,
+                },
+                template: Arc::clone(&template),
+                bounds: BoundingBox::new([1, 14, 1], [1, 14, 1]).unwrap(),
+            }],
+        };
+        let first = make_start([0, 0]);
+        let second = make_start([1, 0]);
+        let treasure = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            orientation: None,
+            bounds: BoundingBox::new([9, 14, 9], [9, 14, 9]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let structures = [
+            PlannedMixedStructureDecoration {
+                entry: &treasure_entry,
+                starts: vec![PlannedStructureStart::Simple(&treasure)],
+            },
+            PlannedMixedStructureDecoration {
+                entry: &ruin_entry,
+                starts: vec![
+                    PlannedStructureStart::OceanRuin(&first),
+                    PlannedStructureStart::OceanRuin(&second),
+                ],
+            },
+        ];
+        let mut expected = ruin_entry.random(plan.decoration_seed());
+        let expected_draws = vec![expected.next_long(), expected.next_long()];
+        let (mut terrain, _, _, _) = fixture();
+        let mut runner = Runner::default();
+        let (features, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)?;
+        assert_eq!(features.len(), plan.features.len());
+        assert_eq!(runner.draws, expected_draws);
+        assert!(
+            matches!(&updated[1][0], PreparedStructureStart::OceanRuin(start) if start.pieces[0].selection.position[1] == 8)
+        );
+        assert_eq!(first.pieces[0].selection.position[1], 14);
+        assert_eq!(
+            terrain.snapshot().block(9, 8, 9).unwrap().name,
+            "minecraft:chest"
+        );
+
+        let (mut failed, _, _, _) = fixture();
+        let before = failed.snapshot();
+        let mut runner = Runner {
+            draws: vec![],
+            fail_at: Some(2),
+            corrupt: false,
+        };
+        assert!(
+            prepared
+                .execute_with_mixed_structure_plan(&mut failed, &structures, &mut runner)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        assert!(runner.draws.is_empty());
+        assert_eq!(first.pieces[0].selection.position[1], 14);
+        let (mut failed, _, _, _) = fixture();
+        let before = failed.snapshot();
+        let mut runner = Runner {
+            corrupt: true,
+            ..Default::default()
+        };
+        assert!(
+            prepared
+                .execute_with_mixed_structure_plan(&mut failed, &structures, &mut runner)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        assert!(runner.draws.is_empty());
+        Ok(())
     }
 
     #[test]

@@ -81,7 +81,8 @@ pub use mob_spawner::{
     FreshCreatureConstruction, GeneratedSheepSpawner, SheepSpawnInputs, SheepSpawnProgress,
 };
 pub use ore::{
-    DecorationRegion, PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
+    DecorationRegion, MixedOceanRuinPlacement, OceanRuinPlacementContext, PlacedDecorationFeature,
+    PreparedDecoration, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,

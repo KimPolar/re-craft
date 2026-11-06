@@ -2983,6 +2983,114 @@ mod tests {
                 assert!(inputs.last_region_random.is_some());
             }
         }
+
+        // Exercise the data-pack-backed equipment adapter inside the actual
+        // drowned marker path, including both weapon types.
+        let items = resources.vanilla_item_registry()?;
+        let known_items = items
+            .iter()
+            .map(|(id, _)| ResourceId::parse(id))
+            .collect::<Result<BTreeSet<_>>>()?;
+        // Java 26.3 item prototypes report enchantability 1 for both weapons.
+        let effects = super::super::super::ocean_ruin::DrownedEquipmentEffects::load(
+            &mut resources,
+            &known_items,
+            Some(1),
+            Some(1),
+            DrownedContext::default(),
+        )?;
+        let make_context = || super::super::super::ocean_ruin::DrownedGenerationContext {
+            biomes: &biomes,
+            biome_tags: &biome_tags,
+            difficulty_at: |_: [i32; 3], _: &World| {
+                Ok(
+                    super::super::super::ocean_ruin::GenerationDifficultyInputs {
+                        difficulty: native_persistence::world::Difficulty::Hard,
+                        overworld_clock_time: 2_000_000,
+                        moon_brightness: 1.0,
+                    },
+                )
+            },
+            halloween_at: || Ok(false),
+            effects: effects.clone(),
+        };
+        let (terrain, _, _, _) = super::super::tests::fixture();
+        let snapshot = terrain.snapshot();
+        let mut seen = BTreeSet::new();
+        let mut first = None;
+        for seed in 0..4096 {
+            let mut random = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mut construct = make_constructor();
+            let mut context = make_context();
+            let Some(GeneratedEntityRecord::Saved(tag)) = draft_initialized_drowned(
+                [3, 8, 1],
+                &snapshot,
+                &mut random,
+                &mut construct,
+                &mut context,
+            )?
+            else {
+                bail!("drowned was not created")
+            };
+            if let Some(hand) = tag
+                .get("equipment")
+                .and_then(|equipment| equipment.get("mainhand"))
+            {
+                if hand
+                    .get("components")
+                    .and_then(|components| components.get("minecraft:enchantments"))
+                    .is_some()
+                {
+                    let Some(Tag::String(id)) = hand.get("id") else {
+                        bail!("missing weapon ID")
+                    };
+                    seen.insert(id.to_string_lossy());
+                    first.get_or_insert((seed, tag));
+                }
+            }
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from([
+                "minecraft:trident".to_owned(),
+                "minecraft:fishing_rod".to_owned()
+            ])
+        );
+        let (seed, expected_first) = first.context("no enchanted structure drowned")?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut piece = make_piece();
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(seed));
+        let mut decoration = DecorationRandom::new(42);
+        let mut construct = make_constructor();
+        let mut context = make_context();
+        region.place_ocean_ruin_piece_with_initialized_drowned(
+            &mut piece,
+            &ice,
+            &water,
+            &bubbles,
+            &registry,
+            Temperature::Warm,
+            63,
+            clip,
+            &mut decoration,
+            &mut random,
+            &mut construct,
+            &mut context,
+        )?;
+        region.finish()?;
+        assert_eq!(
+            terrain.recorded_generated_entities(center)?[0],
+            expected_first
+        );
+        assert_eq!(
+            context.effects.passengers.enchants, 0,
+            "weapon handling must not use delegated effects"
+        );
         Ok(())
     }
 }

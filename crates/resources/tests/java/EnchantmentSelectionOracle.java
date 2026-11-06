@@ -118,7 +118,10 @@ public class EnchantmentSelectionOracle {
                 int cost = net.minecraft.util.Mth.randomBetweenInclusive(random, 5, 5 + (int)(special * 17));
                 var result = EnchantmentHelper.selectEnchantment(random, stack, cost, candidates.stream());
                 String selected = result.stream().map(value -> id(value.enchantment()) + "=" + value.level()).collect(Collectors.joining(","));
-                out.println("P\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + Float.floatToIntBits(special) + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong());
+                var enchanted = stack.copy();
+                for (var value : result) enchanted.enchant(value.enchantment(), value.level());
+                var encoded = ItemStack.CODEC.encodeStart(lookup.createSerializationContext(com.mojang.serialization.JsonOps.INSTANCE), enchanted).getOrThrow();
+                out.println("P\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + Float.floatToIntBits(special) + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong() + "\t" + encoded);
             }
         }
     }

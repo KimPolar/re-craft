@@ -131,7 +131,10 @@ fn enchantment_selection_matches_java() -> Result<()> {
                     exclusive,
                 });
         } else {
-            ensure!(parts.len() == 8, "invalid selection row");
+            ensure!(
+                parts.len() == if parts[0] == "P" { 9 } else { 8 },
+                "invalid selection row"
+            );
             let seed = parts[3].parse()?;
             let mut random = if parts[2] == "0" {
                 RegionRandom::Legacy(LegacyRandom::new(seed))

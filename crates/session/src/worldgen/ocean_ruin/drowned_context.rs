@@ -10,6 +10,110 @@ use native_world::loaded::{ChunkPos, World};
 use super::DrownedMarkerContext;
 use crate::worldgen::{BiomeNeighborhood, LocalDifficulty};
 
+/// Uses the active mob-spawn equipment provider while delegating passenger
+/// operations to the caller. Prepared providers are shared between clones.
+#[derive(Clone)]
+pub struct DrownedEquipmentEffects<E> {
+    pub passengers: E,
+    trident: std::sync::Arc<native_resources::enchantment_provider::DifficultyProvider>,
+    fishing_rod: std::sync::Arc<native_resources::enchantment_provider::DifficultyProvider>,
+}
+
+impl<E> DrownedEquipmentEffects<E> {
+    /// Enchantability values must come from the active item prototypes. The
+    /// item registry and both providers must use the same frozen pack stack.
+    pub fn load(
+        provider: &mut impl native_resources::packs::ResourceProvider,
+        known_items: &std::collections::BTreeSet<native_resources::packs::ResourceId>,
+        trident_enchantability: Option<i32>,
+        fishing_rod_enchantability: Option<i32>,
+        passengers: E,
+    ) -> Result<Self> {
+        use native_resources::{enchantment_provider::DifficultyProvider, packs::ResourceId};
+        let id = ResourceId::parse("minecraft:mob_spawn_equipment")?;
+        let trident = DifficultyProvider::load(
+            provider,
+            &id,
+            known_items,
+            &ResourceId::parse("minecraft:trident")?,
+            trident_enchantability,
+        )?;
+        let fishing_rod = DifficultyProvider::load(
+            provider,
+            &id,
+            known_items,
+            &ResourceId::parse("minecraft:fishing_rod")?,
+            fishing_rod_enchantability,
+        )?;
+        Ok(Self {
+            passengers,
+            trident: std::sync::Arc::new(trident),
+            fishing_rod: std::sync::Arc::new(fishing_rod),
+        })
+    }
+}
+
+impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> {
+    fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
+        self.passengers.try_existing_chicken(position, world)
+    }
+    fn spawn_chicken_jockey(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+    ) -> Result<bool> {
+        self.passengers
+            .spawn_chicken_jockey(position, world, random)
+    }
+    fn enchant_weapon(
+        &mut self,
+        _: [i32; 3],
+        _: &World,
+        random: &mut RegionRandom,
+        weapon: MainHandRoll,
+        special: f32,
+    ) -> Result<Tag> {
+        let (id, provider) = match weapon {
+            MainHandRoll::Trident => ("minecraft:trident", &self.trident),
+            MainHandRoll::FishingRod => ("minecraft:fishing_rod", &self.fishing_rod),
+            MainHandRoll::Unchanged => anyhow::bail!("drowned has no weapon to enchant"),
+        };
+        let selected = provider.enchant(random, special)?;
+        let mut fields = vec![
+            ("id".into(), Tag::String(id.into())),
+            ("count".into(), Tag::Int(1)),
+        ];
+        if !selected.is_empty() {
+            let enchantments = selected
+                .into_iter()
+                .map(|entry| {
+                    let id = format!("{}:{}", entry.id.namespace, entry.id.path);
+                    (id.as_str().into(), Tag::Int(entry.level))
+                })
+                .collect();
+            fields.push((
+                "components".into(),
+                Tag::Compound(vec![(
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(enchantments),
+                )]),
+            ));
+        }
+        Ok(Tag::Compound(fields))
+    }
+    fn spawn_zombie_nautilus(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+    ) -> Result<bool> {
+        self.passengers
+            .spawn_zombie_nautilus(position, world, random, persistent)
+    }
+}
+
 /// Current values observed from the active level at a spawn position.
 #[derive(Clone, Copy, Debug)]
 pub struct GenerationDifficultyInputs {

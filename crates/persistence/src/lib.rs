@@ -8,6 +8,7 @@ pub mod generated_ticks;
 pub mod heightmap;
 pub mod jigsaw_assembly;
 pub mod jigsaw_piece;
+pub mod jigsaw_replacement;
 pub mod level_data;
 pub mod nbt;
 pub mod palette;

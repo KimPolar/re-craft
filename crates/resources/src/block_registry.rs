@@ -710,6 +710,12 @@ impl GeneratedBlockRegistry {
             .map(|schema| schema.default_properties())
     }
 
+    /// Strict property lookup for command block states. Unlike the NBT codec,
+    /// command parsing rejects unknown names and invalid values.
+    pub fn command_property(&self, id: &str, name: &str, value: &str) -> Option<String> {
+        self.states.get(id)?.parse_property(name, value)
+    }
+
     /// Java's block-state codec ignores unknown or invalid property entries.
     pub fn resolve(&self, value: &serde_json::Value) -> Result<(String, BTreeMap<String, String>)> {
         let raw = value

@@ -1,9 +1,12 @@
-//! Initial 26.3 mineshaft room. Children, vertical placement and block
-//! decoration remain separate; this intermediate is not a structure start.
+//! 26.3 mineshaft piece layout. Vertical placement and block decoration
+//! remain separate; the generated graph is not yet a structure start.
 
 use crate::structure_start::HorizontalDirection;
 use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
+
+mod graph;
+pub use graph::{MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MineshaftVariant {

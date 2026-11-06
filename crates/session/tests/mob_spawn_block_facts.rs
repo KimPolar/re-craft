@@ -90,6 +90,7 @@ fn supported_block_states_match_all_java_entity_types() {
         "glass",
         "torch",
         "moss_carpet",
+        "leaf_litter",
     ];
     let temp = tempfile::tempdir().unwrap();
     let version = game.join("versions/26.3");

@@ -438,9 +438,25 @@ mod face_tests {
     }
 }
 
+pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
+    state.name == "minecraft:leaf_litter"
+        && state.properties.len() == 2
+        && matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "west" | "east")
+        )
+        && matches!(
+            state.properties.get("segment_amount").map(String::as_str),
+            Some("1" | "2" | "3" | "4")
+        )
+}
+
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "leaf_litter" {
+        return valid_leaf_litter(state).then(|| EMPTY.to_vec());
+    }
     if matches!(id, "anvil" | "chipped_anvil" | "damaged_anvil") {
         if state.properties.len() != 1 {
             return None;

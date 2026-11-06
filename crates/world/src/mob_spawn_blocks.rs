@@ -116,6 +116,9 @@ pub fn common_mob_spawn_block_facts(state: &BlockState) -> Option<MobSpawnBlockF
         {
             (false, true, false, false, false, true, false)
         }
+        "minecraft:leaf_litter" if crate::collision::valid_leaf_litter(state) => {
+            (false, true, false, false, false, true, false)
+        }
         "minecraft:tall_grass" if property("half", &["upper", "lower"]) => {
             (false, true, false, false, false, true, false)
         }
@@ -210,5 +213,20 @@ mod tests {
         assert!(common_mob_spawn_block_facts(&state).unwrap().valid_support);
         state.properties.insert("up".into(), "invalid".into());
         assert!(common_mob_spawn_block_facts(&state).is_none());
+        state.name = "minecraft:leaf_litter".into();
+        state.properties = [
+            ("facing".into(), "north".into()),
+            ("segment_amount".into(), "2".into()),
+        ]
+        .into();
+        assert!(
+            common_mob_spawn_block_facts(&state)
+                .unwrap()
+                .pathfindable_land
+        );
+        assert!(crate::collision::block_shape(&state).unwrap().is_empty());
+        state.properties.insert("segment_amount".into(), "5".into());
+        assert!(common_mob_spawn_block_facts(&state).is_none());
+        assert!(crate::collision::block_shape(&state).is_none());
     }
 }

@@ -88,6 +88,7 @@ pub(crate) fn block_classifiers(
 
 pub struct PreparedFreshGeneration {
     pub lighting: GeneratedDimensionLighting,
+    dimension_definition: Value,
     worldgen_settings: native_persistence::nbt::NamedTag,
     pack_selection: Option<DataPackSettings>,
     batch: FreshTerrainBatch,
@@ -310,7 +311,7 @@ impl InitialOceanGeneration {
 impl InitialHutGeneration {
     fn load(
         resources: &mut ResourceStack,
-        dimension_type: &ResourceId,
+        dimension_definition: &Value,
         difficulty: Option<native_persistence::world::Difficulty>,
         blocks: &BTreeSet<String>,
         registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
@@ -321,8 +322,10 @@ impl InitialHutGeneration {
             .collect();
         let variants = native_resources::cat_variants::CatSpawnVariants::load_active(resources)?;
         let conditions = variants.prepare_world_conditions(resources)?;
-        let name = format!("{}:{}", dimension_type.namespace, dimension_type.path);
-        let moon = native_resources::moon_phase::Environment::load(resources, &name)?;
+        let moon = native_resources::moon_phase::Environment::from_definition(
+            resources,
+            dimension_definition,
+        )?;
         let ocean = if difficulty.is_some() {
             Some(InitialOceanGeneration::load(resources, blocks, registry)?)
         } else {
@@ -347,25 +350,20 @@ pub struct InitialFluidEnvironment {
 }
 
 impl InitialFluidEnvironment {
-    fn load(resources: &mut ResourceStack, lighting: &GeneratedDimensionLighting) -> Self {
-        let Some(id) = &lighting.dimension_type else {
-            return Self::default();
-        };
-        let dimension_type = format!("{}:{}", id.namespace, id.path);
-        let fast_lava = match native_resources::fluid_environment::load_fast_lava_environment(
-            resources,
-            &dimension_type,
-        ) {
-            Ok(value) => Some(Arc::new(value)),
-            Err(error) => {
-                eprintln!("Fast lava environment is unavailable: {error:#}");
-                None
-            }
-        };
+    fn load(resources: &mut ResourceStack, definition: &Value) -> Self {
+        let fast_lava =
+            match native_resources::fluid_environment::fast_lava_environment_from_definition(
+                resources, definition,
+            ) {
+                Ok(value) => Some(Arc::new(value)),
+                Err(error) => {
+                    eprintln!("Fast lava environment is unavailable: {error:#}");
+                    None
+                }
+            };
         let water_evaporation =
-            match native_resources::fluid_environment::load_water_evaporation_environment(
-                resources,
-                &dimension_type,
+            match native_resources::fluid_environment::water_evaporation_environment_from_definition(
+                resources, definition,
             ) {
                 Ok(value) => Some(Arc::new(value)),
                 Err(error) => {
@@ -392,17 +390,24 @@ pub struct InitialClockCommandData {
 }
 
 impl InitialClockCommandData {
-    fn load(resources: &mut ResourceStack, lighting: &GeneratedDimensionLighting) -> Self {
-        let default_clock = lighting.dimension_type.as_ref().and_then(|id| {
-            let name = format!("{}:{}", id.namespace, id.path);
-            match native_resources::world_clock::dimension_default_clock(resources, &name) {
+    fn load(
+        resources: &mut ResourceStack,
+        lighting: &GeneratedDimensionLighting,
+        definition: &Value,
+    ) -> Self {
+        let name = lighting.dimension_type.as_ref().map_or_else(
+            || "[unregistered]".to_owned(),
+            |id| format!("{}:{}", id.namespace, id.path),
+        );
+        let default_clock =
+            match native_resources::world_clock::dimension_default_clock_from_definition(definition)
+            {
                 Ok(clock) => Some((Arc::from(name), clock)),
                 Err(error) => {
                     eprintln!("Dimension clock is unavailable: {error:#}");
                     None
                 }
-            }
-        });
+            };
         let timelines = match native_resources::world_clock::timelines(resources) {
             Ok(timelines) => Some(Arc::new(timelines)),
             Err(error) => {
@@ -443,10 +448,10 @@ pub struct PreparedCreatureSpawning {
 
 impl PreparedCreatureSpawning {
     /// Load on the worker with the already-configured world data packs.
-    /// Inline dimension types and unsupported spawn conditions remain errors.
+    /// Unsupported spawn conditions remain errors.
     pub fn load(
         resources: &mut ResourceStack,
-        lighting: &GeneratedDimensionLighting,
+        definition: &Value,
         border: native_session::respawn::RespawnBorder,
         clocks: BTreeMap<ResourceId, i64>,
     ) -> Result<Self> {
@@ -461,29 +466,15 @@ impl PreparedCreatureSpawning {
                 && border.min_z < border.max_z,
             "invalid world border"
         );
-        let dimension_type = lighting
-            .dimension_type
-            .as_ref()
-            .context("inline dimension types are not yet supported for creature generation")?;
-        let path = format!(
-            "data/{}/dimension_type/{}.json",
-            dimension_type.namespace, dimension_type.path
-        );
-        let bytes = resources
-            .read_data(&path)?
-            .with_context(|| format!("missing dimension type {path}"))?;
-        let definition: Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid dimension type {path}"))?;
         let has_ceiling = definition
             .get("has_ceiling")
             .and_then(Value::as_bool)
             .context("dimension has_ceiling is missing or invalid")?;
         let categories = resources.vanilla_entity_category_registry()?;
-        let name = format!("{}:{}", dimension_type.namespace, dimension_type.path);
         let environment =
-            native_resources::creature_timeline::CreatureSpawnEnvironment::load_with_registry(
+            native_resources::creature_timeline::CreatureSpawnEnvironment::from_definition_with_registry(
                 resources,
-                &name,
+                definition,
                 &categories,
             )?;
         environment.sample_layers(|id| clocks.get(id).copied())?;
@@ -513,7 +504,8 @@ impl PreparedCreatureSpawning {
             .iter()
             .any(|variant| variant.uses_moon_conditions())
             .then(|| {
-                native_resources::moon_phase::Environment::load(resources, &name).map(Arc::new)
+                native_resources::moon_phase::Environment::from_definition(resources, definition)
+                    .map(Arc::new)
             })
             .transpose()?;
         Ok(Self {
@@ -582,7 +574,8 @@ pub(crate) fn structured_initial_context(
     generator_disables_mobs: bool,
     advance_time: bool,
 ) -> Result<StructuredInitialContext> {
-    let lighting = GeneratedDimensionLighting::load_preset(resources, preset, dimension)?;
+    let (lighting, _, definition) =
+        GeneratedDimensionLighting::load_preset_with_definition(resources, preset, dimension)?;
     let ticks: BTreeMap<_, _> = native_resources::world_clock::registered_clocks(resources)?
         .into_iter()
         .map(|id| (id, 0))
@@ -590,8 +583,8 @@ pub(crate) fn structured_initial_context(
     let clocks = Arc::new(InitialWorldClocks {
         ticks: ticks.clone(),
         advance_time,
-        command_data: InitialClockCommandData::load(resources, &lighting),
-        fluid_environment: InitialFluidEnvironment::load(resources, &lighting),
+        command_data: InitialClockCommandData::load(resources, &lighting, &definition),
+        fluid_environment: InitialFluidEnvironment::load(resources, &definition),
     });
     let collision_registry = match resources.vanilla_entity_collision_registry() {
         Ok(registry) => Some(Arc::new(registry)),
@@ -602,7 +595,10 @@ pub(crate) fn structured_initial_context(
     };
     let creatures = if spawn_mobs && !generator_disables_mobs {
         Some(PreparedCreatureSpawning::load(
-            resources, &lighting, border, ticks,
+            resources,
+            &definition,
+            border,
+            ticks,
         )?)
     } else {
         None
@@ -643,8 +639,15 @@ impl PreparedFreshGeneration {
         let initial_clocks = Arc::new(InitialWorldClocks {
             ticks: clocks.clone(),
             advance_time,
-            command_data: InitialClockCommandData::load(&mut self.resources, &self.lighting),
-            fluid_environment: InitialFluidEnvironment::load(&mut self.resources, &self.lighting),
+            command_data: InitialClockCommandData::load(
+                &mut self.resources,
+                &self.lighting,
+                &self.dimension_definition,
+            ),
+            fluid_environment: InitialFluidEnvironment::load(
+                &mut self.resources,
+                &self.dimension_definition,
+            ),
         });
         let entity_collision_registry = match self.resources.vanilla_entity_collision_registry() {
             Ok(registry) => Some(Arc::new(registry)),
@@ -656,7 +659,7 @@ impl PreparedFreshGeneration {
         let creatures = if spawn_mobs && !self.batch.mob_generation_disabled()? {
             Some(PreparedCreatureSpawning::load(
                 &mut self.resources,
-                &self.lighting,
+                &self.dimension_definition,
                 border,
                 clocks,
             )?)
@@ -780,11 +783,12 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
             bonus_chest: settings.bonus_chest,
         },
     )?;
-    let (lighting, definition) = GeneratedDimensionLighting::load_preset_with_generator(
-        &mut resources,
-        &settings.preset,
-        &settings.dimension,
-    )?;
+    let (lighting, definition, dimension_definition) =
+        GeneratedDimensionLighting::load_preset_with_definition(
+            &mut resources,
+            &settings.preset,
+            &settings.dimension,
+        )?;
     let blocks = resources.vanilla_block_ids()?;
     let tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let generator = TerrainGenerator::without_terrain_adjustments(
@@ -821,6 +825,7 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         Box::new(move |value| resolve_generated_terrain_state(value, &registry));
     Ok(PreparedFreshGeneration {
         lighting,
+        dimension_definition,
         worldgen_settings,
         pack_selection,
         batch,
@@ -853,27 +858,21 @@ pub(crate) fn prepare_with_structures_and_difficulty(
             bonus_chest: settings.bonus_chest,
         },
     )?;
-    let (lighting, definition) = GeneratedDimensionLighting::load_preset_with_generator(
-        &mut resources,
-        &settings.preset,
-        &settings.dimension,
-    )?;
+    let (lighting, definition, dimension_definition) =
+        GeneratedDimensionLighting::load_preset_with_definition(
+            &mut resources,
+            &settings.preset,
+            &settings.dimension,
+        )?;
     let blocks = resources.vanilla_block_ids()?;
     let registry = Arc::new(resources.vanilla_generated_block_registry()?);
-    let hut_generation = lighting
-        .dimension_type
-        .as_ref()
-        .map(|dimension| {
-            InitialHutGeneration::load(
-                &mut resources,
-                dimension,
-                difficulty,
-                &blocks,
-                Arc::clone(&registry),
-            )
-            .map(Arc::new)
-        })
-        .transpose()?;
+    let hut_generation = Some(Arc::new(InitialHutGeneration::load(
+        &mut resources,
+        &dimension_definition,
+        difficulty,
+        &blocks,
+        Arc::clone(&registry),
+    )?));
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let height_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(
         &mut resources,
@@ -1015,7 +1014,7 @@ mod tests {
             ("minecraft:overworld", false),
             ("minecraft:the_nether", true),
         ] {
-            let lighting = GeneratedDimensionLighting::load_preset(
+            let (_, _, definition) = GeneratedDimensionLighting::load_preset_with_definition(
                 &mut resources,
                 "minecraft:normal",
                 dimension,
@@ -1026,8 +1025,12 @@ mod tests {
                 min_z: -29_999_984.0,
                 max_z: 29_999_984.0,
             };
-            let inputs =
-                PreparedCreatureSpawning::load(&mut resources, &lighting, border, clocks.clone())?;
+            let inputs = PreparedCreatureSpawning::load(
+                &mut resources,
+                &definition,
+                border,
+                clocks.clone(),
+            )?;
             assert_eq!(inputs.has_ceiling, ceiling);
             assert!(!inputs.prevent_inside.is_empty());
             assert_eq!(
@@ -1207,6 +1210,153 @@ mod tests {
                 .and_then(|v| v.get("example:sky"))
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn inline_dimension_initializes_creatures_clocks_and_structure_environment() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut vanilla = ResourceStack::open(&game)?;
+        let mut definition: Value = serde_json::from_slice(
+            &vanilla
+                .read_data("data/minecraft/dimension_type/overworld.json")?
+                .context("overworld type missing")?,
+        )?;
+        definition["attributes"]["minecraft:gameplay/creature_world_gen_spawn_probability"] =
+            json!(0.31);
+        definition["attributes"]["minecraft:gameplay/fast_lava"] = json!(true);
+        definition["attributes"]["minecraft:gameplay/water_evaporates"] = json!(true);
+        definition["attributes"]["minecraft:visual/moon_phase"] = json!("new_moon");
+        definition["timelines"] = json!(["example:inline"]);
+        definition["default_clock"] = json!("minecraft:overworld");
+        let mut preset: Value = serde_json::from_slice(
+            &vanilla
+                .read_data("data/minecraft/worldgen/world_preset/normal.json")?
+                .context("normal preset missing")?,
+        )?;
+        preset["dimensions"]["minecraft:overworld"]["type"] = definition.clone();
+        let temp = tempfile::tempdir()?;
+        let world = temp.path().join("world");
+        let pack = world.join("datapacks/inline");
+        let preset_path = pack.join("data/example/worldgen/world_preset/inline.json");
+        std::fs::create_dir_all(preset_path.parent().unwrap())?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
+        )?;
+        std::fs::write(preset_path, serde_json::to_vec(&preset)?)?;
+        let timeline_path = pack.join("data/example/timeline/inline.json");
+        std::fs::create_dir_all(timeline_path.parent().unwrap())?;
+        let timeline = json!({"clock":"minecraft:overworld","period_ticks":20,"tracks":{
+            "minecraft:visual/moon_phase":{"modifier":"override","keyframes":[{"ticks":0,"value":"new_moon"},{"ticks":10,"value":"full_moon"}]},
+            "minecraft:gameplay/fast_lava":{"modifier":"xor","keyframes":[{"ticks":0,"value":false},{"ticks":10,"value":true}]},
+            "minecraft:gameplay/water_evaporates":{"modifier":"xor","keyframes":[{"ticks":0,"value":false},{"ticks":10,"value":true}]},
+            "minecraft:gameplay/creature_world_gen_spawn_probability":{"modifier":"add","keyframes":[{"ticks":0,"value":0.1}]}
+        }});
+        std::fs::write(timeline_path, serde_json::to_vec(&timeline)?)?;
+        let selection = DataPackSettings {
+            enabled: vec!["vanilla".into(), "file/inline".into()],
+            disabled: vec![],
+            enabled_features: vec!["minecraft:vanilla".into()],
+        };
+        let settings = |structures_enabled| FreshGenerationSettings {
+            minecraft_dir: game.clone(),
+            preset: "example:inline".into(),
+            dimension: "minecraft:overworld".into(),
+            seed: 42,
+            bonus_chest: false,
+            structures_enabled,
+            data_packs: Some((world.clone(), selection.clone())),
+        };
+        let border = native_session::respawn::RespawnBorder {
+            min_x: -100.0,
+            max_x: 100.0,
+            min_z: -100.0,
+            max_z: 100.0,
+        };
+        let prepared = prepare(settings(false))?;
+        assert_eq!(prepared.lighting.dimension_type, None);
+        assert_eq!(prepared.dimension_definition, definition);
+        let inputs = prepared.into_new_world_inputs(border, true, true)?;
+        let creatures = inputs
+            .creatures
+            .as_ref()
+            .context("creature inputs missing")?;
+        assert!(!creatures.has_ceiling);
+        assert_eq!(
+            creatures.environment.dimension_attributes()["minecraft:gameplay/creature_world_gen_spawn_probability"],
+            json!(0.31)
+        );
+        assert_eq!(creatures.environment.sample_layers(|_| Some(0))?.len(), 1);
+        assert!(creatures.environment.sample_layers(|_| None).is_err());
+        let initial = &inputs.initial_clocks;
+        assert_eq!(
+            initial
+                .command_data
+                .default_clock
+                .as_ref()
+                .map(|(name, id)| (name.as_ref(), id.clone())),
+            Some((
+                "[unregistered]",
+                Some(ResourceId::parse("minecraft:overworld")?)
+            ))
+        );
+        assert_eq!(
+            initial
+                .fluid_environment
+                .fast_lava
+                .as_ref()
+                .context("fast lava environment missing")?
+                .sample(|id| initial.ticks.get(id).copied()),
+            Some(true)
+        );
+        assert_eq!(
+            initial
+                .fluid_environment
+                .fast_lava
+                .as_ref()
+                .unwrap()
+                .sample(|_| Some(10)),
+            Some(false)
+        );
+        assert_eq!(
+            initial
+                .fluid_environment
+                .water_evaporation
+                .as_ref()
+                .context("water evaporation environment missing")?
+                .sample(|id| initial.ticks.get(id).copied()),
+            Some(true)
+        );
+        assert_eq!(
+            initial
+                .fluid_environment
+                .water_evaporation
+                .as_ref()
+                .unwrap()
+                .sample(|_| Some(10)),
+            Some(false)
+        );
+        let structured = prepare_with_structures_and_difficulty(
+            settings(true),
+            Some(native_persistence::world::Difficulty::Normal),
+        )?;
+        let hut = structured
+            .hut_generation
+            .as_ref()
+            .context("structure environment missing")?;
+        assert_eq!(
+            hut.moon.sample(None, |_| Some(0)),
+            Some(native_resources::moon_phase::Phase::NewMoon)
+        );
+        assert_eq!(
+            hut.moon.sample(None, |_| Some(10)),
+            Some(native_resources::moon_phase::Phase::FullMoon)
+        );
+        assert!(hut.ocean.is_some());
         Ok(())
     }
 

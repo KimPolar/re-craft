@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 use crate::{
-    fluid_environment::load_dimension_timelines,
+    fluid_environment::dimension_timelines_from_definition,
     mob_spawns::{CreatureSpawnLayer, resolve_creature_spawns},
     packs::{ResourceId, ResourceProvider},
 };
@@ -33,7 +33,7 @@ impl CreatureSpawnEnvironment {
     pub fn load(
         provider: &mut impl ResourceProvider,
         dimension_type: &str,
-        mut entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
+        entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
     ) -> Result<Self> {
         let id = ResourceId::parse(dimension_type)?;
         let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
@@ -42,6 +42,22 @@ impl CreatureSpawnEnvironment {
             .with_context(|| format!("missing dimension type {path}"))?;
         let definition: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid dimension type {path}"))?;
+        Self::from_definition(provider, &definition, entity_is_misc)
+    }
+
+    pub fn from_definition_with_registry(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        registry: &crate::entity_category::EntityCategoryRegistry,
+    ) -> Result<Self> {
+        Self::from_definition(provider, definition, |id| registry.is_misc(id))
+    }
+
+    pub fn from_definition(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        mut entity_is_misc: impl FnMut(&ResourceId) -> Option<bool>,
+    ) -> Result<Self> {
         let object = definition
             .as_object()
             .context("dimension type must be an object")?;
@@ -61,7 +77,7 @@ impl CreatureSpawnEnvironment {
             &mut entity_is_misc,
         )?;
         let mut tracks = Vec::new();
-        for timeline in load_dimension_timelines(provider, dimension_type)? {
+        for timeline in dimension_timelines_from_definition(provider, definition)? {
             let values = timeline
                 .get("tracks")
                 .and_then(Value::as_object)

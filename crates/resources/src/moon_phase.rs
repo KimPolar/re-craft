@@ -215,6 +215,13 @@ impl Environment {
             .with_context(|| format!("missing dimension type {path}"))?;
         let definition: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid dimension type {path}"))?;
+        Self::from_definition(provider, &definition)
+    }
+
+    pub fn from_definition(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+    ) -> Result<Self> {
         ensure!(definition.is_object(), "dimension type must be an object");
         let base = moon_attribute(definition.get("attributes"))?
             .map(layer)
@@ -247,7 +254,7 @@ impl Environment {
             );
         }
         for timeline in
-            crate::fluid_environment::load_dimension_timelines(provider, dimension_type)?
+            crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
         {
             let tracks = timeline
                 .get("tracks")

@@ -34,6 +34,17 @@ impl GeneratedDimensionLighting {
         preset: &str,
         dimension: &str,
     ) -> Result<(Self, Value)> {
+        let (lighting, generator, _) =
+            Self::load_preset_with_definition(provider, preset, dimension)?;
+        Ok((lighting, generator))
+    }
+
+    /// Resolve lighting, generator, and the exact named or inline type together.
+    pub fn load_preset_with_definition(
+        provider: &mut impl ResourceProvider,
+        preset: &str,
+        dimension: &str,
+    ) -> Result<(Self, Value, Value)> {
         let preset = ResourceId::parse(preset)?;
         let dimension = ResourceId::parse(dimension)?;
         let path = format!(
@@ -139,6 +150,7 @@ impl GeneratedDimensionLighting {
                 ambient_light,
             },
             generator,
+            definition,
         ))
     }
 }

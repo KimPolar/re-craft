@@ -125,11 +125,26 @@ pub fn load_fast_lava_environment(
     load_boolean_environment(provider, dimension_type, "gameplay/fast_lava")
 }
 
+pub fn fast_lava_environment_from_definition(
+    provider: &mut impl ResourceProvider,
+    definition: &Value,
+) -> Result<FastLavaEnvironment> {
+    boolean_environment_from_definition(provider, definition, "gameplay/fast_lava")
+}
+
 /// Water evaporation can also vary by biome. Reject such packs until biome
 /// boundary sampling can reproduce the server's positional lookup.
 pub fn load_water_evaporation_environment(
     provider: &mut impl ResourceProvider,
     dimension_type: &str,
+) -> Result<WaterEvaporationEnvironment> {
+    let definition = load_dimension_type(provider, dimension_type)?;
+    water_evaporation_environment_from_definition(provider, &definition)
+}
+
+pub fn water_evaporation_environment_from_definition(
+    provider: &mut impl ResourceProvider,
+    definition: &Value,
 ) -> Result<WaterEvaporationEnvironment> {
     let biomes = provider.list_data("worldgen/biome")?;
     ensure!(!biomes.is_empty(), "biome registry is empty");
@@ -154,7 +169,7 @@ pub fn load_water_evaporation_environment(
             }
         }
     }
-    load_boolean_environment(provider, dimension_type, "gameplay/water_evaporates")
+    boolean_environment_from_definition(provider, definition, "gameplay/water_evaporates")
 }
 
 fn load_boolean_environment(
@@ -162,6 +177,14 @@ fn load_boolean_environment(
     dimension_type: &str,
     attribute: &str,
 ) -> Result<FastLavaEnvironment> {
+    let definition = load_dimension_type(provider, dimension_type)?;
+    boolean_environment_from_definition(provider, &definition, attribute)
+}
+
+fn load_dimension_type(
+    provider: &mut impl ResourceProvider,
+    dimension_type: &str,
+) -> Result<Value> {
     let id = ResourceId::parse(dimension_type)?;
     let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
     let bytes = provider
@@ -173,16 +196,25 @@ fn load_boolean_environment(
         definition.is_object(),
         "dimension type {path} is not an object"
     );
+    Ok(definition)
+}
+
+fn boolean_environment_from_definition(
+    provider: &mut impl ResourceProvider,
+    definition: &Value,
+    attribute: &str,
+) -> Result<FastLavaEnvironment> {
+    ensure!(definition.is_object(), "dimension type must be an object");
     let base = match definition.get("attributes") {
         Some(attributes) => boolean_from_attributes(attributes, attribute)
-            .with_context(|| format!("invalid attributes in {path}"))?,
+            .context("invalid dimension attributes")?,
         None => false,
     };
     let mut result = FastLavaEnvironment {
         base,
         tracks: Vec::new(),
     };
-    for timeline in dimension_timelines(provider, &definition)? {
+    for timeline in dimension_timelines(provider, definition)? {
         let tracks = timeline
             .get("tracks")
             .and_then(Value::as_object)
@@ -205,18 +237,16 @@ pub fn load_dimension_timelines(
     provider: &mut impl ResourceProvider,
     dimension_type: &str,
 ) -> Result<Vec<Value>> {
-    let id = ResourceId::parse(dimension_type)?;
-    let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
-    let bytes = provider
-        .read_data(&path)?
-        .with_context(|| format!("missing dimension type {path}"))?;
-    let definition: Value =
-        serde_json::from_slice(&bytes).with_context(|| format!("invalid dimension type {path}"))?;
-    ensure!(
-        definition.is_object(),
-        "dimension type {path} is not an object"
-    );
+    let definition = load_dimension_type(provider, dimension_type)?;
     dimension_timelines(provider, &definition)
+}
+
+pub fn dimension_timelines_from_definition(
+    provider: &mut impl ResourceProvider,
+    definition: &Value,
+) -> Result<Vec<Value>> {
+    ensure!(definition.is_object(), "dimension type must be an object");
+    dimension_timelines(provider, definition)
 }
 
 fn dimension_timelines(

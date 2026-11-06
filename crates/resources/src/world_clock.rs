@@ -151,6 +151,13 @@ pub fn dimension_default_clock(
         definition.is_object(),
         "dimension type {path} must be an object"
     );
+    dimension_default_clock_from_definition(&definition)
+}
+
+pub fn dimension_default_clock_from_definition(
+    definition: &serde_json::Value,
+) -> Result<Option<ResourceId>> {
+    ensure!(definition.is_object(), "dimension type must be an object");
     match definition.get("default_clock") {
         None => Ok(None),
         Some(value) => {

@@ -152,7 +152,8 @@ fn creature_timeline_tracks_match_java() {
             dimension: json!({"timelines":["example:test"]}),
             timeline,
         };
-        let env = CreatureSpawnEnvironment::load(&mut data, "example:test", |id| {
+        let inline = data.dimension.clone();
+        let env = CreatureSpawnEnvironment::from_definition(&mut data, &inline, |id| {
             (id.namespace == "minecraft").then_some(false)
         })
         .unwrap();

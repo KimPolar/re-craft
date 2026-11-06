@@ -3261,11 +3261,12 @@ mod tests {
             let worker =
                 GenerationWorker::complete_creature_spawning_from_packs(ready, move || {
                     let mut resources = native_resources::packs::ResourceStack::open(&pack_game)?;
-                    let lighting = GeneratedDimensionLighting::load_preset(
-                        &mut resources,
-                        "minecraft:normal",
-                        "minecraft:overworld",
-                    )?;
+                    let (_, _, definition) =
+                        GeneratedDimensionLighting::load_preset_with_definition(
+                            &mut resources,
+                            "minecraft:normal",
+                            "minecraft:overworld",
+                        )?;
                     let clocks = native_resources::world_clock::registered_clocks(&mut resources)?
                         .into_iter()
                         .map(|id| (id, 0))
@@ -3278,7 +3279,7 @@ mod tests {
                     };
                     let spawn = crate::fresh_generation::PreparedCreatureSpawning::load(
                         &mut resources,
-                        &lighting,
+                        &definition,
                         border,
                         clocks,
                     )?;

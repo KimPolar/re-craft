@@ -3875,7 +3875,7 @@ mod tests {
             (
                 "data/example/worldgen/world_preset/ocean.json",
                 json!({"dimensions":{"minecraft:overworld":{
-                    "type":"example:test", "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:ocean"},"settings":{
+                    "type":{"min_y":0,"height":96,"has_skylight":true,"ambient_light":0.0}, "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:ocean"},"settings":{
                         "noise":{"min_y":0,"height":96},"legacy_random_source":false,"sea_level":63,"disable_mob_generation":true,
                         "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
                         "material_rule":{"type":"block","result_state":"minecraft:stone"},
@@ -6552,6 +6552,15 @@ mod tests {
                 pack.join("data/example/dimension_type/compact.json"),
                 serde_json::to_vec(&selected_dimension)?,
             )?;
+            if species == "minecraft:pig" {
+                let mut inline_preset = preset.clone();
+                inline_preset["dimensions"]["minecraft:overworld"]["type"] =
+                    selected_dimension.clone();
+                std::fs::write(
+                    pack.join("data/example/worldgen/world_preset/compact.json"),
+                    serde_json::to_vec(&inline_preset)?,
+                )?;
+            }
             let mut selected_biome = biome.clone();
             if feature_kind != 0 {
                 let simple = json!({"feature":{"type":"minecraft:simple_block", "to_place":{"id":"minecraft:short_grass"}},"placement":[]});

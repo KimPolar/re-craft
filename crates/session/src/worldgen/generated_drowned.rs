@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use native_persistence::nbt::{Tag, TagType};
 use native_resources::{
     drowned_spawn::{ChickenJockey, HalloweenHelmet, MainHandRoll, StructureDrownedInitialization},
-    worldgen_region_random::AnimalBaseInitialization,
+    worldgen_region_random::{AnimalBaseInitialization, MobBaseInitialization},
 };
 
 fn compound(fields: Vec<(&str, Tag)>) -> Tag {
@@ -36,6 +36,79 @@ fn attribute(id: &str, base: f64, modifiers: Vec<Tag>) -> Tag {
 }
 fn item(id: &str) -> Tag {
     compound(vec![("id", Tag::String(id.into())), ("count", Tag::Int(1))])
+}
+
+/// Snapshot the baby drowned when a newly created chicken is added during
+/// Zombie.finalizeSpawn, before equipment and zombie attribute rolls. The
+/// chicken is at the same position, so its rider's saved X/Z are unchanged.
+pub fn draft_drowned_at_chicken_spawn(
+    uuid: [i32; 4],
+    block_position: [i32; 3],
+    mob: MobBaseInitialization,
+    can_pick_up_loot: bool,
+) -> Result<Tag> {
+    let follow = mob
+        .follow_range_bonus
+        .context("missing drowned follow-range bonus")?;
+    ensure!(follow.is_finite(), "invalid drowned follow-range bonus");
+    let position = [
+        f64::from(block_position[0]) + 0.5,
+        f64::from(block_position[1]),
+        f64::from(block_position[2]) + 0.5,
+    ];
+    let Tag::Compound(mut fields) = super::generated_sheep::draft_fresh_animal_base(
+        uuid,
+        position,
+        0.0,
+        "minecraft:drowned",
+        20.0,
+        AnimalBaseInitialization {
+            set_baby_age: false,
+            follow_range_bonus: Some(follow),
+            left_handed: mob.left_handed,
+        },
+    )?
+    else {
+        unreachable!("fresh mob base is a compound")
+    };
+    fields.retain(|(key, _)| {
+        !["Age", "ForcedAge", "AgeLocked", "InLove", "attributes"]
+            .iter()
+            .any(|name| key.matches(name))
+    });
+    for (key, value) in &mut fields {
+        if key.matches("PersistenceRequired") {
+            *value = Tag::Byte(1);
+        }
+        if key.matches("CanPickUpLoot") {
+            *value = Tag::Byte(i8::from(can_pick_up_loot));
+        }
+    }
+    fields.extend([
+        (
+            "attributes".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![
+                    attribute(
+                        "minecraft:follow_range",
+                        35.0,
+                        vec![modifier(
+                            "minecraft:random_spawn_bonus",
+                            follow,
+                            "add_multiplied_base",
+                        )],
+                    ),
+                    attribute("minecraft:movement_speed", f64::from(0.23_f32), vec![]),
+                ],
+            },
+        ),
+        ("IsBaby".into(), Tag::Byte(1)),
+        ("CanBreakDoors".into(), Tag::Byte(0)),
+        ("InWaterTime".into(), Tag::Int(-1)),
+        ("DrownedConversionTime".into(), Tag::Int(-1)),
+    ]);
+    Ok(Tag::Compound(fields))
 }
 
 /// Build the saved compound for an unmounted freshly spawned structure
@@ -458,6 +531,43 @@ mod tests {
             cases.len() > 1000 && babies > 0 && leaders > 0 && weapons > 0 && shells > 0,
             "insufficient case coverage"
         );
+        let mut snapshots = 0;
+        for i in 0..200_000 {
+            let region_seed = i64::from(i) * 671_231 - 12_345;
+            let entity_seed = i64::from(i) * 98_317 + 3_329;
+            let mut region = if i % 2 == 0 {
+                RegionRandom::Legacy(LegacyRandom::new(region_seed))
+            } else {
+                RegionRandom::Xoroshiro(XoroshiroRandom::new(region_seed))
+            };
+            let special = factors[(i as usize / 8) % 4];
+            let mob =
+                native_resources::worldgen_region_random::finalize_mob_base(&mut region, false);
+            let can_pick_up_loot = region.next_float() < 0.55_f32 * special;
+            if region.next_float() >= 0.05_f32
+                || f64::from(region.next_float()) < 0.05_f64
+                || f64::from(region.next_float()) >= 0.05_f64
+            {
+                continue;
+            }
+            let tag =
+                draft_drowned_at_chicken_spawn([0, 1, 0, 2], [3, 10, -2], mob, can_pick_up_loot)?;
+            let path = temp.path().join(format!("chicken-rider-{i}.nbt"));
+            std::fs::write(
+                &path,
+                nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: tag,
+                })?,
+            )?;
+            let mut entity = LegacyRandom::new(entity_seed);
+            cases.push(serde_json::json!({"path":path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":region.next_long(),"next_entity":entity.next_long(),"chicken_snapshot":true}));
+            snapshots += 1;
+            if snapshots == 128 {
+                break;
+            }
+        }
+        ensure!(snapshots == 128, "insufficient chicken snapshot cases");
         let input = temp.path().join("cases.json");
         std::fs::write(&input, serde_json::to_vec(&cases)?)?;
         let output = Command::new(java.join("java.exe"))

@@ -398,8 +398,8 @@ impl DecorationRegion<'_> {
 
     /// Initialize and save a structure drowned using separate region and
     /// entity random sources. The constructor returns None when Java's entity
-    /// factory returns null. Mounted drowned fail closed until their vehicle
-    /// and passenger serialization is supported.
+    /// factory returns null. A newly created chicken must be supplied by the
+    /// context; unsupported mounted cases fail closed.
     /// All callback state must be cloned independently and staged again by
     /// the caller until the enclosing decoration region is committed.
     pub fn handle_ocean_ruin_marker_with_initialized_drowned<C, W>(
@@ -519,6 +519,21 @@ where
         special,
         |adapter| adapter.context.halloween(),
     )?;
+    if initialized.chicken_jockey == native_resources::drowned_spawn::ChickenJockey::Created {
+        let chicken = adapter
+            .context
+            .take_created_chicken()?
+            .context("created jockey chicken data is unavailable")?;
+        let rider = super::super::generated_drowned::draft_drowned_at_chicken_spawn(
+            creature.construction.uuid,
+            position,
+            initialized.mob,
+            initialized.can_pick_up_loot,
+        )?;
+        return Ok(Some(super::super::GeneratedEntityRecord::Saved(
+            attach_created_chicken_rider(chicken, rider, position)?,
+        )));
+    }
     let main_hand = match (initialized.main_hand, adapter.enchanted_hand) {
         (MainHandRoll::Unchanged, None) => None,
         (MainHandRoll::Trident, None) => Some(default_hand("minecraft:trident")),
@@ -532,6 +547,55 @@ where
         main_hand,
     )?;
     Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
+}
+
+fn attach_created_chicken_rider(mut chicken: Tag, rider: Tag, position: [i32; 3]) -> Result<Tag> {
+    use native_persistence::nbt::TagType;
+    let Tag::Compound(ref fields) = chicken else {
+        bail!("jockey chicken is not a compound")
+    };
+    for name in ["id", "UUID", "Pos", "IsChickenJockey", "Passengers"] {
+        ensure!(
+            fields.iter().filter(|(key, _)| key.matches(name)).count() <= 1,
+            "duplicate jockey chicken field {name}"
+        );
+    }
+    ensure!(
+        matches!(chicken.get("id"), Some(Tag::String(id)) if id.matches("minecraft:chicken")),
+        "invalid jockey chicken type"
+    );
+    ensure!(
+        chicken.get("IsChickenJockey") == Some(&Tag::Byte(1)),
+        "chicken is not marked as a jockey"
+    );
+    ensure!(
+        chicken.get("Passengers").is_none(),
+        "jockey chicken already has passengers"
+    );
+    ensure!(
+        matches!(chicken.get("UUID"), Some(Tag::IntArray(uuid)) if uuid.len() == 4 && rider.get("UUID") != Some(&Tag::IntArray(uuid.clone()))),
+        "invalid or duplicate jockey UUID"
+    );
+    let expected = [
+        f64::from(position[0]) + 0.5,
+        f64::from(position[1]),
+        f64::from(position[2]) + 0.5,
+    ];
+    ensure!(
+        matches!(chicken.get("Pos"), Some(Tag::List { element_type: TagType::Double, values }) if values == &expected.map(Tag::Double)),
+        "jockey chicken position differs from drowned"
+    );
+    let Tag::Compound(ref mut fields) = chicken else {
+        unreachable!()
+    };
+    fields.push((
+        "Passengers".into(),
+        Tag::List {
+            element_type: TagType::Compound,
+            values: vec![rider],
+        },
+    ));
+    Ok(chicken)
 }
 
 fn default_hand(id: &str) -> Tag {
@@ -1067,6 +1131,8 @@ mod tests {
         invalid_difficulty: bool,
         special_calls: usize,
         fail_on_special: Option<usize>,
+        create_chicken: bool,
+        created_chicken: Option<Tag>,
     }
     impl super::super::super::ocean_ruin::DrownedMarkerContext for DrownedContext {
         fn special_multiplier(&mut self, _: [i32; 3], _: &World) -> Result<f32> {
@@ -1091,12 +1157,33 @@ mod tests {
         }
         fn spawn_chicken_jockey(
             &mut self,
-            _: [i32; 3],
+            position: [i32; 3],
             _: &World,
             _: &mut RegionRandom,
         ) -> Result<bool> {
             self.calls += 1;
-            Ok(false)
+            if self.create_chicken {
+                self.created_chicken = Some(Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:chicken".into())),
+                    ("UUID".into(), Tag::IntArray(vec![10, 11, 12, 13])),
+                    ("IsChickenJockey".into(), Tag::Byte(1)),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Double,
+                            values: vec![
+                                Tag::Double(f64::from(position[0]) + 0.5),
+                                Tag::Double(f64::from(position[1])),
+                                Tag::Double(f64::from(position[2]) + 0.5),
+                            ],
+                        },
+                    ),
+                ]));
+            }
+            Ok(self.create_chicken)
+        }
+        fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
+            Ok(self.created_chicken.take())
         }
         fn enchant_weapon(
             &mut self,
@@ -1174,6 +1261,65 @@ mod tests {
                 self, pos, world, random, persistent,
             )
         }
+    }
+
+    #[test]
+    fn created_chicken_stores_drowned_at_spawn_time() -> Result<()> {
+        use super::super::super::{FreshCreatureRandom, GeneratedEntityRecord};
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::TagType;
+
+        let drowned = ResourceId::parse("minecraft:drowned")?;
+        let position = [3, 10, -2];
+        let (terrain, _, _, _) = super::super::tests::fixture();
+        let world = terrain.snapshot();
+        for seed in 0..100_000 {
+            let mut probe = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mob =
+                native_resources::worldgen_region_random::finalize_mob_base(&mut probe, false);
+            let pickup = probe.next_float() < 0.55;
+            if probe.next_float() >= 0.05
+                || f64::from(probe.next_float()) < 0.05
+                || f64::from(probe.next_float()) >= 0.05
+            {
+                continue;
+            }
+            let mut random = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mut construct = || Ok(Some(FreshCreatureRandom::from_seed(&drowned, 42)?));
+            let uuid = FreshCreatureRandom::from_seed(&drowned, 42)?
+                .construction
+                .uuid;
+            let mut context = DrownedContext {
+                create_chicken: true,
+                ..Default::default()
+            };
+            let Some(GeneratedEntityRecord::Saved(chicken)) = draft_initialized_drowned(
+                position,
+                &world,
+                &mut random,
+                &mut construct,
+                &mut context,
+            )?
+            else {
+                bail!("missing chicken")
+            };
+            assert!(context.created_chicken.is_none());
+            let expected = super::super::super::generated_drowned::draft_drowned_at_chicken_spawn(
+                uuid, position, mob, pickup,
+            )?;
+            assert_eq!(
+                chicken.get("Passengers"),
+                Some(&Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![expected]
+                })
+            );
+            assert!(
+                matches!(chicken.get("id"), Some(Tag::String(id)) if id.matches("minecraft:chicken"))
+            );
+            return Ok(());
+        }
+        bail!("no deterministic chicken jockey seed")
     }
 
     struct IceTag(bool);

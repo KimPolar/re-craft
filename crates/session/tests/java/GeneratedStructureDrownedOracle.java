@@ -75,7 +75,13 @@ public class GeneratedStructureDrownedOracle {
                 case "getRandom"->random;case "getBiome"->biome;case "getEntitiesOfClass"->List.of();
                 case "registryAccess"->throw new StructureDrownedOracle.Stop("ENCHANT");default->throw new AssertionError(m);
             });
-            drowned.finalizeSpawn(region,new StructureDrownedOracle.DifficultyValue(test.get("special").getAsFloat()),EntitySpawnReason.STRUCTURE,null);
+            boolean snapshot=test.has("chicken_snapshot") && test.get("chicken_snapshot").getAsBoolean();
+            try {
+                drowned.finalizeSpawn(region,new StructureDrownedOracle.DifficultyValue(test.get("special").getAsFloat()),EntitySpawnReason.STRUCTURE,null);
+                if(snapshot) throw new AssertionError("expected chicken spawn");
+            } catch(StructureDrownedOracle.Stop stop) {
+                if(!snapshot || !stop.event.equals("CHICKEN")) throw stop;
+            }
             var output=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
             if(!drowned.save(output))throw new AssertionError("unexpected passenger");
             var actual=output.buildResult();var expected=NbtIo.read(Path.of(test.get("path").getAsString()));

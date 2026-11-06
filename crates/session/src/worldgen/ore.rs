@@ -533,6 +533,7 @@ pub struct DecorationRegion<'a> {
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
     pile_block_write: bool,
+    jigsaw_wood_write: bool,
     column_block_write: bool,
     patch_block_write: bool,
     multiface_block_write: bool,
@@ -3187,6 +3188,7 @@ impl CarvedTerrainWorld {
             light_guard: None,
             tree_block_write: false,
             pile_block_write: false,
+            jigsaw_wood_write: false,
             column_block_write: false,
             patch_block_write: false,
             multiface_block_write: false,
@@ -7115,6 +7117,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let pile_light_update = self.pile_block_write
                         && old_air
                         && (pile_safe_full_block(state) || pile_snow_layer(state));
+                    let jigsaw_wood_light_update =
+                        self.jigsaw_wood_write && old_air && jigsaw::jigsaw_wood(state);
                     let patch_water = self.patch_block_write
                         && old.name == "minecraft:clay"
                         && old.properties.is_empty()
@@ -7194,6 +7198,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         ensure!(
                             tree_light_update
                                 || pile_light_update
+                                || jigsaw_wood_light_update
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
@@ -7210,6 +7215,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     ensure!(
                         tree_light_update
                             || pile_light_update
+                            || jigsaw_wood_light_update
                             || fresh_patch_water
                             || staged_patch_water
                             || fresh_water_dripleaf
@@ -7249,7 +7255,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         };
                         new_section = old_air
                             && count == 0
-                            && (tree_light_update || vine_write || pile_light_update);
+                            && (tree_light_update
+                                || vine_write
+                                || pile_light_update
+                                || jigsaw_wood_light_update);
                         ensure!(
                             if old_air {
                                 count > 0 || new_section
@@ -7267,6 +7276,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     }
                     if tree_light_update
                         || pile_light_update
+                        || jigsaw_wood_light_update
                         || fresh_patch_water
                         || staged_patch_water
                         || fresh_water_dripleaf
@@ -7281,6 +7291,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         guard.light_replay_positions.insert(p);
                         if vine_write
                             || (pile_light_update && guard.require_unchanged_light)
+                            || (jigsaw_wood_light_update && guard.require_unchanged_light)
                             || water_lichen_write
                             || lake_light_update
                             || magma_light_update
@@ -7290,6 +7301,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         }
                         if tree_light_update
                             || pile_light_update
+                            || jigsaw_wood_light_update
                             || vine_check
                             || lichen_check
                             || lake_light_update
@@ -11458,6 +11470,17 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_wood_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_log",
+            "vine_active_self_jigsaw_planks",
+            "vine_active_empty_jigsaw_planks",
+            "vine_active_self_empty_jigsaw_log",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11648,6 +11671,18 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_jigsaw_") {
+                    let mut block = state(if mode.ends_with("_log") {
+                        "oak_log"
+                    } else {
+                        "oak_planks"
+                    });
+                    if mode.ends_with("_log") {
+                        block.properties.insert("axis".into(), "y".into());
+                    }
+                    jigsaw::place_wood_for_light_test(&mut draft, &registry, p, &block).unwrap();
+                    continue;
+                }
                 if mode.contains("_pile_") {
                     let mut block = state(if mode.ends_with("_pile_snow") {
                         "snow"

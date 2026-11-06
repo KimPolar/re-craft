@@ -15,7 +15,41 @@ struct JigsawRegion<'r, 'a, 'g> {
     registry: &'g GeneratedBlockRegistry,
 }
 
+#[cfg(test)]
+pub(super) fn place_wood_for_light_test(
+    region: &mut DecorationRegion<'_>,
+    registry: &GeneratedBlockRegistry,
+    pos: [i32; 3],
+    state: &BlockState,
+) -> Result<()> {
+    let mut random = DecorationRandom::new(42);
+    ensure!(JigsawRegion { region, registry }.place_template_block(
+        pos,
+        state,
+        None,
+        &mut random
+    )?);
+    Ok(())
+}
+
+pub(super) fn jigsaw_wood(state: &BlockState) -> bool {
+    if native_core::wood::Planks::from_id(&state.name).is_some() {
+        state.properties.is_empty()
+    } else if native_core::wood::Wood::from_id(&state.name).is_some() {
+        state.properties.len() == 1
+            && matches!(
+                state.properties.get("axis").map(String::as_str),
+                Some("x" | "y" | "z")
+            )
+    } else {
+        false
+    }
+}
+
 fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
+    if jigsaw_wood(state) {
+        return Ok(true);
+    }
     if state.name == "minecraft:chest" {
         monster_block_flags(state)?;
         return Ok(false);
@@ -174,7 +208,10 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             );
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         } else {
-            self.region.set_proto_block(pos, state)?;
+            self.region.jigsaw_wood_write = jigsaw_wood(state);
+            let result = self.region.set_proto_block(pos, state);
+            self.region.jigsaw_wood_write = false;
+            result?;
         }
         Ok(true)
     }
@@ -591,6 +628,68 @@ mod tests {
             stones_checked += 1;
         }
         assert_eq!(stones_checked, 29);
+        let mut wood_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("WOOD\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                axis,
+                mirror,
+                rotation,
+                expected_axis,
+                full,
+                entity,
+                poi,
+                postprocess,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java wood result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let id = format!("minecraft:{name}");
+            let properties = if *axis == "-" {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([("axis".into(), (*axis).to_owned())])
+            };
+            let state = BlockState {
+                name: id.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&id, &properties), "{state:?}");
+            assert_eq!(*full, "true", "{state:?}");
+            assert_eq!(*entity, "false", "{state:?}");
+            assert_eq!(*poi, "false", "{state:?}");
+            assert_eq!(*postprocess, "false", "{state:?}");
+            assert_eq!(registry.has_block_entity(&id), Some(false), "{state:?}");
+            assert!(jigsaw_static_full(&state)?);
+            let transformed =
+                registry.transform_template_state(&id, &properties, mirror, rotation)?;
+            assert_eq!(
+                transformed.get("axis").map(String::as_str).unwrap_or("-"),
+                *expected_axis,
+                "{state:?}"
+            );
+            wood_checked += 1;
+        }
+        assert_eq!(
+            wood_checked,
+            (native_core::wood::Wood::all().count() * 3 + native_core::wood::Planks::ALL.len())
+                * 12
+        );
         let mut axes_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("AXIS\t")) {
             let fields: Vec<_> = line.split('\t').collect();
@@ -698,6 +797,67 @@ mod tests {
         assert_eq!(random.next_long(), expected.next_long());
         drop(region);
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn vanilla_plains_house_wood_is_placed_from_template() -> Result<()> {
+        use native_persistence::{
+            jigsaw_template::resolve_template_state, structure_template::StructureTemplate,
+        };
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let blocks = resources.vanilla_block_ids()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let mut found = BTreeSet::new();
+        for name in [
+            "plains_small_house_1",
+            "plains_small_house_2",
+            "plains_small_house_3",
+        ] {
+            let id = ResourceId::parse(&format!("minecraft:village/plains/houses/{name}"))?;
+            let template = StructureTemplate::load(&mut resources, &id)?
+                .context("village template missing")?;
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            for block in &template.blocks {
+                let raw = &template.palettes[0][block.state];
+                let Some(Tag::String(id)) = raw.get("id") else {
+                    continue;
+                };
+                let id = String::from_utf16(&id.0)?;
+                if native_core::wood::Wood::from_id(&id).is_none()
+                    && native_core::wood::Planks::from_id(&id).is_none()
+                {
+                    continue;
+                }
+                let state = resolve_template_state(raw, &registry)?;
+                if block.position.iter().any(|value| !(0..16).contains(value)) {
+                    continue;
+                }
+                let mut random = DecorationRandom::new(42);
+                assert!(
+                    JigsawRegion {
+                        region: &mut region,
+                        registry: &registry
+                    }
+                    .place_template_block(
+                        block.position,
+                        &state,
+                        None,
+                        &mut random
+                    )?
+                );
+                found.insert(id);
+            }
+            region.finish()?;
+        }
+        assert!(found.contains("minecraft:oak_log"), "{found:?}");
+        assert!(found.contains("minecraft:oak_planks"), "{found:?}");
         Ok(())
     }
 

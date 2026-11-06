@@ -60,6 +60,28 @@ public class JigsawChestOracle {
             var state = BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:" + name)).defaultBlockState();
             out.printf("STONE\t%s\t%s\t%s\t%d%n", name, state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), state.hasBlockEntity(), state.getBlock().getStateDefinition().getPossibleStates().size());
         }
+        for (var family : new String[]{"oak","spruce","birch","jungle","acacia","dark_oak","mangrove","cherry","pale_oak","bamboo","crimson","warped","poplar"}) {
+            var names = new java.util.ArrayList<String>();
+            names.add(family + "_planks");
+            if (family.equals("bamboo")) {
+                names.add("bamboo_block"); names.add("stripped_bamboo_block");
+            } else {
+                var a = family.equals("crimson") || family.equals("warped") ? "stem" : "log";
+                var b = family.equals("crimson") || family.equals("warped") ? "hyphae" : "wood";
+                for (var part : new String[]{a,b}) for (var prefix : new String[]{"","stripped_"}) names.add(prefix + family + "_" + part);
+            }
+            for (var name : names) {
+                var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:" + name));
+                for (var original : block.getStateDefinition().getPossibleStates()) for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var rotated = original.mirror(mirror).rotate(rotation);
+                    var axis = original.hasProperty(RotatedPillarBlock.AXIS) ? original.getValue(RotatedPillarBlock.AXIS).getSerializedName() : "-";
+                    var nextAxis = rotated.hasProperty(RotatedPillarBlock.AXIS) ? rotated.getValue(RotatedPillarBlock.AXIS).getSerializedName() : "-";
+                    out.printf("WOOD\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n", name, axis, mirror.name(), rotation.name(), nextAxis,
+                        original.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), original.hasBlockEntity(),
+                        net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(original), original.getPostProcessPos(null, BlockPos.ZERO) != null);
+                }
+            }
+        }
         for (var axis : Direction.Axis.values()) for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
             var state = Blocks.DEEPSLATE.defaultBlockState().setValue(RotatedPillarBlock.AXIS, axis).mirror(mirror).rotate(rotation);
             out.printf("AXIS\t%s\t%s\t%s\t%s%n", axis.getSerializedName(), mirror.name(), rotation.name(), state.getValue(RotatedPillarBlock.AXIS).getSerializedName());

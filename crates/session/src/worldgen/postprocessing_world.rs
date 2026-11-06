@@ -899,7 +899,7 @@ fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     }
     ensure!(
         state.properties.is_empty(),
-        "unsupported generated postprocessing block state"
+        "unsupported generated postprocessing block state: {state:?}"
     );
     match state.name.as_str() {
         "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel" => Ok(DryBlock::Falling),

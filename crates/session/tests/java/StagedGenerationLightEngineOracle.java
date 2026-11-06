@@ -146,12 +146,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean vineActiveMany=vineActive && (args[1].equals("vine_active_many") || args[1].equals("vine_active_self_many"));
         boolean vineActiveTransition=vineActive && args[1].endsWith("_plain_then_glowing");
         boolean stagedActivate=args.length>1 && args[1].equals("tree_empty_full_activate");
-        boolean activeEmptyWide=args.length>1 && args[1].equals("tree_empty_active_wide");
-        boolean emptyFullWide=args.length>1 && (args[1].equals("tree_empty_full_wide") || stagedActivate || activeEmptyWide);
+        boolean activeEmptyWide=args.length>1 && (args[1].equals("tree_empty_active_wide") || args[1].equals("tree_empty_birch_leaf_self_wide"));
+        boolean emptyFullWide=args.length>1 && (args[1].equals("tree_empty_full_wide") || args[1].equals("tree_empty_birch_leaf_wide") || args[1].equals("tree_empty_birch_log_wide") || stagedActivate || activeEmptyWide);
         boolean registerAfter=args.length>1 && args[1].startsWith("tree_empty_partial_register");
         w.emptyWest=registerAfter && args[1].endsWith("_empty");
         boolean emptyPartialWide=args.length>1 && (args[1].equals("tree_empty_partial_wide") || registerAfter);
-        boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && (args[1].equals("log_active_sparse_wide") || args[1].equals("log_active_sparse_litter_wide")));
+        boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && (args[1].equals("log_active_sparse_wide") || args[1].equals("log_active_sparse_litter_wide") || args[1].equals("log_active_sparse_birch_leaf_wide") || args[1].equals("log_active_sparse_birch_log_wide")));
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeFreshEmpty=args.length>1 && args[1].equals("tree_fresh_empty");
@@ -322,7 +322,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         }
         if(leafActive){
             engine.propagateLightSources(new ChunkPos(activeEmptyWide?1:leafFull?0:1,0)); drain(engine); stages.add(skyWide ? captureWide(engine) : capture(engine));
-            var state=vineNoSky ? Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,true) : emptyLeaf ? Blocks.DARK_OAK_LEAVES.defaultBlockState() : (logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var state=args[1].contains("birch_leaf") ? Blocks.BIRCH_LEAVES.defaultBlockState() : args[1].contains("birch_log") ? Blocks.BIRCH_LOG.defaultBlockState() : vineNoSky ? Blocks.CAVE_VINES_PLANT.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,true) : emptyLeaf ? Blocks.DARK_OAK_LEAVES.defaultBlockState() : (logActive || treeEmpty || treeSparse) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             int[][] positions=skyMany ? new int[][]{{16,10,8},{16,10,9},{17,10,8}} : leafMany ? new int[][]{{16,10,8},{17,11,8},{31,10,4},{16,9,10}} : new int[][]{{16,10,8}};
             for(var p:positions){
                 var pos=new BlockPos(p[0],p[1],p[2]); boolean wasEmpty=eastSection.section.hasOnlyAir();

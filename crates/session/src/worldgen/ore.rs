@@ -6502,11 +6502,6 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         .context("registered light new state is unknown")?;
                     let tree_light_update = self.tree_block_write
                         && (old_air || tree_leaf_litter(&old)?)
-                        && (!guard.require_unchanged_light
-                            || !matches!(
-                                state.name.as_str(),
-                                "minecraft:birch_log" | "minecraft:birch_leaves"
-                            ))
                         && ((matches!(
                             state.name.as_str(),
                             "minecraft:dark_oak_leaves" | "minecraft:birch_leaves"
@@ -10398,6 +10393,11 @@ mod tests {
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
         for mode in [
+            "log_active_sparse_birch_leaf_wide",
+            "log_active_sparse_birch_log_wide",
+            "tree_empty_birch_leaf_wide",
+            "tree_empty_birch_log_wide",
+            "tree_empty_birch_leaf_self_wide",
             "log_active_sparse_wide",
             "log_active_sparse_litter_wide",
             "tree_empty_full_wide",
@@ -10431,11 +10431,12 @@ mod tests {
             let east = ChunkPos { x: 1, z: 0 };
             let world = Arc::make_mut(&mut terrain.world);
             let template = Arc::clone(world.chunks.get(&center).unwrap());
-            let halo = if mode == "tree_empty_active_wide" {
-                3
-            } else {
-                2
-            };
+            let halo =
+                if mode == "tree_empty_active_wide" || mode == "tree_empty_birch_leaf_self_wide" {
+                    3
+                } else {
+                    2
+                };
             for z in -halo..=halo {
                 for x in -halo..=halo {
                     let pos = ChunkPos { x, z };
@@ -10464,7 +10465,7 @@ mod tests {
                 );
                 section.blocks.as_mut().unwrap().fill(air);
             }
-            if mode == "log_active_sparse_wide" || mode == "log_active_sparse_litter_wide" {
+            if mode.starts_with("log_active_sparse_") {
                 let stone = world.intern_state(state("stone"));
                 world.set_block_id(31, 0, 0, stone).unwrap();
             }
@@ -10477,18 +10478,20 @@ mod tests {
                 let id = world.intern_state(litter);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
-            let registered: Vec<_> =
-                if mode == "tree_empty_full_activate" || mode == "tree_empty_active_wide" {
-                    (-2..=2)
-                        .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
-                        .collect()
-                } else if mode.starts_with("tree_empty_partial_") {
-                    vec![center, east]
-                } else {
-                    (-1..=1)
-                        .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
-                        .collect()
-                };
+            let registered: Vec<_> = if mode == "tree_empty_full_activate"
+                || mode == "tree_empty_active_wide"
+                || mode == "tree_empty_birch_leaf_self_wide"
+            {
+                (-2..=2)
+                    .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+                    .collect()
+            } else if mode.starts_with("tree_empty_partial_") {
+                vec![center, east]
+            } else {
+                (-1..=1)
+                    .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
+                    .collect()
+            };
             terrain
                 .completed_decoration
                 .extend(registered.iter().copied());
@@ -10503,7 +10506,8 @@ mod tests {
             let before = engine
                 .activate(
                     &terrain,
-                    if mode == "tree_empty_active_wide" {
+                    if mode == "tree_empty_active_wide" || mode == "tree_empty_birch_leaf_self_wide"
+                    {
                         east
                     } else {
                         center
@@ -10527,9 +10531,23 @@ mod tests {
                 new_nonempty_sections: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
-            let mut log = state("dark_oak_log");
-            log.properties.insert("axis".into(), "y".into());
-            draft.set_tree_block([16, 10, 8], &log, 19).unwrap();
+            let mut block = if mode.contains("birch_leaf") {
+                state("birch_leaves")
+            } else if mode.contains("birch_log") {
+                state("birch_log")
+            } else {
+                state("dark_oak_log")
+            };
+            if mode.contains("birch_leaf") {
+                block.properties = BTreeMap::from([
+                    ("distance".into(), "7".into()),
+                    ("persistent".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            } else {
+                block.properties.insert("axis".into(), "y".into());
+            }
+            draft.set_tree_block([16, 10, 8], &block, 19).unwrap();
             let mut tracking = Some(DecorationLightTracking::Staged(&mut engine, &registry));
             finish_decoration_with_light(draft, &mut tracking).unwrap();
             drop(tracking);

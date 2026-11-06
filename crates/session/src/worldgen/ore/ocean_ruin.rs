@@ -2531,6 +2531,212 @@ mod tests {
             );
             assert_eq!(terrain.recorded_generated_entities(center)?.len(), 4);
         }
+
+        // Huts and ruins in the same FEATURES pass use one region RNG, while
+        // each structure entry retains its own decoration RNG.
+        use native_resources::{
+            cat_variants::CatSpawnVariants,
+            structure_piece::swamp_hut::{HutMob, SwampHutState},
+            structure_start::{HorizontalDirection, SimpleStructureKind, SimpleStructureStart},
+        };
+        struct Cats;
+        impl ResourceProvider for Cats {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/cat_variant/black.json").then(||
+                    br#"{"spawn_conditions":[{"condition":{"type":"minecraft:structure","structures":"minecraft:ocean_ruin_warm"},"priority":0}]}"#.to_vec()))
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse(match folder {
+                    "cat_variant" => "minecraft:black",
+                    "cat_sound_variant" => "minecraft:classic",
+                    _ => bail!("unexpected registry"),
+                })?])
+            }
+        }
+        let variants = CatSpawnVariants::load_active(&mut Cats)?;
+        let hut_entry = native_resources::structure_decoration::StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:swamp_hut")?,
+            step: 0,
+            index: 1,
+        };
+        let hut = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [0, 0],
+            generation_point: [3, 8, 3],
+            orientation: Some(HorizontalDirection::South),
+            bounds: BoundingBox::new([3, 8, 3], [9, 14, 11]).unwrap(),
+            terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+        };
+        let key = (hut_entry.id.clone(), center);
+        let state = SwampHutState {
+            ground: native_resources::structure_piece::ScatteredGroundHeight::from_saved(8),
+            ..Default::default()
+        };
+        let initial = BTreeMap::from([(
+            key.clone(),
+            super::super::super::SavedSwampHutPiece::capture(&hut, state)?,
+        )]);
+        let make_hut_constructor = || {
+            |mob| {
+                let (id, seed) = match mob {
+                    HutMob::Witch => ("minecraft:witch", 1),
+                    HutMob::Cat => ("minecraft:cat", 2),
+                };
+                FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
+            }
+        };
+        let condition =
+            |_: &super::super::super::structure_batch::TerrainStartKey,
+             _: [i32; 3],
+             _: &World,
+             _: &serde_json::Value,
+             _: BoundingBox,
+             revisions: &[super::super::super::structure_batch::StructurePieceRevision]|
+             -> Result<bool> {
+                let bounds: Vec<_> = revisions
+                    .iter()
+                    .filter(|(key, _)| key.0 == entry.id)
+                    .map(|(_, bounds)| bounds.min[1])
+                    .collect();
+                ensure!(
+                    bounds == [8, 8, 15] || bounds == [15, 15, 15],
+                    "ocean piece revisions do not reflect current placement"
+                );
+                Ok(true)
+            };
+        let make_adapter = || super::super::MixedHutOceanPlacementContext {
+            ocean: OceanRuinPlacementContext {
+                ice_tags: &ice,
+                water_fluids: &water,
+                bubble_fluids: &bubbles,
+                registry: &registry,
+                sea_level: 63,
+                region_random: RegionRandom::Legacy(LegacyRandom::new(12345)),
+                construct: make_constructor(),
+                context: DrownedContext::default(),
+            },
+            huts: initial.clone(),
+            variants: &variants,
+            construct_hut: make_hut_constructor(),
+            condition,
+        };
+        let mixed = [
+            super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                entry: &entry,
+                starts: vec![
+                    super::super::super::structure_batch::PlannedStructureStart::OceanRuin(&start),
+                ],
+            },
+            super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                entry: &hut_entry,
+                starts: vec![
+                    super::super::super::structure_batch::PlannedStructureStart::Simple(&hut),
+                ],
+            },
+        ];
+        let (mut mixed_terrain, _, _, _) = super::super::tests::fixture();
+        let mut combined = make_adapter();
+        prepared.execute_with_mixed_structure_plan(&mut mixed_terrain, &mixed, &mut combined)?;
+        assert!(combined.huts[&key].state.spawned_witch && combined.huts[&key].state.spawned_cat);
+        assert_eq!(combined.ocean.context.special_calls, 4);
+        assert_eq!(mixed_terrain.recorded_generated_entities(center)?.len(), 6);
+
+        let (mut expected_terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = expected_terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = expected_terrain.decoration_region(&tags, &motion, writable)?;
+        let mut expected_start = make_start();
+        let mut expected_hut = hut.clone();
+        let mut expected_saved = initial[&key].clone();
+        let mut expected = make_adapter();
+        let mut decoration = entry.random(plan.decoration_seed());
+        region.place_ocean_ruin_start_with_initialized_drowned(
+            &mut expected_start,
+            &ice,
+            &water,
+            &bubbles,
+            &registry,
+            63,
+            clip,
+            &mut decoration,
+            &mut expected.ocean.region_random,
+            &mut expected.ocean.construct,
+            &mut expected.ocean.context,
+        )?;
+        let mut revisions: Vec<_> = expected_start
+            .pieces
+            .iter()
+            .map(|piece| ((entry.id.clone(), center), piece.bounds))
+            .collect();
+        revisions.push((key.clone(), expected_hut.bounds));
+        region.resume_swamp_hut_with_initialized_mobs(
+            &mut expected_hut,
+            &key.0,
+            &mut expected_saved,
+            clip,
+            &revisions,
+            &mut expected.ocean.region_random,
+            &variants,
+            &mut expected.construct_hut,
+            &mut expected.condition,
+        )?;
+        region.finish()?;
+        assert_eq!(
+            combined.ocean.region_random.next_long(),
+            expected.ocean.region_random.next_long()
+        );
+        assert_eq!(combined.huts[&key], expected_saved);
+        assert_eq!(
+            mixed_terrain.recorded_generated_entities(center)?,
+            expected_terrain.recorded_generated_entities(center)?
+        );
+
+        let earlier_hut = native_resources::structure_decoration::StructureDecorationEntry {
+            index: 0,
+            ..hut_entry.clone()
+        };
+        let later_ruin = native_resources::structure_decoration::StructureDecorationEntry {
+            index: 1,
+            ..entry.clone()
+        };
+        let mixed_failure = [
+            super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                entry: &earlier_hut,
+                starts: vec![
+                    super::super::super::structure_batch::PlannedStructureStart::Simple(&hut),
+                ],
+            },
+            super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                entry: &later_ruin,
+                starts: vec![
+                    super::super::super::structure_batch::PlannedStructureStart::OceanRuin(&start),
+                ],
+            },
+        ];
+        let (mut failed, _, _, _) = super::super::tests::fixture();
+        let before = failed.snapshot();
+        let mut combined = make_adapter();
+        combined.ocean.context.fail_on_special = Some(2);
+        let mut original_random = combined.ocean.region_random.clone();
+        let error = match prepared.execute_with_mixed_structure_plan(
+            &mut failed,
+            &mixed_failure,
+            &mut combined,
+        ) {
+            Ok(_) => bail!("expected an injected drowned initialization failure"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("injected difficulty failure"));
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        assert_eq!(combined.huts, initial);
+        assert_eq!(combined.ocean.context.special_calls, 0);
+        assert_eq!(
+            combined.ocean.region_random.next_long(),
+            original_random.next_long()
+        );
+        assert!(failed.recorded_generated_entities(center)?.is_empty());
         Ok(())
     }
 }

@@ -65,6 +65,88 @@ pub trait MixedOceanRuinPlacement {
         clip: native_core::beardifier::BoundingBox,
         random: &mut DecorationRandom,
     ) -> Result<()>;
+
+    /// Place a hut using the same region-random state as ocean ruins.
+    fn place_hut(
+        &mut self,
+        _region: &mut DecorationRegion<'_>,
+        _key: &super::structure_batch::TerrainStartKey,
+        _start: &mut native_resources::structure_start::SimpleStructureStart,
+        _clip: native_core::beardifier::BoundingBox,
+        _revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        bail!("mixed hut decoration context is missing")
+    }
+}
+
+/// Transactional hut and ocean-ruin callbacks sharing one region RNG.
+/// Callback clones must isolate their mutable state.
+#[derive(Clone)]
+pub struct MixedHutOceanPlacementContext<'a, C, W, H, P> {
+    pub ocean: OceanRuinPlacementContext<'a, C, W>,
+    pub huts: BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+    pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
+    pub construct_hut: H,
+    pub condition: P,
+}
+
+impl<C, W, H, P> MixedOceanRuinPlacement for MixedHutOceanPlacementContext<'_, C, W, H, P>
+where
+    C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+    W: super::ocean_ruin::DrownedMarkerContext,
+    H: Clone
+        + FnMut(
+            native_resources::structure_piece::swamp_hut::HutMob,
+        ) -> Result<super::FreshCreatureRandom>,
+    P: Clone
+        + FnMut(
+            &super::structure_batch::TerrainStartKey,
+            [i32; 3],
+            &World,
+            &Value,
+            native_core::beardifier::BoundingBox,
+            &[super::structure_batch::StructurePieceRevision],
+        ) -> Result<bool>,
+{
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.ocean.place(region, start, clip, random)
+    }
+
+    fn place_hut(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        let saved = self
+            .huts
+            .get_mut(key)
+            .context("swamp hut piece state is missing")?;
+        region.resume_swamp_hut_with_initialized_mobs(
+            start,
+            &key.0,
+            saved,
+            clip,
+            revisions,
+            &mut self.ocean.region_random,
+            self.variants,
+            &mut self.construct_hut,
+            &mut self.condition,
+        )?;
+        ensure!(
+            super::SavedSwampHutPiece::capture(start, saved.state)? == *saved,
+            "decorated hut state differs from its piece"
+        );
+        Ok(())
+    }
 }
 
 trait PlannedHutPlacement {
@@ -1864,8 +1946,48 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                     DecorationAction::Structure(index) => {
                         if let Some((plan, updated, ocean)) = mixed.as_mut() {
                             let mut random = plan[index].entry.random(self.plan.decoration_seed());
-                            for start in &mut updated[index] {
-                                match start {
+                            for start_index in 0..updated[index].len() {
+                                let is_hut = matches!(
+                                    &updated[index][start_index],
+                                    PreparedStructureStart::Simple(start)
+                                        if start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut
+                                            && (0..3).all(|axis| start.bounds.max[axis] >= clip.min[axis]
+                                                && start.bounds.min[axis] <= clip.max[axis])
+                                );
+                                let mut revisions = Vec::new();
+                                if is_hut {
+                                    for (entry, starts) in plan.iter().zip(updated.iter()) {
+                                        for start in starts {
+                                            match start {
+                                                PreparedStructureStart::Simple(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.push((key, start.bounds));
+                                                }
+                                                PreparedStructureStart::OceanRuin(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.extend(
+                                                        start.pieces.iter().map(|piece| {
+                                                            (key.clone(), piece.bounds)
+                                                        }),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                match &mut updated[index][start_index] {
                                     PreparedStructureStart::Simple(start) => {
                                         let intersects = (0..3).all(|axis| {
                                             start.bounds.max[axis] >= clip.min[axis]
@@ -1874,6 +1996,12 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                         if intersects {
                                             match start.kind {
                                                 native_resources::structure_start::SimpleStructureKind::BuriedTreasure => { region.place_buried_treasure(start, clip, &mut random)?; }
+                                                native_resources::structure_start::SimpleStructureKind::SwampHut => {
+                                                    let key = (plan[index].entry.id.clone(), ChunkPos { x: start.chunk[0], z: start.chunk[1] });
+                                                    let original = start.clone();
+                                                    ocean.place_hut(&mut region, &key, start, clip, &revisions)?;
+                                                    validate_decorated_hut_start(&original, start)?;
+                                                }
                                                 _ => bail!("mixed structure decoration context is missing"),
                                             }
                                         }
@@ -1962,6 +2090,26 @@ fn validate_decorated_ocean_start(
         let mut restored = before.clone();
         saved.restore(&mut restored, original.temperature)?;
     }
+    Ok(())
+}
+
+fn validate_decorated_hut_start(
+    original: &native_resources::structure_start::SimpleStructureStart,
+    updated: &native_resources::structure_start::SimpleStructureStart,
+) -> Result<()> {
+    ensure!(
+        original.kind == updated.kind
+            && original.chunk == updated.chunk
+            && original.generation_point == updated.generation_point
+            && original.orientation == updated.orientation
+            && original.terrain_adjustment == updated.terrain_adjustment
+            && [0, 2]
+                .into_iter()
+                .all(|axis| original.bounds.min[axis] == updated.bounds.min[axis]
+                    && original.bounds.max[axis] == updated.bounds.max[axis]),
+        "swamp hut start identity changed"
+    );
+    super::SavedSwampHutPiece::capture(updated, Default::default())?;
     Ok(())
 }
 

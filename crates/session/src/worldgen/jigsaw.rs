@@ -634,15 +634,116 @@ mod tests {
             .contains("jigsaw structure decoration")
         );
         let plan = StructurePreparationPlan::new([(target, GenerationStage::StructureReferences)])?;
+        let mut stages = batch.prepare_additional_stages(&plan, None)?;
+        let transferred = stages
+            .jigsaw_starts
+            .get(&target)
+            .context("jigsaw was not transferred")?
+            .get(&structure)
+            .context("city missing")?;
+        assert_eq!(transferred.to_tag(&structure)?, start.to_tag(&structure)?);
         assert!(
             format!(
                 "{:#}",
-                batch
-                    .prepare_additional_stages(&plan, None)
+                stages
+                    .mixed_decoration_plan(target, &schedule)
                     .err()
-                    .context("jigsaw transfer must be rejected")?
+                    .context("jigsaw decoration must be rejected")?
             )
-            .contains("jigsaw start transfer")
+            .contains("jigsaw structure decoration")
+        );
+        let refs = stages
+            .references
+            .get(&target)
+            .context("missing staged references")?;
+        let sources = super::super::structure_data::referenced_start_chunks_with_jigsaw(
+            target,
+            &stages.starts,
+            &stages.ocean_starts,
+            &stages.mineshafts,
+            &stages.jigsaw_starts,
+            refs,
+            &stages.huts,
+        )?;
+        assert!(sources.contains(&target));
+        let data = super::super::structure_data::pack_structure_data_with_jigsaw(
+            target,
+            &stages.starts[&target],
+            stages
+                .ocean_starts
+                .get(&target)
+                .unwrap_or(&Default::default()),
+            stages
+                .mineshafts
+                .get(&target)
+                .unwrap_or(&Default::default()),
+            &stages.jigsaw_starts[&target],
+            refs,
+            &stages.huts,
+        )?;
+        assert_eq!(
+            data.get("starts")
+                .and_then(|tag| tag.get("minecraft:ancient_city")),
+            Some(&start.to_tag(&structure)?)
+        );
+        // An unsupported inline holder must abort the entire draft.
+        let original = stages.jigsaw_starts[&target][&structure].clone();
+        let first = &mut stages
+            .jigsaw_starts
+            .get_mut(&target)
+            .unwrap()
+            .get_mut(&structure)
+            .unwrap()
+            .pieces[0]
+            .element;
+        if let PoolElement::Single { processors, .. } = first {
+            *processors = native_resources::structure_pool::HolderValue::Inline(
+                serde_json::json!({"processors":[]}),
+            );
+        } else {
+            anyhow::bail!("expected a single city center");
+        }
+        assert!(
+            super::super::structure_data::pack_structure_data_with_jigsaw(
+                target,
+                &stages.starts[&target],
+                &Default::default(),
+                &Default::default(),
+                &stages.jigsaw_starts[&target],
+                refs,
+                &stages.huts
+            )
+            .is_err()
+        );
+        stages
+            .jigsaw_starts
+            .get_mut(&target)
+            .unwrap()
+            .insert(structure.clone(), original);
+        let registry: std::collections::BTreeSet<_> = provider
+            .inner
+            .vanilla_generated_block_registry()?
+            .ids()
+            .map(str::to_owned)
+            .collect();
+        let tags = native_resources::carver::tags::CarverBlockTags::load(&mut provider, &registry)?;
+        let moved = super::super::FreshTerrainBatch::new_with_prepared_structures(
+            batch,
+            std::collections::BTreeMap::from([(target, order)]),
+            tags,
+            "minecraft:overworld",
+        )?;
+        assert!(moved.structure_starts(target).is_none());
+        assert_eq!(
+            moved
+                .jigsaw_starts(target)
+                .context("jigsaw missing from terrain batch")?[&structure]
+                .to_tag(&structure)?,
+            start.to_tag(&structure)?
+        );
+        assert!(
+            moved.structure_data(target).is_err(),
+            "unfinished features must not expose save data"
         );
         Ok(())
     }

@@ -478,13 +478,27 @@ fn ruin_structures_with_piece(
                 .ocean_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let mine = structures
+                .mineshafts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            let jigsaw = structures
+                .jigsaw_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
-                simple.is_some() != ocean.is_some(),
+                usize::from(simple.is_some())
+                    + usize::from(ocean.is_some())
+                    + usize::from(mine.is_some())
+                    + usize::from(jigsaw.is_some())
+                    == 1,
                 "ruin spawn referenced structure is missing or ambiguous"
             );
             let actual_chunk = simple
                 .map(|start| start.chunk)
                 .or_else(|| ocean.map(|start| start.chunk))
+                .or_else(|| mine.map(|start| start.chunk))
+                .or_else(|| jigsaw.map(|start| start.chunk))
                 .context("ruin structure missing")?;
             ensure!(
                 actual_chunk == [source.x, source.z],
@@ -504,8 +518,15 @@ fn ruin_structures_with_piece(
                 revised.any(|(_, bounds)| contains(bounds))
             } else if let Some(start) = simple {
                 contains(&start.bounds)
+            } else if let Some(start) = ocean {
+                start.pieces.iter().any(|piece| contains(&piece.bounds))
+            } else if let Some(start) = mine {
+                start
+                    .pieces
+                    .iter()
+                    .any(|piece| contains(&piece.piece.bounds))
             } else {
-                ocean
+                jigsaw
                     .expect("one start was validated")
                     .pieces
                     .iter()
@@ -952,13 +973,27 @@ pub(super) fn native_cat_condition(
                     .ocean_starts
                     .get(&source)
                     .and_then(|starts| starts.get(id));
+                let mine = all_structures
+                    .mineshafts
+                    .get(&source)
+                    .and_then(|starts| starts.get(id));
+                let jigsaw = all_structures
+                    .jigsaw_starts
+                    .get(&source)
+                    .and_then(|starts| starts.get(id));
                 ensure!(
-                    simple.is_some() != ocean.is_some(),
+                    usize::from(simple.is_some())
+                        + usize::from(ocean.is_some())
+                        + usize::from(mine.is_some())
+                        + usize::from(jigsaw.is_some())
+                        == 1,
                     "cat spawn referenced structure is missing or ambiguous"
                 );
                 let start_chunk = simple
                     .map(|start| start.chunk)
                     .or_else(|| ocean.map(|start| start.chunk))
+                    .or_else(|| mine.map(|start| start.chunk))
+                    .or_else(|| jigsaw.map(|start| start.chunk))
                     .context("cat spawn referenced structure is missing")?;
                 ensure!(
                     start_chunk == [source.x, source.z],
@@ -977,8 +1012,15 @@ pub(super) fn native_cat_condition(
                     matching_revisions.any(|(_, piece)| contains(piece))
                 } else if let Some(start) = simple {
                     contains(&start.bounds)
+                } else if let Some(start) = ocean {
+                    start.pieces.iter().any(|piece| contains(&piece.bounds))
+                } else if let Some(start) = mine {
+                    start
+                        .pieces
+                        .iter()
+                        .any(|piece| contains(&piece.piece.bounds))
                 } else {
-                    ocean
+                    jigsaw
                         .expect("one start was validated")
                         .pieces
                         .iter()
@@ -1794,6 +1836,61 @@ impl GenerationSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ruin_variant_lookup_checks_jigsaw_piece_bounds() -> Result<()> {
+        use super::super::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            packs::ResourceId,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, Projection},
+            structure_transform::Rotation,
+        };
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:jigsaw")?;
+        let piece = |min, max| Piece {
+            element: PoolElement::Feature {
+                feature: HolderValue::Reference(ResourceId::parse("example:tree").unwrap()),
+                projection: Projection::Rigid,
+            },
+            origin: min,
+            rotation: Rotation::None,
+            bounds: BoundingBox::new(min, max).unwrap(),
+            ground_level_delta: 1,
+            junctions: vec![],
+        };
+        let start = super::super::jigsaw::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::ApplyWaterlogging,
+            pieces: vec![piece([2, 1, 2], [4, 5, 4]), piece([12, 1, 2], [14, 5, 4])],
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let mut stages = super::super::structure_batch::PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .jigsaw_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(
+            source,
+            collect_ordered_structure_references(source, |pos| {
+                Ok(if pos == source {
+                    vec![bounds.clone()]
+                } else {
+                    vec![]
+                })
+            })?,
+        );
+        let current = (ResourceId::parse("example:other")?, source);
+        assert_eq!(
+            ruin_structures_with_piece(&stages, [13, 3, 3], &current, &[], &[])?,
+            BTreeSet::from([id])
+        );
+        assert!(ruin_structures_with_piece(&stages, [8, 3, 3], &current, &[], &[])?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn ruin_variant_structure_lookup_uses_current_and_revised_pieces() -> Result<()> {

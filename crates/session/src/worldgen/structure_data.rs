@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     SavedSwampHutPiece,
-    structure_batch::{MineshaftStarts, OceanRuinStarts, SimpleStarts, TerrainStartKey},
+    structure_batch::{
+        JigsawStarts, MineshaftStarts, OceanRuinStarts, SimpleStarts, TerrainStartKey,
+    },
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
     },
@@ -45,11 +47,33 @@ pub(super) fn referenced_start_chunks_with_ocean(
 }
 
 /// Recompute every reference from all supported starts, including mineshafts.
+#[cfg(test)]
 pub(super) fn referenced_start_chunks_with_mineshaft(
     pos: ChunkPos,
     all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
     all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
     all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<BTreeSet<ChunkPos>> {
+    referenced_start_chunks_with_jigsaw(
+        pos,
+        all_starts,
+        all_ocean,
+        all_mineshafts,
+        &BTreeMap::new(),
+        references,
+        huts,
+    )
+}
+
+/// Recompute every reference, retaining jigsaw source chunks as well.
+pub(super) fn referenced_start_chunks_with_jigsaw(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
+    all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
+    all_jigsaw: &BTreeMap<ChunkPos, JigsawStarts>,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
@@ -87,6 +111,22 @@ pub(super) fn referenced_start_chunks_with_mineshaft(
                 bounds.push(start.reference_bounds(id.clone())?);
             }
         }
+        if let Some(jigsaws) = all_jigsaw.get(&source) {
+            for (id, start) in jigsaws {
+                ensure!(
+                    !simple.contains_key(id)
+                        && !all_ocean
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_mineshafts
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id)),
+                    "duplicate structure start"
+                );
+                validate_jigsaw_start(source, id, start)?;
+                bounds.push(start.reference_bounds(id.clone())?);
+            }
+        }
         Ok(bounds)
     })?;
     ensure!(
@@ -110,23 +150,39 @@ pub(super) fn referenced_start_chunks_with_mineshaft(
             let mineshaft = all_mineshafts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
-            match (simple, ocean, mineshaft) {
-                (Some(start), None, None) => {
+            let jigsaw = all_jigsaw.get(&source).and_then(|starts| starts.get(id));
+            match (simple, ocean, mineshaft, jigsaw) {
+                (Some(start), None, None, None) => {
                     validate_start(source, id, start, huts)?;
                 }
-                (None, Some(start), None) => {
+                (None, Some(start), None, None) => {
                     validate_ocean_start(source, start)?;
                 }
-                (None, None, Some(start)) => {
+                (None, None, Some(start), None) => {
                     validate_mineshaft_start(source, id, start)?;
                 }
-                (None, None, None) => anyhow::bail!("referenced structure start is missing"),
+                (None, None, None, Some(start)) => {
+                    validate_jigsaw_start(source, id, start)?;
+                }
+                (None, None, None, None) => anyhow::bail!("referenced structure start is missing"),
                 _ => anyhow::bail!("duplicate structure start"),
             }
             required.insert(source);
         }
     }
     Ok(required)
+}
+
+fn validate_jigsaw_start(
+    pos: ChunkPos,
+    id: &ResourceId,
+    start: &super::jigsaw::PreparedStart,
+) -> Result<Tag> {
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "jigsaw belongs to another chunk"
+    );
+    start.to_tag(id)
 }
 
 fn validate_mineshaft_start(
@@ -256,11 +312,33 @@ pub(super) fn pack_structure_data_with_ocean(
 }
 
 /// Serialize supported fresh starts and their ordered references together.
+#[cfg(test)]
 pub(super) fn pack_structure_data_with_mineshaft(
     pos: ChunkPos,
     starts: &SimpleStarts,
     ocean: &OceanRuinStarts,
     mineshafts: &MineshaftStarts,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Tag> {
+    pack_structure_data_with_jigsaw(
+        pos,
+        starts,
+        ocean,
+        mineshafts,
+        &JigsawStarts::new(),
+        references,
+        huts,
+    )
+}
+
+/// Serialize supported starts, including jigsaw pieces, without writing a world.
+pub(super) fn pack_structure_data_with_jigsaw(
+    pos: ChunkPos,
+    starts: &SimpleStarts,
+    ocean: &OceanRuinStarts,
+    mineshafts: &MineshaftStarts,
+    jigsaws: &JigsawStarts,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
@@ -322,6 +400,15 @@ pub(super) fn pack_structure_data_with_mineshaft(
             "duplicate structure start"
         );
         let value = validate_mineshaft_start(pos, id, start)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        packed_starts.push((name.as_str().into(), value));
+    }
+    for (id, start) in jigsaws {
+        ensure!(
+            !starts.contains_key(id) && !ocean.contains_key(id) && !mineshafts.contains_key(id),
+            "duplicate structure start"
+        );
+        let value = validate_jigsaw_start(pos, id, start)?;
         let name = format!("{}:{}", id.namespace, id.path);
         packed_starts.push((name.as_str().into(), value));
     }
@@ -392,6 +479,146 @@ mod tests {
                 pieces,
             },
         )
+    }
+
+    #[test]
+    fn jigsaw_draft_preserves_sources_and_rejects_invalid_inputs() -> Result<()> {
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, Projection},
+            structure_transform::Rotation,
+        };
+        let pos = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:jigsaw")?;
+        let start = super::super::jigsaw::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 10, 8],
+            terrain_adjustment: TerrainAdjustment::BeardThin,
+            liquid_settings: LiquidSettings::ApplyWaterlogging,
+            pieces: vec![Piece {
+                element: PoolElement::Single {
+                    legacy: false,
+                    location: ResourceId::parse("example:room")?,
+                    processors: HolderValue::Reference(ResourceId::parse("minecraft:empty")?),
+                    projection: Projection::Rigid,
+                    override_liquid_settings: None,
+                },
+                origin: [8, 10, 8],
+                rotation: Rotation::None,
+                bounds: BoundingBox::new([8, 10, 8], [10, 12, 10]).unwrap(),
+                ground_level_delta: 1,
+                junctions: vec![],
+            }],
+        };
+        let mut simple = BTreeMap::new();
+        for x in -8..=8 {
+            for z in -8..=8 {
+                simple.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        let mut all = BTreeMap::from([(pos, JigsawStarts::from([(id.clone(), start.clone())]))]);
+        let refs = collect_ordered_structure_references(pos, |source| {
+            if source == pos {
+                Ok(vec![start.reference_bounds(id.clone())?])
+            } else {
+                Ok(vec![])
+            }
+        })?;
+        assert_eq!(
+            referenced_start_chunks_with_jigsaw(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &all,
+                &refs,
+                &BTreeMap::new()
+            )?,
+            BTreeSet::from([pos])
+        );
+        let draft = pack_structure_data_with_jigsaw(
+            pos,
+            &simple[&pos],
+            &OceanRuinStarts::new(),
+            &MineshaftStarts::new(),
+            &all[&pos],
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        assert_eq!(
+            draft
+                .get("starts")
+                .and_then(|tag| tag.get("example:jigsaw")),
+            Some(&start.to_tag(&id)?)
+        );
+        let empty = collect_ordered_structure_references(pos, |_| Ok(vec![]))?;
+        assert!(
+            referenced_start_chunks_with_jigsaw(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &all,
+                &empty,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        all.get_mut(&pos).unwrap().get_mut(&id).unwrap().chunk[0] = 1;
+        assert!(
+            referenced_start_chunks_with_jigsaw(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &all,
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            pack_structure_data_with_jigsaw(
+                pos,
+                &simple[&pos],
+                &OceanRuinStarts::new(),
+                &MineshaftStarts::new(),
+                &all[&pos],
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        all.get_mut(&pos).unwrap().insert(id.clone(), start);
+        let mut duplicate = fixture(pos, 90, true).0;
+        let treasure = duplicate.pop_first().unwrap().1;
+        duplicate.insert(id.clone(), treasure);
+        assert!(
+            pack_structure_data_with_jigsaw(
+                pos,
+                &duplicate,
+                &OceanRuinStarts::new(),
+                &MineshaftStarts::new(),
+                &all[&pos],
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        simple.insert(pos, duplicate);
+        assert!(
+            referenced_start_chunks_with_jigsaw(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &all,
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

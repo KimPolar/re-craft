@@ -885,7 +885,8 @@ impl FreshTerrainBatch {
             .then(|| {
                 let structures = self.structures.as_ref()?;
                 (!structures.ocean_starts.contains_key(&pos)
-                    && !structures.mineshafts.contains_key(&pos))
+                    && !structures.mineshafts.contains_key(&pos)
+                    && !structures.jigsaw_starts.contains_key(&pos))
                 .then(|| structures.starts.get(&pos))
                 .flatten()
             })
@@ -912,6 +913,13 @@ impl FreshTerrainBatch {
             .flatten()
     }
 
+    /// Intermediate jigsaw starts retained for later decoration.
+    pub fn jigsaw_starts(&self, pos: ChunkPos) -> Option<&super::structure_batch::JigsawStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.jigsaw_starts.get(&pos))
+            .flatten()
+    }
+
     /// Build intermediate 26.3 structure NBT after the batch finishes FEATURES.
     /// The returned data does not establish that the world is safe to save.
     pub fn structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
@@ -926,7 +934,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::pack_structure_data_with_mineshaft(
+        super::structure_data::pack_structure_data_with_jigsaw(
             pos,
             structures
                 .starts
@@ -938,6 +946,10 @@ impl FreshTerrainBatch {
                 .unwrap_or(&Default::default()),
             structures
                 .mineshafts
+                .get(&pos)
+                .unwrap_or(&Default::default()),
+            structures
+                .jigsaw_starts
                 .get(&pos)
                 .unwrap_or(&Default::default()),
             structures
@@ -962,11 +974,12 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::referenced_start_chunks_with_mineshaft(
+        super::structure_data::referenced_start_chunks_with_jigsaw(
             pos,
             &structures.starts,
             &structures.ocean_starts,
             &structures.mineshafts,
+            &structures.jigsaw_starts,
             structures
                 .references
                 .get(&pos)
@@ -1237,10 +1250,15 @@ fn structures_with_piece_at(
                 .mineshafts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let jigsaw = structures
+                .jigsaw_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
                 usize::from(simple.is_some())
                     + usize::from(ocean.is_some())
                     + usize::from(mineshaft.is_some())
+                    + usize::from(jigsaw.is_some())
                     == 1,
                 "spawn referenced structure is missing or ambiguous"
             );
@@ -1259,8 +1277,7 @@ fn structures_with_piece_at(
                     "spawn structure source differs"
                 );
                 start.pieces.iter().any(|piece| contains(&piece.bounds))
-            } else {
-                let start = mineshaft.expect("one start was validated");
+            } else if let Some(start) = mineshaft {
                 ensure!(
                     start.chunk == [source.x, source.z],
                     "spawn structure source differs"
@@ -1269,6 +1286,13 @@ fn structures_with_piece_at(
                     .pieces
                     .iter()
                     .any(|piece| contains(&piece.piece.bounds))
+            } else {
+                let start = jigsaw.expect("one start was validated");
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                start.pieces.iter().any(|piece| contains(&piece.bounds))
             };
             if inside {
                 matching.insert(id.clone());
@@ -1565,9 +1589,17 @@ impl FreshTerrainBatch {
                 .all(|pos| !existing.mineshafts.contains_key(pos)),
             "expanded mineshaft state already exists"
         );
+        ensure!(
+            added
+                .jigsaw_starts
+                .keys()
+                .all(|pos| !existing.jigsaw_starts.contains_key(pos)),
+            "expanded jigsaw state already exists"
+        );
         existing.starts.extend(added.starts);
         existing.ocean_starts.extend(added.ocean_starts);
         existing.mineshafts.extend(added.mineshafts);
+        existing.jigsaw_starts.extend(added.jigsaw_starts);
         existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);
@@ -4884,6 +4916,63 @@ mod entity_source_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn animal_structure_conditions_use_individual_jigsaw_pieces() {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, Projection},
+            structure_transform::Rotation,
+        };
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:jigsaw").unwrap();
+        let piece = |min, max| Piece {
+            element: PoolElement::Feature {
+                feature: HolderValue::Reference(ResourceId::parse("example:tree").unwrap()),
+                projection: Projection::Rigid,
+            },
+            origin: min,
+            rotation: Rotation::None,
+            bounds: BoundingBox::new(min, max).unwrap(),
+            ground_level_delta: 1,
+            junctions: vec![],
+        };
+        let start = crate::worldgen::jigsaw::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [0, 0, 0],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::ApplyWaterlogging,
+            pieces: vec![piece([2, 1, 2], [4, 5, 4]), piece([12, 1, 2], [14, 5, 4])],
+        };
+        let bounds = start.reference_bounds(id.clone()).unwrap();
+        let references = collect_ordered_structure_references(source, |pos| {
+            Ok(if pos == source {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        let mut stages = PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .jigsaw_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(source, references);
+        assert_eq!(
+            structures_with_piece_at(Some(&stages), [13, 3, 3]).unwrap(),
+            BTreeSet::from([id.clone()])
+        );
+        assert!(
+            structures_with_piece_at(Some(&stages), [8, 3, 3])
+                .unwrap()
+                .is_empty()
+        );
+        stages.jigsaw_starts.clear();
+        assert!(structures_with_piece_at(Some(&stages), [13, 3, 3]).is_err());
     }
 
     #[test]

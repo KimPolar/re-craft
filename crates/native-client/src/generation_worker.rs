@@ -768,7 +768,8 @@ impl GenerationReady {
             targets.contains(&player_chunk),
             "generated player is outside light-complete targets"
         );
-        let mut world = generated_session_world(&mesh.world, &targets);
+        let mut world =
+            generated_session_world(&mesh.world, &targets, self.postprocessed.is_some());
         ensure!(
             world.chunks.len() == targets.len(),
             "generated session target is missing"
@@ -1024,6 +1025,7 @@ fn generated_session_block_entities(
 fn generated_session_world(
     source: &native_world::loaded::World,
     targets: &BTreeSet<ChunkPos>,
+    converted_ticks: bool,
 ) -> native_world::loaded::World {
     let mut world = source.clone();
     world.chunks.retain(|pos, _| targets.contains(pos));
@@ -1034,6 +1036,12 @@ fn generated_session_world(
     world
         .saved_fluid_ticks
         .retain(|pos, _| targets.contains(pos));
+    if converted_ticks {
+        // The activated LevelChunk queues are installed separately below.
+        // Retaining the protochunk lists here would enqueue them a second time.
+        world.saved_block_ticks.clear();
+        world.saved_fluid_ticks.clear();
+    }
     world
         .saved_block_entities
         .retain(|pos, _| targets.contains(pos));
@@ -5913,7 +5921,7 @@ mod tests {
                 .insert(pos, SavedBlockEntities::Empty);
             source.missing_chunks.insert(pos);
         }
-        let world = generated_session_world(&source, &BTreeSet::from([home]));
+        let world = generated_session_world(&source, &BTreeSet::from([home]), false);
         assert_eq!(world.chunks.len(), 1);
         assert!(Arc::ptr_eq(&world.chunks[&home], &source.chunks[&home]));
         assert_eq!(
@@ -5944,6 +5952,58 @@ mod tests {
         assert_eq!(source.saved_block_ticks.len(), 2);
         assert_eq!(source.saved_fluid_ticks.len(), 2);
         assert_eq!(source.chunks.len(), 2);
+        let converted = generated_session_world(&source, &BTreeSet::from([home]), true);
+        assert!(converted.saved_block_ticks.is_empty());
+        assert!(converted.saved_fluid_ticks.is_empty());
+        assert_eq!(
+            converted
+                .saved_block_entities
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![home]
+        );
+        let player = native_session::PlayerState {
+            position: glam::Vec3::new(0.5, 4.0, 0.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = native_session::loaded::LoadedSession::new(
+            converted,
+            glam::IVec3::ZERO,
+            native_session::loaded::BuildBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            player,
+        )
+        .unwrap();
+        use native_session::worldgen::chunk_ticks::{
+            ActivatedChunkTicks, ActivatedRegionTicks, ScheduledTick,
+        };
+        let tick = |kind: &str, y, sub_tick| ScheduledTick {
+            kind: kind.into(),
+            position: [0, y, 0],
+            trigger: 5,
+            priority: 0,
+            sub_tick,
+        };
+        let activated = ActivatedRegionTicks {
+            game_time: 0,
+            next_sub_tick: 2,
+            chunks: BTreeMap::from([(
+                home,
+                ActivatedChunkTicks {
+                    blocks: vec![tick("minecraft:sand", 2, 0)],
+                    fluids: vec![tick("minecraft:water", 3, 1)],
+                },
+            )]),
+        };
+        session.install_generated_ticks(&activated).unwrap();
+        assert!(session.install_generated_ticks(&activated).is_err());
     }
 
     #[test]

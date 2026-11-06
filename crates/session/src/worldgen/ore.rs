@@ -532,6 +532,7 @@ pub struct DecorationRegion<'a> {
     pending_monster_spawners: usize,
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
+    pile_block_write: bool,
     column_block_write: bool,
     patch_block_write: bool,
     multiface_block_write: bool,
@@ -3185,6 +3186,7 @@ impl CarvedTerrainWorld {
             pending_monster_spawners: 0,
             light_guard: None,
             tree_block_write: false,
+            pile_block_write: false,
             column_block_write: false,
             patch_block_write: false,
             multiface_block_write: false,
@@ -6348,7 +6350,10 @@ impl BlockPileWorld for DecorationRegion<'_> {
                 && !self.bee_nests.contains_key(&pos),
             "unsupported block pile replacement source"
         );
-        self.set_proto_block(pos, state)
+        self.pile_block_write = true;
+        let result = self.set_proto_block(pos, state);
+        self.pile_block_write = false;
+        result
     }
 }
 
@@ -7105,6 +7110,11 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 state.name.as_str(),
                                 "minecraft:dark_oak_log" | "minecraft:birch_log"
                             ) && tree_generated_log(state)));
+                    // Block piles only replace air with one of the verified
+                    // vanilla states accepted by set_pile_block.
+                    let pile_light_update = self.pile_block_write
+                        && old_air
+                        && (pile_safe_full_block(state) || pile_snow_layer(state));
                     let patch_water = self.patch_block_write
                         && old.name == "minecraft:clay"
                         && old.properties.is_empty()
@@ -7183,6 +7193,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
+                                || pile_light_update
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
@@ -7198,6 +7209,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // allocation, the checked stored light remains zero.
                     ensure!(
                         tree_light_update
+                            || pile_light_update
                             || fresh_patch_water
                             || staged_patch_water
                             || fresh_water_dripleaf
@@ -7235,7 +7247,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             }
                             count
                         };
-                        new_section = old_air && count == 0 && (tree_light_update || vine_write);
+                        new_section = old_air
+                            && count == 0
+                            && (tree_light_update || vine_write || pile_light_update);
                         ensure!(
                             if old_air {
                                 count > 0 || new_section
@@ -7252,6 +7266,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         }
                     }
                     if tree_light_update
+                        || pile_light_update
                         || fresh_patch_water
                         || staged_patch_water
                         || fresh_water_dripleaf
@@ -7265,6 +7280,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         let guard = self.light_guard.as_mut().unwrap();
                         guard.light_replay_positions.insert(p);
                         if vine_write
+                            || (pile_light_update && guard.require_unchanged_light)
                             || water_lichen_write
                             || lake_light_update
                             || magma_light_update
@@ -7273,6 +7289,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             guard.vine_light_positions.insert(p);
                         }
                         if tree_light_update
+                            || pile_light_update
                             || vine_check
                             || lichen_check
                             || lake_light_update
@@ -11361,6 +11378,30 @@ mod tests {
         check_staged_light_modes(&["vine_active_magma_block", "vine_active_self_magma_block"]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_village_piles_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_pile_snow",
+            "vine_active_self_pile_snow",
+            "vine_active_pile_hay",
+            "vine_active_self_pile_hay",
+            "vine_active_pile_ice",
+            "vine_active_self_pile_ice",
+            "vine_active_pile_lantern",
+            "vine_active_self_pile_lantern",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_village_piles_allocate_empty_sections_like_java() {
+        check_staged_light_modes(&[
+            "vine_active_empty_pile_snow",
+            "vine_active_self_empty_pile_lantern",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11551,6 +11592,30 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_pile_") {
+                    let mut block = state(if mode.ends_with("_pile_snow") {
+                        "snow"
+                    } else if mode.ends_with("_pile_hay") {
+                        "hay_block"
+                    } else if mode.ends_with("_pile_ice") {
+                        "blue_ice"
+                    } else if mode.ends_with("_pile_melon") {
+                        "melon"
+                    } else if mode.ends_with("_pile_pumpkin") {
+                        "pumpkin"
+                    } else {
+                        "jack_o_lantern"
+                    });
+                    if mode.ends_with("_pile_snow") {
+                        block.properties.insert("layers".into(), "1".into());
+                    } else if mode.ends_with("_pile_hay") {
+                        block.properties.insert("axis".into(), "y".into());
+                    } else if mode.ends_with("_pile_lantern") {
+                        block.properties.insert("facing".into(), "north".into());
+                    }
+                    BlockPileWorld::set_pile_block(&mut draft, p, &block).unwrap();
+                    continue;
+                }
                 if mode.ends_with("_magma_block") {
                     assert!(MagmaWorld::set_magma(&mut draft, p, &state("magma_block")).unwrap());
                     let marks = &draft.feature_marks[&east];

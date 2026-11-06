@@ -518,7 +518,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (1, 0)
         }
-        "minecraft:basalt" | "minecraft:deepslate" | "minecraft:muddy_mangrove_roots"
+        "minecraft:basalt"
+        | "minecraft:deepslate"
+        | "minecraft:muddy_mangrove_roots"
+        | "minecraft:hay_block"
             if state.properties.len() == 1 && axis() =>
         {
             (15, 0)
@@ -549,7 +552,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             (15, 15)
         }
         "minecraft:magma_block" if state.properties.is_empty() => (15, 3),
+        "minecraft:jack_o_lantern" if state.properties.len() == 1 && facing() => (15, 15),
         "minecraft:stone"
+        | "minecraft:melon"
+        | "minecraft:pumpkin"
         | "minecraft:dirt"
         | "minecraft:granite"
         | "minecraft:diorite"
@@ -2284,6 +2290,10 @@ mod tests {
             "frosted_ice",
             "packed_ice",
             "blue_ice",
+            "hay_block",
+            "melon",
+            "pumpkin",
+            "jack_o_lantern",
             "bamboo_mosaic",
             "mangrove_roots",
             "muddy_mangrove_roots",

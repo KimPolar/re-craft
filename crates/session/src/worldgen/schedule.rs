@@ -263,6 +263,7 @@ where
         + FnMut(
             [i32; 3],
             &native_world::loaded::World,
+            &super::BiomeNeighborhood,
         ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
     H: Clone + FnMut() -> Result<bool>,
 {

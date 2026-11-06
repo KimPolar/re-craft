@@ -590,7 +590,11 @@ mod tests {
                 })?,
             )?;
             let mut combined_entity = LegacyRandom::new(entity_seed);
-            cases.push(serde_json::json!({"path":combined_path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":combined_random.next_long(),"next_entity":combined_entity.next_long(),"chicken_snapshot":true,"combined":true,"egg":egg}));
+            let phase = snapshots % 8;
+            let brightness_bits = native_resources::moon_phase::Phase::ALL[phase]
+                .brightness()
+                .to_bits();
+            cases.push(serde_json::json!({"path":combined_path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":combined_random.next_long(),"next_entity":combined_entity.next_long(),"chicken_snapshot":true,"combined":true,"egg":egg,"moon_phase":phase,"moon_brightness_bits":brightness_bits}));
             let path = temp.path().join(format!("chicken-rider-{i}.nbt"));
             std::fs::write(
                 &path,

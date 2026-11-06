@@ -3467,7 +3467,12 @@ impl FreshTerrainBatch {
     where
         C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
         E: super::ocean_ruin::DrownedSpawnEffects,
-        D: Clone + FnMut([i32; 3], &World) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
+        D: Clone
+            + FnMut(
+                [i32; 3],
+                &World,
+                &super::BiomeNeighborhood,
+            ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
         H: Clone + FnMut() -> Result<bool>,
     {
         ensure!(

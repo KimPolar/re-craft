@@ -47,6 +47,17 @@ impl Phase {
         Self::ALL.iter().position(|phase| *phase == self).unwrap()
     }
 
+    /// Java's DimensionType.MOON_BRIGHTNESS_PER_PHASE value.
+    pub fn brightness(self) -> f32 {
+        match self {
+            Self::FullMoon => 1.0,
+            Self::WaningGibbous | Self::WaxingGibbous => 0.75,
+            Self::ThirdQuarter | Self::FirstQuarter => 0.5,
+            Self::WaningCrescent | Self::WaxingCrescent => 0.25,
+            Self::NewMoon => 0.0,
+        }
+    }
+
     pub fn parse(value: &Value) -> Result<Self> {
         let value = value.as_str().context("invalid moon phase")?;
         Self::ALL

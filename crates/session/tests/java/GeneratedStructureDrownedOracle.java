@@ -82,6 +82,10 @@ public class GeneratedStructureDrownedOracle {
         var tests=JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonArray();
         for(var entry:tests){
             var test=entry.getAsJsonObject();long regionSeed=test.get("region_seed").getAsLong(),entitySeed=test.get("entity_seed").getAsLong();
+            if(test.has("moon_phase")) {
+                float brightness=net.minecraft.world.level.dimension.DimensionType.MOON_BRIGHTNESS_PER_PHASE[test.get("moon_phase").getAsInt()];
+                if(Float.floatToRawIntBits(brightness)!=test.get("moon_brightness_bits").getAsInt())throw new AssertionError("moon brightness mismatch "+test);
+            }
             RandomSource random=test.get("legacy").getAsBoolean()?new LegacyRandomSource(regionSeed):new XoroshiroRandomSource(regionSeed);
             boolean snapshot=test.has("chicken_snapshot") && test.get("chicken_snapshot").getAsBoolean();
             boolean combined=test.has("combined") && test.get("combined").getAsBoolean();

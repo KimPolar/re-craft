@@ -7570,7 +7570,7 @@ mod tests {
                     bail!("unexpected drowned")
                 },
                 effects: NoDrowned,
-                difficulty_at: |_: [i32; 3], _: &World| {
+                difficulty_at: |_: [i32; 3], _: &World, _: &BiomeNeighborhood| {
                     Ok(ocean_ruin::GenerationDifficultyInputs {
                         difficulty: native_persistence::world::Difficulty::Normal,
                         overworld_clock_time: 0,

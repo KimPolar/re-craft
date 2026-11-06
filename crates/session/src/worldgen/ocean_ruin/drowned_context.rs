@@ -223,6 +223,39 @@ pub struct GenerationDifficultyInputs {
     pub moon_brightness: f32,
 }
 
+/// The complete clock snapshot and active dimension/biome moon layers used
+/// when a generation region asks the server for difficulty at a position.
+pub struct GenerationDifficultyEnvironment<'a> {
+    pub difficulty: Difficulty,
+    pub moon: &'a native_resources::moon_phase::Environment,
+    pub clocks: &'a std::collections::BTreeMap<native_resources::packs::ResourceId, i64>,
+}
+
+impl GenerationDifficultyEnvironment<'_> {
+    pub fn sample(
+        &self,
+        position: [i32; 3],
+        biomes: &BiomeNeighborhood,
+    ) -> Result<GenerationDifficultyInputs> {
+        let biome = if self.moon.has_biome_layer {
+            let id = biomes.biome_at_block(position[0], position[1], position[2])?;
+            Some(format!("{}:{}", id.namespace, id.path))
+        } else {
+            None
+        };
+        let phase = self
+            .moon
+            .sample(biome.as_deref(), |id| self.clocks.get(id).copied())
+            .context("moon phase environment or world clock unavailable")?;
+        let overworld = native_resources::packs::ResourceId::parse("minecraft:overworld")?;
+        Ok(GenerationDifficultyInputs {
+            difficulty: self.difficulty,
+            overworld_clock_time: self.clocks.get(&overworld).copied().unwrap_or(0),
+            moon_brightness: phase.brightness(),
+        })
+    }
+}
+
 /// Resources and mutable effects for structure drowned during a terrain batch.
 /// The batch supplies its current biome neighborhood at the FEATURES stage.
 /// Callback clones must isolate all mutable state until the pass succeeds.
@@ -288,7 +321,7 @@ pub struct DrownedGenerationContext<'a, E, D, H> {
 impl<E, D, H> DrownedMarkerContext for DrownedGenerationContext<'_, E, D, H>
 where
     E: DrownedSpawnEffects,
-    D: Clone + FnMut([i32; 3], &World) -> Result<GenerationDifficultyInputs>,
+    D: Clone + FnMut([i32; 3], &World, &BiomeNeighborhood) -> Result<GenerationDifficultyInputs>,
     H: Clone + FnMut() -> Result<bool>,
 {
     fn special_multiplier(&mut self, position: [i32; 3], world: &World) -> Result<f32> {
@@ -300,7 +333,7 @@ where
             world.chunks.contains_key(&chunk),
             "drowned difficulty chunk is unavailable"
         );
-        let inputs = (self.difficulty_at)(position, world)?;
+        let inputs = (self.difficulty_at)(position, world, self.biomes)?;
         Ok(LocalDifficulty::for_generation(
             inputs.difficulty,
             inputs.overworld_clock_time,
@@ -458,7 +491,7 @@ mod tests {
             }
         }
         let mut world = World::new("minecraft:overworld");
-        let difficulty_at = |_: [i32; 3], _: &World| {
+        let difficulty_at = |_: [i32; 3], _: &World, _: &BiomeNeighborhood| {
             Ok(GenerationDifficultyInputs {
                 difficulty: Difficulty::Hard,
                 overworld_clock_time: 0,
@@ -505,6 +538,85 @@ mod tests {
         assert!(!isolated.try_existing_chicken([1, 8, 1], &world)?);
         assert_eq!(isolated.effects.calls, 0);
         assert_eq!(context.effects.calls, 0);
+
+        use native_resources::moon_phase::{Environment, Phase, Track};
+        let moon = Environment {
+            base: Phase::FullMoon,
+            biomes: BTreeMap::from([
+                ("minecraft:ocean".into(), Some(Some(Phase::NewMoon))),
+                ("minecraft:river".into(), Some(Some(Phase::ThirdQuarter))),
+            ]),
+            has_biome_layer: true,
+            tracks: vec![],
+        };
+        let overworld = ResourceId::parse("minecraft:overworld")?;
+        let clocks = BTreeMap::from([(overworld, 900_000)]);
+        let difficulty = GenerationDifficultyEnvironment {
+            difficulty: Difficulty::Hard,
+            moon: &moon,
+            clocks: &clocks,
+        };
+        let mut saw = [false; 2];
+        for x in 0..16 {
+            for z in 0..16 {
+                let biome = biomes.biome_at_block(x, 8, z)?;
+                let values = difficulty.sample([x, 8, z], &biomes)?;
+                let expected = if biome == &ocean {
+                    saw[0] = true;
+                    0.0
+                } else {
+                    saw[1] = true;
+                    0.5
+                };
+                assert_eq!(values.moon_brightness, expected);
+                assert_eq!(values.overworld_clock_time, 900_000);
+                assert_eq!(values.difficulty, Difficulty::Hard);
+            }
+        }
+        assert!(saw.into_iter().all(|found| found));
+        let mut live_context = DrownedGenerationContext {
+            biomes: &biomes,
+            biome_tags: &tags,
+            difficulty_at: |pos, _: &World, biomes: &BiomeNeighborhood| {
+                difficulty.sample(pos, biomes)
+            },
+            halloween_at: || Ok(false),
+            effects: Effects::default(),
+        };
+        let values = difficulty.sample([1, 8, 1], &biomes)?;
+        assert_eq!(
+            live_context.special_multiplier([1, 8, 1], &world)?,
+            LocalDifficulty::for_generation(
+                values.difficulty,
+                values.overworld_clock_time,
+                values.moon_brightness
+            )
+            .special_multiplier()
+        );
+        let timed = Environment {
+            base: Phase::FullMoon,
+            biomes: BTreeMap::new(),
+            has_biome_layer: false,
+            tracks: vec![Track::parse(
+                &serde_json::json!({"clock":"example:moon","period_ticks":20}),
+                &serde_json::json!({"keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]}),
+            )?],
+        };
+        let without_clock = GenerationDifficultyEnvironment {
+            difficulty: Difficulty::Easy,
+            moon: &timed,
+            clocks: &clocks,
+        };
+        assert!(without_clock.sample([1, 8, 1], &biomes).is_err());
+        let timed_clocks = BTreeMap::from([(ResourceId::parse("example:moon")?, 10)]);
+        let with_clock = GenerationDifficultyEnvironment {
+            difficulty: Difficulty::Easy,
+            moon: &timed,
+            clocks: &timed_clocks,
+        };
+        let values = with_clock.sample([1, 8, 1], &biomes)?;
+        assert_eq!(values.moon_brightness, 0.0);
+        assert_eq!(values.overworld_clock_time, 0);
         Ok(())
     }
 

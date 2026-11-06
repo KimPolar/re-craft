@@ -2379,7 +2379,7 @@ mod tests {
         let mut context = super::super::super::ocean_ruin::DrownedGenerationContext {
             biomes: &biomes,
             biome_tags: &biome_tags,
-            difficulty_at: |_: [i32; 3], _: &World| {
+            difficulty_at: |_: [i32; 3], _: &World, _: &super::super::super::BiomeNeighborhood| {
                 Ok(
                     super::super::super::ocean_ruin::GenerationDifficultyInputs {
                         difficulty: native_persistence::world::Difficulty::Normal,
@@ -3060,7 +3060,7 @@ mod tests {
         // drowned initialization and publishes callbacks only on success.
         let make_difficulty = |fail: bool| {
             let mut calls = 0;
-            move |_: [i32; 3], _: &World| {
+            move |_: [i32; 3], _: &World, _: &super::super::super::BiomeNeighborhood| {
                 calls += 1;
                 ensure!(!fail || calls < 2, "injected difficulty lookup failure");
                 Ok(
@@ -3153,7 +3153,7 @@ mod tests {
         let make_context = || super::super::super::ocean_ruin::DrownedGenerationContext {
             biomes: &biomes,
             biome_tags: &biome_tags,
-            difficulty_at: |_: [i32; 3], _: &World| {
+            difficulty_at: |_: [i32; 3], _: &World, _: &super::super::super::BiomeNeighborhood| {
                 Ok(
                     super::super::super::ocean_ruin::GenerationDifficultyInputs {
                         difficulty: native_persistence::world::Difficulty::Hard,

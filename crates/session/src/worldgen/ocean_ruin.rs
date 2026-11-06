@@ -16,7 +16,8 @@ mod placement;
 mod saved_piece;
 pub use drowned_context::{
     DrownedChickenEffects, DrownedEquipmentEffects, DrownedGenerationContext,
-    DrownedPlacementInputs, DrownedSpawnEffects, GenerationDifficultyInputs,
+    DrownedPlacementInputs, DrownedSpawnEffects, GenerationDifficultyEnvironment,
+    GenerationDifficultyInputs,
 };
 pub use placement::OceanRuinPlacementWorld;
 pub use saved_piece::SavedOceanRuinPiece;

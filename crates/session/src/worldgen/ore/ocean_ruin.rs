@@ -35,6 +35,78 @@ struct RuinFloorWorld<'r, 'a, 't> {
 }
 
 impl DecorationRegion<'_> {
+    /// Place the pieces of one ocean-ruin start in their generation order.
+    /// Java checks each piece's current bounds against the chunk clip before
+    /// postprocessing it. All caller-owned state is staged until every piece
+    /// succeeds; the region itself remains unpublished until `finish`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_ocean_ruin_start_with_initialized_drowned<C, W>(
+        &mut self,
+        start: &mut super::super::ocean_ruin::PreparedStart,
+        ice_tags: &OreBlockTags,
+        water_fluids: &BTreeSet<String>,
+        bubble_fluids: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        sea_level: i32,
+        clip: BoundingBox,
+        decoration_random: &mut DecorationRandom,
+        region_random: &mut RegionRandom,
+        construct: &mut C,
+        context: &mut W,
+    ) -> Result<usize>
+    where
+        C: Clone + FnMut() -> Result<Option<super::super::FreshCreatureRandom>>,
+        W: super::super::ocean_ruin::DrownedMarkerContext,
+    {
+        ensure!(!self.failed, "generation attempt previously failed");
+        ensure!(
+            (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
+            "invalid ruin clipping box"
+        );
+        ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
+        ensure!(
+            start
+                .pieces
+                .iter()
+                .all(|piece| (0..3).all(|axis| piece.bounds.min[axis] <= piece.bounds.max[axis])),
+            "invalid ruin piece bounds"
+        );
+        let mut staged = start.clone();
+        let mut next_decoration = decoration_random.clone();
+        let mut next_random = region_random.clone();
+        let mut next_construct = construct.clone();
+        let mut next_context = context.clone();
+        let mut processed = 0;
+        for piece in &mut staged.pieces {
+            if !(0..3).all(|axis| {
+                piece.bounds.max[axis] >= clip.min[axis] && piece.bounds.min[axis] <= clip.max[axis]
+            }) {
+                continue;
+            }
+            self.place_ocean_ruin_piece_with_initialized_drowned(
+                piece,
+                ice_tags,
+                water_fluids,
+                bubble_fluids,
+                registry,
+                staged.temperature,
+                sea_level,
+                clip,
+                &mut next_decoration,
+                &mut next_random,
+                &mut next_construct,
+                &mut next_context,
+            )?;
+            processed += 1;
+        }
+        *start = staged;
+        *decoration_random = next_decoration;
+        *region_random = next_random;
+        *construct = next_construct;
+        *context = next_context;
+        Ok(processed)
+    }
+
     /// Run a complete ocean-ruin template piece against this unpublished
     /// region. The spawn callback must create the exact structure drowned;
     /// cloning it must isolate all callback state. The caller must stage the
@@ -2151,6 +2223,136 @@ mod tests {
                 .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
                 .len(),
             2
+        );
+
+        // A start can contain several pieces, and each chunk processes only
+        // the pieces whose current bounds intersect its clipping box.
+        let make_start = || {
+            let pieces = [1, 7, 20]
+                .into_iter()
+                .map(|x| {
+                    let mut piece = make_piece();
+                    piece.selection.position[0] = x;
+                    piece.bounds = BoundingBox::new([x, 15, 1], [x + 3, 15, 1]).unwrap();
+                    piece
+                })
+                .collect();
+            super::super::super::ocean_ruin::PreparedStart {
+                chunk: [0, 0],
+                generation_point: [8, 8, 8],
+                terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+                temperature: Temperature::Warm,
+                pieces,
+            }
+        };
+        let (mut start_terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = start_terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = start_terrain.decoration_region(&tags, &motion, writable)?;
+        let mut start = make_start();
+        let mut decoration = DecorationRandom::new(42);
+        let mut expected_decoration = decoration.clone();
+        expected_decoration.next_long();
+        expected_decoration.next_long();
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(12345));
+        let mut construct = make_constructor();
+        let mut context = DrownedContext::default();
+        assert_eq!(
+            region.place_ocean_ruin_start_with_initialized_drowned(
+                &mut start,
+                &ice,
+                &water,
+                &bubbles,
+                &registry,
+                63,
+                clip,
+                &mut decoration,
+                &mut random,
+                &mut construct,
+                &mut context,
+            )?,
+            2
+        );
+        assert_eq!(context.special_calls, 4);
+        assert_eq!(
+            start
+                .pieces
+                .iter()
+                .map(|piece| piece.selection.position[1])
+                .collect::<Vec<_>>(),
+            vec![8, 8, 15]
+        );
+        assert_eq!(decoration.next_long(), expected_decoration.next_long());
+        assert_eq!(region.generated_entities[&ChunkPos { x: 0, z: 0 }].len(), 4);
+        region.finish()?;
+        assert_eq!(
+            start_terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                .len(),
+            4
+        );
+
+        let (mut failed_terrain, tags, _, _) = super::super::tests::fixture();
+        let before = failed_terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = failed_terrain.decoration_region(&tags, &motion, writable)?;
+        let mut start = make_start();
+        let initial = start
+            .pieces
+            .iter()
+            .map(|piece| piece.selection.clone())
+            .collect::<Vec<_>>();
+        let mut decoration = DecorationRandom::new(42);
+        let mut original_decoration = decoration.clone();
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(12345));
+        let mut original_random = random.clone();
+        let mut construct = make_constructor();
+        let mut original_constructor = construct.clone();
+        let mut context = DrownedContext {
+            fail_on_special: Some(4),
+            ..Default::default()
+        };
+        let original_context = context.clone();
+        assert!(
+            region
+                .place_ocean_ruin_start_with_initialized_drowned(
+                    &mut start,
+                    &ice,
+                    &water,
+                    &bubbles,
+                    &registry,
+                    63,
+                    clip,
+                    &mut decoration,
+                    &mut random,
+                    &mut construct,
+                    &mut context,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            start
+                .pieces
+                .iter()
+                .map(|piece| piece.selection.clone())
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert_eq!(context, original_context);
+        assert_eq!(decoration.next_long(), original_decoration.next_long());
+        assert_eq!(random.next_long(), original_random.next_long());
+        assert_eq!(
+            construct()?.unwrap().construction,
+            original_constructor()?.unwrap().construction
+        );
+        assert!(region.finish().is_err());
+        assert_eq!(
+            failed_terrain.snapshot().block(1, 8, 1),
+            before.block(1, 8, 1)
+        );
+        assert!(
+            failed_terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                .is_empty()
         );
         Ok(())
     }

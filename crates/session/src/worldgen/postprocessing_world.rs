@@ -510,10 +510,24 @@ impl GeneratedPostprocessing {
         heightmaps: native_persistence::heightmap::FullHeightmaps,
         light: Option<VisibleLightSnapshot>,
     ) -> Result<()> {
+        self.register_converted_chunk_inner(pos, converted, entities, heightmaps, light, true)
+    }
+
+    pub(super) fn register_converted_chunk_inner(
+        &mut self,
+        pos: ChunkPos,
+        converted: super::postprocessing::ConvertedChunkPostprocessing,
+        entities: ConvertedBlockEntities,
+        heightmaps: native_persistence::heightmap::FullHeightmaps,
+        light: Option<VisibleLightSnapshot>,
+        required: bool,
+    ) -> Result<()> {
         self.check_registration(pos)?;
         self.region.ticks.register_chunk(pos, converted.ticks)?;
         self.region.tasks.insert(pos, converted.task);
-        self.required.insert(pos);
+        if required {
+            self.required.insert(pos);
+        }
         self.block_entities.insert(pos, entities);
         self.heightmaps.insert(pos, heightmaps);
         if let Some(light) = light {
@@ -3605,6 +3619,130 @@ mod tests {
         assert!(Arc::ptr_eq(&stage.world, &before_world));
         assert_eq!(stage.region.ticks.activated_snapshot(), before_ticks);
         assert!(!stage.failed && stage.active.is_none());
+    }
+
+    #[test]
+    fn deferred_neighbor_retries_target_without_replaying_completed_ticks() {
+        use super::super::chunk_ticks::TickRegistry;
+        let (tags_fixture, _) = bonus_chest_fixture();
+        let height_tags = tags_fixture.heightmap_tags.unwrap();
+        let (mut stage, _, first) = fixture(false);
+        let target = ChunkPos { x: 1, z: 0 };
+        let neighbor = ChunkPos { x: 2, z: 0 };
+        let world = Arc::make_mut(&mut stage.world);
+        for pos in [target, neighbor] {
+            let mut chunk = world.chunks[&first].as_ref().clone();
+            chunk.position = pos;
+            world.chunks.insert(pos, Arc::new(chunk));
+        }
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        world.set_block_id(31, 8, 8, water).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let task = |pos, mark| {
+            let mut marks = PostProcessing::new(0, 16).unwrap();
+            if mark {
+                marks.mark(31, 8, 8);
+            }
+            PostprocessingTask::new(Arc::new(marks), pos)
+        };
+        let empty = |pos| ConvertedChunkTicks {
+            blocks: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+        };
+        stage.region.tasks.insert(first, task(first, false));
+        while !stage.poll(first, 10).unwrap() {}
+        stage
+            .region
+            .ticks
+            .schedule(TickRegistry::Block, "minecraft:sand", [8, 8, 8], 2, 0)
+            .unwrap();
+        stage
+            .register_converted_chunk_inner(
+                target,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: task(target, true),
+                    ticks: empty(target),
+                },
+                ConvertedBlockEntities::default(),
+                fixture_maps(0),
+                None,
+                false,
+            )
+            .unwrap();
+        stage.set_bubble_tags(Some(Arc::new(
+            native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeSet::from(["minecraft:water".into()]),
+            ),
+        )));
+        let baseline = stage.finish().unwrap();
+        let ticks_before = baseline.ticks().activated_snapshot();
+        let mut attempt = GeneratedPostprocessing::from_completed(
+            &baseline,
+            None,
+            None,
+            Arc::clone(&height_tags),
+        )
+        .unwrap();
+        let bubble_tags = || {
+            Arc::new(native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                BTreeSet::new(),
+                BTreeSet::new(),
+                BTreeSet::from(["minecraft:water".into()]),
+            ))
+        };
+        attempt.set_bubble_tags(Some(bubble_tags()));
+        attempt.request_converted_chunk(target).unwrap();
+        assert_eq!(
+            attempt.try_poll(target, 100).unwrap(),
+            PostprocessingAttempt::NeedsChunk(neighbor)
+        );
+        assert_eq!(baseline.ticks().activated_snapshot(), ticks_before);
+        let mut expanded = GeneratedPostprocessing::from_completed(
+            &baseline,
+            None,
+            None,
+            Arc::clone(&height_tags),
+        )
+        .unwrap();
+        expanded
+            .register_converted_chunk_inner(
+                neighbor,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: task(neighbor, false),
+                    ticks: empty(neighbor),
+                },
+                ConvertedBlockEntities::default(),
+                fixture_maps(0),
+                None,
+                false,
+            )
+            .unwrap();
+        let expanded = expanded.finish().unwrap();
+        assert_eq!(
+            expanded.deferred_chunks().collect::<BTreeSet<_>>(),
+            BTreeSet::from([target, neighbor])
+        );
+        assert_eq!(
+            expanded.ticks().chunk(first).unwrap().blocks.activated(100),
+            baseline.ticks().chunk(first).unwrap().blocks.activated(100)
+        );
+        let mut retry =
+            GeneratedPostprocessing::from_completed(&expanded, None, None, height_tags).unwrap();
+        retry.set_bubble_tags(Some(bubble_tags()));
+        retry.request_converted_chunk(target).unwrap();
+        while !retry.poll(target, 100).unwrap() {}
+        let result = retry.finish().unwrap();
+        assert!(result.chunks.contains(&target));
+        assert_eq!(result.deferred_chunks().collect::<Vec<_>>(), vec![neighbor]);
+        assert_eq!(
+            result.ticks().registration_order(),
+            &[first, target, neighbor]
+        );
     }
 
     fn inert_cube_postprocessing_trace() -> Vec<String> {

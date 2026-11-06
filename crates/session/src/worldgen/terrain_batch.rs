@@ -2544,6 +2544,25 @@ impl FreshTerrainBatch {
         stage: &mut super::GeneratedPostprocessing,
         pos: ChunkPos,
     ) -> Result<()> {
+        self.register_generated_postprocessing_chunk_inner(stage, pos, true)
+    }
+
+    /// Register a converted neighbor without running its postprocessing pass.
+    /// The caller must supply it before retrying callbacks that need this chunk.
+    pub fn register_generated_postprocessing_neighbor(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+        pos: ChunkPos,
+    ) -> Result<()> {
+        self.register_generated_postprocessing_chunk_inner(stage, pos, false)
+    }
+
+    fn register_generated_postprocessing_chunk_inner(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+        pos: ChunkPos,
+        required: bool,
+    ) -> Result<()> {
         stage.check_registration(pos)?;
         ensure!(
             stage.batch_revision == Some(self.schedule.revision())
@@ -2574,7 +2593,11 @@ impl FreshTerrainBatch {
         } else {
             None
         };
-        stage.register_converted_chunk(pos, converted, entities, heightmaps, light)
+        if required {
+            stage.register_converted_chunk(pos, converted, entities, heightmaps, light)
+        } else {
+            stage.register_converted_chunk_inner(pos, converted, entities, heightmaps, light, false)
+        }
     }
 
     /// Reopen a completed pass against the same validated batch revision.

@@ -448,6 +448,9 @@ impl PreparedStructureStages {
                             .and_then(|s| s.get_mut(&key.0))
                             .expect("validated ocean start") = start
                     }
+                    super::PreparedStructureStart::Mineshaft(_) => {
+                        unreachable!("mineshafts are not accepted by the mixed decoration plan")
+                    }
                 }
             }
         }
@@ -563,6 +566,7 @@ pub struct StructureGenerationBatch {
     schedule: GenerationSchedule,
     starts: BTreeMap<ChunkPos, SimpleStarts>,
     ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
+    mineshafts: BTreeMap<ChunkPos, MineshaftStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
     references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
@@ -578,6 +582,10 @@ impl StructureGenerationBatch {
         ensure!(
             self.is_complete(),
             "structure batch has unfinished or failed work"
+        );
+        ensure!(
+            plan.starts().all(|pos| !self.mineshafts.contains_key(&pos)),
+            "mineshaft terrain transfer and decoration are not yet connected"
         );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
@@ -681,6 +689,10 @@ impl StructureGenerationBatch {
             "structure batch has unfinished or failed work"
         );
         ensure!(
+            self.mineshafts.is_empty(),
+            "mineshaft terrain transfer and decoration are not yet connected"
+        );
+        ensure!(
             self.generator.structure_context,
             "generator lacks structure context"
         );
@@ -731,6 +743,7 @@ impl StructureGenerationBatch {
             schedule: GenerationSchedule::new(),
             starts: BTreeMap::new(),
             ocean_starts: BTreeMap::new(),
+            mineshafts: BTreeMap::new(),
             bounds: BTreeMap::new(),
             references: BTreeMap::new(),
             failed: false,
@@ -756,9 +769,11 @@ impl StructureGenerationBatch {
     /// Return starts only when this chunk has no multi-piece starts, so a
     /// simple-only caller cannot accidentally publish an incomplete chunk.
     pub fn starts(&self, pos: ChunkPos) -> Option<&SimpleStarts> {
-        (!self.failed && !self.ocean_starts.contains_key(&pos))
-            .then(|| self.starts.get(&pos))
-            .flatten()
+        (!self.failed
+            && !self.ocean_starts.contains_key(&pos)
+            && !self.mineshafts.contains_key(&pos))
+        .then(|| self.starts.get(&pos))
+        .flatten()
     }
 
     /// Whether the start stage is complete, including multi-piece starts.
@@ -771,6 +786,36 @@ impl StructureGenerationBatch {
         (!self.failed && self.starts.contains_key(&pos))
             .then(|| self.ocean_starts.get(&pos))
             .flatten()
+    }
+
+    /// Return mineshafts retained for a completed start chunk.
+    pub fn mineshaft_starts(&self, pos: ChunkPos) -> Option<&MineshaftStarts> {
+        (!self.failed && self.starts.contains_key(&pos))
+            .then(|| self.mineshafts.get(&pos))
+            .flatten()
+    }
+
+    fn require_supported_decoration_references(&self, pos: ChunkPos) -> Result<()> {
+        let references = self
+            .references(pos)
+            .context("structure references are unavailable")?;
+        for (id, sources) in references {
+            for &packed in sources {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                ensure!(
+                    !self
+                        .mineshafts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "mineshaft mixed decoration context is missing"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
@@ -804,6 +849,7 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
+        self.require_supported_decoration_references(pos)?;
         decoration_plan(
             &self.starts,
             &self.ocean_starts,
@@ -820,6 +866,7 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
+        self.require_supported_decoration_references(pos)?;
         mixed_decoration_plan(
             &self.starts,
             &self.ocean_starts,
@@ -846,8 +893,14 @@ impl StructureGenerationBatch {
                 let adjustment =
                     if let Some(start) = self.starts.get(&source).and_then(|s| s.get(structure)) {
                         start.terrain_adjustment
+                    } else if let Some(start) = self
+                        .ocean_starts
+                        .get(&source)
+                        .and_then(|s| s.get(structure))
+                    {
+                        start.terrain_adjustment
                     } else {
-                        self.ocean_starts
+                        self.mineshafts
                             .get(&source)
                             .and_then(|s| s.get(structure))
                             .context("referenced structure start is missing")?
@@ -918,8 +971,10 @@ impl StructureGenerationBatch {
             let pieces = starts.iter().try_fold(0usize, |count, (id, pos)| {
                 let n = if self.starts.get(pos).is_some_and(|s| s.contains_key(id)) {
                     1
+                } else if let Some(start) = self.ocean_starts.get(pos).and_then(|s| s.get(id)) {
+                    start.pieces.len()
                 } else {
-                    self.ocean_starts
+                    self.mineshafts
                         .get(pos)
                         .and_then(|s| s.get(id))
                         .context("referenced structure start is missing")?
@@ -1008,14 +1063,26 @@ impl StructureGenerationBatch {
                 .and_then(|starts| starts.get(structure))
             {
                 pieces.push(start.terrain_piece());
+            } else if let Some(start) = self
+                .ocean_starts
+                .get(source)
+                .and_then(|starts| starts.get(structure))
+            {
+                pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
+                    bounds: piece.bounds,
+                    adjustment: start.terrain_adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: vec![],
+                }));
             } else {
                 let start = self
-                    .ocean_starts
+                    .mineshafts
                     .get(source)
                     .and_then(|starts| starts.get(structure))
                     .context("referenced structure start is missing")?;
                 pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
-                    bounds: piece.bounds,
+                    bounds: piece.piece.bounds,
                     adjustment: start.terrain_adjustment,
                     ground_delta: 0,
                     projection: PieceProjection::NonPool,
@@ -1086,6 +1153,7 @@ impl StructureGenerationBatch {
                 );
                 let mut starts = SimpleStarts::new();
                 let mut ocean_starts = OceanRuinStarts::new();
+                let mut mineshafts = MineshaftStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
                     let outcome = self.generator.try_generate_supported_structure_set(
@@ -1095,7 +1163,11 @@ impl StructureGenerationBatch {
                         &self.biome_rules,
                         set,
                         [pos.x, pos.z],
-                        |id| Ok(starts.contains_key(id) || ocean_starts.contains_key(id)),
+                        |id| {
+                            Ok(starts.contains_key(id)
+                                || ocean_starts.contains_key(id)
+                                || mineshafts.contains_key(id))
+                        },
                         &mut *classify,
                     )?;
                     if let StructureSetStart::Generated { structure, start } = outcome {
@@ -1117,6 +1189,13 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
+                            PreparedStructureStart::Mineshaft(start) => {
+                                bounds.push(start.reference_bounds(structure.clone())?);
+                                ensure!(
+                                    mineshafts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
                         }
                     }
                 }
@@ -1124,6 +1203,9 @@ impl StructureGenerationBatch {
                 self.starts.insert(pos, starts);
                 if !ocean_starts.is_empty() {
                     self.ocean_starts.insert(pos, ocean_starts);
+                }
+                if !mineshafts.is_empty() {
+                    self.mineshafts.insert(pos, mineshafts);
                 }
                 self.bounds.insert(pos, bounds);
                 Ok(())

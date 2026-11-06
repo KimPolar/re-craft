@@ -2406,6 +2406,7 @@ impl BiomeNeighborhood {
 pub enum PreparedStructureStart {
     Simple(SimpleStructureStart),
     OceanRuin(ocean_ruin::PreparedStart),
+    Mineshaft(mineshaft::PreparedStart),
 }
 
 /// A generator configured from the dimension's active biome source and noise
@@ -2837,7 +2838,8 @@ impl TerrainGenerator {
                     start: PreparedStructureStart::Simple(start),
                 } => StructureSetStart::Generated { structure, start },
                 StructureSetStart::Generated {
-                    start: PreparedStructureStart::OceanRuin(_),
+                    start:
+                        PreparedStructureStart::OceanRuin(_) | PreparedStructureStart::Mineshaft(_),
                     ..
                 } => unreachable!("ocean ruins are disabled"),
             },
@@ -2955,12 +2957,13 @@ impl TerrainGenerator {
                     max_y,
                 };
                 if mineshaft {
-                    if mineshaft::PreparedStart::generate(&definition, &mut env, self.seed, chunk)?
-                        .is_some()
-                    {
-                        bail!("mineshaft decoration and structure persistence are not implemented");
-                    }
-                    return Ok(None);
+                    return Ok(mineshaft::PreparedStart::generate(
+                        &definition,
+                        &mut env,
+                        self.seed,
+                        chunk,
+                    )?
+                    .map(PreparedStructureStart::Mineshaft));
                 }
                 if ocean_ruins
                     && structure_type.namespace == "minecraft"
@@ -8291,13 +8294,12 @@ mod tests {
                 .expect("eligible unsupported structure must fail");
             assert!(format!("{error:#}").contains("unsupported simple structure"));
         }
-        // An accepted mineshaft has a prepared layout, but may not be
-        // published until its decoration and save path are implemented.
+        // A generated mineshaft is retained as an intermediate start.
         for variant in ["normal", "mesa"] {
-            let definition = json!({"type":"minecraft:mineshaft","biomes":["minecraft:plains"],"mineshaft_type":variant});
+            let definition = json!({"type":"minecraft:mineshaft","biomes":["minecraft:plains"],"mineshaft_type":variant,"step":"underground_structures","terrain_adaptation":"beard_thin"});
             data.0
                 .insert(path.into(), serde_json::to_vec(&definition).unwrap());
-            let error = generator
+            let outcome = generator
                 .try_generate_supported_structure_set(
                     &mut data,
                     &mut evaluator,
@@ -8308,11 +8310,94 @@ mod tests {
                     |_| Ok(false),
                     classify,
                 )
-                .err()
-                .expect("incomplete mineshaft must not be published");
-            assert!(
-                format!("{error:#}").contains("mineshaft decoration and structure persistence")
-            );
+                .unwrap();
+            let StructureSetStart::Generated {
+                structure,
+                start: PreparedStructureStart::Mineshaft(start),
+            } = outcome
+            else {
+                panic!("expected mineshaft start")
+            };
+            assert_eq!(structure, structure_id);
+            assert!(!start.pieces.is_empty());
+            assert!(start.reference_bounds(structure).is_ok());
+        }
+        {
+            let sparse = ResourceId::parse("example:mine_sparse").unwrap();
+            data.0.insert("data/example/worldgen/structure_set/mine_sparse.json".into(), serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap());
+            let [x, z] = StructureSetCache::default()
+                .load(&mut data, &sparse)
+                .unwrap()
+                .placement
+                .potential_chunk(42, [0, 0]);
+            let target = ChunkPos { x, z };
+            let batch_generator =
+                TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16)
+                    .unwrap();
+            let batch_rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+            let mut batch = structure_batch::StructureGenerationBatch::new(
+                batch_generator,
+                batch_rules,
+                vec![sparse],
+            )
+            .unwrap();
+            batch.request_references(target).unwrap();
+            while batch
+                .step(&mut data, &mut |v| classify(v))
+                .unwrap()
+                .is_some()
+            {}
+            assert!(batch.is_complete());
+            assert!(batch.starts(target).is_none());
+            let start = &batch.mineshaft_starts(target).unwrap()[&structure_id];
+            assert!(!start.pieces.is_empty());
+            let packed = (target.x as u32 as u64 | ((target.z as u32 as u64) << 32)) as i64;
+            assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+            let order = batch
+                .unambiguous_terrain_start_order(target)
+                .unwrap()
+                .unwrap();
+            assert!(order.contains(&(structure_id.clone(), target)));
+            let actual = batch.beardifier_for_chunk(target, &order).unwrap();
+            assert!(actual.affected_bounds().is_some());
+            let mut pieces = Vec::new();
+            for (id, source) in &order {
+                let start = &batch.mineshaft_starts(*source).unwrap()[id];
+                pieces.extend(start.pieces.iter().map(|piece| {
+                    native_core::beardifier::StructurePiece {
+                        bounds: piece.piece.bounds,
+                        adjustment: start.terrain_adjustment,
+                        ground_delta: 0,
+                        projection: native_core::beardifier::PieceProjection::NonPool,
+                        junctions: vec![],
+                    }
+                }));
+            }
+            let expected = Beardifier::for_chunk([target.x, target.z], &pieces).unwrap();
+            for y in [-32, 0, 32, 64] {
+                for dx in [0, 8, 15] {
+                    for dz in [0, 8, 15] {
+                        let x = target.x * 16 + dx;
+                        let z = target.z * 16 + dz;
+                        assert_eq!(
+                            actual.sample(x, y, z).to_bits(),
+                            expected.sample(x, y, z).to_bits()
+                        );
+                    }
+                }
+            }
+            let schedule =
+                native_resources::structure_decoration::StructureDecorationSchedule::load(
+                    &mut data,
+                )
+                .unwrap();
+            assert!(batch.mixed_decoration_plan(target, &schedule).is_err());
+            let plan = structure_batch::StructurePreparationPlan::new([(
+                target,
+                schedule::GenerationStage::StructureReferences,
+            )])
+            .unwrap();
+            assert!(batch.prepare_additional_stages(&plan, None).is_err());
         }
         // The generalized start path can retain a multi-piece ruin without
         // changing the simple-only scheduler's conservative behavior.

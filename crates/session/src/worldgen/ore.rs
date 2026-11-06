@@ -2028,6 +2028,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                         }),
                                                     );
                                                 }
+                                                PreparedStructureStart::Mineshaft(_) => bail!(
+                                                    "mineshaft mixed decoration context is missing"
+                                                ),
                                             }
                                         }
                                     }
@@ -2069,6 +2072,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                             &revisions,
                                         )?;
                                         validate_decorated_ocean_start(&original, start)?;
+                                    }
+                                    PreparedStructureStart::Mineshaft(_) => {
+                                        bail!("mineshaft mixed decoration context is missing")
                                     }
                                 }
                             }

@@ -2,9 +2,10 @@
 use super::*;
 use native_core::beardifier::BoundingBox;
 use native_resources::mineshaft::{
-    CorridorBlock, MineshaftCorridorWorld, MineshaftCrossingWorld, MineshaftGraphPiece,
-    MineshaftGraphPieceKind, MineshaftPlacementOutcome, MineshaftPlacementWorld,
-    MineshaftSupportBlock, MineshaftSupportOutcome, MineshaftSupportWorld, MineshaftVariant,
+    CorridorBlock, MineshaftCorridorGenerationWorld, MineshaftCorridorWorld,
+    MineshaftCrossingWorld, MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftMinecartWorld,
+    MineshaftPlacementOutcome, MineshaftPlacementWorld, MineshaftSupportBlock,
+    MineshaftSupportOutcome, MineshaftSupportWorld, MineshaftVariant, place_corridor,
     place_corridor_beam, place_corridor_cobweb, place_crossing, place_room_or_stairs,
     place_vertical_support,
 };
@@ -13,6 +14,11 @@ use native_resources::{structure_piece::StructureFrame, structure_start::Horizon
 struct MineshaftRegion<'a, 'b, F> {
     region: &'a mut DecorationRegion<'b>,
     blocking_biome: &'a mut F,
+}
+
+struct CorridorRegion<'a, 'b, F, U> {
+    inner: MineshaftRegion<'a, 'b, F>,
+    uuid_factory: &'a mut U,
 }
 
 fn known_piece_block(state: &BlockState) -> bool {
@@ -70,6 +76,59 @@ fn known_piece_block(state: &BlockState) -> bool {
 }
 
 impl DecorationRegion<'_> {
+    /// Run a complete corridor on this draft. The UUID factory must isolate its
+    /// state when cloned, just like the decoration RNG and spider flag.
+    /// The loaded block tags must include `minecraft:unstable_bottom_center`.
+    pub fn place_mineshaft_corridor<U>(
+        &mut self,
+        piece: &MineshaftGraphPiece,
+        placed_spider: &mut bool,
+        variant: MineshaftVariant,
+        clip: BoundingBox,
+        biomes: &super::super::BiomeNeighborhood,
+        blocking: &native_resources::mineshaft::MineshaftBlockingBiomes,
+        random: &mut DecorationRandom,
+        uuid_factory: &mut U,
+    ) -> Result<MineshaftPlacementOutcome>
+    where
+        U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+    {
+        ensure!(!self.failed, "generation attempt previously failed");
+        ensure!(
+            biomes.seed == self.target.seed
+                && biomes.min_y == self.target.min_y
+                && biomes.height == self.target.height,
+            "mineshaft biome neighborhood does not match the terrain"
+        );
+        let mut next_random = random.clone();
+        let mut next_uuid = uuid_factory.clone();
+        let mut next_spider = *placed_spider;
+        let mut resolve = |position: [i32; 3], _: &World| {
+            blocking.blocks(biomes.biome_at_block(position[0], position[1], position[2])?)
+        };
+        self.failed = true;
+        let mut region = CorridorRegion {
+            inner: MineshaftRegion {
+                region: self,
+                blocking_biome: &mut resolve,
+            },
+            uuid_factory: &mut next_uuid,
+        };
+        let result = place_corridor(
+            piece,
+            &mut next_spider,
+            variant,
+            &mut region,
+            clip,
+            &mut next_random,
+        )?;
+        *random = next_random;
+        *uuid_factory = next_uuid;
+        *placed_spider = next_spider;
+        self.failed = false;
+        Ok(result)
+    }
+
     /// Apply the corridor's direct vertical support writes to the draft.
     /// The region's block tags must include `minecraft:unstable_bottom_center`.
     pub fn place_mineshaft_vertical_support(
@@ -152,27 +211,7 @@ impl DecorationRegion<'_> {
             region: self,
             blocking_biome: &mut unused_biome,
         };
-        region.write(
-            position,
-            BlockState {
-                name: "minecraft:spawner".into(),
-                properties: BTreeMap::new(),
-            },
-        )?;
-        Arc::make_mut(&mut region.region.monster_entities).insert(
-            position,
-            Some(super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(
-                super::super::GeneratedCaveSpiderSpawner { position },
-            )),
-        );
-        Arc::make_mut(
-            region
-                .region
-                .entity_order
-                .entry(chunk(position))
-                .or_default(),
-        )
-        .insert(position);
+        region.write_spawner(position)?;
         self.failed = false;
         Ok(())
     }
@@ -442,6 +481,25 @@ where
 }
 
 impl<F> MineshaftRegion<'_, '_, F> {
+    fn write_spawner(&mut self, position: [i32; 3]) -> Result<()> {
+        self.write(
+            position,
+            BlockState {
+                name: "minecraft:spawner".into(),
+                properties: BTreeMap::new(),
+            },
+        )?;
+        Arc::make_mut(&mut self.region.monster_entities).insert(
+            position,
+            Some(super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(
+                super::super::GeneratedCaveSpiderSpawner { position },
+            )),
+        );
+        Arc::make_mut(self.region.entity_order.entry(chunk(position)).or_default())
+            .insert(position);
+        Ok(())
+    }
+
     fn block(&mut self, position: [i32; 3]) -> Result<BlockState> {
         OreWorld::block(self.region, position)
     }
@@ -469,6 +527,140 @@ impl<F> MineshaftRegion<'_, '_, F> {
             old.name
         );
         self.region.set_proto_block(position, &state)
+    }
+}
+
+impl<F, U> MineshaftPlacementWorld for CorridorRegion<'_, '_, F, U>
+where
+    F: FnMut([i32; 3], &World) -> Result<bool>,
+{
+    fn blocking_biome(&mut self, position: [i32; 3]) -> Result<bool> {
+        self.inner.blocking_biome(position)
+    }
+    fn liquid_block(&mut self, position: [i32; 3]) -> Result<bool> {
+        self.inner.liquid_block(position)
+    }
+    fn protected_block(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<bool> {
+        self.inner.protected_block(position, variant)
+    }
+    fn set_cave_air(&mut self, position: [i32; 3]) -> Result<()> {
+        self.inner.set_cave_air(position)
+    }
+}
+
+impl<F, U> MineshaftCorridorWorld for CorridorRegion<'_, '_, F, U>
+where
+    F: FnMut([i32; 3], &World) -> Result<bool>,
+{
+    fn is_air(&mut self, position: [i32; 3]) -> Result<bool> {
+        MineshaftCorridorWorld::is_air(&mut self.inner, position)
+    }
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        MineshaftCorridorWorld::ocean_floor_height(&mut self.inner, x, z)
+    }
+    fn face_sturdy(&mut self, position: [i32; 3], face: [i32; 3]) -> Result<bool> {
+        self.inner.face_sturdy(position, face)
+    }
+    fn set_corridor_block(
+        &mut self,
+        position: [i32; 3],
+        block: CorridorBlock,
+        variant: MineshaftVariant,
+    ) -> Result<()> {
+        self.inner.set_corridor_block(position, block, variant)
+    }
+}
+
+impl<F, U> MineshaftSupportWorld for CorridorRegion<'_, '_, F, U> {
+    type State = BlockState;
+    fn vertical_bounds(&self) -> (i32, i32) {
+        self.inner.vertical_bounds()
+    }
+    fn block_state(&mut self, position: [i32; 3]) -> Result<BlockState> {
+        self.inner.block_state(position)
+    }
+    fn replaceable_by_structure(&mut self, state: &BlockState) -> Result<bool> {
+        self.inner.replaceable_by_structure(state)
+    }
+    fn is_lava(&mut self, state: &BlockState) -> Result<bool> {
+        self.inner.is_lava(state)
+    }
+    fn supports_column(&mut self, position: [i32; 3], state: &BlockState) -> Result<bool> {
+        self.inner.supports_column(position, state)
+    }
+    fn supports_hanging_chain(&mut self, position: [i32; 3], state: &BlockState) -> Result<bool> {
+        self.inner.supports_hanging_chain(position, state)
+    }
+    fn set_support(
+        &mut self,
+        position: [i32; 3],
+        block: MineshaftSupportBlock,
+        variant: MineshaftVariant,
+    ) -> Result<()> {
+        self.inner.set_support(position, block, variant)
+    }
+}
+
+impl<F, U> MineshaftMinecartWorld for CorridorRegion<'_, '_, F, U>
+where
+    F: FnMut([i32; 3], &World) -> Result<bool>,
+    U: FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+{
+    type Minecart = ([f64; 3], [i32; 4]);
+    fn new_chest_minecart(&mut self, position: [f64; 3]) -> Result<Option<Self::Minecart>> {
+        Ok((self.uuid_factory)(position)?.map(|uuid| (position, uuid)))
+    }
+    fn add_chest_minecart(
+        &mut self,
+        (position, uuid): Self::Minecart,
+        loot_seed: i64,
+    ) -> Result<()> {
+        let tag = super::super::draft_fresh_mineshaft_chest_minecart(uuid, position, loot_seed)?;
+        let block_position = position.map(|coordinate| coordinate.floor() as i32);
+        self.inner.region.record_generated_entity(
+            block_position,
+            super::super::GeneratedEntityRecord::Saved(tag),
+        )
+    }
+}
+
+impl<F, U> MineshaftCorridorGenerationWorld for CorridorRegion<'_, '_, F, U>
+where
+    F: FnMut([i32; 3], &World) -> Result<bool>,
+    U: FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+{
+    fn upper_face_sturdy(&mut self, position: [i32; 3]) -> Result<bool> {
+        MineshaftCrossingWorld::upper_face_sturdy(&mut self.inner, position)
+    }
+    fn set_floor_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<()> {
+        MineshaftCrossingWorld::set_floor_planks(&mut self.inner, position, variant)
+    }
+    fn is_variant_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<bool> {
+        let state = self.inner.block(position)?;
+        let name = match variant {
+            MineshaftVariant::Normal => "minecraft:oak_planks",
+            MineshaftVariant::Mesa => "minecraft:dark_oak_planks",
+        };
+        Ok(state.name == name && state.properties.is_empty())
+    }
+    fn solid_render_floor(&mut self, position: [i32; 3]) -> Result<bool> {
+        let state = self.inner.block(position)?;
+        if known_piece_block(&state) {
+            return Ok(matches!(
+                state.name.as_str(),
+                "minecraft:oak_planks"
+                    | "minecraft:dark_oak_planks"
+                    | "minecraft:oak_log"
+                    | "minecraft:dark_oak_log"
+            ));
+        }
+        if is_air(&state) {
+            return Ok(false);
+        }
+        tree_solid_render(&state)
+    }
+    fn set_spider_spawner(&mut self, position: [i32; 3], _: &mut DecorationRandom) -> Result<()> {
+        self.inner.write_spawner(position)
     }
 }
 
@@ -575,7 +767,7 @@ mod tests {
                 }),
                 "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                 | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => Some(
-                    br#"{"values":["minecraft:stone","minecraft:oak_log","minecraft:oak_fence"]}"#
+                    br#"{"values":["minecraft:stone","minecraft:oak_log","minecraft:oak_fence","minecraft:oak_planks"]}"#
                         .to_vec(),
                 ),
                 _ => None,
@@ -591,7 +783,12 @@ mod tests {
             "stone",
             "oak_log",
             "oak_fence",
+            "oak_planks",
             "iron_chain",
+            "cobweb",
+            "wall_torch",
+            "rail",
+            "spawner",
         ]
         .into_iter()
         .map(|name| format!("minecraft:{name}"))
@@ -695,6 +892,227 @@ mod tests {
             depth: 0,
             kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
         }
+    }
+
+    fn corridor(spiders: bool, rails: bool) -> MineshaftGraphPiece {
+        MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 2, 2], [4, 4, 6]).unwrap(),
+            direction: Some(HorizontalDirection::South),
+            depth: 1,
+            kind: MineshaftGraphPieceKind::Corridor {
+                rails,
+                spiders,
+                sections: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn complete_spider_corridor_stages_blocks_and_spawner() {
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let (tags, motion) = support_tags(false);
+        let biomes = plains();
+        let blocking =
+            native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut BiomeData(false))
+                .unwrap();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let mut spider = false;
+        let mut random = DecorationRandom::new(5);
+        let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert_eq!(
+            region
+                .place_mineshaft_corridor(
+                    &corridor(true, false),
+                    &mut spider,
+                    MineshaftVariant::Normal,
+                    clip,
+                    &biomes,
+                    &blocking,
+                    &mut random,
+                    &mut uuid
+                )
+                .unwrap(),
+            MineshaftPlacementOutcome::Carved
+        );
+        assert!(spider);
+        region.finish().unwrap();
+        let spawner = terrain.generated_monster_entities().next().unwrap();
+        let super::super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(spawner) = spawner
+        else {
+            panic!("missing cave-spider spawner")
+        };
+        assert_eq!(
+            terrain
+                .world
+                .block(
+                    spawner.position[0],
+                    spawner.position[1],
+                    spawner.position[2]
+                )
+                .unwrap()
+                .name,
+            "minecraft:spawner"
+        );
+        let data = terrain
+            .generated_block_entity_data_with(ChunkPos { x: 0, z: 0 }, |state| {
+                Some(state.name == "minecraft:spawner")
+            })
+            .unwrap();
+        assert_eq!(
+            data,
+            native_persistence::nbt::Tag::List {
+                element_type: native_persistence::nbt::TagType::Compound,
+                values: vec![spawner.block_entity()]
+            }
+        );
+    }
+
+    #[test]
+    fn complete_corridor_failure_preserves_caller_state_and_world() {
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(BlockState {
+            name: "minecraft:beacon".into(),
+            properties: BTreeMap::new(),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap()[3 + 4 * 16 + 4 * 256] = id;
+        let before = Arc::clone(&terrain.world);
+        let (tags, motion) = support_tags(false);
+        let biomes = plains();
+        let blocking =
+            native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut BiomeData(false))
+                .unwrap();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let seed = (0..100)
+            .find(|seed| {
+                let mut r = DecorationRandom::new(*seed);
+                (0..7).for_each(|_| {
+                    r.next_float();
+                });
+                r.next_float() <= 0.8
+            })
+            .unwrap();
+        let mut random = DecorationRandom::new(seed);
+        let mut expected = random.clone();
+        let mut spider = false;
+        let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let error = region
+            .place_mineshaft_corridor(
+                &corridor(true, false),
+                &mut spider,
+                MineshaftVariant::Normal,
+                clip,
+                &biomes,
+                &blocking,
+                &mut random,
+                &mut uuid,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("minecraft:beacon"));
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(!spider);
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
+    }
+
+    #[test]
+    fn complete_corridor_records_minecart_and_rolls_back_factory_failure() {
+        use native_persistence::nbt::Tag;
+
+        let (tags, motion) = support_tags(false);
+        let biomes = plains();
+        let blocking =
+            native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut BiomeData(false))
+                .unwrap();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let mut found = None;
+        for seed in 0..300 {
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            let mut spider = false;
+            let mut random = DecorationRandom::new(seed);
+            let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+                .unwrap();
+            region
+                .place_mineshaft_corridor(
+                    &corridor(false, true),
+                    &mut spider,
+                    MineshaftVariant::Normal,
+                    clip,
+                    &biomes,
+                    &blocking,
+                    &mut random,
+                    &mut uuid,
+                )
+                .unwrap();
+            region.finish().unwrap();
+            let records = terrain.recorded_generated_entities(chunk).unwrap();
+            if let Some(cart) = records.first() {
+                assert_eq!(cart.get("UUID"), Some(&Tag::IntArray(vec![1, 2, 3, 4])));
+                assert!(
+                    matches!(cart.get("LootTable"), Some(Tag::String(value)) if value.matches("minecraft:chests/abandoned_mineshaft"))
+                );
+                found = Some(seed);
+                break;
+            }
+        }
+        let seed = found.expect("no minecart generated in test seeds");
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let before = Arc::clone(&terrain.world);
+        let mut spider = false;
+        let mut random = DecorationRandom::new(seed);
+        let mut expected = random.clone();
+        let mut count = 0;
+        let mut uuid = move |_: [f64; 3]| -> Result<Option<[i32; 4]>> {
+            count += 1;
+            anyhow::bail!("factory call {count}")
+        };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+            .unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                region
+                    .place_mineshaft_corridor(
+                        &corridor(false, true),
+                        &mut spider,
+                        MineshaftVariant::Normal,
+                        clip,
+                        &biomes,
+                        &blocking,
+                        &mut random,
+                        &mut uuid
+                    )
+                    .unwrap_err()
+            )
+            .contains("factory call 1")
+        );
+        assert!(format!("{:#}", uuid([0.0; 3]).unwrap_err()).contains("factory call 1"));
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(!spider);
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
+        assert!(
+            terrain
+                .recorded_generated_entities(chunk)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn corridor_motion() -> HeightmapTags {

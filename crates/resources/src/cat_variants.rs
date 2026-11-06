@@ -56,6 +56,28 @@ pub struct CatSpawnContext<'a> {
     pub structures_with_piece: Option<&'a BTreeSet<ResourceId>>,
 }
 
+/// World information queried only when a matching selector needs it.
+pub trait SpawnVariantEnvironment {
+    fn biome(&self) -> Result<&ResourceId>;
+    fn moon_phase(&mut self) -> Result<u8>;
+    fn structures_with_piece(&mut self) -> Result<&BTreeSet<ResourceId>>;
+}
+
+impl SpawnVariantEnvironment for CatSpawnContext<'_> {
+    fn biome(&self) -> Result<&ResourceId> {
+        self.biome.context("spawn biome unavailable")
+    }
+
+    fn moon_phase(&mut self) -> Result<u8> {
+        self.moon_phase.context("moon phase unavailable")
+    }
+
+    fn structures_with_piece(&mut self) -> Result<&BTreeSet<ResourceId>> {
+        self.structures_with_piece
+            .context("structure pieces unavailable")
+    }
+}
+
 impl CatSpawnVariants {
     pub fn load_active(provider: &mut impl ResourceProvider) -> Result<Self> {
         let variants = provider.list_registry_data("cat_variant")?;
@@ -276,28 +298,39 @@ impl CatWorldConditions {
 }
 
 impl CatWorldConditions {
+    pub(crate) fn uses_moon(&self) -> bool {
+        self.predicates
+            .values()
+            .any(|condition| matches!(condition, WorldCondition::Moon { .. }))
+    }
+
     pub fn matches(&self, condition: &Value, context: &CatSpawnContext<'_>) -> Result<bool> {
         let key = serde_json::to_string(condition)?;
         self.matches_key(&key, context)
     }
 
     pub(crate) fn matches_key(&self, key: &str, context: &CatSpawnContext<'_>) -> Result<bool> {
+        let mut context = *context;
+        self.matches_environment(key, &mut context)
+    }
+
+    pub(crate) fn matches_environment(
+        &self,
+        key: &str,
+        context: &mut impl SpawnVariantEnvironment,
+    ) -> Result<bool> {
         match self
             .predicates
             .get(key)
             .context("cat condition was not prepared")?
         {
-            WorldCondition::Structures(values) => Ok(!values.is_disjoint(
-                context
-                    .structures_with_piece
-                    .context("structure pieces unavailable")?,
-            )),
-            WorldCondition::Biomes(values) => {
-                Ok(values.contains(context.biome.context("spawn biome unavailable")?))
+            WorldCondition::Structures(values) => {
+                Ok(!values.is_disjoint(context.structures_with_piece()?))
             }
+            WorldCondition::Biomes(values) => Ok(values.contains(context.biome()?)),
             WorldCondition::Moon { min, max } => {
                 const BRIGHTNESS: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
-                let phase = usize::from(context.moon_phase.context("moon phase unavailable")?);
+                let phase = usize::from(context.moon_phase()?);
                 let brightness = f64::from(*BRIGHTNESS.get(phase).context("invalid moon phase")?);
                 Ok(min.is_none_or(|min| brightness >= min)
                     && max.is_none_or(|max| brightness <= max))

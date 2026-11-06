@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-pub use crate::cat_variants::CatSpawnContext as SpawnVariantContext;
+pub use crate::cat_variants::{CatSpawnContext as SpawnVariantContext, SpawnVariantEnvironment};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FarmAnimal {
@@ -106,6 +106,10 @@ impl FarmAnimalSpawnVariants {
         self.species
     }
 
+    pub fn uses_moon_conditions(&self) -> bool {
+        self.visual.conditions.uses_moon()
+    }
+
     /// Java constructs these animals with temperate, or the first registry
     /// entry if a data pack removed it.
     pub fn default_variant(&self) -> &ResourceId {
@@ -141,11 +145,23 @@ impl FarmAnimalSpawnVariants {
         group: &mut AnimalGroupData,
         has_follow_range_bonus: bool,
     ) -> Result<FarmAnimalInitialization> {
+        let mut context = *context;
+        self.finalize_in_environment(&mut context, random, group, has_follow_range_bonus)
+    }
+
+    /// Evaluate world conditions lazily, preserving RNG and group on errors.
+    pub fn finalize_in_environment(
+        &self,
+        context: &mut impl SpawnVariantEnvironment,
+        random: &mut RegionRandom,
+        group: &mut AnimalGroupData,
+        has_follow_range_bonus: bool,
+    ) -> Result<FarmAnimalInitialization> {
         let mut next_random = random.clone();
         let mut next_group = *group;
         let variant = self
             .visual
-            .choose_in_context(context, &mut next_random)?
+            .choose_in_environment(context, &mut next_random)?
             .cloned();
         let count = i32::try_from(self.sounds.len()).context("too many sound variants")?;
         let index = next_random
@@ -268,7 +284,16 @@ impl FarmAnimalVariants {
         context: &SpawnVariantContext<'_>,
         random: &mut RegionRandom,
     ) -> Result<Option<&'a ResourceId>> {
-        let biome = context.biome.context("spawn biome unavailable")?;
+        let mut context = *context;
+        self.choose_in_environment(&mut context, random)
+    }
+
+    pub fn choose_in_environment<'a>(
+        &'a self,
+        context: &mut impl SpawnVariantEnvironment,
+        random: &mut RegionRandom,
+    ) -> Result<Option<&'a ResourceId>> {
+        let biome = context.biome()?;
         ensure!(
             self.biome_registry.contains(biome),
             "biome is absent from the active registry"
@@ -282,7 +307,7 @@ impl FarmAnimalVariants {
             if selector
                 .condition_key
                 .as_ref()
-                .map(|key| self.conditions.matches_key(key, context))
+                .map(|key| self.conditions.matches_environment(key, context))
                 .transpose()?
                 .unwrap_or(true)
             {
@@ -355,10 +380,19 @@ impl ZombieNautilusSpawnVariants {
         context: &SpawnVariantContext<'_>,
         random: &mut RegionRandom,
     ) -> Result<ZombieNautilusInitialization> {
+        let mut context = *context;
+        self.finalize_structure_spawn_in_environment(&mut context, random)
+    }
+
+    pub fn finalize_structure_spawn_in_environment(
+        &self,
+        context: &mut impl SpawnVariantEnvironment,
+        random: &mut RegionRandom,
+    ) -> Result<ZombieNautilusInitialization> {
         let mut next = random.clone();
         let variant = self
             .visual
-            .choose_in_context(context, &mut next)?
+            .choose_in_environment(context, &mut next)?
             .unwrap_or(&self.default_visual)
             .clone();
         let attack_cooldown = 2400

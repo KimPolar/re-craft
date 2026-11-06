@@ -433,7 +433,8 @@ pub struct PreparedCreatureSpawning {
     biome_tags: native_resources::worldgen_region_random::SheepBiomeTags,
     variants: [Arc<native_resources::animal_variants::FarmAnimalSpawnVariants>; 3],
     border: native_session::respawn::RespawnBorder,
-    clocks: BTreeMap<ResourceId, i64>,
+    clocks: Arc<BTreeMap<ResourceId, i64>>,
+    moon: Option<Arc<native_resources::moon_phase::Environment>>,
     has_ceiling: bool,
 }
 
@@ -505,6 +506,13 @@ impl PreparedCreatureSpawning {
                 FarmAnimal::Chicken,
             )?),
         ];
+        let moon = variants
+            .iter()
+            .any(|variant| variant.uses_moon_conditions())
+            .then(|| {
+                native_resources::moon_phase::Environment::load(resources, &name).map(Arc::new)
+            })
+            .transpose()?;
         Ok(Self {
             environment,
             categories,
@@ -514,7 +522,8 @@ impl PreparedCreatureSpawning {
             biome_tags,
             variants,
             border,
-            clocks,
+            clocks: Arc::new(clocks),
+            moon,
             has_ceiling,
         })
     }
@@ -545,6 +554,9 @@ impl PreparedCreatureSpawning {
         )?;
         for variants in &self.variants {
             driver.enable_farm_animal(Arc::clone(variants))?;
+        }
+        if let Some(moon) = &self.moon {
+            driver.set_farm_moon_environment(Arc::clone(moon), Arc::clone(&self.clocks))?;
         }
         Ok(driver)
     }

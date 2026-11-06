@@ -59,6 +59,48 @@ pub struct FreshTerrainBatch {
     failed: bool,
 }
 
+/// Resolves only the conditions encountered by the active variant selectors.
+struct FarmAnimalEnvironment<'a> {
+    batch: &'a FreshTerrainBatch,
+    position: [i32; 3],
+    biome: &'a ResourceId,
+    moon: Option<(
+        &'a native_resources::moon_phase::Environment,
+        &'a BTreeMap<ResourceId, i64>,
+    )>,
+    structures: Option<BTreeSet<ResourceId>>,
+}
+
+impl native_resources::animal_variants::SpawnVariantEnvironment for FarmAnimalEnvironment<'_> {
+    fn biome(&self) -> Result<&ResourceId> {
+        Ok(self.biome)
+    }
+
+    fn moon_phase(&mut self) -> Result<u8> {
+        let (moon, clocks) = self.moon.context("moon phase environment unavailable")?;
+        let biome = moon
+            .has_biome_layer
+            .then(|| format!("{}:{}", self.biome.namespace, self.biome.path));
+        Ok(moon
+            .sample(biome.as_deref(), |id| clocks.get(id).copied())
+            .context("moon phase environment or world clock unavailable")?
+            .index() as u8)
+    }
+
+    fn structures_with_piece(&mut self) -> Result<&BTreeSet<ResourceId>> {
+        if self.structures.is_none() {
+            self.structures = Some(structures_with_piece_at(
+                self.batch.structures.as_ref(),
+                self.position,
+            )?);
+        }
+        Ok(self
+            .structures
+            .as_ref()
+            .expect("structure set was initialized"))
+    }
+}
+
 /// Coordinated postprocessing output for one chunk. Block entities, entity
 /// regions, structures and other world-save requirements remain separate.
 pub struct PostprocessedChunkComponents {
@@ -1058,6 +1100,28 @@ impl FreshTerrainBatch {
         group: &mut native_resources::worldgen_region_random::AnimalGroupData,
         has_follow_range_bonus: bool,
     ) -> Result<native_resources::animal_variants::FarmAnimalInitialization> {
+        self.initialize_farm_animal_with_moon(
+            position,
+            variants,
+            random,
+            group,
+            has_follow_range_bonus,
+            None,
+        )
+    }
+
+    pub(super) fn initialize_farm_animal_with_moon(
+        &self,
+        position: [i32; 3],
+        variants: &native_resources::animal_variants::FarmAnimalSpawnVariants,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        has_follow_range_bonus: bool,
+        moon: Option<(
+            &native_resources::moon_phase::Environment,
+            &BTreeMap<ResourceId, i64>,
+        )>,
+    ) -> Result<native_resources::animal_variants::FarmAnimalInitialization> {
         ensure!(
             self.is_complete(),
             "finish generation requests before initializing an animal"
@@ -1074,9 +1138,79 @@ impl FreshTerrainBatch {
             "animal initialization requires a light-complete chunk"
         );
         let biome = self.biomes.biome_at_block(x, y, z)?;
-        variants.finalize(biome, random, group, has_follow_range_bonus)
+        let mut environment = FarmAnimalEnvironment {
+            batch: self,
+            position,
+            biome,
+            moon,
+            structures: None,
+        };
+        variants.finalize_in_environment(&mut environment, random, group, has_follow_range_bonus)
     }
+}
 
+fn structures_with_piece_at(
+    structures: Option<&PreparedStructureStages>,
+    position: [i32; 3],
+) -> Result<BTreeSet<ResourceId>> {
+    let mut matching = BTreeSet::new();
+    let Some(structures) = structures else {
+        return Ok(matching);
+    };
+    let chunk = ChunkPos {
+        x: position[0].div_euclid(16),
+        z: position[2].div_euclid(16),
+    };
+    let references = structures
+        .references
+        .get(&chunk)
+        .context("spawn chunk structure references unavailable")?;
+    for (id, sources) in references.membership() {
+        for &packed in sources {
+            let bits = packed as u64;
+            let source = ChunkPos {
+                x: bits as u32 as i32,
+                z: (bits >> 32) as u32 as i32,
+            };
+            let simple = structures
+                .starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            let ocean = structures
+                .ocean_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            ensure!(
+                simple.is_some() != ocean.is_some(),
+                "spawn referenced structure is missing or ambiguous"
+            );
+            let contains = |bounds: &native_core::beardifier::BoundingBox| {
+                (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&position[axis]))
+            };
+            let inside = if let Some(start) = simple {
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                contains(&start.bounds)
+            } else {
+                let start = ocean.expect("one start was validated");
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                start.pieces.iter().any(|piece| contains(&piece.bounds))
+            };
+            if inside {
+                matching.insert(id.clone());
+                break;
+            }
+        }
+    }
+    Ok(matching)
+}
+
+impl FreshTerrainBatch {
     /// Start the random ordering for one light-complete chunk. The supplied
     /// list and probability must be resolved from the same data-pack stack
     /// and all applicable environment layers. This only plans attempts; it
@@ -4218,6 +4352,56 @@ mod entity_source_tests {
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
             Ok(self.0.get(path).cloned())
         }
+    }
+
+    #[test]
+    fn animal_structure_conditions_use_referenced_piece_bounds() {
+        use crate::worldgen::structure_references::{
+            StructureStartBounds, collect_ordered_structure_references,
+        };
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        let source = ChunkPos { x: -1, z: -1 };
+        let id = ResourceId::parse("minecraft:swamp_hut").unwrap();
+        let start = SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [source.x, source.z],
+            generation_point: [-8, 64, -8],
+            orientation: None,
+            bounds: BoundingBox::new([-10, 63, -10], [-5, 68, -5]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::BeardThin,
+        };
+        let bounds = StructureStartBounds::from_simple(id.clone(), &start).unwrap();
+        let mut stages = PreparedStructureStages::default();
+        stages
+            .starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        let references = collect_ordered_structure_references(source, |pos| {
+            Ok(if pos == source {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        stages.references.insert(source, references);
+        assert_eq!(
+            structures_with_piece_at(Some(&stages), [-10, 63, -10]).unwrap(),
+            BTreeSet::from([id])
+        );
+        assert!(
+            structures_with_piece_at(Some(&stages), [-11, 63, -10])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            structures_with_piece_at(None, [-10, 63, -10])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(structures_with_piece_at(Some(&stages), [16, 63, 16]).is_err());
+        stages.starts.clear();
+        assert!(structures_with_piece_at(Some(&stages), [-10, 63, -10]).is_err());
     }
 
     #[test]

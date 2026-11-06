@@ -6156,6 +6156,7 @@ mod tests {
             "data/example/dimension_type",
             "data/example/world_clock",
             "data/example/timeline",
+            "data/example/pig_variant",
             "data/minecraft/tags/block",
         ] {
             std::fs::create_dir_all(pack.join(dir))?;
@@ -6189,6 +6190,7 @@ mod tests {
         )?;
         std::fs::write(pack.join("data/example/world_clock/creatures.json"), b"{}")?;
         let timeline = json!({"clock":"example:creatures","period_ticks":20,"time_markers":{"example:wake":7},"tracks":{
+            "minecraft:visual/moon_phase":{"modifier":"override","keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]},
             "minecraft:gameplay/creature_world_gen_spawn_probability":{
                 "modifier":"override","keyframes":[{"ticks":0,"value":0.75},{"ticks":10,"value":0.0}]
             },
@@ -6198,6 +6200,17 @@ mod tests {
         std::fs::write(
             pack.join("data/example/timeline/creatures.json"),
             serde_json::to_vec(&timeline)?,
+        )?;
+        let mut vanilla = native_resources::packs::ResourceStack::open(&game)?;
+        let mut moon_pig: serde_json::Value = serde_json::from_slice(
+            &vanilla
+                .read_data("data/minecraft/pig_variant/temperate.json")?
+                .context("missing vanilla pig variant")?,
+        )?;
+        moon_pig["spawn_conditions"] = json!([{"priority":100,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}]);
+        std::fs::write(
+            pack.join("data/example/pig_variant/moon.json"),
+            serde_json::to_vec(&moon_pig)?,
         )?;
         let biome = json!({"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[],"attributes":{
             "minecraft:gameplay/creature_world_gen_spawn_probability":0.0,
@@ -6505,6 +6518,7 @@ mod tests {
             (true, false, "minecraft:sheep", 3),
             (true, false, "minecraft:horse", 0),
             (true, false, "minecraft:donkey", 0),
+            (true, false, "minecraft:pig", 0),
         ] {
             let has_skylight = !disabled || feature_kind % 2 == 0;
             let mut selected_dimension = dimension.clone();
@@ -6798,6 +6812,11 @@ mod tests {
                         assert!(
                             matches!(entity.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches(species))
                         );
+                        if species == "minecraft:pig" {
+                            assert!(
+                                matches!(entity.get("variant"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("example:moon"))
+                            );
+                        }
                     }
                 }
                 let target = *targets

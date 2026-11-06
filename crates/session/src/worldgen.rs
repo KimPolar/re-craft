@@ -4529,6 +4529,72 @@ mod tests {
             );
             assert_eq!(group, expected_group);
             assert_eq!(random.next_long(), expected_random.next_long());
+            struct ConditionalPigData;
+            impl ResourceProvider for ConditionalPigData {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(match path {
+                        "data/minecraft/pig_variant/temperate.json" => Some(br#"{"spawn_conditions":[{"priority":0}]}"#.to_vec()),
+                        "data/minecraft/pig_variant/moon.json" => Some(br#"{"spawn_conditions":[{"priority":1,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}]}"#.to_vec()),
+                        "data/minecraft/pig_sound_variant/classic.json" | "data/minecraft/worldgen/biome/plains.json" => Some(b"{}".to_vec()),
+                        _ => None,
+                    })
+                }
+                fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                    let names: &[&str] = match folder {
+                        "pig_variant" => &["minecraft:temperate", "minecraft:moon"],
+                        "pig_sound_variant" => &["minecraft:classic"],
+                        "worldgen/biome" => &["minecraft:plains"],
+                        _ => &[],
+                    };
+                    names.iter().map(|id| ResourceId::parse(id)).collect()
+                }
+            }
+            let conditional =
+                native_resources::animal_variants::FarmAnimalSpawnVariants::load_active(
+                    &mut ConditionalPigData,
+                    native_resources::animal_variants::FarmAnimal::Pig,
+                )
+                .unwrap();
+            let moon = native_resources::moon_phase::Environment {
+                base: native_resources::moon_phase::Phase::NewMoon,
+                biomes: BTreeMap::new(),
+                has_biome_layer: false,
+                tracks: vec![native_resources::moon_phase::Track::parse(
+                    &json!({"clock":"example:clock","period_ticks":20}),
+                    &json!({"keyframes":[{"ticks":0,"value":"full_moon"},{"ticks":10,"value":"new_moon"}]}),
+                ).unwrap()],
+            };
+            let mut random = native_resources::worldgen_region_random::RegionRandom::new(
+                91,
+                native_resources::density::WorldgenRandom::Legacy,
+                0,
+                0,
+            );
+            let mut original = random.clone();
+            let mut group = native_resources::worldgen_region_random::AnimalGroupData::default();
+            assert!(
+                batch
+                    .initialize_farm_animal(position, &conditional, &mut random, &mut group, false)
+                    .is_err()
+            );
+            assert_eq!(random.next_long(), original.next_long());
+            for (ticks, expected) in [(0, "minecraft:moon"), (10, "minecraft:temperate")] {
+                let clocks = BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), ticks)]);
+                let actual = batch
+                    .initialize_farm_animal_with_moon(
+                        position,
+                        &conditional,
+                        &mut random,
+                        &mut group,
+                        false,
+                        Some((&moon, &clocks)),
+                    )
+                    .unwrap();
+                assert_eq!(actual.variant, Some(ResourceId::parse(expected).unwrap()));
+            }
             let saved = || GeneratedEntityAddition {
                 block_position: position,
                 record: GeneratedEntityRecord::Saved(native_persistence::nbt::Tag::Compound(vec![

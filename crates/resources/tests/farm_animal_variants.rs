@@ -268,6 +268,87 @@ fn world_conditions_select_animal_and_nautilus_variants_transactionally() {
 }
 
 #[test]
+fn selectors_query_only_conditions_reached_at_the_winning_priority() {
+    use native_resources::animal_variants::SpawnVariantEnvironment;
+    use std::collections::BTreeSet;
+    struct Environment {
+        biome: ResourceId,
+        structures: BTreeSet<ResourceId>,
+        structure_queries: usize,
+        moon_queries: usize,
+    }
+    impl SpawnVariantEnvironment for Environment {
+        fn biome(&self) -> Result<&ResourceId> {
+            Ok(&self.biome)
+        }
+        fn moon_phase(&mut self) -> Result<u8> {
+            self.moon_queries += 1;
+            anyhow::bail!("clock unavailable")
+        }
+        fn structures_with_piece(&mut self) -> Result<&BTreeSet<ResourceId>> {
+            self.structure_queries += 1;
+            Ok(&self.structures)
+        }
+    }
+    let mut data = Data::default();
+    data.0.insert(
+        "data/minecraft/worldgen/biome/ocean.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/worldgen/structure/shipwreck.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/pig_sound_variant/classic.json".into(),
+        b"{}".to_vec(),
+    );
+    for (name, condition) in [
+        (
+            "ship",
+            json!({"priority":2,"condition":{"type":"minecraft:structure","structures":"minecraft:shipwreck"}}),
+        ),
+        (
+            "moon",
+            json!({"priority":1,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}),
+        ),
+    ] {
+        data.0.insert(
+            format!("data/minecraft/pig_variant/{name}.json"),
+            serde_json::to_vec(&json!({"spawn_conditions":[condition]})).unwrap(),
+        );
+    }
+    let variants = FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).unwrap();
+    let mut env = Environment {
+        biome: id("ocean"),
+        structures: BTreeSet::from([id("shipwreck")]),
+        structure_queries: 0,
+        moon_queries: 0,
+    };
+    let mut random = RegionRandom::new(17, WorldgenRandom::Legacy, 0, 0);
+    let mut group = AnimalGroupData::default();
+    assert_eq!(
+        variants
+            .finalize_in_environment(&mut env, &mut random, &mut group, false)
+            .unwrap()
+            .variant,
+        Some(id("ship"))
+    );
+    assert_eq!((env.structure_queries, env.moon_queries), (1, 0));
+    env.structures.clear();
+    let mut expected_random = random.clone();
+    let expected_group = group;
+    assert!(
+        variants
+            .finalize_in_environment(&mut env, &mut random, &mut group, false)
+            .is_err()
+    );
+    assert_eq!((env.structure_queries, env.moon_queries), (2, 1));
+    assert_eq!(group, expected_group);
+    assert_eq!(random.next_long(), expected_random.next_long());
+}
+
+#[test]
 fn selectors_preserve_order_duplicates_and_reject_unknown_conditions() {
     let mut data = Data::default();
     for biome in ["plains", "desert"] {

@@ -12,7 +12,10 @@ use native_resources::{
 };
 use native_world::loaded::ChunkPos;
 use native_world::movement::BoundingBox;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use super::{
     FreshTerrainBatch, GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
@@ -101,6 +104,10 @@ pub struct GeneratedSheepSpawner {
     pose: Option<GeneratedCreaturePose>,
     construction: Option<FreshCreatureConstruction>,
     farm_variants: [Option<Arc<FarmAnimalSpawnVariants>>; 3],
+    farm_moon: Option<(
+        Arc<native_resources::moon_phase::Environment>,
+        Arc<BTreeMap<native_resources::packs::ResourceId, i64>>,
+    )>,
     additions: Vec<super::GeneratedEntityAddition>,
     #[cfg(test)]
     rule_light: Option<(
@@ -208,6 +215,7 @@ impl GeneratedSheepSpawner {
             pose: None,
             construction: None,
             farm_variants: [None, None, None],
+            farm_moon: None,
             additions: Vec::new(),
             #[cfg(test)]
             rule_light: None,
@@ -259,6 +267,24 @@ impl GeneratedSheepSpawner {
             "animal registry is already enabled"
         );
         self.farm_variants[index] = Some(variants);
+        Ok(())
+    }
+
+    /// Use the same immutable dimension environment and clocks as generation.
+    pub fn set_farm_moon_environment(
+        &mut self,
+        moon: Arc<native_resources::moon_phase::Environment>,
+        clocks: Arc<BTreeMap<native_resources::packs::ResourceId, i64>>,
+    ) -> Result<()> {
+        ensure!(
+            matches!(self.stage, Stage::Begin),
+            "cannot change environment during a candidate"
+        );
+        ensure!(
+            self.farm_moon.is_none(),
+            "farm moon environment is already set"
+        );
+        self.farm_moon = Some((moon, clocks));
         Ok(())
     }
 
@@ -377,6 +403,9 @@ impl GeneratedSheepSpawner {
                         &mut self.group,
                         construction.uuid,
                         construction.chicken_egg_time,
+                        self.farm_moon
+                            .as_ref()
+                            .map(|(moon, clocks)| (moon.as_ref(), clocks.as_ref())),
                     )?
                 } else {
                     probe.prepare_fresh_sheep(

@@ -540,6 +540,10 @@ impl GeneratedCreatureProbe {
         group: &mut native_resources::worldgen_region_random::AnimalGroupData,
         uuid: [i32; 4],
         chicken_egg_time: Option<i32>,
+        moon: Option<(
+            &native_resources::moon_phase::Environment,
+            &std::collections::BTreeMap<native_resources::packs::ResourceId, i64>,
+        )>,
     ) -> Result<super::GeneratedEntityAddition> {
         use native_resources::animal_variants::FarmAnimal;
         let species = match (
@@ -571,12 +575,13 @@ impl GeneratedCreatureProbe {
         let position = geometry_block_position(geometry)?.to_array();
         let mut next_random = random.clone();
         let mut next_group = *group;
-        let initialized = batch.initialize_farm_animal(
+        let initialized = batch.initialize_farm_animal_with_moon(
             position,
             variants,
             &mut next_random,
             &mut next_group,
             false,
+            moon,
         )?;
         let tag = super::draft_fresh_farm_animal(
             species,

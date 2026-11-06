@@ -50,6 +50,90 @@ pub enum PieceProcessors {
     List(Vec<PieceProcessors>),
 }
 
+/// A rigid single-template piece with its active data and processors. This is
+/// still an intermediate result; placement and entities remain separate.
+#[derive(Clone)]
+pub struct PreparedTemplatePiece {
+    template: Arc<native_persistence::structure_template::StructureTemplate>,
+    processors: Arc<native_persistence::structure_processors::PreparedProcessors>,
+    origin: [i32; 3],
+    rotation: native_resources::structure_transform::Rotation,
+    legacy: bool,
+}
+
+impl PreparedTemplatePiece {
+    pub fn load(
+        piece: &Piece,
+        processors: &PieceProcessors,
+        provider: &mut impl ResourceProvider,
+    ) -> Result<Self> {
+        let PoolElement::Single {
+            location,
+            legacy,
+            projection,
+            ..
+        } = &piece.element
+        else {
+            anyhow::bail!("jigsaw piece is not a single template");
+        };
+        ensure!(
+            *projection == Projection::Rigid,
+            "terrain-matching jigsaw projection is not yet supported"
+        );
+        let PieceProcessors::Single(processors) = processors else {
+            anyhow::bail!("jigsaw piece processors do not match its element");
+        };
+        let template =
+            native_persistence::structure_template::StructureTemplate::load(provider, location)?
+                .with_context(|| {
+                    format!(
+                        "missing jigsaw template {}:{}",
+                        location.namespace, location.path
+                    )
+                })?;
+        ensure!(
+            template.data_version == Some(5023),
+            "jigsaw template needs unsupported data-version conversion"
+        );
+        Ok(Self {
+            template: Arc::new(template),
+            processors: Arc::clone(processors),
+            origin: piece.origin,
+            rotation: piece.rotation,
+            legacy: *legacy,
+        })
+    }
+
+    /// Return unrotated, processed records in Java order without world writes.
+    pub fn process_blocks(
+        &self,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        clip: native_core::beardifier::BoundingBox,
+        is_static_full: impl FnMut(&native_world::loaded::BlockState) -> Result<bool>,
+        world: &mut impl FnMut([i32; 3]) -> Result<native_world::loaded::BlockState>,
+    ) -> Result<Vec<native_persistence::jigsaw_template::ProcessedTemplateBlock>> {
+        use native_persistence::jigsaw_template::{
+            TemplateSettings, process_template, resolve_template_state,
+        };
+        process_template(
+            &self.template,
+            registry,
+            &self.processors,
+            TemplateSettings {
+                origin: self.origin,
+                rotation: self.rotation,
+                clip,
+                legacy: self.legacy,
+                keep_jigsaws: false,
+            },
+            |tag| resolve_template_state(tag, registry),
+            is_static_full,
+            world,
+            |_, block| Ok(Some(block)),
+        )
+    }
+}
+
 fn prepare_element_processors(
     element: &PoolElement,
     provider: &mut impl ResourceProvider,
@@ -265,6 +349,191 @@ impl PreparedStart {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    #[ignore = "requires the installed verified 26.3 client and Java 25"]
+    fn processed_real_template_matches_java() -> Result<()> {
+        use native_persistence::structure_processors::PreparedProcessors;
+        use native_resources::{structure_pool::HolderValue, structure_transform::Rotation};
+        use native_world::loaded::BlockState;
+        use std::{path::PathBuf, process::Command};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut data = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = data.vanilla_block_ids()?;
+        let registry = data.vanilla_generated_block_registry()?;
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[
+            {"processor_type":"minecraft:block_rot","integrity":0.83},
+            {"processor_type":"minecraft:protected_blocks","value":["minecraft:bedrock"]}
+        ]}));
+        let prepared = PieceProcessors::Single(Arc::new(PreparedProcessors::load(
+            &holder, &mut data, &blocks, &registry,
+        )?));
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home is missing")?
+            .join("bin");
+        let source = temp.path().join("JigsawTemplateOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/JigsawTemplateOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("JigsawTemplateOracle")
+            .arg(version.join("26.3.jar"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rotations = [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Clockwise180,
+            Rotation::Counterclockwise90,
+        ];
+        let mut expected = VecDeque::new();
+        let mut cases = 0;
+        let mut checked = 0;
+        let mut defaults_checked = false;
+        let format_state = |state: &BlockState| {
+            let mut actual = format!("Block{{{}}}", state.name);
+            if !state.properties.is_empty() {
+                let properties = state
+                    .properties
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                actual.push_str(&format!("[{properties}]"));
+            }
+            actual
+        };
+        for line in String::from_utf8(output.stdout)?.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["DEFAULT", structure, jigsaw] => {
+                    for (id, expected) in [
+                        ("minecraft:structure_block", *structure),
+                        ("minecraft:jigsaw", *jigsaw),
+                    ] {
+                        let tag = native_persistence::nbt::Tag::Compound(vec![(
+                            "id".into(),
+                            native_persistence::nbt::Tag::String(id.into()),
+                        )]);
+                        let state = native_persistence::jigsaw_template::resolve_template_state(
+                            &tag, &registry,
+                        )?;
+                        assert_eq!(format_state(&state), expected);
+                    }
+                    defaults_checked = true;
+                }
+                ["CASE", rotation, clipped, count] => {
+                    ensure!(expected.is_empty(), "previous case incomplete");
+                    let rotation = rotations[rotation.parse::<usize>()?];
+                    let clip = if *clipped == "0" {
+                        native_core::beardifier::BoundingBox::new([-1000; 3], [1000; 3])
+                            .map_err(anyhow::Error::msg)?
+                    } else {
+                        native_core::beardifier::BoundingBox::new([14, 20, -26], [19, 23, -20])
+                            .map_err(anyhow::Error::msg)?
+                    };
+                    let piece = Piece {
+                        element: PoolElement::Single {
+                            legacy: false,
+                            location: ResourceId::parse("minecraft:underwater_ruin/warm_1")?,
+                            processors: holder.clone(),
+                            projection: Projection::Rigid,
+                            override_liquid_settings: None,
+                        },
+                        origin: [17, 20, -23],
+                        rotation,
+                        bounds: clip,
+                        ground_level_delta: 0,
+                        junctions: Vec::new(),
+                    };
+                    let piece = PreparedTemplatePiece::load(&piece, &prepared, &mut data)?;
+                    let result = piece.process_blocks(
+                        &registry,
+                        clip,
+                        super::super::ocean_ruin::ocean_template_static_full,
+                        &mut |pos| {
+                            Ok(BlockState {
+                                name: if pos[0] % 7 == 0 {
+                                    "minecraft:bedrock"
+                                } else {
+                                    "minecraft:stone"
+                                }
+                                .into(),
+                                properties: BTreeMap::new(),
+                            })
+                        },
+                    )?;
+                    ensure!(
+                        result.len() == count.parse::<usize>()?,
+                        "different block count for {rotation:?} clip {clipped}"
+                    );
+                    expected.extend(result);
+                    cases += 1;
+                }
+                ["BLOCK", x, y, z, state, nbt] => {
+                    let block = expected.pop_front().context("unexpected Java block")?.block;
+                    assert_eq!(
+                        block.position,
+                        [x.parse::<i32>()?, y.parse::<i32>()?, z.parse::<i32>()?]
+                    );
+                    assert_eq!(&format_state(&block.state), state);
+                    assert_eq!(
+                        if block.nbt.is_none() {
+                            "none"
+                        } else {
+                            "present"
+                        },
+                        *nbt
+                    );
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        ensure!(expected.is_empty(), "last case incomplete");
+        assert!(defaults_checked);
+        assert_eq!(cases, 8);
+        assert!(checked > 100);
+        Ok(())
+    }
 
     struct Terrain {
         allow: bool,

@@ -1071,6 +1071,14 @@ impl GeneratedBlockView<'_> {
                 falling: false,
             });
         }
+        if super::ore::valid_lichen(&state) && state.properties["waterlogged"] == "true" {
+            return Cell::FenceWater(native_world::fluid::FluidState {
+                kind: native_world::fluid::FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            });
+        }
         if let Some((top, waterlogged)) = self.slab(&state) {
             return Cell::Slab { top, waterlogged };
         }
@@ -1167,6 +1175,10 @@ impl GeneratedBlockView<'_> {
         {
             return Ok(());
         }
+        ensure!(
+            !super::ore::valid_lichen(&self.read(pos)?),
+            "waterlogged lichen fluid spread is not yet supported"
+        );
         // Unknown rules must yield the same plan for both possible values.
         // Water's delay is fixed and never samples lava's delay RNG.
         let mut planned = None;
@@ -1746,6 +1758,20 @@ impl GeneratedBlockView<'_> {
         flags: i32,
     ) -> Result<()> {
         let old = self.read(pos)?;
+        if super::ore::valid_lichen(&old) {
+            let faces = ["down", "up", "north", "south", "west", "east"];
+            let valid = if super::ore::valid_lichen(next) {
+                old.properties["waterlogged"] == next.properties["waterlogged"]
+                    && faces.iter().all(|face| {
+                        old.properties[*face] == "true" || next.properties[*face] == "false"
+                    })
+                    && faces.iter().any(|face| next.properties[*face] == "true")
+            } else {
+                next.name == "minecraft:air" && next.properties.is_empty()
+            };
+            ensure!(flags == 276 && valid, "unsupported generated lichen write");
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         if native_world::collision::fence_waterlogged(&old).is_some()
             && native_world::collision::fence_waterlogged(next).is_some()
         {
@@ -1990,6 +2016,40 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
         _: [i32; 3],
         neighbor: &BlockState,
     ) -> Result<BlockState> {
+        if super::ore::valid_lichen(state) {
+            if state.properties["waterlogged"] == "true" {
+                self.schedule_contained_water(pos)?;
+            }
+            let faces = ["down", "up", "north", "south", "west", "east"];
+            if !faces.iter().any(|face| state.properties[*face] == "true") {
+                return Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: Default::default(),
+                });
+            }
+            let face = match direction {
+                [-1, 0, 0] => "west",
+                [1, 0, 0] => "east",
+                [0, 0, -1] => "north",
+                [0, 0, 1] => "south",
+                [0, -1, 0] => "down",
+                [0, 1, 0] => "up",
+                _ => anyhow::bail!("invalid lichen update direction"),
+            };
+            if state.properties[face] == "false" || super::ore::multiface_support(neighbor)? {
+                return Ok(state.clone());
+            }
+            let mut updated = state.clone();
+            updated.properties.insert(face.into(), "false".into());
+            return if faces.iter().any(|face| updated.properties[*face] == "true") {
+                Ok(updated)
+            } else {
+                Ok(BlockState {
+                    name: "minecraft:air".into(),
+                    properties: Default::default(),
+                })
+            };
+        }
         if let Some(waterlogged) = native_world::collision::fence_waterlogged(state) {
             if waterlogged {
                 self.schedule_contained_water(pos)?;
@@ -2115,6 +2175,16 @@ impl PostprocessingWorld for GeneratedBlockView<'_> {
         self.read(pos)
     }
     fn fluid(&mut self, state: &BlockState) -> Result<Option<Self::Fluid>> {
+        if super::ore::valid_lichen(state) {
+            return Ok((state.properties["waterlogged"] == "true").then_some(
+                native_world::fluid::FluidState {
+                    kind: native_world::fluid::FluidKind::Water,
+                    amount: 8,
+                    source: true,
+                    falling: false,
+                },
+            ));
+        }
         if let Some(fluid) = liquid_state(state)? {
             return Ok(Some(fluid));
         }
@@ -2814,6 +2884,177 @@ mod tests {
             result.edits.len(),
             result.light_checks.len()
         )
+    }
+
+    fn lichen_postprocessing_trace(mode: &str) -> String {
+        use native_resources::packs::ResourceProvider;
+        struct Tags;
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                    | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => {
+                        Ok(Some(br#"{"values":["minecraft:stone"]}"#.to_vec()))
+                    }
+                    _ => Ok(None),
+                }
+            }
+        }
+        let registry = ["air", "stone", "glow_lichen"]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}"))
+            .collect();
+        let (mut stage, _, chunk) = fixture(false);
+        stage.heightmap_tags = Some(Arc::new(
+            native_resources::heightmap_tags::HeightmapTags::load(&mut Tags, &registry).unwrap(),
+        ));
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(stone);
+        let faces = ["down", "up", "north", "south", "west", "east"];
+        let mut lichen = BlockState {
+            name: "minecraft:glow_lichen".into(),
+            properties: BTreeMap::new(),
+        };
+        for face in faces {
+            let present = mode == "all"
+                || mode.starts_with("lose_")
+                || (face == "west" && mode != "empty")
+                || (face == "east" && mode == "lost_one");
+            lichen.properties.insert(face.into(), present.to_string());
+        }
+        lichen
+            .properties
+            .insert("waterlogged".into(), (mode == "wet").to_string());
+        let id = world.intern_state(lichen);
+        world.set_block_id(8, 8, 8, id).unwrap();
+        if mode.starts_with("lost_") {
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            world.set_block_id(7, 8, 8, air).unwrap();
+        }
+        if let Some(face) = mode.strip_prefix("lose_") {
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let pos = match face {
+                "down" => [8, 7, 8],
+                "up" => [8, 9, 8],
+                "north" => [8, 8, 7],
+                "south" => [8, 8, 9],
+                "west" => [7, 8, 8],
+                "east" => [9, 8, 8],
+                _ => panic!("invalid test face"),
+            };
+            world.set_block_id(pos[0], pos[1], pos[2], air).unwrap();
+        }
+        stage.source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        stage
+            .region
+            .tasks
+            .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+        stage.region.ticks = RegionTicks::new(
+            BTreeMap::from([(
+                chunk,
+                ConvertedChunkTicks {
+                    blocks: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                    fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
+                },
+            )]),
+            100,
+            0,
+        )
+        .unwrap();
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        let block = result.world.block(8, 8, 8).unwrap();
+        let mask = if block.name == "minecraft:glow_lichen" {
+            faces
+                .into_iter()
+                .map(|face| {
+                    if block.properties[face] == "true" {
+                        '1'
+                    } else {
+                        '0'
+                    }
+                })
+                .collect::<String>()
+        } else {
+            "-".into()
+        };
+        let ticks = result.ticks.chunk(chunk).unwrap();
+        let blocks = ticks.blocks.pack(100);
+        let fluids = ticks.fluids.pack(100);
+        format!(
+            "L {mode} {} {mask} {} {} {} {} {} {}",
+            block.name,
+            blocks.len(),
+            fluids.len(),
+            fluids.first().map_or(-1, |tick| tick.delay),
+            result.ticks.activated_snapshot().next_sub_tick,
+            result.edits.len(),
+            result.light_checks.len()
+        )
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn generated_lichen_postprocessing_matches_java() {
+        let actual = java_results(
+            "GeneratedLichenPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedLichenPostprocessingOracle.java"),
+        );
+        let expected: Vec<_> = [
+            "supported",
+            "lost_west",
+            "lost_one",
+            "empty",
+            "wet",
+            "all",
+            "lose_down",
+            "lose_up",
+            "lose_north",
+            "lose_south",
+            "lose_west",
+            "lose_east",
+        ]
+        .into_iter()
+        .map(lichen_postprocessing_trace)
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generated_lichen_updates_faces_and_schedules_water() {
+        for (mode, expected) in [
+            ("supported", "minecraft:glow_lichen 000010 0 0 -1 0 0 0"),
+            ("lost_west", "minecraft:air - 0 0 -1 0 1 1"),
+            ("lost_one", "minecraft:glow_lichen 000001 0 0 -1 0 1 0"),
+            ("empty", "minecraft:air - 0 0 -1 0 1 0"),
+            ("wet", "minecraft:glow_lichen 000010 0 1 5 6 0 0"),
+        ] {
+            assert_eq!(
+                lichen_postprocessing_trace(mode),
+                format!("L {mode} {expected}")
+            );
+        }
     }
 
     #[test]

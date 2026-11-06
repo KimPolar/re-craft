@@ -5152,7 +5152,7 @@ fn multiface_name(face: MultifaceFace) -> &'static str {
         MultifaceFace::East => "east",
     }
 }
-fn valid_lichen(state: &BlockState) -> bool {
+pub(super) fn valid_lichen(state: &BlockState) -> bool {
     state.name == "minecraft:glow_lichen"
         && state.properties.len() == 7
         && [
@@ -5172,7 +5172,7 @@ fn valid_lichen(state: &BlockState) -> bool {
             )
         })
 }
-fn multiface_support(state: &BlockState) -> Result<bool> {
+pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
     if is_air(state)
         || matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava")
         || valid_lichen(state)

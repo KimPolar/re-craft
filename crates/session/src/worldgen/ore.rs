@@ -281,6 +281,7 @@ pub struct DecorationRegion<'a> {
     tree_block_write: bool,
     column_block_write: bool,
     patch_block_write: bool,
+    multiface_block_write: bool,
     failed: bool,
 }
 
@@ -2760,6 +2761,7 @@ impl CarvedTerrainWorld {
             tree_block_write: false,
             column_block_write: false,
             patch_block_write: false,
+            multiface_block_write: false,
             failed: false,
         })
     }
@@ -5428,7 +5430,10 @@ impl native_resources::multiface_growth::MultifaceWorld for DecorationRegion<'_>
             is_air(&old) || old.name == "minecraft:water" || valid_lichen(&old),
             "unsupported multiface replacement effect"
         );
-        self.set_proto_block(pos, state)?;
+        self.multiface_block_write = true;
+        let result = self.set_proto_block(pos, state);
+        self.multiface_block_write = false;
+        result?;
         Ok(true)
     }
     fn mark_postprocessing(&mut self, pos: [i32; 3]) -> Result<()> {
@@ -6549,10 +6554,26 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     } else {
                         false
                     };
+                    let water_lichen_write = guard.require_unchanged_light
+                        && self.multiface_block_write
+                        && old.name == "minecraft:water"
+                        && old.properties.len() == 1
+                        && old.properties.get("level").map(String::as_str) == Some("0")
+                        && valid_lichen(state)
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                        && ["down", "up", "north", "south", "west", "east"]
+                            .into_iter()
+                            .any(|face| {
+                                state.properties.get(face).map(String::as_str) == Some("true")
+                            });
+                    // A source-water block emits no light; a lichen with a
+                    // face emits light and always requires a block check.
+                    let lichen_check = water_lichen_write;
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
                                 || vine_write
+                                || water_lichen_write
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {} -> {}",
@@ -6569,6 +6590,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || fresh_water_dripleaf
                             || fresh_waterlog_dripleaf
                             || vine_write
+                            || water_lichen_write
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
@@ -6621,14 +6643,15 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || fresh_water_dripleaf
                         || fresh_waterlog_dripleaf
                         || vine_check
+                        || lichen_check
                         || new_section
                     {
                         let guard = self.light_guard.as_mut().unwrap();
                         guard.light_replay_positions.insert(p);
-                        if vine_write {
+                        if vine_write || water_lichen_write {
                             guard.vine_light_positions.insert(p);
                         }
-                        if tree_light_update || vine_check {
+                        if tree_light_update || vine_check || lichen_check {
                             guard.light_check_order.push(p);
                         }
                     }
@@ -10673,6 +10696,8 @@ mod tests {
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
         for mode in [
+            "vine_active_lichen",
+            "vine_active_self_lichen",
             "vine_active_plain",
             "vine_active_glowing",
             "vine_active_head",
@@ -10743,6 +10768,12 @@ mod tests {
                 let id = world.intern_state(plain);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if mode.ends_with("_lichen") {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let id = world.intern_state(water);
+                world.set_block_id(16, 10, 8, id).unwrap();
+            }
             let radius = if self_active { 2 } else { 1 };
             let registered: Vec<_> = (-radius..=radius)
                 .flat_map(|z| (-radius..=radius).map(move |x| ChunkPos { x, z }))
@@ -10789,6 +10820,30 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.ends_with("_lichen") {
+                    let mut lichen = state("glow_lichen");
+                    for property in [
+                        "down",
+                        "up",
+                        "north",
+                        "south",
+                        "west",
+                        "east",
+                        "waterlogged",
+                    ] {
+                        lichen.properties.insert(
+                            property.into(),
+                            (property == "up" || property == "waterlogged").to_string(),
+                        );
+                    }
+                    assert!(
+                        native_resources::multiface_growth::MultifaceWorld::set_growth(
+                            &mut draft, p, &lichen, true
+                        )
+                        .unwrap()
+                    );
+                    continue;
+                }
                 let berries = if mode.ends_with("_plain_then_glowing") {
                     i == 1
                 } else if mode.ends_with("_many") {

@@ -13,19 +13,17 @@ use crate::worldgen::{BiomeNeighborhood, LocalDifficulty};
 /// Creates a fresh chicken with the active variants while delegating other
 /// drowned effects. All callback clones must own independent mutable state.
 #[derive(Clone)]
-pub struct DrownedChickenEffects<E, C, B> {
+pub struct DrownedChickenEffects<E, C> {
     pub other: E,
     variants: std::sync::Arc<native_resources::animal_variants::FarmAnimalSpawnVariants>,
     construct: C,
-    biome_at: B,
     pending: Option<Tag>,
 }
 
-impl<E, C, B> DrownedChickenEffects<E, C, B> {
+impl<E, C> DrownedChickenEffects<E, C> {
     pub fn new(
         variants: std::sync::Arc<native_resources::animal_variants::FarmAnimalSpawnVariants>,
         construct: C,
-        biome_at: B,
         other: E,
     ) -> Result<Self> {
         ensure!(
@@ -36,17 +34,15 @@ impl<E, C, B> DrownedChickenEffects<E, C, B> {
             other,
             variants,
             construct,
-            biome_at,
             pending: None,
         })
     }
 }
 
-impl<E, C, B> DrownedSpawnEffects for DrownedChickenEffects<E, C, B>
+impl<E, C> DrownedSpawnEffects for DrownedChickenEffects<E, C>
 where
     E: DrownedSpawnEffects,
     C: Clone + FnMut() -> Result<Option<crate::worldgen::FreshCreatureRandom>>,
-    B: Clone + FnMut([i32; 3], &World) -> Result<native_resources::packs::ResourceId>,
 {
     fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
         self.other.try_existing_chicken(position, world)
@@ -54,8 +50,9 @@ where
     fn spawn_chicken_jockey(
         &mut self,
         position: [i32; 3],
-        world: &World,
+        _: &World,
         random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
     ) -> Result<bool> {
         ensure!(
             self.pending.is_none(),
@@ -66,8 +63,7 @@ where
             self.construct = construct;
             return Ok(false);
         };
-        let mut biome_at = self.biome_at.clone();
-        let biome = biome_at(position, world)?;
+        let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
         let coords = [
             f64::from(position[0]) + 0.5,
             f64::from(position[1]),
@@ -77,12 +73,11 @@ where
             &chicken,
             coords,
             0.0,
-            &biome,
+            biome,
             &self.variants,
             random,
         )?;
         self.construct = construct;
-        self.biome_at = biome_at;
         self.pending = Some(tag);
         Ok(true)
     }
@@ -164,9 +159,10 @@ impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> 
         position: [i32; 3],
         world: &World,
         random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
     ) -> Result<bool> {
         self.passengers
-            .spawn_chicken_jockey(position, world, random)
+            .spawn_chicken_jockey(position, world, random, biomes)
     }
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.passengers.take_created_chicken()
@@ -255,6 +251,7 @@ pub trait DrownedSpawnEffects: Clone {
         position: [i32; 3],
         world: &World,
         random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
     ) -> Result<bool>;
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         Ok(None)
@@ -325,7 +322,8 @@ where
         world: &World,
         random: &mut RegionRandom,
     ) -> Result<bool> {
-        self.effects.spawn_chicken_jockey(position, world, random)
+        self.effects
+            .spawn_chicken_jockey(position, world, random, self.biomes)
     }
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.effects.take_created_chicken()
@@ -401,6 +399,7 @@ mod tests {
             _: [i32; 3],
             _: &World,
             _: &mut RegionRandom,
+            _: &BiomeNeighborhood,
         ) -> Result<bool> {
             self.calls += 1;
             Ok(false)
@@ -528,9 +527,21 @@ mod tests {
         let mut effects = DrownedChickenEffects::new(
             variants.clone(),
             move || Ok(Some(saved.clone())),
-            |_, _: &World| Ok(ResourceId::parse("minecraft:plains")?),
             Effects::default(),
         )?;
+        let plains = ResourceId::parse("minecraft:plains")?;
+        let mut biomes = BiomeNeighborhood::new(87, 0, 16)?;
+        for z in -1..=1 {
+            for x in -1..=1 {
+                biomes.insert(Arc::new(QuartBiomeChunk::from_values(
+                    [x, z],
+                    87,
+                    0,
+                    16,
+                    vec![plains.clone(); 64],
+                )?))?;
+            }
+        }
         let world = World::new("minecraft:overworld");
         let mut random = RegionRandom::Legacy(LegacyRandom::new(99));
         let mut expected_random = random.clone();
@@ -538,36 +549,103 @@ mod tests {
             &creature,
             [3.5, 10.0, -1.5],
             0.0,
-            &ResourceId::parse("minecraft:plains")?,
+            &plains,
             &variants,
             &mut expected_random,
         )?;
-        assert!(effects.spawn_chicken_jockey([3, 10, -2], &world, &mut random)?);
+        assert!(effects.spawn_chicken_jockey([3, 10, -2], &world, &mut random, &biomes)?);
         assert!(
             effects
-                .spawn_chicken_jockey([3, 10, -2], &world, &mut random)
+                .spawn_chicken_jockey([3, 10, -2], &world, &mut random, &biomes)
                 .is_err()
         );
         assert_eq!(effects.take_created_chicken()?, Some(expected));
         assert_eq!(effects.take_created_chicken()?, None);
         assert_eq!(random.next_long(), expected_random.next_long());
 
+        let desert = ResourceId::parse("minecraft:desert")?;
+        let mut mixed = BiomeNeighborhood::new(87, 0, 16)?;
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let mut values = Vec::new();
+                for _z in 0..4 {
+                    for local_x in 0..4 {
+                        for _y in 0..4 {
+                            values.push(if x * 4 + local_x < 0 {
+                                plains.clone()
+                            } else {
+                                desert.clone()
+                            });
+                        }
+                    }
+                }
+                mixed.insert(Arc::new(QuartBiomeChunk::from_values(
+                    [x, z],
+                    87,
+                    0,
+                    16,
+                    values,
+                )?))?;
+            }
+        }
+        let positions = [[-8, 10, -2], [8, 10, -2]];
+        assert_ne!(
+            mixed.biome_at_block(-8, 10, -2)?,
+            mixed.biome_at_block(8, 10, -2)?
+        );
+        for position in positions {
+            let biome = mixed.biome_at_block(position[0], position[1], position[2])?;
+            let coords = [
+                f64::from(position[0]) + 0.5,
+                f64::from(position[1]),
+                f64::from(position[2]) + 0.5,
+            ];
+            let expected = crate::worldgen::draft_fresh_jockey_chicken(
+                &creature,
+                coords,
+                0.0,
+                biome,
+                &variants,
+                &mut expected_random,
+            )?;
+            assert!(effects.spawn_chicken_jockey(position, &world, &mut random, &mixed)?);
+            assert_eq!(effects.take_created_chicken()?, Some(expected));
+            assert_eq!(random.next_long(), expected_random.next_long());
+        }
+
         let mut invalid = creature.clone();
         invalid.construction.chicken_egg_time = None;
         let mut failed = DrownedChickenEffects::new(
-            variants,
+            variants.clone(),
             move || Ok(Some(invalid.clone())),
-            |_, _: &World| Ok(ResourceId::parse("minecraft:plains")?),
             Effects::default(),
         )?;
         let mut before = random.clone();
         assert!(
             failed
-                .spawn_chicken_jockey([3, 10, -2], &world, &mut random)
+                .spawn_chicken_jockey([3, 10, -2], &world, &mut random, &biomes)
                 .is_err()
         );
         assert_eq!(random.next_long(), before.next_long());
         assert!(failed.take_created_chicken()?.is_none());
+        let empty_biomes = BiomeNeighborhood::new(87, 0, 16)?;
+        let mut absent =
+            DrownedChickenEffects::new(variants.clone(), || Ok(None), Effects::default())?;
+        let mut before = random.clone();
+        assert!(!absent.spawn_chicken_jockey([3, 10, -2], &world, &mut random, &empty_biomes)?);
+        assert_eq!(random.next_long(), before.next_long());
+        let mut missing = DrownedChickenEffects::new(
+            variants,
+            move || Ok(Some(creature.clone())),
+            Effects::default(),
+        )?;
+        let mut before = random.clone();
+        assert!(
+            missing
+                .spawn_chicken_jockey([3, 10, -2], &world, &mut random, &empty_biomes)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), before.next_long());
         Ok(())
     }
 }

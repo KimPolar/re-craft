@@ -7309,6 +7309,7 @@ mod tests {
                 pos: [i32; 3],
                 world: &World,
                 random: &mut RegionRandom,
+                _: &BiomeNeighborhood,
             ) -> Result<bool> {
                 ocean_ruin::DrownedMarkerContext::spawn_chicken_jockey(self, pos, world, random)
             }

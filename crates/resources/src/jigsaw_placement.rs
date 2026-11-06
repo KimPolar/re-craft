@@ -278,6 +278,210 @@ pub trait AssemblyContext {
     }
 }
 
+/// A missing padding field uses Java's shared ZERO instance. An explicitly
+/// decoded zero is a distinct instance and still checks the dimension limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DimensionPadding {
+    DefaultZero,
+    Explicit { bottom: i32, top: i32 },
+}
+
+impl DimensionPadding {
+    fn values(self) -> (i32, i32) {
+        match self {
+            Self::DefaultZero => (0, 0),
+            Self::Explicit { bottom, top } => (bottom, top),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartHeightmap {
+    WorldSurfaceWg,
+    WorldSurface,
+    OceanFloorWg,
+    OceanFloor,
+    MotionBlocking,
+    MotionBlockingNoLeaves,
+}
+
+/// The biome precheck and terrain height are kept separate so a rejected
+/// column never causes a height sample.
+pub trait StartEnvironment {
+    fn valid_column(&mut self, x: i32, z: i32, min_y: i32, max_y: i32) -> Result<bool>;
+    fn first_free_height(&mut self, x: i32, z: i32, heightmap: StartHeightmap) -> Result<i32>;
+}
+
+pub struct StartOptions<'a> {
+    pub position: [i32; 3],
+    /// Only registry-backed holders participate in start-pool alias lookup.
+    pub pool_key: Option<&'a ResourceId>,
+    pub start_name: Option<&'a ResourceId>,
+    pub project_to_heightmap: Option<StartHeightmap>,
+    pub min_y: i32,
+    /// Inclusive maximum Y, as returned by Java's LevelHeightAccessor.
+    pub max_y: i32,
+    pub padding: DimensionPadding,
+    pub max_depth: i32,
+    pub horizontal_distance: i32,
+    pub vertical_distance: i32,
+    pub do_expansion_hack: bool,
+}
+
+/// Corresponds to Java's GenerationStub before its lazy piece builder runs.
+pub struct PreparedStart {
+    pub position: [i32; 3],
+    pub root: Piece,
+    max_depth: i32,
+    horizontal_distance: i32,
+    vertical_distance: i32,
+    min_y: i32,
+    max_y: i32,
+    padding: DimensionPadding,
+    do_expansion_hack: bool,
+}
+
+/// Select and align the center piece, consuming randomness in Java order.
+/// A missing alias falls back to the original holder, as it does in 26.3.
+pub fn prepare_start(
+    context: &mut impl AssemblyContext,
+    environment: &mut impl StartEnvironment,
+    original_pool: &TemplatePool,
+    options: StartOptions<'_>,
+    random: &mut impl FnMut(i32) -> Option<i32>,
+) -> Result<Option<PreparedStart>> {
+    ensure!(options.max_depth >= 0, "negative jigsaw depth");
+    ensure!(options.min_y <= options.max_y, "invalid dimension height");
+    ensure!(
+        options.horizontal_distance >= 0 && options.vertical_distance >= 0,
+        "negative jigsaw distance"
+    );
+    let (bottom, top) = options.padding.values();
+    ensure!(bottom >= 0 && top >= 0, "negative dimension padding");
+    let rotation = match random(4).context("invalid rotation random bound")? {
+        0 => Rotation::None,
+        1 => Rotation::Clockwise90,
+        2 => Rotation::Clockwise180,
+        3 => Rotation::Counterclockwise90,
+        _ => anyhow::bail!("rotation random result out of bounds"),
+    };
+    let aliased_pool = if let Some(key) = options.pool_key {
+        let alias = context.resolve_alias(key)?;
+        context.pool(&alias)?
+    } else {
+        None
+    };
+    let pool = aliased_pool.as_deref().unwrap_or(original_pool);
+    let Some(element) = pool.random_element(random)? else {
+        return Ok(None);
+    };
+    if matches!(element, PoolElement::Empty) {
+        return Ok(None);
+    }
+    let anchor = if let Some(name) = options.start_name {
+        let mut connectors = context.connectors(element, options.position, rotation)?;
+        shuffle_by_selection_priority(&mut connectors, random)?;
+        let Some(connector) = connectors
+            .iter()
+            .find(|connector| connector.name.as_ref() == Some(name))
+        else {
+            return Ok(None);
+        };
+        connector.position
+    } else {
+        options.position
+    };
+    let local_anchor: [i32; 3] =
+        std::array::from_fn(|i| anchor[i].wrapping_sub(options.position[i]));
+    let mut origin: [i32; 3] =
+        std::array::from_fn(|i| options.position[i].wrapping_sub(local_anchor[i]));
+    let mut bounds = context.bounds(element, origin, rotation)?;
+    let center_x = bounds.max[0].wrapping_add(bounds.min[0]) / 2;
+    let center_z = bounds.max[2].wrapping_add(bounds.min[2]) / 2;
+    let ground_y = if let Some(heightmap) = options.project_to_heightmap {
+        if !environment.valid_column(center_x, center_z, options.min_y, options.max_y)? {
+            return Ok(None);
+        }
+        options.position[1]
+            .wrapping_add(environment.first_free_height(center_x, center_z, heightmap)?)
+    } else {
+        origin[1]
+    };
+    let move_y = ground_y.wrapping_sub(bounds.min[1].wrapping_add(1));
+    origin[1] = origin[1].wrapping_add(move_y);
+    bounds.min[1] = bounds.min[1].wrapping_add(move_y);
+    bounds.max[1] = bounds.max[1].wrapping_add(move_y);
+    if matches!(options.padding, DimensionPadding::Explicit { .. })
+        && (bounds.min[1] < options.min_y.wrapping_add(bottom)
+            || bounds.max[1] > options.max_y.wrapping_sub(top))
+    {
+        return Ok(None);
+    }
+    Ok(Some(PreparedStart {
+        position: [center_x, ground_y.wrapping_add(local_anchor[1]), center_z],
+        root: Piece {
+            element: element.clone(),
+            origin,
+            rotation,
+            bounds,
+            ground_level_delta: 1,
+            junctions: vec![],
+        },
+        max_depth: options.max_depth,
+        horizontal_distance: options.horizontal_distance,
+        vertical_distance: options.vertical_distance,
+        min_y: options.min_y,
+        max_y: options.max_y,
+        padding: options.padding,
+        do_expansion_hack: options.do_expansion_hack,
+    }))
+}
+
+impl PreparedStart {
+    /// Execute Java's lazy piece builder after the caller validates the biome.
+    pub fn assemble(
+        self,
+        context: &mut impl AssemblyContext,
+        random: &mut impl FnMut(i32) -> Option<i32>,
+    ) -> Result<Vec<Piece>> {
+        if self.max_depth == 0 {
+            // 26.3 returns before copying even the root into the builder.
+            return Ok(Vec::new());
+        }
+        let [x, y, z] = self.position;
+        let (bottom, top) = self.padding.values();
+        let low_y = y
+            .wrapping_sub(self.vertical_distance)
+            .max(self.min_y.wrapping_add(bottom));
+        let high_y_exclusive = y
+            .wrapping_add(self.vertical_distance)
+            .wrapping_add(1)
+            .min(self.max_y.wrapping_add(1).wrapping_sub(top));
+        // AABB normalizes its endpoints, including an inverted vertical range.
+        let low = [
+            x.wrapping_sub(self.horizontal_distance),
+            low_y,
+            z.wrapping_sub(self.horizontal_distance),
+        ];
+        let high = [
+            x.wrapping_add(self.horizontal_distance).wrapping_add(1),
+            high_y_exclusive,
+            z.wrapping_add(self.horizontal_distance).wrapping_add(1),
+        ];
+        let min = std::array::from_fn(|i| low[i].min(high[i]));
+        let max = std::array::from_fn(|i| low[i].max(high[i]).wrapping_sub(1));
+        let bounds = BoundingBox::new(min, max).map_err(anyhow::Error::msg)?;
+        assemble(
+            context,
+            self.root,
+            bounds,
+            self.max_depth,
+            self.do_expansion_hack,
+            random,
+        )
+    }
+}
+
 fn element_projection(element: &PoolElement) -> Result<Projection> {
     match element {
         PoolElement::Single { projection, .. }
@@ -649,6 +853,297 @@ mod tests {
         fn surface_height(&mut self, _: [i32; 3]) -> Result<i32> {
             anyhow::bail!("rigid fixture unexpectedly sampled height")
         }
+    }
+
+    struct StartFixture {
+        graph: GraphFixture,
+        mode: i32,
+    }
+
+    impl AssemblyContext for StartFixture {
+        fn pool(&mut self, id: &ResourceId) -> Result<Option<Arc<TemplatePool>>> {
+            self.graph.pool(id)
+        }
+        fn connectors(
+            &mut self,
+            element: &PoolElement,
+            origin: [i32; 3],
+            rotation: Rotation,
+        ) -> Result<Vec<Connector>> {
+            self.graph.connectors(element, origin, rotation)
+        }
+        fn bounds(
+            &mut self,
+            element: &PoolElement,
+            origin: [i32; 3],
+            rotation: Rotation,
+        ) -> Result<BoundingBox> {
+            self.graph.bounds(element, origin, rotation)
+        }
+        fn surface_height(&mut self, position: [i32; 3]) -> Result<i32> {
+            self.graph.surface_height(position)
+        }
+        fn resolve_alias(&mut self, id: &ResourceId) -> Result<ResourceId> {
+            match self.mode {
+                8 | 10 => ResourceId::parse("example:terminators"),
+                9 => ResourceId::parse("example:missing"),
+                _ => Ok(id.clone()),
+            }
+        }
+    }
+
+    struct StartTerrain {
+        mode: i32,
+        height_calls: usize,
+        column_calls: usize,
+    }
+    impl StartEnvironment for StartTerrain {
+        fn valid_column(&mut self, _: i32, _: i32, min_y: i32, max_y: i32) -> Result<bool> {
+            assert_eq!((min_y, max_y), (-64, 319));
+            self.column_calls += 1;
+            Ok(self.mode != 4)
+        }
+        fn first_free_height(&mut self, _: i32, _: i32, heightmap: StartHeightmap) -> Result<i32> {
+            assert_eq!(heightmap, StartHeightmap::WorldSurfaceWg);
+            self.height_calls += 1;
+            Ok(70)
+        }
+    }
+
+    fn start_line(mode: i32, seed: i64) -> Result<String> {
+        use native_core::random::LegacyRandom;
+        let mut fixture = StartFixture {
+            graph: GraphFixture::new()?,
+            mode,
+        };
+        let mut terrain = StartTerrain {
+            mode,
+            height_calls: 0,
+            column_calls: 0,
+        };
+        let children = ResourceId::parse("example:children")?;
+        let empty = ResourceId::parse("minecraft:empty")?;
+        let name = ResourceId::parse(if mode == 2 {
+            "example:missing"
+        } else {
+            "example:door"
+        })?;
+        let pool = fixture.graph.pools[if mode == 11 { &empty } else { &children }].clone();
+        let mut random = LegacyRandom::new(seed);
+        let result = prepare_start(
+            &mut fixture,
+            &mut terrain,
+            &pool,
+            StartOptions {
+                position: [-5, if mode == 5 || mode == 6 { -100 } else { 30 }, -8],
+                pool_key: if mode == 10 {
+                    None
+                } else if mode == 11 {
+                    Some(&empty)
+                } else {
+                    Some(&children)
+                },
+                start_name: if mode == 1 || mode == 2 {
+                    Some(&name)
+                } else {
+                    None
+                },
+                project_to_heightmap: if mode == 3 || mode == 4 {
+                    Some(StartHeightmap::WorldSurfaceWg)
+                } else {
+                    None
+                },
+                min_y: -64,
+                max_y: 319,
+                padding: match mode {
+                    6 => DimensionPadding::Explicit { bottom: 0, top: 0 },
+                    7 => DimensionPadding::Explicit { bottom: 40, top: 1 },
+                    _ => DimensionPadding::DefaultZero,
+                },
+                max_depth: if mode >= 12 { mode - 11 } else { 0 },
+                horizontal_distance: 16,
+                vertical_distance: 12,
+                do_expansion_hack: false,
+            },
+            &mut |n| random.next_int_bound(n),
+        )?;
+        if result.is_some() && mode == 3 {
+            assert_eq!((terrain.column_calls, terrain.height_calls), (1, 1));
+        }
+        if mode == 4 {
+            assert_eq!(terrain.height_calls, 0);
+        }
+        let Some(result) = result else {
+            return Ok(format!("C\t{mode}\t{seed}\t-\t{}", random.next_long()));
+        };
+        let piece = result.root.clone();
+        let position = result.position;
+        let pieces = result.assemble(&mut fixture, &mut |n| random.next_int_bound(n))?;
+        if mode < 12 {
+            assert!(pieces.is_empty());
+        }
+        let mut graph = String::new();
+        for entry in pieces {
+            let PoolElement::Single { location, .. } = &entry.element else {
+                anyhow::bail!("unexpected graph element");
+            };
+            let rotation = match entry.rotation {
+                Rotation::None => 0,
+                Rotation::Clockwise90 => 1,
+                Rotation::Clockwise180 => 2,
+                Rotation::Counterclockwise90 => 3,
+            };
+            graph.push_str(&format!(
+                "|{}:{},{},{},{},{},{},{},{},{},{},{},{}",
+                location.namespace,
+                location.path,
+                rotation,
+                entry.origin[0],
+                entry.origin[1],
+                entry.origin[2],
+                entry.bounds.min[0],
+                entry.bounds.min[1],
+                entry.bounds.min[2],
+                entry.bounds.max[0],
+                entry.bounds.max[1],
+                entry.bounds.max[2],
+                entry.ground_level_delta
+            ));
+            for j in entry.junctions {
+                let projection = match j.destination_projection {
+                    Projection::Rigid => "rigid",
+                    Projection::TerrainMatching => "terrain_matching",
+                };
+                graph.push_str(&format!(
+                    ";{},{},{},{},{}",
+                    j.source_x, j.source_ground_y, j.source_z, j.delta_y, projection
+                ));
+            }
+        }
+        let PoolElement::Single { location, .. } = &piece.element else {
+            anyhow::bail!("unexpected start element");
+        };
+        let rotation = match piece.rotation {
+            Rotation::None => 0,
+            Rotation::Clockwise90 => 1,
+            Rotation::Clockwise180 => 2,
+            Rotation::Counterclockwise90 => 3,
+        };
+        Ok(format!(
+            "C\t{mode}\t{seed}\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}{graph}",
+            location.namespace,
+            location.path,
+            rotation,
+            piece.origin[0],
+            piece.origin[1],
+            piece.origin[2],
+            piece.bounds.min[0],
+            piece.bounds.min[1],
+            piece.bounds.min[2],
+            piece.bounds.max[0],
+            piece.bounds.max[1],
+            piece.bounds.max[2],
+            position[0],
+            position[1],
+            position[2],
+            piece.ground_level_delta,
+            random.next_long()
+        ))
+    }
+
+    #[test]
+    fn start_padding_and_missing_anchor() -> Result<()> {
+        for seed in 0..16 {
+            assert!(start_line(2, seed)?.contains("\t-\t"));
+            assert!(start_line(6, seed)?.contains("\t-\t"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn start_selection_and_random_state_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let _verified = crate::packs::ResourceStack::open(&game)?;
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home is missing")?
+            .join("bin");
+        for (name, source) in [
+            (
+                "JigsawGraphOracle.java",
+                include_str!("../tests/java/JigsawGraphOracle.java"),
+            ),
+            (
+                "JigsawPlacementOracle.java",
+                include_str!("../tests/java/JigsawPlacementOracle.java"),
+            ),
+            (
+                "JigsawStartOracle.java",
+                include_str!("../tests/java/JigsawStartOracle.java"),
+            ),
+        ] {
+            std::fs::write(temp.path().join(name), source)?;
+        }
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .args([
+                temp.path().join("JigsawGraphOracle.java"),
+                temp.path().join("JigsawPlacementOracle.java"),
+                temp.path().join("JigsawStartOracle.java"),
+            ])
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("JigsawStartOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let mut count = 0;
+        for line in String::from_utf8(output.stdout)?
+            .lines()
+            .filter(|line| line.starts_with("C\t"))
+        {
+            let mut fields = line.split('\t').skip(1);
+            let mode = fields.next().context("missing mode")?.parse()?;
+            let seed = fields.next().context("missing seed")?.parse()?;
+            assert_eq!(start_line(mode, seed)?, line);
+            count += 1;
+        }
+        assert_eq!(count, 112);
+        Ok(())
     }
 
     fn graph_lines(depth: i32, seed: i64) -> Result<VecDeque<String>> {

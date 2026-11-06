@@ -208,7 +208,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
             if(x==1 && z==0 && lakeActive) {
                 int[][] positions=lakeMixed ? new int[][]{{16,10,8},{16,10,9},{16,9,8}} : new int[][]{{16,10,8}};
-                for(var p:positions){ var pos=new BlockPos(p[0],p[1],p[2]); var stone=Blocks.STONE.defaultBlockState();
+                var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
+                var stone=args[1].contains("_deepslate_") ? Blocks.DEEPSLATE.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,axis) : Blocks.STONE.defaultBlockState();
+                for(var p:positions){ var pos=new BlockPos(p[0],p[1],p[2]);
                     fake.section.setBlockState(p[0]-16,p[1],p[2],stone); w.edits.put(pos,stone); }
             }
             if(x==1 && z==0 && patchFreshWater) {

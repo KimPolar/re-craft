@@ -6569,9 +6569,15 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // A source-water block emits no light; a lichen with a
                     // face emits light and always requires a block check.
                     let lichen_check = water_lichen_write;
+                    let lake_source = (old.name == "minecraft:stone" && old.properties.is_empty())
+                        || (old.name == "minecraft:deepslate"
+                            && old.properties.len() == 1
+                            && matches!(
+                                old.properties.get("axis").map(String::as_str),
+                                Some("x" | "y" | "z")
+                            ));
                     let lake_light_update = self.lake_block_write
-                        && old.name == "minecraft:stone"
-                        && old.properties.is_empty()
+                        && lake_source
                         && ((state.name == "minecraft:cave_air" && state.properties.is_empty())
                             || (state.name == "minecraft:lava"
                                 && state.properties.len() == 1
@@ -6584,9 +6590,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || lake_light_update
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
-                            "registered light behavior changed at {p:?}: {} -> {}",
-                            old.name,
-                            state.name
+                            "registered light behavior changed at {p:?}: {old:?} -> {state:?}"
                         );
                     }
                     // Model block checks as drained before activation. With
@@ -6602,9 +6606,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
-                        "registered light chunk has changed at {p:?}: {} -> {}",
-                        old.name,
-                        state.name
+                        "registered light chunk has changed at {p:?}: {old:?} -> {state:?}"
                     );
                     let mut new_section = false;
                     if old_air != new_air {
@@ -10689,6 +10691,41 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_cave_vines_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_air",
+            "vine_active_lake_lava",
+            "vine_active_lake_mixed",
+            "vine_active_self_lake_mixed",
+            "vine_active_lichen",
+            "vine_active_self_lichen",
+            "vine_active_plain",
+            "vine_active_glowing",
+            "vine_active_head",
+            "vine_active_existing",
+            "vine_active_empty_plain",
+            "vine_active_empty_glowing",
+            "vine_active_many",
+            "vine_active_plain_then_glowing",
+            "vine_active_empty_plain_then_glowing",
+            "vine_active_self_empty_plain",
+            "vine_active_self_empty_glowing",
+            "vine_active_self_empty_plain_then_glowing",
+            "vine_active_self_existing",
+            "vine_active_self_many",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_deepslate_lake_light_matches_java_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_deepslate_x_air",
+            "vine_active_lake_deepslate_y_air",
+            "vine_active_self_lake_deepslate_z_lava",
+        ]);
+    }
+
+    fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -10728,28 +10765,7 @@ mod tests {
         );
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
-        for mode in [
-            "vine_active_lake_air",
-            "vine_active_lake_lava",
-            "vine_active_lake_mixed",
-            "vine_active_self_lake_mixed",
-            "vine_active_lichen",
-            "vine_active_self_lichen",
-            "vine_active_plain",
-            "vine_active_glowing",
-            "vine_active_head",
-            "vine_active_existing",
-            "vine_active_empty_plain",
-            "vine_active_empty_glowing",
-            "vine_active_many",
-            "vine_active_plain_then_glowing",
-            "vine_active_empty_plain_then_glowing",
-            "vine_active_self_empty_plain",
-            "vine_active_self_empty_glowing",
-            "vine_active_self_empty_plain_then_glowing",
-            "vine_active_self_existing",
-            "vine_active_self_many",
-        ] {
+        for &mode in modes {
             let path = temp.path().join("vine-wide.json");
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
@@ -10812,7 +10828,22 @@ mod tests {
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
             if mode.contains("_lake_") {
-                let stone = world.intern_state(state("stone"));
+                let mut source = state(if mode.contains("_deepslate_") {
+                    "deepslate"
+                } else {
+                    "stone"
+                });
+                if mode.contains("_deepslate_") {
+                    let axis = if mode.contains("_deepslate_x_") {
+                        "x"
+                    } else if mode.contains("_deepslate_z_") {
+                        "z"
+                    } else {
+                        "y"
+                    };
+                    source.properties.insert("axis".into(), axis.into());
+                }
+                let stone = world.intern_state(source);
                 let positions = if mode.ends_with("_mixed") {
                     vec![[16, 10, 8], [16, 10, 9], [16, 9, 8]]
                 } else {

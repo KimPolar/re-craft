@@ -5,7 +5,9 @@ use native_persistence::nbt::Tag;
 use native_resources::{block_registry::GeneratedBlockRegistry, structure_pool::LiquidSettings};
 use native_world::fluid::{FluidKind, FluidState};
 
-use super::super::jigsaw::{JigsawPlacementWorld, PreparedTemplatePiece};
+use super::super::jigsaw::{
+    JigsawPlacementWorld, PreparedJigsawPlacement, PreparedStart, PreparedTemplatePiece,
+};
 
 struct JigsawRegion<'r, 'a, 'g> {
     region: &'r mut DecorationRegion<'a>,
@@ -125,6 +127,26 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
 }
 
 impl DecorationRegion<'_> {
+    /// Place every intersecting piece of a preflighted start as one staged
+    /// operation. A failure prevents publication and preserves the RNG.
+    pub fn place_jigsaw_start(
+        &mut self,
+        prepared: &PreparedJigsawPlacement,
+        start: &PreparedStart,
+        registry: &GeneratedBlockRegistry,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<usize> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let result = prepared.place_with(start, clip, random, |piece, liquids, next| {
+            self.place_rigid_jigsaw_piece(piece, registry, clip, liquids, next)
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
     /// Place one supported rigid piece in this unpublished region. On failure,
     /// `finish` refuses to publish any of the region's intermediate writes.
     pub fn place_rigid_jigsaw_piece(
@@ -168,13 +190,17 @@ mod tests {
     };
     use std::io::Write;
 
-    struct TemplateData(Vec<u8>);
+    struct TemplateData {
+        bytes: Vec<u8>,
+        reads: usize,
+    }
     impl ResourceProvider for TemplateData {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)
         }
         fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
-            Ok(Some(self.0.clone()))
+            self.reads += 1;
+            Ok(Some(self.bytes.clone()))
         }
     }
     fn ints(values: &[i32]) -> Tag {
@@ -230,7 +256,10 @@ mod tests {
         };
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&nbt::write(&document)?)?;
-        Ok(TemplateData(encoder.finish()?))
+        Ok(TemplateData {
+            bytes: encoder.finish()?,
+            reads: 0,
+        })
     }
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
@@ -302,6 +331,232 @@ mod tests {
         assert!(region.finish().is_err());
         assert_eq!(terrain.snapshot().block(1, 8, 1), before.block(1, 8, 1));
         assert_eq!(terrain.snapshot().block(2, 8, 1), before.block(2, 8, 1));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn prepared_start_places_intersecting_pieces_and_rejects_stale_start() -> Result<()> {
+        use super::super::super::jigsaw::{PreparedJigsawPlacement, PreparedStart};
+        use native_core::beardifier::TerrainAdjustment;
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[]}));
+        let single = PoolElement::Single {
+            legacy: false,
+            location: ResourceId::parse("example:test")?,
+            processors: holder,
+            projection: Projection::Rigid,
+            override_liquid_settings: None,
+        };
+        let make_piece = |x, element| -> Result<Piece> {
+            Ok(Piece {
+                element,
+                origin: [x, 8, 1],
+                rotation: Rotation::None,
+                bounds: BoundingBox::new([x, 8, 1], [x + 1, 8, 1]).map_err(anyhow::Error::msg)?,
+                ground_level_delta: 0,
+                junctions: vec![],
+            })
+        };
+        let start = PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![
+                make_piece(1, single.clone())?,
+                make_piece(
+                    4,
+                    PoolElement::List {
+                        elements: vec![single.clone(), PoolElement::Empty],
+                        projection: Projection::Rigid,
+                    },
+                )?,
+                make_piece(20, single)?,
+            ],
+        };
+        let mut templates = template(false)?;
+        let prepared = PreparedJigsawPlacement::load(&start, &mut templates, &blocks, &registry)?;
+        assert_eq!(
+            templates.reads, 1,
+            "duplicate templates should be loaded once"
+        );
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        assert_eq!(
+            region.place_jigsaw_start(
+                &prepared,
+                &start,
+                &registry,
+                clip,
+                &mut DecorationRandom::new(42)
+            )?,
+            2
+        );
+        region.finish()?;
+        for x in [1, 2, 4, 5] {
+            assert_eq!(
+                terrain.snapshot().block(x, 8, 1).unwrap().name,
+                "minecraft:stone"
+            );
+        }
+        assert_eq!(
+            terrain.snapshot().block(20, 8, 1).unwrap().name,
+            "minecraft:air"
+        );
+
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut stale = start.clone();
+        stale.pieces[1].origin[0] += 1;
+        let mut random = DecorationRandom::new(42);
+        let mut original = random.clone();
+        assert!(
+            region
+                .place_jigsaw_start(&prepared, &stale, &registry, clip, &mut random)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), original.next_long());
+        assert!(region.finish().is_err());
+        assert_eq!(terrain.snapshot().block(1, 8, 1), before.block(1, 8, 1));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn mixed_scheduler_places_jigsaw_and_rejects_missing_context() -> Result<()> {
+        use super::super::super::{
+            jigsaw::PreparedStart,
+            structure_batch::{PlannedMixedStructureDecoration, PlannedStructureStart},
+        };
+        use native_core::beardifier::TerrainAdjustment;
+        use native_resources::structure_decoration::StructureDecorationEntry;
+        #[derive(Clone)]
+        struct NoOcean;
+        impl MixedOceanRuinPlacement for NoOcean {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+        }
+        #[derive(Clone)]
+        struct Corrupt;
+        impl MixedOceanRuinPlacement for Corrupt {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_jigsaw(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &super::super::super::structure_batch::TerrainStartKey,
+                start: &mut PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                start.pieces[0].origin[0] += 1;
+                Ok(())
+            }
+        }
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[]}));
+        let bounds = BoundingBox::new([1, 8, 1], [2, 8, 1]).map_err(anyhow::Error::msg)?;
+        let piece = Piece {
+            element: PoolElement::Single {
+                legacy: false,
+                location: ResourceId::parse("example:test")?,
+                processors: holder,
+                projection: Projection::Rigid,
+                override_liquid_settings: None,
+            },
+            origin: [1, 8, 1],
+            rotation: Rotation::None,
+            bounds,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        let start = PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![piece],
+        };
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("example:jigsaw")?,
+            step: 0,
+            index: 0,
+        };
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![PlannedStructureStart::Jigsaw(&start)],
+        }];
+        let (mut data, schedule, biomes) = super::super::tests::scheduled_fixture(None);
+        let plan = super::super::tests::fixture_plan(&schedule, &biomes);
+        let prepared = PreparedDecoration::load(
+            &mut data,
+            &plan,
+            &super::super::tests::batch_registry(),
+            &mut super::super::tests::resolve_test,
+        )?;
+        let (mut failed, _, _, _) = super::super::tests::fixture();
+        let before = failed.snapshot();
+        assert!(
+            prepared
+                .execute_with_mixed_structure_plan(&mut failed, &structures, &mut NoOcean)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        let error = prepared
+            .execute_with_mixed_structure_plan(&mut failed, &structures, &mut Corrupt)
+            .err()
+            .context("corrupted jigsaw accepted")?;
+        assert!(format!("{error:#}").contains("jigsaw start changed"));
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        let mut context = MixedJigsawPlacementContext::load(
+            NoOcean,
+            &structures,
+            &mut template(false)?,
+            &blocks,
+            &registry,
+        )?;
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut context)?;
+        assert!(matches!(
+            &updated[0][0],
+            super::super::super::PreparedStructureStart::Jigsaw(_)
+        ));
+        assert_eq!(
+            terrain.snapshot().block(1, 8, 1).unwrap().name,
+            "minecraft:stone"
+        );
+        assert_eq!(
+            terrain.snapshot().block(2, 8, 1).unwrap().name,
+            "minecraft:stone"
+        );
         Ok(())
     }
 }

@@ -89,9 +89,9 @@ pub use mob_spawner::{
     FreshCreatureConstruction, GeneratedSheepSpawner, SheepSpawnInputs, SheepSpawnProgress,
 };
 pub use ore::{
-    DecorationRegion, MixedHutOceanPlacementContext, MixedMineshaftPlacementContext,
-    MixedOceanRuinPlacement, OceanRuinPlacementContext, PlacedDecorationFeature,
-    PreparedDecoration, ScheduledDecorationFeature,
+    DecorationRegion, MixedHutOceanPlacementContext, MixedJigsawPlacementContext,
+    MixedMineshaftPlacementContext, MixedOceanRuinPlacement, OceanRuinPlacementContext,
+    PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
@@ -2408,6 +2408,7 @@ pub enum PreparedStructureStart {
     Simple(SimpleStructureStart),
     OceanRuin(ocean_ruin::PreparedStart),
     Mineshaft(mineshaft::PreparedStart),
+    Jigsaw(jigsaw::PreparedStart),
 }
 
 /// Batch-only extension; decoration cannot consume jigsaw pieces yet.
@@ -2970,7 +2971,8 @@ impl TerrainGenerator {
                     start:
                         BatchPreparedStructureStart::Supported(
                             PreparedStructureStart::OceanRuin(_)
-                            | PreparedStructureStart::Mineshaft(_),
+                            | PreparedStructureStart::Mineshaft(_)
+                            | PreparedStructureStart::Jigsaw(_),
                         )
                         | BatchPreparedStructureStart::Jigsaw(_),
                     ..
@@ -8902,6 +8904,9 @@ mod tests {
                             }
                             structure_batch::PlannedStructureStart::Mineshaft(start) => {
                                 PreparedStructureStart::Mineshaft((*start).clone())
+                            }
+                            structure_batch::PlannedStructureStart::Jigsaw(start) => {
+                                PreparedStructureStart::Jigsaw((*start).clone())
                             }
                         })
                         .collect()

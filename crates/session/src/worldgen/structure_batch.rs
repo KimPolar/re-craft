@@ -60,6 +60,7 @@ pub enum PlannedStructureStart<'a> {
     Simple(&'a SimpleStructureStart),
     OceanRuin(&'a super::ocean_ruin::PreparedStart),
     Mineshaft(&'a super::mineshaft::PreparedStart),
+    Jigsaw(&'a super::jigsaw::PreparedStart),
 }
 
 impl PlannedStructureStart<'_> {
@@ -68,6 +69,7 @@ impl PlannedStructureStart<'_> {
             Self::Simple(start) => start.chunk,
             Self::OceanRuin(start) => start.chunk,
             Self::Mineshaft(start) => start.chunk,
+            Self::Jigsaw(start) => start.chunk,
         }
     }
 }
@@ -508,6 +510,24 @@ impl PreparedStructureStages {
         )
     }
 
+    /// Explicit jigsaw-aware plan. A caller must provide a jigsaw placement
+    /// context; ordinary mixed plans still reject unfinished jigsaws.
+    pub(super) fn mixed_decoration_plan_with_jigsaw<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+        mixed_plan_with_jigsaw(
+            &self.starts,
+            &self.ocean_starts,
+            &self.mineshafts,
+            Some(&self.jigsaw_starts),
+            &self.references,
+            pos,
+            schedule,
+        )
+    }
+
     /// Prove that every mixed-plan key points to exactly one retained start.
     /// The mixed executor preserves this shape and validates ruin mutations.
     pub(super) fn mixed_commit_keys(
@@ -541,6 +561,10 @@ impl PreparedStructureStages {
                 PlannedStructureStart::Mineshaft(start) => {
                     let current = self.mineshafts.get(&key.1).and_then(|s| s.get(&key.0)).context("mineshaft start missing")?;
                     ensure!(std::ptr::eq(*start, current), "mixed plan has stale mineshaft start");
+                }
+                PlannedStructureStart::Jigsaw(start) => {
+                    let current = self.jigsaw_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("jigsaw start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale jigsaw start");
                 }
             }
             Ok(key)
@@ -589,6 +613,13 @@ impl PreparedStructureStages {
                             .and_then(|s| s.get_mut(&key.0))
                             .expect("validated mineshaft start") = start
                     }
+                    super::PreparedStructureStart::Jigsaw(start) => {
+                        *self
+                            .jigsaw_starts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated jigsaw start") = start
+                    }
                 }
             }
         }
@@ -625,6 +656,7 @@ fn decoration_plan<'a>(
                 PlannedStructureStart::Mineshaft(_) => {
                     bail!("mineshaft decoration context is missing")
                 }
+                PlannedStructureStart::Jigsaw(_) => bail!("jigsaw decoration context is missing"),
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(PlannedStructureDecoration {
@@ -639,6 +671,26 @@ fn mixed_decoration_plan<'a>(
     starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
     ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
     mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
+    references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
+    pos: ChunkPos,
+    schedule: &'a StructureDecorationSchedule,
+) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+    mixed_plan_with_jigsaw(
+        starts_by_chunk,
+        ocean_by_chunk,
+        mineshafts_by_chunk,
+        None,
+        references_by_chunk,
+        pos,
+        schedule,
+    )
+}
+
+fn mixed_plan_with_jigsaw<'a>(
+    starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
+    ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
+    mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
+    jigsaws_by_chunk: Option<&'a BTreeMap<ChunkPos, JigsawStarts>>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
@@ -681,17 +733,24 @@ fn mixed_decoration_plan<'a>(
             let mineshaft = mineshafts_by_chunk
                 .get(&source)
                 .and_then(|starts| starts.get(&entry.id));
-            let start = match (simple, ocean, mineshaft) {
-                (Some(start), None, None) => PlannedStructureStart::Simple(start),
-                (None, Some(start), None) => {
+            let jigsaw = jigsaws_by_chunk
+                .and_then(|chunks| chunks.get(&source))
+                .and_then(|starts| starts.get(&entry.id));
+            let start = match (simple, ocean, mineshaft, jigsaw) {
+                (Some(start), None, None, None) => PlannedStructureStart::Simple(start),
+                (None, Some(start), None, None) => {
                     ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
                     PlannedStructureStart::OceanRuin(start)
                 }
-                (None, None, Some(start)) => {
+                (None, None, Some(start), None) => {
                     ensure!(!start.pieces.is_empty(), "mineshaft start has no pieces");
                     PlannedStructureStart::Mineshaft(start)
                 }
-                (None, None, None) => bail!("referenced structure start is missing"),
+                (None, None, None, Some(start)) => {
+                    ensure!(!start.pieces.is_empty(), "jigsaw start has no pieces");
+                    PlannedStructureStart::Jigsaw(start)
+                }
+                (None, None, None, None) => bail!("referenced structure start is missing"),
                 _ => bail!("duplicate referenced structure start"),
             };
             ensure!(
@@ -1048,6 +1107,24 @@ impl StructureGenerationBatch {
         )
     }
 
+    /// Explicit jigsaw-aware plan for an executor with a prepared context.
+    pub fn mixed_decoration_plan_with_jigsaw<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        mixed_plan_with_jigsaw(
+            &self.starts,
+            &self.ocean_starts,
+            &self.mineshafts,
+            Some(&self.jigsaw_starts),
+            &self.references,
+            pos,
+            schedule,
+        )
+    }
+
     /// All referenced starts with terrain adaptation. The sorted result is a
     /// membership set, not Java's hash-map and hash-set iteration order.
     pub fn terrain_start_keys(&self, pos: ChunkPos) -> Result<BTreeSet<TerrainStartKey>> {
@@ -1395,7 +1472,10 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
-                            super::BatchPreparedStructureStart::Jigsaw(start) => {
+                            super::BatchPreparedStructureStart::Jigsaw(start)
+                            | super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::Jigsaw(start),
+                            ) => {
                                 bounds.push(start.reference_bounds(structure.clone())?);
                                 ensure!(
                                     jigsaw_starts.insert(structure, start).is_none(),

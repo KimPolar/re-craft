@@ -53,6 +53,198 @@ pub enum PieceProcessors {
     List(Vec<PieceProcessors>),
 }
 
+#[derive(Clone)]
+enum PlacementElement {
+    Empty,
+    Single(PreparedTemplatePiece),
+    List(Vec<PlacementElement>),
+}
+
+/// Prepared immutable start and its pieces, in the order used by Java.
+#[derive(Clone)]
+pub struct PreparedJigsawPlacement {
+    source: PreparedStart,
+    pieces: Vec<PlacementElement>,
+}
+
+impl PreparedJigsawPlacement {
+    /// Preflight all currently supported elements. Templates referenced more
+    /// than once share the same immutable data for the whole start.
+    pub fn load(
+        start: &PreparedStart,
+        provider: &mut impl ResourceProvider,
+        blocks: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Self> {
+        ensure!(!start.pieces.is_empty(), "jigsaw start has no pieces");
+        let processors = start.prepare_processors(provider, blocks, registry)?;
+        let mut templates = BTreeMap::new();
+        let mut pieces = Vec::with_capacity(start.pieces.len());
+        for (piece, processor) in start.pieces.iter().zip(&processors) {
+            ensure!(
+                (0..3).all(|i| piece.bounds.min[i] <= piece.bounds.max[i]),
+                "invalid jigsaw piece bounds"
+            );
+            pieces.push(prepare_placement_element(
+                piece,
+                &piece.element,
+                processor,
+                provider,
+                &mut templates,
+                0,
+            )?);
+        }
+        Ok(Self {
+            source: start.clone(),
+            pieces,
+        })
+    }
+
+    /// Verify that cached templates still belong to the exact retained start.
+    pub(super) fn validate_source(&self, start: &PreparedStart) -> Result<()> {
+        ensure!(
+            self.source.chunk == start.chunk
+                && self.source.generation_point == start.generation_point
+                && self.source.terrain_adjustment == start.terrain_adjustment
+                && self.source.liquid_settings == start.liquid_settings
+                && self.source.pieces == start.pieces,
+            "prepared jigsaw start changed"
+        );
+        ensure!(
+            self.pieces.len() == start.pieces.len(),
+            "prepared jigsaw piece count changed"
+        );
+        Ok(())
+    }
+
+    /// Process intersecting pieces in start order. The caller must stage both
+    /// world and RNG until the complete decoration pass succeeds.
+    pub(super) fn place_with(
+        &self,
+        start: &PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut native_core::random::DecorationRandom,
+        mut place: impl FnMut(
+            &PreparedTemplatePiece,
+            LiquidSettings,
+            &mut native_core::random::DecorationRandom,
+        ) -> Result<bool>,
+    ) -> Result<usize> {
+        self.validate_source(start)?;
+        ensure!(
+            (0..3).all(|i| clip.min[i] <= clip.max[i]),
+            "invalid jigsaw clipping box"
+        );
+        let mut next_random = random.clone();
+        let mut count = 0;
+        for (piece, prepared) in start.pieces.iter().zip(&self.pieces) {
+            if !(0..3)
+                .all(|i| piece.bounds.max[i] >= clip.min[i] && piece.bounds.min[i] <= clip.max[i])
+            {
+                continue;
+            }
+            let _ = prepared.place(start.liquid_settings, &mut next_random, &mut place)?;
+            count += 1;
+        }
+        *random = next_random;
+        Ok(count)
+    }
+}
+
+impl PlacementElement {
+    fn place(
+        &self,
+        liquids: LiquidSettings,
+        random: &mut native_core::random::DecorationRandom,
+        place: &mut impl FnMut(
+            &PreparedTemplatePiece,
+            LiquidSettings,
+            &mut native_core::random::DecorationRandom,
+        ) -> Result<bool>,
+    ) -> Result<bool> {
+        match self {
+            Self::Empty => Ok(true),
+            Self::Single(piece) => place(piece, liquids, random),
+            Self::List(elements) => {
+                for element in elements {
+                    if !element.place(liquids, random, place)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn prepare_placement_element(
+    piece: &Piece,
+    element: &PoolElement,
+    processors: &PieceProcessors,
+    provider: &mut impl ResourceProvider,
+    templates: &mut BTreeMap<
+        ResourceId,
+        Arc<native_persistence::structure_template::StructureTemplate>,
+    >,
+    depth: usize,
+) -> Result<PlacementElement> {
+    ensure!(depth <= 64, "jigsaw element nesting too deep");
+    Ok(match (element, processors) {
+        (PoolElement::Empty, PieceProcessors::Empty) => PlacementElement::Empty,
+        (PoolElement::Single { .. }, PieceProcessors::Single(_)) => {
+            let mut child = piece.clone();
+            child.element = element.clone();
+            PlacementElement::Single(PreparedTemplatePiece::load_cached(
+                &child, processors, provider, templates,
+            )?)
+        }
+        (
+            PoolElement::List {
+                elements,
+                projection,
+            },
+            PieceProcessors::List(prepared),
+        ) => {
+            ensure!(
+                !elements.is_empty() && elements.len() == prepared.len(),
+                "invalid jigsaw element list"
+            );
+            for element in elements {
+                let actual = match element {
+                    PoolElement::Empty => continue,
+                    PoolElement::Single { projection, .. }
+                    | PoolElement::Feature { projection, .. }
+                    | PoolElement::List { projection, .. } => projection,
+                };
+                ensure!(
+                    actual == projection,
+                    "jigsaw list element projection differs"
+                );
+            }
+            PlacementElement::List(
+                elements
+                    .iter()
+                    .zip(prepared)
+                    .map(|(element, processor)| {
+                        prepare_placement_element(
+                            piece,
+                            element,
+                            processor,
+                            provider,
+                            templates,
+                            depth + 1,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        (PoolElement::Feature { .. }, PieceProcessors::Feature) => {
+            anyhow::bail!("jigsaw feature element placement is not yet supported")
+        }
+        _ => anyhow::bail!("jigsaw processors do not match their element"),
+    })
+}
+
 /// A rigid single-template piece with its active data and processors. This is
 /// still an intermediate result; placement and entities remain separate.
 #[derive(Clone)]
@@ -71,6 +263,18 @@ impl PreparedTemplatePiece {
         processors: &PieceProcessors,
         provider: &mut impl ResourceProvider,
     ) -> Result<Self> {
+        Self::load_cached(piece, processors, provider, &mut BTreeMap::new())
+    }
+
+    fn load_cached(
+        piece: &Piece,
+        processors: &PieceProcessors,
+        provider: &mut impl ResourceProvider,
+        cache: &mut BTreeMap<
+            ResourceId,
+            Arc<native_persistence::structure_template::StructureTemplate>,
+        >,
+    ) -> Result<Self> {
         let PoolElement::Single {
             location,
             legacy,
@@ -88,20 +292,29 @@ impl PreparedTemplatePiece {
         let PieceProcessors::Single(processors) = processors else {
             anyhow::bail!("jigsaw piece processors do not match its element");
         };
-        let template =
-            native_persistence::structure_template::StructureTemplate::load(provider, location)?
+        let template = if let Some(template) = cache.get(location) {
+            Arc::clone(template)
+        } else {
+            let template = Arc::new(
+                native_persistence::structure_template::StructureTemplate::load(
+                    provider, location,
+                )?
                 .with_context(|| {
                     format!(
                         "missing jigsaw template {}:{}",
                         location.namespace, location.path
                     )
-                })?;
+                })?,
+            );
+            cache.insert(location.clone(), Arc::clone(&template));
+            template
+        };
         ensure!(
             template.data_version == Some(5023),
             "jigsaw template needs unsupported data-version conversion"
         );
         Ok(Self {
-            template: Arc::new(template),
+            template,
             processors: Arc::clone(processors),
             origin: piece.origin,
             rotation: piece.rotation,
@@ -1080,6 +1293,12 @@ mod tests {
             )
             .contains("jigsaw structure decoration")
         );
+        let aware = batch.mixed_decoration_plan_with_jigsaw(target, &schedule)?;
+        assert!(aware.iter().any(|entry| entry.entry.id == structure
+            && entry.starts.iter().any(|start| matches!(
+                start,
+                super::super::structure_batch::PlannedStructureStart::Jigsaw(_)
+            ))));
         let plan = StructurePreparationPlan::new([(target, GenerationStage::StructureReferences)])?;
         let mut stages = batch.prepare_additional_stages(&plan, None)?;
         let transferred = stages
@@ -1099,6 +1318,15 @@ mod tests {
             )
             .contains("jigsaw structure decoration")
         );
+        {
+            let aware = stages.mixed_decoration_plan_with_jigsaw(target, &schedule)?;
+            let keys = stages.mixed_commit_keys(&aware, false)?;
+            assert!(
+                keys.iter()
+                    .flatten()
+                    .any(|key| key == &(structure.clone(), target))
+            );
+        }
         let refs = stages
             .references
             .get(&target)

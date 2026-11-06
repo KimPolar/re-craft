@@ -109,6 +109,128 @@ pub trait MixedOceanRuinPlacement {
     ) -> Result<()> {
         bail!("mineshaft mixed decoration context is missing")
     }
+
+    fn place_jigsaw(
+        &mut self,
+        _region: &mut DecorationRegion<'_>,
+        _key: &super::structure_batch::TerrainStartKey,
+        _start: &mut super::jigsaw::PreparedStart,
+        _clip: native_core::beardifier::BoundingBox,
+        _random: &mut DecorationRandom,
+    ) -> Result<()> {
+        bail!("jigsaw mixed decoration context is missing")
+    }
+}
+
+/// Adds preflighted jigsaw starts to another mixed decoration context.
+#[derive(Clone)]
+pub struct MixedJigsawPlacementContext<'a, R> {
+    pub other: R,
+    pub registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    pub starts:
+        BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
+}
+
+impl<'a, R> MixedJigsawPlacementContext<'a, R> {
+    /// Resolve all jigsaw resources before a mixed decoration attempt begins.
+    pub fn load(
+        other: R,
+        plan: &[PlannedMixedStructureDecoration<'_>],
+        provider: &mut impl ResourceProvider,
+        blocks: &BTreeSet<String>,
+        registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Self> {
+        let mut starts = BTreeMap::new();
+        for entry in plan {
+            for start in &entry.starts {
+                let PlannedStructureStart::Jigsaw(start) = start else {
+                    continue;
+                };
+                let key = (
+                    entry.entry.id.clone(),
+                    ChunkPos {
+                        x: start.chunk[0],
+                        z: start.chunk[1],
+                    },
+                );
+                let prepared = super::jigsaw::PreparedJigsawPlacement::load(
+                    start, provider, blocks, registry,
+                )?;
+                ensure!(
+                    starts.insert(key, prepared).is_none(),
+                    "duplicate jigsaw placement start"
+                );
+            }
+        }
+        Ok(Self {
+            other,
+            registry,
+            starts,
+        })
+    }
+}
+
+impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedJigsawPlacementContext<'_, R> {
+    fn needs_ruin_revisions(&self) -> bool {
+        self.other.needs_ruin_revisions()
+    }
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place(region, start, clip, random)
+    }
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other
+            .place_with_context(region, key, start, clip, random, revisions)
+    }
+    fn place_hut(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other.place_hut(region, key, start, clip, revisions)
+    }
+    fn place_mineshaft(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::mineshaft::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        biomes: &super::BiomeNeighborhood,
+    ) -> Result<()> {
+        self.other
+            .place_mineshaft(region, start, clip, random, biomes)
+    }
+    fn place_jigsaw(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::jigsaw::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        let prepared = self
+            .starts
+            .get(key)
+            .context("jigsaw placement context is missing")?;
+        region.place_jigsaw_start(prepared, start, self.registry, clip, random)?;
+        Ok(())
+    }
 }
 
 /// Add a transactional mineshaft context to an existing mixed runner. The
@@ -175,6 +297,16 @@ where
             random,
             &mut self.uuid_factory,
         )
+    }
+    fn place_jigsaw(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::jigsaw::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place_jigsaw(region, key, start, clip, random)
     }
 }
 
@@ -1591,6 +1723,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                         PlannedStructureStart::Mineshaft(start) => {
                             PreparedStructureStart::Mineshaft((*start).clone())
                         }
+                        PlannedStructureStart::Jigsaw(start) => {
+                            PreparedStructureStart::Jigsaw((*start).clone())
+                        }
                     })
                     .collect()
             })
@@ -2149,6 +2284,20 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                         |piece| (key.clone(), piece.piece.bounds),
                                                     ));
                                                 }
+                                                PreparedStructureStart::Jigsaw(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.extend(
+                                                        start.pieces.iter().map(|piece| {
+                                                            (key.clone(), piece.bounds)
+                                                        }),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -2201,6 +2350,34 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                             self.plan.biomes,
                                         )?;
                                         validate_decorated_mineshaft_start(&original, start)?;
+                                    }
+                                    PreparedStructureStart::Jigsaw(start) => {
+                                        let original = start.clone();
+                                        let key = (
+                                            plan[index].entry.id.clone(),
+                                            ChunkPos {
+                                                x: start.chunk[0],
+                                                z: start.chunk[1],
+                                            },
+                                        );
+                                        ocean.place_jigsaw(
+                                            &mut region,
+                                            &key,
+                                            start,
+                                            clip,
+                                            &mut random,
+                                        )?;
+                                        ensure!(
+                                            original.chunk == start.chunk
+                                                && original.generation_point
+                                                    == start.generation_point
+                                                && original.terrain_adjustment
+                                                    == start.terrain_adjustment
+                                                && original.liquid_settings
+                                                    == start.liquid_settings
+                                                && original.pieces == start.pieces,
+                                            "jigsaw start changed during decoration"
+                                        );
                                     }
                                 }
                             }
@@ -15695,7 +15872,7 @@ mod tests {
             ScheduledData { heightmap: None }.read_data(path)
         }
     }
-    fn batch_registry() -> BTreeSet<String> {
+    pub(super) fn batch_registry() -> BTreeSet<String> {
         [
             "minecraft:air",
             "minecraft:stone",
@@ -22136,6 +22313,107 @@ mod tests {
         assert_eq!(
             terrain.snapshot().block(3, 2, 3).unwrap().name,
             "minecraft:cave_air"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_jigsaw_starts_share_random_and_rollback_callback_state() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_decoration::StructureDecorationEntry,
+            structure_pool::{LiquidSettings, PoolElement},
+            structure_transform::Rotation,
+        };
+        #[derive(Clone, Default)]
+        struct Runner {
+            draws: Vec<i64>,
+            fail: bool,
+        }
+        impl MixedOceanRuinPlacement for Runner {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_jigsaw(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &super::super::structure_batch::TerrainStartKey,
+                _: &mut super::super::jigsaw::PreparedStart,
+                _: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                self.draws.push(random.next_long());
+                ensure!(
+                    !self.fail || self.draws.len() < 2,
+                    "injected jigsaw failure"
+                );
+                Ok(())
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &batch_registry(), &mut resolve_test)?;
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("example:jigsaw")?,
+            step: 0,
+            index: 0,
+        };
+        let bounds = BoundingBox::new([1, 8, 1], [2, 8, 2]).map_err(anyhow::Error::msg)?;
+        let piece = Piece {
+            element: PoolElement::Empty,
+            origin: [1, 8, 1],
+            rotation: Rotation::None,
+            bounds,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        let make_start = |chunk| super::super::jigsaw::PreparedStart {
+            chunk,
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![piece.clone()],
+        };
+        let first = make_start([0, 0]);
+        let second = make_start([1, 0]);
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![
+                PlannedStructureStart::Jigsaw(&first),
+                PlannedStructureStart::Jigsaw(&second),
+            ],
+        }];
+        let mut expected = entry.random(plan.decoration_seed());
+        let draws = [expected.next_long(), expected.next_long()];
+        let (mut terrain, _, _, _) = fixture();
+        let mut runner = Runner::default();
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)?;
+        assert_eq!(runner.draws, draws);
+        assert_eq!(updated[0].len(), 2);
+        let (mut failed, _, _, _) = fixture();
+        let before = failed.snapshot();
+        let mut failing = Runner {
+            draws: vec![],
+            fail: true,
+        };
+        assert!(
+            prepared
+                .execute_with_mixed_structure_plan(&mut failed, &structures, &mut failing)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        assert!(
+            failing.draws.is_empty(),
+            "failed callback state must not be committed"
         );
         Ok(())
     }

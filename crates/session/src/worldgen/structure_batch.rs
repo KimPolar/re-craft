@@ -36,6 +36,8 @@ use super::{
 pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 /// Multi-piece ocean-ruin starts belonging to one source chunk.
 pub type OceanRuinStarts = BTreeMap<ResourceId, super::ocean_ruin::PreparedStart>;
+/// Multi-piece mineshaft starts belonging to one source chunk.
+pub type MineshaftStarts = BTreeMap<ResourceId, super::mineshaft::PreparedStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     SavedSwampHutPiece,
-    structure_batch::{OceanRuinStarts, SimpleStarts, TerrainStartKey},
+    structure_batch::{MineshaftStarts, OceanRuinStarts, SimpleStarts, TerrainStartKey},
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
     },
@@ -33,6 +33,25 @@ pub(super) fn referenced_start_chunks_with_ocean(
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
+    referenced_start_chunks_with_mineshaft(
+        pos,
+        all_starts,
+        all_ocean,
+        &BTreeMap::new(),
+        references,
+        huts,
+    )
+}
+
+/// Recompute every reference from all supported starts, including mineshafts.
+pub(super) fn referenced_start_chunks_with_mineshaft(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
+    all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<BTreeSet<ChunkPos>> {
     let recomputed = collect_ordered_structure_references(pos, |source| {
         let simple = all_starts.get(&source).with_context(|| {
             format!("structure starts are missing at {}, {}", source.x, source.z)
@@ -51,6 +70,19 @@ pub(super) fn referenced_start_chunks_with_ocean(
             for (id, start) in ocean {
                 ensure!(!simple.contains_key(id), "duplicate structure start");
                 validate_ocean_start(source, start)?;
+                bounds.push(start.reference_bounds(id.clone())?);
+            }
+        }
+        if let Some(mineshafts) = all_mineshafts.get(&source) {
+            for (id, start) in mineshafts {
+                ensure!(
+                    !simple.contains_key(id)
+                        && !all_ocean
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id)),
+                    "duplicate structure start"
+                );
+                validate_mineshaft_start(source, id, start)?;
                 bounds.push(start.reference_bounds(id.clone())?);
             }
         }
@@ -74,20 +106,38 @@ pub(super) fn referenced_start_chunks_with_ocean(
             };
             let simple = all_starts.get(&source).and_then(|starts| starts.get(id));
             let ocean = all_ocean.get(&source).and_then(|starts| starts.get(id));
-            match (simple, ocean) {
-                (Some(start), None) => {
+            let mineshaft = all_mineshafts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            match (simple, ocean, mineshaft) {
+                (Some(start), None, None) => {
                     validate_start(source, id, start, huts)?;
                 }
-                (None, Some(start)) => {
+                (None, Some(start), None) => {
                     validate_ocean_start(source, start)?;
                 }
-                (None, None) => anyhow::bail!("referenced structure start is missing"),
-                (Some(_), Some(_)) => anyhow::bail!("duplicate structure start"),
+                (None, None, Some(start)) => {
+                    validate_mineshaft_start(source, id, start)?;
+                }
+                (None, None, None) => anyhow::bail!("referenced structure start is missing"),
+                _ => anyhow::bail!("duplicate structure start"),
             }
             required.insert(source);
         }
     }
     Ok(required)
+}
+
+fn validate_mineshaft_start(
+    pos: ChunkPos,
+    id: &ResourceId,
+    start: &super::mineshaft::PreparedStart,
+) -> Result<Tag> {
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "mineshaft belongs to another chunk"
+    );
+    start.to_tag(id)
 }
 
 fn validate_ocean_start(pos: ChunkPos, start: &super::ocean_ruin::PreparedStart) -> Result<()> {
@@ -193,6 +243,25 @@ pub(super) fn pack_structure_data_with_ocean(
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
+    pack_structure_data_with_mineshaft(
+        pos,
+        starts,
+        ocean,
+        &MineshaftStarts::new(),
+        references,
+        huts,
+    )
+}
+
+/// Serialize supported fresh starts and their ordered references together.
+pub(super) fn pack_structure_data_with_mineshaft(
+    pos: ChunkPos,
+    starts: &SimpleStarts,
+    ocean: &OceanRuinStarts,
+    mineshafts: &MineshaftStarts,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Tag> {
     let mut packed_starts = Vec::with_capacity(starts.len());
     for (id, start) in starts {
         let hut = validate_start(pos, id, start, huts)?;
@@ -245,6 +314,15 @@ pub(super) fn pack_structure_data_with_ocean(
         ]);
         packed_starts.push((name.as_str().into(), value));
     }
+    for (id, start) in mineshafts {
+        ensure!(
+            !starts.contains_key(id) && !ocean.contains_key(id),
+            "duplicate structure start"
+        );
+        let value = validate_mineshaft_start(pos, id, start)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        packed_starts.push((name.as_str().into(), value));
+    }
     let mut packed_references = Vec::with_capacity(references.membership().len());
     for (id, members) in references.membership() {
         let order = references
@@ -272,6 +350,240 @@ mod tests {
     use super::*;
     use native_core::beardifier::{BoundingBox, TerrainAdjustment};
     use native_resources::{packs::ResourceId, structure_start::SimpleStructureStart};
+
+    fn mineshaft_fixture(pos: ChunkPos) -> (ResourceId, super::super::mineshaft::PreparedStart) {
+        use native_resources::mineshaft::{
+            MineshaftElevation, MineshaftGraph, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        let placed = MineshaftGraph::new(42, [pos.x, pos.z], MineshaftVariant::Normal)
+            .unwrap()
+            .place(MineshaftElevation::Normal {
+                sea_level: 63,
+                min_y: -64,
+            })
+            .unwrap();
+        let mut pieces: Vec<_> = placed
+            .pieces
+            .iter()
+            .map(|piece| {
+                super::super::SavedMineshaftPiece::capture(piece, MineshaftVariant::Normal, false)
+                    .unwrap()
+            })
+            .collect();
+        let spider = pieces
+            .iter_mut()
+            .find(|piece| {
+                matches!(
+                    piece.piece.kind,
+                    MineshaftGraphPieceKind::Corridor { spiders: true, .. }
+                )
+            })
+            .expect("fixture needs a spider corridor");
+        spider.placed_spider = true;
+        (
+            ResourceId::parse("example:mine").unwrap(),
+            super::super::mineshaft::PreparedStart {
+                chunk: [pos.x, pos.z],
+                generation_point: placed.generation_point,
+                terrain_adjustment: TerrainAdjustment::None,
+                variant: MineshaftVariant::Normal,
+                pieces,
+            },
+        )
+    }
+
+    #[test]
+    fn mineshaft_starts_preserve_state_and_validate_all_references() -> Result<()> {
+        let pos = ChunkPos { x: 0, z: 0 };
+        let (id, start) = mineshaft_fixture(pos);
+        let mut simple = BTreeMap::new();
+        for x in -8..=8 {
+            for z in -8..=8 {
+                simple.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        let mines = BTreeMap::from([(pos, MineshaftStarts::from([(id.clone(), start.clone())]))]);
+        let refs = collect_ordered_structure_references(pos, |source| {
+            if source == pos {
+                Ok(vec![start.reference_bounds(id.clone())?])
+            } else {
+                Ok(vec![])
+            }
+        })?;
+        assert_eq!(
+            referenced_start_chunks_with_mineshaft(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &mines,
+                &refs,
+                &BTreeMap::new()
+            )?,
+            BTreeSet::from([pos])
+        );
+        let packed = pack_structure_data_with_mineshaft(
+            pos,
+            &simple[&pos],
+            &OceanRuinStarts::new(),
+            &mines[&pos],
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        assert_eq!(
+            packed
+                .get("starts")
+                .and_then(|value| value.get("example:mine")),
+            Some(&start.to_tag(&id)?)
+        );
+        let mut wrong = mines.clone();
+        wrong.get_mut(&pos).unwrap().get_mut(&id).unwrap().chunk[0] += 1;
+        assert!(
+            referenced_start_chunks_with_mineshaft(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &wrong,
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            pack_structure_data_with_mineshaft(
+                pos,
+                &simple[&pos],
+                &OceanRuinStarts::new(),
+                &wrong[&pos],
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let empty = collect_ordered_structure_references(pos, |_| Ok(vec![]))?;
+        assert!(
+            referenced_start_chunks_with_mineshaft(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &mines,
+                &empty,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut duplicate = fixture(pos, 90, true).0;
+        let treasure = duplicate.pop_first().unwrap().1;
+        duplicate.insert(id.clone(), treasure);
+        assert!(
+            pack_structure_data_with_mineshaft(
+                pos,
+                &duplicate,
+                &OceanRuinStarts::new(),
+                &mines[&pos],
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        simple.insert(pos, duplicate);
+        assert!(
+            referenced_start_chunks_with_mineshaft(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &mines,
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn mineshaft_structure_data_round_trips_java_chunk_serializer() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 JDK path is required")?
+            .join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let source = temp.path().join("MineshaftStructureDataOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/MineshaftStructureDataOracle.java"),
+        )?;
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compile.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let pos = ChunkPos { x: 0, z: 0 };
+        let (id, start) = mineshaft_fixture(pos);
+        let refs = collect_ordered_structure_references(pos, |source| {
+            if source == pos {
+                Ok(vec![start.reference_bounds(id.clone())?])
+            } else {
+                Ok(vec![])
+            }
+        })?;
+        let tag = pack_structure_data_with_mineshaft(
+            pos,
+            &SimpleStarts::new(),
+            &OceanRuinStarts::new(),
+            &MineshaftStarts::from([(id, start)]),
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        let input = temp.path().join("mineshaft.nbt");
+        std::fs::write(
+            &input,
+            native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
+                name: "".into(),
+                value: tag,
+            })?,
+        )?;
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("MineshaftStructureDataOracle")
+            .arg(input)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(())
+    }
 
     fn fixture(pos: ChunkPos, y: i32, present: bool) -> (SimpleStarts, OrderedStructureReferences) {
         let id = ResourceId::parse("example:treasure").unwrap();

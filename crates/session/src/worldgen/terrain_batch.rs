@@ -665,6 +665,12 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
                     .context("selector features are missing")?,
                 depth + 1,
             ),
+            "sequence" => self.placed_set(
+                value
+                    .get("features")
+                    .context("sequence features are missing")?,
+                depth + 1,
+            ),
             "random_boolean_selector" => Ok(self.placed(
                 value
                     .get("feature_true")
@@ -4922,6 +4928,8 @@ mod entity_source_tests {
         for configured in [
             json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":"test:leaf"}),
             json!({"type":"minecraft:simple_random_selector","features":"#test:plants"}),
+            json!({"type":"minecraft:sequence","features":[inline,"test:leaf"]}),
+            json!({"type":"minecraft:sequence","features":"#test:plants"}),
             json!({"type":"minecraft:random_selector","features":[{"chance":0.5,"feature":"test:leaf"}],"default":inline}),
             json!({"type":"minecraft:weighted_random_selector","features":[{"weight":1,"data":"test:leaf"}]}),
             json!({"type":"minecraft:vegetation_patch","vegetation_feature":inline}),
@@ -4940,6 +4948,9 @@ mod entity_source_tests {
             json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":{"feature":{"type":"example:spawner"},"placement":[]}}),
             json!({"type":"minecraft:random_boolean_selector","feature_true":inline,"feature_false":"test:root"}),
             json!({"type":"minecraft:simple_random_selector","features":"#test:missing"}),
+            json!({"type":"minecraft:sequence","features":[]}),
+            json!({"type":"minecraft:sequence","features":[inline,{"feature":{"type":"example:spawner"},"placement":[]}]}),
+            json!({"type":"minecraft:sequence","features":["test:root"]}),
             json!({"type":"minecraft:random_selector","features":[{"chance":2,"feature":"test:leaf"}],"default":inline}),
             json!({"type":"minecraft:weighted_random_selector","features":[{"weight":-1,"data":"test:leaf"}]}),
         ] {
@@ -4951,6 +4962,48 @@ mod entity_source_tests {
             assert!(!features_cannot_spawn_entities(
                 &mut data, &schedule, &registry
             ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_sequence_features_are_classified_conservatively() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources
+            .list_data("worldgen/placed_feature")
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut classifier = EntityFeatureClassifier {
+            provider: &mut resources,
+            registry: &registry,
+            tags: FeatureTags::default(),
+            active: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            nodes: 0,
+        };
+        for name in ["minecraft:sulfur_pool"] {
+            assert!(
+                classifier
+                    .named(&ResourceId::parse(name).unwrap(), true, 0)
+                    .unwrap(),
+                "{name}"
+            );
+        }
+        for name in [
+            "minecraft:rooted_sulfur_spring",
+            "minecraft:sculk_patch_deep_dark",
+            "minecraft:desert_well",
+        ] {
+            assert!(
+                !classifier
+                    .named(&ResourceId::parse(name).unwrap(), true, 0)
+                    .unwrap_or(false),
+                "{name}"
+            );
         }
     }
 

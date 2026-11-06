@@ -1,12 +1,15 @@
-//! 26.3 mineshaft piece layout. Vertical placement and block decoration
-//! remain separate; the generated graph is not yet a structure start.
+//! 26.3 mineshaft piece layout and vertical placement. Block decoration and
+//! persistence remain separate; the graph is not yet a complete structure start.
 
 use crate::structure_start::HorizontalDirection;
 use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
 mod graph;
-pub use graph::{MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind};
+pub use graph::{
+    MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,
+    PlacedMineshaft,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MineshaftVariant {

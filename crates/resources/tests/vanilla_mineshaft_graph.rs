@@ -1,6 +1,8 @@
 //! Compare recursive piece order, attributes, entrances and random state with Java 26.3.
 use native_core::beardifier::BoundingBox;
-use native_resources::mineshaft::{MineshaftGraph, MineshaftGraphPieceKind, MineshaftVariant};
+use native_resources::mineshaft::{
+    MineshaftElevation, MineshaftGraph, MineshaftGraphPieceKind, MineshaftVariant,
+};
 use native_resources::structure_start::HorizontalDirection;
 use serde_json::Value;
 use std::{fmt::Write, path::PathBuf, process::Command};
@@ -105,13 +107,48 @@ fn recursive_mineshaft_graph_matches_java() {
             }
         }
         writeln!(actual, "Z {}", random.next_long()).unwrap();
+        for [sea_level, min_y, surface_height] in [
+            [63, -64, 50],
+            [63, -64, 63],
+            [63, -64, 128],
+            [-20, -100, 20],
+            [320, 300, 321],
+        ] {
+            let graph = MineshaftGraph::new(seed, chunk, variant).unwrap();
+            let center = graph.center();
+            let elevation = match variant {
+                MineshaftVariant::Normal => MineshaftElevation::Normal { sea_level, min_y },
+                MineshaftVariant::Mesa => MineshaftElevation::Mesa {
+                    sea_level,
+                    surface_height,
+                },
+            };
+            let placed = graph.place(elevation).unwrap();
+            let point = placed.generation_point;
+            writeln!(
+                actual,
+                "H {sea_level} {min_y} {surface_height} {},{},{} {} {},{},{}",
+                center[0], center[1], center[2], placed.offset_y, point[0], point[1], point[2]
+            )
+            .unwrap();
+            let (_, pieces, mut random) = placed.into_parts();
+            for piece in &pieces {
+                writeln!(actual, "Q {}", box_string(&piece.bounds)).unwrap();
+            }
+            if let MineshaftGraphPieceKind::Room { entrances } = &pieces[0].kind {
+                for entrance in entrances {
+                    writeln!(actual, "I {}", box_string(entrance)).unwrap();
+                }
+            }
+            writeln!(actual, "Y {}", random.next_long()).unwrap();
+        }
         graphs += 1;
     }
     assert_eq!(graphs, 56);
     let expected: Vec<_> = result
         .lines()
         .filter(|line| {
-            ["G ", "P ", "E ", "Z "]
+            ["G ", "P ", "E ", "Z ", "H ", "Q ", "I ", "Y "]
                 .iter()
                 .any(|prefix| line.starts_with(prefix))
         })

@@ -5,7 +5,7 @@ use super::{
     find_crossing, find_stairs,
 };
 use crate::structure_start::HorizontalDirection as Direction;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,10 +35,32 @@ pub struct MineshaftGraphPiece {
 /// Piece order and entrance geometry before the structure is moved vertically.
 /// This is not yet sufficient to write or place a complete mineshaft.
 pub struct MineshaftGraph {
-    pub variant: MineshaftVariant,
-    pub pieces: Vec<MineshaftGraphPiece>,
+    variant: MineshaftVariant,
+    pieces: Vec<MineshaftGraphPiece>,
     occupied: Vec<BoundingBox>,
     random: LegacyRandom,
+}
+
+/// The surface height is sampled at [`MineshaftGraph::center`] before placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MineshaftElevation {
+    Normal { sea_level: i32, min_y: i32 },
+    Mesa { sea_level: i32, surface_height: i32 },
+}
+
+/// A vertically positioned layout, still awaiting decoration and persistence.
+pub struct PlacedMineshaft {
+    pub variant: MineshaftVariant,
+    pub pieces: Vec<MineshaftGraphPiece>,
+    pub offset_y: i32,
+    pub generation_point: [i32; 3],
+    random: LegacyRandom,
+}
+
+impl PlacedMineshaft {
+    pub fn into_parts(self) -> (MineshaftVariant, Vec<MineshaftGraphPiece>, LegacyRandom) {
+        (self.variant, self.pieces, self.random)
+    }
 }
 
 impl MineshaftGraph {
@@ -73,6 +95,94 @@ impl MineshaftGraph {
     /// Retain the random stream for the subsequent vertical placement step.
     pub fn into_parts(self) -> (MineshaftVariant, Vec<MineshaftGraphPiece>, LegacyRandom) {
         (self.variant, self.pieces, self.random)
+    }
+
+    pub fn pieces(&self) -> &[MineshaftGraphPiece] {
+        &self.pieces
+    }
+
+    /// The inclusive bounding-box center used for mesa surface sampling.
+    pub fn center(&self) -> [i32; 3] {
+        Self::center_of(self.bounds())
+    }
+
+    fn center_of(bounds: BoundingBox) -> [i32; 3] {
+        std::array::from_fn(|axis| {
+            (i64::from(bounds.min[axis])
+                + (i64::from(bounds.max[axis]) - i64::from(bounds.min[axis]) + 1) / 2)
+                as i32
+        })
+    }
+
+    fn bounds(&self) -> BoundingBox {
+        let mut bounds = self.pieces[0].bounds;
+        for piece in &self.pieces[1..] {
+            for axis in 0..3 {
+                bounds.min[axis] = bounds.min[axis].min(piece.bounds.min[axis]);
+                bounds.max[axis] = bounds.max[axis].max(piece.bounds.max[axis]);
+            }
+        }
+        bounds
+    }
+
+    /// Apply the 26.3 vertical placement; `surface_height` must come from the
+    /// unadjusted WORLD_SURFACE_WG heightmap at the graph center.
+    pub fn place(mut self, elevation: MineshaftElevation) -> Result<PlacedMineshaft> {
+        let bounds = self.bounds();
+        let center = Self::center_of(bounds);
+        let target = match (self.variant, elevation) {
+            (MineshaftVariant::Normal, MineshaftElevation::Normal { sea_level, min_y }) => {
+                let limit = i64::from(sea_level) - 10;
+                let mut top =
+                    i64::from(bounds.max[1]) - i64::from(bounds.min[1]) + 1 + i64::from(min_y) + 1;
+                if top < limit {
+                    let range = i32::try_from(limit - top)
+                        .context("mineshaft elevation range too large")?;
+                    top += i64::from(self.draw(range));
+                }
+                top - i64::from(bounds.max[1])
+            }
+            (
+                MineshaftVariant::Mesa,
+                MineshaftElevation::Mesa {
+                    sea_level,
+                    surface_height,
+                },
+            ) => {
+                let mut target = i64::from(sea_level);
+                if surface_height > sea_level {
+                    let range = i32::try_from(i64::from(surface_height) - target + 1)
+                        .context("mineshaft elevation range too large")?;
+                    target += i64::from(self.draw(range));
+                }
+                target - i64::from(center[1])
+            }
+            _ => anyhow::bail!("mineshaft elevation does not match its variant"),
+        };
+        let offset_y = i32::try_from(target).context("mineshaft elevation offset overflow")?;
+        let shifted_y = |y: i32| {
+            y.checked_add(offset_y)
+                .context("mineshaft piece Y overflow")
+        };
+        let root = self.pieces[0].bounds;
+        let generation_point = [root.min[0] + 6, shifted_y(50)?, root.min[2] - 2];
+        for piece in &mut self.pieces {
+            piece.bounds.min[1] = shifted_y(piece.bounds.min[1])?;
+            piece.bounds.max[1] = shifted_y(piece.bounds.max[1])?;
+            if let MineshaftGraphPieceKind::Room { entrances } = &mut piece.kind {
+                for entrance in entrances {
+                    entrance.min[1] = shifted_y(entrance.min[1])?;
+                    entrance.max[1] = shifted_y(entrance.max[1])?;
+                }
+            }
+        }
+        Ok(PlacedMineshaft {
+            variant: self.variant,
+            pieces: self.pieces,
+            offset_y,
+            generation_point,
+            random: self.random,
+        })
     }
 
     fn draw(&mut self, bound: i32) -> i32 {
@@ -296,5 +406,61 @@ mod tests {
     fn graph_rejects_overflowing_coordinates() {
         assert!(MineshaftGraph::new(0, [i32::MAX, 0], MineshaftVariant::Normal).is_err());
         assert!(MineshaftGraph::new(0, [134_217_720, 0], MineshaftVariant::Normal).is_err());
+    }
+
+    #[test]
+    fn mesa_at_or_below_sea_level_moves_every_piece_without_a_random_draw() {
+        let graph = MineshaftGraph::new(42, [4, -1], MineshaftVariant::Mesa).unwrap();
+        let center = graph.center();
+        let original = graph.pieces().to_vec();
+        let (_, _, mut unshifted_random) = MineshaftGraph::new(42, [4, -1], MineshaftVariant::Mesa)
+            .unwrap()
+            .into_parts();
+        let placed = graph
+            .place(MineshaftElevation::Mesa {
+                sea_level: 63,
+                surface_height: 50,
+            })
+            .unwrap();
+        assert_eq!(placed.offset_y, 63 - center[1]);
+        assert_eq!(placed.generation_point, [72, 50 + placed.offset_y, -16]);
+        for (before, after) in original.iter().zip(&placed.pieces) {
+            assert_eq!(after.bounds.min[1], before.bounds.min[1] + placed.offset_y);
+            assert_eq!(after.bounds.max[1], before.bounds.max[1] + placed.offset_y);
+            if let (
+                MineshaftGraphPieceKind::Room { entrances: old },
+                MineshaftGraphPieceKind::Room { entrances: new },
+            ) = (&before.kind, &after.kind)
+            {
+                for (old, new) in old.iter().zip(new) {
+                    assert_eq!(new.min[1], old.min[1] + placed.offset_y);
+                    assert_eq!(new.max[1], old.max[1] + placed.offset_y);
+                }
+            }
+        }
+        let (_, _, mut placed_random) = placed.into_parts();
+        assert_eq!(placed_random.next_long(), unshifted_random.next_long());
+    }
+
+    #[test]
+    fn elevation_rejects_mismatched_variant_and_extreme_ranges() {
+        let graph = MineshaftGraph::new(0, [0, 0], MineshaftVariant::Normal).unwrap();
+        assert!(
+            graph
+                .place(MineshaftElevation::Mesa {
+                    sea_level: 63,
+                    surface_height: 70
+                })
+                .is_err()
+        );
+        let graph = MineshaftGraph::new(0, [0, 0], MineshaftVariant::Mesa).unwrap();
+        assert!(
+            graph
+                .place(MineshaftElevation::Mesa {
+                    sea_level: i32::MIN,
+                    surface_height: i32::MAX
+                })
+                .is_err()
+        );
     }
 }

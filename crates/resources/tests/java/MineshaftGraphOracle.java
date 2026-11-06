@@ -48,6 +48,29 @@ public class MineshaftGraphOracle {
                     }
                     for (Object entrance : (List<?>)field(root, "childEntranceBoxes")) out.printf("E %s%n", box((BoundingBox)entrance));
                     out.printf("Z %d%n", random.nextLong());
+                    for (int[] heights : new int[][]{{63,-64,50}, {63,-64,63}, {63,-64,128}, {-20,-100,20}, {320,300,321}}) {
+                        var placementRandom = new WorldgenRandom(new LegacyRandomSource(0));
+                        placementRandom.setLargeFeatureSeed(seed, chunk[0], chunk[1]);
+                        placementRandom.nextDouble();
+                        var placementRoot = new MineshaftPieces.MineShaftRoom(0, placementRandom, chunk[0]*16+2, chunk[1]*16+2, variant);
+                        var placementBuilder = new StructurePiecesBuilder();
+                        placementBuilder.addPiece(placementRoot);
+                        placementRoot.addChildren(placementRoot, placementBuilder, placementRandom);
+                        var center = placementBuilder.getBoundingBox().getCenter();
+                        int offset;
+                        if (variant == MineshaftStructure.Type.NORMAL) {
+                            offset = placementBuilder.moveBelowSeaLevel(heights[0], heights[1], placementRandom, 10);
+                        } else {
+                            int target = heights[2] <= heights[0] ? heights[0] : net.minecraft.util.Mth.randomBetweenInclusive(placementRandom, heights[0], heights[2]);
+                            offset = target - center.getY();
+                            placementBuilder.offsetPiecesVertically(offset);
+                        }
+                        out.printf("H %d %d %d %d,%d,%d %d %d,%d,%d%n", heights[0], heights[1], heights[2],
+                            center.getX(), center.getY(), center.getZ(), offset, chunk[0]*16+8, 50+offset, chunk[1]*16);
+                        for (var piece : placementBuilder.build().pieces()) out.printf("Q %s%n", box(piece.getBoundingBox()));
+                        for (Object entrance : (List<?>)field(placementRoot, "childEntranceBoxes")) out.printf("I %s%n", box((BoundingBox)entrance));
+                        out.printf("Y %d%n", placementRandom.nextLong());
+                    }
                 }
     }
 }

@@ -42,6 +42,7 @@ pub(super) trait OceanFeatureRunner {
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -70,6 +71,33 @@ impl super::MixedOceanRuinPlacement for NoOceanPlacement {
     }
 }
 
+/// Execute jigsaws without manufacturing ocean, hut, or mineshaft effects.
+pub(super) struct JigsawOnlyFeatureRunner;
+impl OceanFeatureRunner for JigsawOnlyFeatureRunner {
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
+        _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        _: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        _: &super::structure_batch::PreparedStructureStages,
+        _: &super::BiomeNeighborhood,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        ensure!(jigsaws.is_some(), "jigsaw resources are missing");
+        execute_mixed_lighting(
+            terrain,
+            prepared,
+            structures,
+            jigsaws,
+            &mut NoOceanPlacement,
+            lighting,
+        )
+    }
+}
+
 impl<U> OceanFeatureRunner for MineshaftFeatureCallbacks<'_, U>
 where
     U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
@@ -79,6 +107,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         _: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -92,27 +121,14 @@ where
                 .context("mineshaft biome tags are not prepared")?,
             uuid_factory: self.uuid_factory.clone(),
         };
-        let (_, updated) =
-            match lighting {
-                StructureFeatureLighting::Visible(light) => prepared
-                    .execute_mixed_with_visible_light(terrain, structures, &mut context, light)?,
-                StructureFeatureLighting::Fresh(tracker, registry) => prepared
-                    .execute_mixed_with_tracked_light(
-                        terrain,
-                        structures,
-                        &mut context,
-                        tracker,
-                        registry,
-                    )?,
-                StructureFeatureLighting::Staged(engine, registry) => prepared
-                    .execute_mixed_with_staged_light(
-                        terrain,
-                        structures,
-                        &mut context,
-                        engine,
-                        registry,
-                    )?,
-            };
+        let updated = execute_mixed_lighting(
+            terrain,
+            prepared,
+            structures,
+            jigsaws,
+            &mut context,
+            lighting,
+        )?;
         *self.uuid_factory = context.uuid_factory;
         Ok(updated)
     }
@@ -132,6 +148,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -140,27 +157,14 @@ where
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
         let mut staged = self.ocean.clone();
         staged.region_random = region_random.clone();
-        let (_, updated) =
-            match lighting {
-                StructureFeatureLighting::Visible(light) => prepared
-                    .execute_mixed_with_visible_light(terrain, structures, &mut staged, light)?,
-                StructureFeatureLighting::Fresh(tracker, registry) => prepared
-                    .execute_mixed_with_tracked_light(
-                        terrain,
-                        structures,
-                        &mut staged,
-                        tracker,
-                        registry,
-                    )?,
-                StructureFeatureLighting::Staged(engine, registry) => prepared
-                    .execute_mixed_with_staged_light(
-                        terrain,
-                        structures,
-                        &mut staged,
-                        engine,
-                        registry,
-                    )?,
-            };
+        let updated = execute_mixed_lighting(
+            terrain,
+            prepared,
+            structures,
+            jigsaws,
+            &mut staged,
+            lighting,
+        )?;
         *self.ocean = staged;
         Ok(updated)
     }
@@ -176,6 +180,24 @@ pub(super) struct MixedMineshaftFeatureCallbacks<'a, 'b, C, W, H, P, U> {
 }
 
 fn execute_mixed_lighting<R: super::MixedOceanRuinPlacement + Clone>(
+    terrain: &mut super::CarvedTerrainWorld,
+    prepared: &super::PreparedDecoration<'_, '_>,
+    structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+    jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
+    context: &mut R,
+    lighting: StructureFeatureLighting<'_>,
+) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+    if let Some(jigsaws) = jigsaws {
+        let mut staged = jigsaws.wrap(context.clone());
+        let updated =
+            execute_mixed_lighting_inner(terrain, prepared, structures, &mut staged, lighting)?;
+        *context = staged.other;
+        return Ok(updated);
+    }
+    execute_mixed_lighting_inner(terrain, prepared, structures, context, lighting)
+}
+
+fn execute_mixed_lighting_inner<R: super::MixedOceanRuinPlacement + Clone>(
     terrain: &mut super::CarvedTerrainWorld,
     prepared: &super::PreparedDecoration<'_, '_>,
     structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
@@ -221,6 +243,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -230,7 +253,14 @@ where
         let mut staged = self.context.clone();
         staged.ocean.region_random = region_random.clone();
         staged.huts.clone_from(huts);
-        let updated = execute_mixed_lighting(terrain, prepared, structures, &mut staged, lighting)?;
+        let updated = execute_mixed_lighting(
+            terrain,
+            prepared,
+            structures,
+            jigsaws,
+            &mut staged,
+            lighting,
+        )?;
         huts.clone_from(&staged.huts);
         *self.context = staged;
         Ok(updated)
@@ -265,6 +295,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -280,13 +311,19 @@ where
                 blocking_biomes,
                 uuid_factory: self.uuid_factory.clone(),
             };
-            let updated =
-                execute_mixed_lighting(terrain, prepared, structures, &mut staged, lighting)?;
+            let updated = execute_mixed_lighting(
+                terrain,
+                prepared,
+                structures,
+                jigsaws,
+                &mut staged,
+                lighting,
+            )?;
             *self.uuid_factory = staged.uuid_factory;
             other = staged.other;
             updated
         } else {
-            execute_mixed_lighting(terrain, prepared, structures, &mut other, lighting)?
+            execute_mixed_lighting(terrain, prepared, structures, jigsaws, &mut other, lighting)?
         };
         huts.clone_from(&other.huts);
         *self.context = other;
@@ -317,6 +354,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -368,6 +406,7 @@ where
                 terrain,
                 prepared,
                 structures,
+                jigsaws,
                 huts,
                 region_random,
                 lighting,
@@ -382,6 +421,7 @@ where
                 terrain,
                 prepared,
                 structures,
+                jigsaws,
                 huts,
                 region_random,
                 lighting,
@@ -710,6 +750,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -751,6 +792,7 @@ where
             terrain,
             prepared,
             structures,
+            jigsaws,
             huts,
             region_random,
             lighting,
@@ -1720,6 +1762,7 @@ impl GenerationSchedule {
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
@@ -1736,6 +1779,7 @@ impl GenerationSchedule {
             terrain,
             prepared,
             structures,
+            jigsaws,
             huts,
             region_random,
             lighting,

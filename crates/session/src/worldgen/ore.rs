@@ -127,8 +127,9 @@ pub trait MixedOceanRuinPlacement {
 pub struct MixedJigsawPlacementContext<'a, R> {
     pub other: R,
     pub registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
-    pub starts:
+    pub starts: Arc<
         BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
+    >,
 }
 
 impl<'a, R> MixedJigsawPlacementContext<'a, R> {
@@ -165,8 +166,39 @@ impl<'a, R> MixedJigsawPlacementContext<'a, R> {
         Ok(Self {
             other,
             registry,
-            starts,
+            starts: Arc::new(starts),
         })
+    }
+}
+
+/// Immutable bindings shared by the transactional mixed runner and its clone.
+pub(super) struct PreparedJigsawResources<'a> {
+    pub(super) registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    pub(super) starts: Arc<
+        BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
+    >,
+}
+
+impl<'a> PreparedJigsawResources<'a> {
+    pub(super) fn load(
+        plan: &[PlannedMixedStructureDecoration<'_>],
+        provider: &mut impl ResourceProvider,
+        blocks: &BTreeSet<String>,
+        registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Self> {
+        let prepared = MixedJigsawPlacementContext::load((), plan, provider, blocks, registry)?;
+        Ok(Self {
+            registry,
+            starts: prepared.starts,
+        })
+    }
+
+    pub(super) fn wrap<R>(&self, other: R) -> MixedJigsawPlacementContext<'a, R> {
+        MixedJigsawPlacementContext {
+            other,
+            registry: self.registry,
+            starts: Arc::clone(&self.starts),
+        }
     }
 }
 
@@ -22180,6 +22212,7 @@ mod tests {
             &mut terrain,
             &mine,
             &structures,
+            None,
             &mut BTreeMap::new(),
             &region_random,
             super::super::schedule::StructureFeatureLighting::Visible(&light),
@@ -22632,6 +22665,7 @@ mod tests {
                 terrain: &mut CarvedTerrainWorld,
                 prepared: &PreparedDecoration<'_, '_>,
                 structures: &[PlannedMixedStructureDecoration<'_>],
+                _: Option<&super::PreparedJigsawResources<'_>>,
                 _: &mut BTreeMap<
                     super::super::structure_batch::TerrainStartKey,
                     super::super::SavedSwampHutPiece,
@@ -22677,6 +22711,7 @@ mod tests {
                     &mut scheduled,
                     &prepared,
                     &structures,
+                    None,
                     &mut BTreeMap::new(),
                     &random,
                     super::super::schedule::StructureFeatureLighting::Visible(&light),
@@ -22694,6 +22729,7 @@ mod tests {
             &mut scheduled,
             &prepared,
             &structures,
+            None,
             &mut BTreeMap::new(),
             &random,
             super::super::schedule::StructureFeatureLighting::Visible(&light),

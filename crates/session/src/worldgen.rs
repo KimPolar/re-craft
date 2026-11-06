@@ -7765,6 +7765,244 @@ mod tests {
         run_ocean_structure_batch(true, true)
     }
 
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_automatically_decorates_or_rolls_back_jigsaw() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::{
+            heightmap::BlockHeightFlags,
+            nbt::{self, NamedTag, Tag, TagType},
+        };
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+            structure_biomes::StructureBiomes, structure_placement::StructureSetCache,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        use std::io::Write;
+
+        struct FixtureData {
+            vanilla: native_resources::packs::ResourceStack,
+            template: Vec<u8>,
+        }
+        impl ResourceProvider for FixtureData {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.vanilla.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let value = match path {
+                    "data/example/worldgen/structure/test.json" => Some(
+                        json!({"type":"minecraft:jigsaw","biomes":["minecraft:plains"],"step":"surface_structures","start_pool":"example:test","size":1,"start_height":{"absolute":8},"use_expansion_hack":false,"max_distance_from_center":80,"liquid_settings":"ignore_waterlogging"}),
+                    ),
+                    "data/example/worldgen/structure_set/test.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:test","weight":1}]}),
+                    ),
+                    "data/example/worldgen/template_pool/test.json" => Some(
+                        json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":{"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":"rigid"}}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    return Ok(Some(serde_json::to_vec(&value)?));
+                }
+                if path == "data/example/structure/test.nbt" {
+                    return Ok(Some(self.template.clone()));
+                }
+                if path.starts_with("data/minecraft/tags/") {
+                    return self.vanilla.read_data(path);
+                }
+                if let Some(bytes) = Data.read_data(path)? {
+                    return Ok(Some(bytes));
+                }
+                self.vanilla.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                match folder {
+                    "worldgen/structure" => Ok(vec![ResourceId::parse("example:test")?]),
+                    "worldgen/biome" => Ok(vec![ResourceId::parse("minecraft:plains")?]),
+                    _ => self.vanilla.list_data(folder),
+                }
+            }
+        }
+        let list = |element_type, values| Tag::List {
+            element_type,
+            values,
+        };
+        for unsupported in [false, true] {
+            let mut block = vec![
+                (
+                    "pos".into(),
+                    list(TagType::Int, vec![Tag::Int(0), Tag::Int(0), Tag::Int(0)]),
+                ),
+                ("state".into(), Tag::Int(0)),
+            ];
+            if unsupported {
+                block.push(("nbt".into(), Tag::Compound(vec![])));
+            }
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "size".into(),
+                        list(TagType::Int, vec![Tag::Int(1), Tag::Int(1), Tag::Int(1)]),
+                    ),
+                    (
+                        "palette".into(),
+                        list(
+                            TagType::Compound,
+                            vec![Tag::Compound(vec![(
+                                "id".into(),
+                                Tag::String("minecraft:stone_bricks".into()),
+                            )])],
+                        ),
+                    ),
+                    (
+                        "blocks".into(),
+                        list(TagType::Compound, vec![Tag::Compound(block)]),
+                    ),
+                    ("entities".into(), list(TagType::Compound, vec![])),
+                ]),
+            };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(&document)?)?;
+            let game =
+                native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+            let mut vanilla = native_resources::packs::ResourceStack::open(&game)?;
+            let blocks = vanilla.vanilla_block_ids()?;
+            let registry = vanilla.vanilla_generated_block_registry()?;
+            let mut data = FixtureData {
+                vanilla,
+                template: encoder.finish()?,
+            };
+            let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
+                &mut data,
+                &definition(),
+                42,
+                0,
+                16,
+            )?;
+            let structure = ResourceId::parse("example:test")?;
+            let mut cache = StructureSetCache::default();
+            let [x, z] = cache
+                .load(&mut data, &structure)?
+                .placement
+                .potential_chunk(42, [0, 0]);
+            let target = ChunkPos { x, z };
+            let rules = StructureBiomes::load(&mut data, [structure.clone()])?;
+            let mut structures = structure_batch::StructureGenerationBatch::new(
+                generator,
+                rules,
+                vec![structure.clone()],
+            )?;
+            let preparation = structure_batch::StructurePreparationPlan::new([(
+                target,
+                schedule::GenerationStage::Features,
+            )])?;
+            preparation.request_structures(&mut structures)?;
+            while structures
+                .step(&mut data, &mut |value| {
+                    let name = value.as_str().context("expected block")?;
+                    Ok(BlockHeightFlags {
+                        is_air: name == "minecraft:air",
+                        blocks_motion: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                        blocks_motion_no_leaves: matches!(
+                            name,
+                            "minecraft:stone" | "minecraft:dirt"
+                        ),
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                })?
+                .is_some()
+            {}
+            let origin = structures.jigsaw_starts(target).context("missing jigsaw")?[&structure]
+                .pieces[0]
+                .origin;
+            let tags = CarverBlockTags::load(&mut data, &blocks)?;
+            let mut batch = preparation.into_expandable_terrain_batch(
+                structures,
+                terrain_generator,
+                tags,
+                "minecraft:overworld",
+            )?;
+            let lighting = GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld")?,
+                dimension_type: None,
+                inline_dimension_type: None,
+                min_y: 0,
+                height: 16,
+                has_skylight: true,
+                ambient_light: Some(0.0),
+            };
+            batch.enable_decoration(&mut data, &BTreeSet::new(), blocks.clone(), &lighting)?;
+            batch.enable_light_initialization(registry)?;
+            batch.request_features(target)?;
+            let mut failed = false;
+            loop {
+                let before = batch.snapshot();
+                let result = batch.step(
+                    &mut data,
+                    &mut |value| {
+                        let name = value.as_str().context("expected block")?;
+                        Ok(CarverBlockState {
+                            is_air: name == "minecraft:air",
+                            has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                        })
+                    },
+                    &mut |value| {
+                        let name = value.as_str().context("expected block")?;
+                        Ok(BlockState {
+                            name: name.into(),
+                            properties: BTreeMap::new(),
+                        })
+                    },
+                );
+                match result {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) if unsupported => {
+                        ensure!(
+                            format!("{error:#}").contains("jigsaw block entity placement"),
+                            "unexpected failure: {error:#}"
+                        );
+                        let before = before.context("missing pre-failure terrain")?;
+                        assert!(Arc::ptr_eq(
+                            &before,
+                            &batch.snapshot().context("missing terrain")?
+                        ));
+                        assert_ne!(
+                            batch.schedule().completed(target),
+                            Some(schedule::GenerationStage::Features)
+                        );
+                        failed = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            assert_eq!(failed, unsupported);
+            if !unsupported {
+                assert_eq!(
+                    batch.schedule().completed(target),
+                    Some(schedule::GenerationStage::Features)
+                );
+                assert_eq!(
+                    batch
+                        .snapshot()
+                        .context("missing terrain")?
+                        .block(origin[0], origin[1], origin[2])
+                        .context("missing placed block")?
+                        .name,
+                    "minecraft:stone_bricks"
+                );
+                assert!(batch.structure_data(target).is_ok());
+            }
+        }
+        Ok(())
+    }
+
     fn run_ocean_structure_batch(mixed: bool, dynamic_biomes: bool) -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{

@@ -23,9 +23,10 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        MineshaftFeatureCallbacks, MixedFeatureCallbacks, MixedMineshaftFeatureCallbacks,
-        NativeDrownedFeatureRunner, NativeHutFeatureRunner, NativeMixedFeatureRunner,
-        OceanFeatureCallbacks, OceanFeatureRunner, StructureFeatureLighting,
+        JigsawOnlyFeatureRunner, MineshaftFeatureCallbacks, MixedFeatureCallbacks,
+        MixedMineshaftFeatureCallbacks, NativeDrownedFeatureRunner, NativeHutFeatureRunner,
+        NativeMixedFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
+        StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -4311,11 +4312,16 @@ impl FreshTerrainBatch {
                         .structures
                         .as_ref()
                         .context("structure decoration registry is missing")?;
-                    let mixed = if ocean_runner.is_some() {
-                        Some(structures.mixed_decoration_plan(pos, registry)?)
-                    } else {
-                        None
-                    };
+                    let candidate = structures.mixed_decoration_plan_with_jigsaw(pos, registry)?;
+                    let has_jigsaw = candidate.iter().any(|entry| {
+                        entry.starts.iter().any(|start| {
+                            matches!(
+                                start,
+                                super::structure_batch::PlannedStructureStart::Jigsaw(_)
+                            )
+                        })
+                    });
+                    let mixed = (ocean_runner.is_some() || has_jigsaw).then_some(candidate);
                     let allow_huts = ocean_runner
                         .as_ref()
                         .is_some_and(|runner| runner.supports_huts());
@@ -4334,6 +4340,20 @@ impl FreshTerrainBatch {
                     if has_mixed {
                         let planned = mixed.context("mixed structure plan is missing")?;
                         let keys = structures.mixed_commit_keys(&planned, allow_huts)?;
+                        let jigsaws = if has_jigsaw {
+                            let registry = self
+                                .light_registry
+                                .as_ref()
+                                .context("jigsaw block registry is missing")?;
+                            Some(super::ore::PreparedJigsawResources::load(
+                                &planned,
+                                provider,
+                                &config.block_registry,
+                                registry,
+                            )?)
+                        } else {
+                            None
+                        };
                         let mut hut_states: BTreeMap<_, _> = keys
                             .iter()
                             .flatten()
@@ -4341,14 +4361,18 @@ impl FreshTerrainBatch {
                                 structures.huts.get(key).map(|state| (key.clone(), *state))
                             })
                             .collect();
-                        let runner = ocean_runner
-                            .as_deref_mut()
-                            .context("ocean ruin context is missing")?;
+                        let mut jigsaw_only = JigsawOnlyFeatureRunner;
+                        let runner: &mut dyn OceanFeatureRunner = match ocean_runner.as_deref_mut()
+                        {
+                            Some(runner) => runner,
+                            None => &mut jigsaw_only,
+                        };
                         let mut run = |lighting| {
                             self.schedule.run_features_with_ocean(
                                 terrain,
                                 &prepared,
                                 &planned,
+                                jigsaws.as_ref(),
                                 &mut hut_states,
                                 &region_random,
                                 lighting,

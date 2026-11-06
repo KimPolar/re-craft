@@ -173,16 +173,26 @@ impl CatSpawnVariants {
         &self,
         provider: &mut impl ResourceProvider,
     ) -> Result<CatWorldConditions> {
+        CatWorldConditions::prepare_values(
+            provider,
+            self.selectors
+                .iter()
+                .filter_map(|selector| selector.condition.as_ref()),
+        )
+    }
+}
+
+impl CatWorldConditions {
+    pub(crate) fn prepare_values<'a>(
+        provider: &mut impl ResourceProvider,
+        conditions: impl IntoIterator<Item = &'a Value>,
+    ) -> Result<Self> {
         let mut predicates = BTreeMap::new();
         let mut structures = None;
         let mut biomes = None;
         let mut structure_tags = BTreeMap::new();
         let mut biome_tags = BTreeMap::new();
-        for value in self
-            .selectors
-            .iter()
-            .filter_map(|selector| selector.condition.as_ref())
-        {
+        for value in conditions {
             let key = serde_json::to_string(value)?;
             if predicates.contains_key(&key) {
                 continue;
@@ -261,16 +271,20 @@ impl CatSpawnVariants {
             };
             predicates.insert(key, predicate);
         }
-        Ok(CatWorldConditions { predicates })
+        Ok(Self { predicates })
     }
 }
 
 impl CatWorldConditions {
     pub fn matches(&self, condition: &Value, context: &CatSpawnContext<'_>) -> Result<bool> {
         let key = serde_json::to_string(condition)?;
+        self.matches_key(&key, context)
+    }
+
+    pub(crate) fn matches_key(&self, key: &str, context: &CatSpawnContext<'_>) -> Result<bool> {
         match self
             .predicates
-            .get(&key)
+            .get(key)
             .context("cat condition was not prepared")?
         {
             WorldCondition::Structures(values) => Ok(!values.is_disjoint(

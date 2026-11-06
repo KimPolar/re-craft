@@ -172,6 +172,102 @@ fn construction_default_prefers_temperate_then_first_registry_entry() {
 }
 
 #[test]
+fn world_conditions_select_animal_and_nautilus_variants_transactionally() {
+    use native_resources::animal_variants::{SpawnVariantContext, ZombieNautilusSpawnVariants};
+    use std::collections::BTreeSet;
+    let mut data = Data::default();
+    data.0.insert(
+        "data/minecraft/worldgen/biome/ocean.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/worldgen/structure/shipwreck.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert(
+        "data/minecraft/pig_sound_variant/classic.json".into(),
+        b"{}".to_vec(),
+    );
+    for registry in ["pig_variant", "zombie_nautilus_variant"] {
+        for (name, conditions) in [
+            ("temperate", json!([{"priority":0}])),
+            (
+                "moon",
+                json!([{"priority":1,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}]),
+            ),
+            (
+                "ship",
+                json!([{"priority":2,"condition":{"type":"minecraft:structure","structures":"minecraft:shipwreck"}}]),
+            ),
+        ] {
+            data.0.insert(
+                format!("data/minecraft/{registry}/{name}.json"),
+                serde_json::to_vec(&json!({"spawn_conditions":conditions})).unwrap(),
+            );
+        }
+    }
+    let animal = FarmAnimalSpawnVariants::load_active(&mut data, FarmAnimal::Pig).unwrap();
+    let nautilus = ZombieNautilusSpawnVariants::load_active(&mut data).unwrap();
+    let biome = id("ocean");
+    let none = BTreeSet::new();
+    let ship = BTreeSet::from([id("shipwreck")]);
+    for (phase, structures, expected) in [
+        (4, &none, "temperate"),
+        (0, &none, "moon"),
+        (0, &ship, "ship"),
+    ] {
+        for algorithm in [WorldgenRandom::Legacy, WorldgenRandom::Xoroshiro] {
+            let context = SpawnVariantContext {
+                biome: Some(&biome),
+                moon_phase: Some(phase),
+                structures_with_piece: Some(structures),
+            };
+            let mut random = RegionRandom::new(42, algorithm, 0, 0);
+            let mut group = AnimalGroupData::default();
+            assert_eq!(
+                animal
+                    .finalize_in_context(&context, &mut random, &mut group, false)
+                    .unwrap()
+                    .variant,
+                Some(id(expected))
+            );
+            let mut random = RegionRandom::new(42, algorithm, 0, 0);
+            assert_eq!(
+                nautilus
+                    .finalize_structure_spawn_in_context(&context, &mut random)
+                    .unwrap()
+                    .variant,
+                id(expected)
+            );
+        }
+    }
+    let incomplete = SpawnVariantContext {
+        biome: Some(&biome),
+        moon_phase: None,
+        structures_with_piece: None,
+    };
+    let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
+    let mut original = random.clone();
+    let mut group = AnimalGroupData::default();
+    let old_group = group;
+    assert!(
+        animal
+            .finalize_in_context(&incomplete, &mut random, &mut group, false)
+            .is_err()
+    );
+    assert_eq!(group, old_group);
+    assert_eq!(random.next_long(), original.next_long());
+    let mut random = RegionRandom::new(42, WorldgenRandom::Legacy, 0, 0);
+    let mut original = random.clone();
+    assert!(
+        nautilus
+            .finalize_structure_spawn_in_context(&incomplete, &mut random)
+            .is_err()
+    );
+    assert_eq!(random.next_long(), original.next_long());
+}
+
+#[test]
 fn selectors_preserve_order_duplicates_and_reject_unknown_conditions() {
     let mut data = Data::default();
     for biome in ["plains", "desert"] {
@@ -326,6 +422,60 @@ fn installed_variants_match_java_selection_and_random_state() {
         .arg(input)
         .arg(&output));
     let expected: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let mut synthetic_data = Data::default();
+    synthetic_data.0.insert(
+        "data/minecraft/worldgen/biome/ocean.json".into(),
+        b"{}".to_vec(),
+    );
+    synthetic_data.0.insert(
+        "data/minecraft/worldgen/structure/shipwreck.json".into(),
+        b"{}".to_vec(),
+    );
+    for (name, conditions) in [
+        ("temperate", json!([{"priority":0}])),
+        (
+            "moon",
+            json!([{"priority":1,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}]),
+        ),
+        (
+            "ship",
+            json!([{"priority":2,"condition":{"type":"minecraft:structure","structures":"minecraft:shipwreck"}}]),
+        ),
+    ] {
+        synthetic_data.0.insert(
+            format!("data/minecraft/pig_variant/{name}.json"),
+            serde_json::to_vec(&json!({"spawn_conditions":conditions})).unwrap(),
+        );
+    }
+    let table = FarmAnimalVariants::load_active(&mut synthetic_data, FarmAnimal::Pig).unwrap();
+    let biome = id("ocean");
+    let no_structures = std::collections::BTreeSet::new();
+    let shipwreck = std::collections::BTreeSet::from([id("shipwreck")]);
+    let environment_cases = expected["environment_cases"].as_array().unwrap();
+    assert_eq!(environment_cases.len(), 192);
+    for case in environment_cases {
+        let structures = if case["inside"].as_bool().unwrap() {
+            &shipwreck
+        } else {
+            &no_structures
+        };
+        let context = native_resources::animal_variants::SpawnVariantContext {
+            biome: Some(&biome),
+            moon_phase: Some(case["phase"].as_u64().unwrap() as u8),
+            structures_with_piece: Some(structures),
+        };
+        let algorithm = if case["legacy"].as_bool().unwrap() {
+            WorldgenRandom::Legacy
+        } else {
+            WorldgenRandom::Xoroshiro
+        };
+        let mut random = RegionRandom::new(case["seed"].as_i64().unwrap(), algorithm, 0, 0);
+        assert_eq!(
+            table.choose_in_context(&context, &mut random).unwrap(),
+            Some(&id(case["selected"].as_str().unwrap()))
+        );
+        assert_eq!(random.next_long(), case["next"].as_i64().unwrap());
+    }
     let mut provider = ResourceStack::open(&game).unwrap();
     let java_order: Vec<_> = expected["synthetic_order"]
         .as_array()

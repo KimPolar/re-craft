@@ -2,21 +2,20 @@
 //!
 //! The active registry is registered in Java's resource-file order; ties
 //! consume a random index in that order.
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet},
-};
+use std::{cmp::Reverse, collections::BTreeSet};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
 use crate::{
+    cat_variants::CatWorldConditions,
     packs::{ResourceId, ResourceProvider},
-    surface_biomes::resolve_tag,
     worldgen_region_random::{
         AnimalBaseInitialization, AnimalGroupData, RegionRandom, finalize_animal_base,
     },
 };
+
+pub use crate::cat_variants::CatSpawnContext as SpawnVariantContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FarmAnimal {
@@ -46,7 +45,7 @@ impl FarmAnimal {
 struct Selector {
     priority: i32,
     variant: ResourceId,
-    biomes: Option<BTreeSet<ResourceId>>,
+    condition_key: Option<String>,
 }
 
 /// Loaded selectors in Java registry order. Multiple matching selectors for
@@ -54,6 +53,7 @@ struct Selector {
 pub struct FarmAnimalVariants {
     biome_registry: BTreeSet<ResourceId>,
     selectors: Vec<Selector>,
+    conditions: CatWorldConditions,
 }
 
 /// The values applied by a fresh pig, cow or chicken's spawn finalization.
@@ -121,9 +121,32 @@ impl FarmAnimalSpawnVariants {
         group: &mut AnimalGroupData,
         has_follow_range_bonus: bool,
     ) -> Result<FarmAnimalInitialization> {
+        self.finalize_in_context(
+            &SpawnVariantContext {
+                biome: Some(biome),
+                moon_phase: None,
+                structures_with_piece: None,
+            },
+            random,
+            group,
+            has_follow_range_bonus,
+        )
+    }
+
+    /// Apply world-dependent selectors from the active pack snapshot.
+    pub fn finalize_in_context(
+        &self,
+        context: &SpawnVariantContext<'_>,
+        random: &mut RegionRandom,
+        group: &mut AnimalGroupData,
+        has_follow_range_bonus: bool,
+    ) -> Result<FarmAnimalInitialization> {
         let mut next_random = random.clone();
         let mut next_group = *group;
-        let variant = self.visual.choose(biome, &mut next_random)?.cloned();
+        let variant = self
+            .visual
+            .choose_in_context(context, &mut next_random)?
+            .cloned();
         let count = i32::try_from(self.sounds.len()).context("too many sound variants")?;
         let index = next_random
             .next_int_bound(count)
@@ -173,8 +196,8 @@ impl FarmAnimalVariants {
         let biome_registry: BTreeSet<_> =
             provider.list_data("worldgen/biome")?.into_iter().collect();
         ensure!(!biome_registry.is_empty(), "biome registry is empty");
-        let mut cache = BTreeMap::new();
         let mut selectors = Vec::new();
+        let mut condition_values = Vec::new();
         for id in ordered_variants {
             let path = format!("data/{}/{}/{}.json", id.namespace, registry, id.path);
             let bytes = provider
@@ -200,69 +223,26 @@ impl FarmAnimalVariants {
                     .and_then(Value::as_i64)
                     .and_then(|n| i32::try_from(n).ok())
                     .context("invalid spawn selector priority")?;
-                let biomes = match entry.get("condition") {
-                    None => None,
-                    Some(condition) => {
-                        let condition = condition
-                            .as_object()
-                            .context("spawn condition must be an object")?;
-                        let kind = condition
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .context("missing spawn condition type")?;
-                        ensure!(
-                            ResourceId::parse(kind)? == ResourceId::parse("minecraft:biome")?,
-                            "unsupported spawn condition {kind}"
-                        );
-                        let selection = condition
-                            .get("biomes")
-                            .context("missing spawn condition biomes")?;
-                        let values = if let Some(tag) =
-                            selection.as_str().and_then(|s| s.strip_prefix('#'))
-                        {
-                            let tag = ResourceId::parse(tag)?;
-                            resolve_tag(
-                                provider,
-                                &tag,
-                                &biome_registry,
-                                &mut cache,
-                                &mut BTreeSet::new(),
-                            )?
-                            .context("missing spawn condition biome tag")?
-                        } else {
-                            let entries: Vec<&Value> = match selection {
-                                Value::String(_) => vec![selection],
-                                Value::Array(values) => values.iter().collect(),
-                                _ => bail!("biomes must be an ID, tag, or list of IDs"),
-                            };
-                            let mut result = BTreeSet::new();
-                            for value in entries {
-                                let name = value.as_str().context("biome ID must be a string")?;
-                                ensure!(
-                                    !name.starts_with('#'),
-                                    "biome tags are not allowed inside lists"
-                                );
-                                let id = ResourceId::parse(name)?;
-                                ensure!(biome_registry.contains(&id), "unknown biome {name}");
-                                result.insert(id);
-                            }
-                            result
-                        };
-                        Some(values)
-                    }
-                };
+                if let Some(condition) = entry.get("condition") {
+                    condition_values.push(condition.clone());
+                }
                 selectors.push(Selector {
                     priority,
                     variant: id.clone(),
-                    biomes,
+                    condition_key: entry
+                        .get("condition")
+                        .map(serde_json::to_string)
+                        .transpose()?,
                 });
             }
         }
         // Stable sorting preserves registry order and selector order for ties.
         selectors.sort_by_key(|selector| Reverse(selector.priority));
+        let conditions = CatWorldConditions::prepare_values(provider, &condition_values)?;
         Ok(Self {
             biome_registry,
             selectors,
+            conditions,
         })
     }
 
@@ -273,6 +253,22 @@ impl FarmAnimalVariants {
         biome: &ResourceId,
         random: &mut RegionRandom,
     ) -> Result<Option<&'a ResourceId>> {
+        self.choose_in_context(
+            &SpawnVariantContext {
+                biome: Some(biome),
+                moon_phase: None,
+                structures_with_piece: None,
+            },
+            random,
+        )
+    }
+
+    pub fn choose_in_context<'a>(
+        &'a self,
+        context: &SpawnVariantContext<'_>,
+        random: &mut RegionRandom,
+    ) -> Result<Option<&'a ResourceId>> {
+        let biome = context.biome.context("spawn biome unavailable")?;
         ensure!(
             self.biome_registry.contains(biome),
             "biome is absent from the active registry"
@@ -284,9 +280,11 @@ impl FarmAnimalVariants {
                 break;
             }
             if selector
-                .biomes
+                .condition_key
                 .as_ref()
-                .is_none_or(|values| values.contains(biome))
+                .map(|key| self.conditions.matches_key(key, context))
+                .transpose()?
+                .unwrap_or(true)
             {
                 priority = Some(selector.priority);
                 matches.push(&selector.variant);
@@ -342,10 +340,25 @@ impl ZombieNautilusSpawnVariants {
         biome: &ResourceId,
         random: &mut RegionRandom,
     ) -> Result<ZombieNautilusInitialization> {
+        self.finalize_structure_spawn_in_context(
+            &SpawnVariantContext {
+                biome: Some(biome),
+                moon_phase: None,
+                structures_with_piece: None,
+            },
+            random,
+        )
+    }
+
+    pub fn finalize_structure_spawn_in_context(
+        &self,
+        context: &SpawnVariantContext<'_>,
+        random: &mut RegionRandom,
+    ) -> Result<ZombieNautilusInitialization> {
         let mut next = random.clone();
         let variant = self
             .visual
-            .choose(biome, &mut next)?
+            .choose_in_context(context, &mut next)?
             .unwrap_or(&self.default_visual)
             .clone();
         let attack_cooldown = 2400

@@ -23,6 +23,9 @@ import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import sun.misc.Unsafe;
 
 public class FarmAnimalVariantOracle {
+    record Environment(boolean moon, boolean ship) {}
+    record Candidate(String name, java.util.List<PriorityProvider.Selector<Environment, PriorityProvider.SelectorCondition<Environment>>> selectors)
+            implements PriorityProvider<Environment, PriorityProvider.SelectorCondition<Environment>> {}
     static Identifier fileKey(Identifier id) {
         return Identifier.fromNamespaceAndPath(id.getNamespace(), "pig_variant/" + id.getPath() + ".json");
     }
@@ -72,6 +75,25 @@ public class FarmAnimalVariantOracle {
             .stream().map(Identifier::parse).sorted(java.util.Comparator.comparing(FarmAnimalVariantOracle::fileKey))
             .forEach(id -> synthetic.add(id.toString()));
         output.add("synthetic_order", synthetic);
+        PriorityProvider.SelectorCondition<Environment> moon = environment -> environment.moon();
+        PriorityProvider.SelectorCondition<Environment> ship = environment -> environment.ship();
+        var candidates = java.util.List.of(
+            new Candidate("minecraft:moon",PriorityProvider.single(moon,1)),
+            new Candidate("minecraft:ship",PriorityProvider.single(ship,2)),
+            new Candidate("minecraft:temperate",PriorityProvider.alwaysTrue(0))
+        );
+        var environmentCases = new JsonArray();
+        for(int phase=0; phase<8; phase++) for(boolean inside:new boolean[]{false,true})
+            for(boolean legacy:new boolean[]{true,false}) for(long seed:new long[]{0,1,-1,42,Long.MIN_VALUE,Long.MAX_VALUE}) {
+                RandomSource root=legacy?new LegacyRandomSource(seed):new XoroshiroRandomSource(seed);
+                var random=root.forkPositional().fromHashOf(Identifier.withDefaultNamespace("worldgen_region_random")).forkPositional().at(0,0,0);
+                var context=new Environment(net.minecraft.world.level.dimension.DimensionType.MOON_BRIGHTNESS_PER_PHASE[phase]>=0.9,inside);
+                var selected=PriorityProvider.pick(candidates.stream(),c->c,random,context).orElseThrow();
+                var result=new JsonObject(); result.addProperty("phase",phase);result.addProperty("inside",inside);
+                result.addProperty("legacy",legacy);result.addProperty("seed",seed);result.addProperty("selected",selected.name());
+                result.addProperty("next",random.nextLong()); environmentCases.add(result);
+            }
+        output.add("environment_cases",environmentCases);
         var results = new JsonArray();
         for (var raw : cases) {
             var test = raw.getAsJsonObject();

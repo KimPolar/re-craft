@@ -14,6 +14,8 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.RotatedPillarBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
@@ -50,14 +52,29 @@ public class JigsawChestOracle {
                 }
         String[] stones = {"stone", "deepslate", "cobbled_deepslate", "polished_deepslate", "deepslate_bricks",
             "cracked_deepslate_bricks", "deepslate_tiles", "cracked_deepslate_tiles", "chiseled_deepslate",
-            "reinforced_deepslate", "basalt", "polished_basalt", "smooth_basalt"};
+            "reinforced_deepslate", "basalt", "polished_basalt", "smooth_basalt",
+            "white_wool", "orange_wool", "magenta_wool", "light_blue_wool", "yellow_wool", "lime_wool",
+            "pink_wool", "gray_wool", "light_gray_wool", "cyan_wool", "purple_wool", "blue_wool",
+            "brown_wool", "green_wool", "red_wool", "black_wool"};
         for (var name : stones) {
             var state = BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:" + name)).defaultBlockState();
-            out.printf("STONE\t%s\t%s\t%s%n", name, state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), state.hasBlockEntity());
+            out.printf("STONE\t%s\t%s\t%s\t%d%n", name, state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), state.hasBlockEntity(), state.getBlock().getStateDefinition().getPossibleStates().size());
         }
         for (var axis : Direction.Axis.values()) for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
             var state = Blocks.DEEPSLATE.defaultBlockState().setValue(RotatedPillarBlock.AXIS, axis).mirror(mirror).rotate(rotation);
             out.printf("AXIS\t%s\t%s\t%s\t%s%n", axis.getSerializedName(), mirror.name(), rotation.name(), state.getValue(RotatedPillarBlock.AXIS).getSerializedName());
+        }
+        for (var name : new String[]{"cobbled_deepslate_slab", "polished_deepslate_slab", "deepslate_brick_slab", "deepslate_tile_slab"}) {
+            var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:" + name));
+            if (block.getClass() != SlabBlock.class) throw new AssertionError(name);
+            for (var type : SlabType.values()) for (var wet : new boolean[]{false, true})
+                for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var state = block.defaultBlockState().setValue(SlabBlock.TYPE, type).setValue(SlabBlock.WATERLOGGED, wet);
+                    var transformed = state.mirror(mirror).rotate(rotation);
+                    out.printf("SLAB\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n", name, type.getSerializedName(), wet,
+                        mirror.name(), rotation.name(), state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+                        state.getFluidState().isSource(), transformed.getValue(SlabBlock.TYPE).getSerializedName(), transformed.getValue(SlabBlock.WATERLOGGED));
+                }
         }
     }
 }

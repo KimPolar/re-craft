@@ -21,6 +21,19 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     }
     if matches!(
         state.name.as_str(),
+        "minecraft:cobbled_deepslate_slab"
+            | "minecraft:polished_deepslate_slab"
+            | "minecraft:deepslate_brick_slab"
+            | "minecraft:deepslate_tile_slab"
+    ) {
+        return match state.properties.get("type").map(String::as_str) {
+            Some("double") => Ok(true),
+            Some("top" | "bottom") => Ok(false),
+            _ => bail!("invalid jigsaw slab type"),
+        };
+    }
+    if matches!(
+        state.name.as_str(),
         "minecraft:stone"
             | "minecraft:deepslate"
             | "minecraft:cobbled_deepslate"
@@ -34,6 +47,22 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
             | "minecraft:basalt"
             | "minecraft:polished_basalt"
             | "minecraft:smooth_basalt"
+            | "minecraft:white_wool"
+            | "minecraft:orange_wool"
+            | "minecraft:magenta_wool"
+            | "minecraft:light_blue_wool"
+            | "minecraft:yellow_wool"
+            | "minecraft:lime_wool"
+            | "minecraft:pink_wool"
+            | "minecraft:gray_wool"
+            | "minecraft:light_gray_wool"
+            | "minecraft:cyan_wool"
+            | "minecraft:purple_wool"
+            | "minecraft:blue_wool"
+            | "minecraft:brown_wool"
+            | "minecraft:green_wool"
+            | "minecraft:red_wool"
+            | "minecraft:black_wool"
     ) {
         return Ok(true);
     }
@@ -150,7 +179,9 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
     }
     fn is_liquid_container(&mut self, state: &BlockState) -> Result<bool> {
         Ok(state.name.starts_with("minecraft:")
-            && (state.name.ends_with("_stairs") || state.name == "minecraft:chest")
+            && (state.name.ends_with("_stairs")
+                || state.name.ends_with("_slab")
+                || state.name == "minecraft:chest")
             && self
                 .registry
                 .is_canonical_state(&state.name, &state.properties))
@@ -162,6 +193,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         fluid: Option<FluidState>,
     ) -> Result<()> {
         if state.properties.get("waterlogged").map(String::as_str) == Some("false")
+            && !(state.name.ends_with("_slab")
+                && state.properties.get("type").map(String::as_str) == Some("double"))
             && fluid.is_some_and(|fluid| fluid.kind == FluidKind::Water && fluid.source)
         {
             let mut wet = state.clone();
@@ -523,13 +556,13 @@ mod tests {
         let mut stones_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("STONE\t")) {
             let fields: Vec<_> = line.split('\t').collect();
-            let [_, name, full, block_entity] = fields.as_slice() else {
+            let [_, name, full, block_entity, state_count] = fields.as_slice() else {
                 bail!("invalid Java stone result")
             };
             let id = format!("minecraft:{name}");
             let properties = registry
                 .default_properties(&id)
-                .context("missing stone state")?;
+                .with_context(|| format!("missing stone state {id}"))?;
             let state = BlockState {
                 name: id.clone(),
                 properties,
@@ -542,9 +575,12 @@ mod tests {
             );
             assert_eq!(*full, "true", "{id}");
             assert_eq!(*block_entity, "false", "{id}");
+            if name.ends_with("_wool") {
+                assert_eq!(*state_count, "1", "{id}");
+            }
             stones_checked += 1;
         }
-        assert_eq!(stones_checked, 13);
+        assert_eq!(stones_checked, 29);
         let mut axes_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("AXIS\t")) {
             let fields: Vec<_> = line.split('\t').collect();
@@ -575,6 +611,60 @@ mod tests {
             axes_checked += 1;
         }
         assert_eq!(axes_checked, 36);
+        let mut slabs_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("SLAB\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                kind,
+                wet,
+                mirror,
+                rotation,
+                full,
+                source,
+                expected_kind,
+                expected_wet,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java slab result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let name = format!("minecraft:{name}");
+            let properties = BTreeMap::from([
+                ("type".into(), (*kind).to_owned()),
+                ("waterlogged".into(), (*wet).to_owned()),
+            ]);
+            let state = BlockState {
+                name: name.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&name, &properties));
+            assert_eq!(jigsaw_static_full(&state)?, *full == "true");
+            assert_eq!(
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some_and(|fluid| fluid.source),
+                *source == "true"
+            );
+            let actual = registry.transform_template_state(&name, &properties, mirror, rotation)?;
+            assert_eq!(actual["type"], *expected_kind);
+            assert_eq!(actual["waterlogged"], *expected_wet);
+            slabs_checked += 1;
+        }
+        assert_eq!(slabs_checked, 288);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
@@ -598,6 +688,62 @@ mod tests {
         assert_eq!(random.next_long(), expected.next_long());
         drop(region);
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_slabs_accept_water_only_when_not_double() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for kind in ["bottom", "top", "double"] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let state = BlockState {
+                name: "minecraft:deepslate_tile_slab".into(),
+                properties: BTreeMap::from([
+                    ("type".into(), kind.into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            };
+            let pos = [1, 8, 1];
+            {
+                let mut draft = JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                };
+                assert!(draft.place_template_block(
+                    pos,
+                    &state,
+                    None,
+                    &mut DecorationRandom::new(42)
+                )?);
+                assert!(draft.is_liquid_container(&state)?);
+                draft.place_liquid(
+                    pos,
+                    &state,
+                    Some(FluidState {
+                        kind: FluidKind::Water,
+                        source: true,
+                        falling: false,
+                        amount: 8,
+                    }),
+                )?;
+            }
+            region.finish()?;
+            let world = terrain.snapshot();
+            let placed = world.block(pos[0], pos[1], pos[2]).unwrap();
+            assert_eq!(placed.properties["type"], kind);
+            assert_eq!(
+                placed.properties["waterlogged"],
+                if kind == "double" { "false" } else { "true" }
+            );
+        }
         Ok(())
     }
     #[test]

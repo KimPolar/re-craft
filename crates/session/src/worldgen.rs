@@ -7840,6 +7840,9 @@ mod tests {
             (false, true, "minecraft:chest"),
             (false, false, "minecraft:deepslate"),
             (false, true, "minecraft:deepslate"),
+            (false, false, "minecraft:gray_wool"),
+            (false, false, "minecraft:deepslate_tile_slab"),
+            (false, true, "minecraft:deepslate_tile_slab"),
         ] {
             let chest = block_name == "minecraft:chest";
             let mut block = vec![

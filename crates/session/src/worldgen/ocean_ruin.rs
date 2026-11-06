@@ -13,10 +13,12 @@ use serde_json::Value;
 
 mod drowned_context;
 mod placement;
+mod saved_piece;
 pub use drowned_context::{
     DrownedGenerationContext, DrownedSpawnEffects, GenerationDifficultyInputs,
 };
 pub use placement::OceanRuinPlacementWorld;
+pub use saved_piece::SavedOceanRuinPiece;
 
 #[derive(Clone)]
 pub struct PreparedPiece {
@@ -33,10 +35,19 @@ pub struct PreparedStart {
     pub chunk: [i32; 2],
     pub generation_point: [i32; 3],
     pub terrain_adjustment: native_core::beardifier::TerrainAdjustment,
+    pub temperature: Temperature,
     pub pieces: Vec<PreparedPiece>,
 }
 
 impl PreparedStart {
+    /// Build the ordered piece records needed by a future structure save.
+    pub fn saved_piece_tags(&self) -> Result<Vec<Tag>> {
+        self.pieces
+            .iter()
+            .map(|piece| SavedOceanRuinPiece::capture(piece, self.temperature)?.to_tag())
+            .collect()
+    }
+
     /// Attempt one start after the structure-set candidate and existing-start
     /// checks. Rejected biomes do not load structure templates.
     pub fn generate(
@@ -49,7 +60,7 @@ impl PreparedStart {
         use native_resources::structure_start::{
             Heightmap, center_generation_point, decode_terrain_adjustment,
         };
-        Settings::decode(definition)?;
+        let settings = Settings::decode(definition)?;
         let terrain_adjustment = decode_terrain_adjustment(definition)?;
         let Some(generation_point) =
             center_generation_point(environment, chunk, Heightmap::OceanFloor)?
@@ -62,6 +73,7 @@ impl PreparedStart {
             chunk,
             generation_point,
             terrain_adjustment,
+            temperature: settings.temperature,
             pieces,
         }))
     }

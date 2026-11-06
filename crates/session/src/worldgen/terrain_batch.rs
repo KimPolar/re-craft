@@ -2489,6 +2489,36 @@ impl FreshTerrainBatch {
         Ok(stage)
     }
 
+    /// Prepare converted chunks in the supplied registration order while
+    /// initially postprocessing only the selected targets. The result remains
+    /// an isolated intermediate; deferred neighbors cannot yet be saved.
+    pub fn begin_generated_postprocessing_with_neighbors(
+        &self,
+        targets: impl IntoIterator<Item = ChunkPos>,
+        converted: impl IntoIterator<Item = ChunkPos>,
+        game_time: i64,
+        next_sub_tick: i64,
+    ) -> Result<super::GeneratedPostprocessing> {
+        let mut selected = BTreeSet::new();
+        for pos in targets {
+            ensure!(selected.insert(pos), "duplicate postprocessing target");
+        }
+        ensure!(!selected.is_empty(), "no postprocessing targets");
+        let converted: Vec<_> = converted.into_iter().collect();
+        let available: BTreeSet<_> = converted.iter().copied().collect();
+        ensure!(
+            available.len() == converted.len(),
+            "duplicate converted chunk"
+        );
+        ensure!(
+            selected.is_subset(&available),
+            "postprocessing target is not converted"
+        );
+        let mut stage = self.begin_generated_postprocessing(converted, game_time, next_sub_tick)?;
+        stage.select_initial_targets(selected)?;
+        Ok(stage)
+    }
+
     /// Append a spawn-complete chunk to an isolated pass at a boundary after
     /// its previous chunks have finished. The batch and its source snapshot
     /// must still be the same revision; this does not yet extend a batch that
@@ -2552,7 +2582,15 @@ impl FreshTerrainBatch {
                 "minecraft:brown_mushroom" | "minecraft:red_mushroom"
             )
         }) {
-            Some(self.light_snapshot(completed.chunks.iter().copied())?)
+            Some(
+                self.light_snapshot(
+                    completed
+                        .chunks
+                        .iter()
+                        .copied()
+                        .chain(completed.deferred_tasks.keys().copied()),
+                )?,
+            )
         } else {
             None
         };
@@ -2687,6 +2725,10 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
     ) -> Result<PostprocessingExpansionCheckpoint> {
         self.validate_postprocessing(processed)?;
+        ensure!(
+            processed.deferred_tasks.is_empty(),
+            "postprocessing expansion with deferred chunks is unsupported"
+        );
         ensure!(
             processed.light_checkpoint.is_none(),
             "postprocessing with a drained light checkpoint cannot yet be rebased"
@@ -3033,6 +3075,10 @@ impl FreshTerrainBatch {
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
         use native_world::loaded::{SavedBlockTick, SavedFluidTick};
 
+        ensure!(
+            processed.deferred_tasks.is_empty(),
+            "postprocessed drafts with deferred chunks are unsupported"
+        );
         let sections = self.postprocessed_sections_data(processed, positions)?;
         let registry = &self
             .decoration

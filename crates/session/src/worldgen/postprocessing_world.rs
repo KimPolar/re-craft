@@ -131,6 +131,7 @@ pub struct GeneratedPostprocessing {
     min_y: i32,
     max_y: i32,
     pub(super) region: ConvertedPostprocessingRegion,
+    required: BTreeSet<ChunkPos>,
     completed: BTreeSet<ChunkPos>,
     active: Option<ChunkPos>,
     pub(super) failed: bool,
@@ -190,6 +191,7 @@ pub struct PostprocessedGeneratedRegion {
     pub world: Arc<World>,
     pub(super) ticks: RegionTicks,
     pub chunks: BTreeSet<ChunkPos>,
+    pub(super) deferred_tasks: BTreeMap<ChunkPos, super::postprocessing::PostprocessingTask>,
     /// Ordered block changes performed during postprocessing.
     pub edits: Vec<BlockPosition>,
     pub(super) read_chunks: BTreeSet<ChunkPos>,
@@ -238,6 +240,10 @@ impl PostprocessedGeneratedRegion {
     }
     /// Block entities after this chunk's post-generation promotions and writes.
     pub fn block_entity_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
+        ensure!(
+            self.chunks.contains(&pos),
+            "chunk block entities were not postprocessed"
+        );
         self.block_entities
             .get(&pos)
             .context("converted block entities are missing")?
@@ -246,6 +252,11 @@ impl PostprocessedGeneratedRegion {
     /// Read the completed tick containers without changing their snapshot.
     pub fn ticks(&self) -> &RegionTicks {
         &self.ticks
+    }
+
+    /// Converted chunks retained for a later postprocessing pass.
+    pub fn deferred_chunks(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.deferred_tasks.keys().copied()
     }
 
     /// Read the heightmaps produced by the same postprocessing pass.
@@ -345,6 +356,7 @@ impl GeneratedPostprocessing {
             .copied()
             .map(|pos| (pos, ConvertedBlockEntities::default()))
             .collect();
+        let required = region.tasks.keys().copied().collect();
         Self {
             source: Arc::clone(&world),
             world,
@@ -352,6 +364,7 @@ impl GeneratedPostprocessing {
             min_y,
             max_y,
             region,
+            required,
             completed: BTreeSet::new(),
             active: None,
             failed: false,
@@ -408,7 +421,7 @@ impl GeneratedPostprocessing {
             native_core::postprocessing::PostProcessing::new(completed.min_y, height)
                 .context("unsupported postprocessing height")?,
         );
-        let tasks = completed
+        let mut tasks: BTreeMap<_, _> = completed
             .chunks
             .iter()
             .copied()
@@ -419,6 +432,12 @@ impl GeneratedPostprocessing {
                 )
             })
             .collect();
+        for (&pos, task) in &completed.deferred_tasks {
+            ensure!(
+                tasks.insert(pos, task.clone()).is_none(),
+                "deferred chunk was already processed"
+            );
+        }
         let region = ConvertedPostprocessingRegion {
             tasks,
             ticks: completed.ticks.clone(),
@@ -436,6 +455,7 @@ impl GeneratedPostprocessing {
         stage.source = Arc::clone(&completed.source);
         stage.batch_revision = completed.batch_revision;
         stage.completed = completed.chunks.clone();
+        stage.required = completed.chunks.clone();
         stage.light_checkpoint = completed.light_checkpoint.clone();
         stage.water_source_conversion = completed.water_source_conversion;
         stage.edits = completed.edits.clone();
@@ -450,9 +470,7 @@ impl GeneratedPostprocessing {
 
     pub(super) fn check_registration(&self, pos: ChunkPos) -> Result<()> {
         ensure!(
-            !self.failed
-                && self.active.is_none()
-                && self.completed.len() == self.region.tasks.len(),
+            !self.failed && self.active.is_none() && self.completed == self.required,
             "finish existing postprocessing before registering a chunk"
         );
         ensure!(
@@ -476,6 +494,7 @@ impl GeneratedPostprocessing {
         self.check_registration(pos)?;
         self.region.ticks.register_chunk(pos, converted.ticks)?;
         self.region.tasks.insert(pos, converted.task);
+        self.required.insert(pos);
         self.block_entities.insert(pos, entities);
         self.heightmaps.insert(pos, heightmaps);
         if let Some(light) = light {
@@ -572,6 +591,39 @@ impl GeneratedPostprocessing {
         Ok(())
     }
 
+    pub(super) fn select_initial_targets(&mut self, targets: BTreeSet<ChunkPos>) -> Result<()> {
+        ensure!(
+            !self.failed && self.active.is_none() && self.completed.is_empty(),
+            "postprocessing already started"
+        );
+        ensure!(!targets.is_empty(), "no postprocessing targets");
+        ensure!(
+            targets
+                .iter()
+                .all(|pos| self.region.tasks.contains_key(pos)),
+            "postprocessing target is not converted"
+        );
+        self.required = targets;
+        Ok(())
+    }
+
+    /// Request postprocessing of an already converted neighbor between passes.
+    pub fn request_converted_chunk(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            !self.failed && self.active.is_none(),
+            "cannot request a chunk during postprocessing"
+        );
+        ensure!(
+            self.region.tasks.contains_key(&pos),
+            "postprocessing chunk is not converted"
+        );
+        ensure!(
+            self.required.insert(pos),
+            "postprocessing chunk was already requested"
+        );
+        Ok(())
+    }
+
     /// Run a bounded number of callbacks without interleaving another chunk.
     /// Java runs each chunk's pass synchronously against its live neighbors.
     pub fn poll(&mut self, pos: ChunkPos, budget: usize) -> Result<bool> {
@@ -579,6 +631,10 @@ impl GeneratedPostprocessing {
         ensure!(
             !self.completed.contains(&pos),
             "chunk was already processed"
+        );
+        ensure!(
+            self.required.contains(&pos),
+            "converted chunk was not requested for postprocessing"
         );
         ensure!(
             self.active.is_none_or(|active| active == pos),
@@ -693,7 +749,7 @@ impl GeneratedPostprocessing {
     pub fn finish(self) -> Result<PostprocessedGeneratedRegion> {
         ensure!(!self.failed, "generated postprocessing attempt failed");
         ensure!(
-            self.completed.len() == self.region.tasks.len(),
+            self.completed == self.required,
             "generated postprocessing is incomplete"
         );
         let read_chunks = self.read_chunks.into_inner();
@@ -703,6 +759,12 @@ impl GeneratedPostprocessing {
             world: self.world,
             ticks: self.region.ticks,
             sealed_chunks: self.completed.clone(),
+            deferred_tasks: self
+                .region
+                .tasks
+                .into_iter()
+                .filter(|(pos, _)| !self.completed.contains(pos))
+                .collect(),
             chunks: self.completed,
             sealed_edits: self.edits.clone(),
             edits: self.edits,
@@ -4041,6 +4103,7 @@ mod tests {
         let east_entities = stage.block_entities.remove(&east).unwrap();
         let east_maps = stage.heightmaps.remove(&east).unwrap();
         stage.region.tasks = BTreeMap::from([(center, center_task)]);
+        stage.required = BTreeSet::from([center]);
         stage.region.ticks =
             RegionTicks::new(BTreeMap::from([(center, center_ticks)]), 0, 0).unwrap();
         stage.block_entities.retain(|pos, _| *pos == center);
@@ -5118,6 +5181,7 @@ mod tests {
         marks.mark(8, 8, 8);
         marks.mark(8, 8, 8);
         stage.region.tasks = BTreeMap::from([(pos, PostprocessingTask::new(Arc::new(marks), pos))]);
+        stage.required = BTreeSet::from([pos]);
         stage.region.ticks = RegionTicks::new(
             BTreeMap::from([(
                 pos,
@@ -5215,6 +5279,7 @@ mod tests {
         marks.mark(8, 8, 8);
         stage.region.tasks =
             BTreeMap::from([(chunk, PostprocessingTask::new(Arc::new(marks), chunk))]);
+        stage.required = BTreeSet::from([chunk]);
         stage.set_bubble_tags(Some(Arc::new(
             native_resources::fluid_tags::BubbleColumnTags::with_fluids(
                 BTreeSet::new(),
@@ -5375,9 +5440,9 @@ mod tests {
         .as_mut()
         .unwrap()
         .fill(stone);
-        let origin_x = if case == "edge" { 15 } else { 8 };
+        let origin_x = if case.starts_with("edge") { 15 } else { 8 };
         let east_chunk = ChunkPos { x: 1, z: 0 };
-        if case == "edge" {
+        if case.starts_with("edge") {
             let mut east = world.chunks[&chunk].as_ref().clone();
             east.position = east_chunk;
             world.chunks.insert(east_chunk, Arc::new(east));
@@ -5412,8 +5477,20 @@ mod tests {
                 }
                 world.set_block_id(9, 8, 8, air).unwrap();
             }
-            "edge" => {
+            "edge" | "edge_deferred" => {
                 world.set_block_id(16, 8, 8, air).unwrap();
+                if case == "edge_deferred" {
+                    world.set_block_id(18, 8, 8, sand).unwrap();
+                    let chest = world.intern_state(BlockState {
+                        name: "minecraft:chest".into(),
+                        properties: BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("type".into(), "single".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                    });
+                    world.set_block_id(20, 8, 8, chest).unwrap();
+                }
             }
             "convert_on" | "convert_off" | "convert_bubble" => {
                 world.set_block_id(9, 8, 8, air).unwrap();
@@ -5718,8 +5795,11 @@ mod tests {
                 fluids: ChunkTicks::from_saved(chunk, vec![]).unwrap(),
             },
         )]);
-        if case == "edge" {
-            let empty = PostProcessing::new(0, 16).unwrap();
+        if case.starts_with("edge") {
+            let mut empty = PostProcessing::new(0, 16).unwrap();
+            if case == "edge_deferred" {
+                empty.mark(18, 8, 8);
+            }
             stage.region.tasks.insert(
                 east_chunk,
                 PostprocessingTask::new(Arc::new(empty), east_chunk),
@@ -5727,6 +5807,27 @@ mod tests {
             stage
                 .block_entities
                 .insert(east_chunk, ConvertedBlockEntities::default());
+            if case == "edge_deferred" {
+                use native_persistence::nbt::{Tag, TagType};
+                let mut pending = PendingPositions::default();
+                pending.insert([20, 8, 8]);
+                let dummy = Tag::Compound(vec![
+                    ("id".into(), Tag::String("DUMMY".into())),
+                    ("x".into(), Tag::Int(20)),
+                    ("y".into(), Tag::Int(8)),
+                    ("z".into(), Tag::Int(8)),
+                ]);
+                let entities = ConvertedBlockEntities::from_proto(
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![dummy],
+                    },
+                    None,
+                    Some(&pending),
+                )
+                .unwrap();
+                stage.block_entities.insert(east_chunk, entities);
+            }
             chunks.insert(
                 east_chunk,
                 ConvertedChunkTicks {
@@ -5742,6 +5843,7 @@ mod tests {
             "stone",
             "sand",
             "dirt",
+            "chest",
             "stone_slab",
             "oak_slab",
             "oak_stairs",
@@ -5780,7 +5882,7 @@ mod tests {
                 .unwrap(),
         )));
         stage.heightmaps.insert(chunk, fixture_maps(16));
-        if case == "edge" {
+        if case.starts_with("edge") {
             stage.heightmaps.insert(east_chunk, fixture_maps(16));
         }
         stage.set_bubble_tags(Some(Arc::new(
@@ -5825,11 +5927,72 @@ mod tests {
                 ))
                 .unwrap();
         }
+        stage.required = stage.region.tasks.keys().copied().collect();
+        if case == "edge_deferred" {
+            assert!(stage.select_initial_targets(BTreeSet::new()).is_err());
+            assert!(
+                stage
+                    .select_initial_targets(BTreeSet::from([chunk, ChunkPos { x: 9, z: 9 }]))
+                    .is_err()
+            );
+            stage
+                .select_initial_targets(BTreeSet::from([chunk]))
+                .unwrap();
+            assert!(stage.poll(east_chunk, 1).is_err());
+            assert!(stage.request_converted_chunk(chunk).is_err());
+            assert!(stage.clone().finish().is_err());
+        }
+        let heightmap_tags = stage.heightmap_tags.clone().unwrap();
         while !stage.poll(chunk, 1).unwrap() {}
         if case == "edge" {
             while !stage.poll(east_chunk, 1).unwrap() {}
         }
         let result = stage.finish().unwrap();
+        if case == "edge_deferred" {
+            assert_eq!(
+                result.deferred_chunks().collect::<Vec<_>>(),
+                vec![east_chunk]
+            );
+            assert!(result.block_entity_data(east_chunk).is_err());
+            let prior_ticks = result.ticks.activated_snapshot();
+            let mut resumed =
+                GeneratedPostprocessing::from_completed(&result, None, None, heightmap_tags)
+                    .unwrap();
+            assert!(resumed.poll(east_chunk, 1).is_err());
+            assert!(
+                resumed
+                    .request_converted_chunk(ChunkPos { x: 9, z: 9 })
+                    .is_err()
+            );
+            resumed.request_converted_chunk(east_chunk).unwrap();
+            while !resumed.poll(east_chunk, 1).unwrap() {}
+            let after = resumed.finish().unwrap();
+            assert_eq!(after.deferred_chunks().count(), 0);
+            assert_eq!(result.ticks.activated_snapshot(), prior_ticks);
+            let native_persistence::nbt::Tag::List { values, .. } =
+                after.block_entity_data(east_chunk).unwrap()
+            else {
+                panic!("missing resumed block entities")
+            };
+            assert_eq!(values.len(), 1);
+            assert_eq!(
+                values[0].get("id"),
+                Some(&native_persistence::nbt::Tag::String(
+                    "minecraft:chest".into()
+                ))
+            );
+            assert_eq!(after.world.block(16, 8, 8), result.world.block(16, 8, 8));
+            assert!(
+                after
+                    .ticks
+                    .chunk(east_chunk)
+                    .unwrap()
+                    .blocks
+                    .pack(100)
+                    .iter()
+                    .any(|tick| tick.kind == "minecraft:sand" && tick.position == [18, 8, 8])
+            );
+        }
         assert_eq!(
             result.water_source_conversion(),
             match case {
@@ -5909,7 +6072,7 @@ mod tests {
             );
         }
         for kind in [TickRegistry::Block, TickRegistry::Fluid] {
-            for tick_chunk in if case == "edge" {
+            for tick_chunk in if case.starts_with("edge") {
                 vec![chunk, east_chunk]
             } else {
                 vec![chunk]
@@ -5929,6 +6092,37 @@ mod tests {
         }
         trace.push(format!("counter {}", result.ticks.next_sub_tick()));
         trace
+    }
+
+    #[test]
+    fn deferred_converted_neighbor_preserves_water_and_resumes_its_marks() {
+        let trace = water_spread_trace("edge_deferred");
+        assert!(
+            trace
+                .iter()
+                .any(|line| line == "state 16,8,8 minecraft:water 1")
+        );
+        assert!(
+            trace
+                .iter()
+                .any(|line| line == "fluid minecraft:flowing_water 16,8,8 5")
+        );
+        assert!(
+            !trace
+                .iter()
+                .any(|line| line.starts_with("block minecraft:sand 18,8,8"))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn deferred_converted_neighbor_matches_java_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["edge_deferred"],
+        );
+        assert_eq!(actual, water_spread_trace("edge_deferred"));
     }
 
     #[test]
@@ -6350,6 +6544,7 @@ mod tests {
             "sides",
             "mixed",
             "edge",
+            "edge_deferred",
             "convert_off",
             "convert_on",
             "convert_bubble",

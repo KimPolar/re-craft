@@ -106,7 +106,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         leafTypes.put("mangrove_leaves",Blocks.MANGROVE_LEAVES); leafTypes.put("cherry_leaves",Blocks.CHERRY_LEAVES);
         leafTypes.put("pale_oak_leaves",Blocks.PALE_OAK_LEAVES); leafTypes.put("azalea_leaves",Blocks.AZALEA_LEAVES);
         leafTypes.put("flowering_azalea_leaves",Blocks.FLOWERING_AZALEA_LEAVES);
-        var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","stair_bottom","stair_top","stair_bottom_off","marked_stair_dry","marked_stair_wet","marked_stair_side","marked_stair_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
+        var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","edge_deferred","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","stair_bottom","stair_top","stair_bottom_off","marked_stair_dry","marked_stair_wet","marked_stair_side","marked_stair_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
         scenarios.addAll(List.of("marked_fence_wet","marked_fence_side","marked_fence_down","marked_fence_disconnect","marked_fence_disconnect_sand","marked_fence_disconnect_water","marked_fence_disconnect_neighbor"));
         scenarios.addAll(List.of("marked_lichen_wet","marked_lichen_side","marked_lichen_down","marked_lichen_sides","marked_lichen_mixed"));
         for(var name:leafTypes.keySet()) scenarios.add("marked_leaf_type_"+name);
@@ -119,9 +119,10 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                     for(var wet:List.of(false,true))
                         for(var side:List.of("front","back")) scenarios.add("marked_stair_corner_"+facing+"_"+neighbor+"_"+half+"_"+wet+"_"+side);
         if(args.length>0 && args[0].equals("lichen"))scenarios.removeIf(s -> !s.startsWith("marked_lichen_"));
+        if(args.length>0 && args[0].equals("edge_deferred"))scenarios.removeIf(s -> !s.equals("edge_deferred"));
         for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
-            pos=new BlockPos(scenario.equals("edge")?15:8,8,8);
+            pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off"),null);
             blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.equals("down")||scenario.equals("down_sand")||scenario.equals("down_wet_slab")||scenario.equals("mixed"))blocks.put(pos.below(),Blocks.AIR.defaultBlockState());
@@ -132,7 +133,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 for(var p:List.of(pos.north(),pos.south(),pos.west()))blocks.put(p,Blocks.WATER.defaultBlockState());
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
             }
-            if(scenario.equals("edge"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            if(scenario.startsWith("edge"))blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
+            if(scenario.equals("edge_deferred")){blocks.put(pos.east(3),Blocks.SAND.defaultBlockState());blocks.put(pos.east(5),Blocks.CHEST.defaultBlockState());}
             if(scenario.equals("convert_off")||scenario.equals("convert_on")||scenario.equals("convert_bubble")) {
                 blocks.put(pos.east(),Blocks.AIR.defaultBlockState());
                 blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());

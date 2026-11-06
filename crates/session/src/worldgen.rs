@@ -5314,8 +5314,23 @@ mod tests {
         assert_eq!(activated.sub_tick, -1);
         assert!(blocks.poll().is_none());
         let original = batch.snapshot().unwrap();
+        assert!(
+            batch
+                .begin_generated_postprocessing_with_neighbors([center, center], [center], 42, 10)
+                .is_err()
+        );
+        assert!(
+            batch
+                .begin_generated_postprocessing_with_neighbors([center], [center, center], 42, 10)
+                .is_err()
+        );
+        assert!(
+            batch
+                .begin_generated_postprocessing_with_neighbors([distant], [center], 42, 10)
+                .is_err()
+        );
         let mut generated = batch
-            .begin_generated_postprocessing([center], 42, 10)
+            .begin_generated_postprocessing_with_neighbors([center], [center], 42, 10)
             .unwrap();
         while !generated.poll(center, 4).unwrap() {}
         let mut processed = generated.finish().unwrap();

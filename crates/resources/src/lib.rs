@@ -29,6 +29,7 @@ pub mod density;
 pub mod dimension_lighting;
 pub mod disk_feature;
 pub mod drowned_spawn;
+pub mod enchantment_provider;
 pub mod enchantment_selection;
 pub mod enchantments;
 pub mod entity_category;

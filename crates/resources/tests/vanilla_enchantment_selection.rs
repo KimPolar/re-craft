@@ -67,12 +67,24 @@ fn enchantment_selection_matches_java() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     let output = String::from_utf8(output.stdout)?;
+    let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+    let items = resources.vanilla_item_registry()?;
+    let known_items: BTreeSet<_> = items
+        .iter()
+        .map(|(id, _)| ResourceId::parse(id))
+        .collect::<Result<_>>()?;
     let mut candidates = BTreeMap::<String, Vec<Candidate>>::new();
+    let mut providers =
+        BTreeMap::<String, native_resources::enchantment_provider::DifficultyProvider>::new();
     let mut tested = 0;
     let mut multi = 0;
     let mut cost_tested = 0;
+    let mut provider_tested = 0;
     for line in output.lines().filter(|line| {
-        line.starts_with("C\t") || line.starts_with("R\t") || line.starts_with("D\t")
+        line.starts_with("C\t")
+            || line.starts_with("R\t")
+            || line.starts_with("D\t")
+            || line.starts_with("P\t")
     }) {
         let parts: Vec<_> = line.split('\t').collect();
         if parts[0] == "D" {
@@ -126,12 +138,57 @@ fn enchantment_selection_matches_java() -> Result<()> {
             } else {
                 RegionRandom::Xoroshiro(XoroshiroRandom::new(seed))
             };
-            let actual = enchantment_selection::select(
-                &mut random,
-                parts[4].parse()?,
-                Some(parts[5].parse()?),
-                candidates.get(parts[1]).context("candidate set missing")?,
-            )?;
+            let java_candidates = candidates.get(parts[1]).context("candidate set missing")?;
+            if parts[1].starts_with("minecraft:") && !providers.contains_key(parts[1]) {
+                let prepared = native_resources::enchantment_provider::DifficultyProvider::load(
+                    &mut resources,
+                    &ResourceId::parse("minecraft:mob_spawn_equipment")?,
+                    &known_items,
+                    &ResourceId::parse(parts[1])?,
+                    Some(parts[5].parse()?),
+                )?;
+                let native = prepared.candidates();
+                assert_eq!(
+                    native.len(),
+                    java_candidates.len(),
+                    "candidate count: {}",
+                    parts[1]
+                );
+                for (actual, expected) in native.iter().zip(java_candidates) {
+                    assert_eq!(
+                        (&actual.id, actual.weight, &actual.levels),
+                        (&expected.id, expected.weight, &expected.levels),
+                        "candidate definition: {}",
+                        parts[1]
+                    );
+                    for other in native {
+                        if actual.id == other.id {
+                            continue;
+                        }
+                        let incompatible = actual.exclusive.contains(&other.id)
+                            || other.exclusive.contains(&actual.id);
+                        assert_eq!(
+                            incompatible,
+                            expected.exclusive.contains(&other.id),
+                            "candidate compatibility: {}",
+                            parts[1]
+                        );
+                    }
+                }
+                providers.insert(parts[1].into(), prepared);
+            }
+            let actual = if parts[0] == "P" {
+                provider_tested += 1;
+                providers[parts[1]].enchant(&mut random, f32::from_bits(parts[4].parse()?))?
+            } else {
+                tested += 1;
+                enchantment_selection::select(
+                    &mut random,
+                    parts[4].parse()?,
+                    Some(parts[5].parse()?),
+                    java_candidates,
+                )?
+            };
             let rendered = actual
                 .iter()
                 .map(|entry| format!("{}:{}={}", entry.id.namespace, entry.id.path, entry.level))
@@ -146,12 +203,12 @@ fn enchantment_selection_matches_java() -> Result<()> {
                 parts[2],
                 seed
             );
-            tested += 1;
             multi += usize::from(actual.len() > 1);
         }
     }
-    assert_eq!(tested, 4096);
+    assert_eq!(tested, 5120);
     assert_eq!(cost_tested, 1024);
+    assert_eq!(provider_tested, 2048);
     assert!(
         multi > 0,
         "expected at least one multiple-enchantment result"

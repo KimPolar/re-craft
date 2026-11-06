@@ -27,7 +27,7 @@ public class EnchantmentSelectionOracle {
         String name = id.toString();
         if (!visiting.add(name)) throw new IllegalStateException("cyclic oracle tag: " + name);
         String path = "data/" + id.getNamespace() + "/tags/" + kind + "/" + id.getPath() + ".json";
-        var result = new HashSet<String>();
+        var result = new LinkedHashSet<String>();
         try (var stream = EnchantmentSelectionOracle.class.getClassLoader().getResourceAsStream(path)) {
             if (stream == null) throw new IllegalStateException("missing tag " + path);
             var values = JsonParser.parseReader(new InputStreamReader(stream, java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject().getAsJsonArray("values");
@@ -70,6 +70,9 @@ public class EnchantmentSelectionOracle {
             for (var tag : itemTags) if (tagEntries("item", tag.location(), new HashSet<>()).contains(itemId)) membership.add(tag);
             bindTags.invoke(item.builtInRegistryHolder(), membership);
         }
+        var holdersById = new HashMap<String, Holder<Enchantment>>();
+        for (var holder : holders) holdersById.put(id(holder), holder);
+        var mobOrder = tagEntries("enchantment", net.minecraft.tags.EnchantmentTags.ON_MOB_SPAWN_EQUIPMENT.location(), new HashSet<>());
         for (int algorithm = 0; algorithm < 2; algorithm++) for (int i = 0; i < 512; i++) {
             long seed = i * 3456789L - 177L;
             float special = new float[]{0f, 0.1f, 0.25f, 0.5f, 0.75f, 1f}[i % 6];
@@ -77,15 +80,19 @@ public class EnchantmentSelectionOracle {
             int cost = net.minecraft.util.Mth.randomBetweenInclusive(random, 5, 5 + (int)(special * 17));
             out.println("D\t" + algorithm + "\t" + seed + "\t" + Float.floatToIntBits(special) + "\t" + cost + "\t" + random.nextLong());
         }
-        for (int mode = 0; mode < 4; mode++) {
+        for (int mode = 0; mode < 5; mode++) {
             var stack = new ItemStack(mode == 0 ? Items.TRIDENT : mode == 1 ? Items.FISHING_ROD : Items.BOOK);
             if (mode >= 2) stack.set(DataComponents.ENCHANTABLE, new Enchantable(mode == 2 ? 1 : 20));
-            String itemId = mode == 0 ? "minecraft:trident" : mode == 1 ? "minecraft:fishing_rod" : "book_" + stack.get(DataComponents.ENCHANTABLE).value();
+            String itemId = mode == 0 ? "minecraft:trident" : mode == 1 ? "minecraft:fishing_rod" : "book_" + stack.get(DataComponents.ENCHANTABLE).value() + (mode == 4 ? "_duplicates" : "");
             int enchantability = stack.get(DataComponents.ENCHANTABLE).value();
             final boolean weapon = mode < 2;
-            List<Holder<Enchantment>> candidates = holders.stream()
-                .filter(holder -> !weapon || (holder.is(net.minecraft.tags.EnchantmentTags.ON_MOB_SPAWN_EQUIPMENT) && holder.value().isPrimaryItem(stack)))
-                .map(holder -> (Holder<Enchantment>) holder).toList();
+            List<Holder<Enchantment>> candidates = weapon
+                ? mobOrder.stream().map(holdersById::get).filter(holder -> holder.value().isPrimaryItem(stack)).toList()
+                : holders.stream().map(holder -> (Holder<Enchantment>) holder).toList();
+            if (mode == 4) {
+                candidates = new ArrayList<>(candidates);
+                candidates.add(2, candidates.get(0));
+            }
             for (var holder : candidates) {
                 var enchantment = holder.value();
                 var costs = new ArrayList<String>();
@@ -103,6 +110,15 @@ public class EnchantmentSelectionOracle {
                 var result = EnchantmentHelper.selectEnchantment(random, stack, cost, candidates.stream());
                 String selected = result.stream().map(value -> id(value.enchantment()) + "=" + value.level()).collect(Collectors.joining(","));
                 out.println("R\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + cost + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong());
+            }
+            if (weapon) for (int algorithm = 0; algorithm < 2; algorithm++) for (int i = 0; i < 512; i++) {
+                long seed = i * 7654321L - 321L;
+                float special = new float[]{0f, 0.1f, 0.25f, 0.5f, 0.75f, 1f}[i % 6];
+                RandomSource random = algorithm == 0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
+                int cost = net.minecraft.util.Mth.randomBetweenInclusive(random, 5, 5 + (int)(special * 17));
+                var result = EnchantmentHelper.selectEnchantment(random, stack, cost, candidates.stream());
+                String selected = result.stream().map(value -> id(value.enchantment()) + "=" + value.level()).collect(Collectors.joining(","));
+                out.println("P\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + Float.floatToIntBits(special) + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong());
             }
         }
     }

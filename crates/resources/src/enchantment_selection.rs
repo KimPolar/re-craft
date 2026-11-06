@@ -3,7 +3,7 @@
 //! Callers must supply the active provider's holder order, item eligibility,
 //! per-level costs and exclusive sets. This module does not load data packs
 //! or write item components.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 
@@ -17,7 +17,7 @@ pub struct LevelCost {
 }
 
 /// A primary-item-eligible holder, in the provider's exact holder order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub id: ResourceId,
     pub weight: i32,
@@ -75,13 +75,15 @@ pub fn select(
         (0..=1_000_000).contains(&cost),
         "unsupported enchantment cost"
     );
-    let mut ids = BTreeSet::new();
+    let mut ids = BTreeMap::new();
     let mut total = 0_i32;
     for candidate in candidates {
-        ensure!(
-            ids.insert(candidate.id.clone()),
-            "duplicate enchantment holder"
-        );
+        if let Some(previous) = ids.insert(candidate.id.clone(), candidate) {
+            ensure!(
+                previous == candidate,
+                "inconsistent duplicate enchantment holder"
+            );
+        }
         ensure!(
             candidate.weight > 0 && !candidate.levels.is_empty(),
             "invalid enchantment candidate"

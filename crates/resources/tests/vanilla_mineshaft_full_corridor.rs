@@ -3,8 +3,9 @@ use native_core::{beardifier::BoundingBox, random::DecorationRandom};
 use native_resources::{
     mineshaft::{
         CorridorBlock, MineshaftCorridorGenerationWorld, MineshaftCorridorWorld,
-        MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftPlacementWorld,
-        MineshaftSupportBlock, MineshaftSupportWorld, MineshaftVariant, place_corridor,
+        MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftMinecartWorld,
+        MineshaftPlacementWorld, MineshaftSupportBlock, MineshaftSupportWorld, MineshaftVariant,
+        place_corridor,
     },
     structure_piece::StructureFrame,
     structure_start::HorizontalDirection,
@@ -217,6 +218,15 @@ impl MineshaftSupportWorld for World {
         };
         self.write(p, label, state);
         Ok(())
+    }
+}
+impl MineshaftMinecartWorld for World {
+    type Minecart = ();
+    fn new_chest_minecart(&mut self, _: [f64; 3]) -> anyhow::Result<Option<()>> {
+        unreachable!("oracle overrides chest creation")
+    }
+    fn add_chest_minecart(&mut self, _: (), _: i64) -> anyhow::Result<()> {
+        unreachable!("oracle overrides chest creation")
     }
 }
 impl MineshaftCorridorGenerationWorld for World {

@@ -10,8 +10,9 @@ mod graph;
 mod placement;
 mod support;
 pub use corridor::{
-    CorridorBlock, MineshaftCorridorGenerationWorld, MineshaftCorridorWorld, place_corridor,
-    place_corridor_beam, place_corridor_cobweb,
+    CorridorBlock, MineshaftCorridorGenerationWorld, MineshaftCorridorWorld,
+    MineshaftMinecartWorld, place_corridor, place_corridor_beam, place_corridor_cobweb,
+    try_mineshaft_chest_minecart,
 };
 pub use graph::{
     MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,

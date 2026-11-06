@@ -20,14 +20,14 @@ pub enum CorridorBlock {
 
 /// Additional operations needed by the whole corridor pass. Entity callbacks
 /// must reproduce the Java creation path and its use of the passed RNG.
-pub trait MineshaftCorridorGenerationWorld: MineshaftCorridorWorld + MineshaftSupportWorld {
+pub trait MineshaftCorridorGenerationWorld: MineshaftMinecartWorld + MineshaftSupportWorld {
     fn upper_face_sturdy(&mut self, position: [i32; 3]) -> Result<bool>;
     fn set_floor_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<()>;
     fn is_variant_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<bool>;
     /// Read one floor block; check both non-air and solid-render on that state.
     fn solid_render_floor(&mut self, position: [i32; 3]) -> Result<bool>;
-    /// Implements the entire createChest path, including its own eligibility,
-    /// rail state, entity creation, loot seed and RNG consumption.
+    /// Can be overridden for instrumented worlds; normal implementations use
+    /// the shared Java-compatible eligibility and minecart creation path.
     fn create_chest_minecart(
         &mut self,
         frame: StructureFrame,
@@ -35,13 +35,24 @@ pub trait MineshaftCorridorGenerationWorld: MineshaftCorridorWorld + MineshaftSu
         clip: BoundingBox,
         variant: MineshaftVariant,
         random: &mut DecorationRandom,
-    ) -> Result<bool>;
+    ) -> Result<bool> {
+        try_mineshaft_chest_minecart(frame, local, clip, variant, self, random)
+    }
     /// Set the spawner and configure a cave spider if the block entity exists.
     fn set_spider_spawner(
         &mut self,
         position: [i32; 3],
         random: &mut DecorationRandom,
     ) -> Result<()>;
+}
+
+/// Construct an entity independently of the decoration RNG. Returning None
+/// models an unavailable or disabled entity type, which consumes no loot seed.
+pub trait MineshaftMinecartWorld: MineshaftCorridorWorld {
+    type Minecart;
+    fn new_chest_minecart(&mut self, position: [f64; 3]) -> Result<Option<Self::Minecart>>;
+    /// Set the abandoned-mineshaft loot table and seed, then add the entity.
+    fn add_chest_minecart(&mut self, entity: Self::Minecart, loot_seed: i64) -> Result<()>;
 }
 
 /// Structure-piece writes include the rotated block state, fluid scheduling,
@@ -63,13 +74,13 @@ fn inside(b: BoundingBox, p: [i32; 3]) -> bool {
     (0..3).all(|i| (b.min[i]..=b.max[i]).contains(&p[i]))
 }
 
-fn put(
+fn put<W: MineshaftCorridorWorld + ?Sized>(
     frame: StructureFrame,
     clip: BoundingBox,
     local: [i32; 3],
     mut block: CorridorBlock,
     variant: MineshaftVariant,
-    world: &mut impl MineshaftCorridorWorld,
+    world: &mut W,
 ) -> Result<()> {
     let p = frame.world_position(local);
     if !inside(clip, p) || world.protected_block(p, variant)? {
@@ -99,6 +110,46 @@ fn put(
         other => other,
     };
     world.set_corridor_block(p, block, variant)
+}
+
+/// Create a chest minecart after checking its local block and floor. A true
+/// result means the location qualified, even if the entity type was disabled.
+/// On error, discard the world draft and random stream.
+pub fn try_mineshaft_chest_minecart<W: MineshaftMinecartWorld + ?Sized>(
+    frame: StructureFrame,
+    local: [i32; 3],
+    clip: BoundingBox,
+    variant: MineshaftVariant,
+    world: &mut W,
+    random: &mut DecorationRandom,
+) -> Result<bool> {
+    validate(frame, clip)?;
+    let pos = frame.world_position(local);
+    if !inside(clip, pos)
+        || !world.is_air(pos)?
+        || world.is_air([pos[0], pos[1].wrapping_sub(1), pos[2]])?
+    {
+        return Ok(false);
+    }
+    let north_south = random.next_bool();
+    put(
+        frame,
+        clip,
+        local,
+        CorridorBlock::Rail { north_south },
+        variant,
+        world,
+    )?;
+    let center = [
+        f64::from(pos[0]) + 0.5,
+        f64::from(pos[1]) + 0.5,
+        f64::from(pos[2]) + 0.5,
+    ];
+    if let Some(entity) = world.new_chest_minecart(center)? {
+        let loot_seed = random.next_long();
+        world.add_chest_minecart(entity, loot_seed)?;
+    }
+    Ok(true)
 }
 
 fn validate(frame: StructureFrame, clip: BoundingBox) -> Result<()> {

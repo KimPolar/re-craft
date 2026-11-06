@@ -282,6 +282,7 @@ pub struct DecorationRegion<'a> {
     column_block_write: bool,
     patch_block_write: bool,
     multiface_block_write: bool,
+    lake_block_write: bool,
     failed: bool,
 }
 
@@ -2762,6 +2763,7 @@ impl CarvedTerrainWorld {
             column_block_write: false,
             patch_block_write: false,
             multiface_block_write: false,
+            lake_block_write: false,
             failed: false,
         })
     }
@@ -6401,7 +6403,10 @@ impl LakeWorld for DecorationRegion<'_> {
                 disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
                 "unsupported lake source effects"
             );
-            self.set_proto_block(pos, state)?;
+            self.lake_block_write = true;
+            let write = self.set_proto_block(pos, state);
+            self.lake_block_write = false;
+            write?;
             Ok(true)
         })();
         if result.is_err() {
@@ -6564,11 +6569,19 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // A source-water block emits no light; a lichen with a
                     // face emits light and always requires a block check.
                     let lichen_check = water_lichen_write;
+                    let lake_light_update = self.lake_block_write
+                        && old.name == "minecraft:stone"
+                        && old.properties.is_empty()
+                        && ((state.name == "minecraft:cave_air" && state.properties.is_empty())
+                            || (state.name == "minecraft:lava"
+                                && state.properties.len() == 1
+                                && state.properties.get("level").map(String::as_str) == Some("0")));
                     if guard.require_unchanged_light {
                         ensure!(
                             tree_light_update
                                 || vine_write
                                 || water_lichen_write
+                                || lake_light_update
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {} -> {}",
@@ -6586,6 +6599,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || fresh_waterlog_dripleaf
                             || vine_write
                             || water_lichen_write
+                            || lake_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
                         "registered light chunk has changed at {p:?}: {} -> {}",
@@ -6639,14 +6653,15 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || fresh_waterlog_dripleaf
                         || vine_check
                         || lichen_check
+                        || lake_light_update
                         || new_section
                     {
                         let guard = self.light_guard.as_mut().unwrap();
                         guard.light_replay_positions.insert(p);
-                        if vine_write || water_lichen_write {
+                        if vine_write || water_lichen_write || lake_light_update {
                             guard.vine_light_positions.insert(p);
                         }
-                        if tree_light_update || vine_check || lichen_check {
+                        if tree_light_update || vine_check || lichen_check || lake_light_update {
                             guard.light_check_order.push(p);
                         }
                     }
@@ -10714,6 +10729,10 @@ mod tests {
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
         for mode in [
+            "vine_active_lake_air",
+            "vine_active_lake_lava",
+            "vine_active_lake_mixed",
+            "vine_active_self_lake_mixed",
             "vine_active_lichen",
             "vine_active_self_lichen",
             "vine_active_plain",
@@ -10792,6 +10811,17 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if mode.contains("_lake_") {
+                let stone = world.intern_state(state("stone"));
+                let positions = if mode.ends_with("_mixed") {
+                    vec![[16, 10, 8], [16, 10, 9], [16, 9, 8]]
+                } else {
+                    vec![[16, 10, 8]]
+                };
+                for p in positions {
+                    world.set_block_id(p[0], p[1], p[2], stone).unwrap();
+                }
+            }
             let radius = if self_active { 2 } else { 1 };
             let registered: Vec<_> = (-radius..=radius)
                 .flat_map(|z| (-radius..=radius).map(move |x| ChunkPos { x, z }))
@@ -10830,7 +10860,9 @@ mod tests {
                 new_nonempty_sections: Vec::new(),
                 non_air_counts: BTreeMap::new(),
             });
-            let positions = if mode.ends_with("_plain_then_glowing") {
+            let positions = if mode.contains("_lake_") && mode.ends_with("_mixed") {
+                vec![[16, 10, 8], [16, 10, 9], [16, 9, 8]]
+            } else if mode.ends_with("_plain_then_glowing") {
                 vec![[16, 10, 8], [16, 10, 8]]
             } else if mode.ends_with("_many") {
                 vec![[16, 10, 8], [16, 9, 8], [16, 8, 8]]
@@ -10838,6 +10870,15 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_lake_") {
+                    let lava = mode.ends_with("_lava") || (mode.ends_with("_mixed") && i == 1);
+                    let mut block = state(if lava { "lava" } else { "cave_air" });
+                    if lava {
+                        block.properties.insert("level".into(), "0".into());
+                    }
+                    assert!(draft.set_lake_block(p, &block).unwrap());
+                    continue;
+                }
                 if mode.ends_with("_lichen") {
                     let mut lichen = state("glow_lichen");
                     for property in [
@@ -10882,7 +10923,9 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.ends_with("_many") {
+            let expected_checks = if mode.contains("_lake_") && mode.ends_with("_mixed") {
+                3
+            } else if mode.ends_with("_many") {
                 2
             } else if mode.ends_with("_plain") {
                 0

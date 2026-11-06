@@ -435,7 +435,7 @@ impl PreparedPiece {
 
 /// Verified collision classes for the vanilla ocean-ruin palette. Unknown
 /// data-pack blocks remain errors until their dynamic shape is established.
-fn ocean_template_static_full(state: &native_world::loaded::BlockState) -> Result<bool> {
+pub(super) fn ocean_template_static_full(state: &native_world::loaded::BlockState) -> Result<bool> {
     let id = state
         .name
         .strip_prefix("minecraft:")

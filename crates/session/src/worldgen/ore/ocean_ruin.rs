@@ -1,7 +1,9 @@
 //! Access the current decoration region for ocean-ruin floor adjustment.
 use super::*;
+use native_core::beardifier::BoundingBox;
 use native_persistence::nbt::Tag;
 use native_resources::ocean_ruin::{DataMarkerKind, FloorWorld, MarkerWorld, handle_data_marker};
+use native_resources::tree_leaf_update::ShapeEdgeWorld;
 use native_resources::{
     drowned_spawn::{
         MainHandRoll, NautilusJockeyWorld, StructureDrownedWorld, initialize_structure_drowned,
@@ -30,6 +32,60 @@ struct RuinFloorWorld<'r, 'a, 't> {
 }
 
 impl DecorationRegion<'_> {
+    /// Run a complete ocean-ruin template piece against this unpublished
+    /// region. The spawn callback must create the exact structure drowned;
+    /// cloning it must isolate all callback state. The caller must stage the
+    /// piece, RNG and callback again until the region itself is committed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_ocean_ruin_piece<F>(
+        &mut self,
+        piece: &mut super::super::ocean_ruin::PreparedPiece,
+        ice_tags: &OreBlockTags,
+        water_fluids: &BTreeSet<String>,
+        bubble_fluids: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        temperature: native_resources::ocean_ruin::Temperature,
+        sea_level: i32,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+        spawn: &mut F,
+    ) -> Result<bool>
+    where
+        F: Clone + FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+    {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let mut next_spawn = spawn.clone();
+        let world_seed = self.target.seed;
+        let result = piece.post_process(
+            &mut RuinPieceRegion {
+                marker: RuinMarkerRegion {
+                    region: self,
+                    registry,
+                    water_fluids,
+                    sea_level,
+                    spawn: &mut next_spawn,
+                },
+                ice_tags,
+                bubble_fluids,
+            },
+            registry,
+            world_seed,
+            temperature,
+            clip,
+            random,
+        );
+        match result {
+            Ok(value) => {
+                *spawn = next_spawn;
+                Ok(value)
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
     /// Apply one processed archaeology replacement and materialize its block
     /// entity in Java's template-placement order. The caller must still run
     /// the template fluid and shape passes and the later marker pass.
@@ -41,6 +97,17 @@ impl DecorationRegion<'_> {
     ) -> Result<()> {
         ensure!(!self.failed, "generation attempt previously failed");
         self.failed = true;
+        self.place_ocean_ruin_archaeology_inner(position, replacement, registry)?;
+        self.failed = false;
+        Ok(())
+    }
+
+    fn place_ocean_ruin_archaeology_inner(
+        &mut self,
+        position: [i32; 3],
+        replacement: &super::super::ocean_ruin::ArchaeologyReplacement,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<()> {
         ensure!(
             self.writable.contains(&chunk(position)) && !self.is_outside(position[1]),
             "archaeology block outside writable region"
@@ -76,7 +143,6 @@ impl DecorationRegion<'_> {
             )),
         );
         Arc::make_mut(self.entity_order.entry(chunk(position)).or_default()).insert(position);
-        self.failed = false;
         Ok(())
     }
 
@@ -442,6 +508,325 @@ impl FloorWorld for RuinFloorWorld<'_, '_, '_> {
     }
 }
 
+struct RuinPieceRegion<'r, 'a, 't, F> {
+    marker: RuinMarkerRegion<'r, 'a, 't, F>,
+    ice_tags: &'t OreBlockTags,
+    bubble_fluids: &'t BTreeSet<String>,
+}
+
+impl<F> FloorWorld for RuinPieceRegion<'_, '_, '_, F> {
+    fn min_y(&self) -> i32 {
+        self.marker.region.target.min_y
+    }
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        OreVeinWorld::ocean_floor_height(self.marker.region, x, z)
+    }
+    fn floor_scan_passable(&mut self, position: [i32; 3]) -> Result<bool> {
+        RuinFloorWorld {
+            region: self.marker.region,
+            ice_tags: self.ice_tags,
+            water_fluids: self.marker.water_fluids,
+        }
+        .floor_scan_passable(position)
+    }
+}
+
+impl<F> MarkerWorld for RuinPieceRegion<'_, '_, '_, F>
+where
+    F: FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+{
+    fn fluid_in_water_tag(&mut self, position: [i32; 3]) -> Result<bool> {
+        self.marker.fluid_in_water_tag(position)
+    }
+    fn set_default_chest(&mut self, position: [i32; 3], waterlogged: bool) -> Result<()> {
+        self.marker.set_default_chest(position, waterlogged)
+    }
+    fn chest_entity_exists(&mut self, position: [i32; 3]) -> Result<bool> {
+        self.marker.chest_entity_exists(position)
+    }
+    fn set_chest_loot(&mut self, position: [i32; 3], table: &str, seed: i64) -> Result<()> {
+        self.marker.set_chest_loot(position, table, seed)
+    }
+    fn create_and_spawn_drowned(&mut self, position: [i32; 3]) -> Result<bool> {
+        self.marker.create_and_spawn_drowned(position)
+    }
+    fn sea_level(&mut self) -> Result<i32> {
+        self.marker.sea_level()
+    }
+    fn clear_drowned_marker(&mut self, position: [i32; 3], water: bool) -> Result<()> {
+        self.marker.clear_drowned_marker(position, water)
+    }
+}
+
+impl<F> ShapeEdgeWorld for RuinPieceRegion<'_, '_, '_, F> {
+    type State = BlockState;
+    fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        OreWorld::block(self.marker.region, pos)
+    }
+    fn update_shape(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        direction: [i32; 3],
+        neighbor_pos: [i32; 3],
+        neighbor: &BlockState,
+    ) -> Result<BlockState> {
+        use native_world::{
+            fluid::{FluidKind, FluidState},
+            stairs::{Neighbor, Stair},
+        };
+        let region = &mut *self.marker.region;
+        if state.name.starts_with("minecraft:") && state.name.ends_with("_stairs") {
+            ensure!(
+                self.marker
+                    .registry
+                    .is_canonical_state(&state.name, &state.properties),
+                "unsupported ruin stair state"
+            );
+            if state.properties["waterlogged"] == "true" {
+                SpringWorld::schedule_spring_tick(
+                    region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            if direction[1] != 0 {
+                return Ok(state.clone());
+            }
+            let stair = Stair::from_state(state).context("invalid ruin stair")?;
+            let base = glam::IVec3::from_array(pos);
+            let shape = native_world::stairs::shape(stair, |offset| {
+                let Some(x) = base.x.checked_add(offset.x) else {
+                    return Neighbor::Unknown;
+                };
+                let Some(z) = base.z.checked_add(offset.z) else {
+                    return Neighbor::Unknown;
+                };
+                let Ok(other) = region.read([x, base.y, z]) else {
+                    return Neighbor::Unknown;
+                };
+                if other.name.starts_with("minecraft:") && other.name.ends_with("_stairs") {
+                    if !self
+                        .marker
+                        .registry
+                        .is_canonical_state(&other.name, &other.properties)
+                    {
+                        return Neighbor::Unknown;
+                    }
+                    Stair::from_state(&other).map_or(Neighbor::Unknown, Neighbor::Stair)
+                } else {
+                    Neighbor::Other
+                }
+            })
+            .context("ruin stair needs unavailable neighbors")?;
+            let mut result = state.clone();
+            result.properties.insert("shape".into(), shape.into());
+            return Ok(result);
+        }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+        ) {
+            ensure!(
+                self.marker
+                    .registry
+                    .is_canonical_state(&state.name, &state.properties),
+                "invalid brushable shape state"
+            );
+            SimpleBlockWorld::schedule_simple_tick(region, pos)?;
+            return Ok(state.clone());
+        }
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            ensure!(
+                self.marker
+                    .registry
+                    .is_canonical_state(&state.name, &state.properties),
+                "invalid ruin fluid state"
+            );
+            let fluid = FluidState::from_block(state)
+                .map_err(anyhow::Error::msg)?
+                .context("missing fluid")?;
+            let other = FluidState::from_block(neighbor).map_err(anyhow::Error::msg)?;
+            let id = match (fluid.kind, fluid.source) {
+                (FluidKind::Water, true) => "minecraft:water",
+                (FluidKind::Water, false) => "minecraft:flowing_water",
+                (FluidKind::Lava, true) => "minecraft:lava",
+                (FluidKind::Lava, false) => "minecraft:flowing_lava",
+            };
+            if fluid.source || other.is_some_and(|value| value.source) {
+                SpringWorld::schedule_spring_tick(region, pos, &ResourceId::parse(id)?)?;
+            }
+            if direction == [0, -1, 0]
+                && fluid.source
+                && fluid.amount == 8
+                && self.bubble_fluids.contains(id)
+            {
+                let down = ResourceId::parse("minecraft:enables_bubble_column_drag_down")?;
+                let up = ResourceId::parse("minecraft:enables_bubble_column_push_up")?;
+                if region.tags.contains(&down, &neighbor.name)?
+                    || region.tags.contains(&up, &neighbor.name)?
+                {
+                    SimpleBlockWorld::schedule_simple_tick(region, pos)?;
+                }
+            }
+            return Ok(state.clone());
+        }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+        ) && state.properties.is_empty()
+        {
+            SimpleBlockWorld::schedule_simple_tick(region, pos)?;
+            return Ok(state.clone());
+        }
+        if self
+            .marker
+            .registry
+            .is_canonical_state(&state.name, &state.properties)
+            && super::super::ocean_ruin::ocean_template_static_full(state).ok() == Some(true)
+        {
+            return Ok(state.clone());
+        }
+        ShapeEdgeWorld::update_shape(region, pos, state, direction, neighbor_pos, neighbor)
+    }
+    fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
+        ensure!(
+            matches!(flags, 2 | 18),
+            "unsupported ruin shape write flags"
+        );
+        if !self.marker.region.writable.contains(&chunk(pos))
+            || self.marker.region.is_outside(pos[1])
+        {
+            return Ok(());
+        }
+        ensure!(
+            self.marker
+                .registry
+                .is_canonical_state(&state.name, &state.properties),
+            "unsupported ruin shape write state"
+        );
+        self.marker.region.set_proto_block(pos, state)
+    }
+}
+
+impl<F> super::super::ocean_ruin::OceanRuinPlacementWorld for RuinPieceRegion<'_, '_, '_, F>
+where
+    F: FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
+{
+    fn fluid_at(&mut self, position: [i32; 3]) -> Result<Option<native_world::fluid::FluidState>> {
+        let state = OreWorld::block(self.marker.region, position)?;
+        self.fluid_of_state(&state)
+    }
+    fn fluid_of_state(
+        &mut self,
+        state: &BlockState,
+    ) -> Result<Option<native_world::fluid::FluidState>> {
+        native_world::fluid::FluidState::from_block(state).map_err(anyhow::Error::msg)
+    }
+    fn place_template_block(
+        &mut self,
+        position: [i32; 3],
+        state: &BlockState,
+        nbt: Option<&Tag>,
+        _: &mut DecorationRandom,
+    ) -> Result<bool> {
+        let region = &mut self.marker.region;
+        if !region.writable.contains(&chunk(position)) {
+            return Ok(false);
+        }
+        ensure!(
+            region.world.chunks.contains_key(&chunk(position)),
+            "ruin block chunk missing"
+        );
+        if region.is_outside(position[1]) {
+            return Ok(true);
+        }
+        if let Some(nbt) = nbt {
+            let replacement = super::super::ocean_ruin::ArchaeologyReplacement {
+                state: state.clone(),
+                nbt: nbt.clone(),
+            };
+            region.place_ocean_ruin_archaeology_inner(
+                position,
+                &replacement,
+                self.marker.registry,
+            )?;
+            return Ok(true);
+        }
+        ensure!(
+            self.marker
+                .registry
+                .is_canonical_state(&state.name, &state.properties)
+                && self.marker.registry.has_block_entity(&state.name) == Some(false)
+                && super::super::ocean_ruin::ocean_template_static_full(state).is_ok(),
+            "unsupported ruin template block"
+        );
+        let old = region.read(position)?;
+        ensure!(
+            self.marker
+                .registry
+                .is_canonical_state(&old.name, &old.properties)
+                && self.marker.registry.has_block_entity(&old.name) == Some(false)
+                && (disk_safe_solid(&old.name).is_some()
+                    || super::super::ocean_ruin::ocean_template_static_full(&old).is_ok())
+                && !region.monster_entities.contains_key(&position)
+                && !region.bee_nests.contains_key(&position),
+            "unsupported ruin template replacement source"
+        );
+        region.set_proto_block(position, state)?;
+        Ok(true)
+    }
+    fn is_liquid_container(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(state.name.starts_with("minecraft:")
+            && state.name.ends_with("_stairs")
+            && self
+                .marker
+                .registry
+                .is_canonical_state(&state.name, &state.properties))
+    }
+    fn place_liquid(
+        &mut self,
+        position: [i32; 3],
+        state: &BlockState,
+        fluid: Option<native_world::fluid::FluidState>,
+    ) -> Result<()> {
+        if state.properties.get("waterlogged").map(String::as_str) == Some("false")
+            && fluid.is_some_and(|value| {
+                value.kind == native_world::fluid::FluidKind::Water && value.source
+            })
+        {
+            let mut wet = state.clone();
+            wet.properties.insert("waterlogged".into(), "true".into());
+            if self.marker.region.writable.contains(&chunk(position))
+                && !self.marker.region.is_outside(position[1])
+            {
+                self.marker.region.set_proto_block(position, &wet)?;
+            }
+            SpringWorld::schedule_spring_tick(
+                self.marker.region,
+                position,
+                &ResourceId::parse("minecraft:water")?,
+            )?;
+        }
+        Ok(())
+    }
+    fn update_neighbors_at(&mut self, _: [i32; 3], _: &BlockState) -> Result<()> {
+        Ok(())
+    }
+    fn mark_block_entity_changed(&mut self, _: [i32; 3]) -> Result<()> {
+        Ok(())
+    }
+    fn place_template_entities(
+        &mut self,
+        _: &[Tag],
+        _: [i32; 3],
+        _: native_resources::ocean_ruin::Rotation,
+        _: BoundingBox,
+    ) -> Result<()> {
+        bail!("ocean ruin template entities are unsupported")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,7 +836,7 @@ mod tests {
         structure_template::StructureTemplate,
     };
     use native_resources::{
-        ocean_ruin::{Piece, Rotation},
+        ocean_ruin::{Piece, Rotation, Temperature},
         packs::ResourceProvider,
     };
 
@@ -979,6 +1364,369 @@ mod tests {
         );
         assert!(region.finish().is_err());
         assert_eq!(terrain.snapshot().block(10, 8, 8), before.block(10, 8, 8));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn region_places_ocean_ruin_piece_and_discards_failed_attempt() -> Result<()> {
+        use super::super::super::{GeneratedEntityRecord, ocean_ruin::PreparedPiece};
+        use native_persistence::structure_template::TemplateBlock;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let ice_id = ResourceId::parse("minecraft:ice")?;
+        let ice = OreBlockTags::load(&mut IceTag(false), &ids, &BTreeSet::from([ice_id]))?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let mut palette: Vec<_> = [
+            "stone_bricks",
+            "stone_brick_stairs",
+            "sand",
+            "structure_block",
+        ]
+        .into_iter()
+        .map(|id| {
+            Tag::Compound(vec![(
+                "id".into(),
+                Tag::String(format!("minecraft:{id}").as_str().into()),
+            )])
+        })
+        .collect();
+        palette.push(Tag::Compound(vec![
+            (
+                "id".into(),
+                Tag::String("minecraft:stone_brick_stairs".into()),
+            ),
+            (
+                "properties".into(),
+                Tag::Compound(vec![("facing".into(), Tag::String("east".into()))]),
+            ),
+        ]));
+        let marker_nbt = Tag::Compound(vec![
+            ("mode".into(), Tag::String("DATA".into())),
+            ("metadata".into(), Tag::String("chest".into())),
+        ]);
+        let blocks = vec![
+            TemplateBlock {
+                position: [0, 0, 0],
+                state: 0,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [1, 0, 0],
+                state: 1,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [1, 0, 1],
+                state: 4,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [2, 0, 0],
+                state: 2,
+                nbt: None,
+            },
+            TemplateBlock {
+                position: [3, 0, 0],
+                state: 3,
+                nbt: Some(marker_nbt),
+            },
+        ];
+        let piece = PreparedPiece {
+            selection: Piece {
+                template: "minecraft:test".into(),
+                position: [1, 15, 1],
+                rotation: Rotation::None,
+                integrity: 1.0,
+                large: false,
+            },
+            template: Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [4, 1, 2],
+                palettes: vec![palette],
+                blocks,
+                entities: vec![],
+            }),
+            bounds: BoundingBox::new([1, 15, 1], [4, 15, 2]).unwrap(),
+        };
+        let water = BTreeSet::from(["minecraft:water".into(), "minecraft:flowing_water".into()]);
+        let bubbles = BTreeSet::new();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut piece = piece;
+        let mut random = DecorationRandom::new(42);
+        let mut expected = random.clone();
+        let expected_loot_seed = expected.next_long();
+        let mut no_spawn =
+            |_: [i32; 3], _: &World| -> Result<Option<GeneratedEntityRecord>> { Ok(None) };
+        assert!(region.place_ocean_ruin_piece(
+            &mut piece,
+            &ice,
+            &water,
+            &bubbles,
+            &registry,
+            Temperature::Warm,
+            63,
+            clip,
+            &mut random,
+            &mut no_spawn
+        )?);
+        assert_eq!(piece.selection.position, [1, 8, 1]);
+        assert_eq!(random.next_long(), expected.next_long());
+        assert_eq!(region.read([1, 8, 1])?.name, "minecraft:stone_bricks");
+        assert_eq!(region.read([3, 8, 1])?.name, "minecraft:suspicious_sand");
+        assert_eq!(region.read([4, 8, 1])?.name, "minecraft:chest");
+        let Some(Some(super::super::super::GeneratedMonsterRoomEntity::Chest(chest))) =
+            region.monster_entities.get(&[4, 8, 1])
+        else {
+            bail!("missing chest")
+        };
+        assert_eq!(chest.loot_seed, expected_loot_seed);
+        assert!(
+            region
+                .world
+                .saved_block_ticks
+                .get(&ChunkPos { x: 0, z: 0 })
+                .is_some_and(|ticks| ticks
+                    .iter()
+                    .any(|t| t.position == [3, 8, 1] && t.block == "minecraft:suspicious_sand"))
+        );
+        let actual = java_ruin_region_output(&game)?;
+        let mut expected_lines = Vec::new();
+        for p in [[1, 8, 1], [2, 8, 1], [2, 8, 2], [3, 8, 1]] {
+            let state = region.read(p)?;
+            let props = state
+                .properties
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            expected_lines.push(format!(
+                "B\t{}\t{}\t{}\t{}\t{{{props}}}",
+                p[0], p[1], p[2], state.name
+            ));
+        }
+        if let Some(ticks) = region.world.saved_block_ticks.get(&ChunkPos { x: 0, z: 0 }) {
+            for tick in ticks {
+                expected_lines.push(format!(
+                    "T\t{}\t{}\t{}\t{}",
+                    tick.block, tick.position[0], tick.position[1], tick.position[2]
+                ));
+            }
+        }
+        if let Some(ticks) = region.world.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 }) {
+            for tick in ticks {
+                expected_lines.push(format!(
+                    "F\t{}\t{}\t{}\t{}",
+                    tick.fluid, tick.position[0], tick.position[1], tick.position[2]
+                ));
+            }
+        }
+        assert_eq!(actual, expected_lines);
+        region.finish()?;
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing block entities")
+        };
+        assert_eq!(values.len(), 2);
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let before_piece = piece.selection.clone();
+        let mut before_random = random.clone();
+        assert!(
+            region
+                .place_ocean_ruin_piece(
+                    &mut piece,
+                    &ice,
+                    &water,
+                    &bubbles,
+                    &registry,
+                    Temperature::Warm,
+                    63,
+                    clip,
+                    &mut random,
+                    &mut no_spawn
+                )
+                .is_err()
+        );
+        assert_eq!(piece.selection, before_piece);
+        assert_eq!(random.next_long(), before_random.next_long());
+        assert!(region.finish().is_err());
+        assert_eq!(terrain.snapshot().block(3, 8, 1), before.block(3, 8, 1));
+
+        let (mut wet_terrain, wet_tags, _, _) = super::super::tests::fixture();
+        let world = Arc::make_mut(&mut wet_terrain.world);
+        let water_id = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        for position in [[2, 8, 1], [2, 8, 2]] {
+            world.set_block_id(position[0], position[1], position[2], water_id)?;
+        }
+        let writable = wet_terrain.snapshot().chunks.keys().copied().collect();
+        let mut wet_region = wet_terrain.decoration_region(&wet_tags, &motion, writable)?;
+        assert!(wet_region.place_ocean_ruin_piece(
+            &mut piece,
+            &ice,
+            &water,
+            &bubbles,
+            &registry,
+            Temperature::Warm,
+            63,
+            clip,
+            &mut random,
+            &mut no_spawn
+        )?);
+        for position in [[2, 8, 1], [2, 8, 2]] {
+            assert_eq!(
+                wet_region
+                    .read(position)?
+                    .properties
+                    .get("waterlogged")
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert!(
+                wet_region
+                    .world
+                    .saved_fluid_ticks
+                    .get(&ChunkPos { x: 0, z: 0 })
+                    .is_some_and(|ticks| ticks
+                        .iter()
+                        .any(|tick| tick.position == position && tick.fluid == "minecraft:water"))
+            );
+        }
+        wet_region.finish()?;
+        Ok(())
+    }
+
+    fn java_ruin_region_output(game: &std::path::Path) -> Result<Vec<String>> {
+        use std::{path::PathBuf, process::Command};
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let source = temp.path().join("OceanRuinRegionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/OceanRuinRegionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("OceanRuinRegionOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java placement failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .filter(|line| {
+                line.starts_with("B\t") || line.starts_with("T\t") || line.starts_with("F\t")
+            })
+            .map(str::to_owned)
+            .collect())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn region_places_selected_vanilla_ruin_templates() -> Result<()> {
+        use super::super::super::{GeneratedEntityRecord, ocean_ruin::prepare_pieces};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut data = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = data.vanilla_generated_block_registry()?;
+        let ids = data.vanilla_block_ids()?;
+        let ice = OreBlockTags::load(
+            &mut data,
+            &ids,
+            &BTreeSet::from([ResourceId::parse("minecraft:ice")?]),
+        )?;
+        let motion = HeightmapTags::load(&mut data, &ids)?;
+        let water = native_resources::fluid_tags::load_water(&mut data)?;
+        let bubbles = native_resources::fluid_tags::load_bubble_column_occupiable(&mut data)?;
+        let clip = BoundingBox::new([-16, 0, -16], [31, 15, 31]).unwrap();
+        let mut total = 0;
+        for temperature in [Temperature::Warm, Temperature::Cold] {
+            let definition = serde_json::json!({"type":"minecraft:ocean_ruin", "biome_temp": if temperature == Temperature::Warm {"warm"} else {"cold"}, "large_probability":0.0, "cluster_probability":0.0});
+            for seed in 0..4 {
+                let mut piece = prepare_pieces(&mut data, &definition, seed, [0, 0])?.remove(0);
+                piece.selection.position = [4, 90, 4];
+                let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                let mut random = DecorationRandom::new(seed);
+                let mut no_spawn =
+                    |_: [i32; 3], _: &World| -> Result<Option<GeneratedEntityRecord>> { Ok(None) };
+                region.place_ocean_ruin_piece(
+                    &mut piece,
+                    &ice,
+                    &water,
+                    &bubbles,
+                    &registry,
+                    temperature,
+                    63,
+                    clip,
+                    &mut random,
+                    &mut no_spawn,
+                )?;
+                total += region
+                    .world
+                    .chunks
+                    .values()
+                    .filter(|chunk| {
+                        !Arc::ptr_eq(
+                            chunk,
+                            region.target.world.chunks.get(&chunk.position).unwrap(),
+                        )
+                    })
+                    .count();
+                region.finish()?;
+            }
+        }
+        assert!(total > 0, "expected vanilla template blocks to be placed");
         Ok(())
     }
 }

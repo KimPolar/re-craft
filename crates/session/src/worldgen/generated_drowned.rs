@@ -446,6 +446,7 @@ mod tests {
         let cp = std::env::join_paths(paths)?;
         let shared = temp.path().join("StructureDrownedOracle.java");
         let source = temp.path().join("GeneratedStructureDrownedOracle.java");
+        let farm = temp.path().join("GeneratedFarmAnimalOracle.java");
         std::fs::write(
             &shared,
             include_str!("../../../resources/tests/java/StructureDrownedOracle.java"),
@@ -454,11 +455,16 @@ mod tests {
             &source,
             include_str!("../../tests/java/GeneratedStructureDrownedOracle.java"),
         )?;
+        std::fs::write(
+            &farm,
+            include_str!("../../tests/java/GeneratedFarmAnimalOracle.java"),
+        )?;
         let compiled = Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&cp)
             .arg(&shared)
             .arg(&source)
+            .arg(&farm)
             .output()?;
         ensure!(
             compiled.status.success(),
@@ -531,6 +537,13 @@ mod tests {
             cases.len() > 1000 && babies > 0 && leaders > 0 && weapons > 0 && shells > 0,
             "insufficient case coverage"
         );
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let variants = native_resources::animal_variants::FarmAnimalSpawnVariants::load_active(
+            &mut resources,
+            native_resources::animal_variants::FarmAnimal::Chicken,
+        )?;
+        let chicken_id = native_resources::packs::ResourceId::parse("minecraft:chicken")?;
+        let ocean = native_resources::packs::ResourceId::parse("minecraft:ocean")?;
         let mut snapshots = 0;
         for i in 0..200_000 {
             let region_seed = i64::from(i) * 671_231 - 12_345;
@@ -552,6 +565,32 @@ mod tests {
             }
             let tag =
                 draft_drowned_at_chicken_spawn([0, 1, 0, 2], [3, 10, -2], mob, can_pick_up_loot)?;
+            let mut combined_random = region.clone();
+            let mut chicken =
+                super::super::FreshCreatureRandom::from_seed(&chicken_id, i64::from(i))?;
+            chicken.construction.uuid = [0, 3, 0, 4];
+            let egg = 6000 + i % 6000;
+            chicken.construction.chicken_egg_time = Some(egg);
+            let chicken = super::super::draft_fresh_jockey_chicken(
+                &chicken,
+                [3.5, 10.0, -1.5],
+                0.0,
+                &ocean,
+                &variants,
+                &mut combined_random,
+            )?;
+            let combined =
+                super::super::ore::attach_created_chicken_rider(chicken, tag.clone(), [3, 10, -2])?;
+            let combined_path = temp.path().join(format!("chicken-combined-{i}.nbt"));
+            std::fs::write(
+                &combined_path,
+                nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: combined,
+                })?,
+            )?;
+            let mut combined_entity = LegacyRandom::new(entity_seed);
+            cases.push(serde_json::json!({"path":combined_path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":combined_random.next_long(),"next_entity":combined_entity.next_long(),"chicken_snapshot":true,"combined":true,"egg":egg}));
             let path = temp.path().join(format!("chicken-rider-{i}.nbt"));
             std::fs::write(
                 &path,

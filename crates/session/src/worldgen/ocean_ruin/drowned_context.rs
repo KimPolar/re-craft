@@ -314,8 +314,10 @@ where
     fn halloween(&mut self) -> Result<bool> {
         (self.halloween_at)()
     }
-    fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
-        self.effects.try_existing_chicken(position, world)
+    fn try_existing_chicken(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+        // WorldGenRegion.getEntities always returns an empty list, including
+        // entities that were already added to its protochunks.
+        Ok(false)
     }
     fn spawn_chicken_jockey(
         &mut self,
@@ -392,7 +394,7 @@ mod tests {
     impl DrownedSpawnEffects for Effects {
         fn try_existing_chicken(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
             self.calls += 1;
-            Ok(false)
+            Ok(true)
         }
         fn spawn_chicken_jockey(
             &mut self,
@@ -502,7 +504,7 @@ mod tests {
         );
         let mut isolated = context.clone();
         assert!(!isolated.try_existing_chicken([1, 8, 1], &world)?);
-        assert_eq!(isolated.effects.calls, 1);
+        assert_eq!(isolated.effects.calls, 0);
         assert_eq!(context.effects.calls, 0);
         Ok(())
     }

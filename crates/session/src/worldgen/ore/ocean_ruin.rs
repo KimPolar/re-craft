@@ -549,7 +549,11 @@ where
     Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
 }
 
-fn attach_created_chicken_rider(mut chicken: Tag, rider: Tag, position: [i32; 3]) -> Result<Tag> {
+pub(in crate::worldgen) fn attach_created_chicken_rider(
+    mut chicken: Tag,
+    rider: Tag,
+    position: [i32; 3],
+) -> Result<Tag> {
     use native_persistence::nbt::TagType;
     let Tag::Compound(ref fields) = chicken else {
         bail!("jockey chicken is not a compound")

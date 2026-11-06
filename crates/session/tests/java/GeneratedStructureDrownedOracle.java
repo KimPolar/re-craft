@@ -8,6 +8,7 @@ import java.util.UUID;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
@@ -15,6 +16,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.server.level.WorldGenRegion;
 import net.minecraft.tags.BiomeTags;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.util.RandomSource;
@@ -25,6 +27,7 @@ import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.ai.navigation.AmphibiousPathNavigation;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.entity.monster.zombie.Drowned;
+import net.minecraft.world.entity.animal.chicken.Chicken;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.ServerLevelAccessor;
 import net.minecraft.world.level.biome.Biomes;
@@ -52,6 +55,7 @@ public class GeneratedStructureDrownedOracle {
         attributes.sort(Comparator.comparing(tag->((CompoundTag)tag).getStringOr("id","")));
         for(var tag:attributes) ((CompoundTag)tag).getList("modifiers").ifPresent(modifiers->
                 modifiers.sort(Comparator.comparing(m->((CompoundTag)m).getStringOr("id",""))));
+        root.getList("Passengers").ifPresent(passengers -> passengers.forEach(tag -> normalize((CompoundTag)tag)));
     }
     public static void main(String[] args) throws Exception {
         var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
@@ -60,7 +64,17 @@ public class GeneratedStructureDrownedOracle {
         for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries))pending.apply();
         var uc=Class.forName("sun.misc.Unsafe");var uf=uc.getDeclaredField("theUnsafe");uf.setAccessible(true);
         StructureDrownedOracle.unsafe=uf.get(null);StructureDrownedOracle.allocate=uc.getMethod("allocateInstance",Class.class);
+        GeneratedFarmAnimalOracle.unsafe=(sun.misc.Unsafe)StructureDrownedOracle.unsafe;
+        GeneratedFarmAnimalOracle.access=new RegistryAccess.ImmutableRegistryAccess(List.of(
+            GeneratedFarmAnimalOracle.registry(Registries.CHICKEN_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_VARIANT).listElements().toList()),
+            GeneratedFarmAnimalOracle.registry(Registries.CHICKEN_SOUND_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_SOUND_VARIANT).listElements().toList())
+        ));
+        var chickenWorld=(GeneratedFarmAnimalOracle.World)StructureDrownedOracle.allocate.invoke(StructureDrownedOracle.unsafe,GeneratedFarmAnimalOracle.World.class);
+        var eggField=Chicken.class.getDeclaredField("eggTime");eggField.setAccessible(true);
         var world=(StructureDrownedOracle.World)StructureDrownedOracle.allocate.invoke(StructureDrownedOracle.unsafe,StructureDrownedOracle.World.class);
+        var generationRegion=(WorldGenRegion)StructureDrownedOracle.allocate.invoke(StructureDrownedOracle.unsafe,WorldGenRegion.class);
+        if(!generationRegion.getEntitiesOfClass(Chicken.class,new net.minecraft.world.phys.AABB(-5,-3,-5,5,3,5),chicken->true).isEmpty())
+            throw new AssertionError("world-generation region unexpectedly exposes chickens");
         var entityRandom=Entity.class.getDeclaredField("random");entityRandom.setAccessible(true);
         var biome=registries.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.OCEAN);
         var bind=Holder.Reference.class.getDeclaredMethod("bindTags",java.util.Collection.class);bind.setAccessible(true);
@@ -69,13 +83,15 @@ public class GeneratedStructureDrownedOracle {
         for(var entry:tests){
             var test=entry.getAsJsonObject();long regionSeed=test.get("region_seed").getAsLong(),entitySeed=test.get("entity_seed").getAsLong();
             RandomSource random=test.get("legacy").getAsBoolean()?new LegacyRandomSource(regionSeed):new XoroshiroRandomSource(regionSeed);
+            boolean snapshot=test.has("chicken_snapshot") && test.get("chicken_snapshot").getAsBoolean();
+            boolean combined=test.has("combined") && test.get("combined").getAsBoolean();
             var drowned=new RealDrowned(world);((RandomSource)entityRandom.get(drowned)).setSeed(entitySeed);
             drowned.setUUID(new UUID(1,2));drowned.setPersistenceRequired();drowned.snapTo(new BlockPos(3,10,-2),0,0);
             var region=(ServerLevelAccessor)Proxy.newProxyInstance(ServerLevelAccessor.class.getClassLoader(),new Class<?>[]{ServerLevelAccessor.class},(p,m,v)->switch(m.getName()){
                 case "getRandom"->random;case "getBiome"->biome;case "getEntitiesOfClass"->List.of();
-                case "registryAccess"->throw new StructureDrownedOracle.Stop("ENCHANT");default->throw new AssertionError(m);
+                case "registryAccess"->{if(combined)yield GeneratedFarmAnimalOracle.access;throw new StructureDrownedOracle.Stop("ENCHANT");}
+                case "environmentAttributes"->null;default->throw new AssertionError(m);
             });
-            boolean snapshot=test.has("chicken_snapshot") && test.get("chicken_snapshot").getAsBoolean();
             try {
                 drowned.finalizeSpawn(region,new StructureDrownedOracle.DifficultyValue(test.get("special").getAsFloat()),EntitySpawnReason.STRUCTURE,null);
                 if(snapshot) throw new AssertionError("expected chicken spawn");
@@ -83,7 +99,15 @@ public class GeneratedStructureDrownedOracle {
                 if(!snapshot || !stop.event.equals("CHICKEN")) throw stop;
             }
             var output=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
-            if(!drowned.save(output))throw new AssertionError("unexpected passenger");
+            if(combined) {
+                var chicken=new GeneratedFarmAnimalOracle.TestChicken(chickenWorld);
+                chicken.setUUID(new UUID(3,4));eggField.setInt(chicken,test.get("egg").getAsInt());
+                chicken.snapTo(3.5,10,-1.5,0,0);
+                chicken.finalizeSpawn(region,new StructureDrownedOracle.DifficultyValue(test.get("special").getAsFloat()),EntitySpawnReason.JOCKEY,null);
+                chicken.setChickenJockey(true);
+                if(!drowned.startRiding(chicken,false,false))throw new AssertionError("could not mount chicken");
+                if(!chicken.save(output))throw new AssertionError("could not save chicken");
+            } else if(!drowned.save(output))throw new AssertionError("unexpected passenger");
             var actual=output.buildResult();var expected=NbtIo.read(Path.of(test.get("path").getAsString()));
             normalize(actual);normalize(expected);
             if(!actual.equals(expected))throw new AssertionError("case="+test+" java="+actual+" rust="+expected);

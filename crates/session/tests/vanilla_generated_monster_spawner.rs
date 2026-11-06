@@ -1,6 +1,6 @@
 use native_persistence::nbt::{self, NamedTag, Tag};
 use native_resources::monster_room::RoomMob;
-use native_session::worldgen::GeneratedMonsterSpawner;
+use native_session::worldgen::{GeneratedCaveSpiderSpawner, GeneratedMonsterSpawner};
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 fn run(c: &mut Command) -> String {
     let o = c.output().unwrap();
@@ -63,35 +63,48 @@ fn generated_monster_spawners_roundtrip_java_nbt() {
         .arg("-classpath")
         .arg(&cp)
         .arg(&source));
-    assert!(
-        run(Command::new(java.join("java.exe"))
-            .arg("-classpath")
-            .arg(&cp)
-            .arg("GeneratedMonsterSpawnerOracle")
-            .arg("java")
-            .arg(temp.path()))
-        .contains("OK")
-    );
-    for (i, mob) in [RoomMob::Skeleton, RoomMob::Zombie, RoomMob::Spider]
-        .into_iter()
-        .enumerate()
-    {
-        let spawner = GeneratedMonsterSpawner {
-            position: [-17 + i as i32, 63 - i as i32, 31 + i as i32],
-            mob,
+    let java_output = run(Command::new(java.join("java.exe"))
+        .arg("-classpath")
+        .arg(&cp)
+        .arg("GeneratedMonsterSpawnerOracle")
+        .arg("java")
+        .arg(temp.path()));
+    assert!(java_output.contains("OK"));
+    let expected_random = native_core::random::DecorationRandom::new(1).next_long();
+    for i in 0..4 {
+        assert!(
+            java_output
+                .lines()
+                .any(|line| line == format!("R {i} {expected_random}")),
+            "spawner consumed random values: {java_output}"
+        );
+        let position = [-17 + i as i32, 63 - i as i32, 31 + i as i32];
+        let tag = match i {
+            0 => GeneratedMonsterSpawner {
+                position,
+                mob: RoomMob::Skeleton,
+            }
+            .block_entity(),
+            1 => GeneratedMonsterSpawner {
+                position,
+                mob: RoomMob::Zombie,
+            }
+            .block_entity(),
+            2 => GeneratedMonsterSpawner {
+                position,
+                mob: RoomMob::Spider,
+            }
+            .block_entity(),
+            _ => GeneratedCaveSpiderSpawner { position }.block_entity(),
         };
         let expected =
             nbt::read(&std::fs::read(temp.path().join(format!("java-{i}.nbt"))).unwrap()).unwrap();
-        assert_eq!(
-            normalized(&spawner.block_entity()),
-            normalized(&expected.value),
-            "case {i}"
-        );
+        assert_eq!(normalized(&tag), normalized(&expected.value), "case {i}");
         std::fs::write(
             temp.path().join(format!("rust-{i}.nbt")),
             nbt::write(&NamedTag {
                 name: "".into(),
-                value: spawner.block_entity(),
+                value: tag,
             })
             .unwrap(),
         )

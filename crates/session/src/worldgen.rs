@@ -2410,6 +2410,12 @@ pub enum PreparedStructureStart {
     Mineshaft(mineshaft::PreparedStart),
 }
 
+/// Batch-only extension; decoration cannot consume jigsaw pieces yet.
+pub(super) enum BatchPreparedStructureStart {
+    Supported(PreparedStructureStart),
+    Jigsaw(jigsaw::PreparedStart),
+}
+
 /// A generator configured from the dimension's active biome source and noise
 /// settings. It must be used with the same data-pack stack throughout its life.
 pub struct TerrainGenerator {
@@ -2950,17 +2956,23 @@ impl TerrainGenerator {
                 existing,
                 classify,
                 false,
+                false,
             )? {
                 StructureSetStart::Existing => StructureSetStart::Existing,
                 StructureSetStart::NotCandidate => StructureSetStart::NotCandidate,
                 StructureSetStart::Rejected => StructureSetStart::Rejected,
                 StructureSetStart::Generated {
                     structure,
-                    start: PreparedStructureStart::Simple(start),
+                    start:
+                        BatchPreparedStructureStart::Supported(PreparedStructureStart::Simple(start)),
                 } => StructureSetStart::Generated { structure, start },
                 StructureSetStart::Generated {
                     start:
-                        PreparedStructureStart::OceanRuin(_) | PreparedStructureStart::Mineshaft(_),
+                        BatchPreparedStructureStart::Supported(
+                            PreparedStructureStart::OceanRuin(_)
+                            | PreparedStructureStart::Mineshaft(_),
+                        )
+                        | BatchPreparedStructureStart::Jigsaw(_),
                     ..
                 } => unreachable!("ocean ruins are disabled"),
             },
@@ -2982,6 +2994,48 @@ impl TerrainGenerator {
         classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
     ) -> Result<native_resources::structure_placement::StructureSetStart<PreparedStructureStart>>
     {
+        use native_resources::structure_placement::StructureSetStart;
+        Ok(
+            match self.try_generate_supported_structure_set_impl(
+                provider,
+                evaluator,
+                cache,
+                biome_rules,
+                id,
+                chunk,
+                existing,
+                classify,
+                true,
+                false,
+            )? {
+                StructureSetStart::Existing => StructureSetStart::Existing,
+                StructureSetStart::NotCandidate => StructureSetStart::NotCandidate,
+                StructureSetStart::Rejected => StructureSetStart::Rejected,
+                StructureSetStart::Generated {
+                    structure,
+                    start: BatchPreparedStructureStart::Supported(start),
+                } => StructureSetStart::Generated { structure, start },
+                StructureSetStart::Generated {
+                    start: BatchPreparedStructureStart::Jigsaw(_),
+                    ..
+                } => unreachable!("jigsaws are disabled"),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_generate_batch_structure_set<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<BatchPreparedStructureStart>>
+    {
         self.try_generate_supported_structure_set_impl(
             provider,
             evaluator,
@@ -2991,6 +3045,7 @@ impl TerrainGenerator {
             chunk,
             existing,
             classify,
+            true,
             true,
         )
     }
@@ -3007,7 +3062,8 @@ impl TerrainGenerator {
         existing: impl FnMut(&ResourceId) -> Result<bool>,
         mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
         ocean_ruins: bool,
-    ) -> Result<native_resources::structure_placement::StructureSetStart<PreparedStructureStart>>
+        jigsaws: bool,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<BatchPreparedStructureStart>>
     {
         let mut columns = HashMap::new();
         let mut structure_evaluator = DensityEvaluator::default();
@@ -3048,7 +3104,10 @@ impl TerrainGenerator {
                 let mineshaft = ocean_ruins
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "mineshaft";
-                let structure = if center_heightmap.is_none() && !mineshaft {
+                let jigsaw = jigsaws
+                    && structure_type.namespace == "minecraft"
+                    && structure_type.path == "jigsaw";
+                let structure = if center_heightmap.is_none() && !mineshaft && !jigsaw {
                     Some(
                         SimpleStructure::decode(&definition)
                             .with_context(|| format!("in structure {path}"))?,
@@ -3077,6 +3136,16 @@ impl TerrainGenerator {
                     min_y: self.min_y,
                     max_y,
                 };
+                if jigsaw {
+                    return Ok(jigsaw::PreparedStart::generate(
+                        provider,
+                        &definition,
+                        &mut env,
+                        self.seed,
+                        chunk,
+                    )?
+                    .map(BatchPreparedStructureStart::Jigsaw));
+                }
                 if mineshaft {
                     return Ok(mineshaft::PreparedStart::generate(
                         &definition,
@@ -3084,7 +3153,11 @@ impl TerrainGenerator {
                         self.seed,
                         chunk,
                     )?
-                    .map(PreparedStructureStart::Mineshaft));
+                    .map(|start| {
+                        BatchPreparedStructureStart::Supported(PreparedStructureStart::Mineshaft(
+                            start,
+                        ))
+                    }));
                 }
                 if ocean_ruins
                     && structure_type.namespace == "minecraft"
@@ -3097,7 +3170,11 @@ impl TerrainGenerator {
                         self.seed,
                         chunk,
                     )?
-                    .map(PreparedStructureStart::OceanRuin));
+                    .map(|start| {
+                        BatchPreparedStructureStart::Supported(PreparedStructureStart::OceanRuin(
+                            start,
+                        ))
+                    }));
                 }
                 if let Some(heightmap) = center_heightmap
                     && native_resources::structure_start::center_generation_point(
@@ -3114,7 +3191,11 @@ impl TerrainGenerator {
                 };
                 Ok(structure
                     .generate(&mut env, self.seed, chunk)?
-                    .map(PreparedStructureStart::Simple))
+                    .map(|start| {
+                        BatchPreparedStructureStart::Supported(PreparedStructureStart::Simple(
+                            start,
+                        ))
+                    }))
             },
         )
     }

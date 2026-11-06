@@ -38,6 +38,8 @@ pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
 pub type OceanRuinStarts = BTreeMap<ResourceId, super::ocean_ruin::PreparedStart>;
 /// Multi-piece mineshaft starts belonging to one source chunk.
 pub type MineshaftStarts = BTreeMap<ResourceId, super::mineshaft::PreparedStart>;
+/// Multi-piece jigsaw starts belonging to one source chunk.
+pub type JigsawStarts = BTreeMap<ResourceId, super::jigsaw::PreparedStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
@@ -646,6 +648,7 @@ pub struct StructureGenerationBatch {
     starts: BTreeMap<ChunkPos, SimpleStarts>,
     ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
     mineshafts: BTreeMap<ChunkPos, MineshaftStarts>,
+    jigsaw_starts: BTreeMap<ChunkPos, JigsawStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
     references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
@@ -661,6 +664,11 @@ impl StructureGenerationBatch {
         ensure!(
             self.is_complete(),
             "structure batch has unfinished or failed work"
+        );
+        ensure!(
+            plan.starts()
+                .all(|pos| !self.jigsaw_starts.contains_key(&pos)),
+            "jigsaw start transfer is not yet supported"
         );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
@@ -770,6 +778,10 @@ impl StructureGenerationBatch {
             self.generator.structure_context,
             "generator lacks structure context"
         );
+        ensure!(
+            self.jigsaw_starts.is_empty(),
+            "jigsaw start transfer is not yet supported"
+        );
         let mut terrain = BTreeMap::new();
         for (pos, order) in orders {
             terrain.insert(pos, self.beardifier_for_chunk(pos, &order)?);
@@ -823,6 +835,7 @@ impl StructureGenerationBatch {
             starts: BTreeMap::new(),
             ocean_starts: BTreeMap::new(),
             mineshafts: BTreeMap::new(),
+            jigsaw_starts: BTreeMap::new(),
             bounds: BTreeMap::new(),
             references: BTreeMap::new(),
             failed: false,
@@ -850,7 +863,8 @@ impl StructureGenerationBatch {
     pub fn starts(&self, pos: ChunkPos) -> Option<&SimpleStarts> {
         (!self.failed
             && !self.ocean_starts.contains_key(&pos)
-            && !self.mineshafts.contains_key(&pos))
+            && !self.mineshafts.contains_key(&pos)
+            && !self.jigsaw_starts.contains_key(&pos))
         .then(|| self.starts.get(&pos))
         .flatten()
     }
@@ -872,6 +886,37 @@ impl StructureGenerationBatch {
         (!self.failed && self.starts.contains_key(&pos))
             .then(|| self.mineshafts.get(&pos))
             .flatten()
+    }
+
+    /// Return jigsaw starts retained for a completed start chunk.
+    pub fn jigsaw_starts(&self, pos: ChunkPos) -> Option<&JigsawStarts> {
+        (!self.failed && self.starts.contains_key(&pos))
+            .then(|| self.jigsaw_starts.get(&pos))
+            .flatten()
+    }
+
+    fn ensure_jigsaw_decoration_supported(&self, pos: ChunkPos) -> Result<()> {
+        let references = self
+            .references
+            .get(&pos)
+            .context("structure references are unavailable")?;
+        for (id, sources) in references.membership() {
+            for &packed in sources {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                ensure!(
+                    !self
+                        .jigsaw_starts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "jigsaw structure decoration is not yet supported"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
@@ -905,6 +950,7 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
+        self.ensure_jigsaw_decoration_supported(pos)?;
         decoration_plan(
             &self.starts,
             &self.ocean_starts,
@@ -922,6 +968,7 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
+        self.ensure_jigsaw_decoration_supported(pos)?;
         mixed_decoration_plan(
             &self.starts,
             &self.ocean_starts,
@@ -951,6 +998,12 @@ impl StructureGenerationBatch {
                         start.terrain_adjustment
                     } else if let Some(start) = self
                         .ocean_starts
+                        .get(&source)
+                        .and_then(|s| s.get(structure))
+                    {
+                        start.terrain_adjustment
+                    } else if let Some(start) = self
+                        .jigsaw_starts
                         .get(&source)
                         .and_then(|s| s.get(structure))
                     {
@@ -1029,6 +1082,13 @@ impl StructureGenerationBatch {
                     1
                 } else if let Some(start) = self.ocean_starts.get(pos).and_then(|s| s.get(id)) {
                     start.pieces.len()
+                } else if let Some(start) = self.jigsaw_starts.get(pos).and_then(|s| s.get(id)) {
+                    start.pieces.iter().try_fold(0usize, |total, piece| {
+                        total
+                            .checked_add(1)
+                            .and_then(|n| n.checked_add(piece.junctions.len()))
+                            .context("too many jigsaw terrain contributions")
+                    })?
                 } else {
                     self.mineshafts
                         .get(pos)
@@ -1131,6 +1191,12 @@ impl StructureGenerationBatch {
                     projection: PieceProjection::NonPool,
                     junctions: vec![],
                 }));
+            } else if let Some(start) = self
+                .jigsaw_starts
+                .get(source)
+                .and_then(|starts| starts.get(structure))
+            {
+                pieces.extend(start.terrain_pieces()?);
             } else {
                 let start = self
                     .mineshafts
@@ -1210,9 +1276,10 @@ impl StructureGenerationBatch {
                 let mut starts = SimpleStarts::new();
                 let mut ocean_starts = OceanRuinStarts::new();
                 let mut mineshafts = MineshaftStarts::new();
+                let mut jigsaw_starts = JigsawStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
-                    let outcome = self.generator.try_generate_supported_structure_set(
+                    let outcome = self.generator.try_generate_batch_structure_set(
                         provider,
                         &mut self.evaluator,
                         &mut self.cache,
@@ -1222,13 +1289,16 @@ impl StructureGenerationBatch {
                         |id| {
                             Ok(starts.contains_key(id)
                                 || ocean_starts.contains_key(id)
-                                || mineshafts.contains_key(id))
+                                || mineshafts.contains_key(id)
+                                || jigsaw_starts.contains_key(id))
                         },
                         &mut *classify,
                     )?;
                     if let StructureSetStart::Generated { structure, start } = outcome {
                         match start {
-                            PreparedStructureStart::Simple(start) => {
+                            super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::Simple(start),
+                            ) => {
                                 bounds.push(StructureStartBounds::from_simple(
                                     structure.clone(),
                                     &start,
@@ -1238,17 +1308,28 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
-                            PreparedStructureStart::OceanRuin(start) => {
+                            super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::OceanRuin(start),
+                            ) => {
                                 bounds.push(start.reference_bounds(structure.clone())?);
                                 ensure!(
                                     ocean_starts.insert(structure, start).is_none(),
                                     "duplicate structure start"
                                 );
                             }
-                            PreparedStructureStart::Mineshaft(start) => {
+                            super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::Mineshaft(start),
+                            ) => {
                                 bounds.push(start.reference_bounds(structure.clone())?);
                                 ensure!(
                                     mineshafts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
+                            super::BatchPreparedStructureStart::Jigsaw(start) => {
+                                bounds.push(start.reference_bounds(structure.clone())?);
+                                ensure!(
+                                    jigsaw_starts.insert(structure, start).is_none(),
                                     "duplicate structure start"
                                 );
                             }
@@ -1262,6 +1343,9 @@ impl StructureGenerationBatch {
                 }
                 if !mineshafts.is_empty() {
                     self.mineshafts.insert(pos, mineshafts);
+                }
+                if !jigsaw_starts.is_empty() {
+                    self.jigsaw_starts.insert(pos, jigsaw_starts);
                 }
                 self.bounds.insert(pos, bounds);
                 Ok(())

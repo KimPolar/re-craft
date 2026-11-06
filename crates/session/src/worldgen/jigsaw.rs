@@ -550,6 +550,100 @@ mod tests {
         assert_eq!(start.chunk, chunk);
         assert!(!start.pieces.is_empty());
         assert_eq!(start.terrain_pieces()?.len(), start.pieces.len());
+
+        use super::super::{
+            schedule::GenerationStage,
+            structure_batch::{StructureGenerationBatch, StructurePreparationPlan},
+        };
+        use native_world::loaded::ChunkPos;
+        let target = ChunkPos {
+            x: chunk[0],
+            z: chunk[1],
+        };
+        let mut batch = StructureGenerationBatch::new(generator, rules, vec![set])?;
+        batch.request_references(target)?;
+        while batch
+            .step(&mut provider, &mut |value| {
+                let name = value
+                    .as_str()
+                    .or_else(|| value.get("id").and_then(Value::as_str))
+                    .context("invalid block")?;
+                Ok(BlockHeightFlags {
+                    is_air: name == "minecraft:air",
+                    blocks_motion: name == "minecraft:stone",
+                    blocks_motion_no_leaves: name == "minecraft:stone",
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            })?
+            .is_some()
+        {}
+        assert!(batch.is_complete());
+        assert!(batch.has_starts(target));
+        assert!(batch.starts(target).is_none());
+        let retained = batch
+            .jigsaw_starts(target)
+            .context("missing batch jigsaw")?
+            .get(&structure)
+            .context("missing city")?;
+        assert_eq!(retained.to_tag(&structure)?, start.to_tag(&structure)?);
+        let references = batch
+            .references(target)
+            .context("missing references")?
+            .get(&structure)
+            .context("missing city reference")?;
+        let packed = ((chunk[1] as u32 as u64) << 32 | chunk[0] as u32 as u64) as i64;
+        assert!(references.contains(&packed));
+        let order = batch
+            .unambiguous_terrain_start_order(target)?
+            .context("unexpected ambiguous order")?;
+        assert!(order.contains(&(structure.clone(), target)));
+        let mut pieces = Vec::new();
+        for (id, source) in &order {
+            pieces.extend(
+                batch
+                    .jigsaw_starts(*source)
+                    .context("missing referenced jigsaw")?[id]
+                    .terrain_pieces()?,
+            );
+        }
+        let expected = native_core::beardifier::Beardifier::for_chunk(chunk, &pieces)
+            .map_err(anyhow::Error::msg)?;
+        let actual = batch.beardifier_for_chunk(target, &order)?;
+        assert_eq!(actual.affected_bounds(), expected.affected_bounds());
+        for y in [-48, -27, 0, 40] {
+            for x in [chunk[0] * 16, chunk[0] * 16 + 8] {
+                for z in [chunk[1] * 16, chunk[1] * 16 + 8] {
+                    assert_eq!(
+                        actual.sample(x, y, z).to_bits(),
+                        expected.sample(x, y, z).to_bits()
+                    );
+                }
+            }
+        }
+        let schedule = native_resources::structure_decoration::StructureDecorationSchedule::load(
+            &mut provider,
+        )?;
+        assert!(
+            format!(
+                "{:#}",
+                batch
+                    .mixed_decoration_plan(target, &schedule)
+                    .err()
+                    .context("jigsaw decoration must be rejected")?
+            )
+            .contains("jigsaw structure decoration")
+        );
+        let plan = StructurePreparationPlan::new([(target, GenerationStage::StructureReferences)])?;
+        assert!(
+            format!(
+                "{:#}",
+                batch
+                    .prepare_additional_stages(&plan, None)
+                    .err()
+                    .context("jigsaw transfer must be rejected")?
+            )
+            .contains("jigsaw start transfer")
+        );
         Ok(())
     }
 }

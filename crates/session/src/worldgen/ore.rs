@@ -21494,6 +21494,8 @@ mod tests {
                 >,
                 _: &native_resources::worldgen_region_random::RegionRandom,
                 lighting: super::super::schedule::StructureFeatureLighting<'_>,
+                _: &super::super::structure_batch::PreparedStructureStages,
+                _: &super::super::BiomeNeighborhood,
             ) -> Result<Vec<Vec<PreparedStructureStart>>> {
                 let super::super::schedule::StructureFeatureLighting::Visible(light) = lighting
                 else {
@@ -21534,7 +21536,9 @@ mod tests {
                     &mut BTreeMap::new(),
                     &random,
                     super::super::schedule::StructureFeatureLighting::Visible(&light),
-                    &mut runner
+                    &mut runner,
+                    &super::super::structure_batch::PreparedStructureStages::default(),
+                    &neighborhood,
                 )
                 .is_err()
         );
@@ -21550,6 +21554,8 @@ mod tests {
             &random,
             super::super::schedule::StructureFeatureLighting::Visible(&light),
             &mut runner,
+            &super::super::structure_batch::PreparedStructureStages::default(),
+            &neighborhood,
         )?;
         assert_eq!(runner.0.draws, expected_draws);
         assert!(

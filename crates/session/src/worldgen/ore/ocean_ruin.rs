@@ -2552,6 +2552,7 @@ mod tests {
                 Ok(vec![ResourceId::parse(match folder {
                     "cat_variant" => "minecraft:black",
                     "cat_sound_variant" => "minecraft:classic",
+                    "worldgen/structure" => "minecraft:ocean_ruin_warm",
                     _ => bail!("unexpected registry"),
                 })?])
             }
@@ -2758,6 +2759,37 @@ mod tests {
             .ocean_starts
             .insert(center, BTreeMap::from([(entry.id.clone(), start.clone())]));
         stages.huts = initial.clone();
+        let references =
+            super::super::super::structure_references::collect_ordered_structure_references(
+                center,
+                |source| {
+                    if source == center {
+                        Ok(vec![start.reference_bounds(entry.id.clone())?])
+                    } else {
+                        Ok(vec![])
+                    }
+                },
+            )?;
+        stages.references.insert(center, references);
+        let conditions = variants.prepare_world_conditions(&mut Cats)?;
+        let selector = serde_json::json!({"type":"minecraft:structure","structures":"minecraft:ocean_ruin_warm"});
+        let selector_at =
+            |pos, revisions: &[super::super::super::structure_batch::StructurePieceRevision]| {
+                super::super::super::schedule::native_cat_condition(
+                    &conditions,
+                    &|_, _| Ok(0),
+                    &stages,
+                    &neighborhood,
+                    &key,
+                    pos,
+                    &selector,
+                    hut.bounds,
+                    revisions,
+                )
+            };
+        assert!(selector_at([8, 8, 1], &revisions)?);
+        assert!(!selector_at([8, 15, 1], &revisions)?);
+        assert!(selector_at([8, 15, 1], &[])?);
         let scheduled_plan = [
             PlannedMixedStructureDecoration {
                 entry: &entry,
@@ -2812,6 +2844,8 @@ mod tests {
             &random,
             StructureFeatureLighting::Visible(&light),
             &mut runner,
+            &stages,
+            &neighborhood,
         )?;
         assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
         assert_eq!(states[&key], expected_saved);
@@ -2858,6 +2892,8 @@ mod tests {
             &random,
             StructureFeatureLighting::Visible(&light),
             &mut runner,
+            &stages,
+            &neighborhood,
         ) {
             Ok(_) => bail!("expected scheduled drowned initialization failure"),
             Err(error) => error,

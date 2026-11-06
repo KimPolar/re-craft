@@ -7322,6 +7322,10 @@ mod tests {
                     "data/example/worldgen/structure_set/hut.json" if self.mixed => Some(
                         json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:hut","weight":1}]}),
                     ),
+                    "data/minecraft/cat_variant/black.json" if self.mixed => Some(json!({})),
+                    "data/example/cat_variant/structure_cat.json" if self.mixed => Some(
+                        json!({"spawn_conditions":[{"condition":{"type":"minecraft:structure","structures":"example:hut"},"priority":0}]}),
+                    ),
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
                     ),
@@ -7351,6 +7355,13 @@ mod tests {
                         Ok(ids)
                     }
                     "worldgen/biome" => Ok(vec![ResourceId::parse("minecraft:plains")?]),
+                    "cat_variant" if self.mixed => Ok(vec![
+                        ResourceId::parse("minecraft:black")?,
+                        ResourceId::parse("example:structure_cat")?,
+                    ]),
+                    "cat_sound_variant" if self.mixed => {
+                        Ok(vec![ResourceId::parse("minecraft:classic")?])
+                    }
                     _ => self.vanilla.list_data(folder),
                 }
             }
@@ -7480,7 +7491,7 @@ mod tests {
             "minecraft:flowing_water".to_owned(),
         ]);
         let bubbles = BTreeSet::new();
-        let ocean = OceanRuinPlacementContext {
+        let mut ocean = OceanRuinPlacementContext {
             ice_tags: &ice,
             water_fluids: &water,
             bubble_fluids: &bubbles,
@@ -7493,29 +7504,10 @@ mod tests {
             context: NoDrowned,
         };
         let variants = native_resources::cat_variants::CatSpawnVariants::load_active(&mut data)?;
-        let mut adapter = MixedHutOceanPlacementContext {
-            ocean,
-            huts: BTreeMap::new(),
-            variants: &variants,
-            construct_hut: |mob| {
-                let (id, seed) = match mob {
-                    native_resources::structure_piece::swamp_hut::HutMob::Witch => {
-                        ("minecraft:witch", 1)
-                    }
-                    native_resources::structure_piece::swamp_hut::HutMob::Cat => {
-                        ("minecraft:cat", 2)
-                    }
-                };
-                FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
-            },
-            condition: |_: &structure_batch::TerrainStartKey,
-                        _: [i32; 3],
-                        _: &World,
-                        _: &Value,
-                        _: native_core::beardifier::BoundingBox,
-                        _: &[structure_batch::StructurePieceRevision]| {
-                Ok(true)
-            },
+        let conditions = if mixed {
+            Some(variants.prepare_world_conditions(&mut data)?)
+        } else {
+            None
         };
         batch.request_features(target)?;
         loop {
@@ -7533,19 +7525,17 @@ mod tests {
                 })
             };
             let result = if mixed {
-                batch.step_with_mixed_structure_support(
+                batch.step_with_native_mixed_environment(
                     &mut data,
                     &mut classify,
                     &mut resolve,
-                    &mut adapter,
+                    &mut ocean,
+                    &variants,
+                    conditions.as_ref().unwrap(),
+                    &|_, _| Ok(0),
                 )?
             } else {
-                batch.step_with_ocean_support(
-                    &mut data,
-                    &mut classify,
-                    &mut resolve,
-                    &mut adapter.ocean,
-                )?
+                batch.step_with_ocean_support(&mut data, &mut classify, &mut resolve, &mut ocean)?
             };
             if result.is_none() {
                 break;
@@ -7570,23 +7560,31 @@ mod tests {
             Some(schedule::GenerationStage::Features)
         );
         if mixed {
-            let hut = ResourceId::parse("example:hut")?;
-            let state = adapter
-                .huts
-                .get(&(hut.clone(), target))
-                .context("hut state missing")?;
-            assert!(state.state.spawned_witch && state.state.spawned_cat);
             assert_eq!(batch.recorded_generated_entities(target)?.len(), 2);
+            let data = batch.structure_data(target)?;
+            let saved_hut = data
+                .get("starts")
+                .and_then(|tag| tag.get("example:hut"))
+                .context("missing hut")?;
+            let Some(native_persistence::nbt::Tag::List { values, .. }) = saved_hut.get("Children")
+            else {
+                bail!("missing hut children")
+            };
+            assert_eq!(
+                values[0].get("Witch"),
+                Some(&native_persistence::nbt::Tag::Byte(1))
+            );
+            assert_eq!(
+                values[0].get("Cat"),
+                Some(&native_persistence::nbt::Tag::Byte(1))
+            );
+            let cat = batch.recorded_generated_entities(target)?.iter().find(|entity| matches!(entity.get("id"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("minecraft:cat"))).context("missing cat")?;
             assert!(
-                batch
-                    .structure_data(target)?
-                    .get("starts")
-                    .and_then(|tag| tag.get("example:hut"))
-                    .is_some()
+                matches!(cat.get("variant"), Some(native_persistence::nbt::Tag::String(id)) if id.matches("example:structure_cat"))
             );
         } else {
             assert_eq!(
-                adapter.ocean.region_random.next_long(),
+                ocean.region_random.next_long(),
                 expected_region_random.next_long()
             );
         }

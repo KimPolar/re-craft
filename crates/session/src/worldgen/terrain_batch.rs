@@ -23,8 +23,8 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        MixedFeatureCallbacks, NativeHutFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
-        StructureFeatureLighting,
+        MixedFeatureCallbacks, NativeHutFeatureRunner, NativeMixedFeatureRunner,
+        OceanFeatureCallbacks, OceanFeatureRunner, StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3418,6 +3418,37 @@ impl FreshTerrainBatch {
         self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }
 
+    /// Evaluate hut cat selectors against the current generated biome,
+    /// structure pieces and caller-supplied world-clock moon phase while
+    /// sharing the chunk's region RNG with ocean ruin entity initialization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_native_mixed_environment<C, W>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        ocean: &mut super::OceanRuinPlacementContext<'_, C, W>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon_phase_at: &dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        W: super::ocean_ruin::DrownedMarkerContext,
+    {
+        ensure!(
+            ocean.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = NativeMixedFeatureRunner {
+            ocean,
+            variants,
+            conditions,
+            moon_phase_at,
+        };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
     /// Perform one operation with hut mob initialization and cat conditions.
     /// Callers must supply the active pack's variants and complete world
     /// context. The condition callback receives the current start key and
@@ -3690,6 +3721,8 @@ impl FreshTerrainBatch {
                                 &region_random,
                                 lighting,
                                 runner,
+                                structures,
+                                &self.biomes,
                             )
                         };
                         let updated = if let Some(engine) = &mut self.light_engine {

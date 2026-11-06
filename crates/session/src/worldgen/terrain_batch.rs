@@ -801,7 +801,22 @@ impl FreshTerrainBatch {
     /// Structure starts remain intermediate and do not authorize saving.
     pub fn structure_starts(&self, pos: ChunkPos) -> Option<&super::structure_batch::SimpleStarts> {
         (!self.failed)
-            .then(|| self.structures.as_ref()?.starts.get(&pos))
+            .then(|| {
+                let structures = self.structures.as_ref()?;
+                (!structures.ocean_starts.contains_key(&pos))
+                    .then(|| structures.starts.get(&pos))
+                    .flatten()
+            })
+            .flatten()
+    }
+
+    /// Intermediate ocean-ruin starts retained for later decoration.
+    pub fn ocean_ruin_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<&super::structure_batch::OceanRuinStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.ocean_starts.get(&pos))
             .flatten()
     }
 
@@ -819,6 +834,10 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
+        ensure!(
+            structures.ocean_starts.is_empty(),
+            "ocean ruin structure persistence is not yet supported"
+        );
         super::structure_data::pack_structure_data(
             pos,
             structures
@@ -847,6 +866,10 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
+        ensure!(
+            structures.ocean_starts.is_empty(),
+            "ocean ruin structure persistence is not yet supported"
+        );
         super::structure_data::referenced_start_chunks(
             pos,
             &structures.starts,
@@ -1327,7 +1350,15 @@ impl FreshTerrainBatch {
                 .all(|key| !existing.huts.contains_key(key)),
             "expanded hut state already exists"
         );
+        ensure!(
+            added
+                .ocean_starts
+                .keys()
+                .all(|pos| !existing.ocean_starts.contains_key(pos)),
+            "expanded ocean ruin state already exists"
+        );
         existing.starts.extend(added.starts);
+        existing.ocean_starts.extend(added.ocean_starts);
         existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);

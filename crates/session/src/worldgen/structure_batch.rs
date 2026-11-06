@@ -122,7 +122,7 @@ impl StructurePreparationPlan {
             "structure batch has unfinished or failed work"
         );
         ensure!(
-            self.starts().all(|pos| batch.starts(pos).is_some()),
+            self.starts().all(|pos| batch.has_starts(pos)),
             "structure starts required by plan are missing"
         );
         ensure!(
@@ -175,12 +175,42 @@ fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<
 #[derive(Default)]
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
+    pub(super) ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
     pub(super) huts: BTreeMap<TerrainStartKey, super::SavedSwampHutPiece>,
     pub(super) references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
 }
 
 impl PreparedStructureStages {
+    fn insert_ocean_starts(&mut self, pos: ChunkPos, starts: OceanRuinStarts) -> Result<()> {
+        ensure!(
+            self.starts.contains_key(&pos),
+            "structure start chunk is missing"
+        );
+        ensure!(
+            !self.ocean_starts.contains_key(&pos),
+            "ocean ruin starts already prepared"
+        );
+        for (id, start) in &starts {
+            ensure!(
+                start.chunk == [pos.x, pos.z],
+                "ocean ruin belongs to another chunk"
+            );
+            ensure!(
+                !self.starts[&pos].contains_key(id),
+                "duplicate structure start"
+            );
+            ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
+            for piece in &start.pieces {
+                super::ocean_ruin::SavedOceanRuinPiece::capture(piece, start.temperature)?;
+            }
+        }
+        if !starts.is_empty() {
+            self.ocean_starts.insert(pos, starts);
+        }
+        Ok(())
+    }
+
     /// Construct all state for a newly added start chunk before publishing it.
     fn insert_starts(&mut self, pos: ChunkPos, starts: SimpleStarts) -> Result<()> {
         ensure!(
@@ -382,18 +412,17 @@ impl StructureGenerationBatch {
             self.is_complete(),
             "structure batch has unfinished or failed work"
         );
-        ensure!(
-            plan.starts()
-                .all(|pos| !self.ocean_starts.contains_key(&pos)),
-            "ocean ruin decoration and persistence are not yet supported"
-        );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
             let starts = self
-                .starts(pos)
+                .starts
+                .get(&pos)
                 .context("structure starts required by plan are missing")?;
             if existing.is_none_or(|old| !old.starts.contains_key(&pos)) {
                 added.insert_starts(pos, starts.clone())?;
+                if let Some(ocean) = self.ocean_starts.get(&pos) {
+                    added.insert_ocean_starts(pos, ocean.clone())?;
+                }
             }
         }
         for pos in plan.references() {
@@ -485,10 +514,6 @@ impl StructureGenerationBatch {
             "structure batch has unfinished or failed work"
         );
         ensure!(
-            self.ocean_starts.is_empty(),
-            "ocean ruin decoration and persistence are not yet supported"
-        );
-        ensure!(
             self.generator.structure_context,
             "generator lacks structure context"
         );
@@ -501,9 +526,17 @@ impl StructureGenerationBatch {
             terrain,
             ..Default::default()
         };
+        let mut ocean_starts = self.ocean_starts;
         for (pos, starts) in self.starts {
             stages.insert_starts(pos, starts)?;
+            if let Some(ocean) = ocean_starts.remove(&pos) {
+                stages.insert_ocean_starts(pos, ocean)?;
+            }
         }
+        ensure!(
+            ocean_starts.is_empty(),
+            "ocean ruin source chunk is missing"
+        );
         Ok((self.generator, stages))
     }
 
@@ -559,6 +592,11 @@ impl StructureGenerationBatch {
         (!self.failed && !self.ocean_starts.contains_key(&pos))
             .then(|| self.starts.get(&pos))
             .flatten()
+    }
+
+    /// Whether the start stage is complete, including multi-piece starts.
+    pub fn has_starts(&self, pos: ChunkPos) -> bool {
+        !self.failed && self.starts.contains_key(&pos)
     }
 
     /// Return all ocean ruins generated for a completed start chunk.

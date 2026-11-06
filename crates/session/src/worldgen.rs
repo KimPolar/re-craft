@@ -5314,6 +5314,7 @@ mod tests {
         starts.insert(center, BTreeMap::from([(structure_id, structure)]));
         batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
             starts,
+            ocean_starts: BTreeMap::new(),
             huts: BTreeMap::new(),
             references: BTreeMap::from([(center, references)]),
             terrain: BTreeMap::new(),
@@ -7655,6 +7656,7 @@ mod tests {
             assert!(batch.starts(target).is_none());
             let scheduled = &batch.ocean_ruin_starts(target).unwrap()[&structure_id];
             assert!(scheduled.pieces.len() > 1);
+            let piece_count = scheduled.pieces.len();
             batch.request_references(target).unwrap();
             while batch
                 .step(&mut data, &mut |v| classify(v))
@@ -7681,7 +7683,22 @@ mod tests {
                 schedule::GenerationStage::StructureReferences,
             )])
             .unwrap();
-            assert!(batch.prepare_additional_stages(&plan, None).is_err());
+            let added = batch.prepare_additional_stages(&plan, None).unwrap();
+            assert_eq!(
+                added.ocean_starts[&target][&structure_id].pieces.len(),
+                piece_count
+            );
+            assert!(added.references[&target].membership()[&structure_id].contains(&packed));
+            let (_, transferred) = batch
+                .into_terrain_stages(BTreeMap::from([(target, order)]))
+                .unwrap();
+            assert_eq!(
+                transferred.ocean_starts[&target][&structure_id]
+                    .pieces
+                    .len(),
+                piece_count
+            );
+            assert!(transferred.terrain[&target].affected_bounds().is_some());
             data.0.remove("ruin-template");
             assert!(
                 generator

@@ -7814,6 +7814,9 @@ mod tests {
                             3 => {
                                 json!({"element_type":"minecraft:feature_pool_element","feature":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_block_tag","tag":"minecraft:dirt"}}]},"projection":projection})
                             }
+                            4 => {
+                                json!({"element_type":"minecraft:feature_pool_element","feature":"minecraft:pile_hay","projection":projection})
+                            }
                             _ => {
                                 json!({"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":projection})
                             }
@@ -7871,6 +7874,7 @@ mod tests {
             (false, false, "minecraft:melon", 1),
             (false, true, "minecraft:melon", 2),
             (false, false, "minecraft:melon", 3),
+            (false, false, "minecraft:hay_block", 4),
         ] {
             let chest = block_name == "minecraft:chest";
             let mut block = vec![
@@ -7932,9 +7936,16 @@ mod tests {
                 terrain_matching,
                 feature_kind,
             };
+            let mut terrain_definition = definition();
+            if feature_kind == 4 {
+                terrain_definition["settings"]["noise_router"]["final_density"] = json!({
+                    "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
+                    "from_value":1.0, "to_value":-1.0
+                });
+            }
             let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
                 &mut data,
-                &definition(),
+                &terrain_definition,
                 42,
                 0,
                 16,
@@ -7994,10 +8005,10 @@ mod tests {
                 has_skylight: true,
                 ambient_light: Some(0.0),
             };
-            let placed_features = if feature_kind == 2 {
-                BTreeSet::from([ResourceId::parse("example:test")?])
-            } else {
-                BTreeSet::new()
+            let placed_features = match feature_kind {
+                2 => BTreeSet::from([ResourceId::parse("example:test")?]),
+                4 => BTreeSet::from([ResourceId::parse("minecraft:pile_hay")?]),
+                _ => BTreeSet::new(),
             };
             batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
             batch.enable_light_initialization(registry)?;
@@ -8051,18 +8062,30 @@ mod tests {
                     batch.schedule().completed(target),
                     Some(schedule::GenerationStage::Features)
                 );
-                assert_eq!(
-                    batch
-                        .snapshot()
-                        .context("missing terrain")?
-                        .block(origin[0], origin[1], origin[2])
-                        .context("missing placed block")?
-                        .name,
-                    block_name
-                );
+                let snapshot = batch.snapshot().context("missing terrain")?;
+                if feature_kind == 4 {
+                    let found = (-3..=3).any(|dz| {
+                        (-3..=3).any(|dx| {
+                            (0..=1).any(|dy| {
+                                snapshot
+                                    .block(origin[0] + dx, origin[1] + dy, origin[2] + dz)
+                                    .is_some_and(|state| state.name == block_name)
+                            })
+                        })
+                    });
+                    assert!(found, "hay pile produced no blocks");
+                } else {
+                    assert_eq!(
+                        snapshot
+                            .block(origin[0], origin[1], origin[2])
+                            .context("missing placed block")?
+                            .name,
+                        block_name
+                    );
+                }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2
+                    feature_kind == 0 || feature_kind == 2 || feature_kind == 4
                 );
                 assert!(
                     batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))

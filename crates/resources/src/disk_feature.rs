@@ -46,6 +46,14 @@ pub trait DiskWorld: OreWorld {
     ) -> Result<Self::State> {
         bail!("integer block properties are unavailable")
     }
+    /// Apply RotatedBlockProvider's trySetValue operations for one direction.
+    fn with_provider_direction(
+        &mut self,
+        _state: Self::State,
+        _direction: [i32; 3],
+    ) -> Result<Self::State> {
+        bail!("rotated provider state properties are unavailable")
+    }
     fn fluid_in_tag(&mut self, _state: &Self::State, _tag: &ResourceId) -> Result<bool> {
         bail!("unsupported survival fluid tag")
     }
@@ -521,6 +529,10 @@ pub(crate) enum Provider<S> {
         property: String,
         values: IntProvider,
     },
+    Rotated {
+        source: Box<Provider<S>>,
+        direction: Option<[i32; 3]>,
+    },
 }
 impl<S: Clone> Provider<S> {
     /// Holder strings refer to the active data-pack state-provider registry.
@@ -545,7 +557,9 @@ impl<S: Clone> Provider<S> {
                         .iter()
                         .any(|(p, v)| p.needs_survival(name) || v.needs_survival(name))
             }
-            Self::RandomizedInt { source, .. } => source.needs_survival(name),
+            Self::RandomizedInt { source, .. } | Self::Rotated { source, .. } => {
+                source.needs_survival(name)
+            }
             _ => false,
         }
     }
@@ -604,6 +618,34 @@ impl<S: Clone> Provider<S> {
             "simple" => Ok(Self::State(resolve(
                 value.get("state").context("missing provider state")?,
             )?)),
+            "rotated" => {
+                let direction = match value.get("direction") {
+                    None => None,
+                    Some(Value::String(name)) => Some(match name.as_str() {
+                        "down" => [0, -1, 0],
+                        "up" => [0, 1, 0],
+                        "north" => [0, 0, -1],
+                        "south" => [0, 0, 1],
+                        "west" => [-1, 0, 0],
+                        "east" => [1, 0, 0],
+                        _ => bail!("invalid rotated provider direction"),
+                    }),
+                    _ => bail!("invalid rotated provider direction"),
+                };
+                let source = Self::decode_inner(
+                    value
+                        .get("state")
+                        .context("missing rotated provider state")?,
+                    resolve,
+                    depth + 1,
+                    resources,
+                    active,
+                )?;
+                Ok(Self::Rotated {
+                    source: Box::new(source),
+                    direction,
+                })
+            }
             "weighted" => {
                 let values = value
                     .get("entries")
@@ -748,7 +790,7 @@ impl<S: Clone> Provider<S> {
         }
     }
     pub(crate) fn tags(&self, tags: &mut BTreeSet<ResourceId>) {
-        if let Self::RandomizedInt { source, .. } = self {
+        if let Self::RandomizedInt { source, .. } | Self::Rotated { source, .. } = self {
             source.tags(tags);
         }
         if let Self::Rules { fallback, rules } = self {
@@ -762,7 +804,7 @@ impl<S: Clone> Provider<S> {
         }
     }
     pub(crate) fn blocks(&self, blocks: &mut BTreeSet<ResourceId>) {
-        if let Self::RandomizedInt { source, .. } = self {
+        if let Self::RandomizedInt { source, .. } | Self::Rotated { source, .. } = self {
             source.blocks(blocks);
         }
         if let Self::Rules { fallback, rules } = self {
@@ -794,7 +836,9 @@ impl<S: Clone> Provider<S> {
                     provider.states(states);
                 }
             }
-            Self::RandomizedInt { source, .. } => source.states(states),
+            Self::RandomizedInt { source, .. } | Self::Rotated { source, .. } => {
+                source.states(states)
+            }
         }
     }
     pub(crate) fn state<W: DiskWorld<State = S>>(
@@ -883,6 +927,23 @@ impl<S: Clone> Provider<S> {
                     "randomized property {property} value {value} is outside {min}..={max}"
                 );
                 Ok(Some(world.with_integer_property(state, property, value)?))
+            }
+            Self::Rotated { source, direction } => {
+                let direction = match direction {
+                    Some(value) => *value,
+                    None => [
+                        [0, -1, 0],
+                        [0, 1, 0],
+                        [0, 0, -1],
+                        [0, 0, 1],
+                        [-1, 0, 0],
+                        [1, 0, 0],
+                    ][random.next_int_bound(6).expect("positive bound") as usize],
+                };
+                let Some(state) = source.state(world, random, pos)? else {
+                    return Ok(None);
+                };
+                Ok(Some(world.with_provider_direction(state, direction)?))
             }
         }
     }

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
 use native_resources::{
     block_column_feature::{BlockColumnFeature, ColumnWorld},
+    block_pile::{BlockPileFeature, BlockPileWorld},
     disk_feature::{BlockPredicate, DiskFeature, DiskWorld, is_simple_carpet_id},
     feature_order::{FeatureHolderIndex, FeatureKey, FeatureSchedule, FeatureTags},
     freeze_feature::freeze_top_layer,
@@ -592,6 +593,7 @@ pub struct PlacedDecorationFeature {
 enum ConfiguredDecoration {
     Ore(ConfiguredOre<BlockState>),
     Disk(DiskFeature<BlockState>),
+    Pile(BlockPileFeature<BlockState>),
     Simple(SimpleBlockFeature<BlockState>),
     Spring(SpringFeature<BlockState>),
     Magma(UnderwaterMagma<BlockState>),
@@ -626,6 +628,7 @@ impl ConfiguredDecoration {
     fn required_blocks(&self) -> BTreeSet<ResourceId> {
         match self {
             Self::Disk(v) => v.required_blocks(),
+            Self::Pile(v) => v.required_blocks(),
             Self::Simple(v) => v.required_blocks(),
             Self::Spring(v) => v.required_blocks(),
             Self::Column(v) => v.required_blocks(),
@@ -686,6 +689,7 @@ impl ConfiguredDecoration {
     fn needs_survival(&self, name: &str) -> bool {
         match self {
             Self::Disk(v) => v.needs_survival(name),
+            Self::Pile(v) => v.needs_survival(name),
             Self::Simple(v) => v.needs_survival(name),
             Self::Column(v) => v.needs_survival(name),
             Self::Lake(v) => v.needs_survival(name),
@@ -845,6 +849,9 @@ impl ConfiguredDecoration {
                 Ok(Self::Ore(ConfiguredOre::decode(value, resolve)?))
             }
             ("minecraft", "disk") => Ok(Self::Disk(DiskFeature::decode(value, resolve)?)),
+            ("minecraft", "block_pile") => Ok(Self::Pile(BlockPileFeature::decode(
+                provider, value, resolve,
+            )?)),
             ("minecraft", "simple_block") => Ok(Self::Simple(
                 SimpleBlockFeature::decode_with_resources(provider, value, resolve)?,
             )),
@@ -1004,6 +1011,7 @@ impl ConfiguredDecoration {
         match self {
             Self::Ore(v) => v.required_tags(),
             Self::Disk(v) => v.required_tags(),
+            Self::Pile(v) => v.required_tags(),
             Self::Spring(v) => v.required_tags(),
             Self::Magma(_) => BTreeSet::new(),
             Self::Column(v) => v.required_tags(),
@@ -1105,6 +1113,7 @@ impl ConfiguredDecoration {
         match self {
             Self::Ore(v) => v.place(world, random, pos),
             Self::Disk(v) => v.place(world, random, pos),
+            Self::Pile(v) => v.place(world, random, pos),
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
             Self::Magma(v) => v.place(world, random, pos),
@@ -5982,6 +5991,42 @@ impl GeodeEnvironment for DecorationRegion<'_> {
 }
 
 impl DiskWorld for DecorationRegion<'_> {
+    fn with_provider_direction(
+        &mut self,
+        mut state: BlockState,
+        direction: [i32; 3],
+    ) -> Result<BlockState> {
+        let (name, axis) = match direction {
+            [0, -1, 0] => ("down", "y"),
+            [0, 1, 0] => ("up", "y"),
+            [0, 0, -1] => ("north", "z"),
+            [0, 0, 1] => ("south", "z"),
+            [-1, 0, 0] => ("west", "x"),
+            [1, 0, 0] => ("east", "x"),
+            _ => bail!("invalid rotated provider direction"),
+        };
+        if let Some(value) = state.properties.get_mut("axis") {
+            ensure!(
+                matches!(value.as_str(), "x" | "y" | "z"),
+                "invalid provider axis"
+            );
+            *value = axis.into();
+        }
+        if state.properties.contains_key("facing") {
+            let registry = self
+                .light_guard
+                .as_ref()
+                .map(|guard| guard.registry)
+                .context("rotated facing provider requires a block registry")?;
+            let mut candidate = state.properties.clone();
+            candidate.insert("facing".into(), name.into());
+            if registry.is_canonical_state(&state.name, &candidate) {
+                state.properties = candidate;
+            }
+        }
+        Ok(state)
+    }
+
     fn face_sturdy(
         &mut self,
         state: &BlockState,
@@ -6239,6 +6284,56 @@ impl DiskWorld for DecorationRegion<'_> {
             self.failed = true;
         }
         result
+    }
+}
+
+fn pile_safe_full_block(state: &BlockState) -> bool {
+    match state.name.as_str() {
+        "minecraft:hay_block" => {
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("axis").map(String::as_str),
+                    Some("x" | "y" | "z")
+                )
+        }
+        "minecraft:melon" | "minecraft:pumpkin" | "minecraft:blue_ice" | "minecraft:packed_ice" => {
+            state.properties.is_empty()
+        }
+        _ => false,
+    }
+}
+
+impl BlockPileWorld for DecorationRegion<'_> {
+    fn min_y(&self) -> i32 {
+        self.target.min_y
+    }
+    fn is_dirt_path(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(state.name == "minecraft:dirt_path" && state.properties.is_empty())
+    }
+    fn pile_sturdy_up(&mut self, state: &BlockState, pos: [i32; 3]) -> Result<bool> {
+        if pile_safe_full_block(state) {
+            Ok(true)
+        } else {
+            self.face_sturdy(state, pos, [0, 1, 0])
+        }
+    }
+    fn set_pile_block(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        if !self.writable.contains(&chunk(pos)) || self.is_outside(pos[1]) {
+            return Ok(());
+        }
+        ensure!(
+            pile_safe_full_block(state),
+            "unsupported block pile placement effects: {}",
+            state.name
+        );
+        let old = self.read(pos)?;
+        ensure!(
+            is_air(&old)
+                && !self.monster_entities.contains_key(&pos)
+                && !self.bee_nests.contains_key(&pos),
+            "unsupported block pile replacement source"
+        );
+        self.set_proto_block(pos, state)
     }
 }
 

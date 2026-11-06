@@ -653,6 +653,7 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
             | "spring_feature"
             | "underwater_magma"
             | "block_column"
+            | "block_pile"
             | "lake"
             | "freeze_top_layer"
             | "monster_room"
@@ -5520,7 +5521,7 @@ mod entity_source_tests {
         }
         assert_eq!(found.get("oak"), Some(&true));
         assert_eq!(found.get("flower_plain"), Some(&true));
-        assert_eq!(found.get("pile_hay"), Some(&false));
+        assert_eq!(found.get("pile_hay"), Some(&true));
     }
 
     #[test]

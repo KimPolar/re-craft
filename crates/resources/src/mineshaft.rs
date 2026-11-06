@@ -7,6 +7,7 @@ use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
 mod graph;
 mod placement;
+mod support;
 pub use graph::{
     MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,
     PlacedMineshaft,
@@ -14,6 +15,9 @@ pub use graph::{
 pub use placement::{
     MineshaftCrossingWorld, MineshaftPlacementOutcome, MineshaftPlacementWorld, place_crossing,
     place_room_or_stairs,
+};
+pub use support::{
+    MineshaftSupportBlock, MineshaftSupportOutcome, MineshaftSupportWorld, place_vertical_support,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

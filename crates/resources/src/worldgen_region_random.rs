@@ -102,6 +102,13 @@ impl RegionRandom {
         }
     }
 
+    pub fn next_gaussian(&mut self) -> f64 {
+        match self {
+            Self::Legacy(random) => random.next_gaussian(),
+            Self::Xoroshiro(random) => random.next_gaussian(),
+        }
+    }
+
     pub fn next_int(&mut self) -> i32 {
         match self {
             Self::Legacy(random) => random.next_int(),

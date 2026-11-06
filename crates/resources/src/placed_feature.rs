@@ -19,6 +19,12 @@ pub(crate) enum IntProvider {
     Uniform(i32, i32),
     Biased(i32, i32),
     VeryBiased(i32, i32),
+    ClampedNormal {
+        mean: f32,
+        deviation: f32,
+        min: i32,
+        max: i32,
+    },
     Trapezoid(i32, i32, i32),
     Weighted(Vec<(i32, IntProvider)>, i32),
     Clamped(Box<IntProvider>, i32, i32),
@@ -26,20 +32,30 @@ pub(crate) enum IntProvider {
 
 trait IntProviderRandom {
     fn bounded(&mut self, bound: i32) -> Option<i32>;
+    fn gaussian(&mut self) -> f64;
 }
 impl IntProviderRandom for DecorationRandom {
     fn bounded(&mut self, bound: i32) -> Option<i32> {
         self.next_int_bound(bound)
+    }
+    fn gaussian(&mut self) -> f64 {
+        self.next_gaussian()
     }
 }
 impl IntProviderRandom for LegacyRandom {
     fn bounded(&mut self, bound: i32) -> Option<i32> {
         self.next_int_bound(bound)
     }
+    fn gaussian(&mut self) -> f64 {
+        self.next_gaussian()
+    }
 }
 impl IntProviderRandom for crate::worldgen_region_random::RegionRandom {
     fn bounded(&mut self, bound: i32) -> Option<i32> {
         self.next_int_bound(bound)
+    }
+    fn gaussian(&mut self) -> f64 {
+        self.next_gaussian()
     }
 }
 
@@ -117,6 +133,26 @@ impl IntProvider {
                 );
                 Self::VeryBiased(min, max)
             }
+            "clamped_normal" => {
+                let float = |field: &str| -> Result<f32> {
+                    let result = value
+                        .get(field)
+                        .and_then(Value::as_f64)
+                        .with_context(|| format!("missing or invalid {field}"))?
+                        as f32;
+                    ensure!(result.is_finite(), "non-finite normal provider parameter");
+                    Ok(result)
+                };
+                let min = integer(value, "min_inclusive")?;
+                let max = integer(value, "max_inclusive")?;
+                ensure!(min <= max, "invalid normal integer range");
+                Self::ClampedNormal {
+                    mean: float("mean")?,
+                    deviation: float("deviation")?,
+                    min,
+                    max,
+                }
+            }
             "trapezoid" => {
                 let min = integer(value, "min")?;
                 let max = integer(value, "max")?;
@@ -177,6 +213,7 @@ impl IntProvider {
             | Self::Biased(a, b)
             | Self::VeryBiased(a, b)
             | Self::Trapezoid(a, b, _) => (*a, *b),
+            Self::ClampedNormal { min, max, .. } => (*min, *max),
             Self::Weighted(items, _) => items
                 .iter()
                 .map(|(_, p)| p.bounds())
@@ -211,6 +248,15 @@ impl IntProvider {
                 let outer = random.bounded(b - a + 1).unwrap() + 1;
                 let inner = random.bounded(outer).unwrap() + 1;
                 a.wrapping_add(random.bounded(inner).unwrap())
+            }
+            Self::ClampedNormal {
+                mean,
+                deviation,
+                min,
+                max,
+            } => {
+                let sample = *mean + random.gaussian() as f32 * *deviation;
+                sample.clamp(*min as f32, *max as f32) as i32
             }
             Self::Trapezoid(a, b, plateau) => {
                 if *plateau == 0 && *b == a.wrapping_neg() {

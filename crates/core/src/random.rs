@@ -48,23 +48,29 @@ impl BlockRandomPosition {
 #[derive(Clone, Debug)]
 pub struct LegacyRandom {
     seed: u64,
+    gaussian: Option<f64>,
 }
 
 impl LegacyRandom {
     pub fn new(seed: i64) -> Self {
         Self {
             seed: (seed as u64 ^ 0x5deece66d) & ((1u64 << 48) - 1),
+            gaussian: None,
         }
     }
 
-    /// Capture the internal 48-bit state without advancing the generator.
+    /// Capture the internal 48-bit uniform state without advancing it. This
+    /// does not include a cached Gaussian; clone the generator to retain both.
     pub fn state(&self) -> u64 {
         self.seed
     }
 
-    /// Restore a previously captured internal state, rejecting non-48-bit data.
+    /// Restore a 48-bit uniform state with an empty Gaussian cache.
     pub fn from_state(state: u64) -> Option<Self> {
-        (state < (1u64 << 48)).then_some(Self { seed: state })
+        (state < (1u64 << 48)).then_some(Self {
+            seed: state,
+            gaussian: None,
+        })
     }
 
     fn bits(&mut self, count: u32) -> u32 {
@@ -134,6 +140,15 @@ impl LegacyRandom {
         value as f64 * (1.0 / 9_007_199_254_740_992.0)
     }
 
+    pub fn next_gaussian(&mut self) -> f64 {
+        if let Some(value) = self.gaussian.take() {
+            return value;
+        }
+        let (value, cached) = gaussian_pair(|| self.next_double());
+        self.gaussian = Some(cached);
+        value
+    }
+
     /// `WorldgenRandom.setDecorationSeed` when backed by LegacyRandomSource.
     pub fn set_decoration_seed(&mut self, world_seed: i64, block_x: i32, block_z: i32) -> i64 {
         *self = Self::new(world_seed);
@@ -152,6 +167,7 @@ impl LegacyRandom {
 pub struct XoroshiroRandom {
     low: u64,
     high: u64,
+    gaussian: Option<f64>,
 }
 
 impl XoroshiroRandom {
@@ -168,9 +184,14 @@ impl XoroshiroRandom {
             Self {
                 low: GOLDEN,
                 high: SILVER,
+                gaussian: None,
             }
         } else {
-            Self { low, high }
+            Self {
+                low,
+                high,
+                gaussian: None,
+            }
         }
     }
 
@@ -193,7 +214,7 @@ impl XoroshiroRandom {
         Self::from_state(mix_stafford13(low), mix_stafford13(high))
     }
 
-    /// State words in the order used by Java's xoroshiro codec.
+    /// State words in Java's xoroshiro codec; the Gaussian cache is omitted.
     pub fn state(&self) -> (u64, u64) {
         (self.low, self.high)
     }
@@ -238,6 +259,26 @@ impl XoroshiroRandom {
     pub fn next_double(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
     }
+    pub fn next_gaussian(&mut self) -> f64 {
+        if let Some(value) = self.gaussian.take() {
+            return value;
+        }
+        let (value, cached) = gaussian_pair(|| self.next_double());
+        self.gaussian = Some(cached);
+        value
+    }
+}
+
+fn gaussian_pair(mut next_double: impl FnMut() -> f64) -> (f64, f64) {
+    loop {
+        let x = 2.0 * next_double() - 1.0;
+        let y = 2.0 * next_double() - 1.0;
+        let radius = x * x + y * y;
+        if radius < 1.0 && radius != 0.0 {
+            let scale = (-2.0 * radius.ln() / radius).sqrt();
+            return (x * scale, y * scale);
+        }
+    }
 }
 
 /// Java 26.3's `WorldgenRandom` over a xoroshiro source, used during decoration.
@@ -246,14 +287,18 @@ impl XoroshiroRandom {
 #[derive(Clone, Debug)]
 pub struct DecorationRandom {
     source: XoroshiroRandom,
+    gaussian: Option<f64>,
 }
 impl DecorationRandom {
     pub fn new(seed: i64) -> Self {
         Self {
             source: XoroshiroRandom::new(seed),
+            gaussian: None,
         }
     }
     pub fn set_seed(&mut self, seed: i64) {
+        // Java's WorldgenRandom reseeds its source without clearing its own
+        // inherited Gaussian cache.
         self.source = XoroshiroRandom::new(seed);
     }
     fn bits(&mut self, bits: u32) -> u32 {
@@ -290,6 +335,14 @@ impl DecorationRandom {
     pub fn next_double(&mut self) -> f64 {
         let value = (u64::from(self.bits(26)) << 27) | u64::from(self.bits(27));
         value as f64 * (1.0 / 9_007_199_254_740_992.0)
+    }
+    pub fn next_gaussian(&mut self) -> f64 {
+        if let Some(value) = self.gaussian.take() {
+            return value;
+        }
+        let (value, cached) = gaussian_pair(|| self.next_double());
+        self.gaussian = Some(cached);
+        value
     }
     pub fn set_decoration_seed(&mut self, seed: i64, block_x: i32, block_z: i32) -> i64 {
         self.set_seed(seed);

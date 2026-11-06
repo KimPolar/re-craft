@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use native_core::random::{LegacyRandom, XoroshiroRandom};
+use native_core::random::{DecorationRandom, LegacyRandom, XoroshiroRandom};
 use native_resources::{
     enchantment_selection::{self, Candidate, LevelCost},
     packs::{ResourceId, ResourceProvider, ResourceStack},
@@ -17,6 +17,42 @@ use serde_json::Value;
 struct ProviderOverlay<'a> {
     base: &'a mut ResourceStack,
     definition: Vec<u8>,
+}
+
+enum GaussianRandom {
+    Legacy(LegacyRandom),
+    Xoroshiro(XoroshiroRandom),
+    Decoration(DecorationRandom),
+}
+impl GaussianRandom {
+    fn gaussian(&mut self) -> f64 {
+        match self {
+            Self::Legacy(r) => r.next_gaussian(),
+            Self::Xoroshiro(r) => r.next_gaussian(),
+            Self::Decoration(r) => r.next_gaussian(),
+        }
+    }
+    fn long(&mut self) -> i64 {
+        match self {
+            Self::Legacy(r) => r.next_long(),
+            Self::Xoroshiro(r) => r.next_long(),
+            Self::Decoration(r) => r.next_long(),
+        }
+    }
+    fn int(&mut self) -> i32 {
+        match self {
+            Self::Legacy(r) => r.next_int(),
+            Self::Xoroshiro(r) => r.next_int(),
+            Self::Decoration(r) => r.next_int(),
+        }
+    }
+    fn reseed(&mut self, seed: i64) {
+        match self {
+            Self::Legacy(r) => *r = LegacyRandom::new(seed),
+            Self::Xoroshiro(r) => *r = XoroshiroRandom::new(seed),
+            Self::Decoration(r) => r.set_seed(seed),
+        }
+    }
 }
 impl ResourceProvider for ProviderOverlay<'_> {
     fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -106,15 +142,93 @@ fn enchantment_selection_matches_java() -> Result<()> {
     let mut cost_tested = 0;
     let mut provider_tested = 0;
     let mut custom_tested = 0;
+    let mut gaussian_tested = 0;
+    let mut chained_tested = 0;
     for line in output.lines().filter(|line| {
         line.starts_with("C\t")
             || line.starts_with("R\t")
             || line.starts_with("D\t")
             || line.starts_with("P\t")
             || line.starts_with("Q\t")
+            || line.starts_with("G\t")
+            || line.starts_with("H\t")
     }) {
         let parts: Vec<_> = line.split('\t').collect();
-        if parts[0] == "D" {
+        if parts[0] == "G" {
+            ensure!(parts.len() == 10, "invalid Gaussian row");
+            let seed: i64 = parts[2].parse()?;
+            let mut random = match parts[1] {
+                "0" => GaussianRandom::Legacy(LegacyRandom::new(seed)),
+                "1" => GaussianRandom::Xoroshiro(XoroshiroRandom::new(seed)),
+                "2" => GaussianRandom::Decoration(DecorationRandom::new(seed)),
+                _ => bail!("unknown Gaussian random source"),
+            };
+            let bits = |value: f64| value.to_bits() as i64;
+            assert_eq!(
+                bits(random.gaussian()),
+                parts[3].parse::<i64>()?,
+                "first Gaussian {} {seed}",
+                parts[1]
+            );
+            assert_eq!(random.long(), parts[4].parse::<i64>()?);
+            assert_eq!(
+                bits(random.gaussian()),
+                parts[5].parse::<i64>()?,
+                "cached Gaussian {} {seed}",
+                parts[1]
+            );
+            assert_eq!(random.int(), parts[6].parse::<i32>()?);
+            assert_eq!(
+                bits(random.gaussian()),
+                parts[7].parse::<i64>()?,
+                "third Gaussian {} {seed}",
+                parts[1]
+            );
+            random.reseed(seed + 1);
+            assert_eq!(
+                bits(random.gaussian()),
+                parts[8].parse::<i64>()?,
+                "reseeded Gaussian {} {seed}",
+                parts[1]
+            );
+            assert_eq!(random.long(), parts[9].parse::<i64>()?);
+            gaussian_tested += 1;
+        } else if parts[0] == "H" {
+            ensure!(parts.len() == 10, "invalid chained provider row");
+            let key = format!("{}:{}:{}", parts[1], parts[4], parts[5]);
+            let provider = custom_providers
+                .get(&key)
+                .context("chained provider is missing")?;
+            let seed = parts[3].parse()?;
+            let mut random = if parts[2] == "0" {
+                RegionRandom::Legacy(LegacyRandom::new(seed))
+            } else {
+                RegionRandom::Xoroshiro(XoroshiroRandom::new(seed))
+            };
+            let render = |selected: Vec<enchantment_selection::Selected>| {
+                let mut result: Vec<_> = selected
+                    .iter()
+                    .map(|entry| {
+                        format!("{}:{}={}", entry.id.namespace, entry.id.path, entry.level)
+                    })
+                    .collect();
+                result.sort();
+                result.join(",")
+            };
+            assert_eq!(
+                render(provider.enchant(&mut random, 0.5)?),
+                parts[6],
+                "first chained provider {key} seed {seed}"
+            );
+            assert_eq!(random.next_int(), parts[7].parse::<i32>()?);
+            assert_eq!(
+                render(provider.enchant(&mut random, 0.5)?),
+                parts[8],
+                "second chained provider {key} seed {seed}"
+            );
+            assert_eq!(random.next_long(), parts[9].parse::<i64>()?);
+            chained_tested += 1;
+        } else if parts[0] == "D" {
             ensure!(parts.len() == 6, "invalid provider cost row");
             let seed = parts[2].parse()?;
             let mut random = if parts[1] == "0" {
@@ -153,6 +267,9 @@ fn enchantment_selection_matches_java() -> Result<()> {
                     }
                     "7" => {
                         serde_json::json!({"type":"minecraft:very_biased_to_bottom","min_inclusive":-5,"max_inclusive":13})
+                    }
+                    "8" => {
+                        serde_json::json!({"type":"minecraft:clamped_normal","mean":3.25,"deviation":4.75,"min_inclusive":-10,"max_inclusive":15})
                     }
                     _ => bail!("unknown integer provider case"),
                 };
@@ -307,7 +424,9 @@ fn enchantment_selection_matches_java() -> Result<()> {
     assert_eq!(tested, 5120);
     assert_eq!(cost_tested, 1024);
     assert_eq!(provider_tested, 2048);
-    assert_eq!(custom_tested, 4096);
+    assert_eq!(custom_tested, 4608);
+    assert_eq!(gaussian_tested, 1536);
+    assert_eq!(chained_tested, 512);
     assert!(
         multi > 0,
         "expected at least one multiple-enchantment result"

@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
 use anyhow::Result;
 use native_resources::{
-    animal_variants::{FarmAnimal, FarmAnimalSpawnVariants, FarmAnimalVariants},
+    animal_variants::{
+        FarmAnimal, FarmAnimalSpawnVariants, FarmAnimalVariants, ZombieNautilusSpawnVariants,
+    },
     density::WorldgenRandom,
     packs::{ResourceId, ResourceProvider, ResourceStack},
     worldgen_region_random::{AnimalGroupData, RegionRandom},
@@ -114,6 +116,34 @@ fn animal_initialization_preserves_random_and_group_on_unknown_biome() {
     );
     assert_eq!(group, expected_group);
     assert_eq!(random.next_long(), expected_random.next_long());
+}
+
+#[test]
+fn zombie_nautilus_selection_uses_pack_variants_and_preserves_random_on_error() {
+    let mut data = Data::default();
+    data.0.insert(
+        "data/minecraft/worldgen/biome/plains.json".into(),
+        b"{}".to_vec(),
+    );
+    data.0.insert("data/minecraft/zombie_nautilus_variant/custom.json".into(),
+        br#"{"spawn_conditions":[{"priority":1,"condition":{"type":"minecraft:biome","biomes":"minecraft:plains"}}]}"#.to_vec());
+    let variants = ZombieNautilusSpawnVariants::load_active(&mut data).unwrap();
+    for seed in 0..32 {
+        let mut random = RegionRandom::new(seed, WorldgenRandom::Legacy, 0, 0);
+        let init = variants
+            .finalize_structure_spawn(&id("plains"), &mut random)
+            .unwrap();
+        assert_eq!(init.variant, id("custom"));
+        assert!((2400..=3600).contains(&init.attack_cooldown));
+        assert!(!init.animal.set_baby_age);
+        let mut before = random.clone();
+        assert!(
+            variants
+                .finalize_structure_spawn(&id("desert"), &mut random)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), before.next_long());
+    }
 }
 
 #[test]

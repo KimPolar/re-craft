@@ -111,6 +111,8 @@ public class GeneratedFarmAnimalOracle {
                 case "minecraft:desert" -> tags.add(BiomeTags.SPAWNS_WARM_VARIANT_FARM_ANIMALS);
                 case "minecraft:snowy_plains" -> tags.add(BiomeTags.SPAWNS_COLD_VARIANT_FARM_ANIMALS);
                 case "minecraft:plains" -> { }
+                case "minecraft:ocean" -> { }
+                case "minecraft:warm_ocean" -> tags.add(BiomeTags.SPAWNS_CORAL_VARIANT_ZOMBIE_NAUTILUS);
                 default -> throw new AssertionError(biomeId);
             }
             bindTags.invoke(biome,tags);
@@ -125,18 +127,22 @@ public class GeneratedFarmAnimalOracle {
             });
             var group=new AgeableMob.AgeableMobGroupData(true,test.get("chance").getAsFloat());
             boolean jockey=test.has("jockey") && test.get("jockey").getAsBoolean();
+            boolean nautilus=test.get("animal").getAsString().equals("zombie_nautilus");
             int index=0;
             for(var path:test.getAsJsonArray("paths")) {
                 var animal=switch(test.get("animal").getAsString()) {
                     case "pig" -> new TestPig(world);
                     case "cow" -> new TestCow(world);
                     case "chicken" -> new TestChicken(world);
+                    case "zombie_nautilus" -> new ObserveZombieNautilus(world);
                     default -> throw new AssertionError();
                 };
                 if(animal instanceof Chicken chicken) eggField.setInt(chicken,new int[]{6000,8999,11999}[index]);
                 animal.setUUID(new UUID(1,2)); animal.setPos(3.5,10,-2.5); animal.setYRot(22.5f); animal.setXRot(0);
-                var result=animal.finalizeSpawn(region,null,jockey?EntitySpawnReason.JOCKEY:EntitySpawnReason.CHUNK_GENERATION,jockey?null:group);
-                if(!jockey && result!=group) throw new AssertionError("group identity");
+                if(nautilus) animal.setPersistenceRequired();
+                var reason=nautilus?EntitySpawnReason.STRUCTURE:jockey?EntitySpawnReason.JOCKEY:EntitySpawnReason.CHUNK_GENERATION;
+                var result=animal.finalizeSpawn(region,null,reason,(jockey||nautilus)?null:group);
+                if(!jockey && !nautilus && result!=group) throw new AssertionError("group identity");
                 if(jockey) ((Chicken)animal).setChickenJockey(true);
                 var output=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
                 if(!animal.save(output)) throw new AssertionError("entity not saved");
@@ -144,7 +150,7 @@ public class GeneratedFarmAnimalOracle {
                 if(!javaTag.equals(rustTag)) throw new AssertionError("case="+test+" index="+index+" java="+javaTag+" rust="+rustTag);
                 index++;
             }
-            if(jockey && random.nextLong()!=test.get("next_random").getAsLong()) throw new AssertionError("jockey random mismatch: "+test);
+            if((jockey||nautilus) && random.nextLong()!=test.get("next_random").getAsLong()) throw new AssertionError("jockey random mismatch: "+test);
         }
         if(args.length>1) {
             var seedField=LegacyRandomSource.class.getDeclaredField("seed"); seedField.setAccessible(true);

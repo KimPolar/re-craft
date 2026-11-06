@@ -84,7 +84,7 @@ impl FarmAnimalSpawnVariants {
             .or_else(|| ordered.first())
             .context("farm animal variant registry is empty")?
             .clone();
-        let visual = FarmAnimalVariants::load_ordered(provider, animal, &ordered)?;
+        let visual = FarmAnimalVariants::load_ordered(provider, animal.registry(), &ordered)?;
         let sounds = provider.list_registry_data(animal.sound_registry())?;
         ensure!(
             !sounds.is_empty(),
@@ -145,7 +145,7 @@ impl FarmAnimalVariants {
     /// Load the active resource-backed registry in Java's registration order.
     pub fn load_active(provider: &mut impl ResourceProvider, animal: FarmAnimal) -> Result<Self> {
         let ordered = provider.list_registry_data(animal.registry())?;
-        Self::load_ordered(provider, animal, &ordered)
+        Self::load_ordered(provider, animal.registry(), &ordered)
     }
 
     /// `ordered_variants` must be the full, ordered active registry. Loading
@@ -162,15 +162,14 @@ impl FarmAnimalVariants {
             supplied.len() == ordered_variants.len() && supplied == visible,
             "{registry} order must contain every active variant exactly once"
         );
-        Self::load_ordered(provider, animal, ordered_variants)
+        Self::load_ordered(provider, animal.registry(), ordered_variants)
     }
 
     fn load_ordered(
         provider: &mut impl ResourceProvider,
-        animal: FarmAnimal,
+        registry: &str,
         ordered_variants: &[ResourceId],
     ) -> Result<Self> {
-        let registry = animal.registry();
         let biome_registry: BTreeSet<_> =
             provider.list_data("worldgen/biome")?.into_iter().collect();
         ensure!(!biome_registry.is_empty(), "biome registry is empty");
@@ -301,5 +300,65 @@ impl FarmAnimalVariants {
             .next_int_bound(count)
             .context("invalid variant count")? as usize;
         Ok(Some(matches[index]))
+    }
+}
+
+/// Spawn data for an adult zombie nautilus created by a structure drowned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZombieNautilusInitialization {
+    pub variant: ResourceId,
+    pub attack_cooldown: i32,
+    pub animal: AnimalBaseInitialization,
+}
+
+/// Registry-backed selection for newly constructed zombie nautiluses.
+pub struct ZombieNautilusSpawnVariants {
+    visual: FarmAnimalVariants,
+    default_visual: ResourceId,
+}
+
+impl ZombieNautilusSpawnVariants {
+    pub fn load_active(provider: &mut impl ResourceProvider) -> Result<Self> {
+        let registry = "zombie_nautilus_variant";
+        let ordered = provider.list_registry_data(registry)?;
+        let temperate = ResourceId::parse("minecraft:temperate")?;
+        let default_visual = ordered
+            .iter()
+            .find(|id| **id == temperate)
+            .or_else(|| ordered.first())
+            .context("zombie nautilus variant registry is empty")?
+            .clone();
+        let visual = FarmAnimalVariants::load_ordered(provider, registry, &ordered)?;
+        Ok(Self {
+            visual,
+            default_visual,
+        })
+    }
+
+    /// Match the STRUCTURE spawn path with a fresh, empty group. Failed
+    /// selection does not consume the caller's region random source.
+    pub fn finalize_structure_spawn(
+        &self,
+        biome: &ResourceId,
+        random: &mut RegionRandom,
+    ) -> Result<ZombieNautilusInitialization> {
+        let mut next = random.clone();
+        let variant = self
+            .visual
+            .choose(biome, &mut next)?
+            .unwrap_or(&self.default_visual)
+            .clone();
+        let attack_cooldown = 2400
+            + next
+                .next_int_bound(1201)
+                .context("invalid attack cooldown bound")?;
+        let animal = finalize_animal_base(&mut next, &mut AnimalGroupData::default(), false);
+        let result = ZombieNautilusInitialization {
+            variant,
+            attack_cooldown,
+            animal,
+        };
+        *random = next;
+        Ok(result)
     }
 }

@@ -2,13 +2,14 @@ use std::{path::PathBuf, process::Command};
 
 use native_persistence::nbt::{NamedTag, write};
 use native_resources::{
-    animal_variants::{FarmAnimal, FarmAnimalSpawnVariants},
+    animal_variants::{FarmAnimal, FarmAnimalSpawnVariants, ZombieNautilusSpawnVariants},
     density::WorldgenRandom,
     packs::{ResourceId, ResourceStack},
     worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
 use native_session::worldgen::{
     FreshCreatureRandom, draft_fresh_farm_animal, draft_fresh_jockey_chicken,
+    draft_fresh_structure_zombie_nautilus,
 };
 use serde_json::{Value, json};
 
@@ -181,6 +182,40 @@ fn fresh_farm_animal_drafts_match_java_entities() {
                 )
                 .unwrap();
                 cases.push(json!({"animal":"chicken","biome":biome,"legacy":legacy,"seed":seed,"chance":0.05,"paths":[path],"jockey":true,"next_random":random.next_long()}));
+            }
+        }
+    }
+    let nautilus_variants = ZombieNautilusSpawnVariants::load_active(&mut resources).unwrap();
+    for biome in ["minecraft:ocean", "minecraft:warm_ocean"] {
+        for legacy in [true, false] {
+            for seed in 0_i64..32 {
+                let algorithm = if legacy {
+                    WorldgenRandom::Legacy
+                } else {
+                    WorldgenRandom::Xoroshiro
+                };
+                let mut random = RegionRandom::new(seed, algorithm, -13, 17);
+                let init = nautilus_variants
+                    .finalize_structure_spawn(&ResourceId::parse(biome).unwrap(), &mut random)
+                    .unwrap();
+                let tag = draft_fresh_structure_zombie_nautilus(
+                    [0, 1, 0, 2],
+                    [3.5, 10.0, -2.5],
+                    22.5,
+                    &init,
+                )
+                .unwrap();
+                let path = temp.path().join(format!("nautilus-{}.nbt", cases.len()));
+                std::fs::write(
+                    &path,
+                    write(&NamedTag {
+                        name: "".into(),
+                        value: tag,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                cases.push(json!({"animal":"zombie_nautilus","biome":biome,"legacy":legacy,"seed":seed,"chance":0.05,"paths":[path],"next_random":random.next_long()}));
             }
         }
     }

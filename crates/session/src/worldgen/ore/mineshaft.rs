@@ -3,8 +3,10 @@ use super::*;
 use native_core::beardifier::BoundingBox;
 use native_resources::mineshaft::{
     CorridorBlock, MineshaftCorridorWorld, MineshaftCrossingWorld, MineshaftGraphPiece,
-    MineshaftGraphPieceKind, MineshaftPlacementOutcome, MineshaftPlacementWorld, MineshaftVariant,
+    MineshaftGraphPieceKind, MineshaftPlacementOutcome, MineshaftPlacementWorld,
+    MineshaftSupportBlock, MineshaftSupportOutcome, MineshaftSupportWorld, MineshaftVariant,
     place_corridor_beam, place_corridor_cobweb, place_crossing, place_room_or_stairs,
+    place_vertical_support,
 };
 use native_resources::{structure_piece::StructureFrame, structure_start::HorizontalDirection};
 
@@ -68,6 +70,27 @@ fn known_piece_block(state: &BlockState) -> bool {
 }
 
 impl DecorationRegion<'_> {
+    /// Apply the corridor's direct vertical support writes to the draft.
+    /// The region's block tags must include `minecraft:unstable_bottom_center`.
+    pub fn place_mineshaft_vertical_support(
+        &mut self,
+        frame: StructureFrame,
+        local: [i32; 3],
+        variant: MineshaftVariant,
+        clip: BoundingBox,
+    ) -> Result<MineshaftSupportOutcome> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        self.failed = true;
+        let mut unused_biome = |_: [i32; 3], _: &World| -> Result<bool> { Ok(false) };
+        let mut region = MineshaftRegion {
+            region: self,
+            blocking_biome: &mut unused_biome,
+        };
+        let result = place_vertical_support(frame, local, variant, clip, &mut region)?;
+        self.failed = false;
+        Ok(result)
+    }
+
     /// Apply one corridor beam, committing the random stream only on success.
     pub fn place_mineshaft_corridor_beam(
         &mut self,
@@ -209,6 +232,128 @@ impl DecorationRegion<'_> {
             blocking.blocks(biomes.biome_at_block(position[0], position[1], position[2])?)
         };
         self.place_mineshaft_static_piece(piece, variant, clip, &mut resolve)
+    }
+}
+
+impl<F> MineshaftSupportWorld for MineshaftRegion<'_, '_, F> {
+    type State = BlockState;
+
+    fn vertical_bounds(&self) -> (i32, i32) {
+        (
+            self.region.target.min_y,
+            self.region.target.min_y + self.region.target.height - 1,
+        )
+    }
+
+    fn block_state(&mut self, position: [i32; 3]) -> Result<BlockState> {
+        self.block(position)
+    }
+
+    fn replaceable_by_structure(&mut self, state: &BlockState) -> Result<bool> {
+        if is_air(state) || valid_lichen(state) {
+            return Ok(true);
+        }
+        if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
+            native_world::fluid::FluidState::from_block(state)
+                .map_err(anyhow::Error::msg)?
+                .context("invalid mineshaft support fluid")?;
+            return Ok(true);
+        }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:seagrass" | "minecraft:tall_seagrass"
+        ) {
+            simple_plant_kind(state)?;
+            return Ok(true);
+        }
+        ensure!(
+            known_piece_block(state) || monster_block_flags(state).is_ok(),
+            "unsupported mineshaft support block: {}",
+            state.name
+        );
+        Ok(false)
+    }
+
+    fn is_lava(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(state.name == "minecraft:lava")
+    }
+
+    fn supports_column(&mut self, _: [i32; 3], state: &BlockState) -> Result<bool> {
+        if known_piece_block(state) {
+            return Ok(matches!(
+                state.name.as_str(),
+                "minecraft:oak_planks"
+                    | "minecraft:dark_oak_planks"
+                    | "minecraft:oak_log"
+                    | "minecraft:dark_oak_log"
+            ));
+        }
+        generation_face_sturdy(state, [0, 1, 0])
+    }
+
+    fn supports_hanging_chain(&mut self, _: [i32; 3], state: &BlockState) -> Result<bool> {
+        let unstable = ResourceId::parse("minecraft:unstable_bottom_center")?;
+        if self.region.tags.contains(&unstable, &state.name)? {
+            return Ok(false);
+        }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
+        ) {
+            return Ok(false);
+        }
+        if known_piece_block(state) {
+            return match state.name.as_str() {
+                "minecraft:oak_planks"
+                | "minecraft:dark_oak_planks"
+                | "minecraft:oak_log"
+                | "minecraft:dark_oak_log" => Ok(true),
+                "minecraft:iron_chain"
+                    if state.properties.get("axis").map(String::as_str) == Some("y") =>
+                {
+                    Ok(true)
+                }
+                "minecraft:cobweb" | "minecraft:wall_torch" | "minecraft:rail" => Ok(false),
+                _ => anyhow::bail!("unsupported mineshaft center support state: {state:?}"),
+            };
+        }
+        monster_block_flags(state)?;
+        vanilla_full_occlusion(&state.name)
+            .with_context(|| format!("unsupported mineshaft center support {}", state.name))
+    }
+
+    fn set_support(
+        &mut self,
+        position: [i32; 3],
+        block: MineshaftSupportBlock,
+        variant: MineshaftVariant,
+    ) -> Result<()> {
+        let wood = match variant {
+            MineshaftVariant::Normal => "oak",
+            MineshaftVariant::Mesa => "dark_oak",
+        };
+        let (name, properties) = match block {
+            MineshaftSupportBlock::Wood => (
+                format!("minecraft:{wood}_log"),
+                BTreeMap::from([("axis".into(), "y".into())]),
+            ),
+            MineshaftSupportBlock::Fence => (
+                format!("minecraft:{wood}_fence"),
+                ["north", "south", "east", "west", "waterlogged"]
+                    .into_iter()
+                    .map(|key| (key.into(), "false".into()))
+                    .collect(),
+            ),
+            MineshaftSupportBlock::IronChain => (
+                "minecraft:iron_chain".into(),
+                BTreeMap::from([
+                    ("axis".into(), "y".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            ),
+        };
+        // Vertical supports use direct WorldGenLevel writes, not StructurePiece writes.
+        self.write(position, BlockState { name, properties })
     }
 }
 
@@ -416,6 +561,80 @@ mod tests {
 
     struct BiomeData(bool);
     struct MotionData;
+    struct SupportData(bool);
+    impl ResourceProvider for SupportData {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok(match path {
+                "data/minecraft/tags/block/unstable_bottom_center.json" => Some(if self.0 {
+                    br#"{"values":["minecraft:stone"]}"#.to_vec()
+                } else {
+                    br#"{"values":[]}"#.to_vec()
+                }),
+                "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
+                | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json" => Some(
+                    br#"{"values":["minecraft:stone","minecraft:oak_log","minecraft:oak_fence"]}"#
+                        .to_vec(),
+                ),
+                _ => None,
+            })
+        }
+    }
+
+    fn support_tags(unstable_stone: bool) -> (OreBlockTags, HeightmapTags) {
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "oak_log",
+            "oak_fence",
+            "iron_chain",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let required =
+            BTreeSet::from([ResourceId::parse("minecraft:unstable_bottom_center").unwrap()]);
+        let tags =
+            OreBlockTags::load(&mut SupportData(unstable_stone), &registry, &required).unwrap();
+        let motion = HeightmapTags::load(&mut SupportData(unstable_stone), &registry).unwrap();
+        (tags, motion)
+    }
+
+    fn replace_column(
+        terrain: &mut super::super::super::CarvedTerrainWorld,
+        from: i32,
+        to: i32,
+        name: &str,
+    ) {
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(BlockState {
+            name: format!("minecraft:{name}"),
+            properties: BTreeMap::new(),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        for y in from..=to {
+            section.blocks.as_mut().unwrap()[(4 + 4 * 16 + y * 256) as usize] = id;
+        }
+    }
+
+    fn support_frame() -> (StructureFrame, BoundingBox) {
+        (
+            StructureFrame {
+                bounds: BoundingBox::new([4, 8, 4], [6, 10, 8]).unwrap(),
+                orientation: Some(HorizontalDirection::South),
+            },
+            BoundingBox::new([4, 7, 4], [4, 7, 4]).unwrap(),
+        )
+    }
     impl ResourceProvider for MotionData {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)
@@ -516,6 +735,75 @@ mod tests {
             terrain.world.block(3, 2, 3).unwrap().name,
             "minecraft:cave_air"
         );
+    }
+
+    #[test]
+    fn vertical_support_writes_logs_beyond_clip_to_real_terrain() {
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        replace_column(&mut terrain, 4, 6, "air");
+        let (tags, motion) = support_tags(false);
+        let (frame, clip) = support_frame();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert_eq!(
+            region
+                .place_mineshaft_vertical_support(frame, [0, -1, 0], MineshaftVariant::Normal, clip)
+                .unwrap(),
+            MineshaftSupportOutcome::Grounded
+        );
+        region.finish().unwrap();
+        for y in 4..=6 {
+            let state = terrain.world.block(4, y, 4).unwrap();
+            assert_eq!(state.name, "minecraft:oak_log");
+            assert_eq!(state.properties["axis"], "y");
+        }
+        assert!(terrain.feature_postprocessing.is_empty());
+    }
+
+    #[test]
+    fn vertical_support_hangs_only_from_stable_ceiling() {
+        for unstable in [false, true] {
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            replace_column(&mut terrain, 0, 6, "air");
+            replace_column(&mut terrain, 11, 11, "stone");
+            let (tags, motion) = support_tags(unstable);
+            let (frame, clip) = support_frame();
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+                .unwrap();
+            assert_eq!(
+                region
+                    .place_mineshaft_vertical_support(
+                        frame,
+                        [0, -1, 0],
+                        MineshaftVariant::Normal,
+                        clip
+                    )
+                    .unwrap(),
+                if unstable {
+                    MineshaftSupportOutcome::NoAnchor
+                } else {
+                    MineshaftSupportOutcome::Hanging
+                }
+            );
+            region.finish().unwrap();
+            if unstable {
+                assert_eq!(terrain.world.block(4, 8, 4).unwrap().name, "minecraft:air");
+            } else {
+                assert_eq!(
+                    terrain.world.block(4, 8, 4).unwrap().name,
+                    "minecraft:oak_fence"
+                );
+                for y in 9..=10 {
+                    let state = terrain.world.block(4, y, 4).unwrap();
+                    assert_eq!(state.name, "minecraft:iron_chain");
+                    assert_eq!(state.properties["axis"], "y");
+                    assert_eq!(state.properties["waterlogged"], "false");
+                }
+                assert!(terrain.feature_postprocessing.is_empty());
+            }
+        }
     }
 
     #[test]

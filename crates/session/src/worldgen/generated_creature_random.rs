@@ -11,6 +11,8 @@ use super::FreshCreatureConstruction;
 pub struct FreshCreatureRandom {
     pub construction: FreshCreatureConstruction,
     pub initial_yaw: f32,
+    /// Initial brain sensor delays, in Java's sensor registration order.
+    pub zombie_nautilus_sensor_delays: Option<[i32; 5]>,
     pub random: LegacyRandom,
 }
 
@@ -44,6 +46,19 @@ impl FreshCreatureRandom {
         // LivingEntity's constructor consumes the same random source before
         // Chicken's constructor draws its egg-laying delay.
         let initial_yaw = random.next_float() * std::f32::consts::TAU;
+        // LivingEntity creates the brain after setting its initial yaw. Each
+        // zombie nautilus sensor samples its initial delay using this RNG.
+        let zombie_nautilus_sensor_delays = if entity.path == "zombie_nautilus" {
+            let mut delays = [0; 5];
+            for delay in &mut delays {
+                *delay = random
+                    .next_int_bound(20)
+                    .context("invalid sensor delay bound")?;
+            }
+            Some(delays)
+        } else {
+            None
+        };
         let chicken_egg_time = if entity.path == "chicken" {
             Some(
                 6000 + random
@@ -59,6 +74,7 @@ impl FreshCreatureRandom {
                 chicken_egg_time,
             },
             initial_yaw,
+            zombie_nautilus_sensor_delays,
             random,
         })
     }
@@ -78,6 +94,7 @@ fn validate_entity(entity: &ResourceId) -> Result<()> {
                     | "witch"
                     | "cat"
                     | "drowned"
+                    | "zombie_nautilus"
             ),
         "unsupported creature construction"
     );

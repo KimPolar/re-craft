@@ -195,6 +195,7 @@ fn fresh_farm_animal_drafts_match_java_entities() {
         .arg(&constructions));
     let construction_cases: Value =
         serde_json::from_slice(&std::fs::read(constructions).unwrap()).unwrap();
+    let mut zombie_nautilus_cases = 0;
     for case in construction_cases.as_array().unwrap() {
         let name = case["entity"].as_str().unwrap();
         let id = ResourceId::parse(name).unwrap();
@@ -219,7 +220,18 @@ fn fresh_farm_animal_drafts_match_java_entities() {
                 break;
             }
         }
-        let actual = matched.unwrap_or_else(|| panic!("constructor RNG mismatch for {name}"));
+        let actual = matched.unwrap_or_else(|| {
+            let mut state = final_state;
+            for draws in 1..=32 {
+                state = state.wrapping_sub(11).wrapping_mul(0xdfe05bcb1365) & ((1_u64 << 48) - 1);
+                let random = native_core::random::LegacyRandom::from_state(state).unwrap();
+                let candidate = FreshCreatureRandom::from_random(&id, random).unwrap();
+                if candidate.construction.uuid.as_slice() == uuid {
+                    panic!("constructor RNG mismatch for {name}; observed {draws} draws, candidate state {} vs {final_state}", candidate.random.state());
+                }
+            }
+            panic!("constructor RNG mismatch for {name}; UUID was not found");
+        });
         assert_eq!(
             actual.initial_yaw.to_bits() as i32,
             case["yaw_bits"].as_i64().unwrap() as i32,
@@ -230,6 +242,17 @@ fn fresh_farm_animal_drafts_match_java_entities() {
             case["egg"].as_i64(),
             "{name}"
         );
+        if let Some(delays) = actual.zombie_nautilus_sensor_delays {
+            zombie_nautilus_cases += 1;
+            let expected: Vec<i32> = case["sensor_delays"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_i64().unwrap() as i32)
+                .collect();
+            assert_eq!(delays.as_slice(), expected, "{name} sensor delays");
+        }
         assert_eq!(actual.random.state(), final_state, "{name}");
     }
+    assert_eq!(zombie_nautilus_cases, 32);
 }

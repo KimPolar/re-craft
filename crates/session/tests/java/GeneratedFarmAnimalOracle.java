@@ -16,6 +16,7 @@ import net.minecraft.world.entity.animal.pig.Pig;
 import net.minecraft.world.entity.animal.cow.Cow;
 import net.minecraft.world.entity.animal.chicken.Chicken;
 import net.minecraft.world.entity.animal.sheep.Sheep;
+import net.minecraft.world.entity.animal.nautilus.ZombieNautilus;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.storage.TagValueOutput;
@@ -68,6 +69,10 @@ public class GeneratedFarmAnimalOracle {
         ObserveChicken(World world) { super(EntityTypes.CHICKEN,world); }
         @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return dummyNavigation(); }
     }
+    static class ObserveZombieNautilus extends ZombieNautilus {
+        ObserveZombieNautilus(World world) { super(EntityTypes.ZOMBIE_NAUTILUS,world); }
+        @Override protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) { return null; }
+    }
     static Identifier fileKey(Identifier id) {
         return Identifier.fromNamespaceAndPath(id.getNamespace(), "entry/" + id.getPath() + ".json");
     }
@@ -86,7 +91,8 @@ public class GeneratedFarmAnimalOracle {
             registry(Registries.CHICKEN_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_VARIANT).listElements().toList()),
             registry(Registries.PIG_SOUND_VARIANT,lookup.lookupOrThrow(Registries.PIG_SOUND_VARIANT).listElements().toList()),
             registry(Registries.COW_SOUND_VARIANT,lookup.lookupOrThrow(Registries.COW_SOUND_VARIANT).listElements().toList()),
-            registry(Registries.CHICKEN_SOUND_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_SOUND_VARIANT).listElements().toList())
+            registry(Registries.CHICKEN_SOUND_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_SOUND_VARIANT).listElements().toList()),
+            registry(Registries.ZOMBIE_NAUTILUS_VARIANT,lookup.lookupOrThrow(Registries.ZOMBIE_NAUTILUS_VARIANT).listElements().toList())
         ));
         var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
         unsafe=(Unsafe)unsafeField.get(null);
@@ -142,13 +148,16 @@ public class GeneratedFarmAnimalOracle {
         }
         if(args.length>1) {
             var seedField=LegacyRandomSource.class.getDeclaredField("seed"); seedField.setAccessible(true);
+            var sensorsField=net.minecraft.world.entity.ai.Brain.class.getDeclaredField("sensors"); sensorsField.setAccessible(true);
+            var delayField=net.minecraft.world.entity.ai.sensing.Sensor.class.getDeclaredField("timeToTick"); delayField.setAccessible(true);
             var results=new JsonArray();
-            for(var type:List.of("sheep","pig","cow","chicken")) for(int i=0;i<32;i++) {
+            for(var type:List.of("sheep","pig","cow","chicken","zombie_nautilus")) for(int i=0;i<32;i++) {
                 var animal=switch(type) {
                     case "sheep" -> new ObserveSheep(world);
                     case "pig" -> new ObservePig(world);
                     case "cow" -> new ObserveCow(world);
                     case "chicken" -> new ObserveChicken(world);
+                    case "zombie_nautilus" -> new ObserveZombieNautilus(world);
                     default -> throw new AssertionError();
                 };
                 var state=((java.util.concurrent.atomic.AtomicLong)seedField.get(animal.getRandom())).get();
@@ -157,6 +166,17 @@ public class GeneratedFarmAnimalOracle {
                 words.add((int)(uuid.getLeastSignificantBits()>>>32)); words.add((int)uuid.getLeastSignificantBits());
                 value.addProperty("entity",type); value.add("uuid",words); value.addProperty("state",state);
                 value.addProperty("yaw_bits",Float.floatToRawIntBits(animal.getYRot()));
+                if(animal instanceof ZombieNautilus) {
+                    var sensors=(Map<?,?>)sensorsField.get(animal.getBrain());
+                    var delays=new JsonArray();
+                    for(var sensor:List.of(net.minecraft.world.entity.ai.sensing.SensorType.NEAREST_LIVING_ENTITIES,
+                            net.minecraft.world.entity.ai.sensing.SensorType.NEAREST_ADULT,
+                            net.minecraft.world.entity.ai.sensing.SensorType.NEAREST_PLAYERS,
+                            net.minecraft.world.entity.ai.sensing.SensorType.HURT_BY,
+                            net.minecraft.world.entity.ai.sensing.SensorType.NAUTILUS_TEMPTATIONS))
+                        delays.add(delayField.getLong(sensors.get(sensor)));
+                    value.add("sensor_delays",delays);
+                }
                 if(animal instanceof Chicken chicken) value.addProperty("egg",eggField.getInt(chicken));
                 else value.add("egg",JsonNull.INSTANCE);
                 results.add(value);

@@ -2929,16 +2929,26 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, native_persistence::nbt::Tag>> {
+        self.converted_sections_data(processed, positions, false)
+    }
+
+    fn converted_sections_data(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        include_deferred: bool,
+    ) -> Result<BTreeMap<ChunkPos, native_persistence::nbt::Tag>> {
         let mut selected = BTreeSet::new();
         for pos in positions {
             ensure!(selected.insert(pos), "duplicate postprocessed chunk");
             ensure!(
-                processed.chunks.contains(&pos),
-                "chunk was not postprocessed"
+                processed.chunks.contains(&pos)
+                    || (include_deferred && processed.deferred_tasks.contains_key(&pos)),
+                "chunk was not selected for this postprocessing pass"
             );
         }
         ensure!(!selected.is_empty(), "no postprocessed chunks selected");
-        let light = self.postprocessed_light_snapshot(processed)?;
+        let light = self.postprocessed_light_snapshot_covering(processed, selected.clone())?;
         let world = self.materialize_postprocessed_light(processed, &light, &selected)?;
         let has_skylight = self
             .decoration
@@ -3073,13 +3083,23 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
-        use native_world::loaded::{SavedBlockTick, SavedFluidTick};
-
         ensure!(
             processed.deferred_tasks.is_empty(),
             "postprocessed drafts with deferred chunks are unsupported"
         );
-        let sections = self.postprocessed_sections_data(processed, positions)?;
+        self.converted_chunk_components(processed, positions, None)
+    }
+
+    fn converted_chunk_components(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        deferred_entities: Option<&BTreeMap<ChunkPos, native_persistence::nbt::Tag>>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkComponents>> {
+        use native_world::loaded::{SavedBlockTick, SavedFluidTick};
+
+        let sections =
+            self.converted_sections_data(processed, positions, deferred_entities.is_some())?;
         let registry = &self
             .decoration
             .as_ref()
@@ -3163,7 +3183,14 @@ impl FreshTerrainBatch {
                         fluid_ticks: native_persistence::generated_ticks::encode_level_fluid_ticks(
                             pos, &fluids,
                         )?,
-                        block_entities: processed.block_entity_data(pos)?,
+                        block_entities: if processed.chunks.contains(&pos) {
+                            processed.block_entity_data(pos)?
+                        } else {
+                            deferred_entities
+                                .and_then(|entities| entities.get(&pos))
+                                .context("deferred block entity snapshot is missing")?
+                                .clone()
+                        },
                         entity_records: self.complete_generated_entity_records_shared(pos)?,
                     },
                 ))
@@ -3188,7 +3215,65 @@ impl FreshTerrainBatch {
         validated: Option<&BTreeSet<ChunkPos>>,
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
         let time = processed.ticks.game_time();
-        self.postprocessed_chunk_components(processed, positions)?
+        let components = self.postprocessed_chunk_components(processed, positions)?;
+        self.assemble_converted_drafts(components, time, validated, &BTreeMap::new())
+    }
+
+    /// Capture every converted chunk from one isolated postprocessing stage.
+    /// Deferred marks and save-time block entity promotions are preserved.
+    /// This is an intermediate preview, not permission to publish a world.
+    /// The stage is changed only after the entire preview succeeds.
+    pub fn converted_chunk_drafts(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
+        let positions: Vec<_> = positions.into_iter().collect();
+        let selected: BTreeSet<_> = positions.iter().copied().collect();
+        ensure!(!selected.is_empty(), "no converted chunks selected");
+        ensure!(
+            selected.len() == positions.len(),
+            "duplicate converted chunk"
+        );
+        let mut candidate = stage.clone();
+        let before = candidate.clone().finish()?;
+        self.validate_postprocessing(&before)?;
+        let available: BTreeSet<_> = before
+            .chunks
+            .iter()
+            .copied()
+            .chain(before.deferred_chunks())
+            .collect();
+        ensure!(
+            selected == available,
+            "all converted chunks must be selected"
+        );
+        let mut entities = BTreeMap::new();
+        for &pos in &positions {
+            if before.deferred_tasks.contains_key(&pos) {
+                entities.insert(pos, candidate.capture_deferred_block_entities(pos)?);
+            }
+        }
+        let processed = candidate.clone().finish()?;
+        let marks = processed
+            .deferred_chunks()
+            .map(|pos| Ok((pos, processed.deferred_postprocessing_data(pos)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let components = self.converted_chunk_components(&processed, positions, Some(&entities))?;
+        let drafts =
+            self.assemble_converted_drafts(components, processed.ticks.game_time(), None, &marks)?;
+        *stage = candidate;
+        Ok(drafts)
+    }
+
+    fn assemble_converted_drafts(
+        &self,
+        components: BTreeMap<ChunkPos, PostprocessedChunkComponents>,
+        time: i64,
+        validated: Option<&BTreeSet<ChunkPos>>,
+        deferred_marks: &BTreeMap<ChunkPos, native_persistence::nbt::Tag>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
+        components
             .into_iter()
             .map(|(pos, components)| {
                 let entity_chunk = components
@@ -3198,19 +3283,25 @@ impl FreshTerrainBatch {
                         native_persistence::generated_chunk::assemble_entity_chunk(pos, records)
                     })
                     .transpose()?;
-                let chunk = native_persistence::generated_chunk::assemble_full_chunk(
-                    native_persistence::generated_chunk::FullChunkComponents {
-                        position: pos,
-                        min_y: self.generator.min_y,
-                        height: self.generator.height,
-                        last_update: time,
-                        sections: components.sections,
-                        heightmaps: components.heightmaps,
-                        block_ticks: components.block_ticks,
-                        fluid_ticks: components.fluid_ticks,
-                        block_entities: components.block_entities,
-                    },
-                )?;
+                let parts = native_persistence::generated_chunk::FullChunkComponents {
+                    position: pos,
+                    min_y: self.generator.min_y,
+                    height: self.generator.height,
+                    last_update: time,
+                    sections: components.sections,
+                    heightmaps: components.heightmaps,
+                    block_ticks: components.block_ticks,
+                    fluid_ticks: components.fluid_ticks,
+                    block_entities: components.block_entities,
+                };
+                let chunk = if let Some(marks) = deferred_marks.get(&pos) {
+                    native_persistence::generated_chunk::assemble_full_chunk_with_postprocessing(
+                        parts,
+                        marks.clone(),
+                    )?
+                } else {
+                    native_persistence::generated_chunk::assemble_full_chunk(parts)?
+                };
                 let chunk = if self.structures.is_some() {
                     let data = if validated.is_some_and(|selection| selection.contains(&pos)) {
                         self.pack_validated_structure_data(pos)?

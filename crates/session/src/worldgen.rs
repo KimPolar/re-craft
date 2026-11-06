@@ -5758,6 +5758,75 @@ mod tests {
             .unwrap()
             .is_some()
         {}
+        // A preview must include both the processed target and the converted
+        // neighbor, preserving the neighbor's unprocessed work and live ticks.
+        let pending_marks = batch.spawned_postprocessing_data(distant).unwrap();
+        let mut mixed = batch
+            .begin_generated_postprocessing_with_neighbors([center], [center, distant], 42, 10)
+            .unwrap();
+        assert!(
+            batch
+                .converted_chunk_drafts(&mut mixed, [center, distant])
+                .is_err()
+        );
+        while !mixed.poll(center, 256).unwrap() {}
+        let tick_position = [distant.x * 16 + 1, 8, distant.z * 16 + 1];
+        mixed
+            .region
+            .ticks
+            .schedule(
+                chunk_ticks::TickRegistry::Block,
+                "minecraft:stone",
+                tick_position,
+                4,
+                0,
+            )
+            .unwrap();
+        assert!(batch.converted_chunk_drafts(&mut mixed, [center]).is_err());
+        assert!(
+            batch
+                .converted_chunk_drafts(&mut mixed, [center, center, distant])
+                .is_err()
+        );
+        let drafts = batch
+            .converted_chunk_drafts(&mut mixed, [center, distant])
+            .unwrap();
+        assert_eq!(drafts.len(), 2);
+        let neighbor = &drafts[&distant].chunk;
+        assert_eq!(
+            neighbor.value.get("Status"),
+            Some(&native_persistence::nbt::Tag::String(
+                "minecraft:full".into()
+            ))
+        );
+        assert_eq!(neighbor.value.get("PostProcessing"), Some(&pending_marks));
+        let Some(native_persistence::nbt::Tag::List { values: ticks, .. }) =
+            neighbor.value.get("block_ticks")
+        else {
+            panic!("missing block ticks")
+        };
+        assert!(ticks.iter().any(|tick| tick.get("i")
+            == Some(&native_persistence::nbt::Tag::String(
+                "minecraft:stone".into()
+            ))
+            && tick.get("t") == Some(&native_persistence::nbt::Tag::Int(4))));
+        assert_eq!(
+            native_persistence::nbt::read(&native_persistence::nbt::write(neighbor).unwrap())
+                .unwrap(),
+            *neighbor
+        );
+        assert_eq!(
+            mixed
+                .clone()
+                .finish()
+                .unwrap()
+                .deferred_chunks()
+                .collect::<Vec<_>>(),
+            vec![distant]
+        );
+        mixed.request_converted_chunk(distant).unwrap();
+        while !mixed.poll(distant, 256).unwrap() {}
+        assert_eq!(mixed.finish().unwrap().deferred_chunks().count(), 0);
         assert!(batch.validate_postprocessing(&processed).is_err());
         batch
             .rebase_postprocessing_after_expansion(&mut processed, &checkpoint)

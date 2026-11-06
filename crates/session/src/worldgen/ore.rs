@@ -4643,7 +4643,11 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
             return Ok(false);
         }
         match self.monster_entities.get(&pos) {
-            Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_))) => {
+            Some(None)
+            | Some(Some(
+                super::GeneratedMonsterRoomEntity::Spawner(_)
+                | super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_),
+            )) => {
                 if let Some(pending) = self.pending_order.get_mut(&chunk(pos)) {
                     Arc::make_mut(pending).remove(pos);
                 }
@@ -4662,7 +4666,11 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
         ensure!(
             matches!(
                 self.monster_entities.get(&pos),
-                Some(None) | Some(Some(super::GeneratedMonsterRoomEntity::Spawner(_)))
+                Some(None)
+                    | Some(Some(
+                        super::GeneratedMonsterRoomEntity::Spawner(_)
+                            | super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_)
+                    ))
             ),
             "generated spawner is unavailable"
         );
@@ -17596,6 +17604,7 @@ mod tests {
                         }
                         super::super::GeneratedMonsterRoomEntity::PendingChest { .. }
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
+                        | super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_)
                         | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {
                             panic!("monster rooms should resolve generated chests")
                         }

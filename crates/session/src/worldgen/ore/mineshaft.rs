@@ -67,6 +67,41 @@ fn known_piece_block(state: &BlockState) -> bool {
 }
 
 impl DecorationRegion<'_> {
+    /// Install and resolve the cave-spider block entity in this draft.
+    /// The enclosing piece controls clipping and its placed-spider flag.
+    pub fn place_mineshaft_spawner(&mut self, position: [i32; 3]) -> Result<()> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        self.failed = true;
+        let mut unused_biome = |_: [i32; 3], _: &World| -> Result<bool> { Ok(false) };
+        let mut region = MineshaftRegion {
+            region: self,
+            blocking_biome: &mut unused_biome,
+        };
+        region.write(
+            position,
+            BlockState {
+                name: "minecraft:spawner".into(),
+                properties: BTreeMap::new(),
+            },
+        )?;
+        Arc::make_mut(&mut region.region.monster_entities).insert(
+            position,
+            Some(super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(
+                super::super::GeneratedCaveSpiderSpawner { position },
+            )),
+        );
+        Arc::make_mut(
+            region
+                .region
+                .entity_order
+                .entry(chunk(position))
+                .or_default(),
+        )
+        .insert(position);
+        self.failed = false;
+        Ok(())
+    }
+
     /// Run one room, stairs or crossing against this unpublished region.
     /// The callback resolves the active MINESHAFT_BLOCKING biome tag using the
     /// same seeded block-biome lookup as the world. It must isolate its state
@@ -142,7 +177,8 @@ impl<F> MineshaftRegion<'_, '_, F> {
         let old = self.region.read(position)?;
         // Do not discard an existing block entity or unknown block side effect.
         ensure!(
-            !self.region.monster_entities.contains_key(&position)
+            !matches!(old.name.as_str(), "minecraft:chest" | "minecraft:spawner")
+                && !self.region.monster_entities.contains_key(&position)
                 && !self.region.bee_nests.contains_key(&position),
             "mineshaft would replace a block entity"
         );
@@ -324,6 +360,77 @@ mod tests {
             terrain.world.block(3, 2, 3).unwrap().name,
             "minecraft:cave_air"
         );
+    }
+
+    #[test]
+    fn cave_spawner_is_saved_with_its_block_and_live_order() {
+        use native_persistence::nbt::{Tag, TagType};
+
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let before = Arc::clone(&terrain.world);
+        let position = [4, 3, 4];
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+            .unwrap();
+        region.place_mineshaft_spawner(position).unwrap();
+        region.finish().unwrap();
+        assert_eq!(before.block(4, 3, 4).unwrap().name, "minecraft:stone");
+        assert_eq!(
+            terrain.world.block(4, 3, 4).unwrap().name,
+            "minecraft:spawner"
+        );
+        assert_eq!(
+            terrain
+                .generated_block_entity_data_with(chunk, |state| {
+                    Some(state.name == "minecraft:spawner")
+                })
+                .unwrap(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![
+                    super::super::super::GeneratedCaveSpiderSpawner { position }.block_entity()
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn spawner_conflict_poisoning_discards_the_entire_draft() {
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let before = Arc::clone(&terrain.world);
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        region.place_mineshaft_spawner([4, 3, 4]).unwrap();
+        assert!(region.place_mineshaft_spawner([4, 3, 4]).is_err());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
+    }
+
+    #[test]
+    fn untracked_existing_spawner_is_not_overwritten() {
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(BlockState {
+            name: "minecraft:spawner".into(),
+            properties: BTreeMap::new(),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap()[4 + 4 * 16 + 3 * 256] = id;
+        let before = Arc::clone(&terrain.world);
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert!(region.place_mineshaft_spawner([4, 3, 4]).is_err());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
     }
 
     #[test]

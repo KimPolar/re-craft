@@ -107,6 +107,7 @@ pub enum GeneratedMonsterRoomEntity {
     Chest(GeneratedLootChest),
     EmptyChest(GeneratedEmptyChest),
     Spawner(GeneratedMonsterSpawner),
+    CaveSpiderSpawner(GeneratedCaveSpiderSpawner),
     Brushable(GeneratedBrushable),
     /// A protochunk DUMMY chest not yet materialized by getBlockEntity.
     PendingChest {
@@ -1710,6 +1711,16 @@ impl CarvedTerrainWorld {
                     )
                 }
                 GeneratedMonsterRoomEntity::Spawner(spawner) => {
+                    ensure!(p == spawner.position, "generated spawner position mismatch");
+                    (
+                        BlockState {
+                            name: "minecraft:spawner".into(),
+                            properties: BTreeMap::new(),
+                        },
+                        spawner.block_entity(),
+                    )
+                }
+                GeneratedMonsterRoomEntity::CaveSpiderSpawner(spawner) => {
                     ensure!(p == spawner.position, "generated spawner position mismatch");
                     (
                         BlockState {

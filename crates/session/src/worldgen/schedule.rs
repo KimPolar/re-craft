@@ -248,6 +248,269 @@ where
     }
 }
 
+#[derive(Clone)]
+struct ContextualDrowned<'a, E, D, H> {
+    base: super::ocean_ruin::DrownedGenerationContext<'a, E, D, H>,
+    structures: &'a super::structure_batch::PreparedStructureStages,
+    moon: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    key: Option<super::structure_batch::TerrainStartKey>,
+    revisions: Vec<super::structure_batch::StructurePieceRevision>,
+    piece_index: Option<usize>,
+    pieces: Vec<native_core::beardifier::BoundingBox>,
+}
+
+struct RuinSpawnEnvironment<'a> {
+    biomes: &'a super::BiomeNeighborhood,
+    position: [i32; 3],
+    moon: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    structures: &'a super::structure_batch::PreparedStructureStages,
+    key: &'a super::structure_batch::TerrainStartKey,
+    revisions: &'a [super::structure_batch::StructurePieceRevision],
+    pieces: &'a [native_core::beardifier::BoundingBox],
+    matching: Option<BTreeSet<native_resources::packs::ResourceId>>,
+}
+
+impl native_resources::animal_variants::SpawnVariantEnvironment for RuinSpawnEnvironment<'_> {
+    fn biome(&self) -> Result<&native_resources::packs::ResourceId> {
+        self.biomes
+            .biome_at_block(self.position[0], self.position[1], self.position[2])
+    }
+    fn moon_phase(&mut self) -> Result<u8> {
+        (self.moon)(self.position, self.biomes)
+    }
+    fn structures_with_piece(&mut self) -> Result<&BTreeSet<native_resources::packs::ResourceId>> {
+        if self.matching.is_none() {
+            self.matching = Some(ruin_structures_with_piece(
+                self.structures,
+                self.position,
+                self.key,
+                self.revisions,
+                self.pieces,
+            )?);
+        }
+        Ok(self
+            .matching
+            .as_ref()
+            .expect("structure set was initialized"))
+    }
+}
+
+fn ruin_structures_with_piece(
+    structures: &super::structure_batch::PreparedStructureStages,
+    position: [i32; 3],
+    key: &super::structure_batch::TerrainStartKey,
+    revisions: &[super::structure_batch::StructurePieceRevision],
+    current_pieces: &[native_core::beardifier::BoundingBox],
+) -> Result<BTreeSet<native_resources::packs::ResourceId>> {
+    let chunk = ChunkPos {
+        x: position[0].div_euclid(16),
+        z: position[2].div_euclid(16),
+    };
+    let references = structures
+        .references
+        .get(&chunk)
+        .context("ruin spawn structure references unavailable")?;
+    let mut matching = BTreeSet::new();
+    let contains = |bounds: &native_core::beardifier::BoundingBox| {
+        (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&position[axis]))
+    };
+    for (id, sources) in references.membership() {
+        for &packed in sources {
+            let bits = packed as u64;
+            let source = ChunkPos {
+                x: bits as u32 as i32,
+                z: (bits >> 32) as u32 as i32,
+            };
+            let candidate = (id.clone(), source);
+            let simple = structures
+                .starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            let ocean = structures
+                .ocean_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            ensure!(
+                simple.is_some() != ocean.is_some(),
+                "ruin spawn referenced structure is missing or ambiguous"
+            );
+            let actual_chunk = simple
+                .map(|start| start.chunk)
+                .or_else(|| ocean.map(|start| start.chunk))
+                .context("ruin structure missing")?;
+            ensure!(
+                actual_chunk == [source.x, source.z],
+                "ruin structure source differs"
+            );
+            let mut revised = revisions
+                .iter()
+                .filter(|(revision, _)| revision == &candidate)
+                .peekable();
+            let inside = if &candidate == key {
+                ensure!(
+                    !current_pieces.is_empty(),
+                    "current ruin pieces unavailable"
+                );
+                current_pieces.iter().any(contains)
+            } else if revised.peek().is_some() {
+                revised.any(|(_, bounds)| contains(bounds))
+            } else if let Some(start) = simple {
+                contains(&start.bounds)
+            } else {
+                ocean
+                    .expect("one start was validated")
+                    .pieces
+                    .iter()
+                    .any(|piece| contains(&piece.bounds))
+            };
+            if inside {
+                matching.insert(id.clone());
+                break;
+            }
+        }
+    }
+    Ok(matching)
+}
+
+impl<E, D, H> super::ocean_ruin::DrownedMarkerContext for ContextualDrowned<'_, E, D, H>
+where
+    E: super::ocean_ruin::DrownedSpawnEffects,
+    D: Clone
+        + FnMut(
+            [i32; 3],
+            &native_world::loaded::World,
+            &super::BiomeNeighborhood,
+        ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
+    H: Clone + FnMut() -> Result<bool>,
+{
+    fn needs_ruin_revisions(&self) -> bool {
+        self.base.effects.needs_structure_variants()
+    }
+    fn begin_ruin_start(
+        &mut self,
+        key: &super::structure_batch::TerrainStartKey,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.key = Some(key.clone());
+        self.revisions = revisions.to_vec();
+        self.piece_index = None;
+        self.pieces.clear();
+        Ok(())
+    }
+    fn begin_ruin_piece(
+        &mut self,
+        index: usize,
+        pieces: &[native_core::beardifier::BoundingBox],
+    ) -> Result<()> {
+        ensure!(index < pieces.len(), "invalid ruin piece index");
+        self.piece_index = Some(index);
+        self.pieces = pieces.to_vec();
+        Ok(())
+    }
+    fn set_aligned_ruin_piece(
+        &mut self,
+        bounds: native_core::beardifier::BoundingBox,
+    ) -> Result<()> {
+        let index = self.piece_index.context("ruin piece index unavailable")?;
+        *self
+            .pieces
+            .get_mut(index)
+            .context("ruin piece unavailable")? = bounds;
+        Ok(())
+    }
+    fn special_multiplier(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<f32> {
+        self.base.special_multiplier(pos, world)
+    }
+    fn halloween(&mut self) -> Result<bool> {
+        self.base.halloween()
+    }
+    fn try_existing_chicken(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<bool> {
+        self.base.try_existing_chicken(pos, world)
+    }
+    fn spawn_chicken_jockey(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+    ) -> Result<bool> {
+        let mut env = RuinSpawnEnvironment {
+            biomes: self.base.biomes,
+            position: pos,
+            moon: self.moon,
+            structures: self.structures,
+            key: self.key.as_ref().context("ruin start unavailable")?,
+            revisions: &self.revisions,
+            pieces: &self.pieces,
+            matching: None,
+        };
+        self.base.effects.spawn_chicken_jockey_in_environment(
+            pos,
+            world,
+            random,
+            self.base.biomes,
+            &mut env,
+        )
+    }
+    fn take_created_chicken(&mut self) -> Result<Option<native_persistence::nbt::Tag>> {
+        self.base.take_created_chicken()
+    }
+    fn take_created_nautilus(&mut self) -> Result<Option<native_persistence::nbt::Tag>> {
+        self.base.take_created_nautilus()
+    }
+    fn enchant_weapon(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        weapon: native_resources::drowned_spawn::MainHandRoll,
+        special: f32,
+    ) -> Result<native_persistence::nbt::Tag> {
+        self.base
+            .enchant_weapon(pos, world, random, weapon, special)
+    }
+    fn more_frequent_drowned_biome(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+    ) -> Result<bool> {
+        self.base.more_frequent_drowned_biome(pos, world)
+    }
+    fn spawn_zombie_nautilus(
+        &mut self,
+        pos: [i32; 3],
+        world: &native_world::loaded::World,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        persistent: bool,
+    ) -> Result<bool> {
+        let mut env = RuinSpawnEnvironment {
+            biomes: self.base.biomes,
+            position: pos,
+            moon: self.moon,
+            structures: self.structures,
+            key: self.key.as_ref().context("ruin start unavailable")?,
+            revisions: &self.revisions,
+            pieces: &self.pieces,
+            matching: None,
+        };
+        self.base.effects.spawn_zombie_nautilus_in_environment(
+            pos,
+            world,
+            random,
+            persistent,
+            self.base.biomes,
+            &mut env,
+        )
+    }
+}
+
 pub(super) struct NativeDrownedFeatureRunner<'a, 'b, C, E, D, H> {
     pub inputs: &'a mut super::ocean_ruin::DrownedPlacementInputs<'b, C, E, D, H>,
     pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
@@ -290,12 +553,20 @@ where
             sea_level: self.inputs.sea_level,
             region_random: region_random.clone(),
             construct: self.inputs.construct.clone(),
-            context: super::ocean_ruin::DrownedGenerationContext {
-                biomes,
-                biome_tags: self.inputs.biome_tags,
-                difficulty_at: self.inputs.difficulty_at.clone(),
-                halloween_at: self.inputs.halloween_at.clone(),
-                effects: self.inputs.effects.clone(),
+            context: ContextualDrowned {
+                base: super::ocean_ruin::DrownedGenerationContext {
+                    biomes,
+                    biome_tags: self.inputs.biome_tags,
+                    difficulty_at: self.inputs.difficulty_at.clone(),
+                    halloween_at: self.inputs.halloween_at.clone(),
+                    effects: self.inputs.effects.clone(),
+                },
+                structures: all_structures,
+                moon: self.moon_phase_at,
+                key: None,
+                revisions: Vec::new(),
+                piece_index: None,
+                pieces: Vec::new(),
             },
         };
         let updated = NativeMixedFeatureRunner {
@@ -315,9 +586,9 @@ where
             biomes,
         )?;
         self.inputs.construct = ocean.construct;
-        self.inputs.effects = ocean.context.effects;
-        self.inputs.difficulty_at = ocean.context.difficulty_at;
-        self.inputs.halloween_at = ocean.context.halloween_at;
+        self.inputs.effects = ocean.context.base.effects;
+        self.inputs.difficulty_at = ocean.context.base.difficulty_at;
+        self.inputs.halloween_at = ocean.context.base.halloween_at;
         self.inputs.last_region_random = Some(ocean.region_random);
         Ok(updated)
     }
@@ -1372,6 +1643,222 @@ impl GenerationSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ruin_variant_structure_lookup_uses_current_and_revised_pieces() -> Result<()> {
+        use super::super::structure_references::{
+            StructureStartBounds, collect_ordered_structure_references,
+        };
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            packs::ResourceId,
+            structure_start::{SimpleStructureKind, SimpleStructureStart},
+        };
+        let source = ChunkPos { x: -1, z: -1 };
+        let id = ResourceId::parse("example:ruin")?;
+        let other = ResourceId::parse("example:hut")?;
+        let make_start = |x| SimpleStructureStart {
+            kind: SimpleStructureKind::SwampHut,
+            chunk: [source.x, source.z],
+            generation_point: [x, 64, -8],
+            orientation: None,
+            bounds: BoundingBox::new([x, 64, -9], [x + 2, 66, -7]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::BeardThin,
+        };
+        let first = make_start(-12);
+        let second = make_start(-6);
+        let references = [
+            StructureStartBounds::from_simple(id.clone(), &first)?,
+            StructureStartBounds::from_simple(other.clone(), &second)?,
+        ];
+        let mut stages = super::super::structure_batch::PreparedStructureStages::default();
+        stages.starts.insert(
+            source,
+            [(id.clone(), first), (other.clone(), second)].into(),
+        );
+        stages.references.insert(
+            source,
+            collect_ordered_structure_references(source, |pos| {
+                Ok(if pos == source {
+                    references.to_vec()
+                } else {
+                    vec![]
+                })
+            })?,
+        );
+        let key = (id.clone(), source);
+        let revised = vec![(
+            (other.clone(), source),
+            BoundingBox::new([-9, 70, -9], [-7, 72, -7]).unwrap(),
+        )];
+        let current = [
+            BoundingBox::new([-11, 70, -9], [-9, 72, -7]).unwrap(),
+            BoundingBox::new([-8, 70, -9], [-6, 72, -7]).unwrap(),
+        ];
+        assert_eq!(
+            ruin_structures_with_piece(&stages, [-8, 71, -8], &key, &revised, &current)?,
+            BTreeSet::from([id.clone(), other])
+        );
+        assert!(
+            ruin_structures_with_piece(&stages, [-11, 64, -8], &key, &revised, &current)?
+                .is_empty()
+        );
+        assert_eq!(
+            ruin_structures_with_piece(&stages, [-10, 70, -8], &key, &revised, &current)?,
+            BTreeSet::from([id])
+        );
+        assert!(ruin_structures_with_piece(&stages, [-10, 70, -8], &key, &revised, &[]).is_err());
+        {
+            use super::super::ocean_ruin::{
+                DrownedGenerationContext, DrownedMarkerContext, DrownedSpawnEffects,
+                GenerationDifficultyInputs,
+            };
+            use native_persistence::nbt::Tag;
+            use native_resources::{
+                animal_variants::SpawnVariantEnvironment,
+                drowned_spawn::{DrownedBiomeTags, MainHandRoll},
+                packs::ResourceProvider,
+                worldgen_region_random::RegionRandom,
+            };
+            use native_world::loaded::World;
+            use std::sync::Arc;
+            struct Data;
+            impl ResourceProvider for Data {
+                fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                    Ok(None)
+                }
+                fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                    Ok((path
+                        == "data/minecraft/tags/worldgen/biome/more_frequent_drowned_spawns.json")
+                        .then(|| br#"{"values":[]}"#.to_vec()))
+                }
+                fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                    Ok(if folder == "worldgen/biome" {
+                        vec![ResourceId::parse("minecraft:ocean")?]
+                    } else {
+                        vec![]
+                    })
+                }
+            }
+            #[derive(Clone, Default)]
+            struct Effects {
+                seen: usize,
+            }
+            impl DrownedSpawnEffects for Effects {
+                fn try_existing_chicken(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+                    Ok(false)
+                }
+                fn spawn_chicken_jockey(
+                    &mut self,
+                    _: [i32; 3],
+                    _: &World,
+                    _: &mut RegionRandom,
+                    _: &super::super::BiomeNeighborhood,
+                ) -> Result<bool> {
+                    anyhow::bail!("missing contextual chicken path")
+                }
+                fn spawn_chicken_jockey_in_environment<V: SpawnVariantEnvironment>(
+                    &mut self,
+                    _: [i32; 3],
+                    _: &World,
+                    _: &mut RegionRandom,
+                    _: &super::super::BiomeNeighborhood,
+                    env: &mut V,
+                ) -> Result<bool> {
+                    assert_eq!(env.biome()?, &ResourceId::parse("minecraft:ocean")?);
+                    assert_eq!(env.moon_phase()?, 3);
+                    assert_eq!(
+                        env.structures_with_piece()?,
+                        &BTreeSet::from([
+                            ResourceId::parse("example:ruin")?,
+                            ResourceId::parse("example:hut")?
+                        ])
+                    );
+                    self.seen += 1;
+                    Ok(true)
+                }
+                fn spawn_zombie_nautilus(
+                    &mut self,
+                    _: [i32; 3],
+                    _: &World,
+                    _: &mut RegionRandom,
+                    _: bool,
+                ) -> Result<bool> {
+                    anyhow::bail!("missing contextual nautilus path")
+                }
+                fn spawn_zombie_nautilus_in_environment<V: SpawnVariantEnvironment>(
+                    &mut self,
+                    pos: [i32; 3],
+                    world: &World,
+                    random: &mut RegionRandom,
+                    _: bool,
+                    biomes: &super::super::BiomeNeighborhood,
+                    env: &mut V,
+                ) -> Result<bool> {
+                    self.spawn_chicken_jockey_in_environment(pos, world, random, biomes, env)
+                }
+                fn enchant_weapon(
+                    &mut self,
+                    _: [i32; 3],
+                    _: &World,
+                    _: &mut RegionRandom,
+                    _: MainHandRoll,
+                    _: f32,
+                ) -> Result<Tag> {
+                    anyhow::bail!("unused")
+                }
+            }
+            let tags = DrownedBiomeTags::load(&mut Data)?;
+            let mut biomes = super::super::BiomeNeighborhood::new(42, 64, 16)?;
+            for z in -2..=0 {
+                for x in -2..=0 {
+                    biomes.insert(Arc::new(super::super::QuartBiomeChunk::from_values(
+                        [x, z],
+                        42,
+                        64,
+                        16,
+                        vec![ResourceId::parse("minecraft:ocean")?; 64],
+                    )?))?;
+                }
+            }
+            let mut context = ContextualDrowned {
+                base: DrownedGenerationContext {
+                    biomes: &biomes,
+                    biome_tags: &tags,
+                    difficulty_at: |_, _: &World, _: &super::super::BiomeNeighborhood| {
+                        Ok(GenerationDifficultyInputs {
+                            difficulty: native_persistence::world::Difficulty::Normal,
+                            overworld_clock_time: 0,
+                            moon_brightness: 1.0,
+                        })
+                    },
+                    halloween_at: || Ok(false),
+                    effects: Effects::default(),
+                },
+                structures: &stages,
+                moon: &|_, _| Ok(3),
+                key: None,
+                revisions: vec![],
+                piece_index: None,
+                pieces: vec![],
+            };
+            context.begin_ruin_start(&key, &revised)?;
+            let mut before_alignment = current;
+            before_alignment[1] = BoundingBox::new([-8, 64, -9], [-6, 66, -7]).unwrap();
+            context.begin_ruin_piece(1, &before_alignment)?;
+            context.set_aligned_ruin_piece(current[1])?;
+            let world = World::new("minecraft:overworld");
+            let mut random = RegionRandom::Legacy(native_core::random::LegacyRandom::new(42));
+            assert!(context.spawn_chicken_jockey([-8, 71, -8], &world, &mut random)?);
+            assert!(context.spawn_zombie_nautilus([-8, 71, -8], &world, &mut random, true)?);
+            assert_eq!(context.base.effects.seen, 2);
+        }
+        stages.starts.clear();
+        assert!(
+            ruin_structures_with_piece(&stages, [-10, 70, -8], &key, &revised, &current).is_err()
+        );
+        Ok(())
+    }
 
     fn scan_next(plan: &GenerationSchedule) -> Option<(ChunkPos, GenerationStage)> {
         plan.required.iter().find_map(|(&pos, &required)| {

@@ -205,6 +205,11 @@ impl CatSpawnVariants {
 }
 
 impl CatWorldConditions {
+    pub(crate) fn uses_structures(&self) -> bool {
+        self.predicates
+            .values()
+            .any(|condition| matches!(condition, WorldCondition::Structures(_)))
+    }
     pub(crate) fn prepare_values<'a>(
         provider: &mut impl ResourceProvider,
         conditions: impl IntoIterator<Item = &'a Value>,

@@ -14,6 +14,9 @@ use std::collections::BTreeSet;
 pub trait OceanRuinPlacementWorld:
     FloorWorld + MarkerWorld + ShapeEdgeWorld<State = BlockState>
 {
+    fn piece_aligned(&mut self, _: BoundingBox) -> Result<()> {
+        Ok(())
+    }
     fn fluid_at(&mut self, position: [i32; 3]) -> Result<Option<FluidState>>;
     fn fluid_of_state(&mut self, state: &BlockState) -> Result<Option<FluidState>>;
     /// Apply the barrier for NBT, the block write with flag 2, and load the
@@ -113,6 +116,7 @@ impl PreparedPiece {
         let mut piece = self.clone();
         let mut next_random = random.clone();
         piece.align_to_floor(world)?;
+        world.piece_aligned(piece.bounds)?;
         let placed = piece.place_aligned(
             world,
             registry,

@@ -110,6 +110,10 @@ impl FarmAnimalSpawnVariants {
         self.visual.conditions.uses_moon()
     }
 
+    pub fn uses_structure_conditions(&self) -> bool {
+        self.visual.conditions.uses_structures()
+    }
+
     /// Java constructs these animals with temperate, or the first registry
     /// entry if a data pack removed it.
     pub fn default_variant(&self) -> &ResourceId {
@@ -341,6 +345,9 @@ pub struct ZombieNautilusSpawnVariants {
 }
 
 impl ZombieNautilusSpawnVariants {
+    pub fn uses_structure_conditions(&self) -> bool {
+        self.visual.conditions.uses_structures()
+    }
     pub fn load_active(provider: &mut impl ResourceProvider) -> Result<Self> {
         let registry = "zombie_nautilus_variant";
         let ordered = provider.list_registry_data(registry)?;

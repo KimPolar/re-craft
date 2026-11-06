@@ -138,6 +138,27 @@ pub struct RuinDataMarker {
 /// must isolate their state when cloned; the enclosing decoration attempt must
 /// also stage the context until the whole region is published.
 pub trait DrownedMarkerContext: Clone {
+    fn needs_ruin_revisions(&self) -> bool {
+        true
+    }
+    /// Start and piece information is staged with the enclosing decoration.
+    fn begin_ruin_start(
+        &mut self,
+        _: &super::structure_batch::TerrainStartKey,
+        _: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn begin_ruin_piece(
+        &mut self,
+        _: usize,
+        _: &[native_core::beardifier::BoundingBox],
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn set_aligned_ruin_piece(&mut self, _: native_core::beardifier::BoundingBox) -> Result<()> {
+        Ok(())
+    }
     /// Use the active base difficulty, overworld clock and position-dependent
     /// moon brightness. WorldGenRegion supplies zero inhabited time; see
     /// `LocalDifficulty::for_generation`.

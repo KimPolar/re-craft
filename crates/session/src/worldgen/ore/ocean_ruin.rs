@@ -53,6 +53,9 @@ where
     C: Clone + FnMut() -> Result<Option<super::super::FreshCreatureRandom>>,
     W: super::super::ocean_ruin::DrownedMarkerContext,
 {
+    fn needs_ruin_revisions(&self) -> bool {
+        self.context.needs_ruin_revisions()
+    }
     fn place(
         &mut self,
         region: &mut DecorationRegion<'_>,
@@ -73,6 +76,22 @@ where
             &mut self.construct,
             &mut self.context,
         )?;
+        Ok(())
+    }
+
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::super::structure_batch::TerrainStartKey,
+        start: &mut super::super::ocean_ruin::PreparedStart,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+        revisions: &[super::super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        let mut staged = self.clone();
+        staged.context.begin_ruin_start(key, revisions)?;
+        staged.place(region, start, clip, random)?;
+        *self = staged;
         Ok(())
     }
 }
@@ -120,12 +139,16 @@ impl DecorationRegion<'_> {
         let mut next_construct = construct.clone();
         let mut next_context = context.clone();
         let mut processed = 0;
-        for piece in &mut staged.pieces {
+        for index in 0..staged.pieces.len() {
+            let piece = &staged.pieces[index];
             if !(0..3).all(|axis| {
                 piece.bounds.max[axis] >= clip.min[axis] && piece.bounds.min[axis] <= clip.max[axis]
             }) {
                 continue;
             }
+            let piece_bounds: Vec<_> = staged.pieces.iter().map(|piece| piece.bounds).collect();
+            next_context.begin_ruin_piece(index, &piece_bounds)?;
+            let piece = &mut staged.pieces[index];
             self.place_ocean_ruin_piece_with_initialized_drowned(
                 piece,
                 ice_tags,
@@ -172,6 +195,7 @@ impl DecorationRegion<'_> {
         F: Clone + FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
     {
         let mut next_spawn = spawn.clone();
+        let aligned = std::cell::Cell::new(None);
         let result = self.place_ocean_ruin_piece_inner(
             piece,
             ice_tags,
@@ -183,6 +207,7 @@ impl DecorationRegion<'_> {
             clip,
             random,
             &mut next_spawn,
+            &aligned,
         )?;
         *spawn = next_spawn;
         Ok(result)
@@ -214,7 +239,11 @@ impl DecorationRegion<'_> {
         let mut next_random = region_random.clone();
         let mut next_construct = construct.clone();
         let mut next_context = context.clone();
+        let aligned = std::cell::Cell::new(None);
         let mut spawn = |position, world: &World| {
+            next_context.set_aligned_ruin_piece(
+                aligned.get().context("aligned ruin piece is unavailable")?,
+            )?;
             draft_initialized_drowned(
                 position,
                 world,
@@ -234,6 +263,7 @@ impl DecorationRegion<'_> {
             clip,
             decoration_random,
             &mut spawn,
+            &aligned,
         )?;
         *region_random = next_random;
         *construct = next_construct;
@@ -254,6 +284,7 @@ impl DecorationRegion<'_> {
         clip: BoundingBox,
         random: &mut DecorationRandom,
         spawn: &mut F,
+        aligned: &std::cell::Cell<Option<BoundingBox>>,
     ) -> Result<bool>
     where
         F: FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
@@ -271,6 +302,7 @@ impl DecorationRegion<'_> {
                 },
                 ice_tags,
                 bubble_fluids,
+                aligned,
             },
             registry,
             world_seed,
@@ -860,6 +892,7 @@ struct RuinPieceRegion<'r, 'a, 't, F> {
     marker: RuinMarkerRegion<'r, 'a, 't, F>,
     ice_tags: &'t OreBlockTags,
     bubble_fluids: &'t BTreeSet<String>,
+    aligned: &'r std::cell::Cell<Option<BoundingBox>>,
 }
 
 impl<F> FloorWorld for RuinPieceRegion<'_, '_, '_, F> {
@@ -1061,6 +1094,10 @@ impl<F> super::super::ocean_ruin::OceanRuinPlacementWorld for RuinPieceRegion<'_
 where
     F: FnMut([i32; 3], &World) -> Result<Option<super::super::GeneratedEntityRecord>>,
 {
+    fn piece_aligned(&mut self, bounds: BoundingBox) -> Result<()> {
+        self.aligned.set(Some(bounds));
+        Ok(())
+    }
     fn fluid_at(&mut self, position: [i32; 3]) -> Result<Option<native_world::fluid::FluidState>> {
         let state = OreWorld::block(self.marker.region, position)?;
         self.fluid_of_state(&state)
@@ -1199,8 +1236,13 @@ mod tests {
         created_chicken: Option<Tag>,
         create_nautilus: bool,
         created_nautilus: Option<Tag>,
+        aligned_pieces: Vec<BoundingBox>,
     }
     impl super::super::super::ocean_ruin::DrownedMarkerContext for DrownedContext {
+        fn set_aligned_ruin_piece(&mut self, bounds: BoundingBox) -> Result<()> {
+            self.aligned_pieces.push(bounds);
+            Ok(())
+        }
         fn special_multiplier(&mut self, _: [i32; 3], _: &World) -> Result<f32> {
             self.calls += 1;
             self.special_calls += 1;
@@ -2412,6 +2454,7 @@ mod tests {
             &mut context
         )?);
         assert_eq!(piece.selection.position, [1, 8, 1]);
+        expected_context.aligned_pieces = vec![piece.bounds; 2];
         assert_eq!(context, expected_context);
         assert_eq!(region_random.next_long(), expected_random.next_long());
         assert_eq!(decoration.next_long(), expected_decoration.next_long());
@@ -2600,6 +2643,15 @@ mod tests {
             2
         );
         assert_eq!(context.special_calls, 4);
+        assert_eq!(
+            context.aligned_pieces,
+            vec![
+                start.pieces[0].bounds,
+                start.pieces[0].bounds,
+                start.pieces[1].bounds,
+                start.pieces[1].bounds
+            ]
+        );
         assert_eq!(
             start
                 .pieces

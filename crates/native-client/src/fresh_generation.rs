@@ -195,6 +195,9 @@ pub(crate) struct InitialOceanGeneration {
 pub(crate) struct UnsupportedOceanEffects;
 
 impl native_session::worldgen::ocean_ruin::DrownedSpawnEffects for UnsupportedOceanEffects {
+    fn needs_structure_variants(&self) -> bool {
+        false
+    }
     fn try_existing_chicken(
         &mut self,
         _: [i32; 3],

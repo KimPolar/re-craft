@@ -10,6 +10,26 @@ use native_world::loaded::{ChunkPos, World};
 use super::DrownedMarkerContext;
 use crate::worldgen::{BiomeNeighborhood, LocalDifficulty};
 
+struct BiomeOnlyEnvironment<'a> {
+    biomes: &'a BiomeNeighborhood,
+    position: [i32; 3],
+}
+
+impl native_resources::animal_variants::SpawnVariantEnvironment for BiomeOnlyEnvironment<'_> {
+    fn biome(&self) -> Result<&native_resources::packs::ResourceId> {
+        self.biomes
+            .biome_at_block(self.position[0], self.position[1], self.position[2])
+    }
+    fn moon_phase(&mut self) -> Result<u8> {
+        anyhow::bail!("moon phase unavailable")
+    }
+    fn structures_with_piece(
+        &mut self,
+    ) -> Result<&std::collections::BTreeSet<native_resources::packs::ResourceId>> {
+        anyhow::bail!("structure pieces unavailable")
+    }
+}
+
 /// Stages the freshly created structure nautilus until its rider is ready.
 #[derive(Clone)]
 pub struct DrownedNautilusEffects<E, C> {
@@ -39,6 +59,9 @@ where
     E: DrownedSpawnEffects,
     C: Clone + FnMut() -> Result<Option<crate::worldgen::FreshCreatureRandom>>,
 {
+    fn needs_structure_variants(&self) -> bool {
+        self.variants.uses_structure_conditions() || self.other.needs_structure_variants()
+    }
     fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
         self.other.try_existing_chicken(position, world)
     }
@@ -51,6 +74,19 @@ where
     ) -> Result<bool> {
         self.other
             .spawn_chicken_jockey(position, world, random, biomes)
+    }
+    fn spawn_chicken_jockey_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
+        environment: &mut V,
+    ) -> Result<bool> {
+        self.other
+            .spawn_chicken_jockey_in_environment(position, world, random, biomes, environment)
     }
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.other.take_created_chicken()
@@ -81,10 +117,31 @@ where
     fn spawn_zombie_nautilus_in_biome(
         &mut self,
         position: [i32; 3],
-        _: &World,
+        world: &World,
         random: &mut RegionRandom,
         persistent: bool,
         biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        let mut environment = BiomeOnlyEnvironment { biomes, position };
+        self.spawn_zombie_nautilus_in_environment(
+            position,
+            world,
+            random,
+            persistent,
+            biomes,
+            &mut environment,
+        )
+    }
+    fn spawn_zombie_nautilus_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        _: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        _: &BiomeNeighborhood,
+        environment: &mut V,
     ) -> Result<bool> {
         ensure!(persistent, "only structure nautilus spawning is supported");
         ensure!(
@@ -101,9 +158,10 @@ where
                 && creature.construction.chicken_egg_time.is_none(),
             "invalid zombie nautilus construction"
         );
-        let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
         let mut next = random.clone();
-        let initialization = self.variants.finalize_structure_spawn(biome, &mut next)?;
+        let initialization = self
+            .variants
+            .finalize_structure_spawn_in_environment(environment, &mut next)?;
         let coords = [
             f64::from(position[0]) + 0.5,
             f64::from(position[1]),
@@ -156,15 +214,31 @@ where
     E: DrownedSpawnEffects,
     C: Clone + FnMut() -> Result<Option<crate::worldgen::FreshCreatureRandom>>,
 {
+    fn needs_structure_variants(&self) -> bool {
+        self.variants.uses_structure_conditions() || self.other.needs_structure_variants()
+    }
     fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
         self.other.try_existing_chicken(position, world)
     }
     fn spawn_chicken_jockey(
         &mut self,
         position: [i32; 3],
-        _: &World,
+        world: &World,
         random: &mut RegionRandom,
         biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        let mut environment = BiomeOnlyEnvironment { biomes, position };
+        self.spawn_chicken_jockey_in_environment(position, world, random, biomes, &mut environment)
+    }
+    fn spawn_chicken_jockey_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        _: &World,
+        random: &mut RegionRandom,
+        _: &BiomeNeighborhood,
+        environment: &mut V,
     ) -> Result<bool> {
         ensure!(
             self.pending.is_none(),
@@ -175,20 +249,20 @@ where
             self.construct = construct;
             return Ok(false);
         };
-        let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
         let coords = [
             f64::from(position[0]) + 0.5,
             f64::from(position[1]),
             f64::from(position[2]) + 0.5,
         ];
-        let tag = crate::worldgen::draft_fresh_jockey_chicken(
-            &chicken,
-            coords,
-            0.0,
-            biome,
-            &self.variants,
-            random,
-        )?;
+        let tag =
+            crate::worldgen::generated_farm_animal::draft_fresh_jockey_chicken_in_environment(
+                &chicken,
+                coords,
+                0.0,
+                environment,
+                &self.variants,
+                random,
+            )?;
         self.construct = construct;
         self.pending = Some(tag);
         Ok(true)
@@ -230,6 +304,26 @@ where
     ) -> Result<bool> {
         self.other
             .spawn_zombie_nautilus_in_biome(position, world, random, persistent, biomes)
+    }
+    fn spawn_zombie_nautilus_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+        environment: &mut V,
+    ) -> Result<bool> {
+        self.other.spawn_zombie_nautilus_in_environment(
+            position,
+            world,
+            random,
+            persistent,
+            biomes,
+            environment,
+        )
     }
 }
 
@@ -277,6 +371,9 @@ impl<E> DrownedEquipmentEffects<E> {
 }
 
 impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> {
+    fn needs_structure_variants(&self) -> bool {
+        self.passengers.needs_structure_variants()
+    }
     fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
         self.passengers.try_existing_chicken(position, world)
     }
@@ -289,6 +386,24 @@ impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> 
     ) -> Result<bool> {
         self.passengers
             .spawn_chicken_jockey(position, world, random, biomes)
+    }
+    fn spawn_chicken_jockey_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
+        environment: &mut V,
+    ) -> Result<bool> {
+        self.passengers.spawn_chicken_jockey_in_environment(
+            position,
+            world,
+            random,
+            biomes,
+            environment,
+        )
     }
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.passengers.take_created_chicken()
@@ -352,6 +467,26 @@ impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> 
     ) -> Result<bool> {
         self.passengers
             .spawn_zombie_nautilus_in_biome(position, world, random, persistent, biomes)
+    }
+    fn spawn_zombie_nautilus_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+        environment: &mut V,
+    ) -> Result<bool> {
+        self.passengers.spawn_zombie_nautilus_in_environment(
+            position,
+            world,
+            random,
+            persistent,
+            biomes,
+            environment,
+        )
     }
 }
 
@@ -418,6 +553,10 @@ pub struct DrownedPlacementInputs<'a, C, E, D, H> {
 /// Remaining world operations that can create or modify entities and items.
 /// Cloning must isolate all mutable state until the enclosing region commits.
 pub trait DrownedSpawnEffects: Clone {
+    /// False only when no delegated effect can request structure conditions.
+    fn needs_structure_variants(&self) -> bool {
+        true
+    }
     fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool>;
     fn spawn_chicken_jockey(
         &mut self,
@@ -426,6 +565,18 @@ pub trait DrownedSpawnEffects: Clone {
         random: &mut RegionRandom,
         biomes: &BiomeNeighborhood,
     ) -> Result<bool>;
+    fn spawn_chicken_jockey_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
+        _: &mut V,
+    ) -> Result<bool> {
+        self.spawn_chicken_jockey(position, world, random, biomes)
+    }
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         Ok(None)
     }
@@ -456,6 +607,19 @@ pub trait DrownedSpawnEffects: Clone {
         _biomes: &BiomeNeighborhood,
     ) -> Result<bool> {
         self.spawn_zombie_nautilus(position, world, random, persistent)
+    }
+    fn spawn_zombie_nautilus_in_environment<
+        V: native_resources::animal_variants::SpawnVariantEnvironment,
+    >(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+        _: &mut V,
+    ) -> Result<bool> {
+        self.spawn_zombie_nautilus_in_biome(position, world, random, persistent, biomes)
     }
 }
 
@@ -561,6 +725,155 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     struct Data;
+
+    #[test]
+    fn jockey_effects_apply_contextual_variants_and_roll_back_missing_context() -> Result<()> {
+        use native_core::random::LegacyRandom;
+        use native_resources::animal_variants::{
+            FarmAnimal, FarmAnimalSpawnVariants, SpawnVariantContext, ZombieNautilusSpawnVariants,
+        };
+        use serde_json::json;
+        use std::collections::BTreeSet;
+        struct Pack(BTreeMap<String, Vec<u8>>);
+        impl ResourceProvider for Pack {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(self.0.get(path).cloned())
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                let prefix = format!("data/minecraft/{folder}/");
+                self.0
+                    .keys()
+                    .filter_map(|path| path.strip_prefix(&prefix)?.strip_suffix(".json"))
+                    .map(ResourceId::parse)
+                    .collect()
+            }
+        }
+        let mut pack = Pack(BTreeMap::new());
+        pack.0.insert(
+            "data/minecraft/worldgen/biome/ocean.json".into(),
+            b"{}".to_vec(),
+        );
+        pack.0.insert(
+            "data/minecraft/worldgen/structure/ocean_ruin.json".into(),
+            b"{}".to_vec(),
+        );
+        pack.0.insert(
+            "data/minecraft/chicken_sound_variant/classic.json".into(),
+            b"{}".to_vec(),
+        );
+        for registry in ["chicken_variant", "zombie_nautilus_variant"] {
+            for (name, condition) in [
+                ("temperate", json!({"priority":0})),
+                (
+                    "moon",
+                    json!({"priority":1,"condition":{"type":"minecraft:moon_brightness","range":{"min":0.9}}}),
+                ),
+                (
+                    "ruin",
+                    json!({"priority":2,"condition":{"type":"minecraft:structure","structures":"minecraft:ocean_ruin"}}),
+                ),
+            ] {
+                pack.0.insert(
+                    format!("data/minecraft/{registry}/{name}.json"),
+                    serde_json::to_vec(&json!({"spawn_conditions":[condition]}))?,
+                );
+            }
+        }
+        let chicken = Arc::new(FarmAnimalSpawnVariants::load_active(
+            &mut pack,
+            FarmAnimal::Chicken,
+        )?);
+        let nautilus = Arc::new(ZombieNautilusSpawnVariants::load_active(&mut pack)?);
+        let chicken_entity = crate::worldgen::FreshCreatureRandom::from_seed(
+            &ResourceId::parse("minecraft:chicken")?,
+            12,
+        )?;
+        let nautilus_entity = crate::worldgen::FreshCreatureRandom::from_seed(
+            &ResourceId::parse("minecraft:zombie_nautilus")?,
+            13,
+        )?;
+        let inner = DrownedChickenEffects::new(
+            chicken,
+            move || Ok(Some(chicken_entity.clone())),
+            Effects::default(),
+        )?;
+        let mut effects =
+            DrownedNautilusEffects::new(nautilus, move || Ok(Some(nautilus_entity.clone())), inner);
+        assert!(effects.needs_structure_variants());
+        let biome = ResourceId::parse("minecraft:ocean")?;
+        let ruin = ResourceId::parse("minecraft:ocean_ruin")?;
+        let empty = BTreeSet::new();
+        let present = BTreeSet::from([ruin]);
+        let biomes = BiomeNeighborhood::new(42, 0, 16)?;
+        let world = World::new("minecraft:overworld");
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(42));
+        for (phase, structures, expected) in [
+            (0, &present, "minecraft:ruin"),
+            (0, &empty, "minecraft:moon"),
+            (4, &empty, "minecraft:temperate"),
+        ] {
+            let mut context = SpawnVariantContext {
+                biome: Some(&biome),
+                moon_phase: Some(phase),
+                structures_with_piece: Some(structures),
+            };
+            assert!(effects.spawn_chicken_jockey_in_environment(
+                [3, 8, 2],
+                &world,
+                &mut random,
+                &biomes,
+                &mut context
+            )?);
+            assert!(
+                matches!(effects.take_created_chicken()?.and_then(|tag| tag.get("variant").cloned()), Some(Tag::String(id)) if id.matches(expected))
+            );
+            assert!(effects.spawn_zombie_nautilus_in_environment(
+                [3, 8, 2],
+                &world,
+                &mut random,
+                true,
+                &biomes,
+                &mut context
+            )?);
+            assert!(
+                matches!(effects.take_created_nautilus()?.and_then(|tag| tag.get("variant").cloned()), Some(Tag::String(id)) if id.matches(expected))
+            );
+        }
+        let mut incomplete = SpawnVariantContext {
+            biome: Some(&biome),
+            moon_phase: None,
+            structures_with_piece: None,
+        };
+        for chicken in [true, false] {
+            let mut before = random.clone();
+            let result = if chicken {
+                effects.spawn_chicken_jockey_in_environment(
+                    [3, 8, 2],
+                    &world,
+                    &mut random,
+                    &biomes,
+                    &mut incomplete,
+                )
+            } else {
+                effects.spawn_zombie_nautilus_in_environment(
+                    [3, 8, 2],
+                    &world,
+                    &mut random,
+                    true,
+                    &biomes,
+                    &mut incomplete,
+                )
+            };
+            assert!(result.is_err());
+            assert_eq!(random.next_long(), before.next_long());
+            assert!(effects.take_created_chicken()?.is_none());
+            assert!(effects.take_created_nautilus()?.is_none());
+        }
+        Ok(())
+    }
     impl ResourceProvider for Data {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)

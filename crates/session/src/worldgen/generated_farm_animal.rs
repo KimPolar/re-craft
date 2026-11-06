@@ -2,7 +2,10 @@
 use anyhow::{Result, ensure};
 use native_persistence::nbt::Tag;
 use native_resources::{
-    animal_variants::{FarmAnimal, FarmAnimalInitialization, FarmAnimalSpawnVariants},
+    animal_variants::{
+        FarmAnimal, FarmAnimalInitialization, FarmAnimalSpawnVariants, SpawnVariantContext,
+        SpawnVariantEnvironment,
+    },
     packs::ResourceId,
     worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
@@ -18,13 +21,37 @@ pub fn draft_fresh_jockey_chicken(
     variants: &FarmAnimalSpawnVariants,
     random: &mut RegionRandom,
 ) -> Result<Tag> {
+    let mut environment = SpawnVariantContext {
+        biome: Some(biome),
+        moon_phase: None,
+        structures_with_piece: None,
+    };
+    draft_fresh_jockey_chicken_in_environment(
+        creature,
+        position,
+        yaw,
+        &mut environment,
+        variants,
+        random,
+    )
+}
+
+pub fn draft_fresh_jockey_chicken_in_environment(
+    creature: &super::FreshCreatureRandom,
+    position: [f64; 3],
+    yaw: f32,
+    environment: &mut impl SpawnVariantEnvironment,
+    variants: &FarmAnimalSpawnVariants,
+    random: &mut RegionRandom,
+) -> Result<Tag> {
     ensure!(
         variants.species() == FarmAnimal::Chicken,
         "expected chicken variants"
     );
     let mut next_random = random.clone();
     let mut group = AnimalGroupData::default();
-    let initialization = variants.finalize(biome, &mut next_random, &mut group, false)?;
+    let initialization =
+        variants.finalize_in_environment(environment, &mut next_random, &mut group, false)?;
     let Tag::Compound(mut fields) = draft_fresh_farm_animal(
         FarmAnimal::Chicken,
         creature.construction.uuid,

@@ -62,6 +62,9 @@ pub use ocean_ruin::OceanRuinPlacementContext;
 /// World-specific ocean-ruin effects used by a mixed decoration pass. Clones
 /// must isolate mutable state until the entire pass succeeds.
 pub trait MixedOceanRuinPlacement {
+    fn needs_ruin_revisions(&self) -> bool {
+        true
+    }
     fn place(
         &mut self,
         region: &mut DecorationRegion<'_>,
@@ -69,6 +72,18 @@ pub trait MixedOceanRuinPlacement {
         clip: native_core::beardifier::BoundingBox,
         random: &mut DecorationRandom,
     ) -> Result<()>;
+
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        _key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        _revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.place(region, start, clip, random)
+    }
 
     /// Place a hut using the same region-random state as ocean ruins.
     fn place_hut(
@@ -112,6 +127,9 @@ where
             &[super::structure_batch::StructurePieceRevision],
         ) -> Result<bool>,
 {
+    fn needs_ruin_revisions(&self) -> bool {
+        self.ocean.needs_ruin_revisions()
+    }
     fn place(
         &mut self,
         region: &mut DecorationRegion<'_>,
@@ -120,6 +138,19 @@ where
         random: &mut DecorationRandom,
     ) -> Result<()> {
         self.ocean.place(region, start, clip, random)
+    }
+
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.ocean
+            .place_with_context(region, key, start, clip, random, revisions)
     }
 
     fn place_hut(
@@ -1959,7 +1990,13 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                 && start.bounds.min[axis] <= clip.max[axis])
                                 );
                                 let mut revisions = Vec::new();
-                                if is_hut {
+                                if is_hut
+                                    || (ocean.needs_ruin_revisions()
+                                        && matches!(
+                                            &updated[index][start_index],
+                                            PreparedStructureStart::OceanRuin(_)
+                                        ))
+                                {
                                     for (entry, starts) in plan.iter().zip(updated.iter()) {
                                         for start in starts {
                                             match start {
@@ -2012,7 +2049,21 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                     }
                                     PreparedStructureStart::OceanRuin(start) => {
                                         let original = start.clone();
-                                        ocean.place(&mut region, start, clip, &mut random)?;
+                                        let key = (
+                                            plan[index].entry.id.clone(),
+                                            ChunkPos {
+                                                x: start.chunk[0],
+                                                z: start.chunk[1],
+                                            },
+                                        );
+                                        ocean.place_with_context(
+                                            &mut region,
+                                            &key,
+                                            start,
+                                            clip,
+                                            &mut random,
+                                            &revisions,
+                                        )?;
                                         validate_decorated_ocean_start(&original, start)?;
                                     }
                                 }

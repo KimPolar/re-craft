@@ -11,7 +11,11 @@ use native_resources::{
 };
 use serde_json::Value;
 
+mod drowned_context;
 mod placement;
+pub use drowned_context::{
+    DrownedGenerationContext, DrownedSpawnEffects, GenerationDifficultyInputs,
+};
 pub use placement::OceanRuinPlacementWorld;
 
 #[derive(Clone)]

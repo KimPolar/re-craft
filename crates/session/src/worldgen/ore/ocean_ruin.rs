@@ -2,11 +2,14 @@
 use super::*;
 use native_core::beardifier::BoundingBox;
 use native_persistence::nbt::Tag;
+#[cfg(test)]
+use native_resources::drowned_spawn::initialize_structure_drowned;
 use native_resources::ocean_ruin::{DataMarkerKind, FloorWorld, MarkerWorld, handle_data_marker};
 use native_resources::tree_leaf_update::ShapeEdgeWorld;
 use native_resources::{
     drowned_spawn::{
-        MainHandRoll, NautilusJockeyWorld, StructureDrownedWorld, initialize_structure_drowned,
+        MainHandRoll, NautilusJockeyWorld, StructureDrownedWorld,
+        initialize_structure_drowned_with_holiday,
     },
     worldgen_region_random::RegionRandom,
 };
@@ -388,19 +391,18 @@ where
         "invalid drowned construction"
     );
     let special = context.special_multiplier(position, world)?;
-    let halloween = context.halloween()?;
     let mut adapter = DrownedMarkerAdapter {
         position,
         world,
         context,
         enchanted_hand: None,
     };
-    let initialized = initialize_structure_drowned(
+    let initialized = initialize_structure_drowned_with_holiday(
         &mut adapter,
         random,
         &mut creature.random,
         special,
-        halloween,
+        |adapter| adapter.context.halloween(),
     )?;
     let main_hand = match (initialized.main_hand, adapter.enchanted_hand) {
         (MainHandRoll::Unchanged, None) => None,
@@ -1016,6 +1018,46 @@ mod tests {
             ensure!(persistent, "structure nautilus must be persistent");
             self.calls += 1;
             Ok(false)
+        }
+    }
+    impl super::super::super::ocean_ruin::DrownedSpawnEffects for DrownedContext {
+        fn try_existing_chicken(&mut self, pos: [i32; 3], world: &World) -> Result<bool> {
+            super::super::super::ocean_ruin::DrownedMarkerContext::try_existing_chicken(
+                self, pos, world,
+            )
+        }
+        fn spawn_chicken_jockey(
+            &mut self,
+            pos: [i32; 3],
+            world: &World,
+            random: &mut RegionRandom,
+        ) -> Result<bool> {
+            super::super::super::ocean_ruin::DrownedMarkerContext::spawn_chicken_jockey(
+                self, pos, world, random,
+            )
+        }
+        fn enchant_weapon(
+            &mut self,
+            pos: [i32; 3],
+            world: &World,
+            random: &mut RegionRandom,
+            weapon: MainHandRoll,
+            special: f32,
+        ) -> Result<Tag> {
+            super::super::super::ocean_ruin::DrownedMarkerContext::enchant_weapon(
+                self, pos, world, random, weapon, special,
+            )
+        }
+        fn spawn_zombie_nautilus(
+            &mut self,
+            pos: [i32; 3],
+            world: &World,
+            random: &mut RegionRandom,
+            persistent: bool,
+        ) -> Result<bool> {
+            super::super::super::ocean_ruin::DrownedMarkerContext::spawn_zombie_nautilus(
+                self, pos, world, random, persistent,
+            )
         }
     }
 
@@ -2049,6 +2091,66 @@ mod tests {
             failed_terrain
                 .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
                 .is_empty()
+        );
+
+        let biome_tags = native_resources::drowned_spawn::DrownedBiomeTags::load(&mut resources)?;
+        let mut biomes = super::super::super::BiomeNeighborhood::new(0, 0, 16)?;
+        let ocean = ResourceId::parse("minecraft:ocean")?;
+        for z in -1..=1 {
+            for x in -1..=1 {
+                biomes.insert(Arc::new(super::super::super::QuartBiomeChunk::from_values(
+                    [x, z],
+                    0,
+                    0,
+                    16,
+                    vec![ocean.clone(); 64],
+                )?))?;
+            }
+        }
+        let (mut actual_terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = actual_terrain.snapshot().chunks.keys().copied().collect();
+        let mut actual_region = actual_terrain.decoration_region(&tags, &motion, writable)?;
+        let mut context = super::super::super::ocean_ruin::DrownedGenerationContext {
+            biomes: &biomes,
+            biome_tags: &biome_tags,
+            difficulty_at: |_: [i32; 3], _: &World| {
+                Ok(
+                    super::super::super::ocean_ruin::GenerationDifficultyInputs {
+                        difficulty: native_persistence::world::Difficulty::Normal,
+                        overworld_clock_time: 0,
+                        moon_brightness: 1.0,
+                    },
+                )
+            },
+            halloween_at: || Ok(false),
+            effects: DrownedContext::default(),
+        };
+        let mut piece = make_piece();
+        let mut decoration = DecorationRandom::new(42);
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(12345));
+        let mut construct = make_constructor();
+        assert!(
+            actual_region.place_ocean_ruin_piece_with_initialized_drowned(
+                &mut piece,
+                &ice,
+                &water,
+                &bubbles,
+                &registry,
+                Temperature::Warm,
+                63,
+                clip,
+                &mut decoration,
+                &mut random,
+                &mut construct,
+                &mut context
+            )?
+        );
+        actual_region.finish()?;
+        assert_eq!(
+            actual_terrain
+                .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                .len(),
+            2
         );
         Ok(())
     }

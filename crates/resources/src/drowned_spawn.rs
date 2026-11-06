@@ -1,8 +1,46 @@
 //! Java 26.3 drowned spawn draws and structure initialization order.
 use anyhow::{Result, ensure};
 use native_core::random::LegacyRandom;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::worldgen_region_random::{MobBaseInitialization, RegionRandom, finalize_mob_base};
+use crate::{
+    packs::{ResourceId, ResourceProvider},
+    surface_biomes,
+};
+
+/// Active biome membership for Drowned's nautilus-jockey check.
+#[derive(Clone, Debug)]
+pub struct DrownedBiomeTags {
+    registry: BTreeSet<ResourceId>,
+    frequent: BTreeSet<ResourceId>,
+}
+
+impl DrownedBiomeTags {
+    pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
+        use anyhow::Context;
+        let registry: BTreeSet<_> = provider.list_data("worldgen/biome")?.into_iter().collect();
+        ensure!(!registry.is_empty(), "biome registry is empty");
+        let frequent = surface_biomes::resolve_tag(
+            provider,
+            &ResourceId::parse("minecraft:more_frequent_drowned_spawns")?,
+            &registry,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )
+        .context("cannot resolve drowned biome tag")?
+        .unwrap_or_default();
+        Ok(Self { registry, frequent })
+    }
+
+    pub fn more_frequent(&self, biome: &ResourceId) -> Result<bool> {
+        ensure!(
+            self.registry.contains(biome),
+            "biome is absent from the active registry"
+        );
+        Ok(self.frequent.contains(biome))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainHandRoll {
@@ -143,6 +181,24 @@ pub fn initialize_structure_drowned(
     special_multiplier: f32,
     halloween: bool,
 ) -> Result<StructureDrownedInitialization> {
+    initialize_structure_drowned_with_holiday(
+        world,
+        region_random,
+        entity_random,
+        special_multiplier,
+        |_| Ok(halloween),
+    )
+}
+
+/// The holiday callback is queried at Java's equipment-finalization point,
+/// after weapon enchantments and before the pumpkin random draws.
+pub fn initialize_structure_drowned_with_holiday<W: StructureDrownedWorld>(
+    world: &mut W,
+    region_random: &mut RegionRandom,
+    entity_random: &mut LegacyRandom,
+    special_multiplier: f32,
+    holiday: impl FnOnce(&mut W) -> Result<bool>,
+) -> Result<StructureDrownedInitialization> {
     ensure!(
         special_multiplier.is_finite() && (0.0..=1.0).contains(&special_multiplier),
         "invalid special difficulty multiplier"
@@ -169,7 +225,7 @@ pub fn initialize_structure_drowned(
     {
         world.enchant_weapon(region_random, main_hand, special_multiplier)?;
     }
-    let helmet = if halloween && region_random.next_float() < 0.25_f32 {
+    let helmet = if holiday(world)? && region_random.next_float() < 0.25_f32 {
         Some(if region_random.next_float() < 0.1_f32 {
             HalloweenHelmet::JackOLantern
         } else {
@@ -238,11 +294,70 @@ pub fn roll_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drowned_biome_tag_respects_pack_layers_and_validates_registry() {
+        #[derive(Default)]
+        struct Data(BTreeMap<String, Vec<Vec<u8>>>);
+        impl ResourceProvider for Data {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(self.0.get(path).cloned().unwrap_or_default())
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                ["minecraft:ocean", "minecraft:river", "example:custom"]
+                    .into_iter()
+                    .map(ResourceId::parse)
+                    .collect()
+            }
+        }
+        let mut data = Data::default();
+        let tag = "data/minecraft/tags/worldgen/biome/more_frequent_drowned_spawns.json";
+        data.0.insert(tag.into(), vec![br#"{"values":["minecraft:ocean"]}"#.to_vec(), br##"{"replace":true,"values":["#example:nested",{"id":"example:missing","required":false}]}"##.to_vec()]);
+        data.0.insert(
+            "data/example/tags/worldgen/biome/nested.json".into(),
+            vec![br#"{"values":["minecraft:river","example:custom"]}"#.to_vec()],
+        );
+        let tags = DrownedBiomeTags::load(&mut data).unwrap();
+        assert!(
+            !tags
+                .more_frequent(&ResourceId::parse("minecraft:ocean").unwrap())
+                .unwrap()
+        );
+        assert!(
+            tags.more_frequent(&ResourceId::parse("minecraft:river").unwrap())
+                .unwrap()
+        );
+        assert!(
+            tags.more_frequent(&ResourceId::parse("example:custom").unwrap())
+                .unwrap()
+        );
+        assert!(
+            tags.more_frequent(&ResourceId::parse("example:missing").unwrap())
+                .is_err()
+        );
+        data.0.insert(
+            "data/example/tags/worldgen/biome/nested.json".into(),
+            vec![br##"{"values":["#example:nested"]}"##.to_vec()],
+        );
+        assert!(DrownedBiomeTags::load(&mut data).is_err());
+        data.0.clear();
+        assert!(
+            !DrownedBiomeTags::load(&mut data)
+                .unwrap()
+                .more_frequent(&ResourceId::parse("minecraft:river").unwrap())
+                .unwrap()
+        );
+    }
     #[derive(Default)]
     struct World {
         biome_calls: usize,
         spawn_calls: usize,
         persistent: Option<bool>,
+        enchant_calls: usize,
     }
     impl NautilusJockeyWorld for World {
         fn more_frequent_drowned_biome(&mut self) -> Result<bool> {
@@ -274,9 +389,35 @@ mod tests {
             _: MainHandRoll,
             _: f32,
         ) -> Result<()> {
+            self.enchant_calls += 1;
             random.next_int();
             Ok(())
         }
+    }
+    #[test]
+    fn holiday_is_observed_after_equipment_enchantment() {
+        for seed in 0..10_000 {
+            let mut world = World::default();
+            let mut region = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mut entity = LegacyRandom::new(seed + 1);
+            let mut enchanted_before_holiday = false;
+            initialize_structure_drowned_with_holiday(
+                &mut world,
+                &mut region,
+                &mut entity,
+                1.0,
+                |world| {
+                    enchanted_before_holiday = world.enchant_calls != 0;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            if world.enchant_calls != 0 {
+                assert!(enchanted_before_holiday);
+                return;
+            }
+        }
+        panic!("no enchanted drowned in sample");
     }
     #[test]
     fn invalid_difficulty_does_not_consume_entity_random() {

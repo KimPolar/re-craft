@@ -23,9 +23,9 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        MixedFeatureCallbacks, NativeDrownedFeatureRunner, NativeHutFeatureRunner,
-        NativeMixedFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
-        StructureFeatureLighting,
+        MineshaftFeatureCallbacks, MixedFeatureCallbacks, NativeDrownedFeatureRunner,
+        NativeHutFeatureRunner, NativeMixedFeatureRunner, OceanFeatureCallbacks,
+        OceanFeatureRunner, StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3791,6 +3791,22 @@ impl FreshTerrainBatch {
         self.step_inner(provider, classify, resolve, None, None)
     }
 
+    /// Perform one operation with a caller-supplied independent minecart UUID
+    /// constructor. Callback clones must isolate mutable state on failure.
+    pub fn step_with_mineshaft_support<U>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        uuid_factory: &mut U,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+    {
+        let mut runner = MineshaftFeatureCallbacks { uuid_factory };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
     /// Perform one operation with explicitly supplied ocean-ruin entity and
     /// item effects. The per-chunk region RNG is initialized by this batch.
     /// Combined hut and ocean decoration remains unsupported.
@@ -4136,8 +4152,19 @@ impl FreshTerrainBatch {
                 let entity_free = plan.features().iter().all(|feature| {
                     config.feature_entity_evidence.get(feature.feature) == Some(&true)
                 });
-                let prepared =
-                    PreparedDecoration::load(provider, &plan, &config.block_registry, resolve)?;
+                let needs_mineshaft = self
+                    .structures
+                    .as_ref()
+                    .map(|structures| structures.has_mineshaft_reference(pos))
+                    .transpose()?
+                    .unwrap_or(false);
+                let prepared = PreparedDecoration::load_with_mineshaft(
+                    provider,
+                    &plan,
+                    &config.block_registry,
+                    resolve,
+                    needs_mineshaft,
+                )?;
                 let terrain = self
                     .terrain
                     .as_mut()

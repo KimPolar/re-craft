@@ -1046,6 +1046,7 @@ pub struct PreparedDecoration<'p, 's> {
     plan: &'p DecorationPlan<'s>,
     features: BTreeMap<FeatureKey, ScheduledDecorationFeature<'s>>,
     tags: OreBlockTags,
+    mineshaft_biomes: Option<native_resources::mineshaft::MineshaftBlockingBiomes>,
     motion: HeightmapTags,
     sugar_cane_fluids: Option<BTreeSet<String>>,
     cactus_lava_fluids: Option<BTreeSet<String>>,
@@ -1073,6 +1074,18 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         plan: &'p DecorationPlan<'s>,
         block_registry: &BTreeSet<String>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    ) -> Result<Self> {
+        Self::load_with_mineshaft(provider, plan, block_registry, resolve, false)
+    }
+
+    /// Resolve the additional active biome and support tags required by a
+    /// referenced mineshaft before any terrain changes are attempted.
+    pub fn load_with_mineshaft(
+        provider: &mut impl ResourceProvider,
+        plan: &'p DecorationPlan<'s>,
+        block_registry: &BTreeSet<String>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        needs_mineshaft: bool,
     ) -> Result<Self> {
         let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
@@ -1119,7 +1132,13 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 features.insert(selected.feature.clone(), feature);
             }
         }
+        if needs_mineshaft {
+            required.insert(ResourceId::parse("minecraft:unstable_bottom_center")?);
+        }
         let tags = OreBlockTags::load(provider, block_registry, &required)?;
+        let mineshaft_biomes = needs_mineshaft
+            .then(|| native_resources::mineshaft::MineshaftBlockingBiomes::load(provider))
+            .transpose()?;
         let motion = HeightmapTags::load(provider, block_registry)?;
         let sugar_cane_fluids = needs_sugar_cane
             .then(|| native_resources::fluid_tags::load_sugar_cane_adjacent(provider))
@@ -1175,6 +1194,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             plan,
             features,
             tags,
+            mineshaft_biomes,
             motion,
             sugar_cane_fluids,
             cactus_lava_fluids,
@@ -1182,6 +1202,13 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             bubble_column_fluids,
             freeze,
         })
+    }
+
+    /// Active data-pack tag snapshot prepared for a referenced mineshaft.
+    pub fn mineshaft_blocking_biomes(
+        &self,
+    ) -> Option<&native_resources::mineshaft::MineshaftBlockingBiomes> {
+        self.mineshaft_biomes.as_ref()
     }
 
     /// `structures_enabled` must be read from this world's generation settings.
@@ -21815,6 +21842,177 @@ mod tests {
         }));
         assert!(prepared.execute(&mut terrain, false).is_err());
         assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn mineshaft_resources_are_loaded_only_when_referenced() -> Result<()> {
+        struct MineData {
+            base: ScheduledData,
+            biome_registry_reads: usize,
+            blocks_plains: bool,
+        }
+        impl ResourceProvider for MineData {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.base.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                match path {
+                    "data/minecraft/tags/worldgen/biome/mineshaft_blocking.json" => {
+                        Ok(Some(if self.blocks_plains {
+                            br#"{"values":["minecraft:plains"]}"#.to_vec()
+                        } else {
+                            br#"{"values":[]}"#.to_vec()
+                        }))
+                    }
+                    "data/minecraft/tags/block/unstable_bottom_center.json" => {
+                        Ok(Some(br#"{"values":["minecraft:stone"]}"#.to_vec()))
+                    }
+                    _ => self.base.read_data(path),
+                }
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                self.biome_registry_reads += 1;
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            }
+        }
+        let (base, schedule, neighborhood) = scheduled_fixture(None);
+        let mut data = MineData {
+            base,
+            biome_registry_reads: 0,
+            blocks_plains: true,
+        };
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let registry = batch_registry();
+        let ordinary = PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test)?;
+        assert!(ordinary.mineshaft_blocking_biomes().is_none());
+        assert_eq!(data.biome_registry_reads, 0);
+        let mine = PreparedDecoration::load_with_mineshaft(
+            &mut data,
+            &plan,
+            &registry,
+            &mut resolve_test,
+            true,
+        )?;
+        assert_eq!(data.biome_registry_reads, 1);
+        assert!(
+            mine.mineshaft_blocking_biomes()
+                .unwrap()
+                .blocks(&ResourceId::parse("minecraft:plains")?)?
+        );
+        assert!(mine.tags.contains(
+            &ResourceId::parse("minecraft:unstable_bottom_center")?,
+            "minecraft:stone"
+        )?);
+        data.blocks_plains = false;
+        let mut registry = registry;
+        registry.extend(
+            [
+                "oak_planks",
+                "oak_fence",
+                "oak_log",
+                "iron_chain",
+                "cobweb",
+                "wall_torch",
+                "rail",
+                "spawner",
+            ]
+            .into_iter()
+            .map(|name| format!("minecraft:{name}")),
+        );
+        let mine = PreparedDecoration::load_with_mineshaft(
+            &mut data,
+            &plan,
+            &registry,
+            &mut resolve_test,
+            true,
+        )?;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            mineshaft::{MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant},
+            structure_decoration::StructureDecorationEntry,
+            structure_start::HorizontalDirection,
+        };
+        let room = MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 1, 2], [10, 6, 10]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let corridor = MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 2, 2], [4, 4, 6]).unwrap(),
+            direction: Some(HorizontalDirection::South),
+            depth: 1,
+            kind: MineshaftGraphPieceKind::Corridor {
+                rails: false,
+                spiders: true,
+                sections: 1,
+            },
+        };
+        let start = super::super::mineshaft::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 0],
+            terrain_adjustment: TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: [room, corridor]
+                .iter()
+                .map(|piece| {
+                    super::super::SavedMineshaftPiece::capture(
+                        piece,
+                        MineshaftVariant::Normal,
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        };
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:mineshaft")?,
+            step: 0,
+            index: 0,
+        };
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![PlannedStructureStart::Mineshaft(&start)],
+        }];
+        let (mut terrain, _, _, _) = fixture();
+        let covered = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+            .collect::<Vec<_>>();
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                covered,
+            )
+            .unwrap();
+        let mut uuid = |_: [f64; 3]| Ok(None);
+        let mut runner = super::super::schedule::MineshaftFeatureCallbacks {
+            uuid_factory: &mut uuid,
+        };
+        let region_random = native_resources::worldgen_region_random::RegionRandom::new(
+            0,
+            native_resources::density::WorldgenRandom::Legacy,
+            0,
+            0,
+        );
+        let updated = super::super::schedule::OceanFeatureRunner::execute(
+            &mut runner,
+            &mut terrain,
+            &mine,
+            &structures,
+            &mut BTreeMap::new(),
+            &region_random,
+            super::super::schedule::StructureFeatureLighting::Visible(&light),
+            &super::super::structure_batch::PreparedStructureStages::default(),
+            &neighborhood,
+        )?;
+        assert!(
+            matches!(&updated[0][0], PreparedStructureStart::Mineshaft(start) if start.pieces[1].placed_spider)
+        );
+        assert_eq!(terrain.generated_monster_entities().count(), 1);
+        Ok(())
     }
 
     #[test]

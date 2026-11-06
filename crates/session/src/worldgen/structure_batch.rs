@@ -209,6 +209,25 @@ pub(super) struct PreparedStructureStages {
 }
 
 impl PreparedStructureStages {
+    pub(super) fn has_mineshaft_reference(&self, pos: ChunkPos) -> Result<bool> {
+        let references = self
+            .references
+            .get(&pos)
+            .context("structure references are unavailable")?;
+        Ok(references.membership().iter().any(|(id, sources)| {
+            sources.iter().any(|&packed| {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                self.mineshafts
+                    .get(&source)
+                    .is_some_and(|starts| starts.contains_key(id))
+            })
+        }))
+    }
+
     fn insert_ocean_starts(&mut self, pos: ChunkPos, starts: OceanRuinStarts) -> Result<()> {
         ensure!(
             self.starts.contains_key(&pos),

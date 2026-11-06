@@ -1,6 +1,6 @@
 //! Java 26.3 chunk-generation dependencies and a deterministic work plan.
 //! Completing a plan entry only records an already successful generation step.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use native_world::loaded::ChunkPos;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,6 +48,74 @@ pub(super) trait OceanFeatureRunner {
         all_structures: &super::structure_batch::PreparedStructureStages,
         biomes: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>>;
+}
+
+/// Execute mineshafts and simple non-hut structures with a caller-provided
+/// independent minecart constructor. Ocean ruins and huts remain explicit.
+pub(super) struct MineshaftFeatureCallbacks<'a, U> {
+    pub uuid_factory: &'a mut U,
+}
+
+#[derive(Clone)]
+struct NoOceanPlacement;
+impl super::MixedOceanRuinPlacement for NoOceanPlacement {
+    fn place(
+        &mut self,
+        _: &mut super::DecorationRegion<'_>,
+        _: &mut super::ocean_ruin::PreparedStart,
+        _: native_core::beardifier::BoundingBox,
+        _: &mut native_core::random::DecorationRandom,
+    ) -> Result<()> {
+        bail!("ocean ruin decoration context is missing")
+    }
+}
+
+impl<U> OceanFeatureRunner for MineshaftFeatureCallbacks<'_, U>
+where
+    U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+{
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        _: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        _: &super::structure_batch::PreparedStructureStages,
+        _: &super::BiomeNeighborhood,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let mut context = super::MixedMineshaftPlacementContext {
+            other: NoOceanPlacement,
+            blocking_biomes: prepared
+                .mineshaft_blocking_biomes()
+                .context("mineshaft biome tags are not prepared")?,
+            uuid_factory: self.uuid_factory.clone(),
+        };
+        let (_, updated) =
+            match lighting {
+                StructureFeatureLighting::Visible(light) => prepared
+                    .execute_mixed_with_visible_light(terrain, structures, &mut context, light)?,
+                StructureFeatureLighting::Fresh(tracker, registry) => prepared
+                    .execute_mixed_with_tracked_light(
+                        terrain,
+                        structures,
+                        &mut context,
+                        tracker,
+                        registry,
+                    )?,
+                StructureFeatureLighting::Staged(engine, registry) => prepared
+                    .execute_mixed_with_staged_light(
+                        terrain,
+                        structures,
+                        &mut context,
+                        engine,
+                        registry,
+                    )?,
+            };
+        *self.uuid_factory = context.uuid_factory;
+        Ok(updated)
+    }
 }
 
 pub(super) struct OceanFeatureCallbacks<'a, 'b, C, W> {

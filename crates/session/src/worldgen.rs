@@ -8499,6 +8499,7 @@ mod tests {
                 added.mineshafts[&target][&structure_id].pieces.len(),
                 start.pieces.len()
             );
+            assert!(added.has_mineshaft_reference(target).unwrap());
             let planned = added.mixed_decoration_plan(target, &schedule).unwrap();
             assert!(
                 planned

@@ -45,6 +45,7 @@ mod generated_mineshaft_piece;
 mod generated_sheep;
 mod generated_spawner;
 mod generated_zombie_nautilus;
+pub mod jigsaw;
 mod local_difficulty;
 pub mod mineshaft;
 mod mob_collision;
@@ -2507,6 +2508,59 @@ impl mineshaft::MineshaftEnvironment for StructureStartEnvironment<'_> {
     }
 }
 
+impl jigsaw::Environment for StructureStartEnvironment<'_> {
+    fn dimension_bounds(&self) -> (i32, i32) {
+        (self.min_y, self.max_y)
+    }
+
+    fn height_context(&self) -> native_resources::height_provider::HeightContext {
+        native_resources::height_provider::HeightContext {
+            min_y: self.min_y.max(self.noise.router().min_y),
+            height: (self.max_y - self.min_y + 1).min(self.noise.router().height),
+            sea_level: self.noise.sea_level(),
+        }
+    }
+
+    fn biome_allowed(&mut self, quart: [i32; 3], query: BiomeQuery) -> Result<bool> {
+        StartEnvironment::biome_allowed(self, quart, query)
+    }
+
+    fn first_free_height(
+        &mut self,
+        x: i32,
+        z: i32,
+        map: native_resources::jigsaw_placement::StartHeightmap,
+    ) -> Result<i32> {
+        use native_resources::jigsaw_placement::StartHeightmap;
+        if !self.columns.contains_key(&[x, z]) {
+            self.columns
+                .insert([x, z], self.noise.base_column(self.evaluator, x, z)?);
+        }
+        self.columns[&[x, z]]
+            .first_occupied_height(self.min_y, |material| {
+                let index = match material {
+                    NoiseMaterial::DefaultBlock => 0,
+                    NoiseMaterial::DefaultFluid => 1,
+                    NoiseMaterial::Lava => 2,
+                    NoiseMaterial::Air => 3,
+                };
+                let flags = self.flags[index];
+                Ok(match map {
+                    StartHeightmap::WorldSurface | StartHeightmap::WorldSurfaceWg => !flags.is_air,
+                    StartHeightmap::OceanFloor | StartHeightmap::OceanFloorWg => {
+                        flags.blocks_motion
+                    }
+                    StartHeightmap::MotionBlocking => flags.blocks_motion || flags.has_fluid,
+                    StartHeightmap::MotionBlockingNoLeaves => {
+                        flags.blocks_motion_no_leaves || flags.has_fluid
+                    }
+                })
+            })?
+            .checked_add(1)
+            .context("jigsaw base height overflow")
+    }
+}
+
 impl TerrainGenerator {
     /// The caller must guarantee no old-chunk blending or structure adjustment.
     /// The dimension must fully contain the noise-settings height range.
@@ -2800,6 +2854,73 @@ impl TerrainGenerator {
             },
         )
     }
+    /// Prepare jigsaw starts after structure-set selection using the active
+    /// biome source and unadjusted terrain. This does not place or save pieces.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_jigsaw_structure_set<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<jigsaw::PreparedStart>>
+    {
+        let mut columns = HashMap::new();
+        let mut structure_evaluator = DensityEvaluator::default();
+        let mut flags = None;
+        let max_y = self
+            .min_y
+            .checked_add(self.height - 1)
+            .context("dimension height overflow")?;
+        self.try_generate_structure_set(
+            provider,
+            evaluator,
+            cache,
+            biome_rules,
+            id,
+            chunk,
+            existing,
+            |provider, entry| {
+                let path = format!(
+                    "data/{}/worldgen/structure/{}.json",
+                    entry.id.namespace, entry.id.path
+                );
+                let bytes = provider
+                    .read_data(&path)?
+                    .with_context(|| format!("missing structure {path}"))?;
+                let definition: Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid structure {path}"))?;
+                if flags.is_none() {
+                    flags = Some([
+                        classify(self.noise.default_block())?,
+                        classify(self.noise.default_fluid())?,
+                        classify(&serde_json::json!("minecraft:lava"))?,
+                        classify(&serde_json::json!("minecraft:air"))?,
+                    ]);
+                }
+                let mut env = StructureStartEnvironment {
+                    noise: &self.noise,
+                    evaluator: &mut structure_evaluator,
+                    biome_rules,
+                    structure: &entry.id,
+                    column_source: self.source.fresh_sampler(),
+                    point_source: self.source.fresh_sampler(),
+                    climate: None,
+                    columns: &mut columns,
+                    flags: flags.as_ref().unwrap(),
+                    min_y: self.min_y,
+                    max_y,
+                };
+                jigsaw::PreparedStart::generate(provider, &definition, &mut env, self.seed, chunk)
+                    .with_context(|| format!("in structure {path}"))
+            },
+        )
+    }
+
     /// Attempt the supported simple structure types using this generator's
     /// unadjusted base heights and noise-biome source. Other structure types
     /// return an error, so they cannot silently lose their generation attempt.

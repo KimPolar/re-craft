@@ -62,13 +62,47 @@ public class GeneratedStructureDrownedOracle {
         if(args.length==1 && args[0].equals("--halloween")){out.println("H\t"+SpecialDates.isHalloween());return;}
         var lookup=VanillaRegistries.createWorldLookup();var registries=VanillaRegistries.createReloadableLookup(lookup);
         for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries))pending.apply();
+        var enchantments=lookup.lookupOrThrow(Registries.ENCHANTMENT).listElements().toList();
+        var enchantmentTags=new java.util.HashMap<String,java.util.List<net.minecraft.tags.TagKey<net.minecraft.world.item.enchantment.Enchantment>>>();
+        var exclusiveTags=new java.util.ArrayList<>(enchantments.stream().map(h->h.value().exclusiveSet().unwrapKey()).flatMap(java.util.Optional::stream).distinct().toList());
+        exclusiveTags.add(net.minecraft.tags.EnchantmentTags.ON_MOB_SPAWN_EQUIPMENT);
+        for(var tag:exclusiveTags) for(var entry:EnchantmentSelectionOracle.tagEntries("enchantment",tag.location(),new java.util.HashSet<>()))
+            enchantmentTags.computeIfAbsent(entry,ignored->new java.util.ArrayList<>()).add(tag);
+        var bindHolderTags=Holder.Reference.class.getDeclaredMethod("bindTags",java.util.Collection.class);bindHolderTags.setAccessible(true);
+        var byId=new java.util.HashMap<String,Holder<net.minecraft.world.item.enchantment.Enchantment>>();
+        for(var holder:enchantments) {
+            var id=EnchantmentSelectionOracle.id(holder);byId.put(id,holder);
+            bindHolderTags.invoke(holder,enchantmentTags.getOrDefault(id,List.of()));
+        }
+        var itemTags=enchantments.stream().map(h->h.value().definition().primaryItems().orElse(h.value().definition().supportedItems()).unwrapKey()).flatMap(java.util.Optional::stream).distinct().toList();
+        for(var item:List.of(net.minecraft.world.item.Items.TRIDENT,net.minecraft.world.item.Items.FISHING_ROD)) {
+            var id=BuiltInRegistries.ITEM.getKey(item).toString();
+            var membership=new java.util.ArrayList<net.minecraft.tags.TagKey<net.minecraft.world.item.Item>>();
+            for(var tag:itemTags)if(EnchantmentSelectionOracle.tagEntries("item",tag.location(),new java.util.HashSet<>()).contains(id))membership.add(tag);
+            bindHolderTags.invoke(item.builtInRegistryHolder(),membership);
+        }
+        var providers=lookup.lookupOrThrow(Registries.ENCHANTMENT_PROVIDER).listElements().toList();
+        var providerRegistry=new net.minecraft.core.MappedRegistry<net.minecraft.world.item.enchantment.providers.EnchantmentProvider>(Registries.ENCHANTMENT_PROVIDER,com.mojang.serialization.Lifecycle.stable());
+        for(var holder:providers) {
+            net.minecraft.world.item.enchantment.providers.EnchantmentProvider value=holder.value();
+            if(holder.key().identifier().toString().equals("minecraft:mob_spawn_equipment")) {
+                var original=(net.minecraft.world.item.enchantment.providers.EnchantmentsByCostWithDifficulty)value;
+                var tag=original.enchantments().unwrapKey().orElseThrow();
+                var members=EnchantmentSelectionOracle.tagEntries("enchantment",tag.location(),new java.util.HashSet<>()).stream().map(byId::get).toList();
+                if(members.contains(null))throw new AssertionError("unknown enchantment in provider");
+                value=new net.minecraft.world.item.enchantment.providers.EnchantmentsByCostWithDifficulty(net.minecraft.core.HolderSet.direct(members),original.minCost(),original.maxCostSpan());
+            }
+            providerRegistry.register(holder.key(),value,net.minecraft.core.RegistrationInfo.BUILT_IN);
+        }
+        providerRegistry.freeze();
         var uc=Class.forName("sun.misc.Unsafe");var uf=uc.getDeclaredField("theUnsafe");uf.setAccessible(true);
         StructureDrownedOracle.unsafe=uf.get(null);StructureDrownedOracle.allocate=uc.getMethod("allocateInstance",Class.class);
         GeneratedFarmAnimalOracle.unsafe=(sun.misc.Unsafe)StructureDrownedOracle.unsafe;
         GeneratedFarmAnimalOracle.access=new RegistryAccess.ImmutableRegistryAccess(List.of(
             GeneratedFarmAnimalOracle.registry(Registries.CHICKEN_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_VARIANT).listElements().toList()),
             GeneratedFarmAnimalOracle.registry(Registries.CHICKEN_SOUND_VARIANT,lookup.lookupOrThrow(Registries.CHICKEN_SOUND_VARIANT).listElements().toList()),
-            GeneratedFarmAnimalOracle.registry(Registries.ZOMBIE_NAUTILUS_VARIANT,lookup.lookupOrThrow(Registries.ZOMBIE_NAUTILUS_VARIANT).listElements().toList())
+            GeneratedFarmAnimalOracle.registry(Registries.ZOMBIE_NAUTILUS_VARIANT,lookup.lookupOrThrow(Registries.ZOMBIE_NAUTILUS_VARIANT).listElements().toList()),
+            providerRegistry
         ));
         var chickenWorld=(GeneratedFarmAnimalOracle.World)StructureDrownedOracle.allocate.invoke(StructureDrownedOracle.unsafe,GeneratedFarmAnimalOracle.World.class);
         var eggField=Chicken.class.getDeclaredField("eggTime");eggField.setAccessible(true);

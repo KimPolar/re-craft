@@ -447,6 +447,7 @@ mod tests {
         let shared = temp.path().join("StructureDrownedOracle.java");
         let source = temp.path().join("GeneratedStructureDrownedOracle.java");
         let farm = temp.path().join("GeneratedFarmAnimalOracle.java");
+        let enchantments = temp.path().join("EnchantmentSelectionOracle.java");
         std::fs::write(
             &shared,
             include_str!("../../../resources/tests/java/StructureDrownedOracle.java"),
@@ -459,12 +460,17 @@ mod tests {
             &farm,
             include_str!("../../tests/java/GeneratedFarmAnimalOracle.java"),
         )?;
+        std::fs::write(
+            &enchantments,
+            include_str!("../../../resources/tests/java/EnchantmentSelectionOracle.java"),
+        )?;
         let compiled = Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&cp)
             .arg(&shared)
             .arg(&source)
             .arg(&farm)
+            .arg(&enchantments)
             .output()?;
         ensure!(
             compiled.status.success(),
@@ -613,6 +619,46 @@ mod tests {
         ensure!(snapshots == 128, "insufficient chicken snapshot cases");
         // Exercise the actual structure marker path, including its staged
         // nautilus and passenger record, against the Java spawn sequence.
+        use super::super::ocean_ruin::{DrownedEquipmentEffects, DrownedSpawnEffects};
+        #[derive(Clone)]
+        struct NoOtherEffects;
+        impl DrownedSpawnEffects for NoOtherEffects {
+            fn try_existing_chicken(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+            ) -> Result<bool> {
+                anyhow::bail!("unexpected chicken")
+            }
+            fn spawn_chicken_jockey(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+                _: &mut RegionRandom,
+                _: &super::super::BiomeNeighborhood,
+            ) -> Result<bool> {
+                anyhow::bail!("unexpected chicken")
+            }
+            fn enchant_weapon(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+                _: &mut RegionRandom,
+                _: MainHandRoll,
+                _: f32,
+            ) -> Result<Tag> {
+                anyhow::bail!("unexpected enchantment delegation")
+            }
+            fn spawn_zombie_nautilus(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+                _: &mut RegionRandom,
+                _: bool,
+            ) -> Result<bool> {
+                anyhow::bail!("unexpected nautilus")
+            }
+        }
         #[derive(Clone)]
         struct NautilusContext<'a> {
             variants: &'a native_resources::animal_variants::ZombieNautilusSpawnVariants,
@@ -620,6 +666,8 @@ mod tests {
             special: f32,
             halloween: bool,
             mount: Option<Tag>,
+            equipment: DrownedEquipmentEffects<NoOtherEffects>,
+            enchant_calls: usize,
         }
         impl super::super::ocean_ruin::DrownedMarkerContext for NautilusContext<'_> {
             fn special_multiplier(
@@ -649,13 +697,15 @@ mod tests {
             }
             fn enchant_weapon(
                 &mut self,
-                _: [i32; 3],
-                _: &native_world::loaded::World,
-                _: &mut RegionRandom,
-                _: MainHandRoll,
-                _: f32,
+                position: [i32; 3],
+                world: &native_world::loaded::World,
+                random: &mut RegionRandom,
+                weapon: MainHandRoll,
+                special: f32,
             ) -> Result<Tag> {
-                anyhow::bail!("unavailable enchantment")
+                self.enchant_calls += 1;
+                self.equipment
+                    .enchant_weapon(position, world, random, weapon, special)
             }
             fn more_frequent_drowned_biome(
                 &mut self,
@@ -693,11 +743,24 @@ mod tests {
             native_resources::animal_variants::ZombieNautilusSpawnVariants::load_active(
                 &mut resources,
             )?;
+        let known_items = resources
+            .vanilla_item_registry()?
+            .iter()
+            .map(|(id, _)| native_resources::packs::ResourceId::parse(id))
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        let equipment = DrownedEquipmentEffects::load(
+            &mut resources,
+            &known_items,
+            Some(1),
+            Some(1),
+            NoOtherEffects,
+        )?;
         let drowned_id = native_resources::packs::ResourceId::parse("minecraft:drowned")?;
         let world = native_world::loaded::World::new("minecraft:overworld");
         let mut mounted = 0;
         let mut mounted_shells = 0;
         let mut algorithms = [0; 2];
+        let mut enchanted_algorithms = [0; 2];
         for i in 0..200_000 {
             let region_seed = i64::from(i) * 671_231 - 12_345;
             let entity_seed = i64::from(i) * 98_317 + 3_329;
@@ -713,6 +776,8 @@ mod tests {
                 special,
                 halloween,
                 mount: None,
+                equipment: equipment.clone(),
+                enchant_calls: 0,
             };
             let mut construct = || {
                 let mut creature = super::super::FreshCreatureRandom::from_seed(&drowned_id, 0)?;
@@ -746,6 +811,15 @@ mod tests {
             {
                 mounted_shells += 1;
             }
+            let enchanted = passengers[0]
+                .get("equipment")
+                .and_then(|e| e.get("mainhand"))
+                .and_then(|item| item.get("components"))
+                .is_some();
+            if enchanted {
+                ensure!(context.enchant_calls > 0, "missing enchantment callback");
+                enchanted_algorithms[i as usize % 2] += 1;
+            }
             let path = temp.path().join(format!("nautilus-jockey-{i}.nbt"));
             std::fs::write(
                 &path,
@@ -757,12 +831,19 @@ mod tests {
             cases.push(serde_json::json!({"path":path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":region.next_long(),"nautilus_snapshot":true}));
             algorithms[i as usize % 2] += 1;
             mounted += 1;
-            if mounted >= 128 && mounted_shells > 0 && algorithms.iter().all(|n| *n >= 32) {
+            if mounted >= 128
+                && mounted_shells > 0
+                && algorithms.iter().all(|n| *n >= 32)
+                && enchanted_algorithms.iter().all(|n| *n >= 32)
+            {
                 break;
             }
         }
         ensure!(
-            mounted >= 128 && mounted_shells > 0 && algorithms.iter().all(|n| *n >= 32),
+            mounted >= 128
+                && mounted_shells > 0
+                && algorithms.iter().all(|n| *n >= 32)
+                && enchanted_algorithms.iter().all(|n| *n >= 32),
             "insufficient nautilus jockey cases"
         );
         let input = temp.path().join("cases.json");

@@ -167,20 +167,9 @@ impl PreparedJigsawPlacement {
         }
         features
     }
-
-    pub(super) fn has_features(&self) -> bool {
-        self.pieces.iter().any(PlacementElement::has_features)
-    }
 }
 
 impl PlacementElement {
-    fn has_features(&self) -> bool {
-        match self {
-            Self::Feature { .. } => true,
-            Self::List(elements) => elements.iter().any(Self::has_features),
-            _ => false,
-        }
-    }
     fn collect_features<'a>(&'a self, features: &mut Vec<&'a super::ore::PlacedDecorationFeature>) {
         match self {
             Self::Feature { placed, .. } => features.push(placed),

@@ -459,6 +459,7 @@ struct DecorationConfig {
     schedule: FeatureSchedule,
     structures: Option<StructureDecorationSchedule>,
     feature_entity_evidence: BTreeMap<FeatureKey, bool>,
+    placed_features: BTreeSet<ResourceId>,
     block_registry: BTreeSet<String>,
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
@@ -782,6 +783,66 @@ fn feature_entity_evidence(
         evidence.insert(key.clone(), safe);
     }
     evidence
+}
+
+fn entity_free_jigsaw_starts(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<ResourceId>,
+    plan: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+) -> BTreeSet<TerrainStartKey> {
+    use native_resources::structure_pool::{HolderValue, PoolElement};
+    fn check<P: ResourceProvider>(
+        element: &PoolElement,
+        classifier: &mut EntityFeatureClassifier<'_, P>,
+        depth: usize,
+    ) -> Result<bool> {
+        ensure!(depth <= 64, "jigsaw element nesting too deep");
+        match element {
+            PoolElement::Empty | PoolElement::Single { .. } => Ok(true),
+            PoolElement::Feature { feature, .. } => match feature {
+                HolderValue::Reference(id) => classifier.named(id, true, depth + 1),
+                HolderValue::Inline(value) => classifier.placed(value, depth + 1),
+            },
+            PoolElement::List { elements, .. } => {
+                for element in elements {
+                    if !check(element, classifier, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+    let mut classifier = EntityFeatureClassifier {
+        provider,
+        registry,
+        tags: FeatureTags::default(),
+        active: BTreeSet::new(),
+        cache: BTreeMap::new(),
+        nodes: 0,
+    };
+    let mut safe = BTreeSet::new();
+    for entry in plan {
+        for start in &entry.starts {
+            let super::structure_batch::PlannedStructureStart::Jigsaw(start) = start else {
+                continue;
+            };
+            if start
+                .pieces
+                .iter()
+                .all(|piece| check(&piece.element, &mut classifier, 0).unwrap_or(false))
+            {
+                safe.insert((
+                    entry.entry.id.clone(),
+                    ChunkPos {
+                        x: start.chunk[0],
+                        z: start.chunk[1],
+                    },
+                ));
+            }
+        }
+    }
+    safe
 }
 
 #[cfg(test)]
@@ -1755,6 +1816,7 @@ impl FreshTerrainBatch {
             schedule,
             structures,
             feature_entity_evidence,
+            placed_features: placed_features.clone(),
             block_registry,
             heightmap_tags,
             mushroom_tags,
@@ -4303,7 +4365,7 @@ impl FreshTerrainBatch {
                     .map(|structures| structures.has_mineshaft_reference(pos))
                     .transpose()?
                     .unwrap_or(false);
-                let jigsaws = if let Some(structures) = &self.structures {
+                let (jigsaws, entity_free_jigsaws) = if let Some(structures) = &self.structures {
                     let registry = config
                         .structures
                         .as_ref()
@@ -4321,17 +4383,22 @@ impl FreshTerrainBatch {
                             .light_registry
                             .as_ref()
                             .context("jigsaw block registry is missing")?;
-                        Some(super::ore::PreparedJigsawResources::load(
-                            &planned,
-                            provider,
-                            &config.block_registry,
-                            registry,
-                        )?)
+                        let safe =
+                            entity_free_jigsaw_starts(provider, &config.placed_features, &planned);
+                        (
+                            Some(super::ore::PreparedJigsawResources::load(
+                                &planned,
+                                provider,
+                                &config.block_registry,
+                                registry,
+                            )?),
+                            safe,
+                        )
                     } else {
-                        None
+                        (None, BTreeSet::new())
                     }
                 } else {
-                    None
+                    (None, BTreeSet::new())
                 };
                 let jigsaw_features = jigsaws
                     .as_ref()
@@ -4407,10 +4474,7 @@ impl FreshTerrainBatch {
                                             z: start.chunk[1],
                                         },
                                     );
-                                    jigsaws
-                                        .as_ref()
-                                        .filter(|resources| !resources.has_features(&key))
-                                        .map(|_| key)
+                                    entity_free_jigsaws.contains(&key).then_some(key)
                                 })
                             })
                             .collect();
@@ -5292,6 +5356,171 @@ mod entity_source_tests {
         assert!(!covered(&structures, &recorded));
         structures.jigsaw_starts.clear();
         assert!(!covered(&structures, &recorded));
+    }
+
+    #[test]
+    fn jigsaw_feature_evidence_checks_holders_and_all_list_elements() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_decoration::StructureDecorationEntry,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, Projection},
+            structure_transform::Rotation,
+        };
+        let mut data = Data::default();
+        data.0.insert(
+            "data/test/worldgen/placed_feature/safe.json".into(),
+            serde_json::to_vec(
+                &json!({"feature":{"type":"minecraft:simple_block"},"placement":[]}),
+            )
+            .unwrap(),
+        );
+        data.0.insert("data/test/worldgen/placed_feature/cycle.json".into(),
+            serde_json::to_vec(&json!({"feature":{"type":"minecraft:sequence","features":["test:cycle"]},"placement":[]})).unwrap());
+        let safe_id = ResourceId::parse("test:safe").unwrap();
+        let registry = BTreeSet::from([safe_id.clone(), ResourceId::parse("test:cycle").unwrap()]);
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("test:structure").unwrap(),
+            step: 0,
+            index: 0,
+        };
+        let feature = |holder| PoolElement::Feature {
+            feature: holder,
+            projection: Projection::Rigid,
+        };
+        let inline = || {
+            feature(HolderValue::Inline(
+                json!({"feature":{"type":"minecraft:simple_block"},"placement":[]}),
+            ))
+        };
+        let evaluate = |data: &mut Data, element: PoolElement| {
+            let start = super::super::jigsaw::PreparedStart {
+                chunk: [0, 0],
+                generation_point: [0, 0, 0],
+                terrain_adjustment: TerrainAdjustment::None,
+                liquid_settings: LiquidSettings::IgnoreWaterlogging,
+                pieces: vec![Piece {
+                    element,
+                    origin: [0, 0, 0],
+                    rotation: Rotation::None,
+                    bounds: BoundingBox::new([0, 0, 0], [0, 0, 0]).unwrap(),
+                    ground_level_delta: 0,
+                    junctions: vec![],
+                }],
+            };
+            let plan = [
+                super::super::structure_batch::PlannedMixedStructureDecoration {
+                    entry: &entry,
+                    starts: vec![
+                        super::super::structure_batch::PlannedStructureStart::Jigsaw(&start),
+                    ],
+                },
+            ];
+            entity_free_jigsaw_starts(data, &registry, &plan)
+                .contains(&(entry.id.clone(), ChunkPos { x: 0, z: 0 }))
+        };
+        assert!(evaluate(&mut data, inline()));
+        assert!(evaluate(
+            &mut data,
+            feature(HolderValue::Reference(safe_id.clone()))
+        ));
+        assert!(!evaluate(
+            &mut data,
+            feature(HolderValue::Reference(
+                ResourceId::parse("test:unregistered").unwrap()
+            ))
+        ));
+        assert!(!evaluate(
+            &mut data,
+            feature(HolderValue::Reference(
+                ResourceId::parse("test:cycle").unwrap()
+            ))
+        ));
+        let unknown = feature(HolderValue::Inline(
+            json!({"feature":{"type":"example:unknown"},"placement":[]}),
+        ));
+        assert!(!evaluate(&mut data, unknown.clone()));
+        assert!(!evaluate(
+            &mut data,
+            PoolElement::List {
+                elements: vec![inline(), unknown],
+                projection: Projection::Rigid
+            }
+        ));
+        assert!(evaluate(
+            &mut data,
+            PoolElement::List {
+                elements: vec![inline(), feature(HolderValue::Reference(safe_id))],
+                projection: Projection::Rigid
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_village_decor_features_have_conservative_entity_evidence() {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_decoration::StructureDecorationEntry,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, TemplatePool},
+            structure_transform::Rotation,
+        };
+        let game = native_resources::default_minecraft_dir().unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources
+            .list_data("worldgen/placed_feature")
+            .unwrap()
+            .into_iter()
+            .collect();
+        let bytes = resources
+            .read_data("data/minecraft/worldgen/template_pool/village/plains/decor.json")
+            .unwrap()
+            .unwrap();
+        let pool = TemplatePool::decode(&serde_json::from_slice(&bytes).unwrap()).unwrap();
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:village_plains").unwrap(),
+            step: 0,
+            index: 0,
+        };
+        let mut found = BTreeMap::new();
+        for (element, _) in pool.entries() {
+            let PoolElement::Feature {
+                feature: HolderValue::Reference(id),
+                ..
+            } = element
+            else {
+                continue;
+            };
+            let start = super::super::jigsaw::PreparedStart {
+                chunk: [0, 0],
+                generation_point: [0, 0, 0],
+                terrain_adjustment: TerrainAdjustment::None,
+                liquid_settings: LiquidSettings::IgnoreWaterlogging,
+                pieces: vec![Piece {
+                    element: element.clone(),
+                    origin: [0, 0, 0],
+                    rotation: Rotation::None,
+                    bounds: BoundingBox::new([0, 0, 0], [0, 0, 0]).unwrap(),
+                    ground_level_delta: 0,
+                    junctions: vec![],
+                }],
+            };
+            let plan = [
+                super::super::structure_batch::PlannedMixedStructureDecoration {
+                    entry: &entry,
+                    starts: vec![
+                        super::super::structure_batch::PlannedStructureStart::Jigsaw(&start),
+                    ],
+                },
+            ];
+            let safe = entity_free_jigsaw_starts(&mut resources, &registry, &plan)
+                .contains(&(entry.id.clone(), ChunkPos { x: 0, z: 0 }));
+            found.insert(id.path.clone(), safe);
+        }
+        assert_eq!(found.get("oak"), Some(&true));
+        assert_eq!(found.get("flower_plain"), Some(&true));
+        assert_eq!(found.get("pile_hay"), Some(&false));
     }
 
     #[test]

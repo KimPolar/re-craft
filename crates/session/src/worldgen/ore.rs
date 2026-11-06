@@ -187,12 +187,6 @@ impl<'a> PreparedJigsawResources<'a> {
             .collect()
     }
 
-    pub(super) fn has_features(&self, key: &super::structure_batch::TerrainStartKey) -> bool {
-        self.starts
-            .get(key)
-            .is_none_or(|start| start.has_features())
-    }
-
     pub(super) fn load(
         plan: &[PlannedMixedStructureDecoration<'_>],
         provider: &mut impl ResourceProvider,

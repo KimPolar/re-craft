@@ -7994,7 +7994,12 @@ mod tests {
                 has_skylight: true,
                 ambient_light: Some(0.0),
             };
-            batch.enable_decoration(&mut data, &BTreeSet::new(), blocks.clone(), &lighting)?;
+            let placed_features = if feature_kind == 2 {
+                BTreeSet::from([ResourceId::parse("example:test")?])
+            } else {
+                BTreeSet::new()
+            };
+            batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
             batch.enable_light_initialization(registry)?;
             batch.request_features(target)?;
             let mut failed = false;
@@ -8059,9 +8064,8 @@ mod tests {
                     batch.structure_data(target).is_ok(),
                     feature_kind == 0 || feature_kind == 2
                 );
-                assert_eq!(
-                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target)),
-                    feature_kind == 0
+                assert!(
+                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
                 );
             }
         }

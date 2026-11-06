@@ -100,7 +100,8 @@ pub fn template_structure_center_heightmap(value: &Value) -> Result<Option<Heigh
     Ok(Some(map))
 }
 
-fn decode_terrain_adjustment(value: &Value) -> Result<TerrainAdjustment> {
+/// Resolve the structure's terrain adaptation from its active definition.
+pub fn decode_terrain_adjustment(value: &Value) -> Result<TerrainAdjustment> {
     let adjustment = value
         .get("terrain_adaptation")
         .map(|v| v.as_str().context("invalid terrain adaptation"))

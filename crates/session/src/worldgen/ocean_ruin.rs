@@ -26,6 +26,60 @@ pub struct PreparedPiece {
     pub bounds: native_core::beardifier::BoundingBox,
 }
 
+/// A complete ocean-ruin start before any of its pieces are floor-aligned.
+/// Piece order is significant during decoration and is kept as generated.
+#[derive(Clone)]
+pub struct PreparedStart {
+    pub chunk: [i32; 2],
+    pub generation_point: [i32; 3],
+    pub terrain_adjustment: native_core::beardifier::TerrainAdjustment,
+    pub pieces: Vec<PreparedPiece>,
+}
+
+impl PreparedStart {
+    /// Attempt one start after the structure-set candidate and existing-start
+    /// checks. Rejected biomes do not load structure templates.
+    pub fn generate(
+        provider: &mut impl ResourceProvider,
+        definition: &Value,
+        environment: &mut impl native_resources::structure_start::StartEnvironment,
+        seed: i64,
+        chunk: [i32; 2],
+    ) -> Result<Option<Self>> {
+        use native_resources::structure_start::{
+            Heightmap, center_generation_point, decode_terrain_adjustment,
+        };
+        Settings::decode(definition)?;
+        let terrain_adjustment = decode_terrain_adjustment(definition)?;
+        let Some(generation_point) =
+            center_generation_point(environment, chunk, Heightmap::OceanFloor)?
+        else {
+            return Ok(None);
+        };
+        let pieces = prepare_pieces(provider, definition, seed, chunk)?;
+        ensure!(!pieces.is_empty(), "ocean ruin produced no pieces");
+        Ok(Some(Self {
+            chunk,
+            generation_point,
+            terrain_adjustment,
+            pieces,
+        }))
+    }
+
+    /// The structure-reference stage uses the union of every initial piece.
+    pub fn reference_bounds(
+        &self,
+        structure: ResourceId,
+    ) -> Result<super::structure_references::StructureStartBounds> {
+        let pieces: Vec<_> = self.pieces.iter().map(|piece| piece.bounds).collect();
+        super::structure_references::StructureStartBounds::from_pieces(
+            structure,
+            &pieces,
+            self.terrain_adjustment,
+        )
+    }
+}
+
 /// A structure block is retained for the later data-marker pass and must not
 /// be placed as an ordinary template block.
 #[derive(Clone, Debug, PartialEq)]
@@ -611,6 +665,74 @@ mod tests {
             )
             .contains("missing ocean ruin template")
         );
+    }
+
+    #[test]
+    fn start_checks_biomes_before_loading_and_references_every_piece() -> Result<()> {
+        use native_core::beardifier::TerrainAdjustment;
+        use native_resources::structure_start::{BiomeQuery, Heightmap, StartEnvironment};
+
+        struct Environment {
+            column: bool,
+            point: bool,
+            heights: usize,
+        }
+        impl StartEnvironment for Environment {
+            fn vertical_bounds(&self) -> (i32, i32) {
+                (-64, 319)
+            }
+            fn sea_level(&self) -> i32 {
+                63
+            }
+            fn first_occupied_height(&mut self, x: i32, z: i32, map: Heightmap) -> Result<i32> {
+                assert_eq!((x, z, map), (-40, 40, Heightmap::OceanFloor));
+                self.heights += 1;
+                Ok(42)
+            }
+            fn biome_allowed(&mut self, _: [i32; 3], query: BiomeQuery) -> Result<bool> {
+                Ok(match query {
+                    BiomeQuery::Column => self.column,
+                    BiomeQuery::Point => self.point,
+                })
+            }
+        }
+        let definition = json!({"type":"minecraft:ocean_ruin","biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
+        let mut data = Data {
+            bytes: Some(template(5023)),
+            reads: BTreeMap::new(),
+        };
+        let mut env = Environment {
+            column: false,
+            point: false,
+            heights: 0,
+        };
+        assert!(PreparedStart::generate(&mut data, &definition, &mut env, 42, [-3, 2])?.is_none());
+        assert_eq!(env.heights, 0);
+        assert!(data.reads.is_empty());
+        env.column = true;
+        assert!(PreparedStart::generate(&mut data, &definition, &mut env, 42, [-3, 2])?.is_none());
+        assert_eq!(env.heights, 1);
+        assert!(data.reads.is_empty());
+        env.point = true;
+        let start =
+            PreparedStart::generate(&mut data, &definition, &mut env, 42, [-3, 2])?.unwrap();
+        assert_eq!(start.generation_point, [-40, 42, 40]);
+        assert_eq!(start.chunk, [-3, 2]);
+        assert_eq!(start.terrain_adjustment, TerrainAdjustment::BeardThin);
+        assert!(start.pieces.len() > 1);
+        let bounds = start
+            .reference_bounds(ResourceId::parse("test:ruin")?)?
+            .bounds;
+        for piece in &start.pieces {
+            for axis in 0..3 {
+                assert!(bounds.min[axis] <= piece.bounds.min[axis]);
+                assert!(bounds.max[axis] >= piece.bounds.max[axis]);
+            }
+        }
+        assert_eq!(data.reads.values().copied().max(), Some(1));
+        data.bytes = None;
+        assert!(PreparedStart::generate(&mut data, &definition, &mut env, 42, [-3, 2]).is_err());
+        Ok(())
     }
 
     #[test]

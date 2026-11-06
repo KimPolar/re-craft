@@ -2348,6 +2348,13 @@ impl BiomeNeighborhood {
     }
 }
 
+/// A supported structure start, retaining every piece in decoration order.
+#[derive(Clone)]
+pub enum PreparedStructureStart {
+    Simple(SimpleStructureStart),
+    OceanRuin(ocean_ruin::PreparedStart),
+}
+
 /// A generator configured from the dimension's active biome source and noise
 /// settings. It must be used with the same data-pack stack throughout its life.
 pub struct TerrainGenerator {
@@ -2746,8 +2753,78 @@ impl TerrainGenerator {
         id: &ResourceId,
         chunk: [i32; 2],
         existing: impl FnMut(&ResourceId) -> Result<bool>,
-        mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+        classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
     ) -> Result<native_resources::structure_placement::StructureSetStart<SimpleStructureStart>>
+    {
+        use native_resources::structure_placement::StructureSetStart;
+        Ok(
+            match self.try_generate_supported_structure_set_impl(
+                provider,
+                evaluator,
+                cache,
+                biome_rules,
+                id,
+                chunk,
+                existing,
+                classify,
+                false,
+            )? {
+                StructureSetStart::Existing => StructureSetStart::Existing,
+                StructureSetStart::NotCandidate => StructureSetStart::NotCandidate,
+                StructureSetStart::Rejected => StructureSetStart::Rejected,
+                StructureSetStart::Generated {
+                    structure,
+                    start: PreparedStructureStart::Simple(start),
+                } => StructureSetStart::Generated { structure, start },
+                StructureSetStart::Generated {
+                    start: PreparedStructureStart::OceanRuin(_),
+                    ..
+                } => unreachable!("ocean ruins are disabled"),
+            },
+        )
+    }
+
+    /// Generate supported simple and ocean-ruin starts after normal structure
+    /// set selection. Other eligible types still fail rather than disappear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_supported_structure_set<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<PreparedStructureStart>>
+    {
+        self.try_generate_supported_structure_set_impl(
+            provider,
+            evaluator,
+            cache,
+            biome_rules,
+            id,
+            chunk,
+            existing,
+            classify,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_generate_supported_structure_set_impl<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+        ocean_ruins: bool,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<PreparedStructureStart>>
     {
         let mut columns = HashMap::new();
         let mut structure_evaluator = DensityEvaluator::default();
@@ -2808,6 +2885,25 @@ impl TerrainGenerator {
                     min_y: self.min_y,
                     max_y,
                 };
+                let structure_type = ResourceId::parse(
+                    definition
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .context("missing structure type")?,
+                )?;
+                if ocean_ruins
+                    && structure_type.namespace == "minecraft"
+                    && structure_type.path == "ocean_ruin"
+                {
+                    return Ok(ocean_ruin::PreparedStart::generate(
+                        provider,
+                        &definition,
+                        &mut env,
+                        self.seed,
+                        chunk,
+                    )?
+                    .map(PreparedStructureStart::OceanRuin));
+                }
                 if let Some(heightmap) = center_heightmap
                     && native_resources::structure_start::center_generation_point(
                         &mut env, chunk, heightmap,
@@ -2821,7 +2917,9 @@ impl TerrainGenerator {
                     None => SimpleStructure::decode(&definition)
                         .with_context(|| format!("in structure {path}"))?,
                 };
-                structure.generate(&mut env, self.seed, chunk)
+                Ok(structure
+                    .generate(&mut env, self.seed, chunk)?
+                    .map(PreparedStructureStart::Simple))
             },
         )
     }
@@ -7366,6 +7464,8 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if let Some(value) = self.0.get(path) {
                     Ok(Some(value.clone()))
+                } else if path.starts_with("data/minecraft/structure/underwater_ruin/") {
+                    Ok(self.0.get("ruin-template").cloned())
                 } else {
                     Data.read_data(path)
                 }
@@ -7465,6 +7565,78 @@ mod tests {
                 .err()
                 .expect("eligible unsupported structure must fail");
             assert!(format!("{error:#}").contains("unsupported simple structure"));
+        }
+        // The generalized start path can retain a multi-piece ruin without
+        // changing the simple-only scheduler's conservative behavior.
+        {
+            use flate2::{Compression, write::GzEncoder};
+            use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+            use std::io::Write;
+            let list = |element_type, values| Tag::List {
+                element_type,
+                values,
+            };
+            let template = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "size".into(),
+                        list(TagType::Int, vec![Tag::Int(2), Tag::Int(3), Tag::Int(4)]),
+                    ),
+                    (
+                        "palette".into(),
+                        list(TagType::Compound, vec![Tag::Compound(vec![])]),
+                    ),
+                    ("blocks".into(), list(TagType::Compound, vec![])),
+                    ("entities".into(), list(TagType::Compound, vec![])),
+                ]),
+            };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(&template).unwrap()).unwrap();
+            data.0
+                .insert("ruin-template".into(), encoder.finish().unwrap());
+            let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"none"});
+            data.0
+                .insert(path.into(), serde_json::to_vec(&ruin).unwrap());
+            let result = generator
+                .try_generate_supported_structure_set(
+                    &mut data,
+                    &mut evaluator,
+                    &mut cache,
+                    &rules,
+                    &set_id,
+                    [0, 0],
+                    |_| Ok(false),
+                    classify,
+                )
+                .unwrap();
+            let StructureSetStart::Generated {
+                structure,
+                start: PreparedStructureStart::OceanRuin(start),
+            } = result
+            else {
+                panic!("expected a multi-piece ocean ruin")
+            };
+            assert_eq!(structure, structure_id);
+            assert_eq!(start.generation_point, [8, 15, 8]);
+            assert!(start.pieces.len() > 1);
+            assert!(start.reference_bounds(structure).is_ok());
+            data.0.remove("ruin-template");
+            assert!(
+                generator
+                    .try_generate_supported_structure_set(
+                        &mut data,
+                        &mut evaluator,
+                        &mut cache,
+                        &rules,
+                        &set_id,
+                        [0, 0],
+                        |_| Ok(false),
+                        classify,
+                    )
+                    .is_err()
+            );
         }
         data.0.insert(path.into(), original);
 

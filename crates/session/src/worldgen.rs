@@ -42,6 +42,7 @@ mod generated_hut_mobs;
 mod generated_hut_piece;
 mod generated_sheep;
 mod generated_spawner;
+mod local_difficulty;
 mod mob_collision;
 mod mob_obstruction;
 mod mob_placement;
@@ -70,6 +71,7 @@ pub use generated_hut_mobs::{draft_fresh_hut_cat, draft_fresh_hut_witch};
 pub use generated_hut_piece::SavedSwampHutPiece;
 pub use generated_sheep::draft_fresh_sheep;
 pub use generated_spawner::GeneratedMonsterSpawner;
+pub use local_difficulty::LocalDifficulty;
 pub use mob_placement::{
     GeneratedCreatureCollisionProgress, GeneratedCreatureInstanceRuleProgress,
     GeneratedCreatureObstructionProgress, GeneratedCreaturePose, GeneratedCreatureProbe,

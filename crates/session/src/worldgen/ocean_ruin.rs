@@ -66,6 +66,9 @@ pub struct RuinDataMarker {
 /// must isolate their state when cloned; the enclosing decoration attempt must
 /// also stage the context until the whole region is published.
 pub trait DrownedMarkerContext: Clone {
+    /// Use the active base difficulty, overworld clock and position-dependent
+    /// moon brightness. WorldGenRegion supplies zero inhabited time; see
+    /// `LocalDifficulty::for_generation`.
     fn special_multiplier(
         &mut self,
         position: [i32; 3],

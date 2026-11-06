@@ -153,6 +153,8 @@ pub struct FreshWorldDraft {
     player: nbt::NamedTag,
     uuid: [i32; 4],
     seed: i64,
+    player_dimension: DimensionId,
+    player_chunk: crate::world::ChunkPos,
     clocks: BTreeMap<DimensionId, crate::world::SavedClock>,
     regions: BTreeMap<(DimensionId, FreshRegionKind, i32, i32), FreshRegionDraft>,
 }
@@ -640,6 +642,7 @@ impl FreshWorldDraft {
             matches!(player_ids.as_slice(), [(_, Tag::IntArray(words))] if words.as_slice() == uuid),
             "player UUID differs from its level and filename"
         );
+        let (player_dimension, player_chunk) = fresh_player_location(player_fields)?;
         crate::world::WorldReader::create_world_clock_document(&clocks)?;
         nbt::write(&level)?;
         nbt::write(&worldgen)?;
@@ -649,6 +652,8 @@ impl FreshWorldDraft {
             player,
             uuid,
             seed,
+            player_dimension,
+            player_chunk,
             clocks,
             regions: BTreeMap::new(),
         })
@@ -676,6 +681,24 @@ impl FreshWorldDraft {
                 .any(|(_, kind, _, _)| *kind == FreshRegionKind::Terrain),
             "generated world has no terrain regions"
         );
+        ensure!(
+            self.has_terrain_chunk(&self.player_dimension, self.player_chunk),
+            "staged player chunk is missing"
+        );
+        for ((dimension, kind, _, _), region) in &self.regions {
+            if *kind != FreshRegionKind::Terrain {
+                for position in region.chunks.keys() {
+                    ensure!(
+                        self.has_terrain_chunk(dimension, *position),
+                        "staged {kind:?} chunk ({}, {}) has no matching terrain chunk in {}:{}",
+                        position.x,
+                        position.z,
+                        dimension.namespace,
+                        dimension.path
+                    );
+                }
+            }
+        }
         let directory = tempfile::Builder::new()
             .prefix(".re-craft-world-")
             .tempdir_in(parent)
@@ -797,6 +820,69 @@ impl FreshWorldDraft {
             manifest,
         })
     }
+
+    fn has_terrain_chunk(&self, dimension: &DimensionId, pos: crate::world::ChunkPos) -> bool {
+        self.regions
+            .get(&(
+                dimension.clone(),
+                FreshRegionKind::Terrain,
+                pos.x.div_euclid(REGION_SIDE),
+                pos.z.div_euclid(REGION_SIDE),
+            ))
+            .is_some_and(|region| region.chunks.contains_key(&pos))
+    }
+}
+
+/// Fresh player records are written by the client, so require the exact
+/// position and dimension instead of guessing Java's defaults on malformed data.
+fn fresh_player_location(
+    fields: &[(nbt::JavaString, Tag)],
+) -> Result<(DimensionId, crate::world::ChunkPos)> {
+    let dimension: Vec<_> = fields
+        .iter()
+        .filter(|(name, _)| name.matches("Dimension"))
+        .collect();
+    let [(_, Tag::String(dimension))] = dimension.as_slice() else {
+        anyhow::bail!("new player must contain one dimension")
+    };
+    let dimension = DimensionId::parse(
+        &String::from_utf16(&dimension.0).context("invalid player dimension string")?,
+    )?;
+    let positions: Vec<_> = fields
+        .iter()
+        .filter(|(name, _)| name.matches("Pos"))
+        .collect();
+    let [
+        (
+            _,
+            Tag::List {
+                element_type: nbt::TagType::Double,
+                values,
+            },
+        ),
+    ] = positions.as_slice()
+    else {
+        anyhow::bail!("new player must contain one double position")
+    };
+    let [Tag::Double(x), Tag::Double(y), Tag::Double(z)] = values.as_slice() else {
+        anyhow::bail!("new player position must have three doubles")
+    };
+    ensure!(
+        x.is_finite()
+            && y.is_finite()
+            && z.is_finite()
+            && (-30_000_512.0..=30_000_512.0).contains(x)
+            && (-20_000_000.0..=20_000_000.0).contains(y)
+            && (-30_000_512.0..=30_000_512.0).contains(z),
+        "new player position is invalid"
+    );
+    Ok((
+        dimension,
+        crate::world::ChunkPos {
+            x: (x.floor() as i32).div_euclid(16),
+            z: (z.floor() as i32).div_euclid(16),
+        },
+    ))
 }
 
 fn write_new_gzip(path: &Path, document: &nbt::NamedTag) -> Result<()> {
@@ -3870,6 +3956,17 @@ mod tests {
             value: Tag::Compound(vec![
                 ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
                 ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                (
+                    "Dimension".into(),
+                    Tag::String("minecraft:overworld".into()),
+                ),
+                (
+                    "Pos".into(),
+                    Tag::List {
+                        element_type: nbt::TagType::Double,
+                        values: vec![Tag::Double(0.5), Tag::Double(64.0), Tag::Double(0.5)],
+                    },
+                ),
             ]),
         };
         (level, worldgen, player, uuid)
@@ -3964,6 +4061,139 @@ mod tests {
             .add_region(DimensionId::parse("overworld").unwrap(), terrain)
             .unwrap();
         assert!(draft.stage(parent.path()).is_err());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fresh_world_requires_player_and_auxiliary_terrain_chunks() {
+        let parent = tempfile::tempdir().unwrap();
+        let (level, worldgen, mut player, uuid) = fresh_world_metadata();
+        let Tag::Compound(fields) = &mut player.value else {
+            unreachable!()
+        };
+        let position = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Pos"))
+            .unwrap();
+        position.1 = Tag::List {
+            element_type: nbt::TagType::Double,
+            values: vec![Tag::Double(-0.25), Tag::Double(64.0), Tag::Double(0.5)],
+        };
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let overworld = DimensionId::parse("overworld").unwrap();
+        let add_terrain = |draft: &mut FreshWorldDraft, x: i32| {
+            let mut region = FreshRegionDraft::new(FreshRegionKind::Terrain, x.div_euclid(32), 0);
+            region
+                .add(crate::world::ChunkPos { x, z: 0 }, &chunk(x, "stage"), 1)
+                .unwrap();
+            draft.add_region(overworld.clone(), region).unwrap();
+        };
+        add_terrain(&mut draft, 0);
+        assert!(
+            format!("{:#}", draft.stage(parent.path()).err().unwrap()).contains("player chunk")
+        );
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        add_terrain(&mut draft, -1);
+        drop(draft.stage(parent.path()).unwrap());
+        let mut entities = FreshRegionDraft::new(FreshRegionKind::Entities, -2, 0);
+        entities
+            .add(
+                crate::world::ChunkPos { x: -33, z: 0 },
+                &entity_chunk(-33, vec![]),
+                1,
+            )
+            .unwrap();
+        draft.add_region(overworld.clone(), entities).unwrap();
+        assert!(
+            format!("{:#}", draft.stage(parent.path()).err().unwrap()).contains("Entities chunk")
+        );
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        add_terrain(&mut draft, -33);
+        drop(draft.stage(parent.path()).unwrap());
+        let mut poi = FreshRegionDraft::new(FreshRegionKind::Poi, -3, 0);
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        poi.add(crate::world::ChunkPos { x: -65, z: 0 }, &document, 1)
+            .unwrap();
+        draft.add_region(overworld.clone(), poi).unwrap();
+        assert!(format!("{:#}", draft.stage(parent.path()).err().unwrap()).contains("Poi chunk"));
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        add_terrain(&mut draft, -65);
+        drop(draft.stage(parent.path()).unwrap());
+    }
+
+    #[test]
+    fn fresh_player_location_rejects_invalid_or_ambiguous_data() {
+        let (_, _, player, _) = fresh_world_metadata();
+        let Tag::Compound(fields) = player.value else {
+            unreachable!()
+        };
+        assert_eq!(
+            fresh_player_location(&fields).unwrap().1,
+            crate::world::ChunkPos { x: 0, z: 0 }
+        );
+        for name in ["Pos", "Dimension"] {
+            let mut missing = fields.clone();
+            missing.retain(|(key, _)| !key.matches(name));
+            assert!(fresh_player_location(&missing).is_err());
+            let mut duplicate = fields.clone();
+            duplicate.push(
+                fields
+                    .iter()
+                    .find(|(key, _)| key.matches(name))
+                    .unwrap()
+                    .clone(),
+            );
+            assert!(fresh_player_location(&duplicate).is_err());
+        }
+        for value in [f64::NAN, f64::INFINITY, 30_000_513.0] {
+            let mut invalid = fields.clone();
+            invalid
+                .iter_mut()
+                .find(|(name, _)| name.matches("Pos"))
+                .unwrap()
+                .1 = Tag::List {
+                element_type: nbt::TagType::Double,
+                values: vec![Tag::Double(value), Tag::Double(64.0), Tag::Double(0.0)],
+            };
+            assert!(fresh_player_location(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_player_chunk_must_belong_to_its_saved_dimension() {
+        let parent = tempfile::tempdir().unwrap();
+        let (level, worldgen, mut player, uuid) = fresh_world_metadata();
+        let Tag::Compound(fields) = &mut player.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Dimension"))
+            .unwrap()
+            .1 = Tag::String("minecraft:the_nether".into());
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(
+                crate::world::ChunkPos { x: 0, z: 0 },
+                &chunk(0, "overworld"),
+                1,
+            )
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        assert!(
+            format!("{:#}", draft.stage(parent.path()).err().unwrap()).contains("player chunk")
+        );
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 

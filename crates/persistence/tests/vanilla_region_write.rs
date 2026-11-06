@@ -1816,6 +1816,17 @@ fn fresh_world_stage_is_readable_by_java_26_3() {
         value: Tag::Compound(vec![
             ("DataVersion".into(), Tag::Int(5023)),
             ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+            (
+                "Dimension".into(),
+                Tag::String("minecraft:overworld".into()),
+            ),
+            (
+                "Pos".into(),
+                Tag::List {
+                    element_type: nbt::TagType::Double,
+                    values: vec![Tag::Double(0.5), Tag::Double(64.0), Tag::Double(0.5)],
+                },
+            ),
         ]),
     };
     let mut draft =

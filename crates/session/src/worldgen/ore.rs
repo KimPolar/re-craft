@@ -6519,13 +6519,17 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 state.name.as_str(),
                                 "minecraft:dark_oak_log" | "minecraft:birch_log"
                             ) && tree_generated_log(state)));
-                    let fresh_patch_water = !guard.require_unchanged_light
-                        && self.patch_block_write
+                    let patch_water = self.patch_block_write
                         && old.name == "minecraft:clay"
                         && old.properties.is_empty()
                         && state.name == "minecraft:water"
                         && state.properties.len() == 1
                         && state.properties.get("level").map(String::as_str) == Some("0");
+                    let fresh_patch_water = !guard.require_unchanged_light && patch_water;
+                    let staged_patch_water = guard.require_unchanged_light && patch_water;
+                    // Java checks this transition: opaque clay becomes source
+                    // water with a different light-blocking state.
+                    let patch_check = staged_patch_water;
                     let fresh_water_dripleaf = !guard.require_unchanged_light
                         && self.column_block_write
                         && old.name == "minecraft:water"
@@ -6590,6 +6594,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
+                                || staged_patch_water
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {old:?} -> {state:?}"
@@ -6601,6 +6606,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     ensure!(
                         tree_light_update
                             || fresh_patch_water
+                            || staged_patch_water
                             || fresh_water_dripleaf
                             || fresh_waterlog_dripleaf
                             || vine_write
@@ -6653,6 +6659,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     }
                     if tree_light_update
                         || fresh_patch_water
+                        || staged_patch_water
                         || fresh_water_dripleaf
                         || fresh_waterlog_dripleaf
                         || vine_check
@@ -6662,10 +6669,19 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     {
                         let guard = self.light_guard.as_mut().unwrap();
                         guard.light_replay_positions.insert(p);
-                        if vine_write || water_lichen_write || lake_light_update {
+                        if vine_write
+                            || water_lichen_write
+                            || lake_light_update
+                            || staged_patch_water
+                        {
                             guard.vine_light_positions.insert(p);
                         }
-                        if tree_light_update || vine_check || lichen_check || lake_light_update {
+                        if tree_light_update
+                            || vine_check
+                            || lichen_check
+                            || lake_light_update
+                            || patch_check
+                        {
                             guard.light_check_order.push(p);
                         }
                     }
@@ -10736,6 +10752,12 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_clay_to_water_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -10838,6 +10860,10 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if mode.ends_with("_patch_water") {
+                let clay = world.intern_state(state("clay"));
+                world.set_block_id(16, 10, 8, clay).unwrap();
+            }
             if mode.contains("_lake_") {
                 let mut source = state(if mode.contains("_iron_ore_") {
                     "deepslate_iron_ore"
@@ -10914,6 +10940,12 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.ends_with("_patch_water") {
+                    let mut water = state("water");
+                    water.properties.insert("level".into(), "0".into());
+                    draft.set_patch_block(p, &water).unwrap();
+                    continue;
+                }
                 if mode.contains("_lake_") {
                     let lava = mode.ends_with("_lava") || (mode.ends_with("_mixed") && i == 1);
                     let mut block = state(if mode.ends_with("_stone") {

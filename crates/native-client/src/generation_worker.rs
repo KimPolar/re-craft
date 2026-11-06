@@ -3755,7 +3755,16 @@ fn generation_step(
                 halloween_at: crate::screenshot::is_halloween,
                 last_region_random: None,
             };
-            batch.step_with_drowned_environment(
+            let mut minecart_uuid = |_: [f64; 3]| {
+                if hut.chest_minecart_enabled {
+                    Ok(Some(
+                        native_session::worldgen::fresh_entity_uuid_from_entropy()?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            };
+            batch.step_with_drowned_mineshaft_environment(
                 provider,
                 classify,
                 resolve,
@@ -3775,6 +3784,7 @@ fn generation_step(
                         .context("moon phase environment or world clock unavailable")?
                         .index() as u8)
                 },
+                &mut minecart_uuid,
             )
         } else {
             batch.step_with_hut_clocks(
@@ -3911,6 +3921,14 @@ mod tests {
                 json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:ruin","weight":1}]}),
             ),
             (
+                "data/example/worldgen/structure/mine.json",
+                json!({"type":"minecraft:mineshaft","biomes":["example:ocean"],"step":"underground_structures","mineshaft_type":"normal"}),
+            ),
+            (
+                "data/example/worldgen/structure_set/mine.json",
+                json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:mine","weight":1}]}),
+            ),
+            (
                 "data/example/worldgen/world_preset/ocean.json",
                 json!({"dimensions":{"minecraft:overworld":{
                     "type":{"min_y":0,"height":96,"has_skylight":true,"ambient_light":0.0}, "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:ocean"},"settings":{
@@ -4033,6 +4051,12 @@ mod tests {
         assert_eq!(inline["height"], 96);
         ensure!(records.iter().any(|entity| matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:drowned"))),
             "ocean ruin did not generate a drowned: {records:?}");
+        ensure!(
+            ready.batch.mineshaft_starts(target).is_some_and(
+                |starts| starts.contains_key(&ResourceId::parse("example:mine").unwrap())
+            ),
+            "the matching mineshaft was not retained"
+        );
         Ok(())
     }
 
@@ -5177,6 +5201,7 @@ mod tests {
                 clocks: BTreeMap::from([(clock, 0)]),
                 difficulty: None,
                 ocean: None,
+                chest_minecart_enabled: true,
             }));
             let registry = Arc::new(registry);
             let for_height = Arc::clone(&registry);

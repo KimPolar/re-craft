@@ -169,6 +169,7 @@ pub(crate) struct InitialHutGeneration {
     /// Present only when generation is tied to frozen create-world settings.
     pub difficulty: Option<native_persistence::world::Difficulty>,
     pub ocean: Option<InitialOceanGeneration>,
+    pub chest_minecart_enabled: bool,
 }
 
 pub(crate) type CreatureConstructor =
@@ -315,6 +316,7 @@ impl InitialHutGeneration {
         difficulty: Option<native_persistence::world::Difficulty>,
         blocks: &BTreeSet<String>,
         registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
+        chest_minecart_enabled: bool,
     ) -> Result<Self> {
         let clocks = native_resources::world_clock::registered_clocks(resources)?
             .into_iter()
@@ -338,6 +340,7 @@ impl InitialHutGeneration {
             clocks,
             difficulty,
             ocean,
+            chest_minecart_enabled,
         })
     }
 }
@@ -872,6 +875,12 @@ pub(crate) fn prepare_with_structures_and_difficulty(
         difficulty,
         &blocks,
         Arc::clone(&registry),
+        settings.data_packs.as_ref().is_none_or(|(_, selection)| {
+            selection
+                .enabled_features
+                .iter()
+                .any(|feature| feature == "minecraft:vanilla")
+        }),
     )?));
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;
     let height_tags = Arc::new(native_resources::heightmap_tags::HeightmapTags::load(

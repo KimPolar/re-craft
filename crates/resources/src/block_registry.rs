@@ -647,6 +647,9 @@ impl GeneratedBlockRegistry {
             "unknown or noncanonical template state {id}"
         );
         let schema = self.states[id];
+        if mirror == Mirror::None && rotation == Rotation::None {
+            return Ok(properties.clone());
+        }
         if matches!(schema, StateSchema::Stateless | StateSchema::Dusted) {
             return Ok(properties.clone());
         }
@@ -988,6 +991,38 @@ mod tests {
         assert!(
             registry
                 .transform_template_state("minecraft:stairs", &state, Mirror::None, Rotation::None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_template_transform_preserves_verified_non_directional_states() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:water".into(), StateSchema::Liquid)]),
+            block_entities: BTreeMap::new(),
+        };
+        let water = BTreeMap::from([("level".into(), "7".into())]);
+        assert_eq!(
+            registry
+                .transform_template_state("minecraft:water", &water, Mirror::None, Rotation::None)
+                .unwrap(),
+            water
+        );
+        let invalid = BTreeMap::from([("level".into(), "99".into())]);
+        assert!(
+            registry
+                .transform_template_state("minecraft:water", &invalid, Mirror::None, Rotation::None)
+                .is_err()
+        );
+        assert!(
+            registry
+                .transform_template_state(
+                    "minecraft:water",
+                    &water,
+                    Mirror::None,
+                    Rotation::Clockwise90
+                )
                 .is_err()
         );
     }

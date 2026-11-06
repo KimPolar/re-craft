@@ -51,6 +51,7 @@ use super::{
 };
 
 mod buried_treasure;
+mod jigsaw;
 mod mineshaft;
 mod ocean_ruin;
 #[cfg(test)]

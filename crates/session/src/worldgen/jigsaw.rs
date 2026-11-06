@@ -21,6 +21,9 @@ use native_resources::{
 };
 use serde_json::Value;
 
+mod placement;
+pub use placement::JigsawPlacementWorld;
+
 /// Sampling must use the unadjusted generator and the structure's biome rules.
 pub trait Environment {
     fn dimension_bounds(&self) -> (i32, i32);
@@ -59,6 +62,7 @@ pub struct PreparedTemplatePiece {
     origin: [i32; 3],
     rotation: native_resources::structure_transform::Rotation,
     legacy: bool,
+    override_liquid_settings: Option<LiquidSettings>,
 }
 
 impl PreparedTemplatePiece {
@@ -71,6 +75,7 @@ impl PreparedTemplatePiece {
             location,
             legacy,
             projection,
+            override_liquid_settings,
             ..
         } = &piece.element
         else {
@@ -101,6 +106,7 @@ impl PreparedTemplatePiece {
             origin: piece.origin,
             rotation: piece.rotation,
             legacy: *legacy,
+            override_liquid_settings: *override_liquid_settings,
         })
     }
 
@@ -350,6 +356,70 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    #[derive(Default)]
+    struct TemplateOracleDraft {
+        writes: Vec<([i32; 3], native_world::loaded::BlockState)>,
+    }
+    impl JigsawPlacementWorld for TemplateOracleDraft {
+        fn block(&mut self, pos: [i32; 3]) -> Result<native_world::loaded::BlockState> {
+            Ok(native_world::loaded::BlockState {
+                name: if pos[0] % 7 == 0 {
+                    "minecraft:bedrock"
+                } else {
+                    "minecraft:stone"
+                }
+                .into(),
+                properties: BTreeMap::new(),
+            })
+        }
+        fn fluid_at(&mut self, _: [i32; 3]) -> Result<Option<native_world::fluid::FluidState>> {
+            anyhow::bail!("unexpected fluid query")
+        }
+        fn fluid_of_state(
+            &mut self,
+            _: &native_world::loaded::BlockState,
+        ) -> Result<Option<native_world::fluid::FluidState>> {
+            anyhow::bail!("unexpected fluid query")
+        }
+        fn place_template_block(
+            &mut self,
+            pos: [i32; 3],
+            state: &native_world::loaded::BlockState,
+            nbt: Option<&native_persistence::nbt::Tag>,
+            _: &mut native_core::random::DecorationRandom,
+        ) -> Result<bool> {
+            ensure!(
+                nbt.is_none(),
+                "oracle fixture unexpectedly has block entity data"
+            );
+            self.writes.push((pos, state.clone()));
+            Ok(true)
+        }
+        fn is_liquid_container(&mut self, _: &native_world::loaded::BlockState) -> Result<bool> {
+            anyhow::bail!("unexpected fluid query")
+        }
+        fn place_liquid(
+            &mut self,
+            _: [i32; 3],
+            _: &native_world::loaded::BlockState,
+            _: Option<native_world::fluid::FluidState>,
+        ) -> Result<()> {
+            anyhow::bail!("unexpected fluid placement")
+        }
+        fn mark_block_entity_changed(&mut self, _: [i32; 3]) -> Result<()> {
+            anyhow::bail!("unexpected block entity")
+        }
+        fn place_template_entities(
+            &mut self,
+            _: &[native_persistence::nbt::Tag],
+            _: [i32; 3],
+            _: native_resources::structure_transform::Rotation,
+            _: native_core::beardifier::BoundingBox,
+        ) -> Result<()> {
+            anyhow::bail!("unexpected template entities")
+        }
+    }
+
     #[test]
     #[ignore = "requires the installed verified 26.3 client and Java 25"]
     fn processed_real_template_matches_java() -> Result<()> {
@@ -425,6 +495,7 @@ mod tests {
             Rotation::Counterclockwise90,
         ];
         let mut expected = VecDeque::new();
+        let mut expected_writes = VecDeque::new();
         let mut cases = 0;
         let mut checked = 0;
         let mut defaults_checked = false;
@@ -506,6 +577,16 @@ mod tests {
                         "different block count for {rotation:?} clip {clipped}"
                     );
                     expected.extend(result);
+                    let mut draft = TemplateOracleDraft::default();
+                    assert!(piece.place(
+                        &mut draft,
+                        &registry,
+                        clip,
+                        LiquidSettings::IgnoreWaterlogging,
+                        super::super::ocean_ruin::ocean_template_static_full,
+                        &mut native_core::random::DecorationRandom::new(77)
+                    )?);
+                    expected_writes.extend(draft.writes);
                     cases += 1;
                 }
                 ["BLOCK", x, y, z, state, nbt] => {
@@ -525,10 +606,26 @@ mod tests {
                     );
                     checked += 1;
                 }
+                ["PLACE", placed, count] => {
+                    assert_eq!(*placed, "true");
+                    assert_eq!(expected_writes.len(), count.parse::<usize>()?);
+                }
+                ["WRITE", x, y, z, state, flags] => {
+                    let (position, actual) = expected_writes
+                        .pop_front()
+                        .context("unexpected Java write")?;
+                    assert_eq!(
+                        position,
+                        [x.parse::<i32>()?, y.parse::<i32>()?, z.parse::<i32>()?]
+                    );
+                    assert_eq!(&format_state(&actual), state);
+                    assert_eq!(*flags, "18");
+                }
                 _ => {}
             }
         }
         ensure!(expected.is_empty(), "last case incomplete");
+        ensure!(expected_writes.is_empty(), "last write case incomplete");
         assert!(defaults_checked);
         assert_eq!(cases, 8);
         assert!(checked > 100);

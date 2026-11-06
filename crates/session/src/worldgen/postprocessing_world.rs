@@ -953,6 +953,19 @@ fn inert_generated_full_cube(name: &str) -> bool {
     )
 }
 
+// Snowy surfaces have full fluid-occlusion faces in either state. This only
+// classifies a neighbor for fluid flow; their shape callbacks are separate.
+fn snowy_fluid_barrier(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:grass_block" | "minecraft:podzol" | "minecraft:mycelium"
+    ) && state.properties.len() == 1
+        && matches!(
+            state.properties.get("snowy").map(String::as_str),
+            Some("true" | "false")
+        )
+}
+
 // These vanilla pillars have exactly one axis property, no contained fluid,
 // full faces, and no neighbor-shape side effects in Java 26.3.
 fn inert_generated_pillar(state: &BlockState) -> bool {
@@ -1257,7 +1270,7 @@ impl GeneratedBlockView<'_> {
                 .flatten()
                 .map_or(Cell::Unknown, Cell::Fluid);
         }
-        if inert_generated_pillar(&state) {
+        if inert_generated_pillar(&state) || snowy_fluid_barrier(&state) {
             return Cell::Solid;
         }
         if !state.properties.is_empty() {
@@ -3662,6 +3675,60 @@ mod tests {
             let result = stage.finish().unwrap();
             assert!(Arc::ptr_eq(&original, &result.world), "{material}");
             assert_eq!(before, result.ticks.activated_snapshot(), "{material}");
+        }
+    }
+
+    #[test]
+    fn snowy_surfaces_block_generated_water_and_reject_invalid_states() {
+        for name in ["grass_block", "podzol", "mycelium"] {
+            for snowy in ["false", "true"] {
+                let (mut stage, _, chunk) = fixture(false);
+                let world = Arc::make_mut(&mut stage.world);
+                let state = BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::from([("snowy".into(), snowy.into())]),
+                };
+                assert!(snowy_fluid_barrier(&state));
+                let surface = world.intern_state(state);
+                let water = world.intern_state(BlockState {
+                    name: "minecraft:water".into(),
+                    properties: BTreeMap::from([("level".into(), "0".into())]),
+                });
+                for [x, y, z] in [[7, 8, 8], [9, 8, 8], [8, 7, 8], [8, 8, 7], [8, 8, 9]] {
+                    world.set_block_id(x, y, z, surface).unwrap();
+                }
+                world.set_block_id(8, 8, 8, water).unwrap();
+                stage.set_bubble_tags(Some(Arc::new(
+                    native_resources::fluid_tags::BubbleColumnTags::with_fluids(
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        BTreeSet::from(["minecraft:water".into()]),
+                    ),
+                )));
+                let mut marks = PostProcessing::new(0, 16).unwrap();
+                marks.mark(8, 8, 8);
+                stage
+                    .region
+                    .tasks
+                    .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+                let before = Arc::clone(&stage.world);
+                while !stage.poll(chunk, 1).unwrap() {}
+                let result = stage.finish().unwrap();
+                assert!(Arc::ptr_eq(&before, &result.world));
+            }
+        }
+        for properties in [
+            BTreeMap::new(),
+            BTreeMap::from([("snowy".into(), "invalid".into())]),
+            BTreeMap::from([
+                ("snowy".into(), "false".into()),
+                ("extra".into(), "true".into()),
+            ]),
+        ] {
+            assert!(!snowy_fluid_barrier(&BlockState {
+                name: "minecraft:grass_block".into(),
+                properties,
+            }));
         }
     }
 
@@ -7285,6 +7352,18 @@ mod tests {
         );
         let mut expected = inert_cube_postprocessing_trace();
         expected.extend(inert_pillar_postprocessing_trace());
+        for name in ["grass_block", "podzol", "mycelium"] {
+            for snowy in ["false", "true"] {
+                let state = BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::from([("snowy".into(), snowy.into())]),
+                };
+                expected.push(format!(
+                    "Q {name} {snowy} {} true false",
+                    snowy_fluid_barrier(&state)
+                ));
+            }
+        }
         assert_eq!(actual, expected);
     }
 

@@ -113,6 +113,13 @@ public class GeneratedInertPostprocessingOracle {
             out.printf("P %s %s %s %d %d %d %d%n",name,axis,BuiltInRegistries.BLOCK.getKey(adjacent).getPath(),
                 writes,blockTicks.pack(100).size(),fluidTicks.pack(100).size(),random.nextLong());
         }
+        for(var name:List.of("grass_block","podzol","mycelium")) for(var snowy:List.of(false,true)) {
+            var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
+            var surface=block.defaultBlockState().setValue(BlockStateProperties.SNOWY,snowy);
+            boolean full=true;
+            for(var direction:Direction.values()) full &= Block.isShapeFullBlock(surface.getFaceOcclusionShape(direction));
+            out.printf("Q %s %s %s %s %s%n",name,snowy,full,surface.getFluidState().isEmpty(),surface.canBeReplaced());
+        }
         out.println("END_RESULT");
     }
 }

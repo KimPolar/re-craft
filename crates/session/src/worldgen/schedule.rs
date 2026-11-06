@@ -170,6 +170,30 @@ pub(super) struct MixedFeatureCallbacks<'a, 'b, C, W, H, P> {
     pub context: &'a mut super::MixedHutOceanPlacementContext<'b, C, W, H, P>,
 }
 
+pub(super) struct MixedMineshaftFeatureCallbacks<'a, 'b, C, W, H, P, U> {
+    pub context: &'a mut super::MixedHutOceanPlacementContext<'b, C, W, H, P>,
+    pub uuid_factory: &'a mut U,
+}
+
+fn execute_mixed_lighting<R: super::MixedOceanRuinPlacement + Clone>(
+    terrain: &mut super::CarvedTerrainWorld,
+    prepared: &super::PreparedDecoration<'_, '_>,
+    structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+    context: &mut R,
+    lighting: StructureFeatureLighting<'_>,
+) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+    let (_, updated) = match lighting {
+        StructureFeatureLighting::Visible(light) => {
+            prepared.execute_mixed_with_visible_light(terrain, structures, context, light)?
+        }
+        StructureFeatureLighting::Fresh(tracker, registry) => prepared
+            .execute_mixed_with_tracked_light(terrain, structures, context, tracker, registry)?,
+        StructureFeatureLighting::Staged(engine, registry) => prepared
+            .execute_mixed_with_staged_light(terrain, structures, context, engine, registry)?,
+    };
+    Ok(updated)
+}
+
 impl<C, W, H, P> OceanFeatureRunner for MixedFeatureCallbacks<'_, '_, C, W, H, P>
 where
     C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
@@ -206,29 +230,66 @@ where
         let mut staged = self.context.clone();
         staged.ocean.region_random = region_random.clone();
         staged.huts.clone_from(huts);
-        let (_, updated) =
-            match lighting {
-                StructureFeatureLighting::Visible(light) => prepared
-                    .execute_mixed_with_visible_light(terrain, structures, &mut staged, light)?,
-                StructureFeatureLighting::Fresh(tracker, registry) => prepared
-                    .execute_mixed_with_tracked_light(
-                        terrain,
-                        structures,
-                        &mut staged,
-                        tracker,
-                        registry,
-                    )?,
-                StructureFeatureLighting::Staged(engine, registry) => prepared
-                    .execute_mixed_with_staged_light(
-                        terrain,
-                        structures,
-                        &mut staged,
-                        engine,
-                        registry,
-                    )?,
-            };
+        let updated = execute_mixed_lighting(terrain, prepared, structures, &mut staged, lighting)?;
         huts.clone_from(&staged.huts);
         *self.context = staged;
+        Ok(updated)
+    }
+}
+
+impl<C, W, H, P, U> OceanFeatureRunner for MixedMineshaftFeatureCallbacks<'_, '_, C, W, H, P, U>
+where
+    C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+    W: super::ocean_ruin::DrownedMarkerContext,
+    H: Clone
+        + FnMut(
+            native_resources::structure_piece::swamp_hut::HutMob,
+        ) -> Result<super::FreshCreatureRandom>,
+    P: Clone
+        + FnMut(
+            &super::structure_batch::TerrainStartKey,
+            [i32; 3],
+            &native_world::loaded::World,
+            &serde_json::Value,
+            native_core::beardifier::BoundingBox,
+            &[super::structure_batch::StructurePieceRevision],
+        ) -> Result<bool>,
+    U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+{
+    fn supports_huts(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        _: &super::structure_batch::PreparedStructureStages,
+        _: &super::BiomeNeighborhood,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let mut other = self.context.clone();
+        other.ocean.region_random = region_random.clone();
+        other.huts.clone_from(huts);
+        let updated = if let Some(blocking_biomes) = prepared.mineshaft_blocking_biomes() {
+            let mut staged = super::MixedMineshaftPlacementContext {
+                other,
+                blocking_biomes,
+                uuid_factory: self.uuid_factory.clone(),
+            };
+            let updated =
+                execute_mixed_lighting(terrain, prepared, structures, &mut staged, lighting)?;
+            *self.uuid_factory = staged.uuid_factory;
+            other = staged.other;
+            updated
+        } else {
+            execute_mixed_lighting(terrain, prepared, structures, &mut other, lighting)?
+        };
+        huts.clone_from(&other.huts);
+        *self.context = other;
         Ok(updated)
     }
 }

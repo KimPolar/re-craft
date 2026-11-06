@@ -23,9 +23,9 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        MineshaftFeatureCallbacks, MixedFeatureCallbacks, NativeDrownedFeatureRunner,
-        NativeHutFeatureRunner, NativeMixedFeatureRunner, OceanFeatureCallbacks,
-        OceanFeatureRunner, StructureFeatureLighting,
+        MineshaftFeatureCallbacks, MixedFeatureCallbacks, MixedMineshaftFeatureCallbacks,
+        NativeDrownedFeatureRunner, NativeHutFeatureRunner, NativeMixedFeatureRunner,
+        OceanFeatureCallbacks, OceanFeatureRunner, StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3862,6 +3862,46 @@ impl FreshTerrainBatch {
             "ocean ruin sea level differs from generator"
         );
         let mut runner = MixedFeatureCallbacks { context };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
+    /// Run mixed hut, ocean ruin and mineshaft decoration in one transaction.
+    /// All callback clones must isolate mutable state until the pass commits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_mixed_mineshaft_support<C, W, H, P, U>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        context: &mut super::MixedHutOceanPlacementContext<'_, C, W, H, P>,
+        uuid_factory: &mut U,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        W: super::ocean_ruin::DrownedMarkerContext,
+        H: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone
+            + FnMut(
+                &TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+                &[super::structure_batch::StructurePieceRevision],
+            ) -> Result<bool>,
+        U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+    {
+        ensure!(
+            context.ocean.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = MixedMineshaftFeatureCallbacks {
+            context,
+            uuid_factory,
+        };
         self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }
 

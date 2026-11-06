@@ -3241,6 +3241,138 @@ mod tests {
         assert_eq!(combined.huts, initial);
         assert_eq!(combined.ocean.context.special_calls, 0);
 
+        // A referenced mineshaft shares the same FEATURES transaction with
+        // huts and ruins; a later failure must discard every earlier change.
+        use native_resources::mineshaft::{
+            MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        let mine_entry = native_resources::structure_decoration::StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:mineshaft")?,
+            step: 0,
+            index: 0,
+        };
+        let late_ruin = native_resources::structure_decoration::StructureDecorationEntry {
+            index: 2,
+            ..entry.clone()
+        };
+        let room = MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 1, 2], [10, 6, 10]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let mine = super::super::super::mineshaft::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 0],
+            terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: vec![super::super::super::SavedMineshaftPiece::capture(
+                &room,
+                MineshaftVariant::Normal,
+                false,
+            )?],
+        };
+        let all_three = [
+            PlannedMixedStructureDecoration {
+                entry: &mine_entry,
+                starts: vec![PlannedStructureStart::Mineshaft(&mine)],
+            },
+            PlannedMixedStructureDecoration {
+                entry: &hut_entry,
+                starts: vec![PlannedStructureStart::Simple(&hut)],
+            },
+            PlannedMixedStructureDecoration {
+                entry: &late_ruin,
+                starts: vec![PlannedStructureStart::OceanRuin(&start)],
+            },
+        ];
+        let prepared_mine = super::super::PreparedDecoration::load_with_mineshaft(
+            &mut data,
+            &plan,
+            &ids,
+            &mut super::super::tests::resolve_test,
+            true,
+        )?;
+        for fail in [false, true] {
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(center, GenerationStage::Features)?;
+            loop {
+                let (pos, stage) = schedule
+                    .next_ready()
+                    .context("missing generation prerequisite")?;
+                if pos == center && stage == GenerationStage::Features {
+                    break;
+                }
+                schedule.complete(pos, stage)?;
+            }
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let mut states = initial.clone();
+            let mut combined = make_adapter();
+            if fail {
+                combined.ocean.context.fail_on_special = Some(2);
+            }
+            let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+            let mut runner = super::super::super::schedule::MixedMineshaftFeatureCallbacks {
+                context: &mut combined,
+                uuid_factory: &mut uuid,
+            };
+            let result = schedule.run_features_with_ocean(
+                &mut terrain,
+                &prepared_mine,
+                &all_three,
+                &mut states,
+                &random,
+                StructureFeatureLighting::Visible(&light),
+                &mut runner,
+                &stages,
+                &neighborhood,
+            );
+            if fail {
+                assert!(result.is_err());
+                assert!(schedule.ready(center, GenerationStage::Features));
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(states, initial);
+                assert_eq!(combined.ocean.context.special_calls, 0);
+            } else {
+                let updated = result?;
+                assert!(matches!(
+                    &updated[0][0],
+                    super::super::super::PreparedStructureStart::Mineshaft(_)
+                ));
+                assert!(states[&key].state.spawned_witch && states[&key].state.spawned_cat);
+                assert_eq!(combined.ocean.context.special_calls, 4);
+                assert_eq!(
+                    terrain.snapshot().block(3, 2, 3).unwrap().name,
+                    "minecraft:cave_air"
+                );
+            }
+        }
+
+        // Chunks without a referenced mineshaft do not load its biome tags,
+        // but the same mixed runner must still support huts and ruins.
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let mut states = initial.clone();
+        let mut combined = make_adapter();
+        let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+        let mut runner = super::super::super::schedule::MixedMineshaftFeatureCallbacks {
+            context: &mut combined,
+            uuid_factory: &mut uuid,
+        };
+        super::super::super::schedule::OceanFeatureRunner::execute(
+            &mut runner,
+            &mut terrain,
+            &prepared,
+            &mixed,
+            &mut states,
+            &random,
+            StructureFeatureLighting::Visible(&light),
+            &stages,
+            &neighborhood,
+        )?;
+        assert_eq!(states[&key], expected_saved);
+        assert_eq!(combined.ocean.context.special_calls, 4);
+
         // The runner supplies the actual FEATURES biome neighborhood to
         // drowned initialization and publishes callbacks only on success.
         let make_difficulty = |fail: bool| {

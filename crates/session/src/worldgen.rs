@@ -7831,9 +7831,14 @@ mod tests {
             element_type,
             values,
         };
-        for (unsupported, terrain_matching) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for (unsupported, terrain_matching, chest) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
             let mut block = vec![
                 (
                     "pos".into(),
@@ -7843,6 +7848,17 @@ mod tests {
             ];
             if unsupported {
                 block.push(("nbt".into(), Tag::Compound(vec![])));
+            } else if chest {
+                block.push((
+                    "nbt".into(),
+                    Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:chest".into())),
+                        (
+                            "LootTable".into(),
+                            Tag::String("minecraft:chests/village/village_armorer".into()),
+                        ),
+                    ]),
+                ));
             }
             let document = NamedTag {
                 name: "".into(),
@@ -7858,7 +7874,14 @@ mod tests {
                             TagType::Compound,
                             vec![Tag::Compound(vec![(
                                 "id".into(),
-                                Tag::String("minecraft:stone_bricks".into()),
+                                Tag::String(
+                                    if chest {
+                                        "minecraft:chest"
+                                    } else {
+                                        "minecraft:stone_bricks"
+                                    }
+                                    .into(),
+                                ),
                             )])],
                         ),
                     ),
@@ -8002,7 +8025,11 @@ mod tests {
                         .block(origin[0], origin[1], origin[2])
                         .context("missing placed block")?
                         .name,
-                    "minecraft:stone_bricks"
+                    if chest {
+                        "minecraft:chest"
+                    } else {
+                        "minecraft:stone_bricks"
+                    }
                 );
                 assert!(batch.structure_data(target).is_ok());
             }

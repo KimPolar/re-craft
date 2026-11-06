@@ -654,7 +654,10 @@ impl GeneratedBlockRegistry {
             return Ok(properties.clone());
         }
         ensure!(
-            matches!(schema, StateSchema::HorizontalFacing | StateSchema::Stairs),
+            matches!(
+                schema,
+                StateSchema::HorizontalFacing | StateSchema::Stairs | StateSchema::Chest
+            ),
             "template state transform is unsupported for {id}"
         );
         let mut result = properties.clone();

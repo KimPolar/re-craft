@@ -65,6 +65,12 @@ impl GeneratedEmptyChest {
     }
 }
 impl GeneratedLootChest {
+    pub(super) fn update_state(&mut self, state: native_world::loaded::BlockState) -> Result<()> {
+        ensure!(state.name == "minecraft:chest", "invalid chest state");
+        self.state_override = Some(state);
+        Ok(())
+    }
+
     pub(super) fn with_loot_table(&self, table: &str, seed: i64) -> Result<Self> {
         let mut chest = self.clone();
         chest.loot_table = ResourceId::parse(table)?;

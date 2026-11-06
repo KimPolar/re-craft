@@ -457,7 +457,7 @@ pub enum FreshBatchLight {
 struct DecorationConfig {
     schedule: FeatureSchedule,
     structures: Option<StructureDecorationSchedule>,
-    features_cannot_spawn_entities: bool,
+    feature_entity_evidence: BTreeMap<FeatureKey, bool>,
     block_registry: BTreeSet<String>,
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
@@ -751,11 +751,11 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
     }
 }
 
-fn features_cannot_spawn_entities(
+fn feature_entity_evidence(
     provider: &mut impl ResourceProvider,
     schedule: &FeatureSchedule,
     registry: &BTreeSet<ResourceId>,
-) -> bool {
+) -> BTreeMap<FeatureKey, bool> {
     let mut classifier = EntityFeatureClassifier {
         provider,
         registry,
@@ -764,8 +764,12 @@ fn features_cannot_spawn_entities(
         cache: BTreeMap::new(),
         nodes: 0,
     };
-    schedule.steps().iter().flatten().all(|key| {
-        match key {
+    let mut evidence = BTreeMap::new();
+    for key in schedule.steps().iter().flatten() {
+        if evidence.contains_key(key) {
+            continue;
+        }
+        let safe = match key {
             FeatureKey::Registered(id) => classifier.named(id, true, 0),
             FeatureKey::Inline { biome, .. } => schedule
                 .biome(biome)
@@ -773,14 +777,31 @@ fn features_cannot_spawn_entities(
                 .context("inline placed feature is missing")
                 .and_then(|value| classifier.placed(value, 0)),
         }
-        .unwrap_or(false)
-    })
+        .unwrap_or(false);
+        evidence.insert(key.clone(), safe);
+    }
+    evidence
+}
+
+#[cfg(test)]
+fn features_cannot_spawn_entities(
+    provider: &mut impl ResourceProvider,
+    schedule: &FeatureSchedule,
+    registry: &BTreeSet<ResourceId>,
+) -> bool {
+    feature_entity_evidence(provider, schedule, registry)
+        .values()
+        .all(|safe| *safe)
 }
 
 #[derive(Default)]
 struct GeneratedEntitySources {
     complete_spawns: BTreeSet<ChunkPos>,
     recorded_hut_features: BTreeSet<ChunkPos>,
+    completed_feature_passes: BTreeSet<ChunkPos>,
+    // Only completed passes can already have contributed entities. Once an
+    // unverified pass runs, earlier per-chunk completeness is invalid too.
+    untracked_feature_pass: bool,
     untracked: bool,
 }
 
@@ -817,6 +838,11 @@ fn structure_entities_are_accounted_for(
 }
 
 impl GeneratedEntitySources {
+    fn complete_feature_pass(&mut self, pos: ChunkPos, entity_free: bool) {
+        self.completed_feature_passes.insert(pos);
+        self.untracked_feature_pass |= !entity_free;
+    }
+
     fn complete_spawn(&mut self, pos: ChunkPos, additions: &[super::GeneratedEntityAddition]) {
         if additions.iter().all(|addition| {
             addition.block_position[0].div_euclid(16) == pos.x
@@ -836,10 +862,10 @@ impl GeneratedEntitySources {
         &self,
         pos: ChunkPos,
         structure_entities_accounted_for: bool,
-        features_entity_free: bool,
     ) -> bool {
         structure_entities_accounted_for
-            && features_entity_free
+            && self.completed_feature_passes.contains(&pos)
+            && !self.untracked_feature_pass
             && self.contains_complete_spawn(pos)
     }
 }
@@ -1302,11 +1328,10 @@ impl FreshTerrainBatch {
                 )
             }),
         };
-        if !self.entity_sources.complete_entity_coverage(
-            pos,
-            structure_entities_accounted_for,
-            decoration.features_cannot_spawn_entities,
-        ) {
+        if !self
+            .entity_sources
+            .complete_entity_coverage(pos, structure_entities_accounted_for)
+        {
             return Ok(None);
         }
         Ok(Some(self.recorded_generated_entities(pos)?))
@@ -1575,8 +1600,7 @@ impl FreshTerrainBatch {
             .as_ref()
             .map(|_| StructureDecorationSchedule::load(provider))
             .transpose()?;
-        let features_cannot_spawn_entities =
-            features_cannot_spawn_entities(provider, &schedule, placed_features);
+        let feature_entity_evidence = feature_entity_evidence(provider, &schedule, placed_features);
         let heightmap_tags =
             native_resources::heightmap_tags::HeightmapTags::load(provider, &block_registry)?;
         let mushroom_tag = ResourceId::parse("minecraft:overrides_mushroom_light_requirement")?;
@@ -1627,7 +1651,7 @@ impl FreshTerrainBatch {
         self.decoration = Some(DecorationConfig {
             schedule,
             structures,
-            features_cannot_spawn_entities,
+            feature_entity_evidence,
             block_registry,
             heightmap_tags,
             mushroom_tags,
@@ -4069,6 +4093,9 @@ impl FreshTerrainBatch {
                     &self.biomes,
                     [pos.x, pos.z],
                 )?;
+                let entity_free = plan.features().iter().all(|feature| {
+                    config.feature_entity_evidence.get(feature.feature) == Some(&true)
+                });
                 let prepared =
                     PreparedDecoration::load(provider, &plan, &config.block_registry, resolve)?;
                 let terrain = self
@@ -4290,6 +4317,7 @@ impl FreshTerrainBatch {
                     self.schedule
                         .run_features_with_visible_light(terrain, &prepared, false, &light)?;
                 }
+                self.entity_sources.complete_feature_pass(pos, entity_free);
                 self.lit_cache = None;
                 Ok(())
             })(),
@@ -4888,6 +4916,71 @@ mod entity_source_tests {
     }
 
     #[test]
+    fn entity_coverage_tracks_only_completed_selected_features() {
+        let mut data = Data::default();
+        for (path, value) in [
+            (
+                "data/test/worldgen/biome/plain.json",
+                json!({"features":[["test:safe"]]}),
+            ),
+            (
+                "data/test/worldgen/biome/other.json",
+                json!({"features":[["test:unknown"]]}),
+            ),
+            (
+                "data/test/worldgen/placed_feature/safe.json",
+                json!({"feature":{"type":"minecraft:ore"},"placement":[]}),
+            ),
+            (
+                "data/test/worldgen/placed_feature/unknown.json",
+                json!({"feature":{"type":"example:spawner"},"placement":[]}),
+            ),
+        ] {
+            data.0
+                .insert(path.into(), serde_json::to_vec(&value).unwrap());
+        }
+        let plain = ResourceId::parse("test:plain").unwrap();
+        let other = ResourceId::parse("test:other").unwrap();
+        let registry = BTreeSet::from([
+            ResourceId::parse("test:safe").unwrap(),
+            ResourceId::parse("test:unknown").unwrap(),
+        ]);
+        let schedule =
+            FeatureSchedule::load(&mut data, &[plain.clone(), other.clone()], &registry).unwrap();
+        let facts = feature_entity_evidence(&mut data, &schedule, &registry);
+        let selected_safe = schedule.select([&plain]);
+        let selected_unknown = schedule.select([&other]);
+        assert!(
+            selected_safe
+                .iter()
+                .all(|feature| facts.get(feature.feature) == Some(&true))
+        );
+        assert!(
+            !selected_unknown
+                .iter()
+                .all(|feature| facts.get(feature.feature) == Some(&true))
+        );
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut sources = GeneratedEntitySources::default();
+        sources.complete_spawn(center, &[]);
+        assert!(!sources.complete_entity_coverage(center, true));
+        sources.complete_feature_pass(
+            center,
+            selected_safe
+                .iter()
+                .all(|feature| facts.get(feature.feature) == Some(&true)),
+        );
+        assert!(sources.complete_entity_coverage(center, true));
+        sources.complete_feature_pass(
+            ChunkPos { x: 1, z: 0 },
+            selected_unknown
+                .iter()
+                .all(|feature| facts.get(feature.feature) == Some(&true)),
+        );
+        assert!(!sources.complete_entity_coverage(center, true));
+    }
+
+    #[test]
     fn nested_selectors_require_every_branch_and_resolve_tags() {
         let mut data = Data::default();
         let put = |data: &mut Data, path: &str, value: Value| {
@@ -5058,9 +5151,16 @@ mod entity_source_tests {
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[local]);
         assert!(evidence.contains_complete_spawn(chunk));
-        assert!(evidence.complete_entity_coverage(chunk, true, true));
-        assert!(!evidence.complete_entity_coverage(chunk, false, true));
-        assert!(!evidence.complete_entity_coverage(chunk, true, false));
+        assert!(!evidence.complete_entity_coverage(chunk, true));
+        evidence.complete_feature_pass(chunk, true);
+        assert!(evidence.complete_entity_coverage(chunk, true));
+        assert!(!evidence.complete_entity_coverage(chunk, false));
+        let mut unknown_feature = GeneratedEntitySources::default();
+        unknown_feature.complete_spawn(chunk, &[]);
+        unknown_feature.complete_feature_pass(chunk, true);
+        assert!(unknown_feature.complete_entity_coverage(chunk, true));
+        unknown_feature.complete_feature_pass(ChunkPos { x: 2, z: 0 }, false);
+        assert!(!unknown_feature.complete_entity_coverage(chunk, true));
         evidence.complete_spawn(ChunkPos { x: 1, z: 0 }, &[neighbor]);
         assert!(!evidence.contains_complete_spawn(chunk));
         evidence.complete_spawn(chunk, &[]);

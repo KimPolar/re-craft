@@ -66,7 +66,7 @@ pub use carving::CarverBlockState;
 pub use generated_beehive::GeneratedBeeNest;
 pub use generated_brushable::GeneratedBrushable;
 pub use generated_chest::{GeneratedEmptyChest, GeneratedLootChest};
-pub use generated_creature_random::FreshCreatureRandom;
+pub use generated_creature_random::{FreshCreatureRandom, fresh_entity_uuid_from_entropy};
 pub use generated_donkey::draft_fresh_donkey;
 pub use generated_drowned::draft_fresh_structure_drowned;
 pub use generated_farm_animal::{draft_fresh_farm_animal, draft_fresh_jockey_chicken};

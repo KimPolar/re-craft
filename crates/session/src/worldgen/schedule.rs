@@ -294,17 +294,19 @@ where
     }
 }
 
-pub(super) struct NativeMixedFeatureRunner<'a, 'b, C, W> {
+pub(super) struct NativeMixedFeatureRunner<'a, 'b, C, W, U> {
     pub ocean: &'a mut super::OceanRuinPlacementContext<'b, C, W>,
     pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
     pub conditions: &'a native_resources::cat_variants::CatWorldConditions,
     pub moon_phase_at: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    pub uuid_factory: Option<&'a mut U>,
 }
 
-impl<C, W> OceanFeatureRunner for NativeMixedFeatureRunner<'_, '_, C, W>
+impl<C, W, U> OceanFeatureRunner for NativeMixedFeatureRunner<'_, '_, C, W, U>
 where
     C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
     W: super::ocean_ruin::DrownedMarkerContext,
+    U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
 {
     fn supports_huts(&self) -> bool {
         true
@@ -357,19 +359,36 @@ where
                     )
                 },
         };
-        let updated = MixedFeatureCallbacks {
-            context: &mut context,
-        }
-        .execute(
-            terrain,
-            prepared,
-            structures,
-            huts,
-            region_random,
-            lighting,
-            all_structures,
-            biomes,
-        )?;
+        let updated = if let Some(uuid_factory) = self.uuid_factory.as_deref_mut() {
+            MixedMineshaftFeatureCallbacks {
+                context: &mut context,
+                uuid_factory,
+            }
+            .execute(
+                terrain,
+                prepared,
+                structures,
+                huts,
+                region_random,
+                lighting,
+                all_structures,
+                biomes,
+            )?
+        } else {
+            MixedFeatureCallbacks {
+                context: &mut context,
+            }
+            .execute(
+                terrain,
+                prepared,
+                structures,
+                huts,
+                region_random,
+                lighting,
+                all_structures,
+                biomes,
+            )?
+        };
         self.ocean.region_random = context.ocean.region_random;
         self.ocean.construct = context.ocean.construct;
         self.ocean.context = context.ocean.context;
@@ -640,14 +659,15 @@ where
     }
 }
 
-pub(super) struct NativeDrownedFeatureRunner<'a, 'b, C, E, D, H> {
+pub(super) struct NativeDrownedFeatureRunner<'a, 'b, C, E, D, H, U> {
     pub inputs: &'a mut super::ocean_ruin::DrownedPlacementInputs<'b, C, E, D, H>,
     pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
     pub conditions: &'a native_resources::cat_variants::CatWorldConditions,
     pub moon_phase_at: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    pub uuid_factory: Option<&'a mut U>,
 }
 
-impl<C, E, D, H> OceanFeatureRunner for NativeDrownedFeatureRunner<'_, '_, C, E, D, H>
+impl<C, E, D, H, U> OceanFeatureRunner for NativeDrownedFeatureRunner<'_, '_, C, E, D, H, U>
 where
     C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
     E: super::ocean_ruin::DrownedSpawnEffects,
@@ -658,6 +678,7 @@ where
             &super::BiomeNeighborhood,
         ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
     H: Clone + FnMut() -> Result<bool>,
+    U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
 {
     fn supports_huts(&self) -> bool {
         true
@@ -703,6 +724,7 @@ where
             variants: self.variants,
             conditions: self.conditions,
             moon_phase_at: self.moon_phase_at,
+            uuid_factory: self.uuid_factory.as_deref_mut(),
         }
         .execute(
             terrain,

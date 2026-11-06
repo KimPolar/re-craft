@@ -3422,6 +3422,7 @@ mod tests {
                 variants: &variants,
                 conditions: &conditions,
                 moon_phase_at: &|_, _| Ok(0),
+                uuid_factory: None::<&mut fn([f64; 3]) -> Result<Option<[i32; 4]>>>,
             };
             let result = schedule.run_features_with_ocean(
                 &mut terrain,
@@ -3448,6 +3449,81 @@ mod tests {
                 result?;
                 assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
                 assert_eq!(terrain.recorded_generated_entities(center)?.len(), 4);
+                assert!(inputs.last_region_random.is_some());
+            }
+        }
+
+        // The native drowned environment must also pass mineshafts through
+        // the same transaction as huts and ruins.
+        for fail in [false, true] {
+            let mut inputs = super::super::super::ocean_ruin::DrownedPlacementInputs {
+                ice_tags: &ice,
+                water_fluids: &water,
+                bubble_fluids: &bubbles,
+                registry: &registry,
+                biome_tags: &biome_tags,
+                sea_level: 63,
+                construct: make_constructor(),
+                effects: DrownedContext::default(),
+                difficulty_at: make_difficulty(fail),
+                halloween_at: || Ok(false),
+                last_region_random: None,
+            };
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(center, GenerationStage::Features)?;
+            loop {
+                let (pos, stage) = schedule
+                    .next_ready()
+                    .context("missing generation prerequisite")?;
+                if pos == center && stage == GenerationStage::Features {
+                    break;
+                }
+                schedule.complete(pos, stage)?;
+            }
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let mut states = initial.clone();
+            let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+            let mut runner = super::super::super::schedule::NativeDrownedFeatureRunner {
+                inputs: &mut inputs,
+                variants: &variants,
+                conditions: &conditions,
+                moon_phase_at: &|_, _| Ok(0),
+                uuid_factory: Some(&mut uuid),
+            };
+            let result = schedule.run_features_with_ocean(
+                &mut terrain,
+                &prepared_mine,
+                &all_three,
+                &mut states,
+                &random,
+                StructureFeatureLighting::Visible(&light),
+                &mut runner,
+                &stages,
+                &neighborhood,
+            );
+            if fail {
+                let error = match result {
+                    Ok(_) => bail!("expected difficulty lookup failure"),
+                    Err(error) => error,
+                };
+                assert!(format!("{error:#}").contains("injected difficulty lookup failure"));
+                assert!(schedule.ready(center, GenerationStage::Features));
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert_eq!(states, initial);
+                assert!(inputs.last_region_random.is_none());
+                assert_eq!(inputs.effects, DrownedContext::default());
+            } else {
+                let updated = result?;
+                assert!(matches!(
+                    &updated[0][0],
+                    super::super::super::PreparedStructureStart::Mineshaft(_)
+                ));
+                assert!(states[&key].state.spawned_witch && states[&key].state.spawned_cat);
+                assert_eq!(
+                    terrain.snapshot().block(3, 2, 3).unwrap().name,
+                    "minecraft:cave_air"
+                );
                 assert!(inputs.last_region_random.is_some());
             }
         }

@@ -21,10 +21,7 @@ impl FreshCreatureRandom {
     /// The exact seed is not derived from the world seed in vanilla.
     pub fn from_entropy(entity: &ResourceId) -> Result<Self> {
         validate_entity(entity)?;
-        let mut seed = [0_u8; 8];
-        getrandom::fill(&mut seed)
-            .map_err(|error| anyhow::anyhow!("cannot seed entity RNG: {error}"))?;
-        Self::from_seed(entity, i64::from_ne_bytes(seed))
+        Self::from_random(entity, random_from_entropy()?)
     }
 
     /// A supplied seed allows deterministic comparison against Java's
@@ -35,14 +32,7 @@ impl FreshCreatureRandom {
 
     pub fn from_random(entity: &ResourceId, mut random: LegacyRandom) -> Result<Self> {
         validate_entity(entity)?;
-        let most = (random.next_long() as u64 & 0xffff_ffff_ffff_0fff) | 0x4000;
-        let least = (random.next_long() as u64 & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
-        let uuid = [
-            (most >> 32) as i32,
-            most as i32,
-            (least >> 32) as i32,
-            least as i32,
-        ];
+        let uuid = fresh_entity_uuid_from_random(&mut random);
         // LivingEntity's constructor consumes the same random source before
         // Chicken's constructor draws its egg-laying delay.
         let initial_yaw = random.next_float() * std::f32::consts::TAU;
@@ -78,6 +68,29 @@ impl FreshCreatureRandom {
             random,
         })
     }
+}
+
+/// Construct an entity UUID independently of the world-generation RNG.
+pub fn fresh_entity_uuid_from_entropy() -> Result<[i32; 4]> {
+    Ok(fresh_entity_uuid_from_random(&mut random_from_entropy()?))
+}
+
+fn random_from_entropy() -> Result<LegacyRandom> {
+    let mut seed = [0_u8; 8];
+    getrandom::fill(&mut seed)
+        .map_err(|error| anyhow::anyhow!("cannot seed entity RNG: {error}"))?;
+    Ok(LegacyRandom::new(i64::from_ne_bytes(seed)))
+}
+
+fn fresh_entity_uuid_from_random(random: &mut LegacyRandom) -> [i32; 4] {
+    let most = (random.next_long() as u64 & 0xffff_ffff_ffff_0fff) | 0x4000;
+    let least = (random.next_long() as u64 & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    [
+        (most >> 32) as i32,
+        most as i32,
+        (least >> 32) as i32,
+        least as i32,
+    ]
 }
 
 fn validate_entity(entity: &ResourceId) -> Result<()> {
@@ -119,6 +132,27 @@ mod tests {
             FreshCreatureRandom::from_seed(&ResourceId::parse("minecraft:llama").unwrap(), 42)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn entity_uuid_uses_the_same_random_draws_for_minecarts_and_creatures() -> Result<()> {
+        let chicken = ResourceId::parse("minecraft:chicken")?;
+        for seed in [0, 1, -1, i64::MIN, i64::MAX, 42] {
+            let mut random = LegacyRandom::new(seed);
+            let uuid = fresh_entity_uuid_from_random(&mut random);
+            assert_eq!(
+                uuid,
+                FreshCreatureRandom::from_seed(&chicken, seed)?
+                    .construction
+                    .uuid
+            );
+            assert_eq!((uuid[1] as u32) & 0xf000, 0x4000);
+            assert_eq!((uuid[2] as u32) >> 30, 2);
+        }
+        let uuid = fresh_entity_uuid_from_entropy()?;
+        assert_eq!((uuid[1] as u32) & 0xf000, 0x4000);
+        assert_eq!((uuid[2] as u32) >> 30, 2);
+        Ok(())
     }
 
     #[test]

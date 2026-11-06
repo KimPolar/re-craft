@@ -3932,6 +3932,7 @@ impl FreshTerrainBatch {
             variants,
             conditions,
             moon_phase_at,
+            uuid_factory: None::<&mut fn([f64; 3]) -> Result<Option<[i32; 4]>>>,
         };
         self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }
@@ -3970,6 +3971,47 @@ impl FreshTerrainBatch {
             variants,
             conditions,
             moon_phase_at,
+            uuid_factory: None::<&mut fn([f64; 3]) -> Result<Option<[i32; 4]>>>,
+        };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
+    /// Execute ocean ruins, huts and mineshafts with the current biome and
+    /// difficulty environment. The UUID callback must clone independently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_drowned_mineshaft_environment<C, E, D, H, U>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        inputs: &mut super::ocean_ruin::DrownedPlacementInputs<'_, C, E, D, H>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon_phase_at: &dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+        uuid_factory: &mut U,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        E: super::ocean_ruin::DrownedSpawnEffects,
+        D: Clone
+            + FnMut(
+                [i32; 3],
+                &World,
+                &super::BiomeNeighborhood,
+            ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
+        H: Clone + FnMut() -> Result<bool>,
+        U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+    {
+        ensure!(
+            inputs.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = NativeDrownedFeatureRunner {
+            inputs,
+            variants,
+            conditions,
+            moon_phase_at,
+            uuid_factory: Some(uuid_factory),
         };
         self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }

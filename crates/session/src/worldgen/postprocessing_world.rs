@@ -141,6 +141,7 @@ pub struct GeneratedPostprocessing {
     pub(super) light_checkpoint: Option<PostprocessingLightCheckpoint>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
@@ -389,6 +390,7 @@ impl GeneratedPostprocessing {
             light_checkpoint: None,
             mushroom_tags,
             leaf_tags: None,
+            snow_tags: None,
             fence_tags: None,
             bubble_tags: None,
             washed_blocks: None,
@@ -574,6 +576,13 @@ impl GeneratedPostprocessing {
         self.leaf_tags = tags;
     }
 
+    pub(super) fn set_snow_tags(
+        &mut self,
+        tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    ) {
+        self.snow_tags = tags;
+    }
+
     pub(super) fn set_fence_tags(
         &mut self,
         tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
@@ -749,6 +758,7 @@ impl GeneratedPostprocessing {
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
+            snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
@@ -815,6 +825,7 @@ impl GeneratedPostprocessing {
             light: self.light.as_ref(),
             mushroom_tags: self.mushroom_tags.as_deref(),
             leaf_tags: self.leaf_tags.as_deref(),
+            snow_tags: self.snow_tags.as_deref(),
             fence_tags: self.fence_tags.as_deref(),
             bubble_tags: self.bubble_tags.as_deref(),
             washed_blocks: self.washed_blocks.as_deref(),
@@ -888,6 +899,7 @@ struct GeneratedBlockView<'a> {
     light: Option<&'a VisibleLightSnapshot>,
     mushroom_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     leaf_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
+    snow_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     fence_tags: Option<&'a native_resources::ore_feature::OreBlockTags>,
     bubble_tags: Option<&'a native_resources::fluid_tags::BubbleColumnTags>,
     washed_blocks: Option<&'a BTreeSet<String>>,
@@ -905,6 +917,7 @@ enum DryBlock {
     Falling,
     Mushroom,
     Leaves,
+    Snowy,
 }
 
 // Full cubes whose block states have no properties and whose Java shape
@@ -964,6 +977,29 @@ fn snowy_fluid_barrier(state: &BlockState) -> bool {
             state.properties.get("snowy").map(String::as_str),
             Some("true" | "false")
         )
+}
+
+fn snowy_shape_update(
+    state: &BlockState,
+    direction: [i32; 3],
+    neighbor: &BlockState,
+    tags: Option<&native_resources::ore_feature::OreBlockTags>,
+) -> Result<BlockState> {
+    ensure!(snowy_fluid_barrier(state), "invalid snowy surface state");
+    if direction != [0, 1, 0] {
+        return Ok(state.clone());
+    }
+    static TAG: std::sync::OnceLock<native_resources::packs::ResourceId> =
+        std::sync::OnceLock::new();
+    let tag = TAG.get_or_init(|| {
+        native_resources::packs::ResourceId::parse("minecraft:snow").expect("static tag identifier")
+    });
+    let snowy = tags
+        .context("snow block tags unavailable")?
+        .contains(tag, &neighbor.name)?;
+    let mut updated = state.clone();
+    updated.properties.insert("snowy".into(), snowy.to_string());
+    Ok(updated)
 }
 
 // These vanilla pillars have exactly one axis property, no contained fluid,
@@ -1059,6 +1095,9 @@ fn supported_postprocessing_block(state: &BlockState) -> Result<DryBlock> {
     }
     if inert_generated_pillar(state) {
         return Ok(DryBlock::Plain);
+    }
+    if snowy_fluid_barrier(state) {
+        return Ok(DryBlock::Snowy);
     }
     ensure!(
         state.properties.is_empty(),
@@ -1938,6 +1977,13 @@ impl GeneratedBlockView<'_> {
         flags: i32,
     ) -> Result<()> {
         let old = self.read(pos)?;
+        if snowy_fluid_barrier(&old) && snowy_fluid_barrier(next) {
+            ensure!(
+                flags == 276 && old.name == next.name,
+                "unsupported generated snowy surface write"
+            );
+            return self.write_postprocessed_state(pos, &old, next);
+        }
         if super::ore::valid_lichen(&old) {
             let faces = ["down", "up", "north", "south", "west", "east"];
             let valid = if super::ore::valid_lichen(next) {
@@ -2371,6 +2417,9 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                         "leaf tick container is missing"
                     );
                 }
+            }
+            DryBlock::Snowy => {
+                return snowy_shape_update(state, direction, neighbor, self.snow_tags);
             }
             DryBlock::Plain | DryBlock::Mushroom => {}
         }
@@ -2822,6 +2871,171 @@ mod tests {
     use native_core::postprocessing::PostProcessing;
     use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
     use std::collections::BTreeMap;
+
+    fn snowy_test_tags(tagged: bool) -> Arc<native_resources::ore_feature::OreBlockTags> {
+        use native_resources::{
+            ore_feature::OreBlockTags,
+            packs::{ResourceId, ResourceProvider},
+        };
+        struct Tags(bool);
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/minecraft/tags/block/snow.json" {
+                    Ok(Some(if self.0 {
+                        br#"{"values":["minecraft:stone","minecraft:water","minecraft:snow"]}"#
+                            .to_vec()
+                    } else {
+                        br#"{"values":[]}"#.to_vec()
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let registry = ["minecraft:stone", "minecraft:water", "minecraft:snow"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let ids = BTreeSet::from([ResourceId::parse("minecraft:snow").unwrap()]);
+        Arc::new(OreBlockTags::load(&mut Tags(tagged), &registry, &ids).unwrap())
+    }
+
+    fn snowy_shape_trace() -> Vec<String> {
+        let directions = [
+            ("down", [0, -1, 0]),
+            ("up", [0, 1, 0]),
+            ("north", [0, 0, -1]),
+            ("south", [0, 0, 1]),
+            ("west", [-1, 0, 0]),
+            ("east", [1, 0, 0]),
+        ];
+        let mut result = Vec::new();
+        for tagged in [false, true] {
+            let tags = snowy_test_tags(tagged);
+            for name in ["grass_block", "podzol", "mycelium"] {
+                for snowy in [false, true] {
+                    let state = BlockState {
+                        name: format!("minecraft:{name}"),
+                        properties: BTreeMap::from([("snowy".into(), snowy.to_string())]),
+                    };
+                    for (direction_name, direction) in directions {
+                        for neighbor_name in ["stone", "water", "snow"] {
+                            let neighbor = BlockState {
+                                name: format!("minecraft:{neighbor_name}"),
+                                properties: BTreeMap::new(),
+                            };
+                            let next =
+                                snowy_shape_update(&state, direction, &neighbor, Some(&tags))
+                                    .unwrap();
+                            result.push(format!(
+                                "{tagged} {name} {snowy} {direction_name} {neighbor_name} {} {}",
+                                next.properties["snowy"],
+                                native_core::random::LegacyRandom::new(42).next_long()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn snowy_shape_requires_known_tags_only_for_upper_neighbor() {
+        let state = BlockState {
+            name: "minecraft:grass_block".into(),
+            properties: BTreeMap::from([("snowy".into(), "true".into())]),
+        };
+        let neighbor = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        };
+        assert_eq!(
+            snowy_shape_update(&state, [1, 0, 0], &neighbor, None).unwrap(),
+            state
+        );
+        assert!(snowy_shape_update(&state, [0, 1, 0], &neighbor, None).is_err());
+        assert_eq!(snowy_shape_trace().len(), 216);
+    }
+
+    #[test]
+    fn marked_snowy_surface_uses_active_snow_tag() {
+        use native_resources::{heightmap_tags::HeightmapTags, packs::ResourceProvider};
+        struct HeightTags;
+        impl ResourceProvider for HeightTags {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.ends_with("blocks_motion_in_heightmap.json")
+                    || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
+                {
+                    Ok(Some(
+                        br#"{"values":["minecraft:stone","minecraft:grass_block"]}"#.to_vec(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let registry = ["minecraft:stone", "minecraft:grass_block"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for tagged in [false, true] {
+            let (mut stage, _, chunk) = fixture(false);
+            let world = Arc::make_mut(&mut stage.world);
+            let stone = world.block_id(0, 0, 0).unwrap();
+            Arc::make_mut(
+                Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                    .sections
+                    .get_mut(&0)
+                    .unwrap(),
+            )
+            .blocks
+            .as_mut()
+            .unwrap()
+            .fill(stone);
+            let grass = world.intern_state(BlockState {
+                name: "minecraft:grass_block".into(),
+                properties: BTreeMap::from([("snowy".into(), "false".into())]),
+            });
+            world.set_block_id(8, 8, 8, grass).unwrap();
+            stage.source = Arc::clone(&stage.world);
+            stage.set_snow_tags(Some(snowy_test_tags(tagged)));
+            stage.heightmap_tags = Some(Arc::new(
+                HeightmapTags::load(&mut HeightTags, &registry).unwrap(),
+            ));
+            let mut marks = PostProcessing::new(0, 16).unwrap();
+            marks.mark(8, 8, 8);
+            stage
+                .region
+                .tasks
+                .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+            while !stage.poll(chunk, 1).unwrap() {}
+            let result = stage.finish().unwrap();
+            assert_eq!(
+                result.world.block(8, 8, 8).unwrap().properties["snowy"],
+                tagged.to_string()
+            );
+            assert_eq!(result.edits.len(), usize::from(tagged));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn snowy_shape_updates_match_java_and_active_tags() {
+        assert_eq!(
+            java_results(
+                "GeneratedSnowyShapeOracle",
+                include_str!("../../tests/java/GeneratedSnowyShapeOracle.java")
+            ),
+            snowy_shape_trace()
+        );
+    }
 
     fn fixture_maps(surface: i32) -> native_persistence::heightmap::FullHeightmaps {
         use native_persistence::heightmap::{

@@ -466,6 +466,7 @@ struct DecorationConfig {
     ambient_light: Option<f32>,
     mushroom_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    snow_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
@@ -1588,6 +1589,13 @@ impl FreshTerrainBatch {
         )
         .ok()
         .map(Arc::new);
+        let snow_tags = native_resources::ore_feature::OreBlockTags::load(
+            provider,
+            &block_registry,
+            &BTreeSet::from([ResourceId::parse("minecraft:snow")?]),
+        )
+        .ok()
+        .map(Arc::new);
         let fence_tags = native_resources::ore_feature::OreBlockTags::load(
             provider,
             &block_registry,
@@ -1618,6 +1626,7 @@ impl FreshTerrainBatch {
             heightmap_tags,
             mushroom_tags,
             leaf_tags,
+            snow_tags,
             fence_tags,
             bubble_tags,
             washed_blocks,
@@ -2470,6 +2479,11 @@ impl FreshTerrainBatch {
                 .as_ref()
                 .and_then(|config| config.leaf_tags.clone()),
         );
+        stage.set_snow_tags(
+            self.decoration
+                .as_ref()
+                .and_then(|config| config.snow_tags.clone()),
+        );
         stage.set_fence_tags(
             self.decoration
                 .as_ref()
@@ -2603,6 +2617,7 @@ impl FreshTerrainBatch {
             Arc::new(config.heightmap_tags.clone()),
         )?;
         stage.set_leaf_tags(config.leaf_tags.clone());
+        stage.set_snow_tags(config.snow_tags.clone());
         stage.set_fence_tags(config.fence_tags.clone());
         stage.set_bubble_tags(config.bubble_tags.clone());
         stage.set_fluid_tags(config.washed_blocks.clone(), config.lava_fluids.clone());

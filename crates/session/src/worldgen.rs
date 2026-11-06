@@ -5820,6 +5820,9 @@ mod tests {
             deferred.deferred_chunks().collect::<Vec<_>>(),
             vec![distant]
         );
+        // Entity source coverage is intentionally incomplete in this fixture;
+        // even with all terrain chunks present, no region set may be staged.
+        assert!(batch.converted_region_drafts(&deferred, 1).is_err());
         let deferred_checkpoint = batch
             .checkpoint_postprocessing_expansion(&deferred)
             .unwrap();

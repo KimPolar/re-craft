@@ -3345,6 +3345,15 @@ impl FreshTerrainBatch {
         processed: &super::PostprocessedGeneratedRegion,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>> {
+        self.converted_missing_poi_snapshot(processed, positions, false)
+    }
+
+    fn converted_missing_poi_snapshot(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        include_deferred: bool,
+    ) -> Result<BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>> {
         self.validate_postprocessing(processed)?;
         let registry = self
             .light_registry
@@ -3353,8 +3362,9 @@ impl FreshTerrainBatch {
         let mut output = BTreeMap::new();
         for pos in positions {
             ensure!(
-                processed.chunks.contains(&pos),
-                "chunk was not postprocessed"
+                processed.chunks.contains(&pos)
+                    || (include_deferred && processed.deferred_tasks.contains_key(&pos)),
+                "chunk was not selected for this postprocessing pass"
             );
             ensure!(!output.contains_key(&pos), "duplicate postprocessed chunk");
             let poi_pos = native_persistence::world::ChunkPos { x: pos.x, z: pos.z };
@@ -3466,6 +3476,31 @@ impl FreshTerrainBatch {
         let positions: Vec<_> = positions.into_iter().collect();
         let chunks = self.postprocessed_chunk_drafts(processed, positions.iter().copied())?;
         let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
+        group_fresh_regions(chunks, poi, timestamp)
+    }
+
+    /// Prepare all converted chunks, including deferred FULL neighbors, as a
+    /// single in-memory terrain/entity/POI region set. Missing entity coverage
+    /// rejects the entire preview; no world files are written or authorized.
+    pub fn converted_region_drafts(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+    ) -> Result<
+        BTreeMap<
+            (native_persistence::save::FreshRegionKind, i32, i32),
+            native_persistence::save::FreshRegionDraft,
+        >,
+    > {
+        ensure!(
+            self.structures.is_none(),
+            "structure world persistence is not yet supported"
+        );
+        let positions = processed.ticks().registration_order().to_vec();
+        let mut stage = self.resume_generated_postprocessing(processed)?;
+        let chunks = self.converted_chunk_drafts(&mut stage, positions.iter().copied())?;
+        let captured = stage.finish()?;
+        let poi = self.converted_missing_poi_snapshot(&captured, positions, true)?;
         group_fresh_regions(chunks, poi, timestamp)
     }
 

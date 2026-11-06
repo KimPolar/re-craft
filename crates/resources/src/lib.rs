@@ -46,6 +46,7 @@ pub mod huge_mushroom_feature;
 pub mod item_registry;
 pub mod lake_feature;
 pub mod loot;
+pub mod mineshaft;
 pub mod mining_tags;
 pub mod mob_spawn_placement;
 pub mod mob_spawns;

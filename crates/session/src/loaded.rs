@@ -681,6 +681,7 @@ pub struct LoadedSession {
     death_processed: bool,
     respawn_death_safe: bool,
     respawn_support: Option<SavedRespawnSupport>,
+    respawn_darkness: Option<bool>,
     saved_respawn_absent: bool,
     world_respawn_support: Option<WorldRespawnSupport>,
     world_respawn_search: Option<ActiveWorldRespawnSearch>,
@@ -2176,6 +2177,7 @@ impl LoadedSession {
             "invalid respawn maximum health"
         );
         self.respawn_support = Some(support);
+        self.refresh_respawn_darkness();
         self.saved_respawn_absent = false;
         self.respawn_availability = None;
         Ok(())
@@ -2188,6 +2190,7 @@ impl LoadedSession {
             "respawn support must be set before the first tick"
         );
         self.respawn_support = None;
+        self.respawn_darkness = None;
         self.saved_respawn_absent = true;
         self.respawn_availability = None;
         Ok(())
@@ -5779,6 +5782,9 @@ impl LoadedSession {
         self.weather = data.map(crate::weather::Weather::new);
         self.weather_source = None;
         self.advance_weather = advance_weather;
+        if self.tick == 0 {
+            self.refresh_respawn_darkness();
+        }
         let visual = self.weather_visual();
         Arc::make_mut(&mut self.snapshot).weather = visual;
     }
@@ -6755,6 +6761,7 @@ impl LoadedSession {
             death_processed: false,
             respawn_death_safe: false,
             respawn_support: None,
+            respawn_darkness: None,
             saved_respawn_absent: false,
             world_respawn_support: None,
             world_respawn_search: None,
@@ -10160,6 +10167,38 @@ impl LoadedSession {
             .ok_or_else(|| anyhow::anyhow!("unknown saved respawn biome"))
     }
 
+    // ServerLevel caches sky darkening after weather and shared clocks advance.
+    fn refresh_respawn_darkness(&mut self) {
+        let previous = self.respawn_darkness;
+        self.respawn_darkness = self.respawn_support.as_ref().and_then(|support| {
+            let weather = self
+                .weather_visual()
+                .map(|weather| (weather.rain_at(1.0), weather.thunder_at(1.0)));
+            support
+                .environment
+                .dark_outside(
+                    |id| {
+                        self.world_clocks
+                            .iter()
+                            .find(|(clock, _)| {
+                                clock.namespace == id.namespace && clock.path == id.path
+                            })
+                            .map(|(_, clock)| clock.total_ticks)
+                    },
+                    weather,
+                )
+                .ok()
+        });
+        if self.respawn_darkness != previous
+            || self
+                .respawn_support
+                .as_ref()
+                .is_some_and(|support| support.environment.has_timeline_rules())
+        {
+            self.respawn_availability = None;
+        }
+    }
+
     fn prepare_saved_respawn(&self) -> anyhow::Result<Option<crate::respawn::SavedSpawnResult>> {
         use native_resources::respawn_environment::BedCondition;
         let support = self
@@ -10178,22 +10217,24 @@ impl LoadedSession {
             .world
             .state(self.respawn_state_id(pos)?)
             .ok_or_else(|| anyhow::anyhow!("saved respawn block is not loaded"))?;
+        let mut dark_outside = false;
         if is_bed(&state.name) {
             let rule = if state.name == "minecraft:straw_bed" {
                 environment.straw_bed
             } else {
                 environment.bed
             };
-            anyhow::ensure!(
-                rule.can_set_spawn != BedCondition::WhenDark,
-                "time-dependent bed spawn rules are not yet supported"
-            );
+            if rule.can_set_spawn == BedCondition::WhenDark {
+                dark_outside = self
+                    .respawn_darkness
+                    .ok_or_else(|| anyhow::anyhow!("dimension sky darkness is unavailable"))?;
+            }
         }
         let border = crate::respawn::RespawnBorder::from_saved(support.border, self.tick)?;
         self.resolve_saved_spawn(
             &support.config,
             environment,
-            false,
+            dark_outside,
             &support.tags,
             border,
             &mut |_| anyhow::bail!("forced respawn block rules are not yet supported"),
@@ -10731,6 +10772,9 @@ impl LoadedSession {
         self.saved_clock_source = None;
         self.world_clocks = clocks;
         self.advance_time = advance_time;
+        if self.tick == 0 {
+            self.refresh_respawn_darkness();
+        }
     }
 
     /// Capture the exact decoded clock source and install its states. Extra
@@ -18750,6 +18794,7 @@ impl LoadedSession {
                 }
             }
         }
+        self.refresh_respawn_darkness();
         if let Some(environment) = &self.fast_lava_environment
             && let Some(value) = environment.sample(|id| {
                 self.world_clocks
@@ -54437,6 +54482,120 @@ pub(crate) mod tests {
             );
             assert_eq!(session.prepare_saved_respawn().unwrap().is_some(), present);
         }
+        session.respawn_availability = Some((session.revision, session.respawn_revision, 0, true));
+        session.advance_tick();
+        assert!(session.respawn_availability.is_none());
+    }
+
+    #[test]
+    fn saved_bed_when_dark_uses_dimension_sky_and_world_clock() {
+        use native_persistence::world::{
+            DimensionId, PlayerRespawnConfig, RespawnData, SavedClock, SavedWorldBorder,
+        };
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        use native_world::loaded::BIOME_COUNT;
+        struct Provider;
+        impl ResourceProvider for Provider {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(match path {
+                    "data/minecraft/worldgen/biome/plains.json" => Some(br#"{"attributes":{"gameplay/bed_rule":{"can_sleep":"always","can_set_spawn":"when_dark"}}}"#.to_vec()),
+                    "data/example/timeline/test.json" => Some(br#"{"clock":"example:clock","period_ticks":20,"tracks":{"gameplay/sky_light_level":{"keyframes":[{"ticks":0,"value":15},{"ticks":10,"value":0}]}}}"#.to_vec()),
+                    _ => None,
+                })
+            }
+            fn list_data(&mut self, folder: &str) -> anyhow::Result<Vec<ResourceId>> {
+                Ok(if folder == "worldgen/biome" {
+                    vec![ResourceId::parse("minecraft:plains")?]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let environment = Arc::new(
+            native_resources::respawn_environment::RespawnEnvironmentRegistry::from_definition(
+                &mut Provider,
+                &serde_json::json!({"timelines":["example:test"]}),
+            )
+            .unwrap(),
+        );
+        let (mut world, origin, player) = fixture();
+        let biome = world.intern_biome("minecraft:plains".into());
+        let pos = origin + IVec3::new(8, 1, 8);
+        let bed = world.intern_state(state(
+            "minecraft:red_bed",
+            &[("facing", "north"), ("part", "head"), ("occupied", "false")],
+        ));
+        world.set_block_id(pos.x, pos.y, pos.z, bed).unwrap();
+        let home = ChunkPos {
+            x: pos.x.div_euclid(16),
+            z: pos.z.div_euclid(16),
+        };
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&home).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .biomes = Some(Box::new([biome; BIOME_COUNT]));
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_saved_respawn_support(SavedRespawnSupport {
+                config: PlayerRespawnConfig {
+                    data: RespawnData {
+                        dimension: DimensionId::parse("overworld").unwrap(),
+                        position: pos.to_array(),
+                        yaw: 0.0,
+                        pitch: 0.0,
+                    },
+                    forced: false,
+                },
+                environment,
+                tags: Arc::new(respawn_tags(false)),
+                border: SavedWorldBorder::default(),
+                max_health: 20.0,
+            })
+            .unwrap();
+        assert!(session.prepare_saved_respawn().is_err());
+        session.set_weather(Some(false), None, false);
+        assert!(session.prepare_saved_respawn().is_err());
+        let id = DimensionId::parse("example:clock").unwrap();
+        for (ticks, present) in [(0, false), (2, false), (3, true), (10, true), (20, false)] {
+            session.set_world_clocks(
+                BTreeMap::from([(
+                    id.clone(),
+                    SavedClock {
+                        total_ticks: ticks,
+                        ..Default::default()
+                    },
+                )]),
+                false,
+            );
+            assert_eq!(
+                session.prepare_saved_respawn().unwrap().is_some(),
+                present,
+                "tick {ticks}"
+            );
+        }
+        // A time command changes the clock immediately, but Java keeps the
+        // previous sky-darkening result until its next level update.
+        session.respawn_availability = Some((session.revision, session.respawn_revision, 0, false));
+        session.world_clocks.get_mut(&id).unwrap().total_ticks = 10;
+        assert!(session.prepare_saved_respawn().unwrap().is_none());
+        session.refresh_respawn_darkness();
+        assert!(session.respawn_availability.is_none());
+        assert!(session.prepare_saved_respawn().unwrap().is_some());
     }
 
     #[test]

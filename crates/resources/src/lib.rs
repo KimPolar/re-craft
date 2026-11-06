@@ -65,6 +65,7 @@ pub mod respawn_environment;
 pub mod respawn_tags;
 pub mod root_system_feature;
 pub mod simple_block_feature;
+pub mod sky_light;
 pub mod sounds;
 pub mod spawn_origin;
 pub mod spring_feature;

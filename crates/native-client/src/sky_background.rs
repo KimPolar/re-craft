@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
 use glam::DVec3;
-use native_resources::packs::{ResourceId, ResourceProvider};
+use native_resources::{
+    packs::{ResourceId, ResourceProvider},
+    sky_light::SkyLevel,
+};
 use native_world::loaded::World;
 use serde_json::Value;
 
@@ -85,151 +88,6 @@ struct FogTrack {
     index: usize,
     track: SkyTrack,
     modifier: FloatModifier,
-}
-
-enum SkyLevelTrack {
-    Scalar(FogTrack),
-    Alpha { value: SkyTrack, alpha: SkyTrack },
-}
-
-struct SkyLevel {
-    base: f32,
-    tracks: Vec<SkyLevelTrack>,
-}
-
-fn alpha_argument(argument: &Value) -> Result<(f32, f32)> {
-    let (value, alpha) = if let Some(number) = argument.as_f64() {
-        (number as f32, 1.0)
-    } else {
-        let value = argument
-            .get("value")
-            .and_then(Value::as_f64)
-            .context("missing alpha-blend value")? as f32;
-        let alpha = match argument.get("alpha") {
-            Some(value) => value.as_f64().context("invalid alpha-blend alpha")? as f32,
-            None => 1.0,
-        };
-        (value, alpha)
-    };
-    ensure!(
-        value.is_finite() && (0.0..=1.0).contains(&alpha),
-        "invalid alpha-blend argument"
-    );
-    Ok((value, alpha))
-}
-
-impl SkyLevel {
-    fn new(attributes: Option<&Value>) -> Result<Self> {
-        let base = match named_attribute(attributes, "gameplay/sky_light_level")? {
-            None => 15.0,
-            Some(layer)
-                if layer
-                    .get("modifier")
-                    .and_then(Value::as_str)
-                    .and_then(|name| ResourceId::parse(name).ok())
-                    .is_some_and(|id| id.namespace == "minecraft" && id.path == "alpha_blend") =>
-            {
-                let (value, alpha) = alpha_argument(
-                    layer
-                        .get("argument")
-                        .context("missing alpha-blend argument")?,
-                )?;
-                15.0 + alpha * (value - 15.0)
-            }
-            Some(layer) => FloatLayer::parse(layer)?.apply(15.0),
-        };
-        Ok(Self {
-            base,
-            tracks: Vec::new(),
-        })
-    }
-
-    fn add_track(&mut self, timeline: &Value, track: &Value) -> Result<()> {
-        let modifier = track
-            .get("modifier")
-            .and_then(Value::as_str)
-            .unwrap_or("override");
-        let id = ResourceId::parse(modifier)?;
-        if id.namespace != "minecraft" || id.path != "alpha_blend" {
-            self.tracks
-                .push(SkyLevelTrack::Scalar(FogTrack::parse(0, timeline, track)?));
-            return Ok(());
-        }
-        let mut value_track = track.clone();
-        let mut alpha_track = track.clone();
-        for normalized in [&mut value_track, &mut alpha_track] {
-            normalized
-                .as_object_mut()
-                .context("invalid sky-light track")?
-                .insert("modifier".into(), Value::String("override".into()));
-        }
-        let source = track
-            .get("keyframes")
-            .and_then(Value::as_array)
-            .context("missing sky-light keyframes")?;
-        for ((value_frame, alpha_frame), source_frame) in value_track["keyframes"]
-            .as_array_mut()
-            .context("invalid sky-light keyframes")?
-            .iter_mut()
-            .zip(
-                alpha_track["keyframes"]
-                    .as_array_mut()
-                    .context("invalid sky-light keyframes")?
-                    .iter_mut(),
-            )
-            .zip(source)
-        {
-            let (value, alpha) = alpha_argument(
-                source_frame
-                    .get("value")
-                    .context("missing sky-light value")?,
-            )?;
-            value_frame["value"] = Value::from(value);
-            alpha_frame["value"] = Value::from(alpha);
-        }
-        self.tracks.push(SkyLevelTrack::Alpha {
-            value: SkyTrack::parse(timeline, &value_track, true)?,
-            alpha: SkyTrack::parse(timeline, &alpha_track, true)?,
-        });
-        Ok(())
-    }
-
-    fn sample(
-        &self,
-        mut clock: impl FnMut(&ResourceId) -> Option<i64>,
-        weather: native_session::weather::WeatherVisual,
-    ) -> Option<f32> {
-        let mut value = self.base;
-        for track in &self.tracks {
-            value = match track {
-                SkyLevelTrack::Scalar(track) => FloatLayer {
-                    value: track.track.sample(clock(&track.track.clock)?)[0],
-                    modifier: track.modifier,
-                }
-                .apply(value),
-                SkyLevelTrack::Alpha {
-                    value: target,
-                    alpha,
-                } => {
-                    let tick = clock(&target.clock)?;
-                    let target = target.sample(tick)[0];
-                    let alpha = alpha.sample(tick)[0];
-                    value + alpha * (target - value)
-                }
-            };
-        }
-        let rain = weather.rain_at(1.0);
-        let thunder = weather.thunder_at(1.0);
-        if rain - thunder > 0.0 {
-            let rainy = value + 0.3125 * (4.0 - value);
-            value += (rain - thunder) * (rainy - value);
-        }
-        if thunder > 0.0 {
-            let stormy = value + 0.527_343_75 * (4.0 - value);
-            value += thunder * (stormy - value);
-        }
-        value.is_finite().then_some(value.clamp(0.0, 15.0))
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1201,7 +1059,12 @@ impl SkyBackground {
         clock: impl FnMut(&ResourceId) -> Option<i64>,
         weather: Option<native_session::weather::WeatherVisual>,
     ) -> Option<i32> {
-        let level = self.sky_level.as_ref()?.sample(clock, weather?)?;
+        let weather = weather?;
+        let level = self.sky_level.as_ref()?.sample(
+            clock,
+            weather.rain_at(1.0),
+            weather.thunder_at(1.0),
+        )?;
         Some((15.0 - level) as i32)
     }
 
@@ -1484,17 +1347,8 @@ mod tests {
         let timeline = serde_json::json!({"clock":"example:clock","period_ticks":20});
         let track = serde_json::json!({"modifier":"multiply","keyframes":[{"ticks":0,"value":1.0},{"ticks":10,"value":0.5}]});
         level.add_track(&timeline, &track).unwrap();
-        assert_eq!(
-            level.sample(|_| None, native_session::weather::WeatherVisual::default()),
-            None
-        );
-        assert_eq!(
-            level.sample(
-                |_| Some(0),
-                native_session::weather::WeatherVisual::default()
-            ),
-            Some(15.0)
-        );
+        assert_eq!(level.sample(|_| None, 0.0, 0.0), None);
+        assert_eq!(level.sample(|_| Some(0), 0.0, 0.0), Some(15.0));
     }
 
     #[test]
@@ -1629,7 +1483,11 @@ mod tests {
                 thunder,
             };
             let actual = level
-                .sample(|_| Some(case["tick"].as_i64().unwrap()), weather)
+                .sample(
+                    |_| Some(case["tick"].as_i64().unwrap()),
+                    weather.rain_at(1.0),
+                    weather.thunder_at(1.0),
+                )
                 .unwrap();
             assert!(
                 (actual - expected[0]).abs() < 0.000_01,

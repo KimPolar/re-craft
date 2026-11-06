@@ -263,6 +263,8 @@ pub struct RespawnEnvironmentRegistry {
     dimension: RespawnEnvironmentLayer,
     biomes: BTreeMap<String, RespawnEnvironmentLayer>,
     tracks: Vec<RespawnTrack>,
+    fixed_time: bool,
+    sky_level: Option<crate::sky_light::SkyLevel>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +374,10 @@ impl RespawnTrack {
 }
 
 impl RespawnEnvironmentRegistry {
+    pub fn has_timeline_rules(&self) -> bool {
+        !self.tracks.is_empty()
+    }
+
     pub fn load(provider: &mut impl ResourceProvider, dimension_type: &str) -> Result<Self> {
         let id = ResourceId::parse(dimension_type)?;
         let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
@@ -402,6 +408,17 @@ impl RespawnEnvironmentRegistry {
         dimension: RespawnEnvironmentLayer,
         definition: &Value,
     ) -> Result<Self> {
+        let fixed_time = match definition.get("has_fixed_time") {
+            None => false,
+            Some(value) => value.as_bool().context("invalid fixed-time flag")?,
+        };
+        // An unsupported sky-light layer must not prevent rules which do not
+        // depend on darkness from being used.
+        let sky_level = if fixed_time {
+            None
+        } else {
+            crate::sky_light::SkyLevel::from_definition(provider, definition).ok()
+        };
         let mut collected_tracks = Vec::new();
         for timeline in
             crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
@@ -445,7 +462,29 @@ impl RespawnEnvironmentRegistry {
             dimension,
             biomes,
             tracks: collected_tracks,
+            fixed_time,
+            sky_level,
         })
+    }
+
+    /// Dimension-wide darkness for `when_dark`; biome values do not affect it.
+    pub fn dark_outside(
+        &self,
+        clock: impl FnMut(&ResourceId) -> Option<i64>,
+        weather: Option<(f32, f32)>,
+    ) -> Result<bool> {
+        if self.fixed_time {
+            return Ok(false);
+        }
+        let level = self
+            .sky_level
+            .as_ref()
+            .context("sky light environment is unavailable")?;
+        let (rain, thunder) = weather.context("weather is unavailable")?;
+        let value = level
+            .sample(clock, rain, thunder)
+            .context("sky light clock or weather is unavailable")?;
+        crate::sky_light::is_dark_outside(false, value).context("invalid sky light level")
     }
 
     pub fn for_biome(&self, biome: &str) -> Result<RespawnEnvironment> {
@@ -629,6 +668,43 @@ mod tests {
             );
             assert_eq!(calls, 1);
         }
+    }
+
+    #[test]
+    fn darkness_uses_dimension_sky_weather_and_fixed_time() {
+        let mut source = Memory(BTreeMap::from([
+            ("data/example/worldgen/biome/plain.json".into(), json!({})),
+            (
+                "data/example/timeline/test.json".into(),
+                json!({"clock":"example:clock","period_ticks":20,"tracks":{
+                    "gameplay/sky_light_level":{"keyframes":[{"ticks":0,"value":15},{"ticks":10,"value":0}]}
+                }}),
+            ),
+        ]));
+        let definition = json!({"timelines":["example:test"]});
+        let registry =
+            RespawnEnvironmentRegistry::from_definition(&mut source, &definition).unwrap();
+        assert!(registry.dark_outside(|_| None, Some((0.0, 0.0))).is_err());
+        assert!(registry.dark_outside(|_| Some(0), None).is_err());
+        for (tick, dark) in [(0, false), (2, false), (3, true), (10, true), (20, false)] {
+            assert_eq!(
+                registry
+                    .dark_outside(|_| Some(tick), Some((0.0, 0.0)))
+                    .unwrap(),
+                dark
+            );
+        }
+        assert!(
+            registry
+                .dark_outside(|_| Some(0), Some((1.0, 1.0)))
+                .unwrap()
+        );
+        let fixed = RespawnEnvironmentRegistry::from_definition(
+            &mut source,
+            &json!({"has_fixed_time":true,"timelines":["example:test"]}),
+        )
+        .unwrap();
+        assert!(!fixed.dark_outside(|_| None, None).unwrap());
     }
 
     #[test]

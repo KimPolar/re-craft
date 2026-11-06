@@ -84,14 +84,16 @@ impl ConvertedBlockEntities {
     }
 
     fn saved(&self) -> Result<native_persistence::nbt::Tag> {
-        use native_persistence::nbt::{Tag, TagType};
         ensure!(
             self.pending.members().is_empty(),
             "postprocessed block entities remain pending"
         );
-        let values = self
-            .live
-            .saving_order()?
+        self.saved_in_order(self.live.saving_order()?)
+    }
+
+    fn saved_in_order(&self, order: Vec<[i32; 3]>) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::nbt::{Tag, TagType};
+        let values = order
             .into_iter()
             .map(|pos| {
                 let mut data = self
@@ -636,6 +638,75 @@ impl GeneratedPostprocessing {
             "postprocessing chunk was already requested"
         );
         Ok(())
+    }
+
+    /// Capture a deferred chunk's block entities as a Java FULL chunk save does.
+    /// Saving may promote pending entities; successful promotions remain in the
+    /// stage for subsequent callbacks. Unsupported entities leave it unchanged.
+    /// The returned data is an intermediate snapshot, not permission to save.
+    pub fn capture_deferred_block_entities(
+        &mut self,
+        pos: ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::nbt::Tag;
+        ensure!(
+            !self.failed && self.active.is_none(),
+            "cannot capture block entities during postprocessing"
+        );
+        ensure!(!self.required.contains(&pos), "chunk is not deferred");
+        self.region
+            .tasks
+            .get(&pos)
+            .context("chunk is not converted")?
+            .unstarted_marks()?;
+        let mut entities = self
+            .block_entities
+            .get(&pos)
+            .context("converted block entities are missing")?
+            .clone();
+        let order = entities
+            .live
+            .saving_order_with_pending(Some(&entities.pending))?;
+        let mut read_world = false;
+        for &position in &order {
+            if !entities.pending.members().contains(&position) {
+                continue;
+            }
+            ensure!(
+                position[0].div_euclid(16) == pos.x && position[2].div_euclid(16) == pos.z,
+                "pending block entity belongs to another chunk"
+            );
+            ensure!(
+                matches!(entities.records.get(&position).and_then(|tag| tag.get("id")), Some(Tag::String(id)) if id.matches("DUMMY")),
+                "unsupported pending block entity data"
+            );
+            let state = self
+                .world
+                .block(position[0], position[1], position[2])
+                .context("pending block entity state is missing")?
+                .clone();
+            ensure!(
+                state.name == "minecraft:chest",
+                "unsupported pending generated block entity"
+            );
+            entities.pending.remove(position);
+            entities.records.insert(
+                position,
+                super::GeneratedEmptyChest { position, state }.block_entity(),
+            );
+            entities.live.insert(position);
+            read_world = true;
+        }
+        ensure!(
+            entities.pending.members().is_empty(),
+            "pending block entities remain"
+        );
+        let saved = entities.saved_in_order(order)?;
+        self.block_entities.insert(pos, entities);
+        if read_world {
+            self.read_chunks.borrow_mut().insert(pos);
+        }
+        Ok(saved)
     }
 
     /// Run a bounded number of callbacks without interleaving another chunk.
@@ -4813,6 +4884,8 @@ mod tests {
         };
         let expected_pending = parse("P ");
         let expected_order = parse("O ");
+        let expected_saved = parse("S ");
+        let expected_after_saved = parse("T ");
         assert_eq!(expected_pending.len(), 12);
         assert_eq!(expected_order.len(), 24);
         for budget in [1, 100] {
@@ -4874,6 +4947,109 @@ mod tests {
             stage
                 .set_block_entities(BTreeMap::from([(chunk, converted)]))
                 .unwrap();
+            let mut unsupported = stage.clone();
+            unsupported.required.clear();
+            let target = expected_saved
+                .iter()
+                .rev()
+                .copied()
+                .find(|pos| {
+                    unsupported.block_entities[&chunk]
+                        .pending
+                        .members()
+                        .contains(pos)
+                })
+                .unwrap();
+            assert!(
+                expected_saved
+                    .iter()
+                    .take_while(|&&pos| pos != target)
+                    .any(|pos| unsupported.block_entities[&chunk]
+                        .pending
+                        .members()
+                        .contains(pos))
+            );
+            let world = Arc::make_mut(&mut unsupported.world);
+            let stone = world.intern_state(BlockState {
+                name: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+            });
+            world
+                .set_block_id(target[0], target[1], target[2], stone)
+                .unwrap();
+            let original_entities = unsupported.block_entities[&chunk].clone();
+            let original_reads = unsupported.read_chunks.borrow().clone();
+            assert!(unsupported.capture_deferred_block_entities(chunk).is_err());
+            assert_eq!(
+                unsupported.block_entities[&chunk].pending.members(),
+                original_entities.pending.members()
+            );
+            assert_eq!(
+                unsupported.block_entities[&chunk].records,
+                original_entities.records
+            );
+            assert_eq!(*unsupported.read_chunks.borrow(), original_reads);
+            let mut saved_stage = stage.clone();
+            saved_stage.required.clear();
+            let Tag::List { values: saved, .. } =
+                saved_stage.capture_deferred_block_entities(chunk).unwrap()
+            else {
+                panic!("missing saved block entities")
+            };
+            let coordinates = |tag: &Tag| {
+                let number = |name| match tag.get(name) {
+                    Some(Tag::Int(value)) => *value,
+                    _ => panic!("missing position"),
+                };
+                [number("x"), number("y"), number("z")]
+            };
+            assert_eq!(
+                saved.iter().map(coordinates).collect::<Vec<_>>(),
+                expected_saved
+            );
+            for actual in &saved {
+                let p = coordinates(actual);
+                let expected = nbt::read(
+                    &std::fs::read(temp.path().join(format!("save-{}.nbt", p[0] + p[2] * 16)))
+                        .unwrap(),
+                )
+                .unwrap()
+                .value;
+                let (Tag::Compound(a), Tag::Compound(b)) = (actual, &expected) else {
+                    panic!("invalid NBT")
+                };
+                let names_a: BTreeSet<_> =
+                    a.iter().map(|(name, _)| name.to_string_lossy()).collect();
+                let names_b: BTreeSet<_> =
+                    b.iter().map(|(name, _)| name.to_string_lossy()).collect();
+                assert_eq!(names_a, names_b, "fields at {p:?}");
+                for field in names_a {
+                    assert_eq!(
+                        actual.get(&field),
+                        expected.get(&field),
+                        "field {field} at {p:?}"
+                    );
+                }
+            }
+            assert!(
+                saved_stage.block_entities[&chunk]
+                    .pending
+                    .members()
+                    .is_empty()
+            );
+            saved_stage.required.insert(chunk);
+            while !saved_stage.poll(chunk, budget).unwrap() {}
+            let saved_result = saved_stage.finish().unwrap();
+            let Tag::List {
+                values: after_save, ..
+            } = saved_result.block_entity_data(chunk).unwrap()
+            else {
+                panic!("missing block entities")
+            };
+            assert_eq!(
+                after_save.iter().map(coordinates).collect::<Vec<_>>(),
+                expected_after_saved
+            );
             while !stage.poll(chunk, budget).unwrap() {}
             let result = stage.finish().unwrap();
             let Tag::List { values, .. } = result.block_entity_data(chunk).unwrap() else {
@@ -5980,6 +6156,41 @@ mod tests {
             let mut resumed =
                 GeneratedPostprocessing::from_completed(&result, None, None, heightmap_tags)
                     .unwrap();
+            assert!(resumed.capture_deferred_block_entities(chunk).is_err());
+            let mut unsupported = resumed.clone();
+            let world = Arc::make_mut(&mut unsupported.world);
+            let stone = world.intern_state(BlockState {
+                name: "minecraft:stone".into(),
+                properties: BTreeMap::new(),
+            });
+            world.set_block_id(20, 8, 8, stone).unwrap();
+            let before_reads = unsupported.read_chunks.borrow().clone();
+            assert!(
+                unsupported
+                    .capture_deferred_block_entities(east_chunk)
+                    .is_err()
+            );
+            assert!(
+                unsupported.block_entities[&east_chunk]
+                    .pending
+                    .members()
+                    .contains(&[20, 8, 8])
+            );
+            assert_eq!(*unsupported.read_chunks.borrow(), before_reads);
+            let native_persistence::nbt::Tag::List {
+                values: captured, ..
+            } = resumed.capture_deferred_block_entities(east_chunk).unwrap()
+            else {
+                panic!("missing captured entities")
+            };
+            assert_eq!(captured.len(), 1);
+            assert_eq!(
+                captured[0].get("id"),
+                Some(&native_persistence::nbt::Tag::String(
+                    "minecraft:chest".into()
+                ))
+            );
+            assert!(result.block_entity_data(east_chunk).is_err());
             assert!(resumed.poll(east_chunk, 1).is_err());
             assert!(
                 resumed

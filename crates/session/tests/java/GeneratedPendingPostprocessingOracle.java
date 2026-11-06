@@ -55,6 +55,19 @@ public class GeneratedPendingPostprocessingOracle {
             proto.setBlockEntity(new ChestBlockEntity(pos, Blocks.CHEST.defaultBlockState()));
         }
         var full = new LevelChunk(level, proto, null);
+        var savedBeforePostprocessing = new LevelChunk(level, proto, null);
+        out.print("S");
+        for (var pos : savedBeforePostprocessing.getBlockEntitiesPos()) {
+            out.printf(" %d,%d,%d",pos.getX(),pos.getY(),pos.getZ());
+            int index = pos.getX() + pos.getZ()*16;
+            NbtIo.write(savedBeforePostprocessing.getBlockEntityNbtForSaving(pos, registries), Path.of(args[0]).resolve("save-"+index+".nbt"));
+        }
+        out.println();
+        if (!pending(savedBeforePostprocessing).isEmpty()) throw new AssertionError("saving did not promote pending entities");
+        savedBeforePostprocessing.postProcessGeneration(level);
+        out.print("T");
+        for (var pos : savedBeforePostprocessing.getBlockEntitiesPos()) out.printf(" %d,%d,%d",pos.getX(),pos.getY(),pos.getZ());
+        out.println();
         out.print("P");
         for (var pos : pending(full).keySet()) out.printf(" %d,%d,%d",pos.getX(),pos.getY(),pos.getZ());
         out.println();

@@ -5472,6 +5472,7 @@ mod tests {
         batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
             starts,
             ocean_starts: BTreeMap::new(),
+            mineshafts: BTreeMap::new(),
             huts: BTreeMap::new(),
             references: BTreeMap::from([(center, references)]),
             terrain: BTreeMap::new(),
@@ -5496,6 +5497,81 @@ mod tests {
             batch
                 .postprocessed_region_drafts(&processed, [center], 0)
                 .is_err()
+        );
+        // Exercise mineshaft metadata through the same chunk draft paths.
+        let mine_id = ResourceId::parse("minecraft:mineshaft").unwrap();
+        let x = center.x * 16 + 2;
+        let z = center.z * 16 + 2;
+        let piece = native_resources::mineshaft::MineshaftGraphPiece {
+            bounds: native_core::beardifier::BoundingBox::new([x, 1, z], [x + 8, 6, z + 8])
+                .unwrap(),
+            direction: None,
+            depth: 0,
+            kind: native_resources::mineshaft::MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let mine = mineshaft::PreparedStart {
+            chunk: [center.x, center.z],
+            generation_point: [x + 6, 1, z - 2],
+            terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+            variant: native_resources::mineshaft::MineshaftVariant::Normal,
+            pieces: vec![
+                SavedMineshaftPiece::capture(
+                    &piece,
+                    native_resources::mineshaft::MineshaftVariant::Normal,
+                    false,
+                )
+                .unwrap(),
+            ],
+        };
+        let bounds = mine.reference_bounds(mine_id.clone()).unwrap();
+        let refs = structure_references::collect_ordered_structure_references(center, |source| {
+            Ok(if source == center {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        let mut starts = BTreeMap::new();
+        for sx in center.x - 8..=center.x + 8 {
+            for sz in center.z - 8..=center.z + 8 {
+                starts.insert(ChunkPos { x: sx, z: sz }, BTreeMap::new());
+            }
+        }
+        let expected = mine.to_tag(&mine_id).unwrap();
+        batch.set_structure_stages_for_test(Some(structure_batch::PreparedStructureStages {
+            starts,
+            ocean_starts: BTreeMap::new(),
+            mineshafts: BTreeMap::from([(center, BTreeMap::from([(mine_id, mine)]))]),
+            huts: BTreeMap::new(),
+            references: BTreeMap::from([(center, refs)]),
+            terrain: BTreeMap::new(),
+        }));
+        assert!(batch.structure_starts(center).is_none());
+        assert!(batch.mineshaft_starts(center).is_some());
+        let mine_data = batch.structure_data(center).unwrap();
+        assert_eq!(
+            mine_data
+                .get("starts")
+                .and_then(|v| v.get("minecraft:mineshaft")),
+            Some(&expected)
+        );
+        assert_eq!(
+            batch
+                .spawned_chunk_draft(center, 42, vec![])
+                .unwrap()
+                .value
+                .get("structures"),
+            Some(&mine_data)
+        );
+        assert_eq!(
+            batch
+                .postprocessed_chunk_drafts(&processed, [center])
+                .unwrap()[&center]
+                .chunk
+                .value
+                .get("structures"),
+            Some(&mine_data)
         );
         batch.set_structure_stages_for_test(None);
         assert_eq!(full.entity_records, component.entity_records);
@@ -8397,7 +8473,25 @@ mod tests {
                 schedule::GenerationStage::StructureReferences,
             )])
             .unwrap();
-            assert!(batch.prepare_additional_stages(&plan, None).is_err());
+            let added = batch.prepare_additional_stages(&plan, None).unwrap();
+            assert_eq!(
+                added.mineshafts[&target][&structure_id].pieces.len(),
+                start.pieces.len()
+            );
+            assert!(added.mixed_decoration_plan(target, &schedule).is_err());
+            let (_, transferred) = batch
+                .into_terrain_stages(BTreeMap::from([(target, order)]))
+                .unwrap();
+            assert!(
+                !transferred.mineshafts[&target][&structure_id]
+                    .pieces
+                    .is_empty()
+            );
+            assert!(
+                transferred
+                    .mixed_decoration_plan(target, &schedule)
+                    .is_err()
+            );
         }
         // The generalized start path can retain a multi-piece ruin without
         // changing the simple-only scheduler's conservative behavior.

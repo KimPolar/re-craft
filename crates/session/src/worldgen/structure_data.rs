@@ -26,6 +26,7 @@ fn referenced_start_chunks(
     referenced_start_chunks_with_ocean(pos, all_starts, &BTreeMap::new(), references, huts)
 }
 
+#[cfg(test)]
 pub(super) fn referenced_start_chunks_with_ocean(
     pos: ChunkPos,
     all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
@@ -236,6 +237,7 @@ fn pack_structure_data(
 
 /// Serialize fresh starts and ordered references belonging to one chunk.
 /// Existing-world data must not use this draft.
+#[cfg(test)]
 pub(super) fn pack_structure_data_with_ocean(
     pos: ChunkPos,
     starts: &SimpleStarts,

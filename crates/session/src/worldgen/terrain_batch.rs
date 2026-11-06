@@ -884,9 +884,10 @@ impl FreshTerrainBatch {
         (!self.failed)
             .then(|| {
                 let structures = self.structures.as_ref()?;
-                (!structures.ocean_starts.contains_key(&pos))
-                    .then(|| structures.starts.get(&pos))
-                    .flatten()
+                (!structures.ocean_starts.contains_key(&pos)
+                    && !structures.mineshafts.contains_key(&pos))
+                .then(|| structures.starts.get(&pos))
+                .flatten()
             })
             .flatten()
     }
@@ -898,6 +899,16 @@ impl FreshTerrainBatch {
     ) -> Option<&super::structure_batch::OceanRuinStarts> {
         (!self.failed)
             .then(|| self.structures.as_ref()?.ocean_starts.get(&pos))
+            .flatten()
+    }
+
+    /// Intermediate mineshaft starts retained for later decoration.
+    pub fn mineshaft_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<&super::structure_batch::MineshaftStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.mineshafts.get(&pos))
             .flatten()
     }
 
@@ -915,7 +926,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::pack_structure_data_with_ocean(
+        super::structure_data::pack_structure_data_with_mineshaft(
             pos,
             structures
                 .starts
@@ -923,6 +934,10 @@ impl FreshTerrainBatch {
                 .context("structure starts are missing")?,
             structures
                 .ocean_starts
+                .get(&pos)
+                .unwrap_or(&Default::default()),
+            structures
+                .mineshafts
                 .get(&pos)
                 .unwrap_or(&Default::default()),
             structures
@@ -947,10 +962,11 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::referenced_start_chunks_with_ocean(
+        super::structure_data::referenced_start_chunks_with_mineshaft(
             pos,
             &structures.starts,
             &structures.ocean_starts,
+            &structures.mineshafts,
             structures
                 .references
                 .get(&pos)
@@ -1217,8 +1233,15 @@ fn structures_with_piece_at(
                 .ocean_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let mineshaft = structures
+                .mineshafts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
-                simple.is_some() != ocean.is_some(),
+                usize::from(simple.is_some())
+                    + usize::from(ocean.is_some())
+                    + usize::from(mineshaft.is_some())
+                    == 1,
                 "spawn referenced structure is missing or ambiguous"
             );
             let contains = |bounds: &native_core::beardifier::BoundingBox| {
@@ -1230,13 +1253,22 @@ fn structures_with_piece_at(
                     "spawn structure source differs"
                 );
                 contains(&start.bounds)
-            } else {
-                let start = ocean.expect("one start was validated");
+            } else if let Some(start) = ocean {
                 ensure!(
                     start.chunk == [source.x, source.z],
                     "spawn structure source differs"
                 );
                 start.pieces.iter().any(|piece| contains(&piece.bounds))
+            } else {
+                let start = mineshaft.expect("one start was validated");
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                start
+                    .pieces
+                    .iter()
+                    .any(|piece| contains(&piece.piece.bounds))
             };
             if inside {
                 matching.insert(id.clone());
@@ -1526,8 +1558,16 @@ impl FreshTerrainBatch {
                 .all(|pos| !existing.ocean_starts.contains_key(pos)),
             "expanded ocean ruin state already exists"
         );
+        ensure!(
+            added
+                .mineshafts
+                .keys()
+                .all(|pos| !existing.mineshafts.contains_key(pos)),
+            "expanded mineshaft state already exists"
+        );
         existing.starts.extend(added.starts);
         existing.ocean_starts.extend(added.ocean_starts);
+        existing.mineshafts.extend(added.mineshafts);
         existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);
@@ -4665,6 +4705,75 @@ mod entity_source_tests {
         assert!(structures_with_piece_at(Some(&stages), [16, 63, 16]).is_err());
         stages.starts.clear();
         assert!(structures_with_piece_at(Some(&stages), [-10, 63, -10]).is_err());
+    }
+
+    #[test]
+    fn animal_structure_conditions_use_individual_mineshaft_pieces() {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::mineshaft::{
+            MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        use native_resources::structure_start::HorizontalDirection;
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("minecraft:mineshaft").unwrap();
+        let room = MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 1, 2], [10, 6, 10]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let corridor = MineshaftGraphPiece {
+            bounds: BoundingBox::new([12, 2, 2], [14, 4, 6]).unwrap(),
+            direction: Some(HorizontalDirection::South),
+            depth: 1,
+            kind: MineshaftGraphPieceKind::Corridor {
+                rails: false,
+                spiders: false,
+                sections: 1,
+            },
+        };
+        let start = crate::worldgen::mineshaft::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 0],
+            terrain_adjustment: TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: [room, corridor]
+                .iter()
+                .map(|piece| {
+                    crate::worldgen::SavedMineshaftPiece::capture(
+                        piece,
+                        MineshaftVariant::Normal,
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        };
+        let bounds = start.reference_bounds(id.clone()).unwrap();
+        let references = collect_ordered_structure_references(source, |pos| {
+            Ok(if pos == source {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        let mut stages = PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .mineshafts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(source, references);
+        assert_eq!(
+            structures_with_piece_at(Some(&stages), [13, 3, 3]).unwrap(),
+            BTreeSet::from([id])
+        );
+        assert!(
+            structures_with_piece_at(Some(&stages), [11, 3, 3])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

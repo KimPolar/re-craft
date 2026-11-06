@@ -200,6 +200,7 @@ fn unambiguous_structure_keys(starts: &BTreeSet<TerrainStartKey>) -> Option<Vec<
 pub(super) struct PreparedStructureStages {
     pub(super) starts: BTreeMap<ChunkPos, SimpleStarts>,
     pub(super) ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
+    pub(super) mineshafts: BTreeMap<ChunkPos, MineshaftStarts>,
     pub(super) huts: BTreeMap<TerrainStartKey, super::SavedSwampHutPiece>,
     pub(super) references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     pub(super) terrain: BTreeMap<ChunkPos, Arc<Beardifier>>,
@@ -221,7 +222,11 @@ impl PreparedStructureStages {
                 "ocean ruin belongs to another chunk"
             );
             ensure!(
-                !self.starts[&pos].contains_key(id),
+                !self.starts[&pos].contains_key(id)
+                    && !self
+                        .mineshafts
+                        .get(&pos)
+                        .is_some_and(|starts| starts.contains_key(id)),
                 "duplicate structure start"
             );
             ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
@@ -231,6 +236,36 @@ impl PreparedStructureStages {
         }
         if !starts.is_empty() {
             self.ocean_starts.insert(pos, starts);
+        }
+        Ok(())
+    }
+
+    fn insert_mineshaft_starts(&mut self, pos: ChunkPos, starts: MineshaftStarts) -> Result<()> {
+        ensure!(
+            self.starts.contains_key(&pos),
+            "structure start chunk is missing"
+        );
+        ensure!(
+            !self.mineshafts.contains_key(&pos),
+            "mineshaft starts already prepared"
+        );
+        for (id, start) in &starts {
+            ensure!(
+                start.chunk == [pos.x, pos.z],
+                "mineshaft belongs to another chunk"
+            );
+            ensure!(
+                !self.starts[&pos].contains_key(id)
+                    && !self
+                        .ocean_starts
+                        .get(&pos)
+                        .is_some_and(|ocean| ocean.contains_key(id)),
+                "duplicate structure start"
+            );
+            start.to_tag(id)?;
+        }
+        if !starts.is_empty() {
+            self.mineshafts.insert(pos, starts);
         }
         Ok(())
     }
@@ -583,10 +618,6 @@ impl StructureGenerationBatch {
             self.is_complete(),
             "structure batch has unfinished or failed work"
         );
-        ensure!(
-            plan.starts().all(|pos| !self.mineshafts.contains_key(&pos)),
-            "mineshaft terrain transfer and decoration are not yet connected"
-        );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
             let starts = self
@@ -597,6 +628,9 @@ impl StructureGenerationBatch {
                 added.insert_starts(pos, starts.clone())?;
                 if let Some(ocean) = self.ocean_starts.get(&pos) {
                     added.insert_ocean_starts(pos, ocean.clone())?;
+                }
+                if let Some(mineshafts) = self.mineshafts.get(&pos) {
+                    added.insert_mineshaft_starts(pos, mineshafts.clone())?;
                 }
             }
         }
@@ -689,10 +723,6 @@ impl StructureGenerationBatch {
             "structure batch has unfinished or failed work"
         );
         ensure!(
-            self.mineshafts.is_empty(),
-            "mineshaft terrain transfer and decoration are not yet connected"
-        );
-        ensure!(
             self.generator.structure_context,
             "generator lacks structure context"
         );
@@ -706,16 +736,21 @@ impl StructureGenerationBatch {
             ..Default::default()
         };
         let mut ocean_starts = self.ocean_starts;
+        let mut mineshafts = self.mineshafts;
         for (pos, starts) in self.starts {
             stages.insert_starts(pos, starts)?;
             if let Some(ocean) = ocean_starts.remove(&pos) {
                 stages.insert_ocean_starts(pos, ocean)?;
+            }
+            if let Some(mines) = mineshafts.remove(&pos) {
+                stages.insert_mineshaft_starts(pos, mines)?;
             }
         }
         ensure!(
             ocean_starts.is_empty(),
             "ocean ruin source chunk is missing"
         );
+        ensure!(mineshafts.is_empty(), "mineshaft source chunk is missing");
         Ok((self.generator, stages))
     }
 

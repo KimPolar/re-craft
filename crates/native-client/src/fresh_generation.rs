@@ -771,7 +771,7 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
         .data_packs
         .as_ref()
         .map(|(_, selection)| selection.clone());
-    let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
+    let worldgen_settings = native_persistence::worldgen_settings::draft_baked_worldgen_settings(
         &mut resources,
         &settings.preset,
         native_persistence::worldgen_settings::NewWorldOptions {
@@ -844,7 +844,7 @@ pub(crate) fn prepare_with_structures_and_difficulty(
 ) -> Result<PreparedStructuredGeneration> {
     ensure!(settings.structures_enabled, "structures must be enabled");
     let mut resources = open_resources(&settings)?;
-    let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
+    let worldgen_settings = native_persistence::worldgen_settings::draft_baked_worldgen_settings(
         &mut resources,
         &settings.preset,
         native_persistence::worldgen_settings::NewWorldOptions {
@@ -1071,9 +1071,11 @@ mod tests {
         let dimension_dir = pack.join("data/minecraft/dimension_type");
         let tag_dir = pack.join("data/minecraft/tags/block");
         let feature_dir = pack.join("data/minecraft/worldgen/feature");
+        let custom_dimension_dir = pack.join("data/example/dimension");
         std::fs::create_dir_all(&dimension_dir)?;
         std::fs::create_dir_all(&tag_dir)?;
         std::fs::create_dir_all(&feature_dir)?;
+        std::fs::create_dir_all(&custom_dimension_dir)?;
         std::fs::write(
             pack.join("pack.mcmeta"),
             br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
@@ -1090,6 +1092,42 @@ mod tests {
             feature_dir.join("bonus_chest.json"),
             br#"{"type":"minecraft:bonus_chest","config":{}}"#,
         )?;
+        let preset: Value = serde_json::from_slice(
+            &vanilla
+                .read_data("data/minecraft/worldgen/world_preset/normal.json")?
+                .context("normal preset missing")?,
+        )?;
+        let sky_stem = &preset["dimensions"]["minecraft:overworld"];
+        std::fs::write(
+            custom_dimension_dir.join("sky.json"),
+            serde_json::to_vec(sky_stem)?,
+        )?;
+        let custom = prepare(FreshGenerationSettings {
+            minecraft_dir: game.clone(),
+            preset: "minecraft:normal".into(),
+            dimension: "example:sky".into(),
+            seed: 42,
+            bonus_chest: false,
+            structures_enabled: false,
+            data_packs: Some((
+                world.clone(),
+                DataPackSettings {
+                    enabled: vec!["vanilla".into(), "file/overrides".into()],
+                    disabled: vec![],
+                    enabled_features: vec!["minecraft:vanilla".into()],
+                },
+            )),
+        })?;
+        assert_eq!(custom.lighting.dimension, ResourceId::parse("example:sky")?);
+        assert!(
+            custom
+                .worldgen_settings
+                .value
+                .get("data")
+                .and_then(|v| v.get("dimensions"))
+                .and_then(|v| v.get("example:sky"))
+                .is_some()
+        );
         let prepared = prepare(FreshGenerationSettings {
             minecraft_dir: game,
             preset: "minecraft:normal".into(),
@@ -1159,6 +1197,15 @@ mod tests {
                 .get("data")
                 .and_then(|v| v.get("seed")),
             Some(&native_persistence::nbt::Tag::Long(42))
+        );
+        assert!(
+            inputs
+                .worldgen_settings
+                .value
+                .get("data")
+                .and_then(|v| v.get("dimensions"))
+                .and_then(|v| v.get("example:sky"))
+                .is_some()
         );
         Ok(())
     }

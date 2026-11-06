@@ -56,7 +56,6 @@ impl GeneratedDimensionLighting {
                 stem = Some(value);
             }
         }
-        let preset_stem = stem.context("dimension is missing from world preset")?;
         let dimension_path = format!(
             "data/{}/dimension/{}.json",
             dimension.namespace, dimension.path
@@ -68,7 +67,12 @@ impl GeneratedDimensionLighting {
                     .with_context(|| format!("invalid dimension {dimension_path}"))
             })
             .transpose()?;
-        let stem = override_stem.as_ref().unwrap_or(preset_stem);
+        // WorldDimensions.bake takes the union of preset and data-pack
+        // dimensions, preferring a registry entry when both contain a key.
+        let stem = override_stem
+            .as_ref()
+            .or(stem)
+            .context("dimension is missing from world preset and active data packs")?;
         let generator = stem
             .get("generator")
             .filter(|v| v.is_object())
@@ -200,6 +204,33 @@ mod tests {
         assert_eq!(
             (inline.min_y, inline.height, inline.has_skylight),
             (0, 16, true)
+        );
+    }
+    #[test]
+    fn active_data_pack_dimension_can_extend_the_selected_preset() {
+        let mut p = packs();
+        p.0.insert(
+            "data/example/dimension/extra.json".into(),
+            br#"{"type":"example:override","generator":{"type":"example:extra"}}"#.to_vec(),
+        );
+        let (lighting, generator) = GeneratedDimensionLighting::load_preset_with_generator(
+            &mut p,
+            "example:test",
+            "example:extra",
+        )
+        .unwrap();
+        assert_eq!(
+            (lighting.min_y, lighting.height, lighting.has_skylight),
+            (0, 256, false)
+        );
+        assert_eq!(generator["type"], "example:extra");
+        p.0.insert(
+            "data/example/dimension/extra.json".into(),
+            b"invalid".to_vec(),
+        );
+        assert!(
+            GeneratedDimensionLighting::load_preset(&mut p, "example:test", "example:extra")
+                .is_err()
         );
     }
     #[test]

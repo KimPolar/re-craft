@@ -4280,6 +4280,12 @@ mod tests {
             preset_path.with_file_name("bonus_spawn.json"),
             serde_json::to_vec(&bonus_preset)?,
         )?;
+        let custom_dimension = pack.join("data/example/dimension/sky.json");
+        std::fs::create_dir_all(custom_dimension.parent().unwrap())?;
+        std::fs::write(
+            &custom_dimension,
+            serde_json::to_vec(&bonus_preset["dimensions"]["minecraft:overworld"])?,
+        )?;
         let selection = DataPackSettings {
             enabled: vec!["vanilla".into(), "file/structures".into()],
             disabled: vec![],
@@ -4460,6 +4466,25 @@ mod tests {
             native_persistence::world::DimensionId::parse("overworld")?,
         )?;
         assert_eq!(reader.saved_world_seed()?, Some(42));
+        assert!(
+            reader
+                .saved_dimension_generators()?
+                .context("staged generators missing")?
+                .contains_key(&native_persistence::world::DimensionId::parse(
+                    "example:sky"
+                )?)
+        );
+        assert_eq!(
+            reader
+                .saved_dimension_types()?
+                .context("staged dimension types missing")?
+                .get(&native_persistence::world::DimensionId::parse(
+                    "example:sky"
+                )?),
+            Some(&native_persistence::world::SavedDimensionType::Named(
+                native_persistence::world::DimensionId::parse("example:test")?
+            ))
+        );
         assert_eq!(reader.singleplayer_uuid_words()?, Some(staged.initial.uuid));
         let structure_chunk = initial_ready
             .mesh

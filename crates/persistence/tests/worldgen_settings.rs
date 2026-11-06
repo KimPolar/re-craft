@@ -1,9 +1,9 @@
 use anyhow::Result;
 use native_persistence::{
     nbt,
-    worldgen_settings::{NewWorldOptions, draft_worldgen_settings},
+    worldgen_settings::{NewWorldOptions, draft_baked_worldgen_settings, draft_worldgen_settings},
 };
-use native_resources::packs::{ResourceProvider, ResourceStack};
+use native_resources::packs::{ResourceId, ResourceProvider, ResourceStack};
 use std::{path::PathBuf, process::Command};
 
 struct CustomPreset(Vec<u8>);
@@ -13,6 +13,31 @@ impl ResourceProvider for CustomPreset {
     }
     fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
         Ok((path == "data/example/worldgen/world_preset/custom.json").then(|| self.0.clone()))
+    }
+}
+
+struct BakedPreset<'a> {
+    base: &'a mut ResourceStack,
+    overworld: Vec<u8>,
+    sky: Vec<u8>,
+}
+impl ResourceProvider for BakedPreset<'_> {
+    fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        match path {
+            "data/minecraft/dimension/overworld.json" => Ok(Some(self.overworld.clone())),
+            "data/example/dimension/sky.json" => Ok(Some(self.sky.clone())),
+            _ => self.base.read_data(path),
+        }
+    }
+    fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+        assert_eq!(folder, "dimension");
+        Ok(vec![
+            ResourceId::parse("minecraft:overworld")?,
+            ResourceId::parse("example:sky")?,
+        ])
     }
 }
 
@@ -34,6 +59,29 @@ fn preset_documents_match_java_worldgen_codec() {
         .unwrap();
     let mut custom: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let end = custom["dimensions"]["minecraft:the_end"].clone();
+    let nether = custom["dimensions"]["minecraft:the_nether"].clone();
+    {
+        let mut baked = BakedPreset {
+            base: &mut stack,
+            overworld: serde_json::to_vec(&nether).unwrap(),
+            sky: serde_json::to_vec(&end).unwrap(),
+        };
+        let document = draft_baked_worldgen_settings(
+            &mut baked,
+            "minecraft:normal",
+            NewWorldOptions {
+                seed: -42,
+                generate_structures: false,
+                bonus_chest: true,
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("baked.nbt"),
+            nbt::write(&document).unwrap(),
+        )
+        .unwrap();
+    }
     custom["dimensions"]
         .as_object_mut()
         .unwrap()

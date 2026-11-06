@@ -3,6 +3,9 @@ import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.core.MappedRegistry;
+import net.minecraft.core.RegistrationInfo;
+import com.mojang.serialization.Lifecycle;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.nbt.*;
 import net.minecraft.resources.Identifier;
@@ -39,5 +42,19 @@ public class WorldGenSettingsOracle {
                 }
             }
         }
+        var normal = presets.getOrThrow(ResourceKey.create(Registries.WORLD_PRESET, Identifier.parse("minecraft:normal"))).value().createWorldDimensions();
+        var nether = normal.dimensions().get(LevelStem.NETHER);
+        var end = normal.dimensions().get(LevelStem.END);
+        var extraKey = ResourceKey.create(Registries.LEVEL_STEM, Identifier.parse("example:sky"));
+        var active = new MappedRegistry<LevelStem>(Registries.LEVEL_STEM, Lifecycle.experimental());
+        active.register(LevelStem.OVERWORLD, new LevelStem(nether.type(), nether.generator()), RegistrationInfo.BUILT_IN);
+        active.register(extraKey, new LevelStem(end.type(), end.generator()), RegistrationInfo.BUILT_IN);
+        var baked = normal.bake(active.freeze()).dimensions();
+        var expected = new WorldGenSettings(new WorldOptions(-42L, false, true), new WorldDimensions(baked));
+        var root = NbtIo.read(Path.of(args[0], "baked.nbt"));
+        var actual = WorldGenSettings.CODEC.parse(ops, root.get("data")).getOrThrow();
+        var actualTag = WorldGenSettings.CODEC.encodeStart(ops, actual).getOrThrow();
+        var expectedTag = WorldGenSettings.CODEC.encodeStart(ops, expected).getOrThrow();
+        if (!actualTag.equals(expectedTag)) throw new AssertionError("baked dimensions\nactual=" + actualTag + "\nexpected=" + expectedTag);
     }
 }

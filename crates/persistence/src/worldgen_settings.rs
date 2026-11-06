@@ -74,6 +74,34 @@ fn json_to_nbt(value: &Value, depth: usize, nodes: &mut usize) -> Result<Tag> {
     })
 }
 
+fn dimension_stem_to_nbt(stem: &Value, nodes: &mut usize) -> Result<Tag> {
+    let stem_object = stem
+        .as_object()
+        .context("dimension stem must be a compound")?;
+    let dimension_type = stem_object
+        .get("type")
+        .context("dimension type is missing")?;
+    if let Some(name) = dimension_type.as_str() {
+        ResourceId::parse(name)?;
+    } else {
+        ensure!(
+            dimension_type.is_object(),
+            "dimension type must be a reference or compound"
+        );
+    }
+    let generator = stem_object
+        .get("generator")
+        .and_then(Value::as_object)
+        .context("dimension generator is missing")?;
+    ResourceId::parse(
+        generator
+            .get("type")
+            .and_then(Value::as_str)
+            .context("generator type is missing")?,
+    )?;
+    json_to_nbt(stem, 0, nodes)
+}
+
 /// Read the selected preset from the active pack stack and encode the
 /// `data/minecraft/world_gen_settings.dat` document in memory. Every dimension
 /// stem is retained, including custom dimensions; no files are written.
@@ -111,33 +139,9 @@ pub fn draft_worldgen_settings(
         let id = ResourceId::parse(name)?;
         let id = format!("{}:{}", id.namespace, id.path);
         ensure!(seen.insert(id.clone()), "duplicate dimension {id}");
-        let stem_object = stem
-            .as_object()
-            .context("dimension stem must be a compound")?;
-        let dimension_type = stem_object
-            .get("type")
-            .context("dimension type is missing")?;
-        if let Some(name) = dimension_type.as_str() {
-            ResourceId::parse(name)?;
-        } else {
-            ensure!(
-                dimension_type.is_object(),
-                "dimension type must be a reference or compound"
-            );
-        }
-        let generator = stem_object
-            .get("generator")
-            .and_then(Value::as_object)
-            .context("dimension generator is missing")?;
-        ResourceId::parse(
-            generator
-                .get("type")
-                .and_then(Value::as_str)
-                .context("generator type is missing")?,
-        )?;
         entries.push((
             JavaString::from(id.as_str()),
-            json_to_nbt(stem, 0, &mut nodes)?,
+            dimension_stem_to_nbt(stem, &mut nodes)?,
         ));
     }
     ensure!(
@@ -165,6 +169,60 @@ pub fn draft_worldgen_settings(
             ),
         ]),
     })
+}
+
+/// Capture the baked dimension registry used by a new world. Resource-backed
+/// dimension stems override matching preset stems and add their own keys.
+pub fn draft_baked_worldgen_settings(
+    provider: &mut impl ResourceProvider,
+    preset: &str,
+    options: NewWorldOptions,
+) -> Result<NamedTag> {
+    let mut document = draft_worldgen_settings(provider, preset, options)?;
+    let Tag::Compound(root) = &mut document.value else {
+        unreachable!()
+    };
+    let Tag::Compound(data) = &mut root
+        .iter_mut()
+        .find(|(name, _)| name.matches("data"))
+        .expect("draft data exists")
+        .1
+    else {
+        unreachable!()
+    };
+    let Tag::Compound(dimensions) = &mut data
+        .iter_mut()
+        .find(|(name, _)| name.matches("dimensions"))
+        .expect("draft dimensions exist")
+        .1
+    else {
+        unreachable!()
+    };
+    let ids = provider.list_registry_data("dimension")?;
+    ensure!(ids.len() <= 4096, "too many active dimensions");
+    let mut nodes = 0;
+    for id in ids {
+        let path = format!("data/{}/dimension/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing active dimension {path}"))?;
+        ensure!(
+            bytes.len() <= 16 * 1024 * 1024,
+            "dimension exceeds maximum size: {path}"
+        );
+        let stem: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("invalid dimension {path}"))?;
+        let value = dimension_stem_to_nbt(&stem, &mut nodes)
+            .with_context(|| format!("invalid dimension {path}"))?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        if let Some((_, current)) = dimensions.iter_mut().find(|(key, _)| key.matches(&name)) {
+            *current = value;
+        } else {
+            dimensions.push((JavaString::from(name.as_str()), value));
+            ensure!(dimensions.len() <= 4096, "too many baked dimensions");
+        }
+    }
+    Ok(document)
 }
 
 #[cfg(test)]
@@ -208,6 +266,86 @@ mod tests {
         assert!(dims.get("example:other").is_some());
         let bytes = crate::nbt::write(&document).unwrap();
         assert_eq!(crate::nbt::read(&bytes).unwrap(), document);
+    }
+
+    #[test]
+    fn baked_dimensions_include_active_overrides_and_extra_dimensions() {
+        use std::collections::BTreeMap;
+        struct Active {
+            files: BTreeMap<String, Vec<u8>>,
+            ids: Vec<ResourceId>,
+        }
+        impl ResourceProvider for Active {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(self.files.get(path).cloned())
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "dimension", "unexpected registry");
+                Ok(self.ids.clone())
+            }
+        }
+        let mut packs = Active {
+            files: BTreeMap::new(),
+            ids: vec![
+                ResourceId::parse("minecraft:overworld").unwrap(),
+                ResourceId::parse("example:sky").unwrap(),
+            ],
+        };
+        packs.files.insert(
+            "data/example/worldgen/world_preset/custom.json".into(),
+            serde_json::to_vec(
+                &json!({"dimensions":{"minecraft:overworld":stem(),"minecraft:the_nether":stem()}}),
+            )
+            .unwrap(),
+        );
+        let override_stem =
+            json!({"type":"example:overworld_type","generator":{"type":"example:override"}});
+        let extra_stem = json!({"type":"example:sky_type","generator":{"type":"example:sky"}});
+        packs.files.insert(
+            "data/minecraft/dimension/overworld.json".into(),
+            serde_json::to_vec(&override_stem).unwrap(),
+        );
+        packs.files.insert(
+            "data/example/dimension/sky.json".into(),
+            serde_json::to_vec(&extra_stem).unwrap(),
+        );
+        let draft = draft_baked_worldgen_settings(&mut packs, "example:custom", options()).unwrap();
+        let dimensions = draft.value.get("data").unwrap().get("dimensions").unwrap();
+        assert_eq!(
+            dimensions
+                .get("minecraft:overworld")
+                .unwrap()
+                .get("generator")
+                .unwrap()
+                .get("type"),
+            Some(&Tag::String("example:override".into()))
+        );
+        assert_eq!(
+            dimensions
+                .get("example:sky")
+                .unwrap()
+                .get("generator")
+                .unwrap()
+                .get("type"),
+            Some(&Tag::String("example:sky".into()))
+        );
+        assert!(dimensions.get("minecraft:the_nether").is_some());
+        assert_eq!(
+            crate::nbt::read(&crate::nbt::write(&draft).unwrap()).unwrap(),
+            draft
+        );
+        packs.files.remove("data/example/dimension/sky.json");
+        assert!(draft_baked_worldgen_settings(&mut packs, "example:custom", options()).is_err());
+        packs.files.insert(
+            "data/example/dimension/sky.json".into(),
+            br#"{"type":"example:sky_type","generator":{}}"#.to_vec(),
+        );
+        assert!(draft_baked_worldgen_settings(&mut packs, "example:custom", options()).is_err());
+        packs.ids.push(ResourceId::parse("example:sky").unwrap());
+        assert!(draft_baked_worldgen_settings(&mut packs, "example:custom", options()).is_err());
     }
 
     #[test]

@@ -25,7 +25,14 @@ public class MineshaftPieceOracle {
                     var builder = new StructurePiecesBuilder();
                     builder.addPiece(root);
                     root.addChildren(root, builder, random);
-                    builder.offsetPiecesVertically(17);
+                    int offset;
+                    if (variant == MineshaftStructure.Type.NORMAL) {
+                        offset = builder.moveBelowSeaLevel(63, -64, random, 10);
+                    } else {
+                        int centerY = builder.getBoundingBox().getCenter().getY();
+                        offset = net.minecraft.util.Mth.randomBetweenInclusive(random, 63, 80) - centerY;
+                        builder.offsetPiecesVertically(offset);
+                    }
                     var pieces = new ListTag();
                     for (var piece : builder.build().pieces()) pieces.add(piece.createTag(null));
                     var graph = new CompoundTag();
@@ -33,6 +40,7 @@ public class MineshaftPieceOracle {
                     graph.putInt("x", chunk[0]);
                     graph.putInt("z", chunk[1]);
                     graph.putString("variant", variant.name());
+                    graph.putIntArray("point", new int[]{chunk[0]*16+8, 50+offset, chunk[1]*16});
                     graph.put("pieces", pieces);
                     all.add(graph);
                 }

@@ -1,9 +1,39 @@
 //! Compare fresh piece NBT with tags produced by the installed 26.3 client.
 use native_persistence::nbt::{self, Tag};
-use native_resources::mineshaft::{MineshaftGraph, MineshaftGraphPieceKind, MineshaftVariant};
-use native_session::worldgen::SavedMineshaftPiece;
+use native_resources::{
+    mineshaft::MineshaftVariant,
+    packs::ResourceId,
+    structure_start::{BiomeQuery, Heightmap, StartEnvironment},
+};
+use native_session::worldgen::{
+    SavedMineshaftPiece,
+    mineshaft::{MineshaftEnvironment, PreparedStart},
+};
 use serde_json::Value;
 use std::{path::PathBuf, process::Command};
+
+struct Environment;
+impl StartEnvironment for Environment {
+    fn vertical_bounds(&self) -> (i32, i32) {
+        (-64, 319)
+    }
+    fn sea_level(&self) -> i32 {
+        63
+    }
+    fn first_occupied_height(&mut self, _: i32, _: i32, map: Heightmap) -> anyhow::Result<i32> {
+        assert_eq!(map, Heightmap::WorldSurface);
+        Ok(79)
+    }
+    fn biome_allowed(&mut self, _: [i32; 3], query: BiomeQuery) -> anyhow::Result<bool> {
+        assert_eq!(query, BiomeQuery::Point);
+        Ok(true)
+    }
+}
+impl MineshaftEnvironment for Environment {
+    fn generator_min_y(&self) -> i32 {
+        -64
+    }
+}
 
 fn run(command: &mut Command) {
     let output = command.output().unwrap();
@@ -96,34 +126,38 @@ fn fresh_mineshaft_piece_tags_match_java() {
             assert!(name.matches("MESA"));
             MineshaftVariant::Mesa
         };
-        let (_, mut pieces, _) = MineshaftGraph::new(*seed, [*x, *z], variant)
+        let definition = serde_json::json!({"type":"minecraft:mineshaft", "mineshaft_type": if variant == MineshaftVariant::Normal { "normal" } else { "mesa" }});
+        let start = PreparedStart::generate(&definition, &mut Environment, *seed, [*x, *z])
             .unwrap()
-            .into_parts();
+            .unwrap();
+        let Some(Tag::IntArray(point)) = graph.get("point") else {
+            panic!("point")
+        };
+        assert_eq!(start.generation_point.as_slice(), point);
         let Some(Tag::List {
             values: expected, ..
         }) = graph.get("pieces")
         else {
             panic!("pieces")
         };
-        assert_eq!(pieces.len(), expected.len());
-        for (index, (piece, expected)) in pieces.iter_mut().zip(expected).enumerate() {
-            piece.bounds.min[1] += 17;
-            piece.bounds.max[1] += 17;
-            if let MineshaftGraphPieceKind::Room { entrances } = &mut piece.kind {
-                for entrance in entrances {
-                    entrance.min[1] += 17;
-                    entrance.max[1] += 17;
-                }
-            }
-            let saved = SavedMineshaftPiece::capture(piece, variant, false).unwrap();
-            let actual = saved.to_tag().unwrap();
+        assert_eq!(start.pieces.len(), expected.len());
+        let tag = start
+            .to_tag(&ResourceId::parse("minecraft:mineshaft").unwrap())
+            .unwrap();
+        let Some(Tag::List { values: packed, .. }) = tag.get("Children") else {
+            panic!("children")
+        };
+        assert_eq!(packed.len(), expected.len());
+        for (index, ((saved, actual), expected)) in
+            start.pieces.iter().zip(packed).zip(expected).enumerate()
+        {
             assert_eq!(
-                canonical(&actual),
+                canonical(actual),
                 canonical(expected),
                 "seed {seed} chunk {x},{z}, {variant:?} piece {index}"
             );
             assert_eq!(
-                SavedMineshaftPiece::from_tag(expected).unwrap(),
+                &SavedMineshaftPiece::from_tag(expected).unwrap(),
                 saved,
                 "seed {seed} chunk {x},{z}, {variant:?} piece {index}"
             );

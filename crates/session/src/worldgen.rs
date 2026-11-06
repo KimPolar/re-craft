@@ -45,6 +45,7 @@ mod generated_sheep;
 mod generated_spawner;
 mod generated_zombie_nautilus;
 mod local_difficulty;
+pub mod mineshaft;
 mod mob_collision;
 mod mob_obstruction;
 mod mob_placement;
@@ -2485,6 +2486,13 @@ impl StartEnvironment for StructureStartEnvironment<'_> {
         self.biome_rules.permits(self.structure, biome)
     }
 }
+
+impl mineshaft::MineshaftEnvironment for StructureStartEnvironment<'_> {
+    fn generator_min_y(&self) -> i32 {
+        self.noise.router().min_y
+    }
+}
+
 impl TerrainGenerator {
     /// The caller must guarantee no old-chunk blending or structure adjustment.
     /// The dimension must fully contain the noise-settings height range.
@@ -2895,7 +2903,16 @@ impl TerrainGenerator {
                         &definition,
                     )
                     .with_context(|| format!("in structure {path}"))?;
-                let structure = if center_heightmap.is_none() {
+                let structure_type = ResourceId::parse(
+                    definition
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .context("missing structure type")?,
+                )?;
+                let mineshaft = ocean_ruins
+                    && structure_type.namespace == "minecraft"
+                    && structure_type.path == "mineshaft";
+                let structure = if center_heightmap.is_none() && !mineshaft {
                     Some(
                         SimpleStructure::decode(&definition)
                             .with_context(|| format!("in structure {path}"))?,
@@ -2924,12 +2941,14 @@ impl TerrainGenerator {
                     min_y: self.min_y,
                     max_y,
                 };
-                let structure_type = ResourceId::parse(
-                    definition
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .context("missing structure type")?,
-                )?;
+                if mineshaft {
+                    if mineshaft::PreparedStart::generate(&definition, &mut env, self.seed, chunk)?
+                        .is_some()
+                    {
+                        bail!("mineshaft decoration and structure persistence are not implemented");
+                    }
+                    return Ok(None);
+                }
                 if ocean_ruins
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "ocean_ruin"
@@ -8258,6 +8277,29 @@ mod tests {
                 .err()
                 .expect("eligible unsupported structure must fail");
             assert!(format!("{error:#}").contains("unsupported simple structure"));
+        }
+        // An accepted mineshaft has a prepared layout, but may not be
+        // published until its decoration and save path are implemented.
+        for variant in ["normal", "mesa"] {
+            let definition = json!({"type":"minecraft:mineshaft","biomes":["minecraft:plains"],"mineshaft_type":variant});
+            data.0
+                .insert(path.into(), serde_json::to_vec(&definition).unwrap());
+            let error = generator
+                .try_generate_supported_structure_set(
+                    &mut data,
+                    &mut evaluator,
+                    &mut cache,
+                    &rules,
+                    &set_id,
+                    [0, 0],
+                    |_| Ok(false),
+                    classify,
+                )
+                .err()
+                .expect("incomplete mineshaft must not be published");
+            assert!(
+                format!("{error:#}").contains("mineshaft decoration and structure persistence")
+            );
         }
         // The generalized start path can retain a multi-piece ruin without
         // changing the simple-only scheduler's conservative behavior.

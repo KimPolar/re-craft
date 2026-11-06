@@ -8032,6 +8032,9 @@ mod tests {
                     }
                 );
                 assert!(batch.structure_data(target).is_ok());
+                assert!(
+                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
+                );
             }
         }
         Ok(())

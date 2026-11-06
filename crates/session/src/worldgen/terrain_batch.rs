@@ -799,6 +799,7 @@ fn features_cannot_spawn_entities(
 struct GeneratedEntitySources {
     complete_spawns: BTreeSet<ChunkPos>,
     recorded_hut_features: BTreeSet<ChunkPos>,
+    recorded_jigsaw_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
     completed_feature_passes: BTreeSet<ChunkPos>,
     // Only completed passes can already have contributed entities. Once an
     // unverified pass runs, earlier per-chunk completeness is invalid too.
@@ -812,6 +813,7 @@ fn structure_entities_are_accounted_for(
     pos: ChunkPos,
     completed: impl Fn(ChunkPos) -> bool,
     recorded_huts: &BTreeSet<ChunkPos>,
+    recorded_jigsaws: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
 ) -> bool {
     let registered: BTreeSet<_> = registry
         .steps()
@@ -833,6 +835,7 @@ fn structure_entities_are_accounted_for(
                     source,
                     &registered,
                     recorded_huts.contains(&source),
+                    recorded_jigsaws.get(&source),
                 )
         })
     })
@@ -872,6 +875,18 @@ impl GeneratedEntitySources {
 }
 
 impl FreshTerrainBatch {
+    #[cfg(test)]
+    pub(super) fn recorded_jigsaw_feature_for_test(
+        &self,
+        pos: ChunkPos,
+        key: &TerrainStartKey,
+    ) -> bool {
+        self.entity_sources
+            .recorded_jigsaw_features
+            .get(&pos)
+            .is_some_and(|keys| keys.contains(key))
+    }
+
     #[cfg(test)]
     pub(super) fn set_structure_stages_for_test(
         &mut self,
@@ -1396,6 +1411,7 @@ impl FreshTerrainBatch {
                             .is_some_and(|stage| stage >= GenerationStage::Features)
                     },
                     &self.entity_sources.recorded_hut_features,
+                    &self.entity_sources.recorded_jigsaw_features,
                 )
             }),
         };
@@ -4340,6 +4356,26 @@ impl FreshTerrainBatch {
                     if has_mixed {
                         let planned = mixed.context("mixed structure plan is missing")?;
                         let keys = structures.mixed_commit_keys(&planned, allow_huts)?;
+                        let recorded_jigsaws: BTreeSet<_> = planned
+                            .iter()
+                            .flat_map(|entry| {
+                                entry.starts.iter().filter_map(|start| {
+                                    let super::structure_batch::PlannedStructureStart::Jigsaw(
+                                        start,
+                                    ) = start
+                                    else {
+                                        return None;
+                                    };
+                                    Some((
+                                        entry.entry.id.clone(),
+                                        ChunkPos {
+                                            x: start.chunk[0],
+                                            z: start.chunk[1],
+                                        },
+                                    ))
+                                })
+                            })
+                            .collect();
                         let jigsaws = if has_jigsaw {
                             let registry = self
                                 .light_registry
@@ -4415,6 +4451,11 @@ impl FreshTerrainBatch {
                         drop(planned);
                         let huts_recorded = !hut_states.is_empty();
                         structures.commit_mixed_starts(keys, updated, hut_states);
+                        if !recorded_jigsaws.is_empty() {
+                            self.entity_sources
+                                .recorded_jigsaw_features
+                                .insert(pos, recorded_jigsaws);
+                        }
                         if huts_recorded {
                             self.entity_sources.recorded_hut_features.insert(pos);
                         }
@@ -5070,14 +5111,16 @@ mod entity_source_tests {
             &registry,
             center,
             |_| true,
-            &BTreeSet::new()
+            &BTreeSet::new(),
+            &BTreeMap::new()
         ));
         assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             center,
             |pos| pos != ChunkPos { x: 1, z: 0 },
-            &BTreeSet::new()
+            &BTreeSet::new(),
+            &BTreeMap::new()
         ));
         structures.references.remove(&ChunkPos { x: -1, z: 0 });
         assert!(!structure_entities_are_accounted_for(
@@ -5085,7 +5128,8 @@ mod entity_source_tests {
             &registry,
             center,
             |_| true,
-            &BTreeSet::new()
+            &BTreeSet::new(),
+            &BTreeMap::new()
         ));
         let refs = collect_ordered_structure_references(ChunkPos { x: -1, z: 0 }, |pos| {
             Ok(if pos == center {
@@ -5108,15 +5152,122 @@ mod entity_source_tests {
             &registry,
             center,
             |_| true,
-            &BTreeSet::new()
+            &BTreeSet::new(),
+            &BTreeMap::new()
         ));
         assert!(!structure_entities_are_accounted_for(
             &structures,
             &registry,
             ChunkPos { x: i32::MAX, z: 0 },
             |_| true,
-            &BTreeSet::new()
+            &BTreeSet::new(),
+            &BTreeMap::new()
         ));
+    }
+
+    #[test]
+    fn jigsaw_entity_evidence_requires_each_completed_reference() {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            jigsaw_placement::Piece,
+            structure_pool::{HolderValue, LiquidSettings, PoolElement, Projection},
+            structure_transform::Rotation,
+        };
+        struct Registry;
+        impl ResourceProvider for Registry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/test.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:test")?])
+            }
+        }
+        let registry = StructureDecorationSchedule::load(&mut Registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:test").unwrap();
+        let key = (id.clone(), center);
+        let start = super::super::jigsaw::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![Piece {
+                element: PoolElement::Single {
+                    location: ResourceId::parse("example:test").unwrap(),
+                    processors: HolderValue::Inline(serde_json::json!({"processors":[]})),
+                    projection: Projection::Rigid,
+                    legacy: false,
+                    override_liquid_settings: None,
+                },
+                origin: [8, 8, 8],
+                rotation: Rotation::None,
+                bounds: BoundingBox::new([8, 8, 8], [8, 8, 8]).unwrap(),
+                ground_level_delta: 1,
+                junctions: vec![],
+            }],
+        };
+        let bounds = start.reference_bounds(id.clone()).unwrap();
+        let mut structures = PreparedStructureStages::default();
+        structures
+            .jigsaw_starts
+            .insert(center, BTreeMap::from([(id.clone(), start)]));
+        let mut recorded = BTreeMap::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                let refs = collect_ordered_structure_references(pos, |source| {
+                    Ok(if source == center {
+                        vec![bounds.clone()]
+                    } else {
+                        vec![]
+                    })
+                })
+                .unwrap();
+                if !refs.membership().is_empty() {
+                    recorded.insert(pos, BTreeSet::from([key.clone()]));
+                }
+                structures.references.insert(pos, refs);
+            }
+        }
+        let covered =
+            |structures: &PreparedStructureStages,
+             recorded: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>| {
+                structure_entities_are_accounted_for(
+                    structures,
+                    &registry,
+                    center,
+                    |_| true,
+                    &BTreeSet::new(),
+                    recorded,
+                )
+            };
+        assert!(covered(&structures, &recorded));
+        let saved = recorded.remove(&center).unwrap();
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(center, saved);
+        assert!(!structure_entities_are_accounted_for(
+            &structures,
+            &registry,
+            center,
+            |pos| pos != center,
+            &BTreeSet::new(),
+            &recorded
+        ));
+        structures
+            .jigsaw_starts
+            .get_mut(&center)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .chunk = [1, 0];
+        assert!(!covered(&structures, &recorded));
+        structures.jigsaw_starts.clear();
+        assert!(!covered(&structures, &recorded));
     }
 
     #[test]
@@ -5179,7 +5330,14 @@ mod entity_source_tests {
             }
         }
         let covered = |structures: &PreparedStructureStages, recorded: &BTreeSet<ChunkPos>| {
-            structure_entities_are_accounted_for(structures, &registry, center, |_| true, recorded)
+            structure_entities_are_accounted_for(
+                structures,
+                &registry,
+                center,
+                |_| true,
+                recorded,
+                &BTreeMap::new(),
+            )
         };
         assert!(covered(&structures, &recorded));
         assert!(!structure_entities_are_accounted_for(
@@ -5187,7 +5345,8 @@ mod entity_source_tests {
             &registry,
             center,
             |pos| pos != center,
-            &recorded
+            &recorded,
+            &BTreeMap::new()
         ));
         recorded.remove(&center);
         assert!(!covered(&structures, &recorded));

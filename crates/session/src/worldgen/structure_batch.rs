@@ -455,13 +455,23 @@ impl PreparedStructureStages {
         pos: ChunkPos,
         registered: &BTreeSet<&ResourceId>,
         huts_recorded: bool,
+        recorded_jigsaws: Option<&BTreeSet<TerrainStartKey>>,
     ) -> bool {
         self.references.get(&pos).is_some_and(|references| {
             references.membership().iter().all(|(id, positions)| {
                 registered.contains(id) && positions.iter().all(|packed| {
                     let bits = *packed as u64;
                     let source = ChunkPos { x: bits as u32 as i32, z: (bits >> 32) as u32 as i32 };
-                    self.starts.get(&source).and_then(|starts| starts.get(id)).is_some_and(|start| {
+                    let simple = self.starts.get(&source).and_then(|starts| starts.get(id));
+                    let jigsaw = self.jigsaw_starts.get(&source).and_then(|starts| starts.get(id));
+                    if let Some(start) = jigsaw {
+                        return simple.is_none()
+                            && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && self.mineshafts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && start.chunk == [source.x, source.z]
+                            && recorded_jigsaws.is_some_and(|keys| keys.contains(&(id.clone(), source)));
+                    }
+                    simple.is_some_and(|start| {
                         if start.chunk != [source.x, source.z] { return false; }
                         match start.kind {
                             native_resources::structure_start::SimpleStructureKind::BuriedTreasure => true,

@@ -4279,6 +4279,9 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if is_air(state) {
         return Ok((false, false));
     }
+    if tree_leaf_litter(state)? {
+        return Ok((false, false));
+    }
     if matches!(name, "minecraft:water" | "minecraft:lava") {
         native_world::fluid::FluidState::from_block(state)
             .map_err(anyhow::Error::msg)?

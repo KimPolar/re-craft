@@ -5,9 +5,13 @@ use crate::structure_start::HorizontalDirection;
 use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
+mod corridor;
 mod graph;
 mod placement;
 mod support;
+pub use corridor::{
+    CorridorBlock, MineshaftCorridorWorld, place_corridor_beam, place_corridor_cobweb,
+};
 pub use graph::{
     MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,
     PlacedMineshaft,

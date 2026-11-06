@@ -65,7 +65,7 @@ impl SavedMineshaftPiece {
         Ok(saved)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         let p = &self.piece;
         let size = |axis: usize| i64::from(p.bounds.max[axis]) - i64::from(p.bounds.min[axis]) + 1;
         ensure!(

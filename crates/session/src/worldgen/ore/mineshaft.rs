@@ -76,6 +76,88 @@ fn known_piece_block(state: &BlockState) -> bool {
 }
 
 impl DecorationRegion<'_> {
+    /// Place one start's intersecting pieces in stored order using the shared
+    /// structure RNG. On failure the region must be discarded and the input
+    /// start, RNG and UUID factory remain unchanged. Callers that combine this
+    /// with other work must retain these staged inputs until `finish` succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_mineshaft_start<U>(
+        &mut self,
+        start: &mut super::super::mineshaft::PreparedStart,
+        clip: BoundingBox,
+        biomes: &super::super::BiomeNeighborhood,
+        blocking: &native_resources::mineshaft::MineshaftBlockingBiomes,
+        random: &mut DecorationRandom,
+        uuid_factory: &mut U,
+    ) -> Result<()>
+    where
+        U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+    {
+        ensure!(!self.failed, "generation attempt previously failed");
+        ensure!(
+            (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
+            "invalid mineshaft clip"
+        );
+        ensure!(!start.pieces.is_empty(), "mineshaft has no pieces");
+        ensure!(
+            biomes.seed == self.target.seed
+                && biomes.min_y == self.target.min_y
+                && biomes.height == self.target.height,
+            "mineshaft biome neighborhood does not match the terrain"
+        );
+        for saved in &start.pieces {
+            ensure!(
+                saved.variant == start.variant,
+                "mineshaft piece variant mismatch"
+            );
+            saved.validate()?;
+        }
+        let mut staged_spiders: Vec<_> = start
+            .pieces
+            .iter()
+            .map(|piece| piece.placed_spider)
+            .collect();
+        let mut next_random = random.clone();
+        let mut next_uuid = uuid_factory.clone();
+        for (saved, placed_spider) in start.pieces.iter().zip(&mut staged_spiders) {
+            let bounds = saved.piece.bounds;
+            if !(0..3).all(|axis| {
+                bounds.min[axis] <= clip.max[axis] && bounds.max[axis] >= clip.min[axis]
+            }) {
+                continue;
+            }
+            match saved.piece.kind {
+                MineshaftGraphPieceKind::Corridor { .. } => {
+                    self.place_mineshaft_corridor(
+                        &saved.piece,
+                        placed_spider,
+                        saved.variant,
+                        clip,
+                        biomes,
+                        blocking,
+                        &mut next_random,
+                        &mut next_uuid,
+                    )?;
+                }
+                _ => {
+                    self.place_mineshaft_static_piece_with_biomes(
+                        &saved.piece,
+                        saved.variant,
+                        clip,
+                        biomes,
+                        blocking,
+                    )?;
+                }
+            }
+        }
+        for (saved, placed_spider) in start.pieces.iter_mut().zip(staged_spiders) {
+            saved.placed_spider = placed_spider;
+        }
+        *random = next_random;
+        *uuid_factory = next_uuid;
+        Ok(())
+    }
+
     /// Run a complete corridor on this draft. The UUID factory must isolate its
     /// state when cloned, just like the decoration RNG and spider flag.
     /// The loaded block tags must include `minecraft:unstable_bottom_center`.
@@ -905,6 +987,121 @@ mod tests {
                 sections: 1,
             },
         }
+    }
+
+    fn test_start(
+        pieces: Vec<MineshaftGraphPiece>,
+    ) -> super::super::super::mineshaft::PreparedStart {
+        use native_core::beardifier::TerrainAdjustment;
+        let root = MineshaftGraphPiece {
+            bounds: BoundingBox::new([18, 1, 18], [26, 6, 26]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        super::super::super::mineshaft::PreparedStart {
+            chunk: [1, 1],
+            generation_point: [24, 1, 16],
+            terrain_adjustment: TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: std::iter::once(root)
+                .chain(pieces)
+                .map(|piece| {
+                    super::super::super::SavedMineshaftPiece::capture(
+                        &piece,
+                        MineshaftVariant::Normal,
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn start_keeps_one_spawner_across_two_chunks() {
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let (tags, motion) = support_tags(false);
+        let biomes = plains();
+        let blocking =
+            native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut BiomeData(false))
+                .unwrap();
+        let mut long = corridor(true, false);
+        long.bounds = BoundingBox::new([2, 2, 2], [4, 4, 21]).unwrap();
+        long.kind = MineshaftGraphPieceKind::Corridor {
+            rails: false,
+            spiders: true,
+            sections: 4,
+        };
+        let mut start = test_start(vec![long]);
+        let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+        for (z, seed) in [(0, 5), (1, 19)] {
+            let chunk = ChunkPos { x: 0, z };
+            let clip = BoundingBox::new([0, 0, z * 16], [15, 15, z * 16 + 15]).unwrap();
+            let mut random = DecorationRandom::new(seed);
+            let mut region = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+                .unwrap();
+            region
+                .place_mineshaft_start(&mut start, clip, &biomes, &blocking, &mut random, &mut uuid)
+                .unwrap();
+            region.finish().unwrap();
+            assert!(start.pieces[1].placed_spider);
+            assert_eq!(terrain.generated_monster_entities().count(), 1);
+        }
+        let tag = start
+            .to_tag(&ResourceId::parse("minecraft:mineshaft").unwrap())
+            .unwrap();
+        let Some(native_persistence::nbt::Tag::List { values, .. }) = tag.get("Children") else {
+            panic!("missing pieces")
+        };
+        assert_eq!(
+            values[1].get("hps"),
+            Some(&native_persistence::nbt::Tag::Byte(1))
+        );
+    }
+
+    #[test]
+    fn failed_later_piece_rolls_back_whole_start_and_rng() {
+        let (mut terrain, _, _, _) = super::super::tests::fixture();
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(BlockState {
+            name: "minecraft:beacon".into(),
+            properties: BTreeMap::new(),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap()[8 + 2 * 16 + 2 * 256] = id;
+        let before = Arc::clone(&terrain.world);
+        let mut later = corridor(true, false);
+        later.bounds = BoundingBox::new([8, 2, 2], [10, 4, 6]).unwrap();
+        let mut start = test_start(vec![corridor(true, false), later]);
+        let original_pieces = start.pieces.clone();
+        let (tags, motion) = support_tags(false);
+        let biomes = plains();
+        let blocking =
+            native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut BiomeData(false))
+                .unwrap();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let mut random = DecorationRandom::new(5);
+        let mut expected = random.clone();
+        let mut uuid = |_: [f64; 3]| Ok(Some([1, 2, 3, 4]));
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let error = region
+            .place_mineshaft_start(&mut start, clip, &biomes, &blocking, &mut random, &mut uuid)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("minecraft:beacon"));
+        assert_eq!(start.pieces, original_pieces);
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
+        assert_eq!(terrain.generated_monster_entities().count(), 0);
     }
 
     #[test]

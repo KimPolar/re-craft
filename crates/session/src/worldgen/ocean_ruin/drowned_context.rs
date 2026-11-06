@@ -10,6 +10,118 @@ use native_world::loaded::{ChunkPos, World};
 use super::DrownedMarkerContext;
 use crate::worldgen::{BiomeNeighborhood, LocalDifficulty};
 
+/// Stages the freshly created structure nautilus until its rider is ready.
+#[derive(Clone)]
+pub struct DrownedNautilusEffects<E, C> {
+    pub other: E,
+    variants: std::sync::Arc<native_resources::animal_variants::ZombieNautilusSpawnVariants>,
+    construct: C,
+    pending: Option<Tag>,
+}
+
+impl<E, C> DrownedNautilusEffects<E, C> {
+    pub fn new(
+        variants: std::sync::Arc<native_resources::animal_variants::ZombieNautilusSpawnVariants>,
+        construct: C,
+        other: E,
+    ) -> Self {
+        Self {
+            other,
+            variants,
+            construct,
+            pending: None,
+        }
+    }
+}
+
+impl<E, C> DrownedSpawnEffects for DrownedNautilusEffects<E, C>
+where
+    E: DrownedSpawnEffects,
+    C: Clone + FnMut() -> Result<Option<crate::worldgen::FreshCreatureRandom>>,
+{
+    fn try_existing_chicken(&mut self, position: [i32; 3], world: &World) -> Result<bool> {
+        self.other.try_existing_chicken(position, world)
+    }
+    fn spawn_chicken_jockey(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        self.other
+            .spawn_chicken_jockey(position, world, random, biomes)
+    }
+    fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
+        self.other.take_created_chicken()
+    }
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+        Ok(self.pending.take())
+    }
+    fn enchant_weapon(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        weapon: MainHandRoll,
+        special: f32,
+    ) -> Result<Tag> {
+        self.other
+            .enchant_weapon(position, world, random, weapon, special)
+    }
+    fn spawn_zombie_nautilus(
+        &mut self,
+        _: [i32; 3],
+        _: &World,
+        _: &mut RegionRandom,
+        _: bool,
+    ) -> Result<bool> {
+        anyhow::bail!("zombie nautilus biome is unavailable")
+    }
+    fn spawn_zombie_nautilus_in_biome(
+        &mut self,
+        position: [i32; 3],
+        _: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        ensure!(persistent, "only structure nautilus spawning is supported");
+        ensure!(
+            self.pending.is_none(),
+            "previous jockey nautilus was not consumed"
+        );
+        let mut construct = self.construct.clone();
+        let Some(creature) = construct()? else {
+            self.construct = construct;
+            return Ok(false);
+        };
+        ensure!(
+            creature.zombie_nautilus_sensor_delays.is_some()
+                && creature.construction.chicken_egg_time.is_none(),
+            "invalid zombie nautilus construction"
+        );
+        let biome = biomes.biome_at_block(position[0], position[1], position[2])?;
+        let mut next = random.clone();
+        let initialization = self.variants.finalize_structure_spawn(biome, &mut next)?;
+        let coords = [
+            f64::from(position[0]) + 0.5,
+            f64::from(position[1]),
+            f64::from(position[2]) + 0.5,
+        ];
+        let tag = crate::worldgen::draft_fresh_structure_zombie_nautilus(
+            creature.construction.uuid,
+            coords,
+            0.0,
+            &initialization,
+        )?;
+        self.construct = construct;
+        self.pending = Some(tag);
+        *random = next;
+        Ok(true)
+    }
+}
+
 /// Creates a fresh chicken with the active variants while delegating other
 /// drowned effects. All callback clones must own independent mutable state.
 #[derive(Clone)]
@@ -84,6 +196,9 @@ where
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         Ok(self.pending.take())
     }
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+        self.other.take_created_nautilus()
+    }
     fn enchant_weapon(
         &mut self,
         position: [i32; 3],
@@ -104,6 +219,17 @@ where
     ) -> Result<bool> {
         self.other
             .spawn_zombie_nautilus(position, world, random, persistent)
+    }
+    fn spawn_zombie_nautilus_in_biome(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        self.other
+            .spawn_zombie_nautilus_in_biome(position, world, random, persistent, biomes)
     }
 }
 
@@ -167,6 +293,9 @@ impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> 
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.passengers.take_created_chicken()
     }
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+        self.passengers.take_created_nautilus()
+    }
     fn enchant_weapon(
         &mut self,
         _: [i32; 3],
@@ -212,6 +341,17 @@ impl<E: DrownedSpawnEffects> DrownedSpawnEffects for DrownedEquipmentEffects<E> 
     ) -> Result<bool> {
         self.passengers
             .spawn_zombie_nautilus(position, world, random, persistent)
+    }
+    fn spawn_zombie_nautilus_in_biome(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        self.passengers
+            .spawn_zombie_nautilus_in_biome(position, world, random, persistent, biomes)
     }
 }
 
@@ -289,6 +429,9 @@ pub trait DrownedSpawnEffects: Clone {
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         Ok(None)
     }
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+        Ok(None)
+    }
     fn enchant_weapon(
         &mut self,
         position: [i32; 3],
@@ -304,6 +447,16 @@ pub trait DrownedSpawnEffects: Clone {
         random: &mut RegionRandom,
         persistent: bool,
     ) -> Result<bool>;
+    fn spawn_zombie_nautilus_in_biome(
+        &mut self,
+        position: [i32; 3],
+        world: &World,
+        random: &mut RegionRandom,
+        persistent: bool,
+        _biomes: &BiomeNeighborhood,
+    ) -> Result<bool> {
+        self.spawn_zombie_nautilus(position, world, random, persistent)
+    }
 }
 
 /// Uses the generated biome neighborhood and active biome tag. Callers supply
@@ -361,6 +514,9 @@ where
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
         self.effects.take_created_chicken()
     }
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+        self.effects.take_created_nautilus()
+    }
     fn enchant_weapon(
         &mut self,
         position: [i32; 3],
@@ -386,8 +542,13 @@ where
         random: &mut RegionRandom,
         persistent: bool,
     ) -> Result<bool> {
-        self.effects
-            .spawn_zombie_nautilus(position, world, random, persistent)
+        self.effects.spawn_zombie_nautilus_in_biome(
+            position,
+            world,
+            random,
+            persistent,
+            self.biomes,
+        )
     }
 }
 

@@ -540,13 +540,73 @@ where
         (MainHandRoll::FishingRod, None) => Some(default_hand("minecraft:fishing_rod")),
         (_, Some(tag)) => Some(tag),
     };
+    let mut rider_initialization = initialized;
+    rider_initialization.post.spawned_nautilus = false;
     let tag = super::super::draft_fresh_structure_drowned(
         creature.construction.uuid,
         position,
-        &initialized,
+        &rider_initialization,
         main_hand,
     )?;
+    if initialized.post.spawned_nautilus {
+        let nautilus = adapter
+            .context
+            .take_created_nautilus()?
+            .context("created jockey nautilus data is unavailable")?;
+        return Ok(Some(super::super::GeneratedEntityRecord::Saved(
+            attach_created_nautilus_rider(nautilus, tag, position)?,
+        )));
+    }
     Ok(Some(super::super::GeneratedEntityRecord::Saved(tag)))
+}
+
+fn attach_created_nautilus_rider(mut nautilus: Tag, rider: Tag, position: [i32; 3]) -> Result<Tag> {
+    use native_persistence::nbt::TagType;
+    let Tag::Compound(ref fields) = nautilus else {
+        bail!("jockey nautilus is not a compound")
+    };
+    for name in ["id", "UUID", "Pos", "Passengers", "PersistenceRequired"] {
+        ensure!(
+            fields.iter().filter(|(key, _)| key.matches(name)).count() <= 1,
+            "duplicate jockey nautilus field {name}"
+        );
+    }
+    ensure!(
+        matches!(nautilus.get("id"), Some(Tag::String(id)) if id.matches("minecraft:zombie_nautilus")),
+        "invalid jockey nautilus type"
+    );
+    ensure!(
+        nautilus.get("PersistenceRequired") == Some(&Tag::Byte(1)),
+        "jockey nautilus is not persistent"
+    );
+    ensure!(
+        nautilus.get("Passengers").is_none(),
+        "jockey nautilus already has passengers"
+    );
+    ensure!(
+        matches!(nautilus.get("UUID"), Some(Tag::IntArray(uuid)) if uuid.len() == 4 && rider.get("UUID") != Some(&Tag::IntArray(uuid.clone()))),
+        "invalid or duplicate jockey UUID"
+    );
+    let expected = [
+        f64::from(position[0]) + 0.5,
+        f64::from(position[1]),
+        f64::from(position[2]) + 0.5,
+    ];
+    ensure!(
+        matches!(nautilus.get("Pos"), Some(Tag::List { element_type: TagType::Double, values }) if values == &expected.map(Tag::Double)),
+        "jockey nautilus position differs from drowned"
+    );
+    let Tag::Compound(ref mut fields) = nautilus else {
+        unreachable!()
+    };
+    fields.push((
+        "Passengers".into(),
+        Tag::List {
+            element_type: TagType::Compound,
+            values: vec![rider],
+        },
+    ));
+    Ok(nautilus)
 }
 
 pub(in crate::worldgen) fn attach_created_chicken_rider(
@@ -1137,6 +1197,8 @@ mod tests {
         fail_on_special: Option<usize>,
         create_chicken: bool,
         created_chicken: Option<Tag>,
+        create_nautilus: bool,
+        created_nautilus: Option<Tag>,
     }
     impl super::super::super::ocean_ruin::DrownedMarkerContext for DrownedContext {
         fn special_multiplier(&mut self, _: [i32; 3], _: &World) -> Result<f32> {
@@ -1189,6 +1251,9 @@ mod tests {
         fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
             Ok(self.created_chicken.take())
         }
+        fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+            Ok(self.created_nautilus.take())
+        }
         fn enchant_weapon(
             &mut self,
             _: [i32; 3],
@@ -1216,14 +1281,32 @@ mod tests {
         }
         fn spawn_zombie_nautilus(
             &mut self,
-            _: [i32; 3],
+            position: [i32; 3],
             _: &World,
             _: &mut RegionRandom,
             persistent: bool,
         ) -> Result<bool> {
             ensure!(persistent, "structure nautilus must be persistent");
             self.calls += 1;
-            Ok(false)
+            if self.create_nautilus {
+                self.created_nautilus = Some(Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:zombie_nautilus".into())),
+                    ("UUID".into(), Tag::IntArray(vec![10, 11, 12, 13])),
+                    ("PersistenceRequired".into(), Tag::Byte(1)),
+                    (
+                        "Pos".into(),
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Double,
+                            values: vec![
+                                Tag::Double(f64::from(position[0]) + 0.5),
+                                Tag::Double(f64::from(position[1])),
+                                Tag::Double(f64::from(position[2]) + 0.5),
+                            ],
+                        },
+                    ),
+                ]));
+            }
+            Ok(self.create_nautilus)
         }
     }
     impl super::super::super::ocean_ruin::DrownedSpawnEffects for DrownedContext {
@@ -1266,6 +1349,56 @@ mod tests {
                 self, pos, world, random, persistent,
             )
         }
+    }
+
+    #[test]
+    fn created_nautilus_stores_final_drowned_as_passenger() -> Result<()> {
+        use super::super::super::{FreshCreatureRandom, GeneratedEntityRecord};
+        use native_core::random::LegacyRandom;
+        use native_persistence::nbt::TagType;
+        let id = ResourceId::parse("minecraft:drowned")?;
+        let position = [3, 10, -2];
+        let (terrain, _, _, _) = super::super::tests::fixture();
+        let world = terrain.snapshot();
+        for seed in 0..50_000 {
+            let mut random = RegionRandom::Legacy(LegacyRandom::new(seed));
+            let mut construct = || Ok(Some(FreshCreatureRandom::from_seed(&id, 42)?));
+            let mut context = DrownedContext {
+                create_nautilus: true,
+                ..Default::default()
+            };
+            let Some(GeneratedEntityRecord::Saved(saved)) = draft_initialized_drowned(
+                position,
+                &world,
+                &mut random,
+                &mut construct,
+                &mut context,
+            )?
+            else {
+                bail!("missing entity")
+            };
+            if !matches!(saved.get("id"), Some(Tag::String(id)) if id.matches("minecraft:zombie_nautilus"))
+            {
+                continue;
+            }
+            assert!(context.created_nautilus.is_none());
+            let Some(Tag::List {
+                element_type: TagType::Compound,
+                values,
+            }) = saved.get("Passengers")
+            else {
+                bail!("missing passenger")
+            };
+            ensure!(values.len() == 1, "unexpected passenger count");
+            assert!(
+                matches!(values[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:drowned"))
+            );
+            assert!(
+                matches!(values[0].get("equipment").and_then(|v| v.get("mainhand")).and_then(|v| v.get("id")), Some(Tag::String(id)) if id.matches("minecraft:trident"))
+            );
+            return Ok(());
+        }
+        bail!("no deterministic nautilus jockey seed")
     }
 
     #[test]

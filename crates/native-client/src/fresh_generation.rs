@@ -170,12 +170,15 @@ pub(crate) struct InitialHutGeneration {
     pub ocean: Option<InitialOceanGeneration>,
 }
 
-pub(crate) type ChickenConstructor =
+pub(crate) type CreatureConstructor =
     fn() -> Result<Option<native_session::worldgen::FreshCreatureRandom>>;
 pub(crate) type OceanEffects = native_session::worldgen::ocean_ruin::DrownedEquipmentEffects<
     native_session::worldgen::ocean_ruin::DrownedChickenEffects<
-        UnsupportedOceanEffects,
-        ChickenConstructor,
+        native_session::worldgen::ocean_ruin::DrownedNautilusEffects<
+            UnsupportedOceanEffects,
+            CreatureConstructor,
+        >,
+        CreatureConstructor,
     >,
 >;
 
@@ -237,6 +240,14 @@ fn construct_chicken() -> Result<Option<native_session::worldgen::FreshCreatureR
     ))
 }
 
+fn construct_zombie_nautilus() -> Result<Option<native_session::worldgen::FreshCreatureRandom>> {
+    Ok(Some(
+        native_session::worldgen::FreshCreatureRandom::from_entropy(&ResourceId::parse(
+            "minecraft:zombie_nautilus",
+        )?)?,
+    ))
+}
+
 impl InitialOceanGeneration {
     fn load(
         resources: &mut ResourceStack,
@@ -244,13 +255,13 @@ impl InitialOceanGeneration {
         registry: Arc<native_resources::block_registry::GeneratedBlockRegistry>,
     ) -> Result<Self> {
         use native_resources::{
-            animal_variants::{FarmAnimal, FarmAnimalSpawnVariants},
+            animal_variants::{FarmAnimal, FarmAnimalSpawnVariants, ZombieNautilusSpawnVariants},
             drowned_spawn::DrownedBiomeTags,
             fluid_tags,
             ore_feature::OreBlockTags,
         };
         use native_session::worldgen::ocean_ruin::{
-            DrownedChickenEffects, DrownedEquipmentEffects,
+            DrownedChickenEffects, DrownedEquipmentEffects, DrownedNautilusEffects,
         };
         let ice_tags = OreBlockTags::load(
             resources,
@@ -269,10 +280,15 @@ impl InitialOceanGeneration {
             .iter()
             .map(|(id, _)| ResourceId::parse(id))
             .collect::<Result<BTreeSet<_>>>()?;
+        let nautilus = DrownedNautilusEffects::new(
+            Arc::new(ZombieNautilusSpawnVariants::load_active(resources)?),
+            construct_zombie_nautilus as CreatureConstructor,
+            UnsupportedOceanEffects,
+        );
         let chickens = DrownedChickenEffects::new(
             variants,
-            construct_chicken as ChickenConstructor,
-            UnsupportedOceanEffects,
+            construct_chicken as CreatureConstructor,
+            nautilus,
         )?;
         // Both vanilla item prototypes have enchantability one in Java 26.3.
         let effects =

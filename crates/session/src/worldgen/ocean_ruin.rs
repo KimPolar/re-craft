@@ -16,8 +16,8 @@ mod placement;
 mod saved_piece;
 pub use drowned_context::{
     DrownedChickenEffects, DrownedEquipmentEffects, DrownedGenerationContext,
-    DrownedPlacementInputs, DrownedSpawnEffects, GenerationDifficultyEnvironment,
-    GenerationDifficultyInputs,
+    DrownedNautilusEffects, DrownedPlacementInputs, DrownedSpawnEffects,
+    GenerationDifficultyEnvironment, GenerationDifficultyInputs,
 };
 pub use placement::OceanRuinPlacementWorld;
 pub use saved_piece::SavedOceanRuinPiece;
@@ -161,6 +161,10 @@ pub trait DrownedMarkerContext: Clone {
     /// Take the freshly finalized chicken saved by a successful jockey
     /// creation. It must not yet contain the drowned passenger.
     fn take_created_chicken(&mut self) -> Result<Option<Tag>> {
+        Ok(None)
+    }
+    /// Take a freshly finalized nautilus before attaching its drowned rider.
+    fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
         Ok(None)
     }
     /// Return the final item-stack NBT after the active enchantment provider.

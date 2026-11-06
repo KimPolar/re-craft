@@ -1035,6 +1035,130 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
+    fn vanilla_village_piles_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home missing")?
+            .join("bin");
+        let source = temp.path().join("VillagePilesOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/VillagePilesOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let mut found_lantern = false;
+        for kind in ["snow", "melon", "ice", "pumpkin"] {
+            let output = Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("VillagePilesOracle")
+                .arg(kind)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "Java oracle failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut cases = Vec::<(i64, i64, BTreeMap<[i32; 3], BlockState>)>::new();
+            for line in String::from_utf8(output.stdout)?.lines() {
+                let fields: Vec<_> = line.split('\t').collect();
+                match fields.as_slice() {
+                    ["CASE", seed, result, next] => {
+                        assert_eq!(*result, "true");
+                        cases.push((seed.parse()?, next.parse()?, BTreeMap::new()));
+                    }
+                    ["WRITE", x, y, z, name, property, flags] => {
+                        assert_eq!(*flags, "260");
+                        let mut properties = BTreeMap::new();
+                        if !property.is_empty() {
+                            let (key, value) =
+                                property.split_once('=').context("invalid property")?;
+                            properties.insert(key.into(), value.into());
+                        }
+                        found_lantern |= *name == "minecraft:jack_o_lantern";
+                        cases.last_mut().context("write before case")?.2.insert(
+                            [x.parse()?, y.parse()?, z.parse()?],
+                            BlockState {
+                                name: (*name).into(),
+                                properties,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(cases.len(), 20);
+            let placed = PlacedDecorationFeature::load(
+                &mut resources,
+                &ResourceId::parse(&format!("minecraft:pile_{kind}"))?,
+                &mut |value| {
+                    let (name, properties) = registry.resolve(value)?;
+                    Ok(BlockState { name, properties })
+                },
+            )?;
+            for (seed, next, expected) in cases {
+                let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                let mut random = DecorationRandom::new(seed);
+                assert!(region.place_nested(&placed, &mut random, [8, 8, 8], 0, 16)?);
+                assert_eq!(random.next_long(), next, "{kind} seed {seed}");
+                region.finish()?;
+                let world = terrain.snapshot();
+                let mut actual = BTreeMap::new();
+                for y in 8..=9 {
+                    for z in 5..=11 {
+                        for x in 5..=11 {
+                            let state = world.block(x, y, z).context("missing generated block")?;
+                            if !is_air(state) {
+                                actual.insert([x, y, z], state.clone());
+                            }
+                        }
+                    }
+                }
+                assert_eq!(actual, expected, "{kind} seed {seed}");
+            }
+        }
+        assert!(found_lantern, "oracle never generated a jack o'lantern");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn rigid_piece_updates_draft_and_failed_piece_is_not_published() -> Result<()> {
         let game =

@@ -6299,8 +6299,21 @@ fn pile_safe_full_block(state: &BlockState) -> bool {
         "minecraft:melon" | "minecraft:pumpkin" | "minecraft:blue_ice" | "minecraft:packed_ice" => {
             state.properties.is_empty()
         }
+        "minecraft:jack_o_lantern" => {
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("facing").map(String::as_str),
+                    Some("north" | "south" | "east" | "west")
+                )
+        }
         _ => false,
     }
+}
+
+fn pile_snow_layer(state: &BlockState) -> bool {
+    state.name == "minecraft:snow"
+        && state.properties.len() == 1
+        && state.properties.get("layers").map(String::as_str) == Some("1")
 }
 
 impl BlockPileWorld for DecorationRegion<'_> {
@@ -6311,7 +6324,9 @@ impl BlockPileWorld for DecorationRegion<'_> {
         Ok(state.name == "minecraft:dirt_path" && state.properties.is_empty())
     }
     fn pile_sturdy_up(&mut self, state: &BlockState, pos: [i32; 3]) -> Result<bool> {
-        if pile_safe_full_block(state) {
+        if pile_snow_layer(state) {
+            Ok(false)
+        } else if pile_safe_full_block(state) {
             Ok(true)
         } else {
             self.face_sturdy(state, pos, [0, 1, 0])
@@ -6322,7 +6337,7 @@ impl BlockPileWorld for DecorationRegion<'_> {
             return Ok(());
         }
         ensure!(
-            pile_safe_full_block(state),
+            pile_safe_full_block(state) || pile_snow_layer(state),
             "unsupported block pile placement effects: {}",
             state.name
         );

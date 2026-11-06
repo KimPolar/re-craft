@@ -27,6 +27,7 @@ pub struct GeneratedBlockRegistry {
 enum StateSchema {
     Stateless,
     Snowy,
+    SnowLayers,
     Dusted,
     Lit,
     Liquid,
@@ -163,6 +164,7 @@ impl StateSchema {
                 return properties;
             }
             Self::Snowy => ("snowy", "false"),
+            Self::SnowLayers => ("layers", "1"),
             Self::Dusted => ("dusted", "0"),
             Self::Lit => ("lit", "false"),
             Self::Liquid => ("level", "0"),
@@ -290,6 +292,9 @@ impl StateSchema {
             Self::Snowy if name == "snowy" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
+            Self::SnowLayers if name == "layers" => java_decimal(value)
+                .filter(|n| (1..=8).contains(n))
+                .map(|n| n.to_string()),
             Self::Dusted if name == "dusted" => java_decimal(value)
                 .filter(|n| (0..=3).contains(n))
                 .map(|n| n.to_string()),
@@ -555,9 +560,11 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
                 "net/minecraft/world/level/block/SlabBlock" => Some(StateSchema::Slab),
                 "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
-                "net/minecraft/world/level/block/GlazedTerracottaBlock" => {
+                "net/minecraft/world/level/block/GlazedTerracottaBlock"
+                | "net/minecraft/world/level/block/CarvedPumpkinBlock" => {
                     Some(StateSchema::HorizontalFacing)
                 }
+                "net/minecraft/world/level/block/SnowLayerBlock" => Some(StateSchema::SnowLayers),
                 "net/minecraft/world/level/block/SpawnerBlock" => Some(StateSchema::Stateless),
                 "net/minecraft/world/level/block/BrushableBlock" => Some(StateSchema::Dusted),
                 "net/minecraft/world/level/block/AmethystClusterBlock" => {

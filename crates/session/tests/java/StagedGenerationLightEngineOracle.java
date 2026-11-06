@@ -124,6 +124,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean noSky=args.length>1 && (args[1].equals("tree_empty_no_sky") || vineNoSky);
         var engine=new LevelLightEngine(w,true,!noSky);
         boolean patchFreshWater=args.length>1 && args[1].equals("patch_fresh_clay_water");
+        boolean pileFresh=args.length>1 && args[1].startsWith("pile_fresh_");
+        boolean pileFreshEmpty=pileFresh && args[1].contains("_empty_");
         boolean freshWaterDripleaf=args.length>1 && args[1].equals("column_fresh_water_dripleaf");
         boolean freshWaterlogDripleaf=args.length>1 && args[1].equals("patch_fresh_waterlog_dripleaf");
         boolean freshDripleafSequence=args.length>1 && args[1].equals("patch_fresh_dripleaf_sequence");
@@ -162,14 +164,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeFreshEmpty=args.length>1 && args[1].equals("tree_fresh_empty");
         boolean emptyLeaf=args.length>1 && args[1].equals("tree_empty_leaf_active");
-        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || emptyLeaf || noSky || treeEmptyFull || treeFreshEmpty);
+        boolean treeEmpty=args.length>1 && (args[1].equals("tree_empty") || emptyLeaf || noSky || treeEmptyFull || treeFreshEmpty || pileFreshEmpty);
         w.emptyEast=treeEmpty || treeSparse || vineActiveEmpty;
         w.sparseEast=treeSparse;
         w.sparseColumn=args.length>1 && args[1].equals("log_active_sparse_column");
         w.sparseShadow=skyShadow;
         w.sparseMany=skyMany;
         boolean logActive=args.length>1 && args[1].equals("log_active_full");
-        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse || treeFreshEmpty);
+        boolean leafFull=args.length>1 && (args[1].equals("leaf_active_full") || leafMany || logActive || treeEmptyFull || treeSparse || treeFreshEmpty || pileFreshEmpty);
         boolean leafActive=args.length>1 && (args[1].equals("leaf_active") || leafFull || treeEmpty);
         boolean normal=args.length>1 && args[1].equals("normal");
         boolean queued=args.length>1 && (args[1].equals("magma_queued") || args[1].equals("magma_exposed_queued") || args[1].equals("vine_queued") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full_queued"));
@@ -177,7 +179,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean exposed=args.length>1 && args[1].startsWith("magma_exposed");
         boolean vine=args.length>1 && (vineActive || args[1].equals("vine") || args[1].equals("vine_queued") || args[1].equals("vine_plain") || args[1].equals("vine_plain_queued") || args[1].equals("vine_existing") || args[1].equals("vine_existing_queued") || args[1].equals("vine_full") || args[1].equals("vine_full_queued"));
         boolean full=args.length>1 && args[1].startsWith("vine_full");
-        w.wide=full || blockCase || skyActivate || stagedActivate || activeEmptyWide || vineSelf;
+        w.wide=full || blockCase || skyActivate || stagedActivate || activeEmptyWide || vineSelf || pileFresh;
         boolean plain=args.length>1 && (args[1].startsWith("vine_plain") || (vineActive && args[1].endsWith("_plain")));
         boolean existing=args.length>1 && (args[1].startsWith("vine_existing") || args[1].equals("vine_active_existing") || args[1].equals("vine_active_self_existing"));
         w.magmaOnly=magma || magmaActive;
@@ -277,9 +279,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             }
         }
         drain(engine); var stages=new JsonArray();
-        if(args.length>1 && (args[1].startsWith("tree_fresh_") || patchFreshWater || freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence)){
+        if(args.length>1 && (args[1].startsWith("tree_fresh_") || pileFresh || patchFreshWater || freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence)){
             var before=new JsonArray(); before.add(capture(engine,0)); before.add(capture(engine,1)); stages.add(before);
-            var state=(freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence) ? Blocks.BIG_DRIPLEAF.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,net.minecraft.core.Direction.NORTH).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,freshWaterlogDripleaf) : patchFreshWater ? Blocks.WATER.defaultBlockState() : args[1].equals("tree_fresh_birch_log") ? Blocks.BIRCH_LOG.defaultBlockState() : args[1].equals("tree_fresh_birch_leaf") ? Blocks.BIRCH_LEAVES.defaultBlockState() : (args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
+            var pile=args[1].endsWith("_snow") ? Blocks.SNOW : args[1].endsWith("_hay") ? Blocks.HAY_BLOCK : args[1].endsWith("_ice") ? Blocks.BLUE_ICE : Blocks.JACK_O_LANTERN;
+            var state=pileFresh ? pile.defaultBlockState() : (freshWaterDripleaf || freshWaterlogDripleaf || freshDripleafSequence) ? Blocks.BIG_DRIPLEAF.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING,net.minecraft.core.Direction.NORTH).setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,freshWaterlogDripleaf) : patchFreshWater ? Blocks.WATER.defaultBlockState() : args[1].equals("tree_fresh_birch_log") ? Blocks.BIRCH_LOG.defaultBlockState() : args[1].equals("tree_fresh_birch_leaf") ? Blocks.BIRCH_LEAVES.defaultBlockState() : (args[1].equals("tree_fresh_log") || treeFreshEmpty) ? Blocks.DARK_OAK_LOG.defaultBlockState() : Blocks.DARK_OAK_LEAVES.defaultBlockState();
             var pos=new BlockPos(16,10,8);
             boolean wasEmpty=eastSection.section.hasOnlyAir();
             var old=eastSection.section.setBlockState(0,10,8,state); w.edits.put(pos,state);
@@ -298,6 +301,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             var checked=new JsonArray(); checked.add(capture(engine,0)); checked.add(capture(engine,1)); stages.add(checked);
             engine.propagateLightSources(new ChunkPos(0,0)); drain(engine);
             var active=new JsonArray(); active.add(capture(engine,0)); active.add(capture(engine,1)); stages.add(active);
+            if(pileFresh) {
+                engine.propagateLightSources(new ChunkPos(1,0)); drain(engine);
+                var eastActive=new JsonArray(); eastActive.add(capture(engine,0)); eastActive.add(capture(engine,1)); stages.add(eastActive);
+            }
             Files.writeString(Path.of(args[0]),stages.toString()); return;
         }
         if(blockCase){

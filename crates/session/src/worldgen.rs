@@ -7817,6 +7817,15 @@ mod tests {
                             4 => {
                                 json!({"element_type":"minecraft:feature_pool_element","feature":"minecraft:pile_hay","projection":projection})
                             }
+                            5..=8 => {
+                                let feature = match self.feature_kind {
+                                    5 => "minecraft:pile_snow",
+                                    6 => "minecraft:pile_pumpkin",
+                                    7 => "minecraft:pile_melon",
+                                    _ => "minecraft:pile_ice",
+                                };
+                                json!({"element_type":"minecraft:feature_pool_element","feature":feature,"projection":projection})
+                            }
                             _ => {
                                 json!({"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":projection})
                             }
@@ -7875,6 +7884,10 @@ mod tests {
             (false, true, "minecraft:melon", 2),
             (false, false, "minecraft:melon", 3),
             (false, false, "minecraft:hay_block", 4),
+            (false, false, "minecraft:snow", 5),
+            (false, false, "minecraft:pumpkin", 6),
+            (false, false, "minecraft:melon", 7),
+            (false, false, "minecraft:packed_ice", 8),
         ] {
             let chest = block_name == "minecraft:chest";
             let mut block = vec![
@@ -7937,7 +7950,7 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if feature_kind == 4 {
+            if (4..=8).contains(&feature_kind) {
                 terrain_definition["settings"]["noise_router"]["final_density"] = json!({
                     "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
                     "from_value":1.0, "to_value":-1.0
@@ -8008,6 +8021,10 @@ mod tests {
             let placed_features = match feature_kind {
                 2 => BTreeSet::from([ResourceId::parse("example:test")?]),
                 4 => BTreeSet::from([ResourceId::parse("minecraft:pile_hay")?]),
+                5 => BTreeSet::from([ResourceId::parse("minecraft:pile_snow")?]),
+                6 => BTreeSet::from([ResourceId::parse("minecraft:pile_pumpkin")?]),
+                7 => BTreeSet::from([ResourceId::parse("minecraft:pile_melon")?]),
+                8 => BTreeSet::from([ResourceId::parse("minecraft:pile_ice")?]),
                 _ => BTreeSet::new(),
             };
             batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
@@ -8063,7 +8080,7 @@ mod tests {
                     Some(schedule::GenerationStage::Features)
                 );
                 let snapshot = batch.snapshot().context("missing terrain")?;
-                if feature_kind == 4 {
+                if (4..=8).contains(&feature_kind) {
                     let found = (-3..=3).any(|dz| {
                         (-3..=3).any(|dx| {
                             (0..=1).any(|dy| {
@@ -8073,7 +8090,7 @@ mod tests {
                             })
                         })
                     });
-                    assert!(found, "hay pile produced no blocks");
+                    assert!(found, "{block_name} pile produced no matching blocks");
                 } else {
                     assert_eq!(
                         snapshot
@@ -8085,7 +8102,7 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || feature_kind == 4
+                    feature_kind == 0 || feature_kind == 2 || (4..=8).contains(&feature_kind)
                 );
                 assert!(
                     batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))

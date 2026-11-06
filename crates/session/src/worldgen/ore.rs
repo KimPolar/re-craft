@@ -10531,6 +10531,41 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn tracked_tree_light_updates_match_java_or_roll_back() {
+        check_tracked_light_updates(&[
+            "tree_fresh_log",
+            "tree_fresh_leaf",
+            "tree_fresh_birch_log",
+            "tree_fresh_birch_leaf",
+            "tree_fresh_empty",
+            "patch_fresh_clay_water",
+            "column_fresh_water_dripleaf",
+            "patch_fresh_waterlog_dripleaf",
+            "patch_fresh_dripleaf_sequence",
+            "log_active_sparse_column",
+            "leaf_active",
+            "leaf_active_full",
+            "leaf_active_many",
+            "log_active_full",
+            "log_active_sparse",
+            "log_active_sparse_twice",
+            "log_active_sparse_missing",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn fresh_village_pile_light_matches_java() {
+        check_tracked_light_updates(&[
+            "pile_fresh_snow",
+            "pile_fresh_hay",
+            "pile_fresh_ice",
+            "pile_fresh_lantern",
+            "pile_fresh_empty_snow",
+            "pile_fresh_empty_lantern",
+        ]);
+    }
+
+    fn check_tracked_light_updates(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -10571,25 +10606,7 @@ mod tests {
         let path = temp.path().join("leaf.json");
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
         let registry = resources.vanilla_generated_block_registry().unwrap();
-        for mode in [
-            "tree_fresh_log",
-            "tree_fresh_leaf",
-            "tree_fresh_birch_log",
-            "tree_fresh_birch_leaf",
-            "tree_fresh_empty",
-            "patch_fresh_clay_water",
-            "column_fresh_water_dripleaf",
-            "patch_fresh_waterlog_dripleaf",
-            "patch_fresh_dripleaf_sequence",
-            "log_active_sparse_column",
-            "leaf_active",
-            "leaf_active_full",
-            "leaf_active_many",
-            "log_active_full",
-            "log_active_sparse",
-            "log_active_sparse_twice",
-            "log_active_sparse_missing",
-        ] {
+        for &mode in modes {
             let output = Command::new(java.join("java.exe"))
                 .arg("-classpath")
                 .arg(&cp)
@@ -10625,7 +10642,7 @@ mod tests {
             if mode == "log_active_sparse_missing" {
                 world.chunks.remove(&ChunkPos { x: -2, z: 0 });
             }
-            if mode == "tree_fresh_empty" {
+            if mode == "tree_fresh_empty" || mode.starts_with("pile_fresh_empty_") {
                 let air = world.intern_state(state("air"));
                 let section = Arc::make_mut(
                     Arc::make_mut(world.chunks.get_mut(&east).unwrap())
@@ -10674,7 +10691,11 @@ mod tests {
                 let dripleaf = world.intern_state(dripleaf);
                 world.set_block_id(16, 10, 8, dripleaf).unwrap();
             }
-            let registered: Vec<_> = if mode != "leaf_active" {
+            let registered: Vec<_> = if mode.starts_with("pile_fresh_") {
+                (-2..=2)
+                    .flat_map(|z| (-2..=2).map(move |x| ChunkPos { x, z }))
+                    .collect()
+            } else if mode != "leaf_active" {
                 (-1..=1)
                     .flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }))
                     .collect()
@@ -10727,6 +10748,7 @@ mod tests {
                 tracker.initialize_chunk(&terrain, pos, &registry).unwrap();
             }
             if mode.starts_with("tree_fresh_")
+                || mode.starts_with("pile_fresh_")
                 || mode == "patch_fresh_clay_water"
                 || mode == "column_fresh_water_dripleaf"
                 || mode == "patch_fresh_waterlog_dripleaf"
@@ -10736,25 +10758,43 @@ mod tests {
                 let before = tracker
                     .snapshot(&terrain, [center, east], &registry)
                     .unwrap();
-                let mut block = state(
-                    if mode == "column_fresh_water_dripleaf"
-                        || mode == "patch_fresh_waterlog_dripleaf"
-                        || mode == "patch_fresh_dripleaf_sequence"
-                    {
-                        "big_dripleaf"
-                    } else if mode == "patch_fresh_clay_water" {
-                        "water"
-                    } else if mode == "tree_fresh_birch_log" {
-                        "birch_log"
-                    } else if mode == "tree_fresh_birch_leaf" {
-                        "birch_leaves"
-                    } else if mode.ends_with("log") || mode.ends_with("empty") {
-                        "dark_oak_log"
+                let mut block = state(if mode.starts_with("pile_fresh_") {
+                    if mode.ends_with("_snow") {
+                        "snow"
+                    } else if mode.ends_with("_hay") {
+                        "hay_block"
+                    } else if mode.ends_with("_ice") {
+                        "blue_ice"
                     } else {
-                        "dark_oak_leaves"
-                    },
-                );
-                block.properties = if mode == "column_fresh_water_dripleaf"
+                        "jack_o_lantern"
+                    }
+                } else if mode == "column_fresh_water_dripleaf"
+                    || mode == "patch_fresh_waterlog_dripleaf"
+                    || mode == "patch_fresh_dripleaf_sequence"
+                {
+                    "big_dripleaf"
+                } else if mode == "patch_fresh_clay_water" {
+                    "water"
+                } else if mode == "tree_fresh_birch_log" {
+                    "birch_log"
+                } else if mode == "tree_fresh_birch_leaf" {
+                    "birch_leaves"
+                } else if mode.ends_with("log") || mode.ends_with("empty") {
+                    "dark_oak_log"
+                } else {
+                    "dark_oak_leaves"
+                });
+                block.properties = if mode.starts_with("pile_fresh_") {
+                    if mode.ends_with("_snow") {
+                        BTreeMap::from([("layers".into(), "1".into())])
+                    } else if mode.ends_with("_hay") {
+                        BTreeMap::from([("axis".into(), "y".into())])
+                    } else if mode.ends_with("_lantern") {
+                        BTreeMap::from([("facing".into(), "north".into())])
+                    } else {
+                        BTreeMap::new()
+                    }
+                } else if mode == "column_fresh_water_dripleaf"
                     || mode == "patch_fresh_waterlog_dripleaf"
                     || mode == "patch_fresh_dripleaf_sequence"
                 {
@@ -10792,7 +10832,10 @@ mod tests {
                     new_nonempty_sections: Vec::new(),
                     non_air_counts: BTreeMap::new(),
                 });
-                if mode == "column_fresh_water_dripleaf" || mode == "patch_fresh_dripleaf_sequence"
+                if mode.starts_with("pile_fresh_") {
+                    BlockPileWorld::set_pile_block(&mut draft, [16, 10, 8], &block).unwrap();
+                } else if mode == "column_fresh_water_dripleaf"
+                    || mode == "patch_fresh_dripleaf_sequence"
                 {
                     assert!(draft.set_column_block([16, 10, 8], &block).unwrap());
                     if mode == "patch_fresh_dripleaf_sequence" {
@@ -10816,7 +10859,20 @@ mod tests {
                 let active = engine
                     .activate(&terrain, center, [center, east], &registry)
                     .unwrap();
-                for (stage, snapshot) in [&before, &after, &active].into_iter().enumerate() {
+                let east_active = if mode.starts_with("pile_fresh_") {
+                    Some(
+                        engine
+                            .activate(&terrain, east, [center, east], &registry)
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let mut snapshots = vec![&before, &after, &active];
+                if let Some(snapshot) = &east_active {
+                    snapshots.push(snapshot);
+                }
+                for (stage, snapshot) in snapshots.into_iter().enumerate() {
                     for (index, chunk) in [center, east].into_iter().enumerate() {
                         for y in -16..32 {
                             for z in 0..16 {

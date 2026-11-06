@@ -6400,7 +6400,9 @@ impl LakeWorld for DecorationRegion<'_> {
             }
             let old = self.read(pos)?;
             ensure!(
-                disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
+                disk_safe_solid(&old.name).is_some()
+                    || simple_plant_kind(&old).is_ok()
+                    || (old.name == "minecraft:deepslate_iron_ore" && old.properties.is_empty()),
                 "unsupported lake source effects at {pos:?}: {old:?} -> {state:?}"
             );
             self.lake_block_write = true;
@@ -10725,6 +10727,15 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_lake_iron_ore_replacement_matches_java_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_iron_ore_stone",
+            "vine_active_self_lake_iron_ore_stone",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -10828,7 +10839,9 @@ mod tests {
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
             if mode.contains("_lake_") {
-                let mut source = state(if mode.contains("_deepslate_") {
+                let mut source = state(if mode.contains("_iron_ore_") {
+                    "deepslate_iron_ore"
+                } else if mode.contains("_deepslate_") {
                     "deepslate"
                 } else {
                     "stone"
@@ -10903,7 +10916,13 @@ mod tests {
             for (i, p) in positions.iter().copied().enumerate() {
                 if mode.contains("_lake_") {
                     let lava = mode.ends_with("_lava") || (mode.ends_with("_mixed") && i == 1);
-                    let mut block = state(if lava { "lava" } else { "cave_air" });
+                    let mut block = state(if mode.ends_with("_stone") {
+                        "stone"
+                    } else if lava {
+                        "lava"
+                    } else {
+                        "cave_air"
+                    });
                     if lava {
                         block.properties.insert("level".into(), "0".into());
                     }
@@ -10954,7 +10973,9 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_lake_") && mode.ends_with("_mixed") {
+            let expected_checks = if mode.contains("_iron_ore_") {
+                0
+            } else if mode.contains("_lake_") && mode.ends_with("_mixed") {
                 3
             } else if mode.ends_with("_many") {
                 2

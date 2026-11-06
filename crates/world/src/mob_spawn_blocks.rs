@@ -81,6 +81,21 @@ pub fn common_mob_spawn_block_facts(state: &BlockState) -> Option<MobSpawnBlockF
         {
             (false, false, true, true, false, true, false)
         }
+        "minecraft:brown_mushroom_block"
+        | "minecraft:red_mushroom_block"
+        | "minecraft:mushroom_stem"
+            if state.properties.len() == 6
+                && ["down", "up", "north", "south", "west", "east"]
+                    .into_iter()
+                    .all(|key| {
+                        matches!(
+                            state.properties.get(key).map(String::as_str),
+                            Some("false" | "true")
+                        )
+                    }) =>
+        {
+            (false, false, true, true, false, true, false)
+        }
         "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
             if property("lit", &["false", "true"]) =>
         {
@@ -186,6 +201,14 @@ mod tests {
         // Entity immunity is controlled by active block tags.
         assert!(common_mob_spawn_block_facts(&state).is_none());
         state.name = "example:custom".into();
+        assert!(common_mob_spawn_block_facts(&state).is_none());
+        state.name = "minecraft:brown_mushroom_block".into();
+        state.properties = ["down", "up", "north", "south", "west", "east"]
+            .into_iter()
+            .map(|face| (face.into(), "true".into()))
+            .collect();
+        assert!(common_mob_spawn_block_facts(&state).unwrap().valid_support);
+        state.properties.insert("up".into(), "invalid".into());
         assert!(common_mob_spawn_block_facts(&state).is_none());
     }
 }

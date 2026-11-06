@@ -150,7 +150,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean registerAfter=args.length>1 && args[1].startsWith("tree_empty_partial_register");
         w.emptyWest=registerAfter && args[1].endsWith("_empty");
         boolean emptyPartialWide=args.length>1 && (args[1].equals("tree_empty_partial_wide") || registerAfter);
-        boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && args[1].equals("log_active_sparse_wide"));
+        boolean skyWide=skyShadow || skyDark || emptyFullWide || emptyPartialWide || (args.length>1 && (args[1].equals("log_active_sparse_wide") || args[1].equals("log_active_sparse_litter_wide")));
         boolean treeSparse=args.length>1 && (args[1].startsWith("log_active_sparse") || skyShadow || skyDark);
         boolean treeEmptyFull=args.length>1 && (args[1].equals("tree_empty_full") || emptyFullWide || emptyPartialWide);
         boolean treeFreshEmpty=args.length>1 && args[1].equals("tree_fresh_empty");
@@ -193,6 +193,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==2 && z==0) farSection=fake;
             if(!((treeEmpty || treeSparse || vineActiveEmpty) && x==1 && z==0) && !(w.emptyWest && x==-1 && z==0)) for(int y=0;y<8;y++) for(int lz=0;lz<16;lz++) for(int lx=0;lx<16;lx++) fake.section.setBlockState(lx,y,lz,Blocks.STONE.defaultBlockState());
             if(treeSparse && x==1 && z==0) fake.section.setBlockState(w.sparseColumn || skyShadow?0:15,skyShadow?11:0,w.sparseColumn || skyShadow?8:0,Blocks.STONE.defaultBlockState());
+            if(args.length>1 && args[1].equals("log_active_sparse_litter_wide") && x==1 && z==0) {
+                var pos=new BlockPos(16,10,8); var litter=Blocks.LEAF_LITTER.defaultBlockState();
+                fake.section.setBlockState(0,10,8,litter); w.edits.put(pos,litter);
+            }
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
             if(x==1 && z==0 && !blockCase && !magma && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && patchFreshWater) {

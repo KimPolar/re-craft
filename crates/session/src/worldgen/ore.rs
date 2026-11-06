@@ -6496,7 +6496,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let new_air = super::generated_state_is_air(guard.registry, state)
                         .context("registered light new state is unknown")?;
                     let tree_light_update = self.tree_block_write
-                        && old_air
+                        && (old_air || tree_leaf_litter(&old)?)
                         && (!guard.require_unchanged_light
                             || !matches!(
                                 state.name.as_str(),
@@ -10376,6 +10376,7 @@ mod tests {
         let registry = resources.vanilla_generated_block_registry().unwrap();
         for mode in [
             "log_active_sparse_wide",
+            "log_active_sparse_litter_wide",
             "tree_empty_full_wide",
             "tree_empty_partial_wide",
             "tree_empty_partial_register",
@@ -10440,9 +10441,18 @@ mod tests {
                 );
                 section.blocks.as_mut().unwrap().fill(air);
             }
-            if mode == "log_active_sparse_wide" {
+            if mode == "log_active_sparse_wide" || mode == "log_active_sparse_litter_wide" {
                 let stone = world.intern_state(state("stone"));
                 world.set_block_id(31, 0, 0, stone).unwrap();
+            }
+            if mode == "log_active_sparse_litter_wide" {
+                let mut litter = state("leaf_litter");
+                litter.properties = BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("segment_amount".into(), "1".into()),
+                ]);
+                let id = world.intern_state(litter);
+                world.set_block_id(16, 10, 8, id).unwrap();
             }
             let registered: Vec<_> =
                 if mode == "tree_empty_full_activate" || mode == "tree_empty_active_wide" {

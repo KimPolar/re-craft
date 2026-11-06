@@ -57,7 +57,16 @@ pub enum PieceProcessors {
 enum PlacementElement {
     Empty,
     Single(PreparedTemplatePiece),
+    Feature {
+        placed: Arc<super::ore::PlacedDecorationFeature>,
+        origin: [i32; 3],
+    },
     List(Vec<PlacementElement>),
+}
+
+pub(super) enum JigsawElement<'a> {
+    Template(&'a PreparedTemplatePiece),
+    Feature(&'a super::ore::PlacedDecorationFeature, [i32; 3]),
 }
 
 /// Prepared immutable start and its pieces, in the order used by Java.
@@ -90,6 +99,7 @@ impl PreparedJigsawPlacement {
                 &piece.element,
                 processor,
                 provider,
+                registry,
                 &mut templates,
                 0,
             )?);
@@ -125,7 +135,7 @@ impl PreparedJigsawPlacement {
         clip: native_core::beardifier::BoundingBox,
         random: &mut native_core::random::DecorationRandom,
         mut place: impl FnMut(
-            &PreparedTemplatePiece,
+            JigsawElement<'_>,
             LiquidSettings,
             &mut native_core::random::DecorationRandom,
         ) -> Result<bool>,
@@ -149,22 +159,55 @@ impl PreparedJigsawPlacement {
         *random = next_random;
         Ok(count)
     }
+
+    pub(super) fn features(&self) -> Vec<&super::ore::PlacedDecorationFeature> {
+        let mut features = Vec::new();
+        for piece in &self.pieces {
+            piece.collect_features(&mut features);
+        }
+        features
+    }
+
+    pub(super) fn has_features(&self) -> bool {
+        self.pieces.iter().any(PlacementElement::has_features)
+    }
 }
 
 impl PlacementElement {
+    fn has_features(&self) -> bool {
+        match self {
+            Self::Feature { .. } => true,
+            Self::List(elements) => elements.iter().any(Self::has_features),
+            _ => false,
+        }
+    }
+    fn collect_features<'a>(&'a self, features: &mut Vec<&'a super::ore::PlacedDecorationFeature>) {
+        match self {
+            Self::Feature { placed, .. } => features.push(placed),
+            Self::List(elements) => {
+                for element in elements {
+                    element.collect_features(features);
+                }
+            }
+            _ => {}
+        }
+    }
     fn place(
         &self,
         liquids: LiquidSettings,
         random: &mut native_core::random::DecorationRandom,
         place: &mut impl FnMut(
-            &PreparedTemplatePiece,
+            JigsawElement<'_>,
             LiquidSettings,
             &mut native_core::random::DecorationRandom,
         ) -> Result<bool>,
     ) -> Result<bool> {
         match self {
             Self::Empty => Ok(true),
-            Self::Single(piece) => place(piece, liquids, random),
+            Self::Single(piece) => place(JigsawElement::Template(piece), liquids, random),
+            Self::Feature { placed, origin } => {
+                place(JigsawElement::Feature(placed, *origin), liquids, random)
+            }
             Self::List(elements) => {
                 for element in elements {
                     if !element.place(liquids, random, place)? {
@@ -182,6 +225,7 @@ fn prepare_placement_element(
     element: &PoolElement,
     processors: &PieceProcessors,
     provider: &mut impl ResourceProvider,
+    registry: &native_resources::block_registry::GeneratedBlockRegistry,
     templates: &mut BTreeMap<
         ResourceId,
         Arc<native_persistence::structure_template::StructureTemplate>,
@@ -231,6 +275,7 @@ fn prepare_placement_element(
                             element,
                             processor,
                             provider,
+                            registry,
                             templates,
                             depth + 1,
                         )
@@ -238,8 +283,27 @@ fn prepare_placement_element(
                     .collect::<Result<Vec<_>>>()?,
             )
         }
-        (PoolElement::Feature { .. }, PieceProcessors::Feature) => {
-            anyhow::bail!("jigsaw feature element placement is not yet supported")
+        (PoolElement::Feature { feature, .. }, PieceProcessors::Feature) => {
+            let mut resolve = |value: &Value| {
+                let (name, properties) = registry.resolve(value)?;
+                Ok(native_world::loaded::BlockState { name, properties })
+            };
+            let placed = match feature {
+                native_resources::structure_pool::HolderValue::Reference(id) => {
+                    super::ore::PlacedDecorationFeature::load(provider, id, &mut resolve)?
+                }
+                native_resources::structure_pool::HolderValue::Inline(value) => {
+                    super::ore::PlacedDecorationFeature::from_placement(
+                        provider,
+                        native_resources::placed_feature::PlacedFeature::decode(value)?,
+                        &mut resolve,
+                    )?
+                }
+            };
+            PlacementElement::Feature {
+                placed: Arc::new(placed),
+                origin: piece.origin,
+            }
         }
         _ => anyhow::bail!("jigsaw processors do not match their element"),
     })

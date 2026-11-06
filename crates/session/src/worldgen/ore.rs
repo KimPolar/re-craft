@@ -180,6 +180,19 @@ pub(super) struct PreparedJigsawResources<'a> {
 }
 
 impl<'a> PreparedJigsawResources<'a> {
+    pub(super) fn features(&self) -> Vec<&PlacedDecorationFeature> {
+        self.starts
+            .values()
+            .flat_map(|start| start.features())
+            .collect()
+    }
+
+    pub(super) fn has_features(&self, key: &super::structure_batch::TerrainStartKey) -> bool {
+        self.starts
+            .get(key)
+            .is_none_or(|start| start.has_features())
+    }
+
     pub(super) fn load(
         plan: &[PlannedMixedStructureDecoration<'_>],
         provider: &mut impl ResourceProvider,
@@ -498,6 +511,7 @@ pub struct DecorationRegion<'a> {
     tags: &'a OreBlockTags,
     motion: &'a HeightmapTags,
     writable: BTreeSet<ChunkPos>,
+    jigsaw_feature_bounds: Option<(i32, i32)>,
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     final_heights: BTreeMap<ChunkPos, Arc<FinalHeightmaps>>,
@@ -1252,6 +1266,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
         needs_mineshaft: bool,
     ) -> Result<Self> {
+        Self::load_with_jigsaw_features(
+            provider,
+            plan,
+            block_registry,
+            resolve,
+            needs_mineshaft,
+            &[],
+        )
+    }
+
+    pub(super) fn load_with_jigsaw_features(
+        provider: &mut impl ResourceProvider,
+        plan: &'p DecorationPlan<'s>,
+        block_registry: &BTreeSet<String>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        needs_mineshaft: bool,
+        jigsaw_features: &[&PlacedDecorationFeature],
+    ) -> Result<Self> {
         let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
         let mut needs_sugar_cane = false;
@@ -1297,6 +1329,21 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 features.insert(selected.feature.clone(), feature);
             }
         }
+        for feature in jigsaw_features {
+            needs_sugar_cane |= feature.needs_survival("sugar_cane");
+            needs_cactus |= feature.needs_survival("cactus") || feature.feature.needs_root_system();
+            needs_water_fluids |= feature.needs_water_fluids();
+            needs_tree_edges |= feature.feature.needs_tree_edges();
+            for id in feature.required_blocks() {
+                ensure!(
+                    block_registry.contains(&format!("{}:{}", id.namespace, id.path)),
+                    "jigsaw feature predicate references an unregistered block {}:{}",
+                    id.namespace,
+                    id.path
+                );
+            }
+            required.extend(feature.required_tags());
+        }
         if needs_mineshaft {
             required.insert(ResourceId::parse("minecraft:unstable_bottom_center")?);
         }
@@ -1319,10 +1366,15 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             feature
                 .placed
                 .needs_freeze(lake_water_fluids.as_ref().unwrap_or(&empty_fluids))
+        }) || jigsaw_features.iter().any(|feature| {
+            feature.needs_freeze(lake_water_fluids.as_ref().unwrap_or(&empty_fluids))
         });
         let needs_snow_support = features
             .values()
-            .any(|feature| feature.placed.feature.needs_snow_support());
+            .any(|feature| feature.placed.feature.needs_snow_support())
+            || jigsaw_features
+                .iter()
+                .any(|feature| feature.feature.needs_snow_support());
         let bubble_column_fluids = needs_tree_edges
             .then(|| native_resources::fluid_tags::load_bubble_column_occupiable(provider))
             .transpose()?;
@@ -2182,6 +2234,8 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
         }
         let mut region = terrain.decoration_region(&self.tags, &self.motion, writable)?;
+        region.jigsaw_feature_bounds =
+            Some((self.plan.generator_min_y, self.plan.generator_height));
         let guard_inputs = match &light_tracking {
             Some(DecorationLightTracking::Fresh(tracker, registry)) => {
                 Some((&**tracker, *registry, false))
@@ -3102,6 +3156,7 @@ impl CarvedTerrainWorld {
             tags,
             motion,
             writable,
+            jigsaw_feature_bounds: None,
             heights,
             surface_heights,
             final_heights,

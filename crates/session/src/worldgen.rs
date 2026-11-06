@@ -7784,6 +7784,7 @@ mod tests {
             vanilla: native_resources::packs::ResourceStack,
             template: Vec<u8>,
             terrain_matching: bool,
+            feature_kind: u8,
         }
         impl ResourceProvider for FixtureData {
             fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -7797,8 +7798,32 @@ mod tests {
                     "data/example/worldgen/structure_set/test.json" => Some(
                         json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:test","weight":1}]}),
                     ),
-                    "data/example/worldgen/template_pool/test.json" => Some(
-                        json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":{"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":if self.terrain_matching { "terrain_matching" } else { "rigid" }}}]}),
+                    "data/example/worldgen/template_pool/test.json" => {
+                        let projection = if self.terrain_matching {
+                            "terrain_matching"
+                        } else {
+                            "rigid"
+                        };
+                        let element = match self.feature_kind {
+                            1 => {
+                                json!({"element_type":"minecraft:feature_pool_element","feature":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[]},"projection":projection})
+                            }
+                            2 => {
+                                json!({"element_type":"minecraft:feature_pool_element","feature":"example:test","projection":projection})
+                            }
+                            3 => {
+                                json!({"element_type":"minecraft:feature_pool_element","feature":{"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_block_tag","tag":"minecraft:dirt"}}]},"projection":projection})
+                            }
+                            _ => {
+                                json!({"element_type":"minecraft:single_pool_element","location":"example:test","processors":"minecraft:empty","projection":projection})
+                            }
+                        };
+                        Some(
+                            json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":element}]}),
+                        )
+                    }
+                    "data/example/worldgen/placed_feature/test.json" => Some(
+                        json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[]}),
                     ),
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
@@ -7831,18 +7856,21 @@ mod tests {
             element_type,
             values,
         };
-        for (unsupported, terrain_matching, block_name) in [
-            (false, false, "minecraft:stone_bricks"),
-            (true, false, "minecraft:stone_bricks"),
-            (false, true, "minecraft:stone_bricks"),
-            (true, true, "minecraft:stone_bricks"),
-            (false, false, "minecraft:chest"),
-            (false, true, "minecraft:chest"),
-            (false, false, "minecraft:deepslate"),
-            (false, true, "minecraft:deepslate"),
-            (false, false, "minecraft:gray_wool"),
-            (false, false, "minecraft:deepslate_tile_slab"),
-            (false, true, "minecraft:deepslate_tile_slab"),
+        for (unsupported, terrain_matching, block_name, feature_kind) in [
+            (false, false, "minecraft:stone_bricks", 0),
+            (true, false, "minecraft:stone_bricks", 0),
+            (false, true, "minecraft:stone_bricks", 0),
+            (true, true, "minecraft:stone_bricks", 0),
+            (false, false, "minecraft:chest", 0),
+            (false, true, "minecraft:chest", 0),
+            (false, false, "minecraft:deepslate", 0),
+            (false, true, "minecraft:deepslate", 0),
+            (false, false, "minecraft:gray_wool", 0),
+            (false, false, "minecraft:deepslate_tile_slab", 0),
+            (false, true, "minecraft:deepslate_tile_slab", 0),
+            (false, false, "minecraft:melon", 1),
+            (false, true, "minecraft:melon", 2),
+            (false, false, "minecraft:melon", 3),
         ] {
             let chest = block_name == "minecraft:chest";
             let mut block = vec![
@@ -7902,6 +7930,7 @@ mod tests {
                 vanilla,
                 template: encoder.finish()?,
                 terrain_matching,
+                feature_kind,
             };
             let (generator, terrain_generator) = TerrainGenerator::paired_with_structure_context(
                 &mut data,
@@ -7946,7 +7975,7 @@ mod tests {
             let mut origin =
                 structures.jigsaw_starts(target).context("missing jigsaw")?[&structure].pieces[0]
                     .origin;
-            if terrain_matching {
+            if terrain_matching && feature_kind == 0 {
                 origin[1] = 15;
             }
             let tags = CarverBlockTags::load(&mut data, &blocks)?;
@@ -8026,9 +8055,13 @@ mod tests {
                         .name,
                     block_name
                 );
-                assert!(batch.structure_data(target).is_ok());
-                assert!(
-                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
+                assert_eq!(
+                    batch.structure_data(target).is_ok(),
+                    feature_kind == 0 || feature_kind == 2
+                );
+                assert_eq!(
+                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target)),
+                    feature_kind == 0
                 );
             }
         }

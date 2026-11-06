@@ -4303,12 +4303,46 @@ impl FreshTerrainBatch {
                     .map(|structures| structures.has_mineshaft_reference(pos))
                     .transpose()?
                     .unwrap_or(false);
-                let prepared = PreparedDecoration::load_with_mineshaft(
+                let jigsaws = if let Some(structures) = &self.structures {
+                    let registry = config
+                        .structures
+                        .as_ref()
+                        .context("structure decoration registry is missing")?;
+                    let planned = structures.mixed_decoration_plan_with_jigsaw(pos, registry)?;
+                    if planned.iter().any(|entry| {
+                        entry.starts.iter().any(|start| {
+                            matches!(
+                                start,
+                                super::structure_batch::PlannedStructureStart::Jigsaw(_)
+                            )
+                        })
+                    }) {
+                        let registry = self
+                            .light_registry
+                            .as_ref()
+                            .context("jigsaw block registry is missing")?;
+                        Some(super::ore::PreparedJigsawResources::load(
+                            &planned,
+                            provider,
+                            &config.block_registry,
+                            registry,
+                        )?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let jigsaw_features = jigsaws
+                    .as_ref()
+                    .map_or_else(Vec::new, |resources| resources.features());
+                let prepared = PreparedDecoration::load_with_jigsaw_features(
                     provider,
                     &plan,
                     &config.block_registry,
                     resolve,
                     needs_mineshaft,
+                    &jigsaw_features,
                 )?;
                 let terrain = self
                     .terrain
@@ -4366,30 +4400,20 @@ impl FreshTerrainBatch {
                                     else {
                                         return None;
                                     };
-                                    Some((
+                                    let key = (
                                         entry.entry.id.clone(),
                                         ChunkPos {
                                             x: start.chunk[0],
                                             z: start.chunk[1],
                                         },
-                                    ))
+                                    );
+                                    jigsaws
+                                        .as_ref()
+                                        .filter(|resources| !resources.has_features(&key))
+                                        .map(|_| key)
                                 })
                             })
                             .collect();
-                        let jigsaws = if has_jigsaw {
-                            let registry = self
-                                .light_registry
-                                .as_ref()
-                                .context("jigsaw block registry is missing")?;
-                            Some(super::ore::PreparedJigsawResources::load(
-                                &planned,
-                                provider,
-                                &config.block_registry,
-                                registry,
-                            )?)
-                        } else {
-                            None
-                        };
                         let mut hut_states: BTreeMap<_, _> = keys
                             .iter()
                             .flatten()

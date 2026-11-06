@@ -6,7 +6,8 @@ use native_resources::{block_registry::GeneratedBlockRegistry, structure_pool::L
 use native_world::fluid::{FluidKind, FluidState};
 
 use super::super::jigsaw::{
-    JigsawPlacementWorld, PreparedJigsawPlacement, PreparedStart, PreparedTemplatePiece,
+    JigsawElement, JigsawPlacementWorld, PreparedJigsawPlacement, PreparedStart,
+    PreparedTemplatePiece,
 };
 
 struct JigsawRegion<'r, 'a, 'g> {
@@ -260,8 +261,16 @@ impl DecorationRegion<'_> {
         random: &mut DecorationRandom,
     ) -> Result<usize> {
         ensure!(!self.failed, "generation attempt previously failed");
-        let result = prepared.place_with(start, clip, random, |piece, liquids, next| {
-            self.place_rigid_jigsaw_piece(piece, registry, clip, liquids, next)
+        let result = prepared.place_with(start, clip, random, |piece, liquids, next| match piece {
+            JigsawElement::Template(piece) => {
+                self.place_rigid_jigsaw_piece(piece, registry, clip, liquids, next)
+            }
+            JigsawElement::Feature(feature, origin) => {
+                let (min_y, height) = self
+                    .jigsaw_feature_bounds
+                    .context("jigsaw feature generator bounds are missing")?;
+                self.place_nested(feature, next, origin, min_y, height)
+            }
         });
         if result.is_err() {
             self.failed = true;
@@ -499,8 +508,9 @@ mod tests {
             .output()?;
         ensure!(
             output.status.success(),
-            "Java oracle failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
         );
         let expected_line =
             format!("CHEST\tminecraft:chests/village/village_armorer\t{seed}\t{next_random}");
@@ -744,6 +754,169 @@ mod tests {
                 if kind == "double" { "false" } else { "true" }
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
+    fn feature_pool_placement_and_random_match_java() -> Result<()> {
+        use super::super::super::jigsaw::{PreparedJigsawPlacement, PreparedStart};
+        use native_core::beardifier::TerrainAdjustment;
+        use std::{path::PathBuf, process::Command};
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home is missing")?
+            .join("bin");
+        let source = temp.path().join("JigsawFeatureOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/JigsawFeatureOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("JigsawFeatureOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let mut data = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = data.vanilla_block_ids()?;
+        let registry = data.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut data, &blocks)?;
+        let origin = [1, 8, 1];
+        let start = PreparedStart {
+            chunk: [0, 0],
+            generation_point: origin,
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![Piece {
+                element: PoolElement::Feature {
+                    feature: HolderValue::Inline(
+                        serde_json::json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:count","count":3},{"type":"minecraft:in_square"}]}),
+                    ),
+                    projection: Projection::Rigid,
+                },
+                origin,
+                rotation: Rotation::Clockwise90,
+                bounds: BoundingBox::new(origin, origin).map_err(anyhow::Error::msg)?,
+                ground_level_delta: 0,
+                junctions: vec![],
+            }],
+        };
+        let prepared = PreparedJigsawPlacement::load(&start, &mut data, &blocks, &registry)?;
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let mut cases = Vec::<(i64, i64, usize, BTreeSet<[i32; 3]>)>::new();
+        for line in String::from_utf8(output.stdout)?.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["CASE", seed, result, next, count] => {
+                    assert_eq!(*result, "true");
+                    cases.push((
+                        seed.parse()?,
+                        next.parse()?,
+                        count.parse()?,
+                        BTreeSet::new(),
+                    ));
+                }
+                ["WRITE", x, y, z] => {
+                    cases.last_mut().context("write before case")?.3.insert([
+                        x.parse()?,
+                        y.parse()?,
+                        z.parse()?,
+                    ]);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cases.len(), 4);
+        for (seed, next, count, expected) in cases {
+            assert_eq!(count, 3);
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            region.jigsaw_feature_bounds = Some((0, 16));
+            let mut random = DecorationRandom::new(seed);
+            assert_eq!(
+                region.place_jigsaw_start(&prepared, &start, &registry, clip, &mut random)?,
+                1
+            );
+            assert_eq!(random.next_long(), next);
+            region.finish()?;
+            let world = terrain.snapshot();
+            let mut actual = BTreeSet::new();
+            for z in 1..=16 {
+                for x in 1..=16 {
+                    if world.block(x, 8, z).context("missing block")?.name == "minecraft:melon" {
+                        actual.insert([x, 8, z]);
+                    }
+                }
+            }
+            assert_eq!(actual, expected, "seed {seed}");
+        }
+        let mut failing = start.clone();
+        failing.pieces[0].element = PoolElement::List {
+            elements: vec![
+                start.pieces[0].element.clone(),
+                PoolElement::Feature {
+                    feature: HolderValue::Inline(
+                        serde_json::json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:stone"}},"placement":[]}),
+                    ),
+                    projection: Projection::Rigid,
+                },
+            ],
+            projection: Projection::Rigid,
+        };
+        let prepared = PreparedJigsawPlacement::load(&failing, &mut data, &blocks, &registry)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        region.jigsaw_feature_bounds = Some((0, 16));
+        let mut random = DecorationRandom::new(42);
+        let mut original = random.clone();
+        assert!(
+            region
+                .place_jigsaw_start(&prepared, &failing, &registry, clip, &mut random)
+                .is_err()
+        );
+        assert_eq!(random.next_long(), original.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
         Ok(())
     }
     #[test]

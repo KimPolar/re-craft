@@ -282,6 +282,26 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (u8::from(boolean("waterlogged")?), 0)
         }
+        "minecraft:rail" if state.properties.len() == 2 => {
+            if !matches!(
+                state.properties.get("shape").map(String::as_str),
+                Some(
+                    "north_south"
+                        | "east_west"
+                        | "ascending_east"
+                        | "ascending_west"
+                        | "ascending_north"
+                        | "ascending_south"
+                        | "south_east"
+                        | "south_west"
+                        | "north_west"
+                        | "north_east"
+                )
+            ) {
+                return None;
+            }
+            (u8::from(boolean("waterlogged")?), 0)
+        }
         name if name == "minecraft:lever"
             || native_core::button::Button::from_id(name).is_some() =>
         {
@@ -1282,6 +1302,19 @@ mod tests {
         assert!(same_light_behavior(&blossom, &state("air", None)).unwrap());
         blossom.properties.insert("unknown".into(), "true".into());
         assert!(light_properties(&blossom).is_none());
+    }
+
+    #[test]
+    fn rails_attenuate_light_when_waterlogged_and_reject_invalid_shapes() {
+        let mut rail = state("rail", None);
+        rail.properties.insert("shape".into(), "north_south".into());
+        rail.properties.insert("waterlogged".into(), "false".into());
+        assert_eq!(properties(&rail), Some((0, 0)));
+        assert_eq!(same_light_behavior(&rail, &state("air", None)), Some(true));
+        rail.properties.insert("waterlogged".into(), "true".into());
+        assert_eq!(properties(&rail), Some((1, 0)));
+        rail.properties.insert("shape".into(), "invalid".into());
+        assert!(light_properties(&rail).is_none());
     }
 
     #[test]
@@ -2314,6 +2347,7 @@ mod tests {
             "fern",
             "vine",
             "cobweb",
+            "rail",
             "oak_log",
             "oak_planks",
             "oak_leaves",

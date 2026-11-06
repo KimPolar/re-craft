@@ -1677,6 +1677,10 @@ impl GeneratedBlockView<'_> {
             let p = target + glam::IVec3::from_array(d);
             let state = self.read(p.to_array())?;
             ensure!(
+                d != [0, -1, 0] || !snowy_fluid_barrier(&state),
+                "water change needs snowy surface shape callback"
+            );
+            ensure!(
                 matches!(
                     self.fluid_cell(p),
                     Cell::Air
@@ -1806,6 +1810,10 @@ impl GeneratedBlockView<'_> {
                 pos[2].wrapping_add(d[2]),
             ];
             let state = self.read(neighbor)?;
+            ensure!(
+                d != [0, -1, 0] || !snowy_fluid_barrier(&state),
+                "fence change needs snowy surface shape callback"
+            );
             let cell = self.fluid_cell(glam::IVec3::from_array(neighbor));
             ensure!(
                 matches!(
@@ -6551,6 +6559,52 @@ mod tests {
         assert!(message.contains("IVec3(8, 8, 8)"));
         assert!(stage.finish().is_err());
         assert_eq!(original.block(8, 7, 8).unwrap().name, "minecraft:air");
+    }
+
+    #[test]
+    fn water_spread_rejects_unhandled_snowy_surface_callback() {
+        let (mut stage, _, chunk) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let stone = world.block_id(0, 0, 0).unwrap();
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let water = world.intern_state(BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        });
+        let grass = world.intern_state(BlockState {
+            name: "minecraft:grass_block".into(),
+            properties: BTreeMap::from([("snowy".into(), "true".into())]),
+        });
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(stone);
+        world.set_block_id(8, 8, 8, water).unwrap();
+        world.set_block_id(8, 7, 8, air).unwrap();
+        world.set_block_id(8, 6, 8, grass).unwrap();
+        let source = Arc::clone(&stage.world);
+        stage.set_water_source_conversion(true).unwrap();
+        stage.set_fluid_tags(
+            Some(Arc::new(BTreeSet::from([
+                "minecraft:air".into(),
+                "minecraft:water".into(),
+            ]))),
+            Some(Arc::new(BTreeSet::from(["minecraft:lava".into()]))),
+        );
+        let error = stage.poll(chunk, 1).unwrap_err();
+        assert!(format!("{error:#}").contains("water change needs snowy surface shape callback"));
+        assert!(stage.finish().is_err());
+        assert_eq!(source.block(8, 7, 8).unwrap().name, "minecraft:air");
+        assert_eq!(source.block(8, 6, 8).unwrap().properties["snowy"], "true");
     }
 
     #[test]

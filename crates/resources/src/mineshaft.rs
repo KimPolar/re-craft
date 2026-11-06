@@ -6,10 +6,12 @@ use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 
 mod graph;
+mod placement;
 pub use graph::{
     MineshaftElevation, MineshaftGraph, MineshaftGraphPiece, MineshaftGraphPieceKind,
     PlacedMineshaft,
 };
+pub use placement::{MineshaftPlacementOutcome, MineshaftPlacementWorld, place_room_or_stairs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MineshaftVariant {

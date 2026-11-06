@@ -2845,32 +2845,25 @@ where
     let suggestion = ready
         .suggested_spawn
         .context("world spawn suggestion missing")?;
-    ensure!(border.is_valid(), "player spawn border is invalid");
-    let x = f64::from(suggestion.x);
-    let z = f64::from(suggestion.z);
+    let saved_border = validated_initial_border(border, options.saved_border)?;
+    let (x, z, adjusted) = native_session::world_spawn::border_adjusted_column(
+        suggestion,
+        border,
+        saved_border.map_or(0.0, |saved| saved.center_x),
+        saved_border.map_or(0.0, |saved| saved.center_z),
+    )?;
     ensure!(
-        x >= border.min_x && x < border.max_x && z >= border.min_z && z < border.max_z,
-        "world spawn outside the border is not supported for fresh player generation"
+        !adjusted || saved_border.is_some(),
+        "original world border center is required when spawn is outside the border"
     );
-    let distance = (x - border.min_x)
-        .min(border.max_x - x)
-        .min(z - border.min_z)
-        .min(border.max_z - z);
-    let candidates = if options.adventure {
-        None
-    } else {
-        let first = WorldSpawnCandidates::new(suggestion, options.radius, distance, 0)?;
-        let mut random = native_core::random::LegacyRandom::new(options.random_seed);
-        let offset = random
-            .next_int_bound(first.candidate_count())
-            .context("invalid player spawn candidate count")?;
-        Some(WorldSpawnCandidates::new(
-            suggestion,
-            options.radius,
-            distance,
-            offset,
-        )?)
+    let center_chunk = ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
     };
+    let distance = (f64::from(x) - border.min_x)
+        .min(border.max_x - f64::from(x))
+        .min(f64::from(z) - border.min_z)
+        .min(border.max_z - f64::from(z));
     let mut previous_search = None;
     let mut checkpoint: Option<PlayerSearchCheckpoint> = None;
     loop {
@@ -2886,41 +2879,77 @@ where
             on_ground: false,
             pose: native_session::PlayerPose::Standing,
         };
-        let (session, fresh_search) = ready.start_player_spawn_search(
-            player,
-            Arc::clone(&tags),
-            std::iter::empty(),
-            candidates.clone(),
-        )?;
-        let mut search = match (previous_search.take(), checkpoint.take()) {
-            (Some(search), Some(previous)) if previous.matches(&ready)? => {
-                let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
-                progress.player_spawn_search_resumptions =
-                    progress.player_spawn_search_resumptions.saturating_add(1);
-                search
-            }
-            _ => fresh_search,
-        };
-        let needed = loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            match ready.poll_player_spawn(&session, &mut search, ceiling_spawn_height, 256)? {
-                SpawnProgress::Pending => continue,
-                SpawnProgress::Found(pos) => {
-                    ready.player_spawn = Some(pos);
-                    return Ok(Some(ready));
+        let session = ready.prepare_session_with_spawn_heightmaps(player, Arc::clone(&tags))?;
+        let targets = ready
+            .mesh
+            .targets
+            .as_deref()
+            .context("generated targets are missing")?;
+        let needed = if adjusted && !targets.contains(&center_chunk) {
+            previous_search = None;
+            checkpoint = None;
+            center_chunk
+        } else {
+            let origin = if adjusted {
+                let y = session
+                    .generated_spawn_column_heights(x, z, targets)?
+                    .motion_blocking
+                    .checked_add(1)
+                    .context("world spawn height is out of range")?;
+                IVec3::new(x, y, z)
+            } else {
+                suggestion
+            };
+            let candidates = if options.adventure {
+                None
+            } else {
+                let first = WorldSpawnCandidates::new(origin, options.radius, distance, 0)?;
+                let mut random = native_core::random::LegacyRandom::new(options.random_seed);
+                let offset = random
+                    .next_int_bound(first.candidate_count())
+                    .context("invalid player spawn candidate count")?;
+                Some(WorldSpawnCandidates::new(
+                    origin,
+                    options.radius,
+                    distance,
+                    offset,
+                )?)
+            };
+            let fresh_search =
+                native_session::world_spawn::ResumableWorldSpawn::new(origin, candidates)?;
+            let mut search = match (previous_search.take(), checkpoint.take()) {
+                (Some((old_origin, search)), Some(previous))
+                    if old_origin == origin && previous.matches(&ready)? =>
+                {
+                    let mut progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    progress.player_spawn_search_resumptions =
+                        progress.player_spawn_search_resumptions.saturating_add(1);
+                    search
                 }
-                SpawnProgress::NeedsTerrain(pos) => break pos,
-                SpawnProgress::NeedsEntities(pos) => anyhow::bail!(
-                    "generated entity data for spawn chunk {}, {} is incomplete",
-                    pos.x,
-                    pos.z
-                ),
-            }
+                _ => fresh_search,
+            };
+            let needed = loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                match ready.poll_player_spawn(&session, &mut search, ceiling_spawn_height, 256)? {
+                    SpawnProgress::Pending => continue,
+                    SpawnProgress::Found(pos) => {
+                        ready.player_spawn = Some(pos);
+                        return Ok(Some(ready));
+                    }
+                    SpawnProgress::NeedsTerrain(pos) => break pos,
+                    SpawnProgress::NeedsEntities(pos) => anyhow::bail!(
+                        "generated entity data for spawn chunk {}, {} is incomplete",
+                        pos.x,
+                        pos.z
+                    ),
+                }
+            };
+            checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
+            previous_search = Some((origin, search));
+            needed
         };
-        checkpoint = Some(PlayerSearchCheckpoint::capture(&ready)?);
-        previous_search = Some(search);
         drop(session);
         let postprocessed = if let Some(processed) = ready.postprocessed.take() {
             let checkpoint = ready
@@ -6462,6 +6491,7 @@ mod tests {
         let mut construct = |_: &native_resources::packs::ResourceId| {
             anyhow::bail!("mob spawning should be disabled")
         };
+        let height_tags = Arc::clone(&inputs.height_tags);
         let progress = Mutex::new(GenerationProgress {
             phase: GenerationPhase::Planning,
             completed_steps: 0,
@@ -6543,6 +6573,92 @@ mod tests {
         changed.set_block_id(chest.x, chest.y, chest.z, air)?;
         assert!(!search_checkpoint.matches(&expanded)?);
         expanded.postprocessed.as_mut().unwrap().region.world = original_world;
+        // An out-of-border world spawn must first generate the border-center
+        // column and use its postprocessed motion-blocking height.
+        let current_targets = expanded.mesh.targets.as_ref().unwrap();
+        let center = [32, -32, 64, -64, 96, -96]
+            .into_iter()
+            .map(|delta| (suggestion.x + delta, suggestion.z))
+            .find(|&(x, z)| {
+                !current_targets.contains(&ChunkPos {
+                    x: x.div_euclid(16),
+                    z: z.div_euclid(16),
+                })
+            })
+            .context("fixture did not find an ungenerated border center")?;
+        let saved_border = native_persistence::world::SavedWorldBorder {
+            center_x: f64::from(center.0) + 0.25,
+            center_z: f64::from(center.1) + 0.75,
+            size: 8.0,
+            lerp_target: 8.0,
+            ..Default::default()
+        };
+        let adjusted_border = native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?;
+        for adventure in [true, false] {
+            let before = expanded.mesh.targets.as_ref().unwrap().len();
+            expanded = complete_player_spawn(
+                expanded,
+                &mut resources,
+                &mut classify,
+                &mut resolve,
+                &mut build,
+                &mut construct,
+                false,
+                Arc::clone(&height_tags),
+                None,
+                0,
+                None,
+                adjusted_border,
+                InitialPlayerSpawnOptions {
+                    radius: 0,
+                    adventure,
+                    random_seed: 1,
+                    saved_border: Some(saved_border),
+                },
+                &AtomicBool::new(false),
+                &progress,
+            )?
+            .context("border-adjusted spawn was cancelled")?;
+            let spawn = expanded
+                .player_spawn
+                .context("border-adjusted player spawn missing")?;
+            assert_eq!((spawn.x, spawn.z), center);
+            assert_eq!(expanded.suggested_spawn, Some(suggestion));
+            let targets = expanded.mesh.targets.as_ref().unwrap();
+            assert!(targets.contains(&ChunkPos {
+                x: center.0.div_euclid(16),
+                z: center.1.div_euclid(16)
+            }));
+            if adventure {
+                assert!(targets.len() > before);
+            }
+            assert_eq!(
+                expanded
+                    .postprocessed
+                    .as_ref()
+                    .unwrap()
+                    .initial_bonus_chest_position(),
+                Some(Some(chest))
+            );
+            let player = native_session::PlayerState {
+                position: (spawn - expanded.mesh.origin).as_vec3() + glam::Vec3::new(0.5, 0.0, 0.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let session =
+                expanded.prepare_session_with_spawn_heightmaps(player, Arc::clone(&height_tags))?;
+            let height = session
+                .generated_spawn_column_heights(
+                    center.0,
+                    center.1,
+                    expanded.mesh.targets.as_deref().unwrap(),
+                )?
+                .motion_blocking;
+            assert_eq!(spawn.y, height + 1);
+        }
         for (spawn_mobs, disabled, species, feature_kind) in [
             (false, false, "minecraft:sheep", 0),
             (true, true, "minecraft:sheep", 0),

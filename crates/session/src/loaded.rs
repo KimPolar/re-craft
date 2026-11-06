@@ -7342,6 +7342,23 @@ impl LoadedSession {
         crate::world_spawn::column_spawn(&mut view, x, z)
     }
 
+    /// Read the current heightmaps of a generated target without treating the
+    /// intermediate chunk as a fully loaded saved-world chunk.
+    pub fn generated_spawn_column_heights(
+        &self,
+        x: i32,
+        z: i32,
+        generated_targets: &BTreeSet<ChunkPos>,
+    ) -> anyhow::Result<crate::world_spawn::SpawnColumnHeights> {
+        use crate::world_spawn::SharedSpawnWorld;
+        let mut view = LoadedColumnSpawnView {
+            session: self,
+            ceiling_spawn_height: None,
+            generated: Some(generated_targets),
+        };
+        view.heights(x, z)
+    }
+
     /// Run the shared-spawn search over already prepared chunks. Missing
     /// chunks and entities requiring live simulation return an error so an
     /// earlier unresolved candidate cannot be skipped.

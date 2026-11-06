@@ -40,6 +40,27 @@ fn shape(state: &BlockState) -> Result<Shape> {
             Some("true" | "false")
         )
     };
+    if matches!(
+        state.name.as_str(),
+        "minecraft:oak_leaves"
+            | "minecraft:dark_oak_leaves"
+            | "minecraft:birch_leaves"
+            | "minecraft:azalea_leaves"
+            | "minecraft:flowering_azalea_leaves"
+    ) && state.properties.len() == 3
+        && property("persistent")
+        && property("waterlogged")
+        && matches!(
+            state.properties.get("distance").map(String::as_str),
+            Some("1" | "2" | "3" | "4" | "5" | "6" | "7")
+        )
+    {
+        return Ok(Shape {
+            boxes: None,
+            large: false,
+            canonical_full: true,
+        });
+    }
     if state.name == "minecraft:oak_fence"
         && state.properties.len() == 5
         && ["north", "south", "east", "west", "waterlogged"]
@@ -211,6 +232,15 @@ mod tests {
             }))
             .unwrap()
         );
+        let invalid_leaf = state(
+            "oak_leaves",
+            &[
+                ("distance", "0"),
+                ("persistent", "false"),
+                ("waterlogged", "false"),
+            ],
+        );
+        assert!(shape(&invalid_leaf).is_err());
     }
 
     #[test]
@@ -223,6 +253,50 @@ mod tests {
             state("glass", &[]),
             state("dirt", &[]),
             state("short_grass", &[]),
+            state(
+                "leaf_litter",
+                &[("facing", "north"), ("segment_amount", "2")],
+            ),
+            state(
+                "oak_leaves",
+                &[
+                    ("distance", "7"),
+                    ("persistent", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                "dark_oak_leaves",
+                &[
+                    ("distance", "1"),
+                    ("persistent", "true"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            state(
+                "birch_leaves",
+                &[
+                    ("distance", "3"),
+                    ("persistent", "false"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            state(
+                "azalea_leaves",
+                &[
+                    ("distance", "4"),
+                    ("persistent", "true"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                "flowering_azalea_leaves",
+                &[
+                    ("distance", "6"),
+                    ("persistent", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
             state("water", &[("level", "0")]),
             state("farmland", &[("moisture", "0")]),
             state(

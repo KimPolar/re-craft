@@ -19,7 +19,22 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         monster_block_flags(state)?;
         return Ok(false);
     }
-    if state.name == "minecraft:stone" && state.properties.is_empty() {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:stone"
+            | "minecraft:deepslate"
+            | "minecraft:cobbled_deepslate"
+            | "minecraft:polished_deepslate"
+            | "minecraft:deepslate_bricks"
+            | "minecraft:cracked_deepslate_bricks"
+            | "minecraft:deepslate_tiles"
+            | "minecraft:cracked_deepslate_tiles"
+            | "minecraft:chiseled_deepslate"
+            | "minecraft:reinforced_deepslate"
+            | "minecraft:basalt"
+            | "minecraft:polished_basalt"
+            | "minecraft:smooth_basalt"
+    ) {
         return Ok(true);
     }
     super::super::ocean_ruin::ocean_template_static_full(state)
@@ -505,6 +520,61 @@ mod tests {
             states_checked += 1;
         }
         assert_eq!(states_checked, 288);
+        let mut stones_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("STONE\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, name, full, block_entity] = fields.as_slice() else {
+                bail!("invalid Java stone result")
+            };
+            let id = format!("minecraft:{name}");
+            let properties = registry
+                .default_properties(&id)
+                .context("missing stone state")?;
+            let state = BlockState {
+                name: id.clone(),
+                properties,
+            };
+            assert_eq!(jigsaw_static_full(&state)?, *full == "true", "{id}");
+            assert_eq!(
+                registry.has_block_entity(&id),
+                Some(*block_entity == "true"),
+                "{id}"
+            );
+            assert_eq!(*full, "true", "{id}");
+            assert_eq!(*block_entity, "false", "{id}");
+            stones_checked += 1;
+        }
+        assert_eq!(stones_checked, 13);
+        let mut axes_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("AXIS\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, axis, mirror, rotation, expected_axis] = fields.as_slice() else {
+                bail!("invalid Java axis result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let properties = BTreeMap::from([("axis".into(), (*axis).to_owned())]);
+            let actual = registry.transform_template_state(
+                "minecraft:deepslate",
+                &properties,
+                mirror,
+                rotation,
+            )?;
+            assert_eq!(actual["axis"], *expected_axis);
+            axes_checked += 1;
+        }
+        assert_eq!(axes_checked, 36);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();

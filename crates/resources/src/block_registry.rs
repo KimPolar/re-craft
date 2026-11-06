@@ -653,6 +653,22 @@ impl GeneratedBlockRegistry {
         if matches!(schema, StateSchema::Stateless | StateSchema::Dusted) {
             return Ok(properties.clone());
         }
+        if matches!(schema, StateSchema::Axis) {
+            let mut result = properties.clone();
+            if matches!(
+                rotation,
+                Rotation::Clockwise90 | Rotation::Counterclockwise90
+            ) {
+                let axis = match properties["axis"].as_str() {
+                    "x" => "z",
+                    "z" => "x",
+                    "y" => "y",
+                    _ => unreachable!("canonical axis is valid"),
+                };
+                result.insert("axis".into(), axis.into());
+            }
+            return Ok(result);
+        }
         ensure!(
             matches!(
                 schema,
@@ -994,6 +1010,43 @@ mod tests {
         assert!(
             registry
                 .transform_template_state("minecraft:stairs", &state, Mirror::None, Rotation::None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn template_axis_rotation_preserves_vertical_and_swaps_horizontal_axes() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:deepslate".into(), StateSchema::Axis)]),
+            block_entities: BTreeMap::new(),
+        };
+        for (axis, rotation, expected) in [
+            ("x", Rotation::Clockwise90, "z"),
+            ("z", Rotation::Counterclockwise90, "x"),
+            ("x", Rotation::Clockwise180, "x"),
+            ("y", Rotation::Clockwise90, "y"),
+        ] {
+            let state = BTreeMap::from([("axis".into(), axis.into())]);
+            let transformed = registry
+                .transform_template_state(
+                    "minecraft:deepslate",
+                    &state,
+                    Mirror::FrontBack,
+                    rotation,
+                )
+                .unwrap();
+            assert_eq!(transformed["axis"], expected);
+        }
+        let invalid = BTreeMap::from([("axis".into(), "invalid".into())]);
+        assert!(
+            registry
+                .transform_template_state(
+                    "minecraft:deepslate",
+                    &invalid,
+                    Mirror::None,
+                    Rotation::Clockwise90
+                )
                 .is_err()
         );
     }

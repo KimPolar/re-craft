@@ -7831,14 +7831,17 @@ mod tests {
             element_type,
             values,
         };
-        for (unsupported, terrain_matching, chest) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
-            (false, true, true),
+        for (unsupported, terrain_matching, block_name) in [
+            (false, false, "minecraft:stone_bricks"),
+            (true, false, "minecraft:stone_bricks"),
+            (false, true, "minecraft:stone_bricks"),
+            (true, true, "minecraft:stone_bricks"),
+            (false, false, "minecraft:chest"),
+            (false, true, "minecraft:chest"),
+            (false, false, "minecraft:deepslate"),
+            (false, true, "minecraft:deepslate"),
         ] {
+            let chest = block_name == "minecraft:chest";
             let mut block = vec![
                 (
                     "pos".into(),
@@ -7874,14 +7877,7 @@ mod tests {
                             TagType::Compound,
                             vec![Tag::Compound(vec![(
                                 "id".into(),
-                                Tag::String(
-                                    if chest {
-                                        "minecraft:chest"
-                                    } else {
-                                        "minecraft:stone_bricks"
-                                    }
-                                    .into(),
-                                ),
+                                Tag::String(block_name.into()),
                             )])],
                         ),
                     ),
@@ -8025,11 +8021,7 @@ mod tests {
                         .block(origin[0], origin[1], origin[2])
                         .context("missing placed block")?
                         .name,
-                    if chest {
-                        "minecraft:chest"
-                    } else {
-                        "minecraft:stone_bricks"
-                    }
+                    block_name
                 );
                 assert!(batch.structure_data(target).is_ok());
                 assert!(

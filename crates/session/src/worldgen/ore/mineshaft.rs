@@ -2,10 +2,11 @@
 use super::*;
 use native_core::beardifier::BoundingBox;
 use native_resources::mineshaft::{
-    MineshaftCrossingWorld, MineshaftGraphPiece, MineshaftGraphPieceKind,
-    MineshaftPlacementOutcome, MineshaftPlacementWorld, MineshaftVariant, place_crossing,
-    place_room_or_stairs,
+    CorridorBlock, MineshaftCorridorWorld, MineshaftCrossingWorld, MineshaftGraphPiece,
+    MineshaftGraphPieceKind, MineshaftPlacementOutcome, MineshaftPlacementWorld, MineshaftVariant,
+    place_corridor_beam, place_corridor_cobweb, place_crossing, place_room_or_stairs,
 };
+use native_resources::{structure_piece::StructureFrame, structure_start::HorizontalDirection};
 
 struct MineshaftRegion<'a, 'b, F> {
     region: &'a mut DecorationRegion<'b>,
@@ -67,6 +68,57 @@ fn known_piece_block(state: &BlockState) -> bool {
 }
 
 impl DecorationRegion<'_> {
+    /// Apply one corridor beam, committing the random stream only on success.
+    pub fn place_mineshaft_corridor_beam(
+        &mut self,
+        frame: StructureFrame,
+        z: i32,
+        variant: MineshaftVariant,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<bool> {
+        self.run_mineshaft_corridor_part(random, |region, next| {
+            place_corridor_beam(frame, z, variant, region, clip, next)
+        })
+    }
+
+    /// Apply one corridor cobweb attempt, committing RNG only on success.
+    pub fn place_mineshaft_corridor_cobweb(
+        &mut self,
+        frame: StructureFrame,
+        local: [i32; 3],
+        probability: f32,
+        variant: MineshaftVariant,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<bool> {
+        self.run_mineshaft_corridor_part(random, |region, next| {
+            place_corridor_cobweb(frame, local, probability, variant, region, clip, next)
+        })
+    }
+
+    fn run_mineshaft_corridor_part(
+        &mut self,
+        random: &mut DecorationRandom,
+        operation: impl FnOnce(
+            &mut MineshaftRegion<'_, '_, fn([i32; 3], &World) -> Result<bool>>,
+            &mut DecorationRandom,
+        ) -> Result<bool>,
+    ) -> Result<bool> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let mut next = random.clone();
+        self.failed = true;
+        let mut unused_biome: fn([i32; 3], &World) -> Result<bool> = |_, _| Ok(false);
+        let mut region = MineshaftRegion {
+            region: self,
+            blocking_biome: &mut unused_biome,
+        };
+        let result = operation(&mut region, &mut next)?;
+        *random = next;
+        self.failed = false;
+        Ok(result)
+    }
+
     /// Install and resolve the cave-spider block entity in this draft.
     /// The enclosing piece controls clipping and its placed-spider flag.
     pub fn place_mineshaft_spawner(&mut self, position: [i32; 3]) -> Result<()> {
@@ -157,6 +209,90 @@ impl DecorationRegion<'_> {
             blocking.blocks(biomes.biome_at_block(position[0], position[1], position[2])?)
         };
         self.place_mineshaft_static_piece(piece, variant, clip, &mut resolve)
+    }
+}
+
+impl<F> MineshaftCorridorWorld for MineshaftRegion<'_, '_, F>
+where
+    F: FnMut([i32; 3], &World) -> Result<bool>,
+{
+    fn is_air(&mut self, position: [i32; 3]) -> Result<bool> {
+        Ok(super::is_air(&self.block(position)?))
+    }
+
+    fn ocean_floor_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        OreVeinWorld::ocean_floor_height(self.region, x, z)
+    }
+
+    fn face_sturdy(&mut self, position: [i32; 3], face: [i32; 3]) -> Result<bool> {
+        let state = self.block(position)?;
+        if known_piece_block(&state) {
+            return Ok(matches!(
+                state.name.as_str(),
+                "minecraft:oak_planks"
+                    | "minecraft:dark_oak_planks"
+                    | "minecraft:oak_log"
+                    | "minecraft:dark_oak_log"
+            ));
+        }
+        generation_face_sturdy(&state, face)
+    }
+
+    fn set_corridor_block(
+        &mut self,
+        position: [i32; 3],
+        block: CorridorBlock,
+        variant: MineshaftVariant,
+    ) -> Result<()> {
+        let wood = match variant {
+            MineshaftVariant::Normal => "oak",
+            MineshaftVariant::Mesa => "dark_oak",
+        };
+        let facing = |direction| match direction {
+            HorizontalDirection::North => "north",
+            HorizontalDirection::South => "south",
+            HorizontalDirection::West => "west",
+            HorizontalDirection::East => "east",
+        };
+        let (name, properties, mark) = match block {
+            CorridorBlock::Planks => (format!("minecraft:{wood}_planks"), BTreeMap::new(), false),
+            CorridorBlock::Fence { connected } => {
+                let mut properties: BTreeMap<String, String> =
+                    ["north", "south", "east", "west", "waterlogged"]
+                        .into_iter()
+                        .map(|name| (name.into(), "false".into()))
+                        .collect();
+                properties.insert(facing(connected).into(), "true".into());
+                (format!("minecraft:{wood}_fence"), properties, true)
+            }
+            CorridorBlock::WallTorch { facing: direction } => (
+                "minecraft:wall_torch".into(),
+                BTreeMap::from([("facing".into(), facing(direction).into())]),
+                true,
+            ),
+            CorridorBlock::Cobweb => ("minecraft:cobweb".into(), BTreeMap::new(), false),
+            CorridorBlock::Rail { north_south } => (
+                "minecraft:rail".into(),
+                BTreeMap::from([
+                    (
+                        "shape".into(),
+                        if north_south {
+                            "north_south"
+                        } else {
+                            "east_west"
+                        }
+                        .into(),
+                    ),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+                false,
+            ),
+        };
+        self.write(position, BlockState { name, properties })?;
+        if mark {
+            DiskWorld::mark_postprocessing(self.region, position)?;
+        }
+        Ok(())
     }
 }
 
@@ -290,7 +426,10 @@ mod tests {
                 "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                     | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
             )
-            .then(|| br#"{"values":["minecraft:stone","minecraft:oak_planks"]}"#.to_vec()))
+            .then(|| {
+                br#"{"values":["minecraft:stone","minecraft:oak_planks","minecraft:oak_fence"]}"#
+                    .to_vec()
+            }))
         }
     }
     impl ResourceProvider for BiomeData {
@@ -339,6 +478,23 @@ mod tests {
         }
     }
 
+    fn corridor_motion() -> HeightmapTags {
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "oak_planks",
+            "oak_fence",
+            "wall_torch",
+            "cobweb",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        HeightmapTags::load(&mut MotionData, &registry).unwrap()
+    }
+
     #[test]
     fn room_commits_to_draft_and_preserves_previous_snapshot() {
         let (mut terrain, tags, motion, _) = super::super::tests::fixture();
@@ -360,6 +516,113 @@ mod tests {
             terrain.world.block(3, 2, 3).unwrap().name,
             "minecraft:cave_air"
         );
+    }
+
+    #[test]
+    fn corridor_beam_writes_rotated_fences_and_marks_shapes() {
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let motion = corridor_motion();
+        let chunk = ChunkPos { x: 0, z: 0 };
+        let frame = StructureFrame {
+            bounds: BoundingBox::new([2, 2, 2], [4, 4, 6]).unwrap(),
+            orientation: Some(HorizontalDirection::South),
+        };
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([chunk]))
+            .unwrap();
+        assert!(
+            region
+                .place_mineshaft_corridor_beam(
+                    frame,
+                    2,
+                    MineshaftVariant::Normal,
+                    clip,
+                    &mut DecorationRandom::new(1)
+                )
+                .unwrap()
+        );
+        region.finish().unwrap();
+        for (x, direction) in [(2, "west"), (4, "east")] {
+            for y in [2, 3] {
+                let fence = terrain.world.block(x, y, 4).unwrap();
+                assert_eq!(fence.name, "minecraft:oak_fence");
+                assert_eq!(fence.properties[direction], "true");
+                assert_eq!(fence.properties["waterlogged"], "false");
+            }
+        }
+        let marks = &terrain.feature_postprocessing[&chunk];
+        assert_eq!(&marks.sections()[0][..4], &[0x422, 0x432, 0x424, 0x434]);
+    }
+
+    #[test]
+    fn corridor_beam_failure_discards_rng_and_world() {
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let motion = corridor_motion();
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(BlockState {
+            name: "minecraft:beacon".into(),
+            properties: BTreeMap::new(),
+        });
+        let section = Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&ChunkPos { x: 0, z: 0 }).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        );
+        section.blocks.as_mut().unwrap()[3 + 4 * 16 + 4 * 256] = id;
+        let before = Arc::clone(&terrain.world);
+        let frame = StructureFrame {
+            bounds: BoundingBox::new([2, 2, 2], [4, 4, 6]).unwrap(),
+            orientation: Some(HorizontalDirection::South),
+        };
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let seed = (0..100)
+            .find(|seed| DecorationRandom::new(*seed).next_int_bound(4) != Some(0))
+            .unwrap();
+        let mut random = DecorationRandom::new(seed);
+        let mut expected = random.clone();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        let error = region
+            .place_mineshaft_corridor_beam(frame, 2, MineshaftVariant::Normal, clip, &mut random)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("minecraft:beacon"));
+        assert_eq!(random.next_long(), expected.next_long());
+        assert!(region.finish().is_err());
+        assert!(Arc::ptr_eq(&terrain.world, &before));
+    }
+
+    #[test]
+    fn corridor_cobweb_uses_real_neighbor_faces_and_height() {
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let frame = StructureFrame {
+            bounds: BoundingBox::new([2, 2, 2], [4, 4, 6]).unwrap(),
+            orientation: Some(HorizontalDirection::South),
+        };
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        assert!(
+            region
+                .place_mineshaft_corridor_cobweb(
+                    frame,
+                    [2, 1, 2],
+                    1.0,
+                    MineshaftVariant::Normal,
+                    clip,
+                    &mut DecorationRandom::new(1)
+                )
+                .unwrap()
+        );
+        region.finish().unwrap();
+        assert_eq!(
+            terrain.world.block(4, 3, 4).unwrap().name,
+            "minecraft:cobweb"
+        );
+        assert!(terrain.feature_postprocessing.is_empty());
     }
 
     #[test]
@@ -555,10 +818,17 @@ mod tests {
     #[test]
     fn crossing_updates_real_blocks_and_heightmaps() {
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
-        let registry = ["air", "cave_air", "void_air", "stone", "oak_planks"]
-            .into_iter()
-            .map(|name| format!("minecraft:{name}"))
-            .collect();
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "oak_planks",
+            "oak_fence",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
         let motion = HeightmapTags::load(&mut MotionData, &registry).unwrap();
         let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
         let piece = MineshaftGraphPiece {

@@ -33,11 +33,16 @@ pub(super) enum StructureFeatureLighting<'a> {
 }
 
 pub(super) trait OceanFeatureRunner {
+    fn supports_huts(&self) -> bool {
+        false
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>>;
@@ -57,6 +62,7 @@ where
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
@@ -84,6 +90,71 @@ where
                     )?,
             };
         *self.ocean = staged;
+        Ok(updated)
+    }
+}
+
+pub(super) struct MixedFeatureCallbacks<'a, 'b, C, W, H, P> {
+    pub context: &'a mut super::MixedHutOceanPlacementContext<'b, C, W, H, P>,
+}
+
+impl<C, W, H, P> OceanFeatureRunner for MixedFeatureCallbacks<'_, '_, C, W, H, P>
+where
+    C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+    W: super::ocean_ruin::DrownedMarkerContext,
+    H: Clone
+        + FnMut(
+            native_resources::structure_piece::swamp_hut::HutMob,
+        ) -> Result<super::FreshCreatureRandom>,
+    P: Clone
+        + FnMut(
+            &super::structure_batch::TerrainStartKey,
+            [i32; 3],
+            &native_world::loaded::World,
+            &serde_json::Value,
+            native_core::beardifier::BoundingBox,
+            &[super::structure_batch::StructurePieceRevision],
+        ) -> Result<bool>,
+{
+    fn supports_huts(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let mut staged = self.context.clone();
+        staged.ocean.region_random = region_random.clone();
+        staged.huts.clone_from(huts);
+        let (_, updated) =
+            match lighting {
+                StructureFeatureLighting::Visible(light) => prepared
+                    .execute_mixed_with_visible_light(terrain, structures, &mut staged, light)?,
+                StructureFeatureLighting::Fresh(tracker, registry) => prepared
+                    .execute_mixed_with_tracked_light(
+                        terrain,
+                        structures,
+                        &mut staged,
+                        tracker,
+                        registry,
+                    )?,
+                StructureFeatureLighting::Staged(engine, registry) => prepared
+                    .execute_mixed_with_staged_light(
+                        terrain,
+                        structures,
+                        &mut staged,
+                        engine,
+                        registry,
+                    )?,
+            };
+        huts.clone_from(&staged.huts);
+        *self.context = staged;
         Ok(updated)
     }
 }
@@ -976,6 +1047,7 @@ impl GenerationSchedule {
         terrain: &mut super::CarvedTerrainWorld,
         prepared: &super::PreparedDecoration<'_, '_>,
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
         region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
         runner: &mut dyn OceanFeatureRunner,
@@ -985,7 +1057,8 @@ impl GenerationSchedule {
             self.ready(center, Features),
             "features dependencies are incomplete"
         );
-        let updated = runner.execute(terrain, prepared, structures, region_random, lighting)?;
+        let updated =
+            runner.execute(terrain, prepared, structures, huts, region_random, lighting)?;
         self.complete(center, Features)?;
         Ok(updated)
     }

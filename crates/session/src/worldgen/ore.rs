@@ -21488,6 +21488,10 @@ mod tests {
                 terrain: &mut CarvedTerrainWorld,
                 prepared: &PreparedDecoration<'_, '_>,
                 structures: &[PlannedMixedStructureDecoration<'_>],
+                _: &mut BTreeMap<
+                    super::super::structure_batch::TerrainStartKey,
+                    super::super::SavedSwampHutPiece,
+                >,
                 _: &native_resources::worldgen_region_random::RegionRandom,
                 lighting: super::super::schedule::StructureFeatureLighting<'_>,
             ) -> Result<Vec<Vec<PreparedStructureStart>>> {
@@ -21527,6 +21531,7 @@ mod tests {
                     &mut scheduled,
                     &prepared,
                     &structures,
+                    &mut BTreeMap::new(),
                     &random,
                     super::super::schedule::StructureFeatureLighting::Visible(&light),
                     &mut runner
@@ -21541,6 +21546,7 @@ mod tests {
             &mut scheduled,
             &prepared,
             &structures,
+            &mut BTreeMap::new(),
             &random,
             super::super::schedule::StructureFeatureLighting::Visible(&light),
             &mut runner,

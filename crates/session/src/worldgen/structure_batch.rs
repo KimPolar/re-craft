@@ -381,6 +381,7 @@ impl PreparedStructureStages {
     pub(super) fn mixed_commit_keys(
         &self,
         plan: &[PlannedMixedStructureDecoration<'_>],
+        allow_huts: bool,
     ) -> Result<Vec<Vec<TerrainStartKey>>> {
         let mut seen = BTreeSet::new();
         plan.iter().map(|entry| entry.starts.iter().map(|start| {
@@ -391,8 +392,15 @@ impl PreparedStructureStages {
                 PlannedStructureStart::Simple(start) => {
                     let current = self.starts.get(&key.1).and_then(|s| s.get(&key.0)).context("simple start missing")?;
                     ensure!(std::ptr::eq(*start, current), "mixed plan has stale simple start");
-                    ensure!(start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
-                        "mixed structure requires an unsupported decoration context");
+                    match start.kind {
+                        native_resources::structure_start::SimpleStructureKind::BuriedTreasure => {},
+                        native_resources::structure_start::SimpleStructureKind::SwampHut if allow_huts => {
+                            let saved = self.huts.get(&key).context("swamp hut state missing")?;
+                            ensure!(super::SavedSwampHutPiece::capture(start, saved.state)? == *saved,
+                                "swamp hut state differs from its start");
+                        }
+                        _ => bail!("mixed structure requires an unsupported decoration context"),
+                    }
                 }
                 PlannedStructureStart::OceanRuin(start) => {
                     let current = self.ocean_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("ocean ruin start missing")?;
@@ -409,6 +417,7 @@ impl PreparedStructureStages {
         &mut self,
         keys: Vec<Vec<TerrainStartKey>>,
         updated: Vec<Vec<super::PreparedStructureStart>>,
+        huts: BTreeMap<TerrainStartKey, super::SavedSwampHutPiece>,
     ) {
         assert_eq!(
             keys.len(),
@@ -440,6 +449,7 @@ impl PreparedStructureStages {
                 }
             }
         }
+        self.huts.extend(huts);
     }
 }
 

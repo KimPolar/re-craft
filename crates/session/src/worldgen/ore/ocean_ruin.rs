@@ -2737,6 +2737,137 @@ mod tests {
             original_random.next_long()
         );
         assert!(failed.recorded_generated_entities(center)?.is_empty());
+
+        // Exercise the same combined callbacks through the FEATURES scheduler
+        // and the retained start/state commit boundary.
+        use super::super::super::{
+            schedule::{
+                GenerationSchedule, GenerationStage, MixedFeatureCallbacks,
+                StructureFeatureLighting,
+            },
+            structure_batch::{
+                PlannedMixedStructureDecoration, PlannedStructureStart, PreparedStructureStages,
+            },
+        };
+        let mut stages = PreparedStructureStages::default();
+        stages.starts.insert(
+            center,
+            BTreeMap::from([(hut_entry.id.clone(), hut.clone())]),
+        );
+        stages
+            .ocean_starts
+            .insert(center, BTreeMap::from([(entry.id.clone(), start.clone())]));
+        stages.huts = initial.clone();
+        let scheduled_plan = [
+            PlannedMixedStructureDecoration {
+                entry: &entry,
+                starts: vec![PlannedStructureStart::OceanRuin(
+                    &stages.ocean_starts[&center][&entry.id],
+                )],
+            },
+            PlannedMixedStructureDecoration {
+                entry: &hut_entry,
+                starts: vec![PlannedStructureStart::Simple(
+                    &stages.starts[&center][&hut_entry.id],
+                )],
+            },
+        ];
+        assert!(stages.mixed_commit_keys(&scheduled_plan, false).is_err());
+        let keys = stages.mixed_commit_keys(&scheduled_plan, true)?;
+        let mut states = initial.clone();
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(center, GenerationStage::Features)?;
+        loop {
+            let (pos, stage) = schedule
+                .next_ready()
+                .context("missing generation prerequisite")?;
+            if pos == center && stage == GenerationStage::Features {
+                break;
+            }
+            schedule.complete(pos, stage)?;
+        }
+        let covered = (-1..=1).flat_map(|z| (-1..=1).map(move |x| ChunkPos { x, z }));
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                covered,
+            )
+            .context("initial light unavailable")?;
+        let (mut scheduled_terrain, _, _, _) = super::super::tests::fixture();
+        let mut combined = make_adapter();
+        // The scheduler must replace the caller's previous RNG and hut map.
+        combined.ocean.region_random = RegionRandom::Legacy(LegacyRandom::new(999));
+        combined.huts.clear();
+        let random = RegionRandom::Legacy(LegacyRandom::new(12345));
+        let mut runner = MixedFeatureCallbacks {
+            context: &mut combined,
+        };
+        let updated = schedule.run_features_with_ocean(
+            &mut scheduled_terrain,
+            &prepared,
+            &scheduled_plan,
+            &mut states,
+            &random,
+            StructureFeatureLighting::Visible(&light),
+            &mut runner,
+        )?;
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
+        assert_eq!(states[&key], expected_saved);
+        assert_eq!(
+            scheduled_terrain.recorded_generated_entities(center)?,
+            mixed_terrain.recorded_generated_entities(center)?
+        );
+        drop(scheduled_plan);
+        stages.commit_mixed_starts(keys, updated, states);
+        assert_eq!(stages.huts[&key], expected_saved);
+        assert_eq!(
+            stages.ocean_starts[&center][&entry.id].pieces[0].bounds.min[1],
+            8
+        );
+        assert_eq!(
+            stages.starts[&center][&hut_entry.id].bounds,
+            expected_hut.bounds
+        );
+
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(center, GenerationStage::Features)?;
+        loop {
+            let (pos, stage) = schedule
+                .next_ready()
+                .context("missing generation prerequisite")?;
+            if pos == center && stage == GenerationStage::Features {
+                break;
+            }
+            schedule.complete(pos, stage)?;
+        }
+        let (mut failed, _, _, _) = super::super::tests::fixture();
+        let before = failed.snapshot();
+        let mut states = initial.clone();
+        let mut combined = make_adapter();
+        combined.ocean.context.fail_on_special = Some(2);
+        let mut runner = MixedFeatureCallbacks {
+            context: &mut combined,
+        };
+        let error = match schedule.run_features_with_ocean(
+            &mut failed,
+            &prepared,
+            &mixed_failure,
+            &mut states,
+            &random,
+            StructureFeatureLighting::Visible(&light),
+            &mut runner,
+        ) {
+            Ok(_) => bail!("expected scheduled drowned initialization failure"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("injected difficulty failure"));
+        assert!(schedule.ready(center, GenerationStage::Features));
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        assert_eq!(states, initial);
+        assert_eq!(combined.huts, initial);
+        assert_eq!(combined.ocean.context.special_calls, 0);
         Ok(())
     }
 }

@@ -7234,6 +7234,11 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_structure_batch_schedules_ocean_ruin_decoration() -> Result<()> {
+        run_ocean_structure_batch(false)?;
+        run_ocean_structure_batch(true)
+    }
+
+    fn run_ocean_structure_batch(mixed: bool) -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
             heightmap::BlockHeightFlags,
@@ -7297,6 +7302,7 @@ mod tests {
         struct FixtureData {
             vanilla: native_resources::packs::ResourceStack,
             template: Vec<u8>,
+            mixed: bool,
         }
         impl ResourceProvider for FixtureData {
             fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -7309,6 +7315,12 @@ mod tests {
                     ),
                     "data/example/worldgen/structure_set/ruin.json" => Some(
                         json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:ruin","weight":1}]}),
+                    ),
+                    "data/example/worldgen/structure/hut.json" if self.mixed => Some(
+                        json!({"type":"minecraft:swamp_hut","biomes":["minecraft:plains"],"step":"surface_structures"}),
+                    ),
+                    "data/example/worldgen/structure_set/hut.json" if self.mixed => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:hut","weight":1}]}),
                     ),
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
@@ -7331,7 +7343,13 @@ mod tests {
             }
             fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
                 match folder {
-                    "worldgen/structure" => Ok(vec![ResourceId::parse("example:ruin")?]),
+                    "worldgen/structure" => {
+                        let mut ids = vec![ResourceId::parse("example:ruin")?];
+                        if self.mixed {
+                            ids.push(ResourceId::parse("example:hut")?);
+                        }
+                        Ok(ids)
+                    }
                     "worldgen/biome" => Ok(vec![ResourceId::parse("minecraft:plains")?]),
                     _ => self.vanilla.list_data(folder),
                 }
@@ -7386,6 +7404,7 @@ mod tests {
         let mut data = FixtureData {
             vanilla,
             template: encoder.finish()?,
+            mixed,
         };
         let structure = ResourceId::parse("example:ruin")?;
         let set = ResourceId::parse("example:ruin")?;
@@ -7402,9 +7421,15 @@ mod tests {
             .potential_chunk(42, [0, 0]);
         let target = ChunkPos { x, z };
         let mut expected_region_random = generator.region_random(target);
-        let rules = StructureBiomes::load(&mut data, [structure.clone()])?;
+        let mut kinds = vec![structure.clone()];
+        let mut sets = vec![set];
+        if mixed {
+            kinds.push(ResourceId::parse("example:hut")?);
+            sets.push(ResourceId::parse("example:hut")?);
+        }
+        let rules = StructureBiomes::load(&mut data, kinds)?;
         let mut structures =
-            structure_batch::StructureGenerationBatch::new(generator, rules, vec![set])?;
+            structure_batch::StructureGenerationBatch::new(generator, rules, sets)?;
         let preparation = structure_batch::StructurePreparationPlan::new([(
             target,
             schedule::GenerationStage::Features,
@@ -7455,7 +7480,7 @@ mod tests {
             "minecraft:flowing_water".to_owned(),
         ]);
         let bubbles = BTreeSet::new();
-        let mut adapter = OceanRuinPlacementContext {
+        let ocean = OceanRuinPlacementContext {
             ice_tags: &ice,
             water_fluids: &water,
             bubble_fluids: &bubbles,
@@ -7467,27 +7492,65 @@ mod tests {
             },
             context: NoDrowned,
         };
+        let variants = native_resources::cat_variants::CatSpawnVariants::load_active(&mut data)?;
+        let mut adapter = MixedHutOceanPlacementContext {
+            ocean,
+            huts: BTreeMap::new(),
+            variants: &variants,
+            construct_hut: |mob| {
+                let (id, seed) = match mob {
+                    native_resources::structure_piece::swamp_hut::HutMob::Witch => {
+                        ("minecraft:witch", 1)
+                    }
+                    native_resources::structure_piece::swamp_hut::HutMob::Cat => {
+                        ("minecraft:cat", 2)
+                    }
+                };
+                FreshCreatureRandom::from_seed(&ResourceId::parse(id)?, seed)
+            },
+            condition: |_: &structure_batch::TerrainStartKey,
+                        _: [i32; 3],
+                        _: &World,
+                        _: &Value,
+                        _: native_core::beardifier::BoundingBox,
+                        _: &[structure_batch::StructurePieceRevision]| {
+                Ok(true)
+            },
+        };
         batch.request_features(target)?;
-        while batch
-            .step_with_ocean_support(
-                &mut data,
-                &mut |value| {
-                    let name = value.as_str().context("expected block")?;
-                    Ok(CarverBlockState {
-                        is_air: name == "minecraft:air",
-                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
-                    })
-                },
-                &mut |value| {
-                    Ok(BlockState {
-                        name: value.as_str().context("expected block")?.to_owned(),
-                        properties: BTreeMap::new(),
-                    })
-                },
-                &mut adapter,
-            )?
-            .is_some()
-        {}
+        loop {
+            let mut classify = |value: &Value| {
+                let name = value.as_str().context("expected block")?;
+                Ok(CarverBlockState {
+                    is_air: name == "minecraft:air",
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            };
+            let mut resolve = |value: &Value| {
+                Ok(BlockState {
+                    name: value.as_str().context("expected block")?.to_owned(),
+                    properties: BTreeMap::new(),
+                })
+            };
+            let result = if mixed {
+                batch.step_with_mixed_structure_support(
+                    &mut data,
+                    &mut classify,
+                    &mut resolve,
+                    &mut adapter,
+                )?
+            } else {
+                batch.step_with_ocean_support(
+                    &mut data,
+                    &mut classify,
+                    &mut resolve,
+                    &mut adapter.ocean,
+                )?
+            };
+            if result.is_none() {
+                break;
+            }
+        }
         let start = &batch
             .ocean_ruin_starts(target)
             .context("ruin start missing")?[&structure];
@@ -7506,10 +7569,27 @@ mod tests {
             batch.schedule().completed(target),
             Some(schedule::GenerationStage::Features)
         );
-        assert_eq!(
-            adapter.region_random.next_long(),
-            expected_region_random.next_long()
-        );
+        if mixed {
+            let hut = ResourceId::parse("example:hut")?;
+            let state = adapter
+                .huts
+                .get(&(hut.clone(), target))
+                .context("hut state missing")?;
+            assert!(state.state.spawned_witch && state.state.spawned_cat);
+            assert_eq!(batch.recorded_generated_entities(target)?.len(), 2);
+            assert!(
+                batch
+                    .structure_data(target)?
+                    .get("starts")
+                    .and_then(|tag| tag.get("example:hut"))
+                    .is_some()
+            );
+        } else {
+            assert_eq!(
+                adapter.ocean.region_random.next_long(),
+                expected_region_random.next_long()
+            );
+        }
         assert!(
             batch
                 .structure_data(target)?
@@ -8039,7 +8119,7 @@ mod tests {
             let mixed = added
                 .mixed_decoration_plan(target, &decoration_schedule)
                 .unwrap();
-            let keys = added.mixed_commit_keys(&mixed).unwrap();
+            let keys = added.mixed_commit_keys(&mixed, false).unwrap();
             let mut updated: Vec<Vec<_>> = mixed
                 .iter()
                 .map(|entry| {
@@ -8065,7 +8145,7 @@ mod tests {
             first.pieces[0].bounds.max[1] -= 12;
             let next_y = first.pieces[0].selection.position[1];
             drop(mixed);
-            added.commit_mixed_starts(keys, updated);
+            added.commit_mixed_starts(keys, updated, BTreeMap::new());
             let mixed = added
                 .mixed_decoration_plan(target, &decoration_schedule)
                 .unwrap();

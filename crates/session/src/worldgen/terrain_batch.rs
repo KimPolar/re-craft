@@ -23,7 +23,7 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        NativeHutFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
+        MixedFeatureCallbacks, NativeHutFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
         StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
@@ -3382,6 +3382,42 @@ impl FreshTerrainBatch {
         self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }
 
+    /// Perform one operation with hut and ocean entity effects sharing the
+    /// FEATURES chunk's region RNG. Hut states come from the prepared batch;
+    /// on success the context receives the states referenced by that pass.
+    /// Callback clones must isolate mutable state until the pass commits.
+    pub fn step_with_mixed_structure_support<C, W, H, P>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        context: &mut super::MixedHutOceanPlacementContext<'_, C, W, H, P>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        W: super::ocean_ruin::DrownedMarkerContext,
+        H: Clone
+            + FnMut(
+                native_resources::structure_piece::swamp_hut::HutMob,
+            ) -> Result<super::FreshCreatureRandom>,
+        P: Clone
+            + FnMut(
+                &TerrainStartKey,
+                [i32; 3],
+                &World,
+                &Value,
+                native_core::beardifier::BoundingBox,
+                &[super::structure_batch::StructurePieceRevision],
+            ) -> Result<bool>,
+    {
+        ensure!(
+            context.ocean.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = MixedFeatureCallbacks { context };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
     /// Perform one operation with hut mob initialization and cat conditions.
     /// Callers must supply the active pack's variants and complete world
     /// context. The condition callback receives the current start key and
@@ -3619,19 +3655,29 @@ impl FreshTerrainBatch {
                     } else {
                         None
                     };
-                    let has_ocean = mixed.as_ref().is_some_and(|plan| {
+                    let allow_huts = ocean_runner
+                        .as_ref()
+                        .is_some_and(|runner| runner.supports_huts());
+                    let has_mixed = mixed.as_ref().is_some_and(|plan| {
                         plan.iter().any(|entry| {
                             entry.starts.iter().any(|start| {
-                                matches!(
-                                    start,
-                                    super::structure_batch::PlannedStructureStart::OceanRuin(_)
-                                )
+                                match start {
+                                    super::structure_batch::PlannedStructureStart::OceanRuin(_) => true,
+                                    super::structure_batch::PlannedStructureStart::Simple(start) => allow_huts && start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut,
+                                }
                             })
                         })
                     });
-                    if has_ocean {
+                    if has_mixed {
                         let planned = mixed.context("mixed structure plan is missing")?;
-                        let keys = structures.mixed_commit_keys(&planned)?;
+                        let keys = structures.mixed_commit_keys(&planned, allow_huts)?;
+                        let mut hut_states: BTreeMap<_, _> = keys
+                            .iter()
+                            .flatten()
+                            .filter_map(|key| {
+                                structures.huts.get(key).map(|state| (key.clone(), *state))
+                            })
+                            .collect();
                         let runner = ocean_runner
                             .as_deref_mut()
                             .context("ocean ruin context is missing")?;
@@ -3640,6 +3686,7 @@ impl FreshTerrainBatch {
                                 terrain,
                                 &prepared,
                                 &planned,
+                                &mut hut_states,
                                 &region_random,
                                 lighting,
                                 runner,
@@ -3677,7 +3724,11 @@ impl FreshTerrainBatch {
                             run(StructureFeatureLighting::Visible(&light))?
                         };
                         drop(planned);
-                        structures.commit_mixed_starts(keys, updated);
+                        let huts_recorded = !hut_states.is_empty();
+                        structures.commit_mixed_starts(keys, updated, hut_states);
+                        if huts_recorded {
+                            self.entity_sources.recorded_hut_features.insert(pos);
+                        }
                     } else {
                         let planned = structures.decoration_plan(pos, registry)?;
                         let keys: Vec<Vec<_>> = planned

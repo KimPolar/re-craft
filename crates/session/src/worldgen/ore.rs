@@ -4287,6 +4287,38 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if tree_generated_leaf(state)? {
         return Ok((true, false));
     }
+    if tree_generated_log(state) {
+        return Ok((true, true));
+    }
+    if matches!(
+        name,
+        "minecraft:brown_mushroom_block"
+            | "minecraft:red_mushroom_block"
+            | "minecraft:mushroom_stem"
+    ) && native_world::mob_spawn_blocks::common_mob_spawn_block_facts(state).is_some()
+    {
+        return Ok((true, true));
+    }
+    if matches!(
+        name,
+        "minecraft:moss_carpet"
+            | "minecraft:short_grass"
+            | "minecraft:fern"
+            | "minecraft:azalea"
+            | "minecraft:flowering_azalea"
+    ) && state.properties.is_empty()
+    {
+        return Ok((false, false));
+    }
+    if matches!(name, "minecraft:tall_grass" | "minecraft:large_fern")
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("half").map(String::as_str),
+            Some("lower" | "upper")
+        )
+    {
+        return Ok((false, false));
+    }
     if matches!(name, "minecraft:water" | "minecraft:lava") {
         native_world::fluid::FluidState::from_block(state)
             .map_err(anyhow::Error::msg)?
@@ -6292,6 +6324,12 @@ impl SpringWorld for DecorationRegion<'_> {
 
 impl MagmaWorld for DecorationRegion<'_> {
     fn face_is_full(&mut self, state: &BlockState, _direction: [i32; 3]) -> Result<bool> {
+        if matches!(
+            state.name.as_str(),
+            "minecraft:cave_vines" | "minecraft:cave_vines_plant"
+        ) {
+            ensure!(tree_cave_vines(state)?, "invalid magma neighbor cave vines");
+        }
         vanilla_full_occlusion(&state.name)
             .with_context(|| format!("unsupported magma neighbor occlusion for {}", state.name))
     }
@@ -20554,6 +20592,25 @@ mod tests {
         let before = terrain.snapshot();
         assert!(prepared.execute(&mut terrain, false).is_err());
         assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn magma_vine_neighbors_reject_malformed_states() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        for name in ["cave_vines", "cave_vines_plant"] {
+            let mut vine = state(name);
+            vine.properties.insert("berries".into(), "true".into());
+            if name == "cave_vines" {
+                vine.properties.insert("age".into(), "25".into());
+            }
+            assert!(!MagmaWorld::face_is_full(&mut region, &vine, [0, 1, 0]).unwrap());
+            vine.properties.insert("berries".into(), "invalid".into());
+            assert!(MagmaWorld::face_is_full(&mut region, &vine, [0, 1, 0]).is_err());
+        }
     }
 
     #[test]

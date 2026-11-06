@@ -13,8 +13,13 @@ pub trait MagmaWorld: OreWorld {
 /// Known vanilla states with the same occlusion result on every face.
 pub fn vanilla_full_occlusion(name: &str) -> Option<bool> {
     match name {
-        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:water"
-        | "minecraft:lava" => Some(false),
+        "minecraft:air"
+        | "minecraft:cave_air"
+        | "minecraft:void_air"
+        | "minecraft:water"
+        | "minecraft:lava"
+        | "minecraft:cave_vines"
+        | "minecraft:cave_vines_plant" => Some(false),
         "minecraft:stone"
         | "minecraft:deepslate"
         | "minecraft:netherrack"

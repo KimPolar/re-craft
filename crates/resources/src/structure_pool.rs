@@ -170,16 +170,29 @@ impl PoolElement {
 
 impl TemplatePool {
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
+        Self::load_optional(provider, id)?
+            .with_context(|| format!("missing template pool {}:{}", id.namespace, id.path))
+    }
+
+    /// Return None for a missing pool, as distinct from invalid pool data.
+    pub fn load_optional(
+        provider: &mut impl ResourceProvider,
+        id: &ResourceId,
+    ) -> Result<Option<Self>> {
+        let checked = ResourceId::parse(&format!("{}:{}", id.namespace, id.path))?;
+        ensure!(&checked == id, "invalid template pool identifier");
         let path = format!(
             "data/{}/worldgen/template_pool/{}.json",
             id.namespace, id.path
         );
-        let bytes = provider
-            .read_data(&path)?
-            .with_context(|| format!("missing template pool {path}"))?;
+        let Some(bytes) = provider.read_data(&path)? else {
+            return Ok(None);
+        };
         let value: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid template pool {path}"))?;
-        Self::decode(&value).with_context(|| format!("in template pool {path}"))
+        Self::decode(&value)
+            .with_context(|| format!("in template pool {path}"))
+            .map(Some)
     }
 
     pub fn decode(value: &Value) -> Result<Self> {

@@ -1,12 +1,20 @@
 //! Placement geometry and free space used by Java's jigsaw assembler.
 //!
-//! Pool traversal, height sampling and template placement are separate stages.
-use std::collections::{BTreeMap, VecDeque};
+//! Template lookup, height sampling and block placement are supplied by callers.
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::BoundingBox;
 
-use crate::{jigsaw::Connector, structure_pool::Projection};
+use crate::{
+    jigsaw::{Connector, shuffle_by_selection_priority},
+    packs::ResourceId,
+    structure_pool::{PoolElement, PoolFallback, Projection, TemplatePool},
+    structure_transform::Rotation,
+};
 
 /// An integer-aligned box minus full piece boxes. Java tests a candidate after
 /// deflating its box by 0.25 blocks before subtracting the full accepted box.
@@ -236,6 +244,269 @@ impl Attachment<'_> {
     }
 }
 
+/// A generated structure piece before block placement or serialization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Piece {
+    pub element: PoolElement,
+    pub origin: [i32; 3],
+    pub rotation: Rotation,
+    pub bounds: BoundingBox,
+    pub ground_level_delta: i32,
+    pub junctions: Vec<Junction>,
+}
+
+/// World-specific inputs for jigsaw assembly. Connector lists returned here
+/// must be in Java template order; the assembler performs the shuffle itself.
+/// Feature elements require Java's unrotated synthetic connector.
+pub trait AssemblyContext {
+    fn pool(&mut self, id: &ResourceId) -> Result<Option<Arc<TemplatePool>>>;
+    fn connectors(
+        &mut self,
+        element: &PoolElement,
+        origin: [i32; 3],
+        rotation: Rotation,
+    ) -> Result<Vec<Connector>>;
+    fn bounds(
+        &mut self,
+        element: &PoolElement,
+        origin: [i32; 3],
+        rotation: Rotation,
+    ) -> Result<BoundingBox>;
+    fn surface_height(&mut self, position: [i32; 3]) -> Result<i32>;
+    fn resolve_alias(&mut self, id: &ResourceId) -> Result<ResourceId> {
+        Ok(id.clone())
+    }
+}
+
+fn element_projection(element: &PoolElement) -> Result<Projection> {
+    match element {
+        PoolElement::Single { projection, .. }
+        | PoolElement::Feature { projection, .. }
+        | PoolElement::List { projection, .. } => Ok(*projection),
+        PoolElement::Empty => anyhow::bail!("empty pool element has no piece"),
+    }
+}
+
+fn fallback(
+    context: &mut impl AssemblyContext,
+    pool: &TemplatePool,
+) -> Result<(Arc<TemplatePool>, bool)> {
+    match &pool.fallback {
+        PoolFallback::Reference(id) => {
+            let loaded = context
+                .pool(id)?
+                .with_context(|| format!("missing fallback pool {}:{}", id.namespace, id.path))?;
+            Ok((loaded, id.namespace == "minecraft" && id.path == "empty"))
+        }
+        PoolFallback::Inline(pool) => Ok((Arc::new((**pool).clone()), false)),
+    }
+}
+
+fn pool_max_height(context: &mut impl AssemblyContext, pool: &TemplatePool) -> Result<i32> {
+    let mut height = 0;
+    for (element, _) in pool.entries() {
+        if matches!(element, PoolElement::Empty) {
+            continue;
+        }
+        let bounds = context.bounds(element, [0; 3], Rotation::None)?;
+        validate_box(bounds)?;
+        height = height.max(bounds.max[1].wrapping_sub(bounds.min[1]).wrapping_add(1));
+    }
+    Ok(height)
+}
+
+fn expansion_height(
+    context: &mut impl AssemblyContext,
+    target_bounds: BoundingBox,
+    connectors: &[Connector],
+) -> Result<i32> {
+    let mut height = 0;
+    for connector in connectors {
+        let adjacent = connector.adjacent_position();
+        if !(0..3)
+            .all(|i| adjacent[i] >= target_bounds.min[i] && adjacent[i] <= target_bounds.max[i])
+        {
+            continue;
+        }
+        let id = context.resolve_alias(&connector.pool)?;
+        if let Some(pool) = context.pool(&id)? {
+            let (other, _) = fallback(context, &pool)?;
+            height = height
+                .max(pool_max_height(context, &pool)?)
+                .max(pool_max_height(context, &other)?);
+        }
+    }
+    Ok(height)
+}
+
+fn shuffle_rotations(random: &mut impl FnMut(i32) -> Option<i32>) -> Result<[Rotation; 4]> {
+    let mut rotations = [
+        Rotation::None,
+        Rotation::Clockwise90,
+        Rotation::Clockwise180,
+        Rotation::Counterclockwise90,
+    ];
+    for end in (2..=4).rev() {
+        let index = random(end).context("invalid rotation random bound")?;
+        ensure!(
+            (0..end).contains(&index),
+            "rotation random result out of bounds"
+        );
+        rotations.swap((end - 1) as usize, index as usize);
+    }
+    Ok(rotations)
+}
+
+/// Assemble children of an already prepared center piece. The random source
+/// and context are consumed in Java order; callers that need rollback must
+/// stage their mutable context and random source before calling this function.
+pub fn assemble(
+    context: &mut impl AssemblyContext,
+    root: Piece,
+    outer_bounds: BoundingBox,
+    max_depth: i32,
+    do_expansion_hack: bool,
+    random: &mut impl FnMut(i32) -> Option<i32>,
+) -> Result<Vec<Piece>> {
+    ensure!(max_depth >= 0, "negative jigsaw depth");
+    validate_box(root.bounds)?;
+    element_projection(&root.element)?;
+    let mut pieces = vec![root];
+    if max_depth == 0 {
+        return Ok(pieces);
+    }
+    let mut outer = FreeSpace::new(outer_bounds)?;
+    outer.subtract(pieces[0].bounds)?;
+    let mut spaces = vec![outer];
+    let mut queue = PlacementQueue::default();
+    // Java processes the root directly, then drains its priority queue.
+    let mut next = Some((0usize, 0usize, 0i32));
+    while let Some((source_index, context_space, depth)) = next {
+        let source_piece = pieces[source_index].clone();
+        let source_projection = element_projection(&source_piece.element)?;
+        let mut source_jigsaws = context.connectors(
+            &source_piece.element,
+            source_piece.origin,
+            source_piece.rotation,
+        )?;
+        shuffle_by_selection_priority(&mut source_jigsaws, random)?;
+        let mut inside_space = None;
+        for source in source_jigsaws {
+            let pool_id = context.resolve_alias(&source.pool)?;
+            let Some(pool) = context.pool(&pool_id)? else {
+                continue;
+            };
+            if pool.weighted_len() == 0
+                && !(pool_id.namespace == "minecraft" && pool_id.path == "empty")
+            {
+                continue;
+            }
+            let (other, other_is_empty_id) = fallback(context, &pool)?;
+            if other.weighted_len() == 0 && !other_is_empty_id {
+                continue;
+            }
+            let adjacent = source.adjacent_position();
+            let inside = (0..3).all(|i| {
+                adjacent[i] >= source_piece.bounds.min[i]
+                    && adjacent[i] <= source_piece.bounds.max[i]
+            });
+            let free_index = if inside {
+                *inside_space.get_or_insert_with(|| {
+                    spaces.push(
+                        FreeSpace::new(source_piece.bounds).expect("source bounds were validated"),
+                    );
+                    spaces.len() - 1
+                })
+            } else {
+                context_space
+            };
+            let mut candidates = Vec::new();
+            if depth != max_depth {
+                candidates.extend(pool.shuffled_elements(random)?);
+            }
+            candidates.extend(other.shuffled_elements(random)?);
+            let mut cached_height = None;
+            'candidates: for element in candidates {
+                if matches!(element, PoolElement::Empty) {
+                    break;
+                }
+                for rotation in shuffle_rotations(random)? {
+                    let mut targets = context.connectors(element, [0; 3], rotation)?;
+                    shuffle_by_selection_priority(&mut targets, random)?;
+                    let target_bounds = context.bounds(element, [0; 3], rotation)?;
+                    validate_box(target_bounds)?;
+                    let y_span = target_bounds.max[1]
+                        .wrapping_sub(target_bounds.min[1])
+                        .wrapping_add(1);
+                    let expansion = if do_expansion_hack && y_span <= 16 {
+                        expansion_height(context, target_bounds, &targets)?
+                    } else {
+                        0
+                    };
+                    for target in &targets {
+                        if !source.can_attach(target) {
+                            continue;
+                        }
+                        let target_projection = element_projection(element)?;
+                        let surface_height = if source_projection == Projection::Rigid
+                            && target_projection == Projection::Rigid
+                        {
+                            None
+                        } else {
+                            let height = match cached_height {
+                                Some(value) => value,
+                                None => context.surface_height(source.position)?,
+                            };
+                            if height != i32::MIN {
+                                cached_height = Some(height);
+                            }
+                            Some(height)
+                        };
+                        let geometry = Attachment {
+                            source: &source,
+                            target,
+                            source_bounds: source_piece.bounds,
+                            target_bounds_at_origin: target_bounds,
+                            source_projection,
+                            target_projection,
+                            source_ground_level_delta: source_piece.ground_level_delta,
+                            target_ground_level_delta: 1,
+                            surface_height,
+                            expansion,
+                        }
+                        .geometry()?
+                        .context("matching jigsaw connectors changed")?;
+                        if !spaces[free_index].place(geometry.bounds)? {
+                            continue;
+                        }
+                        pieces[source_index]
+                            .junctions
+                            .push(geometry.source_junction);
+                        let child_index = pieces.len();
+                        pieces.push(Piece {
+                            element: element.clone(),
+                            origin: geometry.origin,
+                            rotation,
+                            bounds: geometry.bounds,
+                            ground_level_delta: geometry.ground_level_delta,
+                            junctions: vec![geometry.target_junction],
+                        });
+                        if depth + 1 <= max_depth {
+                            queue.push(
+                                (child_index, free_index, depth + 1),
+                                source.placement_priority,
+                            );
+                        }
+                        break 'candidates;
+                    }
+                }
+            }
+        }
+        next = queue.next();
+    }
+    Ok(pieces)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +530,194 @@ mod tests {
             placement_priority: 0,
             selection_priority: 0,
         }
+    }
+
+    struct GraphFixture {
+        pools: BTreeMap<ResourceId, Arc<TemplatePool>>,
+    }
+
+    impl GraphFixture {
+        fn new() -> Result<Self> {
+            use serde_json::json;
+            let single = |name: &str| json!({"element_type":"minecraft:single_pool_element","location":format!("example:{name}"),"processors":"minecraft:empty","projection":"rigid"});
+            let pools = [
+                (
+                    "minecraft:empty",
+                    json!({"fallback":"minecraft:empty","elements":[]}),
+                ),
+                (
+                    "example:terminators",
+                    json!({"fallback":"minecraft:empty","elements":[{"weight":1,"element":single("end")}]}),
+                ),
+                (
+                    "example:children",
+                    json!({"fallback":"example:terminators","elements":[{"weight":2,"element":single("a")},{"weight":1,"element":single("b")},{"weight":1,"element":{"element_type":"minecraft:empty_pool_element"}}]}),
+                ),
+            ];
+            Ok(Self {
+                pools: pools
+                    .into_iter()
+                    .map(|(id, value)| {
+                        Ok((
+                            ResourceId::parse(id)?,
+                            Arc::new(TemplatePool::decode(&value)?),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            })
+        }
+        fn element(&self, name: &str) -> PoolElement {
+            self.pools[&ResourceId::parse(if name == "end" {
+                "example:terminators"
+            } else {
+                "example:children"
+            })
+            .unwrap()]
+                .entries()
+                .iter()
+                .find_map(|(element, _)| match element {
+                    PoolElement::Single { location, .. } if location.path == name => {
+                        Some(element.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        }
+    }
+    impl AssemblyContext for GraphFixture {
+        fn pool(&mut self, id: &ResourceId) -> Result<Option<Arc<TemplatePool>>> {
+            Ok(self.pools.get(id).cloned())
+        }
+        fn connectors(
+            &mut self,
+            element: &PoolElement,
+            origin: [i32; 3],
+            rotation: Rotation,
+        ) -> Result<Vec<Connector>> {
+            let PoolElement::Single { location, .. } = element else {
+                anyhow::bail!("unexpected fixture element")
+            };
+            let size_x = match location.path.as_str() {
+                "a" => 3,
+                "b" => 2,
+                "end" => 1,
+                _ => anyhow::bail!("unknown fixture element"),
+            };
+            let positions = [[size_x - 1, 1, 1], [0, 1, 1], [1, 1, 0], [1, 1, 2]];
+            let directions = ["east_up", "west_up", "north_up", "south_up"];
+            let placement = [3, 0, 2, 1];
+            let selection = [0, 2, 0, 1];
+            let count = if location.path == "end" { 1 } else { 4 };
+            Ok((0..count)
+                .map(|i| {
+                    let mut value = connector(positions[i], directions[i], "example:door");
+                    value.pool = ResourceId::parse(if location.path == "end" {
+                        "minecraft:empty"
+                    } else {
+                        "example:children"
+                    })
+                    .unwrap();
+                    value.placement_priority = placement[i];
+                    value.selection_priority = selection[i];
+                    value.transformed(origin, rotation)
+                })
+                .collect())
+        }
+        fn bounds(
+            &mut self,
+            element: &PoolElement,
+            origin: [i32; 3],
+            rotation: Rotation,
+        ) -> Result<BoundingBox> {
+            let PoolElement::Single { location, .. } = element else {
+                anyhow::bail!("unexpected fixture element")
+            };
+            let size_x = match location.path.as_str() {
+                "a" => 3,
+                "b" => 2,
+                "end" => 1,
+                _ => anyhow::bail!("unknown fixture element"),
+            };
+            structure_transform::bounding_box(
+                [size_x, 3, 3],
+                origin,
+                Mirror::None,
+                rotation,
+                [0; 3],
+            )
+        }
+        fn surface_height(&mut self, _: [i32; 3]) -> Result<i32> {
+            anyhow::bail!("rigid fixture unexpectedly sampled height")
+        }
+    }
+
+    fn graph_lines(depth: i32, seed: i64) -> Result<VecDeque<String>> {
+        use native_core::random::LegacyRandom;
+        let mut fixture = GraphFixture::new()?;
+        let element = fixture.element("a");
+        let origin = [0, 30, 0];
+        let root = Piece {
+            bounds: fixture.bounds(&element, origin, Rotation::None)?,
+            element,
+            origin,
+            rotation: Rotation::None,
+            ground_level_delta: 1,
+            junctions: vec![],
+        };
+        let mut random = LegacyRandom::new(seed);
+        let pieces = assemble(
+            &mut fixture,
+            root,
+            bounds([-9, 20, -9], [9, 40, 9]),
+            depth,
+            false,
+            &mut |n| random.next_int_bound(n),
+        )?;
+        let mut result = VecDeque::new();
+        result.push_back(format!(
+            "C\t{depth}\t{seed}\t{}\t{}",
+            pieces.len(),
+            random.next_long()
+        ));
+        for piece in pieces {
+            let PoolElement::Single { location, .. } = &piece.element else {
+                anyhow::bail!("unexpected output piece")
+            };
+            let rotation = match piece.rotation {
+                Rotation::None => 0,
+                Rotation::Clockwise90 => 1,
+                Rotation::Clockwise180 => 2,
+                Rotation::Counterclockwise90 => 3,
+            };
+            result.push_back(format!(
+                "P\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                location.namespace,
+                location.path,
+                rotation,
+                piece.origin[0],
+                piece.origin[1],
+                piece.origin[2],
+                piece.bounds.min[0],
+                piece.bounds.min[1],
+                piece.bounds.min[2],
+                piece.bounds.max[0],
+                piece.bounds.max[1],
+                piece.bounds.max[2],
+                piece.ground_level_delta,
+                piece.junctions.len()
+            ));
+            for j in piece.junctions {
+                let projection = match j.destination_projection {
+                    Projection::Rigid => "rigid",
+                    Projection::TerrainMatching => "terrain_matching",
+                };
+                result.push_back(format!(
+                    "J\t{}\t{}\t{}\t{}\t{projection}",
+                    j.source_x, j.source_ground_y, j.source_z, j.delta_y
+                ));
+            }
+        }
+        Ok(result)
     }
 
     #[test]
@@ -305,6 +764,90 @@ mod tests {
         assert_eq!(result.target_junction.source_ground_y, 71);
         input.expansion = 5;
         assert_eq!(input.geometry()?.unwrap().bounds.max[1], 75);
+        Ok(())
+    }
+
+    #[test]
+    fn assembly_is_deterministic_and_depth_zero_keeps_only_root() -> Result<()> {
+        assert_eq!(graph_lines(2, 42)?, graph_lines(2, 42)?);
+        let only_root = graph_lines(0, 42)?;
+        assert!(only_root.front().unwrap().starts_with("C\t0\t42\t1\t"));
+        assert_eq!(only_root.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn synthetic_piece_graphs_and_random_state_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::default_minecraft_dir().unwrap());
+        let _verified = crate::packs::ResourceStack::open(&game)?;
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .context("Java 25 home is missing")?
+            .join("bin");
+        let source = temp.path().join("JigsawGraphOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/JigsawGraphOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("JigsawGraphOracle")
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = VecDeque::new();
+        let mut cases = 0;
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some(rest) = line.strip_prefix("C\t") {
+                ensure!(expected.is_empty(), "previous graph output was incomplete");
+                let fields: Vec<_> = rest.split('\t').collect();
+                ensure!(fields.len() == 4, "invalid Java graph header");
+                expected = graph_lines(fields[0].parse()?, fields[1].parse()?)?;
+                cases += 1;
+            }
+            if line.starts_with("C\t") || line.starts_with("P\t") || line.starts_with("J\t") {
+                let rust = expected.pop_front().context("extra Java graph output")?;
+                assert_eq!(rust, line, "piece graph mismatch in case {cases}");
+            }
+        }
+        assert_eq!(cases, 24);
+        assert!(expected.is_empty());
         Ok(())
     }
 

@@ -6,6 +6,7 @@ pub mod generated_chunk;
 pub mod generated_section;
 pub mod generated_ticks;
 pub mod heightmap;
+pub mod jigsaw_assembly;
 pub mod level_data;
 pub mod nbt;
 pub mod palette;

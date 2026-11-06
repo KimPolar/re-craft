@@ -3966,8 +3966,8 @@ impl MushroomWorld for DecorationRegion<'_> {
         }
         let old = self.read(pos)?;
         ensure!(
-            is_air(&old) || tree_generated_leaf(&old)?,
-            "unsupported mushroom source effects"
+            is_air(&old) || tree_generated_leaf(&old)? || tree_leaf_litter(&old)?,
+            "unsupported mushroom source effects at {pos:?}: {old:?} -> {state:?}"
         );
         self.set_proto_block(pos, state)?;
         Ok(())
@@ -16910,6 +16910,38 @@ mod tests {
         assert_eq!(head.properties["berries"], "true");
         assert!((23..=25).contains(&head.properties["age"].parse::<i32>().unwrap()));
         assert_eq!(before.block(8, 10, 8).unwrap().name, "minecraft:air");
+    }
+
+    #[test]
+    fn huge_mushroom_replaces_valid_leaf_litter() {
+        let (mut terrain, tags, _, _) = fixture();
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:leaf_litter".into(),
+            "minecraft:red_mushroom_block".into(),
+        ]);
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        let world = Arc::make_mut(&mut terrain.world);
+        let mut litter = state("leaf_litter");
+        litter.properties.insert("facing".into(), "north".into());
+        litter
+            .properties
+            .insert("segment_amount".into(), "3".into());
+        let id = world.intern_state(litter);
+        world.set_block_id(8, 8, 8, id).unwrap();
+        let before = terrain.snapshot();
+        let mut cap = state("red_mushroom_block");
+        cap.properties = ["up", "down", "north", "south", "east", "west"]
+            .into_iter()
+            .map(|name| (name.into(), "true".into()))
+            .collect();
+        let mut region = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))
+            .unwrap();
+        region.write_mushroom_block([8, 8, 8], &cap).unwrap();
+        region.finish().unwrap();
+        assert_eq!(before.block(8, 8, 8).unwrap().name, "minecraft:leaf_litter");
+        assert_eq!(terrain.snapshot().block(8, 8, 8).unwrap(), &cap);
     }
 
     #[test]

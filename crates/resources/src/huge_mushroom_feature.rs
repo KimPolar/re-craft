@@ -279,7 +279,9 @@ mod tests {
         fn in_tag(&mut self, block: &State, tag: &ResourceId) -> Result<bool> {
             Ok(match tag.path.as_str() {
                 "leaves" => block.name == "leaves",
-                "replaceable_by_mushrooms" => block.name == "leaves",
+                "replaceable_by_mushrooms" => {
+                    matches!(block.name.as_str(), "leaves" | "leaf_litter")
+                }
                 _ => false,
             })
         }
@@ -438,9 +440,10 @@ mod tests {
         );
         let actual = String::from_utf8(oracle.stdout).unwrap();
         let mut expected = Vec::new();
+        let mut replaced_litter = false;
         for red in [false, true] {
             for seed in [0, 1, -1, 987654321] {
-                for mode in 0..5 {
+                for mode in 0..6 {
                     let mut world = World::default();
                     if mode != 1 {
                         world.blocks.insert([3, 2, -4], state("dirt"));
@@ -454,10 +457,14 @@ mod tests {
                     if mode == 4 {
                         world.blocks.insert([4, 7, -4], state("stone"));
                     }
+                    if mode == 5 {
+                        world.blocks.insert([4, 7, -4], state("leaf_litter"));
+                    }
                     let mut random = DecorationRandom::new(seed);
                     let placed = feature(red)
                         .place(&mut world, &mut random, [3, 3, -4])
                         .unwrap();
+                    replaced_litter |= mode == 5 && world.blocks[&[4, 7, -4]].name == "cap";
                     let writes = world
                         .writes
                         .iter()
@@ -486,6 +493,10 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("M "))
             .collect();
+        assert!(
+            replaced_litter,
+            "the oracle must exercise leaf litter replacement"
+        );
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(&expected) {
             assert_eq!(*actual, expected);

@@ -20,12 +20,14 @@ public class HugeMushroomOracle {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class); bind.setAccessible(true);
     bind.invoke(Blocks.OAK_LEAVES.builtInRegistryHolder(),List.of(BlockTags.LEAVES,BlockTags.REPLACEABLE_BY_MUSHROOMS));
-    for(boolean red:new boolean[]{false,true}) for(long seed:new long[]{0,1,-1,987654321}) for(int mode=0;mode<5;mode++) {
+    bind.invoke(Blocks.LEAF_LITTER.builtInRegistryHolder(),List.of(BlockTags.REPLACEABLE_BY_MUSHROOMS));
+    for(boolean red:new boolean[]{false,true}) for(long seed:new long[]{0,1,-1,987654321}) for(int mode=0;mode<6;mode++) {
       var blocks=new HashMap<BlockPos,BlockState>(); var writes=new ArrayList<String>();
       if(mode!=1) blocks.put(new BlockPos(3,2,-4),Blocks.DIRT.defaultBlockState());
       if(mode==2) blocks.put(new BlockPos(3,4,-4),Blocks.STONE.defaultBlockState());
       if(mode==3) blocks.put(new BlockPos(4,7,-4),Blocks.OAK_LEAVES.defaultBlockState());
       if(mode==4) blocks.put(new BlockPos(4,7,-4),Blocks.STONE.defaultBlockState());
+      if(mode==5) blocks.put(new BlockPos(4,7,-4),Blocks.LEAF_LITTER.defaultBlockState());
       var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(p,m,a)->{
         if(m.getName().equals("getMinY")) return 0;
         if(m.getName().equals("getMaxY")) return 63;

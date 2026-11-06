@@ -51,6 +51,7 @@ use super::{
 };
 
 mod buried_treasure;
+mod mineshaft;
 mod ocean_ruin;
 #[cfg(test)]
 pub(super) use ocean_ruin::attach_created_chicken_rider;

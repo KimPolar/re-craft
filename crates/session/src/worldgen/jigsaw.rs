@@ -2,7 +2,11 @@
 //!
 //! These starts have not yet had processors applied, blocks placed, or save
 //! data written. The chunk pipeline must not treat them as completed terrain.
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::{PieceProjection, StructurePiece, TerrainAdjustment};
@@ -36,6 +40,61 @@ pub struct PreparedStart {
     pub pieces: Vec<Piece>,
 }
 
+/// Processor lists aligned with a piece's pool-element tree. Feature elements
+/// still require their own placement implementation.
+#[derive(Clone, Debug)]
+pub enum PieceProcessors {
+    Empty,
+    Feature,
+    Single(Arc<native_persistence::structure_processors::PreparedProcessors>),
+    List(Vec<PieceProcessors>),
+}
+
+fn prepare_element_processors(
+    element: &PoolElement,
+    provider: &mut impl ResourceProvider,
+    blocks: &BTreeSet<String>,
+    registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    cache: &mut BTreeMap<
+        ResourceId,
+        Arc<native_persistence::structure_processors::PreparedProcessors>,
+    >,
+) -> Result<PieceProcessors> {
+    use native_persistence::structure_processors::PreparedProcessors;
+    use native_resources::structure_pool::HolderValue;
+    Ok(match element {
+        PoolElement::Empty => PieceProcessors::Empty,
+        PoolElement::Feature { .. } => PieceProcessors::Feature,
+        PoolElement::List { elements, .. } => PieceProcessors::List(
+            elements
+                .iter()
+                .map(|element| {
+                    prepare_element_processors(element, provider, blocks, registry, cache)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        PoolElement::Single { processors, .. } => {
+            let prepared = match processors {
+                HolderValue::Reference(id) => {
+                    if let Some(prepared) = cache.get(id) {
+                        Arc::clone(prepared)
+                    } else {
+                        let prepared = Arc::new(PreparedProcessors::load(
+                            processors, provider, blocks, registry,
+                        )?);
+                        cache.insert(id.clone(), Arc::clone(&prepared));
+                        prepared
+                    }
+                }
+                HolderValue::Inline(_) => Arc::new(PreparedProcessors::load(
+                    processors, provider, blocks, registry,
+                )?),
+            };
+            PieceProcessors::Single(prepared)
+        }
+    })
+}
+
 struct StartAdapter<'a, E>(&'a RefCell<&'a mut E>);
 
 impl<E: Environment> jigsaw_placement::StartEnvironment for StartAdapter<'_, E> {
@@ -61,6 +120,23 @@ impl<E: Environment> jigsaw_placement::StartEnvironment for StartAdapter<'_, E> 
 }
 
 impl PreparedStart {
+    /// Resolve each piece's active processor list once per referenced holder.
+    /// This prepares decoration but does not authorize block or entity writes.
+    pub fn prepare_processors(
+        &self,
+        provider: &mut impl ResourceProvider,
+        blocks: &BTreeSet<String>,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Vec<PieceProcessors>> {
+        let mut cache = BTreeMap::new();
+        self.pieces
+            .iter()
+            .map(|piece| {
+                prepare_element_processors(&piece.element, provider, blocks, registry, &mut cache)
+            })
+            .collect()
+    }
+
     /// Construct a fresh start tag only when every piece is preservable.
     /// This does not authorize publishing it to a world.
     pub fn to_tag(&self, structure: &ResourceId) -> Result<native_persistence::nbt::Tag> {
@@ -550,6 +626,11 @@ mod tests {
         assert_eq!(start.chunk, chunk);
         assert!(!start.pieces.is_empty());
         assert_eq!(start.terrain_pieces()?.len(), start.pieces.len());
+        let complete_blocks = provider.inner.vanilla_block_ids()?;
+        let generated_blocks = provider.inner.vanilla_generated_block_registry()?;
+        let prepared_processors =
+            start.prepare_processors(&mut provider, &complete_blocks, &generated_blocks)?;
+        assert_eq!(prepared_processors.len(), start.pieces.len());
 
         use super::super::{
             schedule::GenerationStage,

@@ -77,6 +77,27 @@ pub(crate) fn resolve(
     result
 }
 
+/// Resolve an arbitrary active block tag against the complete block registry.
+/// This respects pack stacking, nested tags, optional entries and cycles.
+pub fn resolve_block_tag(
+    provider: &mut impl ResourceProvider,
+    id: &ResourceId,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    ensure!(!registry.is_empty(), "block registry is empty");
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, id, &mut raw, &mut failed, 0)?;
+    resolve(
+        id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .with_context(|| format!("cannot resolve block tag {}:{}", id.namespace, id.path))
+}
+
 impl HeightmapTags {
     pub fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Result<Self> {
         ensure!(!registry.is_empty(), "block registry is empty");

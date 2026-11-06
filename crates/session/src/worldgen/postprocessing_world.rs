@@ -1770,6 +1770,41 @@ impl GeneratedBlockView<'_> {
                 next.name == "minecraft:air" && next.properties.is_empty()
             };
             ensure!(flags == 276 && valid, "unsupported generated lichen write");
+            if next.name == "minecraft:air" {
+                let chunk = ChunkPos {
+                    x: pos[0].div_euclid(16),
+                    z: pos[2].div_euclid(16),
+                };
+                let section =
+                    i8::try_from(pos[1].div_euclid(16)).context("lichen section out of range")?;
+                let blocks = self
+                    .world
+                    .chunks
+                    .get(&chunk)
+                    .and_then(|chunk| chunk.sections.get(&section))
+                    .and_then(|section| section.blocks.as_ref())
+                    .context("lichen section unavailable")?;
+                let mut nonempty = 0;
+                for id in blocks.iter() {
+                    let state = self
+                        .world
+                        .state(*id)
+                        .context("lichen section state missing")?;
+                    if !matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ) {
+                        nonempty += 1;
+                        if nonempty == 2 {
+                            break;
+                        }
+                    }
+                }
+                ensure!(
+                    nonempty >= 2,
+                    "lichen removal requires light section allocation update"
+                );
+            }
             return self.write_postprocessed_state(pos, &old, next);
         }
         if native_world::collision::fence_waterlogged(&old).is_some()
@@ -3055,6 +3090,59 @@ mod tests {
                 format!("L {mode} {expected}")
             );
         }
+    }
+
+    #[test]
+    fn lichen_removal_rejects_unhandled_light_section_deallocation() {
+        let (mut stage, _, chunk) = fixture(false);
+        let world = Arc::make_mut(&mut stage.world);
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        Arc::make_mut(
+            Arc::make_mut(world.chunks.get_mut(&chunk).unwrap())
+                .sections
+                .get_mut(&0)
+                .unwrap(),
+        )
+        .blocks
+        .as_mut()
+        .unwrap()
+        .fill(air);
+        let mut lichen = BlockState {
+            name: "minecraft:glow_lichen".into(),
+            properties: BTreeMap::new(),
+        };
+        for face in [
+            "down",
+            "up",
+            "north",
+            "south",
+            "west",
+            "east",
+            "waterlogged",
+        ] {
+            lichen
+                .properties
+                .insert(face.into(), (face == "west").to_string());
+        }
+        let lichen = world.intern_state(lichen);
+        world.set_block_id(8, 8, 8, lichen).unwrap();
+        stage.source = Arc::clone(&stage.world);
+        let mut marks = PostProcessing::new(0, 16).unwrap();
+        marks.mark(8, 8, 8);
+        stage
+            .region
+            .tasks
+            .insert(chunk, PostprocessingTask::new(Arc::new(marks), chunk));
+        let before = Arc::clone(&stage.world);
+        let ticks = stage.region.ticks.activated_snapshot();
+        let error = stage.try_poll(chunk, 1).unwrap_err();
+        assert!(format!("{error:#}").contains("light section allocation update"));
+        assert!(Arc::ptr_eq(&stage.world, &before));
+        assert_eq!(stage.region.ticks.activated_snapshot(), ticks);
+        assert!(stage.edits.is_empty() && stage.light_checks.is_empty());
     }
 
     #[test]

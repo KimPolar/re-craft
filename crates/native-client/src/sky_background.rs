@@ -346,7 +346,7 @@ pub(crate) enum SunsetColorOperation {
     AlphaBlend,
 }
 
-fn argb(value: &Value) -> Result<[f32; 4]> {
+pub(crate) fn argb(value: &Value) -> Result<[f32; 4]> {
     let packed = if let Some(s) = value.as_str() {
         ensure!(
             s.len() == 9 && s.starts_with('#'),

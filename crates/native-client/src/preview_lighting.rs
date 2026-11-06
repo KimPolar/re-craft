@@ -1519,6 +1519,55 @@ mod tests {
                 );
             }
         }
+        let document =
+            native_persistence::nbt::read(&std::fs::read(temp.path().join("custom.nbt"))?)?;
+        let converted = saved_inline_definition(&document.value)?;
+        let original: Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("custom.json"))?)?;
+        let inline = PreviewLighting::from_json(&serde_json::to_vec(&converted)?)?;
+        let expected = PreviewLighting::from_json(&serde_json::to_vec(&original)?)?;
+        assert_eq!(inline.lightmap, expected.lightmap, "custom lightmap");
+        assert_eq!(
+            rgb(&converted["attributes"]["minecraft:visual/fog_color"])?,
+            rgb(&original["attributes"]["minecraft:visual/fog_color"])?
+        );
+        assert_eq!(
+            crate::sky_background::argb(
+                &converted["attributes"]["minecraft:visual/sunrise_sunset_color"]
+            )?,
+            crate::sky_background::argb(
+                &original["attributes"]["minecraft:visual/sunrise_sunset_color"]
+            )?
+        );
+        let mut inline_respawn =
+            native_resources::respawn_environment::RespawnEnvironment::default();
+        inline_respawn.apply(
+            native_resources::respawn_environment::RespawnEnvironmentLayer::from_attributes(
+                &converted["attributes"],
+            )?,
+        );
+        let mut expected_respawn =
+            native_resources::respawn_environment::RespawnEnvironment::default();
+        expected_respawn.apply(
+            native_resources::respawn_environment::RespawnEnvironmentLayer::from_attributes(
+                &original["attributes"],
+            )?,
+        );
+        assert_eq!(inline_respawn, expected_respawn);
+        let inline_lava =
+            native_resources::fluid_environment::fast_lava_environment_from_definition(
+                &mut resources,
+                &converted,
+            )?;
+        let expected_lava =
+            native_resources::fluid_environment::fast_lava_environment_from_definition(
+                &mut resources,
+                &original,
+            )?;
+        assert_eq!(
+            inline_lava.sample(|_| Some(0)),
+            expected_lava.sample(|_| Some(0))
+        );
         Ok(())
     }
 

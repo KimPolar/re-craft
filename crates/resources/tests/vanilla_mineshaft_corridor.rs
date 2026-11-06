@@ -131,6 +131,7 @@ impl MineshaftCorridorWorld for World {
                 (format!("torch:{}", name(facing)), Block::Torch, true)
             }
             CorridorBlock::Cobweb => ("web".into(), Block::Web, false),
+            CorridorBlock::Rail { .. } => unreachable!("beam test does not place rails"),
         };
         self.events.push(format!("{} {description}", event("W", p)));
         self.changed.insert(p, state);

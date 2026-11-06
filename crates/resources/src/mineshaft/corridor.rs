@@ -1,8 +1,12 @@
-//! Corridor beam and cobweb placement in an unpublished generation draft.
+//! Corridor placement in an unpublished generation draft.
 use anyhow::{Result, ensure};
 use native_core::{beardifier::BoundingBox, random::DecorationRandom};
 
-use super::{MineshaftPlacementWorld, MineshaftVariant};
+use super::{
+    MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftPlacementOutcome,
+    MineshaftPlacementWorld, MineshaftSupportWorld, MineshaftVariant, place_vertical_support,
+    placement::blocked,
+};
 use crate::{structure_piece::StructureFrame, structure_start::HorizontalDirection};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +15,33 @@ pub enum CorridorBlock {
     Fence { connected: HorizontalDirection },
     WallTorch { facing: HorizontalDirection },
     Cobweb,
+    Rail { north_south: bool },
+}
+
+/// Additional operations needed by the whole corridor pass. Entity callbacks
+/// must reproduce the Java creation path and its use of the passed RNG.
+pub trait MineshaftCorridorGenerationWorld: MineshaftCorridorWorld + MineshaftSupportWorld {
+    fn upper_face_sturdy(&mut self, position: [i32; 3]) -> Result<bool>;
+    fn set_floor_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<()>;
+    fn is_variant_planks(&mut self, position: [i32; 3], variant: MineshaftVariant) -> Result<bool>;
+    /// Read one floor block; check both non-air and solid-render on that state.
+    fn solid_render_floor(&mut self, position: [i32; 3]) -> Result<bool>;
+    /// Implements the entire createChest path, including its own eligibility,
+    /// rail state, entity creation, loot seed and RNG consumption.
+    fn create_chest_minecart(
+        &mut self,
+        frame: StructureFrame,
+        local: [i32; 3],
+        clip: BoundingBox,
+        variant: MineshaftVariant,
+        random: &mut DecorationRandom,
+    ) -> Result<bool>;
+    /// Set the spawner and configure a cave spider if the block entity exists.
+    fn set_spider_spawner(
+        &mut self,
+        position: [i32; 3],
+        random: &mut DecorationRandom,
+    ) -> Result<()>;
 }
 
 /// Structure-piece writes include the rotated block state, fluid scheduling,
@@ -51,6 +82,20 @@ fn put(
         CorridorBlock::WallTorch { facing } => CorridorBlock::WallTorch {
             facing: frame.horizontal_facing(facing),
         },
+        CorridorBlock::Rail { north_south } => {
+            let local = if north_south {
+                HorizontalDirection::North
+            } else {
+                HorizontalDirection::East
+            };
+            let facing = frame.horizontal_facing(local);
+            CorridorBlock::Rail {
+                north_south: matches!(
+                    facing,
+                    HorizontalDirection::North | HorizontalDirection::South
+                ),
+            }
+        }
         other => other,
     };
     world.set_corridor_block(p, block, variant)
@@ -63,6 +108,183 @@ fn validate(frame: StructureFrame, clip: BoundingBox) -> Result<()> {
         "invalid corridor clip"
     );
     Ok(())
+}
+
+fn interior(
+    frame: StructureFrame,
+    clip: BoundingBox,
+    local: [i32; 3],
+    world: &mut impl MineshaftCorridorWorld,
+) -> Result<bool> {
+    let p = frame.world_position([local[0], local[1].wrapping_add(1), local[2]]);
+    Ok(inside(clip, p) && p[1] < world.ocean_floor_height(p[0], p[2])?)
+}
+
+fn cave_air(
+    frame: StructureFrame,
+    clip: BoundingBox,
+    local: [i32; 3],
+    variant: MineshaftVariant,
+    world: &mut impl MineshaftCorridorWorld,
+) -> Result<()> {
+    let p = frame.world_position(local);
+    if inside(clip, p) && !world.protected_block(p, variant)? {
+        world.set_cave_air(p)?;
+    }
+    Ok(())
+}
+
+/// Run one complete corridor piece pass. Entity operations are delegated to
+/// the world implementation; both draft and state must be discarded on error.
+pub fn place_corridor(
+    piece: &MineshaftGraphPiece,
+    placed_spider: &mut bool,
+    variant: MineshaftVariant,
+    world: &mut impl MineshaftCorridorGenerationWorld,
+    clip: BoundingBox,
+    random: &mut DecorationRandom,
+) -> Result<MineshaftPlacementOutcome> {
+    let MineshaftGraphPieceKind::Corridor {
+        rails,
+        spiders,
+        sections,
+    } = piece.kind
+    else {
+        anyhow::bail!("piece is not a mineshaft corridor");
+    };
+    let direction = piece
+        .direction
+        .ok_or_else(|| anyhow::anyhow!("corridor orientation missing"))?;
+    let axis = if matches!(
+        direction,
+        HorizontalDirection::North | HorizontalDirection::South
+    ) {
+        2
+    } else {
+        0
+    };
+    let span = |i: usize| i64::from(piece.bounds.max[i]) - i64::from(piece.bounds.min[i]) + 1;
+    ensure!(
+        (1..=4).contains(&sections)
+            && span(axis) == i64::from(sections) * 5
+            && span(2 - axis) == 3
+            && span(1) == 3
+            && !(rails && spiders)
+            && (!*placed_spider || spiders),
+        "invalid corridor state or bounds"
+    );
+    let frame = StructureFrame {
+        bounds: piece.bounds,
+        orientation: Some(direction),
+    };
+    validate(frame, clip)?;
+    if blocked(world, piece.bounds, clip)? {
+        return Ok(MineshaftPlacementOutcome::Blocked);
+    }
+    let length = sections * 5 - 1;
+    for y in 0..=1 {
+        for x in 0..=2 {
+            for z in 0..=length {
+                cave_air(frame, clip, [x, y, z], variant, world)?;
+            }
+        }
+    }
+    for x in 0..=2 {
+        for z in 0..=length {
+            if random.next_float() <= 0.8 {
+                cave_air(frame, clip, [x, 2, z], variant, world)?;
+            }
+        }
+    }
+    if spiders {
+        for y in 0..=1 {
+            for x in 0..=2 {
+                for z in 0..=length {
+                    let local = [x, y, z];
+                    if random.next_float() <= 0.6 && interior(frame, clip, local, world)? {
+                        put(frame, clip, local, CorridorBlock::Cobweb, variant, world)?;
+                    }
+                }
+            }
+        }
+    }
+    for section in 0..sections {
+        let z = 2 + section * 5;
+        place_corridor_beam(frame, z, variant, world, clip, random)?;
+        for (x, dz, chance) in [
+            (0, -1, 0.1),
+            (2, -1, 0.1),
+            (0, 1, 0.1),
+            (2, 1, 0.1),
+            (0, -2, 0.05),
+            (2, -2, 0.05),
+            (0, 2, 0.05),
+            (2, 2, 0.05),
+        ] {
+            place_corridor_cobweb(frame, [x, 2, z + dz], chance, variant, world, clip, random)?;
+        }
+        for local in [[2, 0, z - 1], [0, 0, z + 1]] {
+            if random.next_int_bound(100).expect("positive bound") == 0 {
+                world.create_chest_minecart(frame, local, clip, variant, random)?;
+            }
+        }
+        if spiders && !*placed_spider {
+            let local = [
+                1,
+                0,
+                z - 1 + random.next_int_bound(3).expect("positive bound"),
+            ];
+            let p = frame.world_position(local);
+            if inside(clip, p) && interior(frame, clip, local, world)? {
+                *placed_spider = true;
+                world.set_spider_spawner(p, random)?;
+            }
+        }
+    }
+    for x in 0..=2 {
+        for z in 0..=length {
+            let local = [x, -1, z];
+            if interior(frame, clip, local, world)? {
+                let p = frame.world_position(local);
+                if !world.upper_face_sturdy(p)? {
+                    world.set_floor_planks(p, variant)?;
+                }
+            }
+        }
+    }
+    for index in 0..if sections > 1 { 2 } else { 1 } {
+        let z = if index == 0 { 2 } else { length - 2 };
+        for x in [0, 2] {
+            let local = [x, -1, z];
+            let p = frame.world_position(local);
+            if inside(clip, p) && world.is_variant_planks(p, variant)? {
+                place_vertical_support(frame, local, variant, clip, world)?;
+            }
+        }
+    }
+    if rails {
+        for z in 0..=length {
+            let floor = frame.world_position([1, -1, z]);
+            if inside(clip, floor) && world.solid_render_floor(floor)? {
+                let chance = if interior(frame, clip, [1, 0, z], world)? {
+                    0.7
+                } else {
+                    0.9
+                };
+                if random.next_float() < chance {
+                    put(
+                        frame,
+                        clip,
+                        [1, 0, z],
+                        CorridorBlock::Rail { north_south: true },
+                        variant,
+                        world,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(MineshaftPlacementOutcome::Carved)
 }
 
 /// Place the fence columns, crossbeam, and possible torches at one local Z.

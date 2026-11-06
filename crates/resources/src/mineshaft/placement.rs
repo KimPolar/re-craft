@@ -39,7 +39,7 @@ fn inside(bounds: BoundingBox, position: [i32; 3]) -> bool {
     (0..3).all(|axis| (bounds.min[axis]..=bounds.max[axis]).contains(&position[axis]))
 }
 
-fn blocked(
+pub(super) fn blocked(
     world: &mut impl MineshaftPlacementWorld,
     piece: BoundingBox,
     clip: BoundingBox,

@@ -456,7 +456,7 @@ impl GenerationReady {
             .suggested_spawn
             .context("world spawn suggestion missing")?;
         let search = native_session::world_spawn::ResumableWorldSpawn::new(suggestion, candidates)?;
-        let mut session = self.start_session_with_spawn_heightmaps(player, tags)?;
+        let mut session = self.prepare_session_with_spawn_heightmaps(player, tags)?;
         for (pos, data) in entities {
             session.set_initial_entity_chunk(pos, data)?;
         }
@@ -565,6 +565,17 @@ impl GenerationReady {
         player: native_session::PlayerState,
         tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
     ) -> Result<native_session::loaded::LoadedSession> {
+        let session = self.prepare_session_with_spawn_heightmaps(player, tags)?;
+        self.hut_generation = None;
+        Ok(session)
+    }
+
+    /// Temporary spawn-search sessions do not end initial chunk generation.
+    fn prepare_session_with_spawn_heightmaps(
+        &mut self,
+        player: native_session::PlayerState,
+        tags: Arc<native_resources::heightmap_tags::HeightmapTags>,
+    ) -> Result<native_session::loaded::LoadedSession> {
         if let Some(initial) = &self.initial_respawn {
             ensure!(
                 *initial.height_tags == *tags,
@@ -573,7 +584,6 @@ impl GenerationReady {
         }
         let mut session = self.start_session_inner(player)?;
         self.install_spawn_heightmaps(&mut session, tags)?;
-        self.hut_generation = None;
         Ok(session)
     }
 
@@ -1072,11 +1082,13 @@ impl GenerationWorker {
                 .data_packs
                 .as_ref()
                 .map(|(_, selection)| selection.clone());
+            let initial_difficulty = level.session.difficulty;
             let child = Self::start_selected_structures_spawn_search(
                 generation,
                 revision,
                 biome_blend,
                 options.ceiling_spawn_height,
+                Some(initial_difficulty),
             )?;
             let Some(mut ready) = wait_nested_generation(child, cancelled, progress)? else {
                 return Ok(None);
@@ -1123,6 +1135,10 @@ impl GenerationWorker {
                 ensure!(
                     hut.clocks == context.clocks.ticks,
                     "hut generation clocks differ from initial world clocks"
+                );
+                ensure!(
+                    hut.difficulty == Some(level.session.difficulty),
+                    "structure generation difficulty differs from frozen settings"
                 );
             }
             let registry = Arc::new(resources.vanilla_generated_block_registry()?);
@@ -1983,9 +1999,14 @@ impl GenerationWorker {
         revision: u64,
         biome_blend: u8,
         ceiling_spawn_height: Option<i32>,
+        difficulty: Option<native_persistence::world::Difficulty>,
     ) -> Result<Self> {
         Self::start_structured(
-            move || crate::fresh_generation::prepare_with_structures(settings),
+            move || {
+                crate::fresh_generation::prepare_with_structures_and_difficulty(
+                    settings, difficulty,
+                )
+            },
             GenerationTargets::SpawnOrigin,
             revision,
             biome_blend,
@@ -3024,7 +3045,7 @@ fn complete_spawn_search(
             on_ground: false,
             pose: native_session::PlayerPose::Standing,
         };
-        let session = ready.start_session_with_spawn_heightmaps(player, Arc::clone(&tags))?;
+        let session = ready.prepare_session_with_spawn_heightmaps(player, Arc::clone(&tags))?;
         let fresh_search = ready.initial_spawn_search_at_origin(&session)?;
         let mut search = match (previous_search.take(), checkpoint.take()) {
             (Some(search), Some(previous))
@@ -3967,6 +3988,10 @@ mod tests {
                 json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
             ),
             (
+                "data/example/dimension_type/test.json",
+                json!({"min_y":80,"height":16,"has_skylight":true,"ambient_light":0.0}),
+            ),
+            (
                 "data/example/worldgen/structure/treasure.json",
                 json!({"type":"minecraft:buried_treasure","biomes":["example:test","example:bonus"],"step":"surface_structures"}),
             ),
@@ -3977,7 +4002,7 @@ mod tests {
             (
                 "data/example/worldgen/world_preset/test.json",
                 json!({"dimensions":{"minecraft:overworld":{
-                    "type":{"min_y":80,"height":16,"has_skylight":true,"ambient_light":0.0},
+                    "type":"example:test",
                     "generator":{"type":"minecraft:noise","biome_source":{"type":"minecraft:fixed","biome":"example:test"},"settings":{
                         "noise":{"min_y":80,"height":16},"legacy_random_source":false,"sea_level":88,
                         "default_block":"minecraft:stone","default_fluid":"minecraft:water","spawn_target":[],
@@ -4030,6 +4055,7 @@ mod tests {
         creation.seed = crate::chat_input::ChatInput::field("42");
         creation.preset = ResourceId::parse("example:bonus_spawn")?;
         creation.mode = crate::world_creation::GameMode::Creative;
+        creation.difficulty = crate::world_creation::Difficulty::Hard;
         creation.bonus_chest = true;
         let frozen = creation.freeze(game.clone(), Some((world.clone(), selection)));
         let saved_border = native_persistence::world::SavedWorldBorder::default();
@@ -4069,6 +4095,10 @@ mod tests {
             42
         );
         assert!(!initial_ready.initial_clocks.as_ref().unwrap().advance_time);
+        assert_eq!(
+            initial_ready.hut_generation.as_ref().unwrap().difficulty,
+            Some(native_persistence::world::Difficulty::Hard)
+        );
         assert!(initial_ready.postprocessed.is_some());
         let processed = initial_ready.postprocessed.as_ref().unwrap();
         let pos = processed
@@ -4216,6 +4246,7 @@ mod tests {
             60,
             0,
             None,
+            None,
         )?;
         let mut spawned = match spawn_worker
             .result
@@ -4228,6 +4259,10 @@ mod tests {
         assert_eq!(spawned.spawn_origin, Some(ChunkPos { x: 0, z: 0 }));
         assert!(spawned.mesh.targets.as_deref().unwrap().len() >= 2);
         assert!(spawned.suggested_spawn.context("world spawn missing")?.x >= 16);
+        assert!(
+            spawned.hut_generation.is_some(),
+            "spawn search must preserve initial structure context"
+        );
         assert!(
             spawned
                 .batch
@@ -4794,6 +4829,7 @@ mod tests {
                 conditions,
                 moon,
                 clocks: BTreeMap::from([(clock, 0)]),
+                difficulty: None,
             }));
             let registry = Arc::new(registry);
             let for_height = Arc::clone(&registry);

@@ -165,10 +165,16 @@ pub(crate) struct InitialHutGeneration {
     pub conditions: native_resources::cat_variants::CatWorldConditions,
     pub moon: native_resources::moon_phase::Environment,
     pub clocks: BTreeMap<ResourceId, i64>,
+    /// Present only when generation is tied to frozen create-world settings.
+    pub difficulty: Option<native_persistence::world::Difficulty>,
 }
 
 impl InitialHutGeneration {
-    fn load(resources: &mut ResourceStack, dimension_type: &ResourceId) -> Result<Self> {
+    fn load(
+        resources: &mut ResourceStack,
+        dimension_type: &ResourceId,
+        difficulty: Option<native_persistence::world::Difficulty>,
+    ) -> Result<Self> {
         let clocks = native_resources::world_clock::registered_clocks(resources)?
             .into_iter()
             .map(|id| (id, 0))
@@ -182,6 +188,7 @@ impl InitialHutGeneration {
             conditions,
             moon,
             clocks,
+            difficulty,
         })
     }
 }
@@ -670,6 +677,13 @@ pub fn prepare(settings: FreshGenerationSettings) -> Result<PreparedFreshGenerat
 pub(crate) fn prepare_with_structures(
     settings: FreshGenerationSettings,
 ) -> Result<PreparedStructuredGeneration> {
+    prepare_with_structures_and_difficulty(settings, None)
+}
+
+pub(crate) fn prepare_with_structures_and_difficulty(
+    settings: FreshGenerationSettings,
+    difficulty: Option<native_persistence::world::Difficulty>,
+) -> Result<PreparedStructuredGeneration> {
     ensure!(settings.structures_enabled, "structures must be enabled");
     let mut resources = open_resources(&settings)?;
     let worldgen_settings = native_persistence::worldgen_settings::draft_worldgen_settings(
@@ -689,7 +703,9 @@ pub(crate) fn prepare_with_structures(
     let hut_generation = lighting
         .dimension_type
         .as_ref()
-        .map(|dimension| InitialHutGeneration::load(&mut resources, dimension).map(Arc::new))
+        .map(|dimension| {
+            InitialHutGeneration::load(&mut resources, dimension, difficulty).map(Arc::new)
+        })
         .transpose()?;
     let blocks = resources.vanilla_block_ids()?;
     let terrain_tags = CarverBlockTags::load(&mut resources, &blocks)?;

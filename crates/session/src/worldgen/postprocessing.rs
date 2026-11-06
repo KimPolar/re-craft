@@ -208,6 +208,19 @@ impl PostprocessingTask {
         }
     }
 
+    /// Capture marks only before any callbacks have observed the task.
+    pub(super) fn unstarted_marks(&self) -> Result<&PostProcessing> {
+        anyhow::ensure!(
+            !self.failed
+                && !self.blocks.failed
+                && self.phase == Phase::Blocks
+                && self.blocks.section == 0
+                && self.blocks.index == 0,
+            "postprocessing task has already started"
+        );
+        Ok(&self.blocks.marks)
+    }
+
     pub fn poll<W: PostprocessingChunk>(
         &mut self,
         world: &mut W,

@@ -259,6 +259,20 @@ impl PostprocessedGeneratedRegion {
         self.deferred_tasks.keys().copied()
     }
 
+    /// The untouched FULL chunk's ordered postprocessing lists for serialization.
+    pub fn deferred_postprocessing_data(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<native_persistence::nbt::Tag> {
+        let task = self
+            .deferred_tasks
+            .get(&pos)
+            .context("chunk has no deferred postprocessing")?;
+        Ok(native_persistence::postprocessing::encode(
+            task.unstarted_marks()?,
+        ))
+    }
+
     /// Read the heightmaps produced by the same postprocessing pass.
     pub fn heightmaps(&self) -> &BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps> {
         &self.heightmaps
@@ -5954,6 +5968,14 @@ mod tests {
                 vec![east_chunk]
             );
             assert!(result.block_entity_data(east_chunk).is_err());
+            let pending = result.deferred_postprocessing_data(east_chunk).unwrap();
+            let decoded = native_persistence::postprocessing::decode(&pending, 0, 16).unwrap();
+            assert_eq!(decoded.sections()[0].len(), 1);
+            assert_eq!(
+                decoded.unpack(0, decoded.sections()[0][0], east_chunk.x, east_chunk.z),
+                Some([18, 8, 8])
+            );
+            assert!(result.deferred_postprocessing_data(chunk).is_err());
             let prior_ticks = result.ticks.activated_snapshot();
             let mut resumed =
                 GeneratedPostprocessing::from_completed(&result, None, None, heightmap_tags)
@@ -5968,6 +5990,7 @@ mod tests {
             while !resumed.poll(east_chunk, 1).unwrap() {}
             let after = resumed.finish().unwrap();
             assert_eq!(after.deferred_chunks().count(), 0);
+            assert!(after.deferred_postprocessing_data(east_chunk).is_err());
             assert_eq!(result.ticks.activated_snapshot(), prior_ticks);
             let native_persistence::nbt::Tag::List { values, .. } =
                 after.block_entity_data(east_chunk).unwrap()

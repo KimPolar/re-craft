@@ -182,6 +182,16 @@ pub fn assemble_spawn_chunk(parts: SpawnChunkComponents) -> Result<NamedTag> {
 pub fn assemble_full_chunk(parts: FullChunkComponents) -> Result<NamedTag> {
     let marks = native_core::postprocessing::PostProcessing::new(parts.min_y, parts.height)
         .context("invalid generated postprocessing bounds")?;
+    assemble_full_chunk_with_postprocessing(parts, postprocessing::encode(&marks))
+}
+
+/// Assemble a FULL chunk whose post-generation callbacks have not all run.
+/// The caller must capture the corresponding live blocks, ticks, block entities
+/// and lighting at the same point; this alone does not authorize a world save.
+pub fn assemble_full_chunk_with_postprocessing(
+    parts: FullChunkComponents,
+    postprocessing: Tag,
+) -> Result<NamedTag> {
     assemble_chunk(
         SpawnChunkComponents {
             position: parts.position,
@@ -192,7 +202,7 @@ pub fn assemble_full_chunk(parts: FullChunkComponents) -> Result<NamedTag> {
             heightmaps: parts.heightmaps,
             block_ticks: parts.block_ticks,
             fluid_ticks: parts.fluid_ticks,
-            postprocessing: postprocessing::encode(&marks),
+            postprocessing,
             block_entities: parts.block_entities,
             entities: Vec::new(),
         },

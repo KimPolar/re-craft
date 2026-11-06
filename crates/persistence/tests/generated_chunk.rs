@@ -4,7 +4,7 @@ use native_core::postprocessing::PostProcessing;
 use native_persistence::{
     generated_chunk::{
         FullChunkComponents, SpawnChunkComponents, assemble_entity_chunk, assemble_full_chunk,
-        assemble_spawn_chunk,
+        assemble_full_chunk_with_postprocessing, assemble_spawn_chunk,
     },
     generated_section::encode_generated_sections,
     generated_ticks::{encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks},
@@ -232,6 +232,35 @@ fn assembles_full_chunk_without_embedding_entities() {
 }
 
 #[test]
+fn full_chunk_preserves_unprocessed_marks_in_order() {
+    let mut marks = PostProcessing::new(-64, 16).unwrap();
+    marks.mark(-15, -60, 34);
+    marks.mark(-15, -60, 34);
+    marks.mark(-14, -59, 34);
+    let encoded = postprocessing::encode(&marks);
+    let draft =
+        assemble_full_chunk_with_postprocessing(full_fixture(-64), encoded.clone()).unwrap();
+    assert_eq!(draft.value.get("PostProcessing"), Some(&encoded));
+    assert_eq!(
+        postprocessing::decode(draft.value.get("PostProcessing").unwrap(), -64, 16)
+            .unwrap()
+            .sections(),
+        marks.sections()
+    );
+    assert_eq!(nbt::read(&nbt::write(&draft).unwrap()).unwrap(), draft);
+    assert!(
+        assemble_full_chunk_with_postprocessing(
+            full_fixture(-64),
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![]
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn assembles_spawn_chunk_and_rejects_incomplete_components() {
     let draft = assemble_spawn_chunk(fixture(0)).unwrap();
     assert_eq!(
@@ -317,6 +346,29 @@ fn assembled_spawn_chunk_roundtrips_java_serializable_chunk_data() {
         std::fs::write(
             &input,
             nbt::write(&assemble_spawn_chunk(fixture(min_y)).unwrap()).unwrap(),
+        )
+        .unwrap();
+        run(Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("GeneratedChunkOracle")
+            .arg(&input)
+            .arg(min_y.to_string())
+            .arg(&entity_input));
+        let mut marks = PostProcessing::new(min_y, 16).unwrap();
+        marks.mark(-15, min_y + 4, 34);
+        marks.mark(-15, min_y + 4, 34);
+        marks.mark(-14, min_y + 5, 34);
+        std::fs::write(
+            &input,
+            nbt::write(
+                &assemble_full_chunk_with_postprocessing(
+                    full_fixture(min_y),
+                    postprocessing::encode(&marks),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         run(Command::new(java.join("java.exe"))

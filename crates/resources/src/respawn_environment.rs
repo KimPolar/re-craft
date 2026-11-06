@@ -268,8 +268,15 @@ pub struct RespawnEnvironmentRegistry {
 
 impl RespawnEnvironmentRegistry {
     pub fn load(provider: &mut impl ResourceProvider, dimension_type: &str) -> Result<Self> {
-        let dimension = RespawnEnvironmentLayer::load_dimension_type(provider, dimension_type)?;
-        Self::with_dimension(provider, dimension)
+        let id = ResourceId::parse(dimension_type)?;
+        let path = format!("data/{}/dimension_type/{}.json", id.namespace, id.path);
+        let bytes = provider
+            .read_data(&path)?
+            .with_context(|| format!("missing environment definition {path}"))?;
+        let definition: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid environment definition {path}"))?;
+        Self::from_definition(provider, &definition)
+            .with_context(|| format!("invalid environment in {path}"))
     }
 
     pub fn from_definition(
@@ -282,24 +289,21 @@ impl RespawnEnvironmentRegistry {
             .map(RespawnEnvironmentLayer::from_attributes)
             .transpose()?
             .unwrap_or_default();
-        Self::with_dimension(provider, dimension)
+        Self::with_dimension(provider, dimension, definition)
     }
 
     fn with_dimension(
         provider: &mut impl ResourceProvider,
         dimension: RespawnEnvironmentLayer,
+        definition: &Value,
     ) -> Result<Self> {
-        for id in provider.list_data("timeline")? {
-            let path = format!("data/{}/timeline/{}.json", id.namespace, id.path);
-            let bytes = provider
-                .read_data(&path)?
-                .with_context(|| format!("missing {path}"))?;
-            let timeline: Value =
-                serde_json::from_slice(&bytes).with_context(|| format!("invalid {path}"))?;
+        for timeline in
+            crate::fluid_environment::dimension_timelines_from_definition(provider, definition)?
+        {
             let tracks = timeline
                 .get("tracks")
                 .and_then(Value::as_object)
-                .with_context(|| format!("invalid timeline tracks in {path}"))?;
+                .context("invalid active timeline tracks")?;
             for key in tracks.keys() {
                 let attr = ResourceId::parse(key)?;
                 ensure!(
@@ -310,7 +314,7 @@ impl RespawnEnvironmentRegistry {
                                 | "gameplay/straw_bed_rule"
                                 | "gameplay/respawn_anchor_works"
                         ),
-                    "timeline {path} modifies a respawn rule, which is not yet supported"
+                    "active timeline modifies a respawn rule, which is not yet supported"
                 );
             }
         }
@@ -345,6 +349,89 @@ impl RespawnEnvironmentRegistry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct Memory(BTreeMap<String, Value>);
+
+    impl ResourceProvider for Memory {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            self.0
+                .get(path)
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(Into::into)
+        }
+
+        fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+            if folder == "worldgen/biome" {
+                Ok(vec![ResourceId::parse("example:plain")?])
+            } else {
+                // A provider may contain timelines that this dimension never uses.
+                Ok(vec![ResourceId::parse("example:other")?])
+            }
+        }
+    }
+
+    #[test]
+    fn checks_respawn_rules_only_in_active_dimension_timelines() {
+        let definition = json!({
+            "attributes": {"minecraft:gameplay/respawn_anchor_works": true},
+            "timelines": "#example:active"
+        });
+        let mut source = Memory(BTreeMap::from([
+            (
+                "data/example/dimension_type/test.json".into(),
+                definition.clone(),
+            ),
+            ("data/example/worldgen/biome/plain.json".into(), json!({})),
+            (
+                "data/example/tags/timeline/active.json".into(),
+                json!({"values":["#example:nested"]}),
+            ),
+            (
+                "data/example/tags/timeline/nested.json".into(),
+                json!({"values":["example:harmless"]}),
+            ),
+            (
+                "data/example/timeline/harmless.json".into(),
+                json!({"tracks":{}}),
+            ),
+            (
+                "data/example/timeline/other.json".into(),
+                json!({"tracks":{"gameplay/bed_rule":{}}}),
+            ),
+        ]));
+        for registry in [
+            RespawnEnvironmentRegistry::load(&mut source, "example:test").unwrap(),
+            RespawnEnvironmentRegistry::from_definition(&mut source, &definition).unwrap(),
+        ] {
+            assert!(registry.for_biome("example:plain").unwrap().anchor_works);
+        }
+        source.0.insert(
+            "data/example/tags/timeline/nested.json".into(),
+            json!({"values":["example:other"]}),
+        );
+        assert!(RespawnEnvironmentRegistry::load(&mut source, "example:test").is_err());
+        assert!(RespawnEnvironmentRegistry::from_definition(&mut source, &definition).is_err());
+        source.0.insert(
+            "data/example/tags/timeline/nested.json".into(),
+            json!({"values":["example:missing"]}),
+        );
+        assert!(RespawnEnvironmentRegistry::from_definition(&mut source, &definition).is_err());
+        let direct = json!({"timelines":["example:other"]});
+        assert!(RespawnEnvironmentRegistry::from_definition(&mut source, &direct).is_err());
+        let no_timelines = json!({"attributes":{"gameplay/respawn_anchor_works":true}});
+        assert!(
+            RespawnEnvironmentRegistry::from_definition(&mut source, &no_timelines)
+                .unwrap()
+                .for_biome("example:plain")
+                .unwrap()
+                .anchor_works
+        );
+    }
 
     #[test]
     fn applies_layers_and_rejects_unknown_relevant_values() {

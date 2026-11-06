@@ -834,16 +834,16 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        ensure!(
-            structures.ocean_starts.is_empty(),
-            "ocean ruin structure persistence is not yet supported"
-        );
-        super::structure_data::pack_structure_data(
+        super::structure_data::pack_structure_data_with_ocean(
             pos,
             structures
                 .starts
                 .get(&pos)
                 .context("structure starts are missing")?,
+            structures
+                .ocean_starts
+                .get(&pos)
+                .unwrap_or(&Default::default()),
             structures
                 .references
                 .get(&pos)
@@ -866,13 +866,10 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        ensure!(
-            structures.ocean_starts.is_empty(),
-            "ocean ruin structure persistence is not yet supported"
-        );
-        super::structure_data::referenced_start_chunks(
+        super::structure_data::referenced_start_chunks_with_ocean(
             pos,
             &structures.starts,
+            &structures.ocean_starts,
             structures
                 .references
                 .get(&pos)

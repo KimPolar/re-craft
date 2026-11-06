@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     SavedSwampHutPiece,
-    structure_batch::{SimpleStarts, TerrainStartKey},
+    structure_batch::{OceanRuinStarts, SimpleStarts, TerrainStartKey},
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
     },
@@ -16,16 +16,28 @@ use super::{
 /// Verify that the saved reference index exactly reflects all starts in the
 /// reference radius. Return source chunks that a later save plan must retain.
 /// This is evidence for a save plan, not authorization to write a world.
-pub(super) fn referenced_start_chunks(
+#[cfg(test)]
+fn referenced_start_chunks(
     pos: ChunkPos,
     all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
+    referenced_start_chunks_with_ocean(pos, all_starts, &BTreeMap::new(), references, huts)
+}
+
+pub(super) fn referenced_start_chunks_with_ocean(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<BTreeSet<ChunkPos>> {
     let recomputed = collect_ordered_structure_references(pos, |source| {
-        all_starts
-            .get(&source)
-            .with_context(|| format!("structure starts are missing at {}, {}", source.x, source.z))?
+        let simple = all_starts.get(&source).with_context(|| {
+            format!("structure starts are missing at {}, {}", source.x, source.z)
+        })?;
+        let mut bounds = simple
             .iter()
             .map(|(id, start)| {
                 ensure!(
@@ -34,7 +46,15 @@ pub(super) fn referenced_start_chunks(
                 );
                 StructureStartBounds::from_simple(id.clone(), start)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(ocean) = all_ocean.get(&source) {
+            for (id, start) in ocean {
+                ensure!(!simple.contains_key(id), "duplicate structure start");
+                validate_ocean_start(source, start)?;
+                bounds.push(start.reference_bounds(id.clone())?);
+            }
+        }
+        Ok(bounds)
     })?;
     ensure!(
         recomputed.membership() == references.membership(),
@@ -52,15 +72,34 @@ pub(super) fn referenced_start_chunks(
                 x: bits as u32 as i32,
                 z: (bits >> 32) as u32 as i32,
             };
-            let start = all_starts
-                .get(&source)
-                .and_then(|starts| starts.get(id))
-                .context("referenced structure start is missing")?;
-            validate_start(source, id, start, huts)?;
+            let simple = all_starts.get(&source).and_then(|starts| starts.get(id));
+            let ocean = all_ocean.get(&source).and_then(|starts| starts.get(id));
+            match (simple, ocean) {
+                (Some(start), None) => {
+                    validate_start(source, id, start, huts)?;
+                }
+                (None, Some(start)) => {
+                    validate_ocean_start(source, start)?;
+                }
+                (None, None) => anyhow::bail!("referenced structure start is missing"),
+                (Some(_), Some(_)) => anyhow::bail!("duplicate structure start"),
+            }
             required.insert(source);
         }
     }
     Ok(required)
+}
+
+fn validate_ocean_start(pos: ChunkPos, start: &super::ocean_ruin::PreparedStart) -> Result<()> {
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "ocean ruin belongs to another chunk"
+    );
+    ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
+    for piece in &start.pieces {
+        super::ocean_ruin::SavedOceanRuinPiece::capture(piece, start.temperature)?;
+    }
+    Ok(())
 }
 
 fn validate_start(
@@ -135,12 +174,22 @@ fn validate_buried_treasure_start(
     Ok(())
 }
 
-/// Serialize fresh starts and ordered references belonging to one chunk.
-/// Only fresh buried treasure and swamp huts are supported; existing-world
-/// data must not use this.
-pub(super) fn pack_structure_data(
+#[cfg(test)]
+fn pack_structure_data(
     pos: ChunkPos,
     starts: &SimpleStarts,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Tag> {
+    pack_structure_data_with_ocean(pos, starts, &OceanRuinStarts::new(), references, huts)
+}
+
+/// Serialize fresh starts and ordered references belonging to one chunk.
+/// Existing-world data must not use this draft.
+pub(super) fn pack_structure_data_with_ocean(
+    pos: ChunkPos,
+    starts: &SimpleStarts,
+    ocean: &OceanRuinStarts,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
@@ -172,6 +221,25 @@ pub(super) fn pack_structure_data(
                 Tag::List {
                     element_type: TagType::Compound,
                     values: vec![piece],
+                },
+            ),
+        ]);
+        packed_starts.push((name.as_str().into(), value));
+    }
+    for (id, start) in ocean {
+        ensure!(!starts.contains_key(id), "duplicate structure start");
+        validate_ocean_start(pos, start)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        let value = Tag::Compound(vec![
+            ("id".into(), Tag::String(name.as_str().into())),
+            ("ChunkX".into(), Tag::Int(pos.x)),
+            ("ChunkZ".into(), Tag::Int(pos.z)),
+            ("references".into(), Tag::Int(0)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: start.saved_piece_tags()?,
                 },
             ),
         ]);
@@ -236,6 +304,119 @@ mod tests {
             },
             references,
         )
+    }
+
+    fn ocean_fixture(pos: ChunkPos) -> (ResourceId, super::super::ocean_ruin::PreparedStart) {
+        use native_persistence::{nbt::NamedTag, structure_template::StructureTemplate};
+        use native_resources::{
+            ocean_ruin::{Piece, Rotation, Temperature},
+            structure_transform::{Mirror, bounding_box},
+        };
+        use std::sync::Arc;
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [7, 4, 5],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let pieces = [
+            ([1, 70, 2], Rotation::None, 0.7, false),
+            ([5, 71, 6], Rotation::Clockwise90, 0.5, true),
+        ]
+        .into_iter()
+        .map(|(offset, rotation, integrity, large)| {
+            let p = [pos.x * 16 + offset[0], offset[1], pos.z * 16 + offset[2]];
+            super::super::ocean_ruin::PreparedPiece {
+                selection: Piece {
+                    template: "minecraft:underwater_ruin/warm_1".into(),
+                    position: p,
+                    rotation,
+                    integrity,
+                    large,
+                },
+                template: Arc::clone(&template),
+                bounds: bounding_box(template.size, p, Mirror::None, rotation, [0; 3]).unwrap(),
+            }
+        })
+        .collect();
+        (
+            ResourceId::parse("example:ruin").unwrap(),
+            super::super::ocean_ruin::PreparedStart {
+                chunk: [pos.x, pos.z],
+                generation_point: [pos.x * 16 + 8, 70, pos.z * 16 + 8],
+                terrain_adjustment: TerrainAdjustment::None,
+                temperature: Temperature::Warm,
+                pieces,
+            },
+        )
+    }
+
+    #[test]
+    fn ocean_starts_preserve_pieces_and_validate_references() -> Result<()> {
+        let pos = ChunkPos { x: 0, z: 0 };
+        let (id, start) = ocean_fixture(pos);
+        let mut simple = BTreeMap::new();
+        for x in -8..=8 {
+            for z in -8..=8 {
+                simple.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        let ocean = BTreeMap::from([(pos, OceanRuinStarts::from([(id.clone(), start.clone())]))]);
+        let refs = collect_ordered_structure_references(pos, |source| {
+            if source == pos {
+                Ok(vec![start.reference_bounds(id.clone())?])
+            } else {
+                Ok(vec![])
+            }
+        })?;
+        assert_eq!(
+            referenced_start_chunks_with_ocean(pos, &simple, &ocean, &refs, &BTreeMap::new())?,
+            BTreeSet::from([pos])
+        );
+        let tag = pack_structure_data_with_ocean(
+            pos,
+            &simple[&pos],
+            &ocean[&pos],
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        let Some(Tag::List { values, .. }) = tag
+            .get("starts")
+            .and_then(|v| v.get("example:ruin"))
+            .and_then(|v| v.get("Children"))
+        else {
+            anyhow::bail!("missing ocean ruin pieces")
+        };
+        assert_eq!(values, &start.saved_piece_tags()?);
+        let mut broken = ocean.clone();
+        broken.get_mut(&pos).unwrap().get_mut(&id).unwrap().pieces[1]
+            .bounds
+            .min[1] += 1;
+        assert!(
+            referenced_start_chunks_with_ocean(pos, &simple, &broken, &refs, &BTreeMap::new())
+                .is_err()
+        );
+        assert!(
+            pack_structure_data_with_ocean(
+                pos,
+                &simple[&pos],
+                &broken[&pos],
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let empty = collect_ordered_structure_references(pos, |_| Ok(vec![]))?;
+        assert!(
+            referenced_start_chunks_with_ocean(pos, &simple, &ocean, &empty, &BTreeMap::new())
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -428,6 +609,92 @@ mod tests {
             },
             other => other,
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn ocean_structure_data_round_trips_java_chunk_serializer() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let source = temp.path().join("OceanRuinStructureDataOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/OceanRuinStructureDataOracle.java"),
+        )?;
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compile.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let pos = ChunkPos { x: 0, z: 0 };
+        let (id, start) = ocean_fixture(pos);
+        let refs = collect_ordered_structure_references(pos, |source| {
+            if source == pos {
+                Ok(vec![start.reference_bounds(id.clone())?])
+            } else {
+                Ok(vec![])
+            }
+        })?;
+        let actual = pack_structure_data_with_ocean(
+            pos,
+            &SimpleStarts::new(),
+            &OceanRuinStarts::from([(id, start)]),
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        let rust_path = temp.path().join("rust.nbt");
+        let java_path = temp.path().join("java.nbt");
+        std::fs::write(
+            &rust_path,
+            native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
+                name: "".into(),
+                value: actual.clone(),
+            })?,
+        )?;
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("OceanRuinStructureDataOracle")
+            .arg(&java_path)
+            .arg(&rust_path)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = native_persistence::nbt::read(&std::fs::read(java_path)?)?.value;
+        assert_eq!(canonical(actual), canonical(expected));
+        Ok(())
     }
 
     #[test]

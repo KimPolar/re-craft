@@ -57,6 +57,7 @@ pub struct PlannedStructureDecoration<'a> {
 pub enum PlannedStructureStart<'a> {
     Simple(&'a SimpleStructureStart),
     OceanRuin(&'a super::ocean_ruin::PreparedStart),
+    Mineshaft(&'a super::mineshaft::PreparedStart),
 }
 
 impl PlannedStructureStart<'_> {
@@ -64,6 +65,7 @@ impl PlannedStructureStart<'_> {
         match self {
             Self::Simple(start) => start.chunk,
             Self::OceanRuin(start) => start.chunk,
+            Self::Mineshaft(start) => start.chunk,
         }
     }
 }
@@ -393,6 +395,7 @@ impl PreparedStructureStages {
         decoration_plan(
             &self.starts,
             &self.ocean_starts,
+            &self.mineshafts,
             &self.references,
             pos,
             schedule,
@@ -407,6 +410,7 @@ impl PreparedStructureStages {
         mixed_decoration_plan(
             &self.starts,
             &self.ocean_starts,
+            &self.mineshafts,
             &self.references,
             pos,
             schedule,
@@ -442,6 +446,10 @@ impl PreparedStructureStages {
                 PlannedStructureStart::OceanRuin(start) => {
                     let current = self.ocean_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("ocean ruin start missing")?;
                     ensure!(std::ptr::eq(*start, current), "mixed plan has stale ocean start");
+                }
+                PlannedStructureStart::Mineshaft(start) => {
+                    let current = self.mineshafts.get(&key.1).and_then(|s| s.get(&key.0)).context("mineshaft start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale mineshaft start");
                 }
             }
             Ok(key)
@@ -483,8 +491,12 @@ impl PreparedStructureStages {
                             .and_then(|s| s.get_mut(&key.0))
                             .expect("validated ocean start") = start
                     }
-                    super::PreparedStructureStart::Mineshaft(_) => {
-                        unreachable!("mineshafts are not accepted by the mixed decoration plan")
+                    super::PreparedStructureStart::Mineshaft(start) => {
+                        *self
+                            .mineshafts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated mineshaft start") = start
                     }
                 }
             }
@@ -496,6 +508,7 @@ impl PreparedStructureStages {
 fn decoration_plan<'a>(
     starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
     ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
+    mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
@@ -503,6 +516,7 @@ fn decoration_plan<'a>(
     mixed_decoration_plan(
         starts_by_chunk,
         ocean_by_chunk,
+        mineshafts_by_chunk,
         references_by_chunk,
         pos,
         schedule,
@@ -517,6 +531,9 @@ fn decoration_plan<'a>(
                 PlannedStructureStart::OceanRuin(_) => {
                     bail!("ocean ruin decoration context is missing")
                 }
+                PlannedStructureStart::Mineshaft(_) => {
+                    bail!("mineshaft decoration context is missing")
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(PlannedStructureDecoration {
@@ -530,6 +547,7 @@ fn decoration_plan<'a>(
 fn mixed_decoration_plan<'a>(
     starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
     ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
+    mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
@@ -569,14 +587,21 @@ fn mixed_decoration_plan<'a>(
             let ocean = ocean_by_chunk
                 .get(&source)
                 .and_then(|starts| starts.get(&entry.id));
-            let start = match (simple, ocean) {
-                (Some(start), None) => PlannedStructureStart::Simple(start),
-                (None, Some(start)) => {
+            let mineshaft = mineshafts_by_chunk
+                .get(&source)
+                .and_then(|starts| starts.get(&entry.id));
+            let start = match (simple, ocean, mineshaft) {
+                (Some(start), None, None) => PlannedStructureStart::Simple(start),
+                (None, Some(start), None) => {
                     ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
                     PlannedStructureStart::OceanRuin(start)
                 }
-                (None, None) => bail!("referenced structure start is missing"),
-                (Some(_), Some(_)) => bail!("duplicate referenced structure start"),
+                (None, None, Some(start)) => {
+                    ensure!(!start.pieces.is_empty(), "mineshaft start has no pieces");
+                    PlannedStructureStart::Mineshaft(start)
+                }
+                (None, None, None) => bail!("referenced structure start is missing"),
+                _ => bail!("duplicate referenced structure start"),
             };
             ensure!(
                 start.chunk() == [source.x, source.z],
@@ -830,29 +855,6 @@ impl StructureGenerationBatch {
             .flatten()
     }
 
-    fn require_supported_decoration_references(&self, pos: ChunkPos) -> Result<()> {
-        let references = self
-            .references(pos)
-            .context("structure references are unavailable")?;
-        for (id, sources) in references {
-            for &packed in sources {
-                let bits = packed as u64;
-                let source = ChunkPos {
-                    x: bits as u32 as i32,
-                    z: (bits >> 32) as u32 as i32,
-                };
-                ensure!(
-                    !self
-                        .mineshafts
-                        .get(&source)
-                        .is_some_and(|starts| starts.contains_key(id)),
-                    "mineshaft mixed decoration context is missing"
-                );
-            }
-        }
-        Ok(())
-    }
-
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
         (!self.failed)
             .then(|| {
@@ -884,10 +886,10 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
-        self.require_supported_decoration_references(pos)?;
         decoration_plan(
             &self.starts,
             &self.ocean_starts,
+            &self.mineshafts,
             &self.references,
             pos,
             schedule,
@@ -901,10 +903,10 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
-        self.require_supported_decoration_references(pos)?;
         mixed_decoration_plan(
             &self.starts,
             &self.ocean_starts,
+            &self.mineshafts,
             &self.references,
             pos,
             schedule,
@@ -1345,10 +1347,27 @@ mod tests {
         };
         let mut ocean = BTreeMap::from([(pos, OceanRuinStarts::from([(id.clone(), start)]))]);
         let mut simple = BTreeMap::new();
-        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        assert!(
+            mixed_decoration_plan(
+                &simple,
+                &ocean,
+                &BTreeMap::new(),
+                &references,
+                pos,
+                &schedule
+            )
+            .is_err()
+        );
         simple.insert(pos, SimpleStarts::new());
         assert_eq!(
-            mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule)?[0]
+            mixed_decoration_plan(
+                &simple,
+                &ocean,
+                &BTreeMap::new(),
+                &references,
+                pos,
+                &schedule
+            )?[0]
                 .starts
                 .len(),
             1
@@ -1361,7 +1380,17 @@ mod tests {
             .unwrap()
             .pieces
             .clear();
-        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        assert!(
+            mixed_decoration_plan(
+                &simple,
+                &ocean,
+                &BTreeMap::new(),
+                &references,
+                pos,
+                &schedule
+            )
+            .is_err()
+        );
         ocean.get_mut(&pos).unwrap().insert(id.clone(), backup);
         simple.get_mut(&pos).unwrap().insert(
             id,
@@ -1374,7 +1403,17 @@ mod tests {
                 terrain_adjustment: TerrainAdjustment::None,
             },
         );
-        assert!(mixed_decoration_plan(&simple, &ocean, &references, pos, &schedule).is_err());
+        assert!(
+            mixed_decoration_plan(
+                &simple,
+                &ocean,
+                &BTreeMap::new(),
+                &references,
+                pos,
+                &schedule
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -97,6 +97,84 @@ pub trait MixedOceanRuinPlacement {
     ) -> Result<()> {
         bail!("mixed hut decoration context is missing")
     }
+
+    fn place_mineshaft(
+        &mut self,
+        _region: &mut DecorationRegion<'_>,
+        _start: &mut super::mineshaft::PreparedStart,
+        _clip: native_core::beardifier::BoundingBox,
+        _random: &mut DecorationRandom,
+        _biomes: &super::BiomeNeighborhood,
+    ) -> Result<()> {
+        bail!("mineshaft mixed decoration context is missing")
+    }
+}
+
+/// Add a transactional mineshaft context to an existing mixed runner. The
+/// decoration region must also have loaded `minecraft:unstable_bottom_center`.
+#[derive(Clone)]
+pub struct MixedMineshaftPlacementContext<'a, R, U> {
+    pub other: R,
+    pub blocking_biomes: &'a native_resources::mineshaft::MineshaftBlockingBiomes,
+    pub uuid_factory: U,
+}
+
+impl<R, U> MixedOceanRuinPlacement for MixedMineshaftPlacementContext<'_, R, U>
+where
+    R: MixedOceanRuinPlacement,
+    U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
+{
+    fn needs_ruin_revisions(&self) -> bool {
+        self.other.needs_ruin_revisions()
+    }
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place(region, start, clip, random)
+    }
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other
+            .place_with_context(region, key, start, clip, random, revisions)
+    }
+    fn place_hut(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other.place_hut(region, key, start, clip, revisions)
+    }
+    fn place_mineshaft(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::mineshaft::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        biomes: &super::BiomeNeighborhood,
+    ) -> Result<()> {
+        region.place_mineshaft_start(
+            start,
+            clip,
+            biomes,
+            self.blocking_biomes,
+            random,
+            &mut self.uuid_factory,
+        )
+    }
 }
 
 /// Transactional hut and ocean-ruin callbacks sharing one region RNG.
@@ -1482,6 +1560,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                         PlannedStructureStart::OceanRuin(start) => {
                             PreparedStructureStart::OceanRuin((*start).clone())
                         }
+                        PlannedStructureStart::Mineshaft(start) => {
+                            PreparedStructureStart::Mineshaft((*start).clone())
+                        }
                     })
                     .collect()
             })
@@ -2028,9 +2109,18 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                         }),
                                                     );
                                                 }
-                                                PreparedStructureStart::Mineshaft(_) => bail!(
-                                                    "mineshaft mixed decoration context is missing"
-                                                ),
+                                                PreparedStructureStart::Mineshaft(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.extend(start.pieces.iter().map(
+                                                        |piece| (key.clone(), piece.piece.bounds),
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
@@ -2073,8 +2163,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                         )?;
                                         validate_decorated_ocean_start(&original, start)?;
                                     }
-                                    PreparedStructureStart::Mineshaft(_) => {
-                                        bail!("mineshaft mixed decoration context is missing")
+                                    PreparedStructureStart::Mineshaft(start) => {
+                                        let original = start.clone();
+                                        ocean.place_mineshaft(
+                                            &mut region,
+                                            start,
+                                            clip,
+                                            &mut random,
+                                            self.plan.biomes,
+                                        )?;
+                                        validate_decorated_mineshaft_start(&original, start)?;
                                     }
                                 }
                             }
@@ -2132,6 +2230,30 @@ fn clone_structure_starts(
                 .collect()
         })
         .collect()
+}
+
+fn validate_decorated_mineshaft_start(
+    original: &super::mineshaft::PreparedStart,
+    updated: &super::mineshaft::PreparedStart,
+) -> Result<()> {
+    ensure!(
+        original.chunk == updated.chunk
+            && original.generation_point == updated.generation_point
+            && original.terrain_adjustment == updated.terrain_adjustment
+            && original.variant == updated.variant
+            && original.pieces.len() == updated.pieces.len(),
+        "mineshaft start identity changed"
+    );
+    for (before, after) in original.pieces.iter().zip(&updated.pieces) {
+        ensure!(
+            before.piece == after.piece
+                && before.variant == after.variant
+                && (!before.placed_spider || after.placed_spider),
+            "mineshaft piece changed unexpectedly"
+        );
+        after.validate()?;
+    }
+    Ok(())
 }
 
 fn validate_decorated_ocean_start(
@@ -21693,6 +21815,130 @@ mod tests {
         }));
         assert!(prepared.execute(&mut terrain, false).is_err());
         assert!(Arc::ptr_eq(&after, &terrain.snapshot()));
+    }
+
+    #[test]
+    fn mixed_plan_places_mineshaft_or_rejects_missing_context() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::{
+            mineshaft::{MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant},
+            structure_decoration::StructureDecorationEntry,
+        };
+        #[derive(Clone)]
+        struct NoOcean;
+        impl MixedOceanRuinPlacement for NoOcean {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+        }
+        #[derive(Clone)]
+        struct Corrupt;
+        impl MixedOceanRuinPlacement for Corrupt {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_mineshaft(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                start: &mut super::super::mineshaft::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+                _: &super::super::BiomeNeighborhood,
+            ) -> Result<()> {
+                start.chunk[0] += 1;
+                Ok(())
+            }
+        }
+        struct Biomes;
+        impl ResourceProvider for Biomes {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(
+                    (path == "data/minecraft/tags/worldgen/biome/mineshaft_blocking.json")
+                        .then(|| br#"{"values":[]}"#.to_vec()),
+                )
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let registry = batch_registry();
+        let prepared = PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test)?;
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:mineshaft")?,
+            step: 0,
+            index: 0,
+        };
+        let room = MineshaftGraphPiece {
+            bounds: BoundingBox::new([2, 1, 2], [10, 6, 10]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let start = super::super::mineshaft::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 0],
+            terrain_adjustment: TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: vec![super::super::SavedMineshaftPiece::capture(
+                &room,
+                MineshaftVariant::Normal,
+                false,
+            )?],
+        };
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![PlannedStructureStart::Mineshaft(&start)],
+        }];
+        let (mut failed, _, _, _) = fixture();
+        let before = failed.snapshot();
+        assert!(
+            prepared
+                .execute_with_mixed_structure_plan(&mut failed, &structures, &mut NoOcean)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        let error = prepared
+            .execute_with_mixed_structure_plan(&mut failed, &structures, &mut Corrupt)
+            .err()
+            .context("corrupted start accepted")?;
+        assert!(format!("{error:#}").contains("mineshaft start identity changed"));
+        assert!(Arc::ptr_eq(&before, &failed.snapshot()));
+        let blocking = native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut Biomes)?;
+        let mut context = MixedMineshaftPlacementContext {
+            other: NoOcean,
+            blocking_biomes: &blocking,
+            uuid_factory: |_: [f64; 3]| Ok(Some([1, 2, 3, 4])),
+        };
+        let (mut terrain, _, _, _) = fixture();
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut context)?;
+        assert!(matches!(
+            &updated[0][0],
+            PreparedStructureStart::Mineshaft(_)
+        ));
+        assert_eq!(
+            terrain.snapshot().block(3, 2, 3).unwrap().name,
+            "minecraft:cave_air"
+        );
+        Ok(())
     }
 
     #[test]

@@ -88,9 +88,9 @@ pub use mob_spawner::{
     FreshCreatureConstruction, GeneratedSheepSpawner, SheepSpawnInputs, SheepSpawnProgress,
 };
 pub use ore::{
-    DecorationRegion, MixedHutOceanPlacementContext, MixedOceanRuinPlacement,
-    OceanRuinPlacementContext, PlacedDecorationFeature, PreparedDecoration,
-    ScheduledDecorationFeature,
+    DecorationRegion, MixedHutOceanPlacementContext, MixedMineshaftPlacementContext,
+    MixedOceanRuinPlacement, OceanRuinPlacementContext, PlacedDecorationFeature,
+    PreparedDecoration, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
@@ -8467,7 +8467,28 @@ mod tests {
                     &mut data,
                 )
                 .unwrap();
-            assert!(batch.mixed_decoration_plan(target, &schedule).is_err());
+            let mixed = batch.mixed_decoration_plan(target, &schedule).unwrap();
+            let entry = mixed
+                .iter()
+                .find(|entry| entry.entry.id == structure_id)
+                .unwrap();
+            let scheduled: Vec<_> = entry
+                .starts
+                .iter()
+                .map(|start| {
+                    assert!(matches!(
+                        start,
+                        structure_batch::PlannedStructureStart::Mineshaft(_)
+                    ));
+                    let [x, z] = start.chunk();
+                    (x as u32 as u64 | ((z as u32 as u64) << 32)) as i64
+                })
+                .collect();
+            assert_eq!(
+                scheduled,
+                batch.reference_order(target, &structure_id).unwrap()
+            );
+            assert!(batch.decoration_plan(target, &schedule).is_err());
             let plan = structure_batch::StructurePreparationPlan::new([(
                 target,
                 schedule::GenerationStage::StructureReferences,
@@ -8478,7 +8499,16 @@ mod tests {
                 added.mineshafts[&target][&structure_id].pieces.len(),
                 start.pieces.len()
             );
-            assert!(added.mixed_decoration_plan(target, &schedule).is_err());
+            let planned = added.mixed_decoration_plan(target, &schedule).unwrap();
+            assert!(
+                planned
+                    .iter()
+                    .any(|entry| entry.starts.iter().any(|start| matches!(
+                        start,
+                        structure_batch::PlannedStructureStart::Mineshaft(_)
+                    )))
+            );
+            assert!(added.mixed_commit_keys(&planned, false).is_ok());
             let (_, transferred) = batch
                 .into_terrain_stages(BTreeMap::from([(target, order)]))
                 .unwrap();
@@ -8490,7 +8520,12 @@ mod tests {
             assert!(
                 transferred
                     .mixed_decoration_plan(target, &schedule)
-                    .is_err()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.starts.iter().any(|start| matches!(
+                        start,
+                        structure_batch::PlannedStructureStart::Mineshaft(_)
+                    )))
             );
         }
         // The generalized start path can retain a multi-piece ruin without
@@ -8659,6 +8694,9 @@ mod tests {
                             }
                             structure_batch::PlannedStructureStart::OceanRuin(start) => {
                                 PreparedStructureStart::OceanRuin((*start).clone())
+                            }
+                            structure_batch::PlannedStructureStart::Mineshaft(start) => {
+                                PreparedStructureStart::Mineshaft((*start).clone())
                             }
                         })
                         .collect()

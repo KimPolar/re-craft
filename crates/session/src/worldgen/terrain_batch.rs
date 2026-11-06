@@ -4169,6 +4169,7 @@ impl FreshTerrainBatch {
                             entry.starts.iter().any(|start| {
                                 match start {
                                     super::structure_batch::PlannedStructureStart::OceanRuin(_) => true,
+                                    super::structure_batch::PlannedStructureStart::Mineshaft(_) => true,
                                     super::structure_batch::PlannedStructureStart::Simple(start) => allow_huts && start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut,
                                 }
                             })

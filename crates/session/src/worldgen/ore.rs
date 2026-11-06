@@ -6401,7 +6401,7 @@ impl LakeWorld for DecorationRegion<'_> {
             let old = self.read(pos)?;
             ensure!(
                 disk_safe_solid(&old.name).is_some() || simple_plant_kind(&old).is_ok(),
-                "unsupported lake source effects"
+                "unsupported lake source effects at {pos:?}: {old:?} -> {state:?}"
             );
             self.lake_block_write = true;
             let write = self.set_proto_block(pos, state);

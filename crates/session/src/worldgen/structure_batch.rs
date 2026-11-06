@@ -361,6 +361,86 @@ impl PreparedStructureStages {
             schedule,
         )
     }
+
+    pub(super) fn mixed_decoration_plan<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+        mixed_decoration_plan(
+            &self.starts,
+            &self.ocean_starts,
+            &self.references,
+            pos,
+            schedule,
+        )
+    }
+
+    /// Prove that every mixed-plan key points to exactly one retained start.
+    /// The mixed executor preserves this shape and validates ruin mutations.
+    pub(super) fn mixed_commit_keys(
+        &self,
+        plan: &[PlannedMixedStructureDecoration<'_>],
+    ) -> Result<Vec<Vec<TerrainStartKey>>> {
+        let mut seen = BTreeSet::new();
+        plan.iter().map(|entry| entry.starts.iter().map(|start| {
+            let [x, z] = start.chunk();
+            let key = (entry.entry.id.clone(), ChunkPos { x, z });
+            ensure!(seen.insert(key.clone()), "duplicate decorated structure start");
+            match start {
+                PlannedStructureStart::Simple(start) => {
+                    let current = self.starts.get(&key.1).and_then(|s| s.get(&key.0)).context("simple start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale simple start");
+                    ensure!(start.kind == native_resources::structure_start::SimpleStructureKind::BuriedTreasure,
+                        "mixed structure requires an unsupported decoration context");
+                }
+                PlannedStructureStart::OceanRuin(start) => {
+                    let current = self.ocean_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("ocean ruin start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale ocean start");
+                }
+            }
+            Ok(key)
+        }).collect()).collect()
+    }
+
+    /// Apply only an executor result whose keys were proved by
+    /// `mixed_commit_keys`; the executor constructs and preserves its shape.
+    pub(super) fn commit_mixed_starts(
+        &mut self,
+        keys: Vec<Vec<TerrainStartKey>>,
+        updated: Vec<Vec<super::PreparedStructureStart>>,
+    ) {
+        assert_eq!(
+            keys.len(),
+            updated.len(),
+            "validated structure result shape changed"
+        );
+        for (keys, starts) in keys.into_iter().zip(updated) {
+            assert_eq!(
+                keys.len(),
+                starts.len(),
+                "validated structure start count changed"
+            );
+            for (key, start) in keys.into_iter().zip(starts) {
+                match start {
+                    super::PreparedStructureStart::Simple(start) => {
+                        *self
+                            .starts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated simple start") = start
+                    }
+                    super::PreparedStructureStart::OceanRuin(start) => {
+                        *self
+                            .ocean_starts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated ocean start") = start
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn decoration_plan<'a>(

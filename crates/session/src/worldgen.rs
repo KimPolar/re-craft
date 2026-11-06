@@ -7231,6 +7231,295 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_structure_batch_schedules_ocean_ruin_decoration() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::{
+            heightmap::BlockHeightFlags,
+            nbt::{self, NamedTag, Tag, TagType},
+        };
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+            drowned_spawn::MainHandRoll, ore_feature::OreBlockTags,
+            structure_biomes::StructureBiomes, structure_placement::StructureSetCache,
+            worldgen_region_random::RegionRandom,
+        };
+        use native_world::loaded::{BlockState, ChunkPos, World};
+        use std::io::Write;
+        struct NoDrowned;
+        impl Clone for NoDrowned {
+            fn clone(&self) -> Self {
+                Self
+            }
+        }
+        impl ocean_ruin::DrownedMarkerContext for NoDrowned {
+            fn special_multiplier(&mut self, _: [i32; 3], _: &World) -> Result<f32> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn halloween(&mut self) -> Result<bool> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn try_existing_chicken(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn spawn_chicken_jockey(
+                &mut self,
+                _: [i32; 3],
+                _: &World,
+                _: &mut RegionRandom,
+            ) -> Result<bool> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn enchant_weapon(
+                &mut self,
+                _: [i32; 3],
+                _: &World,
+                _: &mut RegionRandom,
+                _: MainHandRoll,
+                _: f32,
+            ) -> Result<Tag> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn more_frequent_drowned_biome(&mut self, _: [i32; 3], _: &World) -> Result<bool> {
+                anyhow::bail!("unexpected drowned")
+            }
+            fn spawn_zombie_nautilus(
+                &mut self,
+                _: [i32; 3],
+                _: &World,
+                _: &mut RegionRandom,
+                _: bool,
+            ) -> Result<bool> {
+                anyhow::bail!("unexpected drowned")
+            }
+        }
+        struct FixtureData {
+            vanilla: native_resources::packs::ResourceStack,
+            template: Vec<u8>,
+        }
+        impl ResourceProvider for FixtureData {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.vanilla.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let json = match path {
+                    "data/example/worldgen/structure/ruin.json" => Some(
+                        json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"step":"surface_structures","biome_temp":"warm","large_probability":0.0,"cluster_probability":0.0}),
+                    ),
+                    "data/example/worldgen/structure_set/ruin.json" => Some(
+                        json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:ruin","weight":1}]}),
+                    ),
+                    "data/minecraft/worldgen/biome/plains.json" => Some(
+                        json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
+                    ),
+                    _ => None,
+                };
+                if let Some(value) = json {
+                    return Ok(Some(serde_json::to_vec(&value)?));
+                }
+                if path.starts_with("data/minecraft/structure/underwater_ruin/") {
+                    return Ok(Some(self.template.clone()));
+                }
+                if path.starts_with("data/minecraft/tags/") {
+                    return self.vanilla.read_data(path);
+                }
+                if let Some(bytes) = Data.read_data(path)? {
+                    return Ok(Some(bytes));
+                }
+                self.vanilla.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                match folder {
+                    "worldgen/structure" => Ok(vec![ResourceId::parse("example:ruin")?]),
+                    "worldgen/biome" => Ok(vec![ResourceId::parse("minecraft:plains")?]),
+                    _ => self.vanilla.list_data(folder),
+                }
+            }
+        }
+        let list = |element_type, values| Tag::List {
+            element_type,
+            values,
+        };
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "size".into(),
+                    list(TagType::Int, vec![Tag::Int(1), Tag::Int(1), Tag::Int(1)]),
+                ),
+                (
+                    "palette".into(),
+                    list(
+                        TagType::Compound,
+                        vec![Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:stone_bricks".into()),
+                        )])],
+                    ),
+                ),
+                (
+                    "blocks".into(),
+                    list(
+                        TagType::Compound,
+                        vec![Tag::Compound(vec![
+                            (
+                                "pos".into(),
+                                list(TagType::Int, vec![Tag::Int(0), Tag::Int(0), Tag::Int(0)]),
+                            ),
+                            ("state".into(), Tag::Int(0)),
+                        ])],
+                    ),
+                ),
+                ("entities".into(), list(TagType::Compound, vec![])),
+            ]),
+        };
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&nbt::write(&document)?)?;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut vanilla = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = vanilla.vanilla_block_ids()?;
+        let registry = vanilla.vanilla_generated_block_registry()?;
+        let mut data = FixtureData {
+            vanilla,
+            template: encoder.finish()?,
+        };
+        let structure = ResourceId::parse("example:ruin")?;
+        let set = ResourceId::parse("example:ruin")?;
+        let mut config = definition();
+        config["settings"]["noise"]["height"] = json!(96);
+        config["settings"]["material_rule"] =
+            json!({"type":"block","result_state":"minecraft:stone"});
+        config["settings"]["noise_router"]["final_density"] = json!({"type":"gradient","axis":"y","from_coordinate":0,"to_coordinate":96,"from_value":1,"to_value":-1});
+        let (generator, terrain_generator) =
+            TerrainGenerator::paired_with_structure_context(&mut data, &config, 42, 0, 96)?;
+        let [x, z] = StructureSetCache::default()
+            .load(&mut data, &set)?
+            .placement
+            .potential_chunk(42, [0, 0]);
+        let target = ChunkPos { x, z };
+        let mut expected_region_random = generator.region_random(target);
+        let rules = StructureBiomes::load(&mut data, [structure.clone()])?;
+        let mut structures =
+            structure_batch::StructureGenerationBatch::new(generator, rules, vec![set])?;
+        let preparation = structure_batch::StructurePreparationPlan::new([(
+            target,
+            schedule::GenerationStage::Features,
+        )])?;
+        preparation.request_structures(&mut structures)?;
+        while structures
+            .step(&mut data, &mut |value| {
+                let name = value.as_str().context("expected block")?;
+                Ok(BlockHeightFlags {
+                    is_air: name == "minecraft:air",
+                    blocks_motion: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    blocks_motion_no_leaves: matches!(name, "minecraft:stone" | "minecraft:dirt"),
+                    has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                })
+            })?
+            .is_some()
+        {}
+        let tags = CarverBlockTags::load(&mut data, &blocks)?;
+        let mut batch = preparation.into_expandable_terrain_batch(
+            structures,
+            terrain_generator,
+            tags,
+            "minecraft:overworld",
+        )?;
+        let initial = batch
+            .ocean_ruin_starts(target)
+            .context("ruin start missing")?[&structure]
+            .pieces[0]
+            .selection
+            .position;
+        assert_eq!(initial[1], 90);
+        let lighting = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld")?,
+            dimension_type: None,
+            min_y: 0,
+            height: 96,
+            has_skylight: true,
+            ambient_light: Some(0.0),
+        };
+        batch.enable_decoration(&mut data, &BTreeSet::new(), blocks.clone(), &lighting)?;
+        let ice = OreBlockTags::load(
+            &mut data,
+            &blocks,
+            &BTreeSet::from([ResourceId::parse("minecraft:ice")?]),
+        )?;
+        let water = BTreeSet::from([
+            "minecraft:water".to_owned(),
+            "minecraft:flowing_water".to_owned(),
+        ]);
+        let bubbles = BTreeSet::new();
+        let mut adapter = OceanRuinPlacementContext {
+            ice_tags: &ice,
+            water_fluids: &water,
+            bubble_fluids: &bubbles,
+            registry: &registry,
+            sea_level: 8,
+            region_random: RegionRandom::Legacy(native_core::random::LegacyRandom::new(0)),
+            construct: || -> Result<Option<FreshCreatureRandom>> {
+                anyhow::bail!("unexpected drowned")
+            },
+            context: NoDrowned,
+        };
+        batch.request_features(target)?;
+        while batch
+            .step_with_ocean_support(
+                &mut data,
+                &mut |value| {
+                    let name = value.as_str().context("expected block")?;
+                    Ok(CarverBlockState {
+                        is_air: name == "minecraft:air",
+                        has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+                    })
+                },
+                &mut |value| {
+                    Ok(BlockState {
+                        name: value.as_str().context("expected block")?.to_owned(),
+                        properties: BTreeMap::new(),
+                    })
+                },
+                &mut adapter,
+            )?
+            .is_some()
+        {}
+        let start = &batch
+            .ocean_ruin_starts(target)
+            .context("ruin start missing")?[&structure];
+        let position = start.pieces[0].selection.position;
+        assert_ne!(position[1], initial[1]);
+        assert_eq!(
+            batch
+                .snapshot()
+                .context("missing terrain")?
+                .block(position[0], position[1], position[2])
+                .context("missing ruin block")?
+                .name,
+            "minecraft:stone_bricks"
+        );
+        assert_eq!(
+            batch.schedule().completed(target),
+            Some(schedule::GenerationStage::Features)
+        );
+        assert_eq!(
+            adapter.region_random.next_long(),
+            expected_region_random.next_long()
+        );
+        assert!(
+            batch
+                .structure_data(target)?
+                .get("starts")
+                .and_then(|tag| tag.get("example:ruin"))
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fresh_structure_batch_decorates_and_retains_buried_treasure_start() {
         use native_resources::{
             carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
@@ -7740,12 +8029,49 @@ mod tests {
                 schedule::GenerationStage::StructureReferences,
             )])
             .unwrap();
-            let added = batch.prepare_additional_stages(&plan, None).unwrap();
+            let mut added = batch.prepare_additional_stages(&plan, None).unwrap();
             assert_eq!(
                 added.ocean_starts[&target][&structure_id].pieces.len(),
                 piece_count
             );
             assert!(added.references[&target].membership()[&structure_id].contains(&packed));
+            let mixed = added
+                .mixed_decoration_plan(target, &decoration_schedule)
+                .unwrap();
+            let keys = added.mixed_commit_keys(&mixed).unwrap();
+            let mut updated: Vec<Vec<_>> = mixed
+                .iter()
+                .map(|entry| {
+                    entry
+                        .starts
+                        .iter()
+                        .map(|start| match start {
+                            structure_batch::PlannedStructureStart::Simple(start) => {
+                                PreparedStructureStart::Simple((*start).clone())
+                            }
+                            structure_batch::PlannedStructureStart::OceanRuin(start) => {
+                                PreparedStructureStart::OceanRuin((*start).clone())
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let PreparedStructureStart::OceanRuin(first) = &mut updated[0][0] else {
+                panic!("missing ocean ruin")
+            };
+            first.pieces[0].selection.position[1] -= 12;
+            first.pieces[0].bounds.min[1] -= 12;
+            first.pieces[0].bounds.max[1] -= 12;
+            let next_y = first.pieces[0].selection.position[1];
+            drop(mixed);
+            added.commit_mixed_starts(keys, updated);
+            let mixed = added
+                .mixed_decoration_plan(target, &decoration_schedule)
+                .unwrap();
+            assert!(
+                matches!(mixed[0].starts[0], structure_batch::PlannedStructureStart::OceanRuin(start) if start.pieces[0].selection.position[1] == next_y)
+            );
+            drop(mixed);
             let (_, transferred) = batch
                 .into_terrain_stages(BTreeMap::from([(target, order)]))
                 .unwrap();

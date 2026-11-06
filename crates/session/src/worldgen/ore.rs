@@ -21332,6 +21332,79 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&before, &visible_failed.snapshot()));
         assert!(runner.draws.is_empty());
+
+        struct ScheduledRunner(Runner);
+        impl super::super::schedule::OceanFeatureRunner for ScheduledRunner {
+            fn execute(
+                &mut self,
+                terrain: &mut CarvedTerrainWorld,
+                prepared: &PreparedDecoration<'_, '_>,
+                structures: &[PlannedMixedStructureDecoration<'_>],
+                _: &native_resources::worldgen_region_random::RegionRandom,
+                lighting: super::super::schedule::StructureFeatureLighting<'_>,
+            ) -> Result<Vec<Vec<PreparedStructureStart>>> {
+                let super::super::schedule::StructureFeatureLighting::Visible(light) = lighting
+                else {
+                    anyhow::bail!("unexpected lighting")
+                };
+                Ok(prepared
+                    .execute_mixed_with_visible_light(terrain, structures, &mut self.0, light)?
+                    .1)
+            }
+        }
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut generation = super::super::schedule::GenerationSchedule::new();
+        generation.request(center, super::super::schedule::GenerationStage::Features)?;
+        loop {
+            let (pos, stage) = generation
+                .next_ready()
+                .context("missing generation prerequisite")?;
+            if pos == center && stage == super::super::schedule::GenerationStage::Features {
+                break;
+            }
+            generation.complete(pos, stage)?;
+        }
+        let (mut scheduled, _, _, _) = fixture();
+        let before = scheduled.snapshot();
+        let mut runner = ScheduledRunner(Runner {
+            fail_at: Some(2),
+            ..Default::default()
+        });
+        let random = native_resources::worldgen_region_random::RegionRandom::Legacy(
+            native_core::random::LegacyRandom::new(7),
+        );
+        assert!(
+            generation
+                .run_features_with_ocean(
+                    &mut scheduled,
+                    &prepared,
+                    &structures,
+                    &random,
+                    super::super::schedule::StructureFeatureLighting::Visible(&light),
+                    &mut runner
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &scheduled.snapshot()));
+        assert!(runner.0.draws.is_empty());
+        assert!(generation.ready(center, super::super::schedule::GenerationStage::Features));
+        runner.0.fail_at = None;
+        let updated = generation.run_features_with_ocean(
+            &mut scheduled,
+            &prepared,
+            &structures,
+            &random,
+            super::super::schedule::StructureFeatureLighting::Visible(&light),
+            &mut runner,
+        )?;
+        assert_eq!(runner.0.draws, expected_draws);
+        assert!(
+            matches!(&updated[1][0], PreparedStructureStart::OceanRuin(start) if start.pieces[0].selection.position[1] == 8)
+        );
+        assert_eq!(
+            generation.completed(center),
+            Some(super::super::schedule::GenerationStage::Features)
+        );
         Ok(())
     }
 

@@ -32,6 +32,62 @@ pub(super) enum StructureFeatureLighting<'a> {
     ),
 }
 
+pub(super) trait OceanFeatureRunner {
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>>;
+}
+
+pub(super) struct OceanFeatureCallbacks<'a, 'b, C, W> {
+    pub ocean: &'a mut super::OceanRuinPlacementContext<'b, C, W>,
+}
+
+impl<C, W> OceanFeatureRunner for OceanFeatureCallbacks<'_, '_, C, W>
+where
+    C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+    W: super::ocean_ruin::DrownedMarkerContext,
+{
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let mut staged = self.ocean.clone();
+        staged.region_random = region_random.clone();
+        let (_, updated) =
+            match lighting {
+                StructureFeatureLighting::Visible(light) => prepared
+                    .execute_mixed_with_visible_light(terrain, structures, &mut staged, light)?,
+                StructureFeatureLighting::Fresh(tracker, registry) => prepared
+                    .execute_mixed_with_tracked_light(
+                        terrain,
+                        structures,
+                        &mut staged,
+                        tracker,
+                        registry,
+                    )?,
+                StructureFeatureLighting::Staged(engine, registry) => prepared
+                    .execute_mixed_with_staged_light(
+                        terrain,
+                        structures,
+                        &mut staged,
+                        engine,
+                        registry,
+                    )?,
+            };
+        *self.ocean = staged;
+        Ok(updated)
+    }
+}
+
 pub(super) trait HutFeatureRunner {
     fn execute(
         &mut self,
@@ -910,6 +966,26 @@ impl GenerationSchedule {
             StructureFeatureLighting::Staged(engine, registry) => prepared
                 .execute_structures_with_staged_light(terrain, structures, engine, registry)?,
         };
+        self.complete(center, Features)?;
+        Ok(updated)
+    }
+
+    /// Publish FEATURES only after the mixed structure pass succeeds.
+    pub(super) fn run_features_with_ocean(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        runner: &mut dyn OceanFeatureRunner,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let updated = runner.execute(terrain, prepared, structures, region_random, lighting)?;
         self.complete(center, Features)?;
         Ok(updated)
     }

@@ -23,7 +23,8 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        NativeHutFeatureRunner, StructureFeatureLighting,
+        NativeHutFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
+        StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3356,7 +3357,29 @@ impl FreshTerrainBatch {
         classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
     ) -> Result<Option<(ChunkPos, GenerationStage)>> {
-        self.step_inner(provider, classify, resolve, None)
+        self.step_inner(provider, classify, resolve, None, None)
+    }
+
+    /// Perform one operation with explicitly supplied ocean-ruin entity and
+    /// item effects. The per-chunk region RNG is initialized by this batch.
+    /// Combined hut and ocean decoration remains unsupported.
+    pub fn step_with_ocean_support<C, W>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        ocean: &mut super::OceanRuinPlacementContext<'_, C, W>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        W: super::ocean_ruin::DrownedMarkerContext,
+    {
+        ensure!(
+            ocean.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = OceanFeatureCallbacks { ocean };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
     }
 
     /// Perform one operation with hut mob initialization and cat conditions.
@@ -3395,7 +3418,7 @@ impl FreshTerrainBatch {
             construct,
             condition,
         };
-        self.step_inner(provider, classify, resolve, Some(&mut callbacks))
+        self.step_inner(provider, classify, resolve, Some(&mut callbacks), None)
     }
 
     /// Perform one operation with a moon phase known to be constant across
@@ -3439,7 +3462,7 @@ impl FreshTerrainBatch {
             conditions,
             moon_phase_at,
         };
-        self.step_inner(provider, classify, resolve, Some(&mut runner))
+        self.step_inner(provider, classify, resolve, Some(&mut runner), None)
     }
 
     /// Evaluate the active moon-phase environment against a snapshot of the
@@ -3482,6 +3505,7 @@ impl FreshTerrainBatch {
         classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
         mut hut_runner: Option<&mut dyn HutFeatureRunner>,
+        mut ocean_runner: Option<&mut dyn OceanFeatureRunner>,
     ) -> Result<Option<(ChunkPos, GenerationStage)>> {
         ensure!(!self.failed, "terrain batch failed and must be discarded");
         let Some((pos, stage)) = self.schedule.next_ready() else {
@@ -3590,90 +3614,156 @@ impl FreshTerrainBatch {
                         .structures
                         .as_ref()
                         .context("structure decoration registry is missing")?;
-                    let planned = structures.decoration_plan(pos, registry)?;
-                    let keys: Vec<Vec<_>> = planned
-                        .iter()
-                        .map(|entry| {
-                            entry
-                                .starts
-                                .iter()
-                                .map(|start| {
-                                    (
-                                        entry.entry.id.clone(),
-                                        ChunkPos {
-                                            x: start.chunk[0],
-                                            z: start.chunk[1],
-                                        },
-                                    )
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    // Only huts referenced by this decoration pass can change.
-                    let mut hut_states = hut_runner.as_ref().map(|_| {
-                        keys.iter()
-                            .flatten()
-                            .filter_map(|key| {
-                                structures.huts.get(key).map(|state| (key.clone(), *state))
+                    let mixed = if ocean_runner.is_some() {
+                        Some(structures.mixed_decoration_plan(pos, registry)?)
+                    } else {
+                        None
+                    };
+                    let has_ocean = mixed.as_ref().is_some_and(|plan| {
+                        plan.iter().any(|entry| {
+                            entry.starts.iter().any(|start| {
+                                matches!(
+                                    start,
+                                    super::structure_batch::PlannedStructureStart::OceanRuin(_)
+                                )
                             })
-                            .collect::<BTreeMap<_, _>>()
+                        })
                     });
-                    let mut run = |lighting| {
-                        if let (Some(runner), Some(states)) =
-                            (hut_runner.as_deref_mut(), hut_states.as_mut())
-                        {
-                            self.schedule.run_features_with_huts(
+                    if has_ocean {
+                        let planned = mixed.context("mixed structure plan is missing")?;
+                        let keys = structures.mixed_commit_keys(&planned)?;
+                        let runner = ocean_runner
+                            .as_deref_mut()
+                            .context("ocean ruin context is missing")?;
+                        let mut run = |lighting| {
+                            self.schedule.run_features_with_ocean(
                                 terrain,
                                 &prepared,
                                 &planned,
-                                states,
-                                &mut region_random,
+                                &region_random,
                                 lighting,
                                 runner,
-                                structures,
-                                &self.biomes,
                             )
+                        };
+                        let updated = if let Some(engine) = &mut self.light_engine {
+                            let registry = self
+                                .light_registry
+                                .as_ref()
+                                .context("light registry is missing")?;
+                            run(StructureFeatureLighting::Staged(engine, registry))?
+                        } else if let Some(tracker) = &mut self.light_tracker {
+                            let registry = self
+                                .light_registry
+                                .as_ref()
+                                .context("light registry is missing")?;
+                            run(StructureFeatureLighting::Fresh(tracker, registry))?
                         } else {
-                            self.schedule.run_features_with_structures(
-                                terrain, &prepared, &planned, lighting,
-                            )
-                        }
-                    };
-                    let updated = if let Some(engine) = &mut self.light_engine {
-                        let registry = self
-                            .light_registry
-                            .as_ref()
-                            .context("light registry is missing")?;
-                        run(StructureFeatureLighting::Staged(engine, registry))?
-                    } else if let Some(tracker) = &mut self.light_tracker {
-                        let registry = self
-                            .light_registry
-                            .as_ref()
-                            .context("light registry is missing")?;
-                        run(StructureFeatureLighting::Fresh(tracker, registry))?
-                    } else {
-                        let mut covered = Vec::with_capacity(9);
-                        for dz in -1i32..=1 {
-                            for dx in -1i32..=1 {
-                                covered.push(ChunkPos {
-                                    x: pos.x.checked_add(dx).context("light X overflow")?,
-                                    z: pos.z.checked_add(dz).context("light Z overflow")?,
-                                });
+                            let mut covered = Vec::with_capacity(9);
+                            for dz in -1i32..=1 {
+                                for dx in -1i32..=1 {
+                                    covered.push(ChunkPos {
+                                        x: pos.x.checked_add(dx).context("light X overflow")?,
+                                        z: pos.z.checked_add(dz).context("light Z overflow")?,
+                                    });
+                                }
                             }
+                            let light = VisibleLightSnapshot::fresh_after_section_updates(
+                                true,
+                                config.has_skylight,
+                                [],
+                                covered,
+                            )
+                            .context("invalid initial light columns")?;
+                            run(StructureFeatureLighting::Visible(&light))?
+                        };
+                        drop(planned);
+                        structures.commit_mixed_starts(keys, updated);
+                    } else {
+                        let planned = structures.decoration_plan(pos, registry)?;
+                        let keys: Vec<Vec<_>> = planned
+                            .iter()
+                            .map(|entry| {
+                                entry
+                                    .starts
+                                    .iter()
+                                    .map(|start| {
+                                        (
+                                            entry.entry.id.clone(),
+                                            ChunkPos {
+                                                x: start.chunk[0],
+                                                z: start.chunk[1],
+                                            },
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        // Only huts referenced by this decoration pass can change.
+                        let mut hut_states = hut_runner.as_ref().map(|_| {
+                            keys.iter()
+                                .flatten()
+                                .filter_map(|key| {
+                                    structures.huts.get(key).map(|state| (key.clone(), *state))
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                        });
+                        let mut run = |lighting| {
+                            if let (Some(runner), Some(states)) =
+                                (hut_runner.as_deref_mut(), hut_states.as_mut())
+                            {
+                                self.schedule.run_features_with_huts(
+                                    terrain,
+                                    &prepared,
+                                    &planned,
+                                    states,
+                                    &mut region_random,
+                                    lighting,
+                                    runner,
+                                    structures,
+                                    &self.biomes,
+                                )
+                            } else {
+                                self.schedule.run_features_with_structures(
+                                    terrain, &prepared, &planned, lighting,
+                                )
+                            }
+                        };
+                        let updated = if let Some(engine) = &mut self.light_engine {
+                            let registry = self
+                                .light_registry
+                                .as_ref()
+                                .context("light registry is missing")?;
+                            run(StructureFeatureLighting::Staged(engine, registry))?
+                        } else if let Some(tracker) = &mut self.light_tracker {
+                            let registry = self
+                                .light_registry
+                                .as_ref()
+                                .context("light registry is missing")?;
+                            run(StructureFeatureLighting::Fresh(tracker, registry))?
+                        } else {
+                            let mut covered = Vec::with_capacity(9);
+                            for dz in -1i32..=1 {
+                                for dx in -1i32..=1 {
+                                    covered.push(ChunkPos {
+                                        x: pos.x.checked_add(dx).context("light X overflow")?,
+                                        z: pos.z.checked_add(dz).context("light Z overflow")?,
+                                    });
+                                }
+                            }
+                            let light = VisibleLightSnapshot::fresh_after_section_updates(
+                                true,
+                                config.has_skylight,
+                                [],
+                                covered,
+                            )
+                            .context("invalid initial light columns")?;
+                            run(StructureFeatureLighting::Visible(&light))?
+                        };
+                        drop(planned);
+                        structures.commit_decorated_starts(keys, updated, hut_states.as_ref())?;
+                        if hut_states.as_ref().is_some_and(|states| !states.is_empty()) {
+                            self.entity_sources.recorded_hut_features.insert(pos);
                         }
-                        let light = VisibleLightSnapshot::fresh_after_section_updates(
-                            true,
-                            config.has_skylight,
-                            [],
-                            covered,
-                        )
-                        .context("invalid initial light columns")?;
-                        run(StructureFeatureLighting::Visible(&light))?
-                    };
-                    drop(planned);
-                    structures.commit_decorated_starts(keys, updated, hut_states.as_ref())?;
-                    if hut_states.as_ref().is_some_and(|states| !states.is_empty()) {
-                        self.entity_sources.recorded_hut_features.insert(pos);
                     }
                 } else if let Some(engine) = &mut self.light_engine {
                     let registry = self

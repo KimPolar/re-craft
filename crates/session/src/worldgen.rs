@@ -5815,15 +5815,53 @@ mod tests {
                 .unwrap(),
             *neighbor
         );
+        let mut deferred = mixed.finish().unwrap();
         assert_eq!(
-            mixed
-                .clone()
-                .finish()
-                .unwrap()
-                .deferred_chunks()
-                .collect::<Vec<_>>(),
+            deferred.deferred_chunks().collect::<Vec<_>>(),
             vec![distant]
         );
+        let deferred_checkpoint = batch
+            .checkpoint_postprocessing_expansion(&deferred)
+            .unwrap();
+        // Even a new pass with the same visible blocks and tasks is a distinct
+        // snapshot: its tick and block entity state cannot reuse this proof.
+        let mut different = batch
+            .resume_generated_postprocessing(&deferred)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert!(
+            batch
+                .rebase_postprocessing_after_expansion(&mut different, &deferred_checkpoint)
+                .is_err()
+        );
+        let farther = ChunkPos { x: 80, z: 0 };
+        batch.request_features(farther).unwrap();
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)
+            .unwrap()
+            .is_some()
+        {}
+        batch
+            .rebase_postprocessing_after_expansion(&mut deferred, &deferred_checkpoint)
+            .unwrap();
+        assert_eq!(
+            deferred.deferred_postprocessing_data(distant).unwrap(),
+            pending_marks
+        );
+        assert!(
+            deferred
+                .ticks()
+                .chunk(distant)
+                .unwrap()
+                .blocks
+                .pack(42)
+                .iter()
+                .any(|tick| tick.kind == "minecraft:stone"
+                    && tick.position == tick_position
+                    && tick.delay == 4)
+        );
+        let mut mixed = batch.resume_generated_postprocessing(&deferred).unwrap();
         mixed.request_converted_chunk(distant).unwrap();
         while !mixed.poll(distant, 256).unwrap() {}
         assert_eq!(mixed.finish().unwrap().deferred_chunks().count(), 0);

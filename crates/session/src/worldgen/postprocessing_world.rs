@@ -190,6 +190,7 @@ impl std::error::Error for MissingPostprocessingChunk {}
 /// Completed callbacks for supported blocks only. Other conversion, lighting,
 /// entity and world-save requirements must still be validated.
 pub struct PostprocessedGeneratedRegion {
+    pub(super) identity: Arc<()>,
     pub world: Arc<World>,
     pub(super) ticks: RegionTicks,
     pub chunks: BTreeSet<ChunkPos>,
@@ -840,6 +841,7 @@ impl GeneratedPostprocessing {
         let read_chunks = self.read_chunks.into_inner();
         let light_reads = self.light_reads.into_inner();
         Ok(PostprocessedGeneratedRegion {
+            identity: Arc::new(()),
             sealed_world: Arc::clone(&self.world),
             world: self.world,
             ticks: self.region.ticks,

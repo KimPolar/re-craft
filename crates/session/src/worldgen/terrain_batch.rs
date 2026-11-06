@@ -150,10 +150,12 @@ pub struct PreparedStructureRegions {
 /// The region remains owned by the caller and is unchanged on a failed rebase.
 pub struct PostprocessingExpansionCheckpoint {
     batch_identity: Arc<()>,
+    region_identity: Arc<()>,
     source: Arc<World>,
     processed_world: Arc<World>,
     revision: u64,
     chunks: BTreeSet<ChunkPos>,
+    converted: BTreeSet<ChunkPos>,
     edits: Vec<native_world::loaded::BlockPosition>,
     read_chunks: BTreeSet<ChunkPos>,
     light_reads: BTreeSet<ChunkPos>,
@@ -2726,10 +2728,6 @@ impl FreshTerrainBatch {
     ) -> Result<PostprocessingExpansionCheckpoint> {
         self.validate_postprocessing(processed)?;
         ensure!(
-            processed.deferred_tasks.is_empty(),
-            "postprocessing expansion with deferred chunks is unsupported"
-        );
-        ensure!(
             processed.light_checkpoint.is_none(),
             "postprocessing with a drained light checkpoint cannot yet be rebased"
         );
@@ -2749,17 +2747,24 @@ impl FreshTerrainBatch {
                     .map(|source| (*pos, Arc::clone(source)))
             })
             .collect();
-        let inputs = processed
+        let converted: BTreeSet<_> = processed
             .chunks
+            .iter()
+            .copied()
+            .chain(processed.deferred_chunks())
+            .collect();
+        let inputs = converted
             .iter()
             .map(|&pos| Ok((pos, self.postprocessing_source_inputs(pos)?)))
             .collect::<Result<_>>()?;
         Ok(PostprocessingExpansionCheckpoint {
             batch_identity: Arc::clone(&self.identity),
+            region_identity: Arc::clone(&processed.identity),
             source: Arc::clone(&processed.source),
             processed_world: Arc::clone(&processed.world),
             revision: self.schedule.revision(),
             chunks: processed.chunks.clone(),
+            converted,
             edits: processed.edits.clone(),
             read_chunks: processed.read_chunks.clone(),
             light_reads: processed.light_reads.clone(),
@@ -2789,11 +2794,19 @@ impl FreshTerrainBatch {
         );
         ensure!(
             processed.batch_revision == Some(checkpoint.revision)
+                && Arc::ptr_eq(&processed.identity, &checkpoint.region_identity)
                 && Arc::ptr_eq(&processed.source, &checkpoint.source)
                 && Arc::ptr_eq(&processed.world, &checkpoint.processed_world)
                 && Arc::ptr_eq(&processed.world, &processed.sealed_world)
                 && processed.chunks == checkpoint.chunks
                 && processed.chunks == processed.sealed_chunks
+                && processed
+                    .chunks
+                    .iter()
+                    .copied()
+                    .chain(processed.deferred_chunks())
+                    .collect::<BTreeSet<_>>()
+                    == checkpoint.converted
                 && processed.edits == checkpoint.edits
                 && processed.edits == processed.sealed_edits
                 && processed.read_chunks == checkpoint.read_chunks
@@ -2814,7 +2827,7 @@ impl FreshTerrainBatch {
         // An unconverted read can change when another chunk is registered;
         // do not reuse the old pass without replaying that observation.
         let observed = postprocessing_observed_chunks(
-            &checkpoint.chunks,
+            &checkpoint.converted,
             &checkpoint.read_chunks,
             &checkpoint.edits,
         )

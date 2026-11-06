@@ -18,6 +18,7 @@ pub(crate) enum IntProvider {
     Constant(i32),
     Uniform(i32, i32),
     Biased(i32, i32),
+    VeryBiased(i32, i32),
     Trapezoid(i32, i32, i32),
     Weighted(Vec<(i32, IntProvider)>, i32),
     Clamped(Box<IntProvider>, i32, i32),
@@ -32,6 +33,11 @@ impl IntProviderRandom for DecorationRandom {
     }
 }
 impl IntProviderRandom for LegacyRandom {
+    fn bounded(&mut self, bound: i32) -> Option<i32> {
+        self.next_int_bound(bound)
+    }
+}
+impl IntProviderRandom for crate::worldgen_region_random::RegionRandom {
     fn bounded(&mut self, bound: i32) -> Option<i32> {
         self.next_int_bound(bound)
     }
@@ -102,6 +108,15 @@ impl IntProvider {
                 );
                 Self::Biased(min, max)
             }
+            "very_biased_to_bottom" => {
+                let min = integer(value, "min_inclusive")?;
+                let max = integer(value, "max_inclusive")?;
+                ensure!(
+                    min <= max && i64::from(max) - i64::from(min) < i64::from(i32::MAX),
+                    "invalid very biased integer range"
+                );
+                Self::VeryBiased(min, max)
+            }
             "trapezoid" => {
                 let min = integer(value, "min")?;
                 let max = integer(value, "max")?;
@@ -142,21 +157,26 @@ impl IntProvider {
                 ensure!(total > 0, "weighted distribution has no positive weight");
                 Self::Weighted(items, total)
             }
-            "clamped" => Self::Clamped(
-                Box::new(Self::parse(
+            "clamped" => {
+                let source = Self::parse(
                     value.get("source").context("missing clamped source")?,
                     depth + 1,
-                )?),
-                integer(value, "min_inclusive")?,
-                integer(value, "max_inclusive")?,
-            ),
+                )?;
+                let min = integer(value, "min_inclusive")?;
+                let max = integer(value, "max_inclusive")?;
+                ensure!(min <= max, "invalid clamped integer range");
+                Self::Clamped(Box::new(source), min, max)
+            }
             name => bail!("unsupported integer provider {name}"),
         })
     }
     pub(crate) fn bounds(&self) -> (i32, i32) {
         match self {
             Self::Constant(v) => (*v, *v),
-            Self::Uniform(a, b) | Self::Biased(a, b) | Self::Trapezoid(a, b, _) => (*a, *b),
+            Self::Uniform(a, b)
+            | Self::Biased(a, b)
+            | Self::VeryBiased(a, b)
+            | Self::Trapezoid(a, b, _) => (*a, *b),
             Self::Weighted(items, _) => items
                 .iter()
                 .map(|(_, p)| p.bounds())
@@ -173,6 +193,12 @@ impl IntProvider {
     pub(crate) fn sample_legacy(&self, random: &mut LegacyRandom) -> i32 {
         self.sample_with(random)
     }
+    pub(crate) fn sample_region(
+        &self,
+        random: &mut crate::worldgen_region_random::RegionRandom,
+    ) -> i32 {
+        self.sample_with(random)
+    }
     fn sample_with(&self, random: &mut impl IntProviderRandom) -> i32 {
         match self {
             Self::Constant(v) => *v,
@@ -180,6 +206,11 @@ impl IntProvider {
             Self::Biased(a, b) => {
                 let bound = random.bounded(b - a + 1).unwrap() + 1;
                 a.wrapping_add(random.bounded(bound).unwrap())
+            }
+            Self::VeryBiased(a, b) => {
+                let outer = random.bounded(b - a + 1).unwrap() + 1;
+                let inner = random.bounded(outer).unwrap() + 1;
+                a.wrapping_add(random.bounded(inner).unwrap())
             }
             Self::Trapezoid(a, b, plateau) => {
                 if *plateau == 0 && *b == a.wrapping_neg() {

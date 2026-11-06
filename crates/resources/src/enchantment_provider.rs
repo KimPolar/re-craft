@@ -1,4 +1,4 @@
-//! Data-pack preparation of cost-with-difficulty enchantment providers.
+//! Data-pack preparation of Java enchantment providers.
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::{
     enchantment_selection::{self, Candidate, LevelCost, Selected},
     packs::{ResourceId, ResourceProvider},
+    placed_feature::IntProvider,
     recipes::{TagEntry, parse_tag},
     worldgen_region_random::RegionRandom,
 };
@@ -14,10 +15,23 @@ use crate::{
 /// Prepared for one item prototype and one frozen data-pack stack.
 #[derive(Clone, Debug)]
 pub struct DifficultyProvider {
-    min_cost: i32,
-    max_span: i32,
+    mode: ProviderMode,
     enchantability: Option<i32>,
     candidates: Vec<Candidate>,
+}
+
+#[derive(Clone, Debug)]
+enum ProviderMode {
+    Difficulty {
+        min_cost: i32,
+        max_span: i32,
+    },
+    ByCost(IntProvider),
+    Single {
+        id: ResourceId,
+        max_level: i32,
+        level: IntProvider,
+    },
 }
 
 impl DifficultyProvider {
@@ -36,7 +50,7 @@ impl DifficultyProvider {
             "item is missing from the active registry"
         );
         ensure!(
-            enchantability.is_none_or(|value| (1..=10_000).contains(&value)),
+            enchantability.is_none_or(|value| value > 0),
             "invalid enchantability"
         );
         let enchantments: BTreeSet<_> = provider
@@ -59,8 +73,8 @@ impl DifficultyProvider {
                 .context("provider type is missing")?,
         )?;
         ensure!(
-            kind.namespace == "minecraft" && kind.path == "by_cost_with_difficulty",
-            "unsupported enchantment provider type"
+            kind.namespace == "minecraft",
+            "unsupported enchantment provider namespace"
         );
         let integer = |name: &str| -> Result<i32> {
             definition
@@ -69,12 +83,61 @@ impl DifficultyProvider {
                 .and_then(|v| i32::try_from(v).ok())
                 .with_context(|| format!("invalid provider {name}"))
         };
-        let min_cost = integer("min_cost")?;
-        let max_span = integer("max_cost_span")?;
-        ensure!(
-            (1..=10_000).contains(&min_cost) && (0..=10_000).contains(&max_span),
-            "invalid provider cost bounds"
-        );
+        let mode = match kind.path.as_str() {
+            "by_cost_with_difficulty" => {
+                let min_cost = integer("min_cost")?;
+                let max_span = integer("max_cost_span")?;
+                ensure!(
+                    (1..=10_000).contains(&min_cost) && (0..=10_000).contains(&max_span),
+                    "invalid provider cost bounds"
+                );
+                ProviderMode::Difficulty { min_cost, max_span }
+            }
+            "by_cost" => ProviderMode::ByCost(IntProvider::parse(
+                definition.get("cost").context("provider cost missing")?,
+                0,
+            )?),
+            "single" => {
+                let id = ResourceId::parse(
+                    definition
+                        .get("enchantment")
+                        .and_then(Value::as_str)
+                        .context("single enchantment holder missing")?,
+                )?;
+                ensure!(
+                    enchantments.contains(&id),
+                    "single enchantment is missing from the registry"
+                );
+                let path = format!("data/{}/enchantment/{}.json", id.namespace, id.path);
+                let value: Value = serde_json::from_slice(
+                    &provider
+                        .read_data(&path)?
+                        .with_context(|| format!("missing enchantment {path}"))?,
+                )?;
+                let max_level = value
+                    .get("max_level")
+                    .and_then(Value::as_i64)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .context("invalid enchantment max_level")?;
+                ensure!((1..=255).contains(&max_level), "invalid enchantment level");
+                let level = IntProvider::parse(
+                    definition
+                        .get("level")
+                        .context("single enchantment level missing")?,
+                    0,
+                )?;
+                return Ok(Self {
+                    mode: ProviderMode::Single {
+                        id,
+                        max_level,
+                        level,
+                    },
+                    enchantability,
+                    candidates: Vec::new(),
+                });
+            }
+            _ => bail!("unsupported enchantment provider type"),
+        };
         let mut enchantment_tags = BTreeMap::new();
         let mut item_tags = BTreeMap::new();
         let holders = resolve_set(
@@ -164,8 +227,7 @@ impl DifficultyProvider {
             });
         }
         Ok(Self {
-            min_cost,
-            max_span,
+            mode,
             enchantability,
             candidates,
         })
@@ -178,12 +240,24 @@ impl DifficultyProvider {
     /// The provider's cost draw and the selection are one transaction.
     pub fn enchant(&self, random: &mut RegionRandom, special: f32) -> Result<Vec<Selected>> {
         let mut staged = random.clone();
-        let cost = enchantment_selection::difficulty_cost(
-            &mut staged,
-            self.min_cost,
-            self.max_span,
-            special,
-        )?;
+        let cost = match &self.mode {
+            ProviderMode::Difficulty { min_cost, max_span } => {
+                enchantment_selection::difficulty_cost(&mut staged, *min_cost, *max_span, special)?
+            }
+            ProviderMode::ByCost(cost) => cost.sample_region(&mut staged),
+            ProviderMode::Single {
+                id,
+                max_level,
+                level,
+            } => {
+                let value = level.sample_region(&mut staged).clamp(1, *max_level);
+                *random = staged;
+                return Ok(vec![Selected {
+                    id: id.clone(),
+                    level: value,
+                }]);
+            }
+        };
         let selected = enchantment_selection::select(
             &mut staged,
             cost,
@@ -419,6 +493,34 @@ mod tests {
             json!({"replace":true,"values":["example:missing"]}),
         );
         assert!(DifficultyProvider::load(&mut data, &provider, &items, &item, Some(1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn single_applies_ineligible_enchantment_and_clamps_without_extra_draws() -> Result<()> {
+        let (mut data, mut items, _, provider) = fixture()?;
+        let item = ResourceId::parse("minecraft:fishing_rod")?;
+        items.insert(item.clone());
+        data.add(
+            "data/example/enchantment_provider/test.json",
+            json!({"type":"minecraft:single","enchantment":"example:a","level":100}),
+        );
+        let loaded = DifficultyProvider::load(&mut data, &provider, &items, &item, None)?;
+        let mut random = RegionRandom::Legacy(LegacyRandom::new(33));
+        let mut before = random.clone();
+        assert_eq!(
+            loaded.enchant(&mut random, f32::NAN)?,
+            [Selected {
+                id: ResourceId::parse("example:a")?,
+                level: 2
+            }]
+        );
+        assert_eq!(random.next_long(), before.next_long());
+        data.add(
+            "data/example/enchantment_provider/test.json",
+            json!({"type":"minecraft:single","enchantment":"example:missing","level":1}),
+        );
+        assert!(DifficultyProvider::load(&mut data, &provider, &items, &item, None).is_err());
         Ok(())
     }
 }

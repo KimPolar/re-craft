@@ -15,6 +15,10 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.Enchantable;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
+import net.minecraft.world.item.enchantment.providers.EnchantmentsByCost;
+import net.minecraft.world.item.enchantment.providers.SingleEnchantment;
+import net.minecraft.util.valueproviders.*;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 
@@ -105,7 +109,7 @@ public class EnchantmentSelectionOracle {
             }
             for (int algorithm = 0; algorithm < 2; algorithm++) for (int i = 0; i < 512; i++) {
                 long seed = i * 1234567L - 991L;
-                int cost = new int[]{1, 5, 10, 20, 30, 60, 100}[i % 7];
+                int cost = new int[]{Integer.MIN_VALUE, -20, 1, 5, 10, 20, 30, 60, 100, Integer.MAX_VALUE}[i % 10];
                 RandomSource random = algorithm == 0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
                 var result = EnchantmentHelper.selectEnchantment(random, stack, cost, candidates.stream());
                 String selected = result.stream().map(value -> id(value.enchantment()) + "=" + value.level()).collect(Collectors.joining(","));
@@ -122,6 +126,26 @@ public class EnchantmentSelectionOracle {
                 for (var value : result) enchanted.enchant(value.enchantment(), value.level());
                 var encoded = ItemStack.CODEC.encodeStart(lookup.createSerializationContext(com.mojang.serialization.JsonOps.INSTANCE), enchanted).getOrThrow();
                 out.println("P\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + Float.floatToIntBits(special) + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong() + "\t" + encoded);
+            }
+            if (weapon) for (int algorithm = 0; algorithm < 2; algorithm++) for (int i = 0; i < 1024; i++) {
+                long seed = i * 8765431L - 123L;
+                int variant = i % 8;
+                IntProvider number = switch (variant) {
+                    case 0 -> ConstantInt.of(-2);
+                    case 1 -> UniformInt.of(0, 8);
+                    case 2 -> BiasedToBottomInt.of(-3, 12);
+                    case 3 -> TrapezoidInt.of(0, 12, 2);
+                    case 4 -> ClampedInt.of(UniformInt.of(-10, 20), 1, 7);
+                    case 5 -> ConstantInt.of(Integer.MAX_VALUE);
+                    case 6 -> new WeightedListInt(net.minecraft.util.random.WeightedList.<IntProvider>builder().add(ConstantInt.of(2), 3).add(UniformInt.of(3, 9), 2).build());
+                    default -> VeryBiasedToBottomInt.of(-5, 13);
+                };
+                RandomSource random = algorithm == 0 ? new LegacyRandomSource(seed) : new XoroshiroRandomSource(seed);
+                var mutable = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+                if ((i / 8) % 2 == 0) new SingleEnchantment(holdersById.get("minecraft:loyalty"), number).enchant(stack, mutable, random, null);
+                else new EnchantmentsByCost(net.minecraft.core.HolderSet.direct(candidates), number).enchant(stack, mutable, random, null);
+                String selected = mutable.keySet().stream().map(holder -> id(holder) + "=" + mutable.getLevel(holder)).sorted().collect(Collectors.joining(","));
+                out.println("Q\t" + itemId + "\t" + algorithm + "\t" + seed + "\t" + ((i / 8) % 2) + "\t" + variant + "\t" + enchantability + "\t" + selected + "\t" + random.nextLong());
             }
         }
     }

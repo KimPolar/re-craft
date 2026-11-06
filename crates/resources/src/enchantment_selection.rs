@@ -67,14 +67,7 @@ pub fn select(
     let Some(enchantability) = enchantability else {
         return Ok(Vec::new());
     };
-    ensure!(
-        (1..=10_000).contains(&enchantability),
-        "invalid enchantability"
-    );
-    ensure!(
-        (0..=1_000_000).contains(&cost),
-        "unsupported enchantment cost"
-    );
+    ensure!(enchantability > 0, "invalid enchantability");
     let mut ids = BTreeMap::new();
     let mut total = 0_i32;
     for candidate in candidates {
@@ -103,13 +96,17 @@ pub fn select(
     let mut staged = random.clone();
     let bound = enchantability / 4 + 1;
     let value = cost
-        + 1
-        + staged
-            .next_int_bound(bound)
-            .context("invalid enchantability bound")?
-        + staged
-            .next_int_bound(bound)
-            .context("invalid enchantability bound")?;
+        .wrapping_add(1)
+        .wrapping_add(
+            staged
+                .next_int_bound(bound)
+                .context("invalid enchantability bound")?,
+        )
+        .wrapping_add(
+            staged
+                .next_int_bound(bound)
+                .context("invalid enchantability bound")?,
+        );
     let variation = (staged.next_float() + staged.next_float() - 1.0_f32) * 0.15_f32;
     let rounded_input = value as f32 + value as f32 * variation;
     let mut power = ((f64::from(rounded_input) + 0.5).floor() as i32).max(1);

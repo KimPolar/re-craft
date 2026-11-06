@@ -5,14 +5,37 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use native_core::random::{LegacyRandom, XoroshiroRandom};
 use native_resources::{
     enchantment_selection::{self, Candidate, LevelCost},
-    packs::ResourceId,
+    packs::{ResourceId, ResourceProvider, ResourceStack},
     worldgen_region_random::RegionRandom,
 };
 use serde_json::Value;
+
+struct ProviderOverlay<'a> {
+    base: &'a mut ResourceStack,
+    definition: Vec<u8>,
+}
+impl ResourceProvider for ProviderOverlay<'_> {
+    fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        self.base.read_asset(path)
+    }
+    fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        if path == "data/minecraft/enchantment_provider/mob_spawn_equipment.json" {
+            Ok(Some(self.definition.clone()))
+        } else {
+            self.base.read_data(path)
+        }
+    }
+    fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+        self.base.read_data_stack(path)
+    }
+    fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+        self.base.list_data(folder)
+    }
+}
 
 #[test]
 #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
@@ -76,15 +99,19 @@ fn enchantment_selection_matches_java() -> Result<()> {
     let mut candidates = BTreeMap::<String, Vec<Candidate>>::new();
     let mut providers =
         BTreeMap::<String, native_resources::enchantment_provider::DifficultyProvider>::new();
+    let mut custom_providers =
+        BTreeMap::<String, native_resources::enchantment_provider::DifficultyProvider>::new();
     let mut tested = 0;
     let mut multi = 0;
     let mut cost_tested = 0;
     let mut provider_tested = 0;
+    let mut custom_tested = 0;
     for line in output.lines().filter(|line| {
         line.starts_with("C\t")
             || line.starts_with("R\t")
             || line.starts_with("D\t")
             || line.starts_with("P\t")
+            || line.starts_with("Q\t")
     }) {
         let parts: Vec<_> = line.split('\t').collect();
         if parts[0] == "D" {
@@ -102,6 +129,74 @@ fn enchantment_selection_matches_java() -> Result<()> {
             );
             assert_eq!(random.next_long(), parts[5].parse::<i64>()?);
             cost_tested += 1;
+        } else if parts[0] == "Q" {
+            ensure!(parts.len() == 9, "invalid custom provider row");
+            let key = format!("{}:{}:{}", parts[1], parts[4], parts[5]);
+            if !custom_providers.contains_key(&key) {
+                let number = match parts[5] {
+                    "0" => serde_json::json!(-2),
+                    "1" => {
+                        serde_json::json!({"type":"minecraft:uniform","min_inclusive":0,"max_inclusive":8})
+                    }
+                    "2" => {
+                        serde_json::json!({"type":"minecraft:biased_to_bottom","min_inclusive":-3,"max_inclusive":12})
+                    }
+                    "3" => {
+                        serde_json::json!({"type":"minecraft:trapezoid","min":0,"max":12,"plateau":2})
+                    }
+                    "4" => {
+                        serde_json::json!({"type":"minecraft:clamped","source":{"type":"minecraft:uniform","min_inclusive":-10,"max_inclusive":20},"min_inclusive":1,"max_inclusive":7})
+                    }
+                    "5" => serde_json::json!(i32::MAX),
+                    "6" => {
+                        serde_json::json!({"type":"minecraft:weighted_list","distribution":[{"weight":3,"data":2},{"weight":2,"data":{"type":"minecraft:uniform","min_inclusive":3,"max_inclusive":9}}]})
+                    }
+                    "7" => {
+                        serde_json::json!({"type":"minecraft:very_biased_to_bottom","min_inclusive":-5,"max_inclusive":13})
+                    }
+                    _ => bail!("unknown integer provider case"),
+                };
+                let definition = if parts[4] == "0" {
+                    serde_json::json!({"type":"minecraft:single","enchantment":"minecraft:loyalty","level":number})
+                } else {
+                    serde_json::json!({"type":"minecraft:by_cost","enchantments":"#minecraft:on_mob_spawn_equipment","cost":number})
+                };
+                let mut overlay = ProviderOverlay {
+                    base: &mut resources,
+                    definition: serde_json::to_vec(&definition)?,
+                };
+                let prepared = native_resources::enchantment_provider::DifficultyProvider::load(
+                    &mut overlay,
+                    &ResourceId::parse("minecraft:mob_spawn_equipment")?,
+                    &known_items,
+                    &ResourceId::parse(parts[1])?,
+                    Some(parts[6].parse()?),
+                )?;
+                custom_providers.insert(key.clone(), prepared);
+            }
+            let seed = parts[3].parse()?;
+            let mut random = if parts[2] == "0" {
+                RegionRandom::Legacy(LegacyRandom::new(seed))
+            } else {
+                RegionRandom::Xoroshiro(XoroshiroRandom::new(seed))
+            };
+            let selected = custom_providers[&key].enchant(&mut random, 0.5)?;
+            let mut actual: Vec<_> = selected
+                .iter()
+                .map(|entry| format!("{}:{}={}", entry.id.namespace, entry.id.path, entry.level))
+                .collect();
+            actual.sort();
+            assert_eq!(
+                actual.join(","),
+                parts[7],
+                "custom provider {key} seed {seed}"
+            );
+            assert_eq!(
+                random.next_long(),
+                parts[8].parse::<i64>()?,
+                "custom provider RNG {key} seed {seed}"
+            );
+            custom_tested += 1;
         } else if parts[0] == "C" {
             ensure!(parts.len() == 6, "invalid candidate row");
             let levels = parts[4]
@@ -212,6 +307,7 @@ fn enchantment_selection_matches_java() -> Result<()> {
     assert_eq!(tested, 5120);
     assert_eq!(cost_tested, 1024);
     assert_eq!(provider_tested, 2048);
+    assert_eq!(custom_tested, 4096);
     assert!(
         multi > 0,
         "expected at least one multiple-enchantment result"

@@ -7596,7 +7596,7 @@ mod tests {
             encoder.write_all(&nbt::write(&template).unwrap()).unwrap();
             data.0
                 .insert("ruin-template".into(), encoder.finish().unwrap());
-            let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"none"});
+            let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
             data.0
                 .insert(path.into(), serde_json::to_vec(&ruin).unwrap());
             let result = generator
@@ -7622,6 +7622,66 @@ mod tests {
             assert_eq!(start.generation_point, [8, 15, 8]);
             assert!(start.pieces.len() > 1);
             assert!(start.reference_bounds(structure).is_ok());
+
+            let sparse_id = ResourceId::parse("example:ruin_sparse").unwrap();
+            data.0.insert(
+                "data/example/worldgen/structure_set/ruin_sparse.json".into(),
+                serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap(),
+            );
+            let [x, z] = StructureSetCache::default()
+                .load(&mut data, &sparse_id)
+                .unwrap()
+                .placement
+                .potential_chunk(42, [0, 0]);
+            let target = ChunkPos { x, z };
+            let batch_generator =
+                TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16)
+                    .unwrap();
+            let batch_rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+            let mut batch = structure_batch::StructureGenerationBatch::new(
+                batch_generator,
+                batch_rules,
+                vec![sparse_id],
+            )
+            .unwrap();
+            batch.request_starts(target).unwrap();
+            assert!(
+                batch
+                    .step(&mut data, &mut |v| classify(v))
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(batch.is_complete());
+            assert!(batch.starts(target).is_none());
+            let scheduled = &batch.ocean_ruin_starts(target).unwrap()[&structure_id];
+            assert!(scheduled.pieces.len() > 1);
+            batch.request_references(target).unwrap();
+            while batch
+                .step(&mut data, &mut |v| classify(v))
+                .unwrap()
+                .is_some()
+            {}
+            let packed =
+                i64::from((target.x as u32 as u64 | ((target.z as u32 as u64) << 32)) as i64);
+            assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+            let order = batch
+                .unambiguous_terrain_start_order(target)
+                .unwrap()
+                .unwrap();
+            assert!(order.contains(&(structure_id.clone(), target)));
+            assert!(
+                batch
+                    .beardifier_for_chunk(target, &order)
+                    .unwrap()
+                    .affected_bounds()
+                    .is_some()
+            );
+            let plan = structure_batch::StructurePreparationPlan::new([(
+                target,
+                schedule::GenerationStage::StructureReferences,
+            )])
+            .unwrap();
+            assert!(batch.prepare_additional_stages(&plan, None).is_err());
             data.0.remove("ruin-template");
             assert!(
                 generator

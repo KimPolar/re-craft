@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use native_core::beardifier::{Beardifier, TerrainAdjustment};
+use native_core::beardifier::{Beardifier, PieceProjection, StructurePiece, TerrainAdjustment};
 use native_persistence::heightmap::BlockHeightFlags;
 use native_resources::{
     carver::{schedule::CarverCache, tags::CarverBlockTags},
@@ -24,7 +24,7 @@ use native_world::loaded::ChunkPos;
 use serde_json::Value;
 
 use super::{
-    BiomeNeighborhood, CarverBlockState, TerrainGenerator,
+    BiomeNeighborhood, CarverBlockState, PreparedStructureStart, TerrainGenerator,
     schedule::{GenerationSchedule, GenerationStage},
     structure_references::{
         OrderedStructureReferences, StructureReferences, StructureStartBounds,
@@ -34,6 +34,8 @@ use super::{
 
 /// Supported simple starts by structure key for a single source chunk.
 pub type SimpleStarts = BTreeMap<ResourceId, SimpleStructureStart>;
+/// Multi-piece ocean-ruin starts belonging to one source chunk.
+pub type OceanRuinStarts = BTreeMap<ResourceId, super::ocean_ruin::PreparedStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
@@ -363,6 +365,7 @@ pub struct StructureGenerationBatch {
     cache: StructureSetCache,
     schedule: GenerationSchedule,
     starts: BTreeMap<ChunkPos, SimpleStarts>,
+    ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
     references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
@@ -378,6 +381,11 @@ impl StructureGenerationBatch {
         ensure!(
             self.is_complete(),
             "structure batch has unfinished or failed work"
+        );
+        ensure!(
+            plan.starts()
+                .all(|pos| !self.ocean_starts.contains_key(&pos)),
+            "ocean ruin decoration and persistence are not yet supported"
         );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
@@ -477,6 +485,10 @@ impl StructureGenerationBatch {
             "structure batch has unfinished or failed work"
         );
         ensure!(
+            self.ocean_starts.is_empty(),
+            "ocean ruin decoration and persistence are not yet supported"
+        );
+        ensure!(
             self.generator.structure_context,
             "generator lacks structure context"
         );
@@ -518,6 +530,7 @@ impl StructureGenerationBatch {
             cache: StructureSetCache::default(),
             schedule: GenerationSchedule::new(),
             starts: BTreeMap::new(),
+            ocean_starts: BTreeMap::new(),
             bounds: BTreeMap::new(),
             references: BTreeMap::new(),
             failed: false,
@@ -530,12 +543,29 @@ impl StructureGenerationBatch {
             .request(pos, GenerationStage::StructureReferences)
     }
 
+    /// Request starts without requiring neighboring reference stages.
+    pub fn request_starts(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(!self.failed, "structure batch failed and must be discarded");
+        self.schedule.request(pos, GenerationStage::StructureStarts)
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.failed && self.schedule.is_complete()
     }
 
+    /// Return starts only when this chunk has no multi-piece starts, so a
+    /// simple-only caller cannot accidentally publish an incomplete chunk.
     pub fn starts(&self, pos: ChunkPos) -> Option<&SimpleStarts> {
-        (!self.failed).then(|| self.starts.get(&pos)).flatten()
+        (!self.failed && !self.ocean_starts.contains_key(&pos))
+            .then(|| self.starts.get(&pos))
+            .flatten()
+    }
+
+    /// Return all ocean ruins generated for a completed start chunk.
+    pub fn ocean_ruin_starts(&self, pos: ChunkPos) -> Option<&OceanRuinStarts> {
+        (!self.failed && self.starts.contains_key(&pos))
+            .then(|| self.ocean_starts.get(&pos))
+            .flatten()
     }
 
     pub fn references(&self, pos: ChunkPos) -> Option<&StructureReferences> {
@@ -586,11 +616,17 @@ impl StructureGenerationBatch {
                     x: bits as u32 as i32,
                     z: (bits >> 32) as u32 as i32,
                 };
-                let start = self
-                    .starts(source)
-                    .and_then(|starts| starts.get(structure))
-                    .context("referenced structure start is missing")?;
-                if start.terrain_adjustment != TerrainAdjustment::None {
+                let adjustment =
+                    if let Some(start) = self.starts.get(&source).and_then(|s| s.get(structure)) {
+                        start.terrain_adjustment
+                    } else {
+                        self.ocean_starts
+                            .get(&source)
+                            .and_then(|s| s.get(structure))
+                            .context("referenced structure start is missing")?
+                            .terrain_adjustment
+                    };
+                if adjustment != TerrainAdjustment::None {
                     keys.insert((structure.clone(), source));
                 }
             }
@@ -649,6 +685,26 @@ impl StructureGenerationBatch {
         let Some(kinds) = unambiguous_structure_keys(&starts) else {
             return Ok(None);
         };
+        // A single multi-piece start contributes multiple additions. Two
+        // starts of distinct kinds therefore do not necessarily commute.
+        if kinds.len() > 1 {
+            let pieces = starts.iter().try_fold(0usize, |count, (id, pos)| {
+                let n = if self.starts.get(pos).is_some_and(|s| s.contains_key(id)) {
+                    1
+                } else {
+                    self.ocean_starts
+                        .get(pos)
+                        .and_then(|s| s.get(id))
+                        .context("referenced structure start is missing")?
+                        .pieces
+                        .len()
+                };
+                count.checked_add(n).context("too many structure pieces")
+            })?;
+            if pieces > 2 {
+                return Ok(None);
+            }
+        }
         Ok(Some(self.terrain_start_order(pos, &kinds)?))
     }
 
@@ -719,11 +775,26 @@ impl StructureGenerationBatch {
         );
         let mut pieces = Vec::with_capacity(order.len());
         for (structure, source) in order {
-            let start = self
-                .starts(*source)
+            if let Some(start) = self
+                .starts
+                .get(source)
                 .and_then(|starts| starts.get(structure))
-                .context("referenced structure start is missing")?;
-            pieces.push(start.terrain_piece());
+            {
+                pieces.push(start.terrain_piece());
+            } else {
+                let start = self
+                    .ocean_starts
+                    .get(source)
+                    .and_then(|starts| starts.get(structure))
+                    .context("referenced structure start is missing")?;
+                pieces.extend(start.pieces.iter().map(|piece| StructurePiece {
+                    bounds: piece.bounds,
+                    adjustment: start.terrain_adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: vec![],
+                }));
+            }
         }
         Ok(Arc::new(
             Beardifier::for_chunk([pos.x, pos.z], &pieces).map_err(anyhow::Error::msg)?,
@@ -787,31 +858,46 @@ impl StructureGenerationBatch {
                     "structure starts already exist"
                 );
                 let mut starts = SimpleStarts::new();
+                let mut ocean_starts = OceanRuinStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
-                    let outcome = self.generator.try_generate_simple_structure_set(
+                    let outcome = self.generator.try_generate_supported_structure_set(
                         provider,
                         &mut self.evaluator,
                         &mut self.cache,
                         &self.biome_rules,
                         set,
                         [pos.x, pos.z],
-                        |id| Ok(starts.contains_key(id)),
+                        |id| Ok(starts.contains_key(id) || ocean_starts.contains_key(id)),
                         &mut *classify,
                     )?;
                     if let StructureSetStart::Generated { structure, start } = outcome {
-                        bounds.push(StructureStartBounds::from_simple(
-                            structure.clone(),
-                            &start,
-                        )?);
-                        ensure!(
-                            starts.insert(structure, start).is_none(),
-                            "duplicate structure start"
-                        );
+                        match start {
+                            PreparedStructureStart::Simple(start) => {
+                                bounds.push(StructureStartBounds::from_simple(
+                                    structure.clone(),
+                                    &start,
+                                )?);
+                                ensure!(
+                                    starts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
+                            PreparedStructureStart::OceanRuin(start) => {
+                                bounds.push(start.reference_bounds(structure.clone())?);
+                                ensure!(
+                                    ocean_starts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
+                        }
                     }
                 }
                 self.schedule.complete(pos, stage)?;
                 self.starts.insert(pos, starts);
+                if !ocean_starts.is_empty() {
+                    self.ocean_starts.insert(pos, ocean_starts);
+                }
                 self.bounds.insert(pos, bounds);
                 Ok(())
             })(),

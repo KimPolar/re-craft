@@ -611,6 +611,160 @@ mod tests {
             }
         }
         ensure!(snapshots == 128, "insufficient chicken snapshot cases");
+        // Exercise the actual structure marker path, including its staged
+        // nautilus and passenger record, against the Java spawn sequence.
+        #[derive(Clone)]
+        struct NautilusContext<'a> {
+            variants: &'a native_resources::animal_variants::ZombieNautilusSpawnVariants,
+            biome: &'a native_resources::packs::ResourceId,
+            special: f32,
+            halloween: bool,
+            mount: Option<Tag>,
+        }
+        impl super::super::ocean_ruin::DrownedMarkerContext for NautilusContext<'_> {
+            fn special_multiplier(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+            ) -> Result<f32> {
+                Ok(self.special)
+            }
+            fn halloween(&mut self) -> Result<bool> {
+                Ok(self.halloween)
+            }
+            fn try_existing_chicken(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+            fn spawn_chicken_jockey(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+                _: &mut RegionRandom,
+            ) -> Result<bool> {
+                anyhow::bail!("unavailable chicken")
+            }
+            fn enchant_weapon(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+                _: &mut RegionRandom,
+                _: MainHandRoll,
+                _: f32,
+            ) -> Result<Tag> {
+                anyhow::bail!("unavailable enchantment")
+            }
+            fn more_frequent_drowned_biome(
+                &mut self,
+                _: [i32; 3],
+                _: &native_world::loaded::World,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+            fn spawn_zombie_nautilus(
+                &mut self,
+                position: [i32; 3],
+                _: &native_world::loaded::World,
+                random: &mut RegionRandom,
+                persistent: bool,
+            ) -> Result<bool> {
+                ensure!(persistent, "expected structure persistence");
+                let initialization = self.variants.finalize_structure_spawn(self.biome, random)?;
+                self.mount = Some(super::super::draft_fresh_structure_zombie_nautilus(
+                    [0, 3, 0, 4],
+                    [
+                        f64::from(position[0]) + 0.5,
+                        f64::from(position[1]),
+                        f64::from(position[2]) + 0.5,
+                    ],
+                    0.0,
+                    &initialization,
+                )?);
+                Ok(true)
+            }
+            fn take_created_nautilus(&mut self) -> Result<Option<Tag>> {
+                Ok(self.mount.take())
+            }
+        }
+        let nautilus_variants =
+            native_resources::animal_variants::ZombieNautilusSpawnVariants::load_active(
+                &mut resources,
+            )?;
+        let drowned_id = native_resources::packs::ResourceId::parse("minecraft:drowned")?;
+        let world = native_world::loaded::World::new("minecraft:overworld");
+        let mut mounted = 0;
+        let mut mounted_shells = 0;
+        let mut algorithms = [0; 2];
+        for i in 0..200_000 {
+            let region_seed = i64::from(i) * 671_231 - 12_345;
+            let entity_seed = i64::from(i) * 98_317 + 3_329;
+            let mut region = if i % 2 == 0 {
+                RegionRandom::Legacy(LegacyRandom::new(region_seed))
+            } else {
+                RegionRandom::Xoroshiro(XoroshiroRandom::new(region_seed))
+            };
+            let special = factors[(i as usize / 8) % 4];
+            let mut context = NautilusContext {
+                variants: &nautilus_variants,
+                biome: &ocean,
+                special,
+                halloween,
+                mount: None,
+            };
+            let mut construct = || {
+                let mut creature = super::super::FreshCreatureRandom::from_seed(&drowned_id, 0)?;
+                creature.construction.uuid = [0, 1, 0, 2];
+                creature.random = LegacyRandom::new(entity_seed);
+                Ok(Some(creature))
+            };
+            let Ok(Some(super::super::GeneratedEntityRecord::Saved(tag))) =
+                super::super::ore::draft_initialized_drowned(
+                    [3, 10, -2],
+                    &world,
+                    &mut region,
+                    &mut construct,
+                    &mut context,
+                )
+            else {
+                continue;
+            };
+            if !matches!(tag.get("id"), Some(Tag::String(id)) if id.matches("minecraft:zombie_nautilus"))
+            {
+                continue;
+            }
+            let passengers = match tag.get("Passengers") {
+                Some(Tag::List { values, .. }) => values,
+                _ => anyhow::bail!("missing drowned passenger"),
+            };
+            if passengers[0]
+                .get("equipment")
+                .and_then(|e| e.get("offhand"))
+                .is_some()
+            {
+                mounted_shells += 1;
+            }
+            let path = temp.path().join(format!("nautilus-jockey-{i}.nbt"));
+            std::fs::write(
+                &path,
+                nbt::write(&NamedTag {
+                    name: "".into(),
+                    value: tag,
+                })?,
+            )?;
+            cases.push(serde_json::json!({"path":path,"legacy":i%2==0,"region_seed":region_seed,"entity_seed":entity_seed,"special":special,"next_region":region.next_long(),"nautilus_snapshot":true}));
+            algorithms[i as usize % 2] += 1;
+            mounted += 1;
+            if mounted >= 128 && mounted_shells > 0 && algorithms.iter().all(|n| *n >= 32) {
+                break;
+            }
+        }
+        ensure!(
+            mounted >= 128 && mounted_shells > 0 && algorithms.iter().all(|n| *n >= 32),
+            "insufficient nautilus jockey cases"
+        );
         let input = temp.path().join("cases.json");
         std::fs::write(&input, serde_json::to_vec(&cases)?)?;
         let output = Command::new(java.join("java.exe"))

@@ -54,6 +54,8 @@ mod buried_treasure;
 mod ocean_ruin;
 #[cfg(test)]
 pub(super) use ocean_ruin::attach_created_chicken_rider;
+#[cfg(test)]
+pub(super) use ocean_ruin::draft_initialized_drowned;
 mod swamp_hut;
 pub use ocean_ruin::OceanRuinPlacementContext;
 

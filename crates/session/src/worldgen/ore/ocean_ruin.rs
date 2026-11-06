@@ -487,7 +487,7 @@ impl DecorationRegion<'_> {
     }
 }
 
-fn draft_initialized_drowned<C, W>(
+pub(in crate::worldgen) fn draft_initialized_drowned<C, W>(
     position: [i32; 3],
     world: &World,
     random: &mut RegionRandom,

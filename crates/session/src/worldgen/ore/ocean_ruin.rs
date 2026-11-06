@@ -2904,6 +2904,85 @@ mod tests {
         assert_eq!(states, initial);
         assert_eq!(combined.huts, initial);
         assert_eq!(combined.ocean.context.special_calls, 0);
+
+        // The runner supplies the actual FEATURES biome neighborhood to
+        // drowned initialization and publishes callbacks only on success.
+        let make_difficulty = |fail: bool| {
+            let mut calls = 0;
+            move |_: [i32; 3], _: &World| {
+                calls += 1;
+                ensure!(!fail || calls < 2, "injected difficulty lookup failure");
+                Ok(
+                    super::super::super::ocean_ruin::GenerationDifficultyInputs {
+                        difficulty: native_persistence::world::Difficulty::Normal,
+                        overworld_clock_time: 0,
+                        moon_brightness: 1.0,
+                    },
+                )
+            }
+        };
+        for fail in [false, true] {
+            let mut inputs = super::super::super::ocean_ruin::DrownedPlacementInputs {
+                ice_tags: &ice,
+                water_fluids: &water,
+                bubble_fluids: &bubbles,
+                registry: &registry,
+                biome_tags: &biome_tags,
+                sea_level: 63,
+                construct: make_constructor(),
+                effects: DrownedContext::default(),
+                difficulty_at: make_difficulty(fail),
+                halloween_at: || Ok(false),
+                last_region_random: None,
+            };
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(center, GenerationStage::Features)?;
+            loop {
+                let (pos, stage) = schedule
+                    .next_ready()
+                    .context("missing generation prerequisite")?;
+                if pos == center && stage == GenerationStage::Features {
+                    break;
+                }
+                schedule.complete(pos, stage)?;
+            }
+            let (mut terrain, _, _, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let mut states = BTreeMap::new();
+            let mut runner = super::super::super::schedule::NativeDrownedFeatureRunner {
+                inputs: &mut inputs,
+                variants: &variants,
+                conditions: &conditions,
+                moon_phase_at: &|_, _| Ok(0),
+            };
+            let result = schedule.run_features_with_ocean(
+                &mut terrain,
+                &prepared,
+                &structures,
+                &mut states,
+                &random,
+                StructureFeatureLighting::Visible(&light),
+                &mut runner,
+                &stages,
+                &neighborhood,
+            );
+            if fail {
+                let error = match result {
+                    Ok(_) => bail!("expected difficulty lookup failure"),
+                    Err(error) => error,
+                };
+                assert!(format!("{error:#}").contains("injected difficulty lookup failure"));
+                assert!(schedule.ready(center, GenerationStage::Features));
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(inputs.last_region_random.is_none());
+                assert_eq!(inputs.effects, DrownedContext::default());
+            } else {
+                result?;
+                assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
+                assert_eq!(terrain.recorded_generated_entities(center)?.len(), 4);
+                assert!(inputs.last_region_random.is_some());
+            }
+        }
         Ok(())
     }
 }

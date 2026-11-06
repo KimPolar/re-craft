@@ -18,6 +18,25 @@ pub struct GenerationDifficultyInputs {
     pub moon_brightness: f32,
 }
 
+/// Resources and mutable effects for structure drowned during a terrain batch.
+/// The batch supplies its current biome neighborhood at the FEATURES stage.
+/// Callback clones must isolate all mutable state until the pass succeeds.
+#[derive(Clone)]
+pub struct DrownedPlacementInputs<'a, C, E, D, H> {
+    pub ice_tags: &'a native_resources::ore_feature::OreBlockTags,
+    pub water_fluids: &'a std::collections::BTreeSet<String>,
+    pub bubble_fluids: &'a std::collections::BTreeSet<String>,
+    pub registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    pub biome_tags: &'a DrownedBiomeTags,
+    pub sea_level: i32,
+    pub construct: C,
+    pub effects: E,
+    pub difficulty_at: D,
+    pub halloween_at: H,
+    /// Region RNG after the most recent successful mixed FEATURES pass.
+    pub last_region_random: Option<RegionRandom>,
+}
+
 /// Remaining world operations that can create or modify entities and items.
 /// Cloning must isolate all mutable state until the enclosing region commits.
 pub trait DrownedSpawnEffects: Clone {

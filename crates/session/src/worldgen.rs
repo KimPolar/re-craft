@@ -7234,11 +7234,12 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_structure_batch_schedules_ocean_ruin_decoration() -> Result<()> {
-        run_ocean_structure_batch(false)?;
-        run_ocean_structure_batch(true)
+        run_ocean_structure_batch(false, false)?;
+        run_ocean_structure_batch(true, false)?;
+        run_ocean_structure_batch(true, true)
     }
 
-    fn run_ocean_structure_batch(mixed: bool) -> Result<()> {
+    fn run_ocean_structure_batch(mixed: bool, dynamic_biomes: bool) -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
             heightmap::BlockHeightFlags,
@@ -7299,6 +7300,42 @@ mod tests {
                 anyhow::bail!("unexpected drowned")
             }
         }
+        impl ocean_ruin::DrownedSpawnEffects for NoDrowned {
+            fn try_existing_chicken(&mut self, pos: [i32; 3], world: &World) -> Result<bool> {
+                ocean_ruin::DrownedMarkerContext::try_existing_chicken(self, pos, world)
+            }
+            fn spawn_chicken_jockey(
+                &mut self,
+                pos: [i32; 3],
+                world: &World,
+                random: &mut RegionRandom,
+            ) -> Result<bool> {
+                ocean_ruin::DrownedMarkerContext::spawn_chicken_jockey(self, pos, world, random)
+            }
+            fn enchant_weapon(
+                &mut self,
+                pos: [i32; 3],
+                world: &World,
+                random: &mut RegionRandom,
+                weapon: MainHandRoll,
+                special: f32,
+            ) -> Result<Tag> {
+                ocean_ruin::DrownedMarkerContext::enchant_weapon(
+                    self, pos, world, random, weapon, special,
+                )
+            }
+            fn spawn_zombie_nautilus(
+                &mut self,
+                pos: [i32; 3],
+                world: &World,
+                random: &mut RegionRandom,
+                persistent: bool,
+            ) -> Result<bool> {
+                ocean_ruin::DrownedMarkerContext::spawn_zombie_nautilus(
+                    self, pos, world, random, persistent,
+                )
+            }
+        }
         struct FixtureData {
             vanilla: native_resources::packs::ResourceStack,
             template: Vec<u8>,
@@ -7329,6 +7366,9 @@ mod tests {
                     "data/minecraft/worldgen/biome/plains.json" => Some(
                         json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}),
                     ),
+                    "data/minecraft/tags/worldgen/biome/more_frequent_drowned_spawns.json" => {
+                        Some(json!({"values":[]}))
+                    }
                     _ => None,
                 };
                 if let Some(value) = json {
@@ -7509,6 +7549,36 @@ mod tests {
         } else {
             None
         };
+        let biome_tags = if dynamic_biomes {
+            Some(native_resources::drowned_spawn::DrownedBiomeTags::load(
+                &mut data,
+            )?)
+        } else {
+            None
+        };
+        let mut inputs = biome_tags
+            .as_ref()
+            .map(|biome_tags| ocean_ruin::DrownedPlacementInputs {
+                ice_tags: &ice,
+                water_fluids: &water,
+                bubble_fluids: &bubbles,
+                registry: &registry,
+                biome_tags,
+                sea_level: 8,
+                construct: || -> Result<Option<FreshCreatureRandom>> {
+                    bail!("unexpected drowned")
+                },
+                effects: NoDrowned,
+                difficulty_at: |_: [i32; 3], _: &World| {
+                    Ok(ocean_ruin::GenerationDifficultyInputs {
+                        difficulty: native_persistence::world::Difficulty::Normal,
+                        overworld_clock_time: 0,
+                        moon_brightness: 1.0,
+                    })
+                },
+                halloween_at: || Ok(false),
+                last_region_random: None,
+            });
         batch.request_features(target)?;
         loop {
             let mut classify = |value: &Value| {
@@ -7524,7 +7594,17 @@ mod tests {
                     properties: BTreeMap::new(),
                 })
             };
-            let result = if mixed {
+            let result = if dynamic_biomes {
+                batch.step_with_drowned_environment(
+                    &mut data,
+                    &mut classify,
+                    &mut resolve,
+                    inputs.as_mut().context("missing drowned inputs")?,
+                    &variants,
+                    conditions.as_ref().context("missing cat conditions")?,
+                    &|_, _| Ok(0),
+                )?
+            } else if mixed {
                 batch.step_with_native_mixed_environment(
                     &mut data,
                     &mut classify,
@@ -7560,6 +7640,9 @@ mod tests {
             Some(schedule::GenerationStage::Features)
         );
         if mixed {
+            if dynamic_biomes {
+                assert!(inputs.as_ref().unwrap().last_region_random.is_some());
+            }
             assert_eq!(batch.recorded_generated_entities(target)?.len(), 2);
             let data = batch.structure_data(target)?;
             let saved_hut = data

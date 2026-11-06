@@ -23,8 +23,9 @@ use super::{
     PreparedDecoration, StagedGenerationLightEngine, TerrainGenerator,
     schedule::{
         GenerationSchedule, GenerationStage, HutFeatureCallbacks, HutFeatureRunner,
-        MixedFeatureCallbacks, NativeHutFeatureRunner, NativeMixedFeatureRunner,
-        OceanFeatureCallbacks, OceanFeatureRunner, StructureFeatureLighting,
+        MixedFeatureCallbacks, NativeDrownedFeatureRunner, NativeHutFeatureRunner,
+        NativeMixedFeatureRunner, OceanFeatureCallbacks, OceanFeatureRunner,
+        StructureFeatureLighting,
     },
     structure_batch::{PreparedStructureStages, StructureGenerationBatch, TerrainStartKey},
 };
@@ -3442,6 +3443,39 @@ impl FreshTerrainBatch {
         );
         let mut runner = NativeMixedFeatureRunner {
             ocean,
+            variants,
+            conditions,
+            moon_phase_at,
+        };
+        self.step_inner(provider, classify, resolve, None, Some(&mut runner))
+    }
+
+    /// Use the batch's current generated biomes for drowned and hut cat
+    /// conditions. Item and passenger effects and live difficulty/holiday
+    /// inputs remain explicit; they must belong to the same world and packs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_drowned_environment<C, E, D, H>(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+        resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+        inputs: &mut super::ocean_ruin::DrownedPlacementInputs<'_, C, E, D, H>,
+        variants: &native_resources::cat_variants::CatSpawnVariants,
+        conditions: &native_resources::cat_variants::CatWorldConditions,
+        moon_phase_at: &dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+    ) -> Result<Option<(ChunkPos, GenerationStage)>>
+    where
+        C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+        E: super::ocean_ruin::DrownedSpawnEffects,
+        D: Clone + FnMut([i32; 3], &World) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
+        H: Clone + FnMut() -> Result<bool>,
+    {
+        ensure!(
+            inputs.sea_level == self.generator.noise.sea_level(),
+            "ocean ruin sea level differs from generator"
+        );
+        let mut runner = NativeDrownedFeatureRunner {
+            inputs,
             variants,
             conditions,
             moon_phase_at,

@@ -15,7 +15,8 @@ mod drowned_context;
 mod placement;
 mod saved_piece;
 pub use drowned_context::{
-    DrownedGenerationContext, DrownedSpawnEffects, GenerationDifficultyInputs,
+    DrownedGenerationContext, DrownedPlacementInputs, DrownedSpawnEffects,
+    GenerationDifficultyInputs,
 };
 pub use placement::OceanRuinPlacementWorld;
 pub use saved_piece::SavedOceanRuinPiece;

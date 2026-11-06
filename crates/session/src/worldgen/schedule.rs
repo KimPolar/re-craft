@@ -248,6 +248,80 @@ where
     }
 }
 
+pub(super) struct NativeDrownedFeatureRunner<'a, 'b, C, E, D, H> {
+    pub inputs: &'a mut super::ocean_ruin::DrownedPlacementInputs<'b, C, E, D, H>,
+    pub variants: &'a native_resources::cat_variants::CatSpawnVariants,
+    pub conditions: &'a native_resources::cat_variants::CatWorldConditions,
+    pub moon_phase_at: &'a dyn Fn([i32; 3], &super::BiomeNeighborhood) -> Result<u8>,
+}
+
+impl<C, E, D, H> OceanFeatureRunner for NativeDrownedFeatureRunner<'_, '_, C, E, D, H>
+where
+    C: Clone + FnMut() -> Result<Option<super::FreshCreatureRandom>>,
+    E: super::ocean_ruin::DrownedSpawnEffects,
+    D: Clone
+        + FnMut(
+            [i32; 3],
+            &native_world::loaded::World,
+        ) -> Result<super::ocean_ruin::GenerationDifficultyInputs>,
+    H: Clone + FnMut() -> Result<bool>,
+{
+    fn supports_huts(&self) -> bool {
+        true
+    }
+
+    fn execute(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
+        huts: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
+        lighting: StructureFeatureLighting<'_>,
+        all_structures: &super::structure_batch::PreparedStructureStages,
+        biomes: &super::BiomeNeighborhood,
+    ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
+        let mut ocean = super::OceanRuinPlacementContext {
+            ice_tags: self.inputs.ice_tags,
+            water_fluids: self.inputs.water_fluids,
+            bubble_fluids: self.inputs.bubble_fluids,
+            registry: self.inputs.registry,
+            sea_level: self.inputs.sea_level,
+            region_random: region_random.clone(),
+            construct: self.inputs.construct.clone(),
+            context: super::ocean_ruin::DrownedGenerationContext {
+                biomes,
+                biome_tags: self.inputs.biome_tags,
+                difficulty_at: self.inputs.difficulty_at.clone(),
+                halloween_at: self.inputs.halloween_at.clone(),
+                effects: self.inputs.effects.clone(),
+            },
+        };
+        let updated = NativeMixedFeatureRunner {
+            ocean: &mut ocean,
+            variants: self.variants,
+            conditions: self.conditions,
+            moon_phase_at: self.moon_phase_at,
+        }
+        .execute(
+            terrain,
+            prepared,
+            structures,
+            huts,
+            region_random,
+            lighting,
+            all_structures,
+            biomes,
+        )?;
+        self.inputs.construct = ocean.construct;
+        self.inputs.effects = ocean.context.effects;
+        self.inputs.difficulty_at = ocean.context.difficulty_at;
+        self.inputs.halloween_at = ocean.context.halloween_at;
+        self.inputs.last_region_random = Some(ocean.region_random);
+        Ok(updated)
+    }
+}
+
 pub(super) trait HutFeatureRunner {
     fn execute(
         &mut self,

@@ -2,9 +2,49 @@
 use anyhow::{Result, ensure};
 use native_persistence::nbt::Tag;
 use native_resources::{
-    animal_variants::{FarmAnimal, FarmAnimalInitialization},
+    animal_variants::{FarmAnimal, FarmAnimalInitialization, FarmAnimalSpawnVariants},
     packs::ResourceId,
+    worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
+
+/// Finalize a newly constructed chicken for a zombie jockey. The region RNG
+/// is advanced only if the complete chicken draft can be represented.
+/// The rider must be serialized separately at the time Java adds the chicken.
+pub fn draft_fresh_jockey_chicken(
+    creature: &super::FreshCreatureRandom,
+    position: [f64; 3],
+    yaw: f32,
+    biome: &ResourceId,
+    variants: &FarmAnimalSpawnVariants,
+    random: &mut RegionRandom,
+) -> Result<Tag> {
+    ensure!(
+        variants.species() == FarmAnimal::Chicken,
+        "expected chicken variants"
+    );
+    let mut next_random = random.clone();
+    let mut group = AnimalGroupData::default();
+    let initialization = variants.finalize(biome, &mut next_random, &mut group, false)?;
+    let Tag::Compound(mut fields) = draft_fresh_farm_animal(
+        FarmAnimal::Chicken,
+        creature.construction.uuid,
+        position,
+        yaw,
+        variants.default_variant(),
+        &initialization,
+        creature.construction.chicken_egg_time,
+    )?
+    else {
+        unreachable!("fresh chicken draft is a compound")
+    };
+    let (_, jockey) = fields
+        .iter_mut()
+        .find(|(key, _)| key.matches("IsChickenJockey"))
+        .expect("fresh chicken has a jockey flag");
+    *jockey = Tag::Byte(1);
+    *random = next_random;
+    Ok(Tag::Compound(fields))
+}
 
 /// Serialize an unmodified, freshly finalized animal. `default_variant` is
 /// the construction default from the same active registry. A fresh chicken's

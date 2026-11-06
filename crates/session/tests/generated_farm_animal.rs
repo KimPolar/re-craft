@@ -7,7 +7,9 @@ use native_resources::{
     packs::{ResourceId, ResourceStack},
     worldgen_region_random::{AnimalGroupData, RegionRandom},
 };
-use native_session::worldgen::{FreshCreatureRandom, draft_fresh_farm_animal};
+use native_session::worldgen::{
+    FreshCreatureRandom, draft_fresh_farm_animal, draft_fresh_jockey_chicken,
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -112,6 +114,73 @@ fn fresh_farm_animal_drafts_match_java_entities() {
                         cases.push(json!({"animal":name,"biome":biome,"legacy":legacy,"seed":seed,"chance":chance,"paths":documents}));
                     }
                 }
+            }
+        }
+    }
+    let variants =
+        FarmAnimalSpawnVariants::load_active(&mut resources, FarmAnimal::Chicken).unwrap();
+    let mut invalid =
+        FreshCreatureRandom::from_seed(&ResourceId::parse("minecraft:chicken").unwrap(), 7)
+            .unwrap();
+    invalid.construction.chicken_egg_time = Some(5999);
+    let mut random = RegionRandom::new(19, WorldgenRandom::Legacy, -13, 17);
+    let mut before = random.clone();
+    assert!(
+        draft_fresh_jockey_chicken(
+            &invalid,
+            [3.5, 10.0, -2.5],
+            22.5,
+            &ResourceId::parse("minecraft:plains").unwrap(),
+            &variants,
+            &mut random,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        random.next_long(),
+        before.next_long(),
+        "failed draft must not consume random state"
+    );
+    for biome in [
+        "minecraft:plains",
+        "minecraft:desert",
+        "minecraft:snowy_plains",
+    ] {
+        for legacy in [true, false] {
+            for seed in 0_i64..32 {
+                let algorithm = if legacy {
+                    WorldgenRandom::Legacy
+                } else {
+                    WorldgenRandom::Xoroshiro
+                };
+                let mut random = RegionRandom::new(seed, algorithm, -13, 17);
+                let mut creature = FreshCreatureRandom::from_seed(
+                    &ResourceId::parse("minecraft:chicken").unwrap(),
+                    seed,
+                )
+                .unwrap();
+                creature.construction.uuid = [0, 1, 0, 2];
+                creature.construction.chicken_egg_time = Some(6000);
+                let tag = draft_fresh_jockey_chicken(
+                    &creature,
+                    [3.5, 10.0, -2.5],
+                    22.5,
+                    &ResourceId::parse(biome).unwrap(),
+                    &variants,
+                    &mut random,
+                )
+                .unwrap();
+                let path = temp.path().join(format!("jockey-{}.nbt", cases.len()));
+                std::fs::write(
+                    &path,
+                    write(&NamedTag {
+                        name: "".into(),
+                        value: tag,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                cases.push(json!({"animal":"chicken","biome":biome,"legacy":legacy,"seed":seed,"chance":0.05,"paths":[path],"jockey":true,"next_random":random.next_long()}));
             }
         }
     }

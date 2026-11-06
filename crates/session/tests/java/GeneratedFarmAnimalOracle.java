@@ -118,6 +118,7 @@ public class GeneratedFarmAnimalOracle {
                 };
             });
             var group=new AgeableMob.AgeableMobGroupData(true,test.get("chance").getAsFloat());
+            boolean jockey=test.has("jockey") && test.get("jockey").getAsBoolean();
             int index=0;
             for(var path:test.getAsJsonArray("paths")) {
                 var animal=switch(test.get("animal").getAsString()) {
@@ -128,13 +129,16 @@ public class GeneratedFarmAnimalOracle {
                 };
                 if(animal instanceof Chicken chicken) eggField.setInt(chicken,new int[]{6000,8999,11999}[index]);
                 animal.setUUID(new UUID(1,2)); animal.setPos(3.5,10,-2.5); animal.setYRot(22.5f); animal.setXRot(0);
-                if(animal.finalizeSpawn(region,null,EntitySpawnReason.CHUNK_GENERATION,group)!=group) throw new AssertionError("group identity");
+                var result=animal.finalizeSpawn(region,null,jockey?EntitySpawnReason.JOCKEY:EntitySpawnReason.CHUNK_GENERATION,jockey?null:group);
+                if(!jockey && result!=group) throw new AssertionError("group identity");
+                if(jockey) ((Chicken)animal).setChickenJockey(true);
                 var output=TagValueOutput.createWithContext(ProblemReporter.DISCARDING,lookup);
                 if(!animal.save(output)) throw new AssertionError("entity not saved");
                 var javaTag=output.buildResult(); var rustTag=NbtIo.read(Path.of(path.getAsString()));
                 if(!javaTag.equals(rustTag)) throw new AssertionError("case="+test+" index="+index+" java="+javaTag+" rust="+rustTag);
                 index++;
             }
+            if(jockey && random.nextLong()!=test.get("next_random").getAsLong()) throw new AssertionError("jockey random mismatch: "+test);
         }
         if(args.length>1) {
             var seedField=LegacyRandomSource.class.getDeclaredField("seed"); seedField.setAccessible(true);

@@ -65,7 +65,7 @@ pub use generated_chest::{GeneratedEmptyChest, GeneratedLootChest};
 pub use generated_creature_random::FreshCreatureRandom;
 pub use generated_donkey::draft_fresh_donkey;
 pub use generated_drowned::draft_fresh_structure_drowned;
-pub use generated_farm_animal::draft_fresh_farm_animal;
+pub use generated_farm_animal::{draft_fresh_farm_animal, draft_fresh_jockey_chicken};
 pub use generated_horse::draft_fresh_horse;
 pub use generated_hut_mobs::{draft_fresh_hut_cat, draft_fresh_hut_witch};
 pub use generated_hut_piece::SavedSwampHutPiece;

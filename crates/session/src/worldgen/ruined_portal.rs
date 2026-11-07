@@ -46,6 +46,10 @@ impl PreparedStart {
         random: &mut native_core::random::DecorationRandom,
     ) -> Result<bool> {
         self.piece.validate()?;
+        ensure!(
+            self.template.size == self.piece.template_size,
+            "portal template size changed"
+        );
         if self.template.palettes.is_empty()
             || self.template.size.iter().any(|&size| size < 1)
             || (self.template.blocks.is_empty() && self.template.entities.is_empty())
@@ -135,6 +139,10 @@ impl PreparedStart {
         world: &mut impl FnMut([i32; 3]) -> Result<native_world::loaded::BlockState>,
     ) -> Result<Vec<native_persistence::jigsaw_template::ProcessedTemplateBlock>> {
         self.piece.validate()?;
+        ensure!(
+            self.template.size == self.piece.template_size,
+            "portal template size changed"
+        );
         native_persistence::jigsaw_template::process_structure_template(
             &self.template,
             processors,

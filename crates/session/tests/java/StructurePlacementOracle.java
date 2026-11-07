@@ -7,6 +7,7 @@ import net.minecraft.nbt.*;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.ServerLevelAccessor;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
@@ -25,6 +26,19 @@ public class StructurePlacementOracle {
     static ListTag ints(int... values) { var list = new ListTag(); for (int v:values) list.add(IntTag.valueOf(v)); return list; }
     public static void main(String[] args) throws Exception {
         var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
+                Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
+                Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,
+                Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,
+                Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
+                Blocks.CHISELED_POLISHED_BLACKSTONE, Blocks.IRON_BARS, Blocks.JUNGLE_LEAVES,
+                Blocks.VINE, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR))
+            for (var state : b.getStateDefinition().getPossibleStates()) {
+                var actual = state.getPostProcessPos(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                var expected = b == Blocks.MAGMA_BLOCK ? BlockPos.ZERO.above() : null;
+                if (!Objects.equals(actual, expected))
+                    throw new AssertionError("unexpected postprocess state " + state + " -> " + actual);
+            }
         var root=new CompoundTag(); root.put("size",ints(4,2,4));
         var palette=new ListTag(); palette.add(NbtUtils.writeBlockState(Blocks.STONE.defaultBlockState()));
         palette.add(NbtUtils.writeBlockState(Blocks.IRON_BARS.defaultBlockState())); root.put("palette",palette);
@@ -49,6 +63,21 @@ public class StructurePlacementOracle {
                     case "getBlockEntity" -> null;
                     default -> throw new UnsupportedOperationException(m.toString());
                 });
+            if (mirror == Mirror.NONE && rotation == Rotation.NONE) {
+                for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
+                        Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
+                        Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,
+                        Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,
+                        Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
+                        Blocks.CHISELED_POLISHED_BLACKSTONE)) {
+                    var s = b.defaultBlockState();
+                    for (var d : Direction.values())
+                        if (s.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
+                                Blocks.AIR.defaultBlockState(), levelRandom) != s)
+                            throw new AssertionError("unexpected shape change for " + s);
+                }
+                if (!events.isEmpty()) throw new AssertionError("unexpected shape effects");
+            }
             var settings=new StructurePlaceSettings().setMirror(mirror).setRotation(rotation).setRotationPivot(pivot)
                 .setBoundingBox(new BoundingBox(-20,-20,-20,20,30,20)).setIgnoreEntities(true);
             var random=new WorldgenRandom(new XoroshiroRandomSource(42));

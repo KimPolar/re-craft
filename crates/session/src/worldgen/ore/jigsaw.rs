@@ -10,9 +10,9 @@ use super::super::jigsaw::{
     PreparedTemplatePiece,
 };
 
-struct JigsawRegion<'r, 'a, 'g> {
-    region: &'r mut DecorationRegion<'a>,
-    registry: &'g GeneratedBlockRegistry,
+pub(super) struct JigsawRegion<'r, 'a, 'g> {
+    pub(super) region: &'r mut DecorationRegion<'a>,
+    pub(super) registry: &'g GeneratedBlockRegistry,
 }
 
 #[cfg(test)]

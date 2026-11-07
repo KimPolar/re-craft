@@ -1532,6 +1532,22 @@ fn prepare_existing_world(
                     Ok(tags) => session.set_leaf_support_tags(Arc::new(tags)),
                     Err(error) => eprintln!("Leaf support tag is unavailable: {error:#}"),
                 }
+                let fence_tags = [
+                    "minecraft:fences",
+                    "minecraft:wooden_fences",
+                    "minecraft:shulker_boxes",
+                ]
+                .into_iter()
+                .map(native_resources::packs::ResourceId::parse)
+                .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+                match native_resources::ore_feature::OreBlockTags::load(
+                    &mut resources,
+                    &registry,
+                    &fence_tags,
+                ) {
+                    Ok(tags) => session.set_fence_connection_tags(Arc::new(tags)),
+                    Err(error) => eprintln!("Fence connection tags are unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::load_bounce_suppression_tag(
                     &mut resources,
                     &registry,

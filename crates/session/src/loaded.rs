@@ -840,11 +840,13 @@ pub struct LoadedSession {
     air_deferred_revision: Option<u64>,
     air_pending: BTreeSet<AirTickKey>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
+    fence_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_ticks: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred_revision: Option<u64>,
     leaf_pending: BTreeSet<LeafTickKey>,
     unresolved_leaf_shape: bool,
+    unresolved_fence_shape: bool,
     unresolved_leaf_decay: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
@@ -919,6 +921,7 @@ pub struct LoadedSession {
     lava_source_conversion: bool,
     block_notifications: VecDeque<(IVec3, BlockStateId, BlockStateId)>,
     pending_stair_updates: BTreeMap<ChunkPos, BTreeSet<BlockPosition>>,
+    pending_fence_updates: BTreeMap<ChunkPos, BTreeSet<(BlockPosition, BlockPosition)>>,
     notifying_blocks: bool,
 }
 
@@ -4117,6 +4120,10 @@ impl LoadedSession {
             "leaf shape updates are not yet fully tracked for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
+            "fence shape updates are not yet fully tracked for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_leaf_decay,
             "a leaf decay could not be resolved for saving"
         );
@@ -4340,6 +4347,10 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
         use anyhow::Context;
+        anyhow::ensure!(
+            !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
+            "fence shape updates are not yet fully tracked for saving"
+        );
         anyhow::ensure!(
             self.commands.is_empty(),
             "pending player commands have not reached a tick"
@@ -5776,6 +5787,14 @@ impl LoadedSession {
         self.leaf_deferred_revision = None;
     }
 
+    pub fn set_fence_connection_tags(
+        &mut self,
+        tags: Arc<native_resources::ore_feature::OreBlockTags>,
+    ) {
+        self.fence_tags = Some(tags);
+        self.retry_fence_updates();
+    }
+
     pub fn set_bubble_column_tags(
         &mut self,
         tags: Arc<native_resources::fluid_tags::BubbleColumnTags>,
@@ -6971,11 +6990,13 @@ impl LoadedSession {
             air_deferred_revision: None,
             air_pending: BTreeSet::new(),
             leaf_tags: None,
+            fence_tags: None,
             leaf_ticks: BTreeMap::new(),
             leaf_deferred: BTreeMap::new(),
             leaf_deferred_revision: None,
             leaf_pending: BTreeSet::new(),
             unresolved_leaf_shape: false,
+            unresolved_fence_shape: false,
             unresolved_leaf_decay: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
@@ -7048,6 +7069,7 @@ impl LoadedSession {
             lava_source_conversion: false,
             block_notifications: VecDeque::new(),
             pending_stair_updates: BTreeMap::new(),
+            pending_fence_updates: BTreeMap::new(),
             notifying_blocks: false,
         };
         for (pos, ticks) in saved_ticks {
@@ -9773,6 +9795,10 @@ impl LoadedSession {
             "leaf shape updates are not yet fully tracked for saving"
         );
         ensure!(
+            !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
+            "fence shape updates are not yet fully tracked for saving"
+        );
+        ensure!(
             !self.unresolved_leaf_decay,
             "a leaf decay could not be resolved for saving"
         );
@@ -11393,6 +11419,7 @@ impl LoadedSession {
         }
         if changed {
             self.retry_stair_updates();
+            self.retry_fence_updates();
             self.revision += 1;
             self.light_generation = self.light_generation.wrapping_add(1);
             self.sky_lighting.streaming_changed();
@@ -11850,6 +11877,71 @@ impl LoadedSession {
             self.push_entities_from_soil(relative, absolute);
         }
         Some(placed_soil(block, blocked))
+    }
+
+    fn place_fence(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
+        let hand = crate::placement_input_hand(&self.inventory);
+        let held = self.inventory.slot(hand)?;
+        if !held.id().ends_with("_fence")
+            || !crate::inventory::ordinary_return_supported(held)
+            || !self.vanilla_block_ids.as_ref()?.contains(held.id())
+        {
+            return None;
+        }
+        let tags = Arc::clone(self.fence_tags.as_ref()?);
+        let target = self.ordinary_placement_target(hit)?;
+        let Cell::State(existing) = cell(
+            &self.world,
+            self.origin,
+            self.bounds,
+            target,
+            self.states[0],
+        ) else {
+            return None;
+        };
+        let block = crate::fence_placement::placement(
+            held.id(),
+            self.ordinary_fluid(existing),
+            &tags,
+            |direction| {
+                let position = add(target, IVec3::from_array(direction))
+                    .ok_or_else(|| anyhow::anyhow!("fence neighbor overflow"))?;
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    position,
+                    self.states[0],
+                ) else {
+                    anyhow::bail!("fence neighbor is not loaded")
+                };
+                self.world
+                    .state(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown fence neighbor"))
+            },
+        )
+        .ok()?;
+        let shape = block_shape(&block)?;
+        if !self.falling_blocks_clear_placement(target, &shape) {
+            return None;
+        }
+        let min = self.player.position
+            + Vec3::new(-crate::PLAYER_HALF_WIDTH, 0.0, -crate::PLAYER_HALF_WIDTH);
+        let max = self.player.position
+            + Vec3::new(
+                crate::PLAYER_HALF_WIDTH,
+                self.player.pose.height(),
+                crate::PLAYER_HALF_WIDTH,
+            );
+        if shape.iter().any(|bounds| {
+            min.cmplt(target.as_vec3() + bounds.max).all()
+                && max.cmpgt(target.as_vec3() + bounds.min).all()
+        }) {
+            return None;
+        }
+        let id = self.intern_block(block);
+        self.set_player_placed(target, id).then_some(hand)
     }
 
     fn place_slab(&mut self, hit: ShapeRayHit) -> Option<crate::inventory::PlayerSlot> {
@@ -15404,6 +15496,9 @@ impl LoadedSession {
         if leaf_state_distance(state).is_some() {
             return Some(fluid);
         }
+        if native_world::collision::fence_waterlogged(state) == Some(true) {
+            return Some(fluid);
+        }
         if self.slab_top(state).is_none()
             && self.stair_voxels(id).is_none()
             && !(matches!(
@@ -18077,6 +18172,143 @@ impl LoadedSession {
         self.set(position, next)
     }
 
+    fn queue_fence_update(&mut self, fence: IVec3, source: IVec3, waiting: IVec3) {
+        let (Some(fence), Some(source), Some(waiting)) = (
+            add(self.origin, fence),
+            add(self.origin, source),
+            add(self.origin, waiting),
+        ) else {
+            self.unresolved_fence_shape = true;
+            return;
+        };
+        let pos = |p: IVec3| BlockPosition {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        };
+        self.pending_fence_updates
+            .entry(ChunkPos {
+                x: waiting.x.div_euclid(16),
+                z: waiting.z.div_euclid(16),
+            })
+            .or_default()
+            .insert((pos(fence), pos(source)));
+    }
+
+    fn update_fence_neighbor(
+        &mut self,
+        position: IVec3,
+        id: BlockStateId,
+        direction: IVec3,
+        other: BlockStateId,
+    ) -> bool {
+        let Some(block) = self.world.state(id) else {
+            return false;
+        };
+        let Some(wet) = native_world::collision::fence_waterlogged(block) else {
+            return false;
+        };
+        let block = block.clone();
+        if wet && let Some(fluid) = self.simulated_fluid(id) {
+            self.schedule_fluid(position, fluid, self.fluid_settings().delay(fluid.kind));
+        }
+        let side = match direction {
+            IVec3::NEG_X => "west",
+            IVec3::X => "east",
+            IVec3::NEG_Z => "north",
+            IVec3::Z => "south",
+            IVec3::NEG_Y | IVec3::Y => return true,
+            _ => {
+                self.unresolved_fence_shape = true;
+                return true;
+            }
+        };
+        let connection = self.fence_tags.as_ref().and_then(|tags| {
+            self.world.state(other).and_then(|neighbor| {
+                crate::worldgen::fence_connection(tags, &block, neighbor, direction.to_array()).ok()
+            })
+        });
+        let Some(connection) = connection else {
+            self.unresolved_fence_shape = true;
+            return true;
+        };
+        if block
+            .properties
+            .get(side)
+            .is_some_and(|value| (value == "true") == connection)
+        {
+            return true;
+        }
+        let mut next = block;
+        next.properties.insert(side.into(), connection.to_string());
+        let next = self.intern_block(next);
+        if !self.set(position, next) {
+            self.unresolved_fence_shape = true;
+        }
+        true
+    }
+
+    fn retry_fence_updates(&mut self) {
+        if self.fence_tags.is_none() {
+            return;
+        }
+        let ready: Vec<_> = self
+            .pending_fence_updates
+            .keys()
+            .copied()
+            .filter(|pos| {
+                self.world
+                    .chunks
+                    .get(pos)
+                    .is_some_and(|chunk| chunk.status.as_deref() == Some("minecraft:full"))
+            })
+            .collect();
+        for chunk in ready {
+            let Some(updates) = self.pending_fence_updates.remove(&chunk) else {
+                continue;
+            };
+            for (fence, source) in updates {
+                let fence = IVec3::new(fence.x, fence.y, fence.z);
+                let source = IVec3::new(source.x, source.y, source.z);
+                let (Some(fence), Some(source)) =
+                    (subtract(fence, self.origin), subtract(source, self.origin))
+                else {
+                    self.unresolved_fence_shape = true;
+                    continue;
+                };
+                let Cell::State(id) =
+                    cell(&self.world, self.origin, self.bounds, fence, self.states[0])
+                else {
+                    self.queue_fence_update(fence, source, fence);
+                    continue;
+                };
+                if self
+                    .world
+                    .state(id)
+                    .and_then(native_world::collision::fence_waterlogged)
+                    .is_none()
+                {
+                    continue;
+                }
+                let Cell::State(other) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    source,
+                    self.states[0],
+                ) else {
+                    self.queue_fence_update(fence, source, source);
+                    continue;
+                };
+                let Some(direction) = subtract(source, fence) else {
+                    self.unresolved_fence_shape = true;
+                    continue;
+                };
+                self.update_fence_neighbor(fence, id, direction, other);
+            }
+        }
+    }
+
     fn notify_one_block(&mut self, position: IVec3, old: BlockStateId, new: BlockStateId) {
         let settings = self.fluid_settings();
         let old_name = self.world.state(old).map(|state| state.name.as_str());
@@ -18154,6 +18386,9 @@ impl LoadedSession {
                 neighbor,
                 self.states[0],
             ) else {
+                if direction.y == 0 && self.fence_tags.is_some() {
+                    self.queue_fence_update(neighbor, position, neighbor);
+                }
                 continue;
             };
             if direction == IVec3::NEG_Y {
@@ -18161,6 +18396,17 @@ impl LoadedSession {
             }
             if direction.y == 0 && self.update_stair_shape(neighbor, id) {
                 continue;
+            }
+            if let Cell::State(current) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) {
+                if self.update_fence_neighbor(neighbor, id, -direction, current) {
+                    continue;
+                }
             }
             if self
                 .world
@@ -18523,6 +18769,11 @@ impl LoadedSession {
             && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
         {
             return fluid_sim::Cell::GrateWater(fluid);
+        }
+        if native_world::collision::fence_waterlogged(state) == Some(true)
+            && let Some(fluid) = self.fluids.get(id.0 as usize).copied().flatten()
+        {
+            return fluid_sim::Cell::FenceWater(fluid);
         }
         if matches!(
             state.name.as_str(),
@@ -19673,6 +19924,7 @@ impl LoadedSession {
                                     .or_else(|| self.place_honey_block(hit))
                                     .or_else(|| self.place_chest(hit))
                                     .or_else(|| self.place_banner(hit))
+                                    .or_else(|| self.place_fence(hit))
                                     .or_else(|| self.place_slab(hit))
                                     .or_else(|| self.place_stairs(hit))
                             {
@@ -66520,6 +66772,264 @@ pub(crate) mod tests {
             && key.z == absolute.z
             && key.kind == FluidKind::Water
             && key.source));
+    }
+
+    fn fixture_fence_tags(air_is_fence: bool) -> Arc<native_resources::ore_feature::OreBlockTags> {
+        use native_resources::packs::{ResourceId, ResourceProvider};
+        struct Tags(bool);
+        impl ResourceProvider for Tags {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                let values = match path {
+                    "data/minecraft/tags/block/fences.json"
+                    | "data/minecraft/tags/block/wooden_fences.json" => {
+                        let mut values = vec!["minecraft:oak_fence"];
+                        if self.0 {
+                            values.push("minecraft:air");
+                        }
+                        values
+                    }
+                    "data/minecraft/tags/block/shulker_boxes.json" => vec![],
+                    _ => return Ok(None),
+                };
+                Ok(Some(serde_json::to_vec(
+                    &serde_json::json!({"values": values}),
+                )?))
+            }
+        }
+        let registry = [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:water",
+            "minecraft:oak_fence",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let ids = [
+            "minecraft:fences",
+            "minecraft:wooden_fences",
+            "minecraft:shulker_boxes",
+        ]
+        .into_iter()
+        .map(ResourceId::parse)
+        .collect::<anyhow::Result<_>>()
+        .unwrap();
+        Arc::new(
+            native_resources::ore_feature::OreBlockTags::load(
+                &mut Tags(air_is_fence),
+                &registry,
+                &ids,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn fence_item_uses_both_hands_and_game_mode_consumption() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            for mode in [
+                GameMode::Survival,
+                GameMode::Creative,
+                GameMode::Adventure,
+                GameMode::Spectator,
+            ] {
+                let mut session = session();
+                session.set_vanilla_block_ids(Arc::new(BTreeSet::from([
+                    "minecraft:oak_fence".into()
+                ])));
+                session.set_fence_connection_tags(fixture_fence_tags(false));
+                session.set_game_mode(mode);
+                assert!(session.set(IVec3::new(8, 1, 7), session.states[3]));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    hand,
+                    ItemStack::new("minecraft:oak_fence".into(), 2, 64, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                session.submit_command(PlayerCommand::Place);
+                session.update(TICK);
+                let block = session
+                    .world
+                    .block(session.origin.x + 8, 2, session.origin.z + 7)
+                    .unwrap();
+                assert_eq!(
+                    block.name,
+                    if matches!(mode, GameMode::Survival | GameMode::Creative) {
+                        "minecraft:oak_fence"
+                    } else {
+                        "minecraft:air"
+                    },
+                    "{mode:?} {hand:?}"
+                );
+                assert_eq!(
+                    session.inventory.slot(hand).unwrap().count(),
+                    if mode == GameMode::Survival { 1 } else { 2 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fence_placement_uses_source_water_and_respects_player_collision() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for (level, collision) in [(0, false), (3, false), (0, true)] {
+            let mut session = session();
+            session.set_vanilla_block_ids(Arc::new(BTreeSet::from(["minecraft:oak_fence".into()])));
+            session.set_fence_connection_tags(fixture_fence_tags(false));
+            let target = IVec3::new(4, 2, 4);
+            let water = session.intern_liquid(FluidState {
+                kind: FluidKind::Water,
+                amount: 8 - level,
+                source: level == 0,
+                falling: false,
+            });
+            session.set_with_notify(target, water, false);
+            session.set_with_notify(target + IVec3::NEG_Y, session.states[3], false);
+            session.set_with_notify(target + IVec3::X, session.states[3], false);
+            if collision {
+                session.player.position = Vec3::new(4.5, 2.0, 4.5);
+            }
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:oak_fence".into(), 1, 64, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            let hit = ShapeRayHit {
+                position: target + IVec3::NEG_Y,
+                face: IVec3::Y,
+                location: DVec3::ZERO,
+                inside: false,
+            };
+            assert_eq!(session.place_fence(hit).is_some(), !collision);
+            let block = session
+                .world
+                .block(
+                    session.origin.x + target.x,
+                    target.y,
+                    session.origin.z + target.z,
+                )
+                .unwrap();
+            if collision {
+                assert_eq!(block.name, "minecraft:water");
+            } else {
+                assert_eq!(block.name, "minecraft:oak_fence");
+                assert_eq!(block.properties["east"], "true");
+                assert_eq!(block.properties["waterlogged"], (level == 0).to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn fence_neighbor_updates_use_tags_and_schedule_water() {
+        for air_is_fence in [false, true] {
+            let mut session = session();
+            session.set_fence_connection_tags(fixture_fence_tags(air_is_fence));
+            let pos = IVec3::new(4, 3, 4);
+            let fence = session.intern_block(state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "false"),
+                    ("east", "false"),
+                    ("south", "false"),
+                    ("west", "false"),
+                    ("waterlogged", "true"),
+                ],
+            ));
+            session.set_with_notify(pos, fence, false);
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            assert!(session.set(pos + IVec3::X, session.states[3]));
+            let block = |s: &LoadedSession| {
+                s.world
+                    .block(s.origin.x + pos.x, pos.y, s.origin.z + pos.z)
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(block(&session).properties["east"], "true");
+            assert_eq!(block(&session).properties["waterlogged"], "true");
+            assert!(matches!(
+                session.simulation_cell(pos),
+                fluid_sim::Cell::FenceWater(_)
+            ));
+            let absolute = session.origin + pos;
+            assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                && key.y == absolute.y
+                && key.z == absolute.z
+                && key.kind == FluidKind::Water
+                && key.source));
+            assert!(session.set(pos + IVec3::X, session.states[0]));
+            assert_eq!(block(&session).properties["east"], air_is_fence.to_string());
+        }
+    }
+
+    #[test]
+    fn fence_boundary_updates_wait_for_chunk_and_then_retry() {
+        let mut session = session();
+        session.set_fence_connection_tags(fixture_fence_tags(false));
+        let source = IVec3::new(15, 3, 8);
+        assert!(session.set(source, session.states[3]));
+        let east = ChunkPos {
+            x: session.origin.x.div_euclid(16) + 1,
+            z: session.origin.z.div_euclid(16),
+        };
+        assert!(session.pending_fence_updates.contains_key(&east));
+        let original = native_persistence::nbt::NamedTag {
+            name: "".into(),
+            value: native_persistence::nbt::Tag::Compound(vec![]),
+        };
+        assert!(
+            session
+                .draft_changed_chunk(east, &original)
+                .unwrap_err()
+                .to_string()
+                .contains("fence shape updates")
+        );
+        let mut incoming = World::new("minecraft:overworld");
+        let air = incoming.intern_state(state("minecraft:air", &[]));
+        let fence = incoming.intern_state(state(
+            "minecraft:oak_fence",
+            &[
+                ("north", "false"),
+                ("east", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("waterlogged", "false"),
+            ],
+        ));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 16 + 3 * 256] = fence;
+        incoming.chunks.insert(
+            east,
+            Arc::new(Chunk {
+                position: east,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        session.queue_loaded_chunk(east, incoming);
+        session.apply_streaming();
+        assert!(session.pending_fence_updates.is_empty());
+        let block = session
+            .world
+            .block(session.origin.x + 16, 3, session.origin.z + 8)
+            .unwrap();
+        assert_eq!(block.properties["west"], "true");
     }
 
     #[test]

@@ -1178,6 +1178,13 @@ impl FreshTerrainBatch {
         self.decoration.as_ref()?.leaf_tags.clone()
     }
 
+    /// Active data-pack tags needed for fence connections in the session.
+    pub fn fence_connection_tags(
+        &self,
+    ) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
+        self.decoration.as_ref()?.fence_tags.clone()
+    }
+
     pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
         ensure!(self.is_complete(), "generation batch has pending work");
         let terrain = self

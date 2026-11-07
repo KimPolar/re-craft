@@ -22,12 +22,15 @@ public class MonsterRoomBlockOracle {
   var expandedNames=new ArrayList<>(names);
   expandedNames.addAll(List.of("moss_carpet","short_grass","tall_grass","fern","large_fern","azalea","flowering_azalea","oak_log","birch_log","dark_oak_log","brown_mushroom_block","red_mushroom_block","mushroom_stem"));
   expandedNames.addAll(List.of("rail","powered_rail","detector_rail","activator_rail","cobweb","torch","wall_torch","soul_torch","soul_wall_torch","lantern","soul_lantern","oak_slab","oak_stairs"));
+  var supportNames=new HashSet<>(List.of("rail","powered_rail","detector_rail","activator_rail","cobweb","torch","wall_torch","soul_torch","soul_wall_torch","lantern","soul_lantern"));
   for(var block:BuiltInRegistries.BLOCK) if(block instanceof net.minecraft.world.level.block.FenceBlock
       || block instanceof net.minecraft.world.level.block.FenceGateBlock
       || block instanceof net.minecraft.world.level.block.DoorBlock
       || block instanceof net.minecraft.world.level.block.IronBarsBlock
-      || block instanceof net.minecraft.world.level.block.BedBlock)
+      || block instanceof net.minecraft.world.level.block.BedBlock) {
    expandedNames.add(BuiltInRegistries.BLOCK.getKey(block).getPath());
+   if(!(block instanceof net.minecraft.world.level.block.DoorBlock)) supportNames.add(BuiltInRegistries.BLOCK.getKey(block).getPath());
+  }
   for(var family:List.of("oak","spruce","birch","jungle","acacia","cherry","dark_oak","pale_oak","mangrove","poplar","bamboo","crimson","warped")) {
    var wood=new ArrayList<String>();wood.add(family+"_planks");
    if(family.equals("bamboo")) wood.addAll(List.of("bamboo_block","stripped_bamboo_block"));
@@ -36,7 +39,7 @@ public class MonsterRoomBlockOracle {
     for(var suffix:nether?List.of("stem","hyphae"):List.of("log","wood"))
      for(var prefix:List.of("","stripped_")) wood.add(prefix+family+"_"+suffix);
    }
-   for(var name:wood) if(!expandedNames.contains(name)) expandedNames.add(name);
+   for(var name:wood) {if(!expandedNames.contains(name)) expandedNames.add(name);supportNames.add(name);}
   }
   for(var name:expandedNames){
    var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
@@ -45,6 +48,11 @@ public class MonsterRoomBlockOracle {
     var pairs=new ArrayList<String>();for(var entry:properties.entrySet())pairs.add(entry.getKey()+"="+entry.getValue());
     var post=state.getPostProcessPos(world,new BlockPos(1,4,1));
     out.printf("C %s %s %s %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isSolid(),state.isSolidRender(),state.hasBlockEntity(),post!=null);
+    if(supportNames.contains(name)) {
+     out.printf("S %s %s %s",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isSolidRender());
+     for(var direction:Direction.values())out.printf(" %s",state.isFaceSturdy(world,new BlockPos(1,4,1),direction));
+     out.println();
+    }
    }
   }
  }

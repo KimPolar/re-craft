@@ -4046,7 +4046,68 @@ fn geode_crystal(state: &BlockState) -> Result<bool> {
     Ok(false)
 }
 
+fn generation_rail_state(state: &BlockState) -> bool {
+    let name = state.name.as_str();
+    if !matches!(
+        name,
+        "minecraft:rail"
+            | "minecraft:powered_rail"
+            | "minecraft:detector_rail"
+            | "minecraft:activator_rail"
+    ) {
+        return false;
+    }
+    let powered = name != "minecraft:rail";
+    let shape = state.properties.get("shape").map(String::as_str);
+    let valid_shape = matches!(
+        shape,
+        Some(
+            "north_south"
+                | "east_west"
+                | "ascending_east"
+                | "ascending_west"
+                | "ascending_north"
+                | "ascending_south"
+        )
+    ) || (!powered
+        && matches!(
+            shape,
+            Some("south_east" | "south_west" | "north_west" | "north_east")
+        ));
+    state.properties.len() == if powered { 3 } else { 2 }
+        && valid_shape
+        && matches!(
+            state.properties.get("waterlogged").map(String::as_str),
+            Some("true" | "false")
+        )
+        && (!powered
+            || matches!(
+                state.properties.get("powered").map(String::as_str),
+                Some("true" | "false")
+            ))
+}
+
+fn generation_non_sturdy_structure(state: &BlockState) -> bool {
+    generation_rail_state(state)
+        || jigsaw::jigsaw_torch(state)
+        || native_world::collision::fence_waterlogged(state).is_some()
+        || native_world::collision::fence_gate_open(state).is_some()
+        || native_world::collision::pane_waterlogged(state).is_some()
+        || native_world::collision::bed_leg_end(state).is_some()
+        || (state.name == "minecraft:cobweb" && state.properties.is_empty())
+        || (matches!(
+            state.name.as_str(),
+            "minecraft:lantern" | "minecraft:soul_lantern"
+        ) && native_world::block_light::same_light_behavior(state, state).is_some())
+}
+
 fn tree_solid_render(state: &BlockState) -> Result<bool> {
+    if generation_non_sturdy_structure(state) {
+        return Ok(false);
+    }
+    if jigsaw::jigsaw_wood(state) {
+        return Ok(true);
+    }
     if geode_full_cube(state)? {
         return Ok(true);
     }
@@ -4078,6 +4139,12 @@ fn tree_solid_render(state: &BlockState) -> Result<bool> {
 }
 
 fn tree_sturdy_up(state: &BlockState) -> Result<bool> {
+    if generation_non_sturdy_structure(state) {
+        return Ok(false);
+    }
+    if jigsaw::jigsaw_wood(state) {
+        return Ok(true);
+    }
     if geode_full_cube(state)? {
         return Ok(true);
     }
@@ -4737,44 +4804,8 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
             state.properties.get("type").is_some_and(|v| v == "double"),
         ));
     }
-    if matches!(
-        name,
-        "minecraft:rail"
-            | "minecraft:powered_rail"
-            | "minecraft:detector_rail"
-            | "minecraft:activator_rail"
-    ) {
-        let powered = name != "minecraft:rail";
-        let shape = state.properties.get("shape").map(String::as_str);
-        let valid_shape = matches!(
-            shape,
-            Some(
-                "north_south"
-                    | "east_west"
-                    | "ascending_east"
-                    | "ascending_west"
-                    | "ascending_north"
-                    | "ascending_south"
-            )
-        ) || (!powered
-            && matches!(
-                shape,
-                Some("south_east" | "south_west" | "north_west" | "north_east")
-            ));
-        if state.properties.len() == if powered { 3 } else { 2 }
-            && valid_shape
-            && matches!(
-                state.properties.get("waterlogged").map(String::as_str),
-                Some("true" | "false")
-            )
-            && (!powered
-                || matches!(
-                    state.properties.get("powered").map(String::as_str),
-                    Some("true" | "false")
-                ))
-        {
-            return Ok((false, false));
-        }
+    if generation_rail_state(state) {
+        return Ok((false, false));
     }
     if tree_leaf_litter(state)? {
         return Ok((false, false));
@@ -18381,8 +18412,21 @@ mod tests {
             ("waterlogged".into(), "true".into()),
         ]);
         assert_eq!(monster_block_flags(&rail).unwrap(), (false, false));
+        assert!(!tree_sturdy_up(&rail).unwrap());
+        assert!(!tree_solid_render(&rail).unwrap());
+        for direction in [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ] {
+            assert!(!generation_face_sturdy(&rail, direction).unwrap());
+        }
         rail.properties.insert("shape".into(), "invalid".into());
         assert!(monster_block_flags(&rail).is_err());
+        assert!(tree_sturdy_up(&rail).is_err());
         let mut slab = state("oak_slab");
         slab.properties = BTreeMap::from([
             ("type".into(), "bottom".into()),
@@ -18468,6 +18512,48 @@ mod tests {
             count += 1;
         }
         assert!(count >= 2_000, "missing block states: {count}");
+        let directions = [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ];
+        let mut support_states = 0;
+        for line in output.lines().filter_map(|value| value.strip_prefix("S ")) {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(parts.len(), 9, "{line}");
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for entry in parts[1].split(',') {
+                    let (key, value) = entry.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            assert_eq!(
+                tree_solid_render(&block).unwrap(),
+                parts[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            for (direction, expected) in directions.into_iter().zip(&parts[3..]) {
+                assert_eq!(
+                    generation_face_sturdy(&block, direction).unwrap(),
+                    expected.parse::<bool>().unwrap(),
+                    "{line}"
+                );
+            }
+            assert_eq!(
+                tree_sturdy_up(&block).unwrap(),
+                parts[4].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            support_states += 1;
+        }
+        assert!(
+            support_states >= 1_000,
+            "missing support states: {support_states}"
+        );
     }
 
     #[test]

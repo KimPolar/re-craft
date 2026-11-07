@@ -61,7 +61,7 @@ pub(super) fn jigsaw_torch(state: &BlockState) -> bool {
     }
 }
 
-fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
+pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
     }

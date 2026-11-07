@@ -63,6 +63,7 @@ mod ocean_ruin;
 #[cfg(test)]
 mod potent_sulfur_tests;
 mod ruined_portal;
+mod shipwreck;
 mod speleothem;
 #[cfg(test)]
 pub(super) use ocean_ruin::attach_created_chicken_rider;

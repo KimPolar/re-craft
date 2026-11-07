@@ -62,6 +62,7 @@ enum Processor {
         mossiness: f32,
         tags: crate::structure_block_age::AgeTags,
     },
+    BlackstoneReplace,
 }
 
 /// Decoded, ordered processors with data-pack tags already resolved.
@@ -217,6 +218,7 @@ impl PreparedProcessors {
                     mossiness: number(entry, "mossiness")?,
                     tags: crate::structure_block_age::AgeTags::load(provider, blocks)?,
                 },
+                "minecraft:blackstone_replace" => Processor::BlackstoneReplace,
                 "minecraft:rule" => {
                     let values = entry
                         .get("rules")
@@ -313,6 +315,9 @@ impl PreparedProcessors {
                     let mut random = LegacyRandom::new(positional_seed(x, y, z));
                     block.state = tags.process(&block.state, *mossiness, &mut random)?;
                 }
+                Processor::BlackstoneReplace => {
+                    block.state = blackstone_replace(&block.state)?;
+                }
             }
         }
         Ok(Some(block))
@@ -342,6 +347,83 @@ impl PreparedProcessors {
             },
         )
     }
+}
+
+fn blackstone_replace(state: &BlockState) -> Result<BlockState> {
+    use std::collections::BTreeMap;
+
+    let (name, kind) = match state.name.as_str() {
+        "minecraft:cobblestone" | "minecraft:mossy_cobblestone" => ("blackstone", 0),
+        "minecraft:stone" => ("polished_blackstone", 0),
+        "minecraft:stone_bricks" | "minecraft:mossy_stone_bricks" => {
+            ("polished_blackstone_bricks", 0)
+        }
+        "minecraft:cobblestone_stairs" | "minecraft:mossy_cobblestone_stairs" => {
+            ("blackstone_stairs", 1)
+        }
+        "minecraft:stone_stairs" => ("polished_blackstone_stairs", 1),
+        "minecraft:stone_brick_stairs" | "minecraft:mossy_stone_brick_stairs" => {
+            ("polished_blackstone_brick_stairs", 1)
+        }
+        "minecraft:cobblestone_slab" | "minecraft:mossy_cobblestone_slab" => ("blackstone_slab", 2),
+        "minecraft:smooth_stone_slab" | "minecraft:stone_slab" => ("polished_blackstone_slab", 2),
+        "minecraft:stone_brick_slab" | "minecraft:mossy_stone_brick_slab" => {
+            ("polished_blackstone_brick_slab", 2)
+        }
+        "minecraft:stone_brick_wall" | "minecraft:mossy_stone_brick_wall" => {
+            ("polished_blackstone_brick_wall", 3)
+        }
+        "minecraft:cobblestone_wall" | "minecraft:mossy_cobblestone_wall" => ("blackstone_wall", 3),
+        "minecraft:chiseled_stone_bricks" => ("chiseled_polished_blackstone", 0),
+        "minecraft:cracked_stone_bricks" => ("cracked_polished_blackstone_bricks", 0),
+        "minecraft:iron_bars" => ("iron_chain", 4),
+        _ => return Ok(state.clone()),
+    };
+    let mut properties = BTreeMap::new();
+    let mut insert = |key: &str, value: &str| {
+        properties.insert(key.to_owned(), value.to_owned());
+    };
+    match kind {
+        1 => {
+            for key in ["facing", "half"] {
+                insert(
+                    key,
+                    state
+                        .properties
+                        .get(key)
+                        .with_context(|| format!("missing {key} on {}", state.name))?,
+                );
+            }
+            insert("shape", "straight");
+            insert("waterlogged", "false");
+        }
+        2 => {
+            insert(
+                "type",
+                state
+                    .properties
+                    .get("type")
+                    .with_context(|| format!("missing type on {}", state.name))?,
+            );
+            insert("waterlogged", "false");
+        }
+        3 => {
+            for key in ["east", "north", "south", "west"] {
+                insert(key, "none");
+            }
+            insert("up", "true");
+            insert("waterlogged", "false");
+        }
+        4 => {
+            insert("axis", "y");
+            insert("waterlogged", "false");
+        }
+        _ => {}
+    }
+    Ok(BlockState {
+        name: format!("minecraft:{name}"),
+        properties,
+    })
 }
 
 #[cfg(test)]
@@ -374,6 +456,33 @@ mod tests {
             .unwrap();
         assert_eq!(result.state.name, "minecraft:dirt");
         assert_eq!(result.position, [1, 2, 3]);
+        assert!(result.nbt.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn blackstone_replacement_preserves_only_java_selected_properties() -> Result<()> {
+        let mut stair = block("stone_brick_stairs", [1, 2, 3]);
+        stair.state.properties = [
+            ("facing", "west"),
+            ("half", "top"),
+            ("shape", "inner_left"),
+            ("waterlogged", "true"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let result = PreparedProcessors(vec![Processor::BlackstoneReplace])
+            .process(stair, &mut |_| panic!("unexpected world read"))?
+            .unwrap();
+        assert_eq!(
+            result.state.name,
+            "minecraft:polished_blackstone_brick_stairs"
+        );
+        assert_eq!(result.state.properties["facing"], "west");
+        assert_eq!(result.state.properties["half"], "top");
+        assert_eq!(result.state.properties["shape"], "straight");
+        assert_eq!(result.state.properties["waterlogged"], "false");
         assert!(result.nbt.is_some());
         Ok(())
     }

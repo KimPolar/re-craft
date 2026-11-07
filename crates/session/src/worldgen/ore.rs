@@ -7231,13 +7231,17 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && (old_air || tree_leaf_litter(&old)?)
                         && ((matches!(
                             state.name.as_str(),
-                            "minecraft:dark_oak_leaves" | "minecraft:birch_leaves"
+                            "minecraft:oak_leaves"
+                                | "minecraft:dark_oak_leaves"
+                                | "minecraft:birch_leaves"
                         ) && state.properties.get("waterlogged").map(String::as_str)
                             == Some("false")
                             && tree_generated_leaf(state)?)
                             || (matches!(
                                 state.name.as_str(),
-                                "minecraft:dark_oak_log" | "minecraft:birch_log"
+                                "minecraft:oak_log"
+                                    | "minecraft:dark_oak_log"
+                                    | "minecraft:birch_log"
                             ) && tree_generated_log(state)));
                     // Block piles only replace air with one of the verified
                     // vanilla states accepted by set_pile_block.
@@ -10745,6 +10749,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn oak_tree_light_updates_match_java() {
+        check_tracked_light_updates(&[
+            "tree_fresh_oak_log",
+            "tree_fresh_oak_leaf",
+            "log_active_oak_full",
+            "leaf_active_oak_full",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn fresh_village_pile_light_matches_java() {
         check_tracked_light_updates(&[
             "pile_fresh_snow",
@@ -10970,6 +10985,10 @@ mod tests {
                     "birch_log"
                 } else if mode == "tree_fresh_birch_leaf" {
                     "birch_leaves"
+                } else if mode == "tree_fresh_oak_log" {
+                    "oak_log"
+                } else if mode == "tree_fresh_oak_leaf" {
+                    "oak_leaves"
                 } else if mode.ends_with("log") || mode.ends_with("empty") {
                     "dark_oak_log"
                 } else {
@@ -11094,7 +11113,11 @@ mod tests {
                 .activate(&terrain, active, [center], &registry)
                 .unwrap();
             let is_log = mode.starts_with("log_active_");
-            let mut leaf = state(if is_log {
+            let mut leaf = state(if mode == "log_active_oak_full" {
+                "oak_log"
+            } else if mode == "leaf_active_oak_full" {
+                "oak_leaves"
+            } else if is_log {
                 "dark_oak_log"
             } else {
                 "dark_oak_leaves"

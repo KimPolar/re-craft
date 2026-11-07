@@ -186,6 +186,28 @@ fn installed_cave_vines_column_resolves_named_and_randomized_providers() {
     assert!(states.iter().any(|s| s.0 == "minecraft:cave_vines_plant"));
     assert!(states.iter().any(|s| s.0 == "minecraft:cave_vines"));
 }
+
+#[test]
+#[ignore = "requires Minecraft Java Edition 26.3"]
+fn installed_kelp_column_resolves_both_layers() {
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let mut resources = ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_generated_block_registry().unwrap();
+    let data = resources
+        .read_data("data/minecraft/worldgen/feature/kelp.json")
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&data).unwrap();
+    let feature = BlockColumnFeature::decode_with_resources(&mut resources, &value, &mut |v| {
+        registry.resolve(v)
+    })
+    .unwrap();
+    let states = feature.possible_states();
+    assert!(states.iter().any(|s| s.0 == "minecraft:kelp_plant"));
+    assert!(states.iter().any(|s| s.0 == "minecraft:kelp"));
+}
 fn run(cmd: &mut Command) -> String {
     let out = cmd.output().unwrap();
     assert!(

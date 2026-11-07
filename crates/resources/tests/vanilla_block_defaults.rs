@@ -203,6 +203,11 @@ fn generated_block_defaults_match_java() {
         serde_json::json!("minecraft:leaf_litter"),
         serde_json::json!("minecraft:cave_vines_plant"),
         serde_json::json!("minecraft:cave_vines"),
+        serde_json::json!("minecraft:kelp_plant"),
+        serde_json::json!("minecraft:kelp"),
+        serde_json::json!({"id":"minecraft:kelp","properties":{"age":"25"}}),
+        serde_json::json!({"id":"minecraft:kelp","properties":{"age":"26"}}),
+        serde_json::json!({"id":"minecraft:kelp_plant","properties":{"age":"0"}}),
         serde_json::json!("minecraft:small_dripleaf"),
         serde_json::json!("minecraft:seagrass"),
         serde_json::json!("minecraft:tall_seagrass"),
@@ -256,6 +261,9 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for age in 0..=25 {
+        cases.push(serde_json::json!({"id":"minecraft:kelp","properties":{"age":age.to_string()}}));
+    }
     for state in ["dry", "wet", "dormant", "erupting", "continuous"] {
         cases.push(serde_json::json!({"id":"minecraft:potent_sulfur","properties":{"potent_sulfur_state":state}}));
     }

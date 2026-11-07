@@ -37,6 +37,7 @@ enum StateSchema {
     DoublePlant,
     BerryBush,
     Age15,
+    Age25,
     Sapling,
     Leaves,
     AmethystCluster,
@@ -246,7 +247,7 @@ impl StateSchema {
             Self::HangingRoots => ("waterlogged", "false"),
             Self::DoublePlant => ("half", "lower"),
             Self::BerryBush => ("age", "0"),
-            Self::Age15 => ("age", "0"),
+            Self::Age15 | Self::Age25 => ("age", "0"),
             Self::Sapling => ("stage", "0"),
         };
         BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
@@ -470,6 +471,9 @@ impl StateSchema {
                 .map(|n| n.to_string()),
             Self::Age15 if name == "age" => java_decimal(value)
                 .filter(|n| (0..=15).contains(n))
+                .map(|n| n.to_string()),
+            Self::Age25 if name == "age" => java_decimal(value)
+                .filter(|n| (0..=25).contains(n))
                 .map(|n| n.to_string()),
             Self::Sapling if name == "stage" => java_decimal(value)
                 .filter(|n| (0..=1).contains(n))
@@ -873,6 +877,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/CaveVinesBlock" => {
                     Some(StateSchema::CaveVinesHead)
                 }
+                "net/minecraft/world/level/block/KelpBlock" => Some(StateSchema::Age25),
                 "net/minecraft/world/level/block/SmallDripleafBlock" => {
                     Some(StateSchema::SmallDripleaf)
                 }

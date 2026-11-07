@@ -301,9 +301,21 @@ fn structure_placement_matches_java() -> Result<()> {
     let mut marker_count = 0;
     let mut jigsaw_states = 0;
     let mut barrier_states = 0;
+    let mut liquid_states = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let f: Vec<_> = line.split('\t').collect();
         match f.as_slice() {
+            ["LSTATE", id, level, m, r, expected] => {
+                let properties = BTreeMap::from([("level".into(), (*level).into())]);
+                let result = registry.transform_template_state(
+                    id,
+                    &properties,
+                    mirrors[m.parse::<usize>()?],
+                    rotations[r.parse::<usize>()?],
+                )?;
+                assert_eq!(result["level"], *expected, "{line}");
+                liquid_states += 1;
+            }
             [
                 "BSTATE",
                 wet,
@@ -690,5 +702,6 @@ fn structure_placement_matches_java() -> Result<()> {
     assert!(marker_count > 0);
     assert_eq!(jigsaw_states, 12 * 3 * 4);
     assert_eq!(barrier_states, 2);
+    assert_eq!(liquid_states, 2 * 16 * 3 * 4);
     Ok(())
 }

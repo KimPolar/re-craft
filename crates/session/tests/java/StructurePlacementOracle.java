@@ -69,6 +69,13 @@ public class StructurePlacementOracle {
                 state.getPostProcessPos(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)==null,
                 net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state),
                 net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state));
+        for (var block : List.of(Blocks.WATER, Blocks.LAVA))
+            for (var state : block.getStateDefinition().getPossibleStates())
+                for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var result = state.mirror(mirror).rotate(rotation);
+                    out.printf("LSTATE\t%s\t%d\t%d\t%d\t%d%n", block == Blocks.WATER ? "minecraft:water" : "minecraft:lava",
+                        state.getValue(LiquidBlock.LEVEL), mirror.ordinal(), rotation.ordinal(), result.getValue(LiquidBlock.LEVEL));
+                }
         for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
                 Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
                 Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,

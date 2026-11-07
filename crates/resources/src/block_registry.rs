@@ -965,6 +965,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Dusted
                 | StateSchema::Slab
                 | StateSchema::Waterlogged
+                | StateSchema::Liquid
         ) {
             return Ok(properties.clone());
         }
@@ -1530,15 +1531,16 @@ mod tests {
                 .transform_template_state("minecraft:water", &invalid, Mirror::None, Rotation::None)
                 .is_err()
         );
-        assert!(
+        assert_eq!(
             registry
                 .transform_template_state(
                     "minecraft:water",
                     &water,
-                    Mirror::None,
+                    Mirror::LeftRight,
                     Rotation::Clockwise90
                 )
-                .is_err()
+                .unwrap(),
+            water
         );
     }
 

@@ -300,6 +300,76 @@ pub fn door_open(state: &BlockState) -> Option<bool> {
     }
 }
 
+/// Validate a built-in trapdoor and return its open and waterlogged flags.
+pub fn trapdoor_state(state: &BlockState) -> Option<(bool, bool)> {
+    let family = state
+        .name
+        .strip_prefix("minecraft:")?
+        .strip_suffix("_trapdoor")?;
+    let wooden = native_core::wood::Planks::ALL.into_iter().any(|wood| {
+        wood.id()
+            .strip_prefix("minecraft:")
+            .and_then(|id| id.strip_suffix("_planks"))
+            == Some(family)
+    });
+    let metal = matches!(
+        family,
+        "iron"
+            | "copper"
+            | "exposed_copper"
+            | "weathered_copper"
+            | "oxidized_copper"
+            | "waxed_copper"
+            | "waxed_exposed_copper"
+            | "waxed_weathered_copper"
+            | "waxed_oxidized_copper"
+    );
+    if (!wooden && !metal)
+        || state.properties.len() != 5
+        || !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+        || !matches!(
+            state.properties.get("half").map(String::as_str),
+            Some("bottom" | "top")
+        )
+        || !matches!(
+            state.properties.get("powered").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    let boolean = |key: &str| match state.properties.get(key)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    Some((boolean("open")?, boolean("waterlogged")?))
+}
+
+fn trapdoor_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    let (open, _) = trapdoor_state(state)?;
+    let t = 3.0 / 16.0;
+    let bounds = if !open {
+        match state.properties.get("half")?.as_str() {
+            "bottom" => cuboid(0.0, 0.0, 0.0, 1.0, t, 1.0),
+            "top" => cuboid(0.0, 1.0 - t, 0.0, 1.0, 1.0, 1.0),
+            _ => return None,
+        }
+    } else {
+        match state.properties.get("facing")?.as_str() {
+            "north" => cuboid(0.0, 0.0, 1.0 - t, 1.0, 1.0, 1.0),
+            "south" => cuboid(0.0, 0.0, 0.0, 1.0, 1.0, t),
+            "west" => cuboid(1.0 - t, 0.0, 0.0, 1.0, 1.0, 1.0),
+            "east" => cuboid(0.0, 0.0, 0.0, t, 1.0, 1.0),
+            _ => return None,
+        }
+    };
+    Some(vec![bounds])
+}
+
 fn door_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let open = door_open(state)?;
     let facing = state.properties.get("facing")?.as_str();
@@ -1042,6 +1112,9 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     if id.ends_with("_door") {
         return door_shape(state);
+    }
+    if id.ends_with("_trapdoor") {
+        return trapdoor_shape(state);
     }
     if id.ends_with("_fence") {
         return connected(state, 6.0 / 16.0, 10.0 / 16.0, 1.5);
@@ -1828,6 +1901,29 @@ mod tests {
         state.properties.insert("occupied".into(), "false".into());
         state.name = "minecraft:invented_bed".into();
         assert!(block_shape(&state).is_none());
+    }
+
+    #[test]
+    fn trapdoor_collision_rejects_unknown_and_incomplete_states() {
+        let mut state = BlockState {
+            name: "minecraft:dark_oak_trapdoor".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "north".into()),
+                ("half".into(), "bottom".into()),
+                ("open".into(), "false".into()),
+                ("powered".into(), "false".into()),
+                ("waterlogged".into(), "true".into()),
+            ]),
+        };
+        assert_eq!(trapdoor_state(&state), Some((false, true)));
+        assert_eq!(block_shape(&state).unwrap()[0].max.y, 3.0 / 16.0);
+        state.properties.insert("open".into(), "true".into());
+        assert_eq!(block_shape(&state).unwrap()[0].min.z, 13.0 / 16.0);
+        state.properties.remove("powered");
+        assert_eq!(block_shape(&state), None);
+        state.properties.insert("powered".into(), "false".into());
+        state.name = "mod:dark_oak_trapdoor".into();
+        assert_eq!(block_shape(&state), None);
     }
 
     #[test]

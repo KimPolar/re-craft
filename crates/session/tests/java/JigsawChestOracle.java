@@ -16,6 +16,7 @@ import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.RotatedPillarBlock;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.FenceBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.block.state.properties.SlabType;
@@ -25,6 +26,13 @@ import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.storage.TagValueInput;
 
 public class JigsawChestOracle {
+    static String shape(net.minecraft.world.phys.shapes.VoxelShape value) {
+        var boxes=value.toAabbs();
+        if(boxes.isEmpty()) return "-";
+        if(boxes.size()!=1) throw new AssertionError("unexpected gate shape "+boxes);
+        var a=boxes.get(0);
+        return a.minX+","+a.minY+","+a.minZ+","+a.maxX+","+a.maxY+","+a.maxZ;
+    }
     public static void main(String[] args) throws Exception {
         var out = System.out;
         SharedConstants.tryDetectVersion();
@@ -104,6 +112,31 @@ public class JigsawChestOracle {
                         mirror.name(), rotation.name(), state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
                         state.getFluidState().isSource(), transformed.getValue(SlabBlock.TYPE).getSerializedName(), transformed.getValue(SlabBlock.WATERLOGGED));
                 }
+        }
+        for (var block : BuiltInRegistries.BLOCK) {
+            if (!(block instanceof FenceGateBlock)) continue;
+            var id=BuiltInRegistries.BLOCK.getKey(block);
+            for(var state:block.getStateDefinition().getPossibleStates()) {
+                if(state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !state.getFluidState().isEmpty()
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)
+                    || state.useShapeForLightOcclusion() || state.getLightDampening()!=0
+                    || state.getLightEmission()!=0 || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)
+                    || !LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state)) throw new AssertionError(state);
+                for(var mirror:Mirror.values()) for(var rotation:Rotation.values()) {
+                    var changed=state.mirror(mirror).rotate(rotation);
+                    out.printf("GATE\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",id.getPath(),
+                        state.getValue(BlockStateProperties.HORIZONTAL_FACING).getSerializedName(),
+                        state.getValue(BlockStateProperties.IN_WALL), state.getValue(BlockStateProperties.OPEN),
+                        state.getValue(BlockStateProperties.POWERED), mirror.name(), rotation.name(),
+                        changed.getValue(BlockStateProperties.HORIZONTAL_FACING).getSerializedName(),
+                        shape(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
+                        shape(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
+                    if(changed.getValue(BlockStateProperties.IN_WALL)!=state.getValue(BlockStateProperties.IN_WALL)
+                        || changed.getValue(BlockStateProperties.OPEN)!=state.getValue(BlockStateProperties.OPEN)
+                        || changed.getValue(BlockStateProperties.POWERED)!=state.getValue(BlockStateProperties.POWERED)) throw new AssertionError(changed);
+                }
+            }
         }
         for (var id : BuiltInRegistries.BLOCK.keySet()) {
             if (!id.getNamespace().equals("minecraft") || !id.getPath().endsWith("_fence")) continue;

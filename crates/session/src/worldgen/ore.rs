@@ -7119,7 +7119,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && (pile_safe_full_block(state) || pile_snow_layer(state));
                     let jigsaw_shape = self.jigsaw_block_write
                         && (native_world::collision::slab_stair_solid(state).is_some()
-                            || native_world::collision::fence_waterlogged(state).is_some())
+                            || native_world::collision::fence_waterlogged(state).is_some()
+                            || native_world::collision::fence_gate_open(state).is_some())
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -7136,7 +7137,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && ((old_air && jigsaw::jigsaw_wood(state))
                             || (jigsaw_shape && (old_air || jigsaw_water || jigsaw_waterlog)));
                     let jigsaw_light_check = jigsaw_light_update
-                        && (native_world::collision::fence_waterlogged(state).is_none()
+                        && ((native_world::collision::fence_waterlogged(state).is_none()
+                            && native_world::collision::fence_gate_open(state).is_none())
                             || native_world::block_light::same_light_behavior(&old, state)
                                 == Some(false));
                     let patch_water = self.patch_block_write
@@ -11527,6 +11529,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_gates_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_gate",
+            "vine_active_self_jigsaw_gate",
+            "vine_active_empty_jigsaw_gate",
+            "vine_active_self_empty_jigsaw_gate",
+            "vine_active_jigsaw_water_gate",
+            "vine_active_self_jigsaw_water_gate",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11635,7 +11650,7 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
-            if mode.contains("_jigsaw_wet_") {
+            if mode.contains("_jigsaw_wet_") || mode.contains("_jigsaw_water_") {
                 let mut water = state("water");
                 water.properties.insert("level".into(), "0".into());
                 let id = world.intern_state(water);
@@ -11732,6 +11747,8 @@ mod tests {
                         "oak_stairs"
                     } else if mode.ends_with("_fence") {
                         "oak_fence"
+                    } else if mode.ends_with("_gate") {
+                        "oak_fence_gate"
                     } else {
                         "oak_planks"
                     });
@@ -11754,6 +11771,13 @@ mod tests {
                             .into_iter()
                             .map(|key| (key.into(), "false".into()))
                             .collect();
+                    } else if mode.ends_with("_gate") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("in_wall".into(), "false".into()),
+                            ("open".into(), "false".into()),
+                            ("powered".into(), "false".into()),
+                        ]);
                     }
                     jigsaw::place_block_for_light_test(
                         &mut draft,
@@ -11866,6 +11890,8 @@ mod tests {
             let guard = draft.light_guard.as_ref().unwrap();
             let expected_checks = if mode.contains("_jigsaw_wet_") {
                 2
+            } else if mode.ends_with("_jigsaw_gate") {
+                0
             } else if mode.ends_with("_jigsaw_fence") {
                 0
             } else if mode.contains("_iron_ore_") {

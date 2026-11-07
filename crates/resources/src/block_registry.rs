@@ -51,6 +51,7 @@ enum StateSchema {
     Beehive,
     Chest,
     Fence,
+    FenceGate,
     Slab,
     Stairs,
     HorizontalFacing,
@@ -78,6 +79,14 @@ impl StateSchema {
                     .into_iter()
                     .map(|name| (name.into(), "false".into()))
                     .collect();
+            }
+            Self::FenceGate => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("in_wall".into(), "false".into()),
+                    ("open".into(), "false".into()),
+                    ("powered".into(), "false".into()),
+                ]);
             }
             Self::Stairs => {
                 return BTreeMap::from([
@@ -194,6 +203,13 @@ impl StateSchema {
             Self::Fence
                 if matches!(name, "north" | "south" | "west" | "east" | "waterlogged")
                     && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::FenceGate
+                if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
+                    || (matches!(name, "in_wall" | "open" | "powered")
+                        && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -623,6 +639,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
+                "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
                 "net/minecraft/world/level/block/SlabBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperSlabBlock" => {
                     Some(StateSchema::Slab)
@@ -799,7 +816,10 @@ impl GeneratedBlockRegistry {
         ensure!(
             matches!(
                 schema,
-                StateSchema::HorizontalFacing | StateSchema::Stairs | StateSchema::Chest
+                StateSchema::HorizontalFacing
+                    | StateSchema::Stairs
+                    | StateSchema::Chest
+                    | StateSchema::FenceGate
             ),
             "template state transform is unsupported for {id}"
         );

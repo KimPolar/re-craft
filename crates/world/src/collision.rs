@@ -79,6 +79,47 @@ pub fn fence_waterlogged(state: &BlockState) -> Option<bool> {
     }
 }
 
+/// Validate a vanilla fence gate state and return whether it is open.
+pub fn fence_gate_open(state: &BlockState) -> Option<bool> {
+    let family = state
+        .name
+        .strip_prefix("minecraft:")?
+        .strip_suffix("_fence_gate")?;
+    if !native_core::wood::Planks::ALL.into_iter().any(|wood| {
+        wood.id()
+            .strip_prefix("minecraft:")
+            .and_then(|id| id.strip_suffix("_planks"))
+            == Some(family)
+    }) || state.properties.len() != 4
+        || !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+        || !["in_wall", "powered"].iter().all(|key| {
+            matches!(
+                state.properties.get(*key).map(String::as_str),
+                Some("true" | "false")
+            )
+        })
+    {
+        return None;
+    }
+    match state.properties.get("open").map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn fence_gate_box(state: &BlockState, height: f32) -> Option<Aabb> {
+    fence_gate_open(state)?;
+    Some(match state.properties.get("facing")?.as_str() {
+        "north" | "south" => cuboid(0.0, 0.0, 6.0 / 16.0, 1.0, height, 10.0 / 16.0),
+        "east" | "west" => cuboid(6.0 / 16.0, 0.0, 0.0, 10.0 / 16.0, height, 1.0),
+        _ => return None,
+    })
+}
+
 /// Whether the supplied collision boxes cover an entire block boundary face.
 /// Blocks may still override face sturdiness independently of their shape.
 pub fn covers_full_face(boxes: &[Aabb], direction: IVec3) -> bool {
@@ -720,6 +761,13 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if id.ends_with("_stairs") {
         return stairs(state);
     }
+    if id.ends_with("_fence_gate") {
+        return if fence_gate_open(state)? {
+            Some(EMPTY.to_vec())
+        } else {
+            Some(vec![fence_gate_box(state, 1.5)?])
+        };
+    }
     if id.ends_with("_fence") {
         return connected(state, 6.0 / 16.0, 10.0 / 16.0, 1.5);
     }
@@ -868,6 +916,14 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id.ends_with("_fence_gate") {
+        let height = if state.properties.get("in_wall").map(String::as_str) == Some("true") {
+            13.0 / 16.0
+        } else {
+            1.0
+        };
+        return Some(vec![fence_gate_box(state, height)?]);
+    }
     if banner_item_id(state).is_some() {
         let s = 1.0 / 16.0;
         return Some(vec![if id.contains("_wall_banner") {

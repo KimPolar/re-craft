@@ -783,6 +783,7 @@ enum ConfiguredDecoration {
     HugeMushroom(HugeMushroomFeature<BlockState>),
     VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
     RootSystem(RootSystemFeature<BlockState>, Box<PlacedDecorationFeature>),
+    Sequence(Vec<PlacedDecorationFeature>),
     Selector(Vec<PlacedDecorationFeature>),
     BooleanSelector(Box<PlacedDecorationFeature>, Box<PlacedDecorationFeature>),
     WeightedSelector(
@@ -837,7 +838,7 @@ impl ConfiguredDecoration {
             .into_iter()
             .map(|v| ResourceId::parse(v).unwrap())
             .collect(),
-            Self::Selector(values) => values
+            Self::Sequence(values) | Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_blocks)
                 .collect(),
@@ -874,7 +875,9 @@ impl ConfiguredDecoration {
                 v.needs_survival(name) || nested.needs_survival(name)
             }
             Self::RootSystem(v, nested) => v.needs_survival(name) || nested.needs_survival(name),
-            Self::Selector(values) => values.iter().any(|v| v.needs_survival(name)),
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.needs_survival(name))
+            }
             Self::BooleanSelector(a, b) => a.needs_survival(name) || b.needs_survival(name),
             Self::WeightedSelector(values, default) => {
                 default.needs_survival(name) || values.iter().any(|(_, v)| v.needs_survival(name))
@@ -898,7 +901,7 @@ impl ConfiguredDecoration {
             }),
             Self::VegetationPatch(_, nested) => nested.needs_water_fluids(),
             Self::RootSystem(_, _) => true,
-            Self::Selector(values) => values
+            Self::Sequence(values) | Self::Selector(values) => values
                 .iter()
                 .any(PlacedDecorationFeature::needs_water_fluids),
             Self::BooleanSelector(a, b) => a.needs_water_fluids() || b.needs_water_fluids(),
@@ -933,7 +936,9 @@ impl ConfiguredDecoration {
             }),
             Self::VegetationPatch(_, nested) => nested.needs_freeze(water_fluids),
             Self::RootSystem(_, nested) => nested.needs_freeze(water_fluids),
-            Self::Selector(values) => values.iter().any(|v| v.needs_freeze(water_fluids)),
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.needs_freeze(water_fluids))
+            }
             Self::BooleanSelector(a, b) => {
                 a.needs_freeze(water_fluids) || b.needs_freeze(water_fluids)
             }
@@ -953,7 +958,9 @@ impl ConfiguredDecoration {
             Self::VegetationPatch(_, nested) | Self::RootSystem(_, nested) => {
                 nested.feature.needs_snow_support()
             }
-            Self::Selector(values) => values.iter().any(|v| v.feature.needs_snow_support()),
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.feature.needs_snow_support())
+            }
             Self::BooleanSelector(a, b) => {
                 a.feature.needs_snow_support() || b.feature.needs_snow_support()
             }
@@ -971,7 +978,9 @@ impl ConfiguredDecoration {
         match self {
             Self::RootSystem(_, _) => true,
             Self::VegetationPatch(_, nested) => nested.feature.needs_root_system(),
-            Self::Selector(values) => values.iter().any(|v| v.feature.needs_root_system()),
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.feature.needs_root_system())
+            }
             Self::BooleanSelector(a, b) => {
                 a.feature.needs_root_system() || b.feature.needs_root_system()
             }
@@ -991,7 +1000,9 @@ impl ConfiguredDecoration {
             Self::VegetationPatch(_, nested) | Self::RootSystem(_, nested) => {
                 nested.feature.needs_tree_edges()
             }
-            Self::Selector(values) => values.iter().any(|v| v.feature.needs_tree_edges()),
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.feature.needs_tree_edges())
+            }
             Self::BooleanSelector(a, b) => {
                 a.feature.needs_tree_edges() || b.feature.needs_tree_edges()
             }
@@ -1075,7 +1086,7 @@ impl ConfiguredDecoration {
                 )?;
                 Ok(Self::RootSystem(root, Box::new(nested)))
             }
-            ("minecraft", "simple_random_selector") => {
+            ("minecraft", "sequence" | "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
                     provider,
@@ -1085,7 +1096,11 @@ impl ConfiguredDecoration {
                     depth + 1,
                 )?;
                 ensure!(!entries.is_empty(), "empty selector feature set");
-                Ok(Self::Selector(entries))
+                if id.path == "sequence" {
+                    Ok(Self::Sequence(entries))
+                } else {
+                    Ok(Self::Selector(entries))
+                }
             }
             ("minecraft", "random_boolean_selector") => {
                 let a = PlacedDecorationFeature::load_nested(
@@ -1221,7 +1236,7 @@ impl ConfiguredDecoration {
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
             }
-            Self::Selector(values) => values
+            Self::Sequence(values) | Self::Selector(values) => values
                 .iter()
                 .flat_map(PlacedDecorationFeature::required_tags)
                 .collect(),
@@ -1328,6 +1343,20 @@ impl ConfiguredDecoration {
                 world.tree_leaves = leaves;
                 world.tree_decorations = decorations;
                 result
+            }
+            Self::Sequence(values) => {
+                for feature in values {
+                    if !world.place_nested(
+                        feature,
+                        random,
+                        pos,
+                        generator_min_y,
+                        generator_height,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             Self::Selector(values) => {
                 let index = random
@@ -16347,6 +16376,35 @@ mod tests {
     }
 
     #[test]
+    fn sequence_rejects_empty_and_collects_nested_dependencies() {
+        let placed = |features| json!({"feature":{"type":"minecraft:sequence","features":features},"placement":[]});
+        assert!(
+            PlacedDecorationFeature::from_placement(
+                &mut Data,
+                PlacedFeature::decode(&placed(json!([]))).unwrap(),
+                &mut resolve_test,
+            )
+            .is_err()
+        );
+        let feature = PlacedDecorationFeature::from_placement(
+            &mut Data,
+            PlacedFeature::decode(&placed(json!([
+                {"feature":{"type":"minecraft:vines"},"placement":[]},
+                {"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:red_mushroom"}},"placement":[]}
+            ]))).unwrap(),
+            &mut resolve_test,
+        ).unwrap();
+        assert!(
+            feature
+                .required_blocks()
+                .contains(&ResourceId::parse("minecraft:vine").unwrap())
+        );
+        assert!(feature.required_tags().contains(
+            &ResourceId::parse("minecraft:overrides_mushroom_light_requirement").unwrap()
+        ));
+    }
+
+    #[test]
     fn weighted_selector_validates_weights_and_keeps_zero_weight_dependencies() {
         let vine = json!({"feature":{"type":"minecraft:vines"},"placement":[]});
         let make = |features: Value| json!({"feature":{"type":"minecraft:weighted_random_selector","features":features},"placement":[]});
@@ -16419,6 +16477,10 @@ mod tests {
                 json!({"type":"minecraft:random_selector","features":[{"chance":0.4,"feature":inner},{"chance":0.3,"feature":b}],"default":a})
             } else if kind == 2 {
                 json!({"type":"minecraft:random_boolean_selector","feature_true":inner,"feature_false":b})
+            } else if kind == 8 {
+                json!({"type":"minecraft:sequence","features":[a,b,inner]})
+            } else if kind == 9 {
+                json!({"type":"minecraft:sequence","features":[a,leaf("melon",0,false),b]})
             } else {
                 let entries = match kind {
                     3 => json!([{"weight":80,"data":a},{"weight":20,"data":b}]),
@@ -16517,7 +16579,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(cases.len(), 8 * 2 * 2 * 16);
+        assert_eq!(cases.len(), 10 * 2 * 2 * 16);
         let mut registry = batch_registry();
         registry.extend(["minecraft:melon".into(), "minecraft:pumpkin".into()]);
         let tags = OreBlockTags::load(&mut SelectorData, &registry, &BTreeSet::new()).unwrap();

@@ -185,6 +185,18 @@ fn terrain_matches_java_before_and_after_carvers() {
             "-17",
             "32",
             "overworld",
+            "0",
+            "0",
+            "0",
+            "overworld",
+            "0",
+            "-3",
+            "0",
+            "overworld",
+            "42",
+            "4",
+            "0",
+            "overworld",
             "-1",
             "64",
             "-23",
@@ -217,6 +229,9 @@ fn terrain_matches_java_before_and_after_carvers() {
         ("minecraft:overworld", 2345, [0, 0], -64, 384),
         ("minecraft:overworld", 2345, [1, 0], -64, 384),
         ("minecraft:overworld", 0, [-17, 32], -64, 384),
+        ("minecraft:overworld", 0, [0, 0], -64, 384),
+        ("minecraft:overworld", 0, [-3, 0], -64, 384),
+        ("minecraft:overworld", 42, [4, 0], -64, 384),
         ("minecraft:overworld", -1, [64, -23], -64, 384),
         ("minecraft:overworld", 12345, [-100, 17], -64, 384),
         ("minecraft:the_nether", 42, [0, 0], 0, 256),
@@ -390,6 +405,49 @@ fn terrain_matches_java_before_and_after_carvers() {
         .unwrap();
         let mut evaluator = DensityEvaluator::default();
         let noise = generator.generate_noise(&mut evaluator, pos).unwrap();
+        let noise_states = [
+            Arc::new(noise.default_block().clone()),
+            Arc::new(noise.default_fluid().clone()),
+            Arc::new(serde_json::json!("minecraft:lava")),
+            Arc::new(serde_json::json!("minecraft:air")),
+        ];
+        let material_index = |material| match material {
+            NoiseMaterial::DefaultBlock => 0,
+            NoiseMaterial::DefaultFluid => 1,
+            NoiseMaterial::Lava => 2,
+            NoiseMaterial::Air => 3,
+        };
+        let noise_has_fluid: Vec<_> = noise_states
+            .iter()
+            .map(|state| classify(state).unwrap().has_fluid)
+            .collect();
+        let noise_chunk = SurfaceStageChunk {
+            chunk_position: pos,
+            min_y: noise.min_y(),
+            height: noise.height(),
+            states: noise
+                .materials()
+                .iter()
+                .map(|&material| Arc::clone(&noise_states[material_index(material)]))
+                .collect(),
+            fluid_updates: noise
+                .materials()
+                .iter()
+                .zip(noise.fluid_updates())
+                .map(|(&material, &marked)| marked && noise_has_fluid[material_index(material)])
+                .collect(),
+            noise_postprocessing: None,
+            surface_postprocessing: None,
+            carver_postprocessing: None,
+        };
+        compare(
+            &format!("noise {dimension} {seed} {pos:?}"),
+            &noise_chunk,
+            &groups[i * 3],
+            &palette,
+            &defaults,
+            &updates[i * 3],
+        );
         let marks = noise
             .ordered_fluid_postprocessing(|material| {
                 let value = match material {

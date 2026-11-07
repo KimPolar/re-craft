@@ -762,6 +762,22 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
                 )?
                 .is_entity_free(),
             ),
+            "speleothem" | "speleothem_cluster" => {
+                let base = ResourceId::parse(
+                    value
+                        .get("base_block")
+                        .and_then(Value::as_str)
+                        .context("speleothem base block is missing")?,
+                )?;
+                let pointed = ResourceId::parse(
+                    value
+                        .get("pointed_block")
+                        .and_then(Value::as_str)
+                        .context("speleothem pointed block is missing")?,
+                )?;
+                Ok(base == ResourceId::parse("minecraft:sulfur")?
+                    && pointed == ResourceId::parse("minecraft:sulfur_spike")?)
+            }
             "tree" => known_entity_free_tree(value, false),
             "fallen_tree" => known_entity_free_tree(value, true),
             _ => Ok(false),
@@ -6476,7 +6492,12 @@ mod entity_source_tests {
             cache: BTreeMap::new(),
             nodes: 0,
         };
-        for name in ["minecraft:sulfur_pool", "minecraft:rooted_sulfur_spring"] {
+        for name in [
+            "minecraft:sulfur_pool",
+            "minecraft:rooted_sulfur_spring",
+            "minecraft:sulfur_spike",
+            "minecraft:sulfur_spike_cluster",
+        ] {
             assert!(
                 classifier
                     .named(&ResourceId::parse(name).unwrap(), true, 0)
@@ -6491,6 +6512,39 @@ mod entity_source_tests {
                     .unwrap_or(false),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn speleothem_entity_evidence_requires_verified_block_types() {
+        let mut data = Data::default();
+        let registry = BTreeSet::new();
+        let check = |data: &mut Data, value: &Value| {
+            EntityFeatureClassifier {
+                provider: data,
+                registry: &registry,
+                tags: FeatureTags::default(),
+                active: BTreeSet::new(),
+                cache: BTreeMap::new(),
+                nodes: 0,
+            }
+            .configured(value, 0)
+            .unwrap_or(false)
+        };
+        for kind in ["minecraft:speleothem", "minecraft:speleothem_cluster"] {
+            let value = json!({"type":kind,"base_block":"minecraft:sulfur","pointed_block":"minecraft:sulfur_spike"});
+            assert!(check(&mut data, &value));
+            for (field, replacement) in [
+                ("base_block", "minecraft:stone"),
+                ("pointed_block", "example:unknown"),
+            ] {
+                let mut invalid = value.clone();
+                invalid[field] = json!(replacement);
+                assert!(!check(&mut data, &invalid));
+            }
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove("pointed_block");
+            assert!(!check(&mut data, &missing));
         }
     }
 

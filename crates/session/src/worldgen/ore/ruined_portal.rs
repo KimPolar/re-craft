@@ -541,7 +541,9 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
             return Ok(state.clone());
         }
         ensure!(
-            portal_full(state) || is_air(state),
+            portal_full(state)
+                || is_air(state)
+                || (state.name == "minecraft:dirt" && state.properties.is_empty()),
             "unsupported portal edge update: {state:?}"
         );
         Ok(state.clone())

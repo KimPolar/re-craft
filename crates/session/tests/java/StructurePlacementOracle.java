@@ -132,7 +132,7 @@ public class StructurePlacementOracle {
                     default -> throw new UnsupportedOperationException(m.toString());
                 });
             if (mirror == Mirror.NONE && rotation == Rotation.NONE) {
-                for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
+                for (var b : List.of(Blocks.DIRT, Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
                         Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
                         Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,
                         Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,

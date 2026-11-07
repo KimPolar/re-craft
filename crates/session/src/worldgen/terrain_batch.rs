@@ -4498,19 +4498,22 @@ impl FreshTerrainBatch {
                         .structures
                         .as_ref()
                         .context("structure decoration registry is missing")?;
-                    let planned = structures.mixed_decoration_plan_with_jigsaw(pos, registry)?;
+                    let planned = structures.mixed_decoration_plan_with_portals(pos, registry)?;
                     if planned.iter().any(|entry| {
                         entry.starts.iter().any(|start| {
                             matches!(
                                 start,
                                 super::structure_batch::PlannedStructureStart::Jigsaw(_)
+                                    | super::structure_batch::PlannedStructureStart::RuinedPortal(
+                                        _
+                                    )
                             )
                         })
                     }) {
                         let registry = self
                             .light_registry
                             .as_ref()
-                            .context("jigsaw block registry is missing")?;
+                            .context("template block registry is missing")?;
                         let safe =
                             entity_free_jigsaw_starts(provider, &config.placed_features, &planned);
                         (
@@ -4557,16 +4560,18 @@ impl FreshTerrainBatch {
                         .structures
                         .as_ref()
                         .context("structure decoration registry is missing")?;
-                    let candidate = structures.mixed_decoration_plan_with_jigsaw(pos, registry)?;
-                    let has_jigsaw = candidate.iter().any(|entry| {
-                        entry.starts.iter().any(|start| {
-                            matches!(
+                    let candidate = structures.mixed_decoration_plan_with_portals(pos, registry)?;
+                    let has_templates =
+                        candidate.iter().any(|entry| {
+                            entry.starts.iter().any(|start| {
+                                matches!(
                                 start,
                                 super::structure_batch::PlannedStructureStart::Jigsaw(_)
+                                    | super::structure_batch::PlannedStructureStart::RuinedPortal(_)
                             )
-                        })
-                    });
-                    let mixed = (ocean_runner.is_some() || has_jigsaw).then_some(candidate);
+                            })
+                        });
+                    let mixed = (ocean_runner.is_some() || has_templates).then_some(candidate);
                     let allow_huts = ocean_runner
                         .as_ref()
                         .is_some_and(|runner| runner.supports_huts());

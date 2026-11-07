@@ -76,7 +76,7 @@ impl super::MixedOceanRuinPlacement for NoOceanPlacement {
     }
 }
 
-/// Execute jigsaws without manufacturing ocean, hut, or mineshaft effects.
+/// Execute prepared templates without manufacturing ocean, hut, or mineshaft effects.
 pub(super) struct JigsawOnlyFeatureRunner;
 impl OceanFeatureRunner for JigsawOnlyFeatureRunner {
     fn execute(
@@ -91,7 +91,7 @@ impl OceanFeatureRunner for JigsawOnlyFeatureRunner {
         _: &super::structure_batch::PreparedStructureStages,
         _: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
-        ensure!(jigsaws.is_some(), "jigsaw resources are missing");
+        ensure!(jigsaws.is_some(), "template resources are missing");
         execute_mixed_lighting(
             terrain,
             prepared,
@@ -200,7 +200,7 @@ fn execute_mixed_lighting<R: super::MixedOceanRuinPlacement + Clone>(
         let mut staged = jigsaws.wrap(context.clone());
         let updated =
             execute_mixed_lighting_inner(terrain, prepared, structures, &mut staged, lighting)?;
-        *context = staged.other;
+        *context = staged.other.other;
         return Ok(updated);
     }
     execute_mixed_lighting_inner(terrain, prepared, structures, context, lighting)

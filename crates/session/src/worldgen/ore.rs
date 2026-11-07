@@ -307,6 +307,7 @@ pub(super) struct PreparedJigsawResources<'a> {
     pub(super) starts: Arc<
         BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
     >,
+    portals: Arc<BTreeMap<super::structure_batch::TerrainStartKey, PreparedPortalPlacement<'a>>>,
 }
 
 impl<'a> PreparedJigsawResources<'a> {
@@ -320,19 +321,37 @@ impl<'a> PreparedJigsawResources<'a> {
     pub(super) fn load(
         plan: &[PlannedMixedStructureDecoration<'_>],
         provider: &mut impl ResourceProvider,
-        blocks: &BTreeSet<String>,
+        blocks: &'a BTreeSet<String>,
         registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
     ) -> Result<Self> {
         let prepared = MixedJigsawPlacementContext::load((), plan, provider, blocks, registry)?;
+        let has_portals = plan.iter().any(|entry| {
+            entry
+                .starts
+                .iter()
+                .any(|start| matches!(start, PlannedStructureStart::RuinedPortal(_)))
+        });
+        let portals = if has_portals {
+            MixedPortalPlacementContext::load((), plan, provider, blocks, registry)?.starts
+        } else {
+            Arc::new(BTreeMap::new())
+        };
         Ok(Self {
             registry,
             starts: prepared.starts,
+            portals,
         })
     }
 
-    pub(super) fn wrap<R>(&self, other: R) -> MixedJigsawPlacementContext<'a, R> {
+    pub(super) fn wrap<R>(
+        &self,
+        other: R,
+    ) -> MixedJigsawPlacementContext<'a, MixedPortalPlacementContext<'a, R>> {
         MixedJigsawPlacementContext {
-            other,
+            other: MixedPortalPlacementContext {
+                other,
+                starts: Arc::clone(&self.portals),
+            },
             registry: self.registry,
             starts: Arc::clone(&self.starts),
         }

@@ -7900,6 +7900,16 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_or_rolls_back_jigsaw() -> Result<()> {
+        run_fresh_template_batch(false)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_automatically_decorates_ruined_portal() -> Result<()> {
+        run_fresh_template_batch(true)
+    }
+
+    fn run_fresh_template_batch(portal_only: bool) -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
             heightmap::BlockHeightFlags,
@@ -7924,9 +7934,16 @@ mod tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 let value = match path {
-                    "data/example/worldgen/structure/test.json" => Some(
-                        json!({"type":"minecraft:jigsaw","biomes":["minecraft:plains"],"step":"surface_structures","start_pool":"example:test","size":1,"start_height":{"absolute":8},"use_expansion_hack":false,"max_distance_from_center":80,"liquid_settings":"ignore_waterlogging"}),
-                    ),
+                    "data/example/worldgen/structure/test.json" => {
+                        Some(if self.feature_kind == 9 {
+                            json!({"type":"minecraft:ruined_portal","biomes":["minecraft:plains"],"step":"surface_structures",
+                            "setups":[{"placement":"on_land_surface","air_pocket_probability":0.0,
+                                "mossiness":0.0,"overgrown":false,"vines":false,"can_be_cold":false,
+                                "replace_with_blackstone":false,"weight":1.0}]})
+                        } else {
+                            json!({"type":"minecraft:jigsaw","biomes":["minecraft:plains"],"step":"surface_structures","start_pool":"example:test","size":1,"start_height":{"absolute":8},"use_expansion_hack":false,"max_distance_from_center":80,"liquid_settings":"ignore_waterlogging"})
+                        })
+                    }
                     "data/example/worldgen/structure_set/test.json" => Some(
                         json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:test","weight":1}]}),
                     ),
@@ -7978,6 +7995,11 @@ mod tests {
                     return Ok(Some(serde_json::to_vec(&value)?));
                 }
                 if path == "data/example/structure/test.nbt" {
+                    return Ok(Some(self.template.clone()));
+                }
+                if self.feature_kind == 9
+                    && path.starts_with("data/minecraft/structure/ruined_portal/")
+                {
                     return Ok(Some(self.template.clone()));
                 }
                 if path.starts_with("data/minecraft/tags/") {
@@ -8038,7 +8060,12 @@ mod tests {
             (false, false, "minecraft:pumpkin", 6),
             (false, false, "minecraft:melon", 7),
             (false, false, "minecraft:packed_ice", 8),
-        ] {
+            (false, false, "minecraft:obsidian", 9),
+            (true, false, "minecraft:obsidian", 9),
+        ]
+        .into_iter()
+        .filter(|(_, _, _, kind)| (*kind == 9) == portal_only)
+        {
             let chest = block_name == "minecraft:chest";
             let mut block = vec![
                 (
@@ -8100,7 +8127,7 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if (4..=8).contains(&feature_kind) {
+            if (4..=9).contains(&feature_kind) {
                 terrain_definition["settings"]["noise_router"]["final_density"] = json!({
                     "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
                     "from_value":1.0, "to_value":-1.0
@@ -8146,9 +8173,16 @@ mod tests {
                 })?
                 .is_some()
             {}
-            let mut origin =
+            let mut origin = if feature_kind == 9 {
+                structures
+                    .ruined_portal_starts(target)
+                    .context("missing portal")?[&structure]
+                    .piece
+                    .position
+            } else {
                 structures.jigsaw_starts(target).context("missing jigsaw")?[&structure].pieces[0]
-                    .origin;
+                    .origin
+            };
             if terrain_matching && feature_kind == 0 {
                 origin[1] = 15;
             }
@@ -8205,7 +8239,11 @@ mod tests {
                     Ok(None) => break,
                     Err(error) if unsupported => {
                         ensure!(
-                            format!("{error:#}").contains("jigsaw block entity placement"),
+                            format!("{error:#}").contains(if feature_kind == 9 {
+                                "portal block entities are not yet supported"
+                            } else {
+                                "jigsaw block entity placement"
+                            }),
                             "unexpected failure: {error:#}"
                         );
                         let before = before.context("missing pre-failure terrain")?;
@@ -8241,6 +8279,14 @@ mod tests {
                         })
                     });
                     assert!(found, "{block_name} pile produced no matching blocks");
+                } else if feature_kind == 9 {
+                    let state = snapshot
+                        .block(origin[0], origin[1], origin[2])
+                        .context("missing placed portal block")?;
+                    assert!(matches!(
+                        state.name.as_str(),
+                        "minecraft:obsidian" | "minecraft:crying_obsidian"
+                    ));
                 } else {
                     assert_eq!(
                         snapshot
@@ -8254,9 +8300,12 @@ mod tests {
                     batch.structure_data(target).is_ok(),
                     feature_kind == 0 || feature_kind == 2 || (4..=8).contains(&feature_kind)
                 );
-                assert!(
-                    batch.recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
-                );
+                if feature_kind != 9 {
+                    assert!(
+                        batch
+                            .recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
+                    );
+                }
             }
         }
         Ok(())

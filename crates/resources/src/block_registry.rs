@@ -30,6 +30,8 @@ enum StateSchema {
     SnowLayers,
     Dusted,
     Lit,
+    PotentSulfur,
+    SulfurSpike,
     Liquid,
     Axis,
     DoublePlant,
@@ -158,6 +160,13 @@ impl StateSchema {
             Self::HorizontalFacing => return BTreeMap::from([("facing".into(), "north".into())]),
             Self::Jigsaw => return BTreeMap::from([("orientation".into(), "north_up".into())]),
             Self::Waterlogged => return BTreeMap::from([("waterlogged".into(), "false".into())]),
+            Self::SulfurSpike => {
+                return BTreeMap::from([
+                    ("thickness".into(), "tip".into()),
+                    ("vertical_direction".into(), "up".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::Leaves => {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
@@ -231,6 +240,7 @@ impl StateSchema {
             Self::SnowLayers => ("layers", "1"),
             Self::Dusted => ("dusted", "0"),
             Self::Lit => ("lit", "false"),
+            Self::PotentSulfur => ("potent_sulfur_state", "dry"),
             Self::Liquid => ("level", "0"),
             Self::Axis => ("axis", "y"),
             Self::HangingRoots => ("waterlogged", "false"),
@@ -244,6 +254,20 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::PotentSulfur
+                if name == "potent_sulfur_state"
+                    && matches!(value, "dry" | "wet" | "dormant" | "erupting" | "continuous") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::SulfurSpike
+                if (name == "thickness"
+                    && matches!(value, "tip_merge" | "tip" | "frustum" | "middle" | "base"))
+                    || (name == "vertical_direction" && matches!(value, "up" | "down"))
+                    || (name == "waterlogged" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
             Self::Waterlogged if name == "waterlogged" && matches!(value, "true" | "false") => {
                 Some(value.to_owned())
             }
@@ -788,6 +812,12 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/MyceliumBlock" => Some(StateSchema::Snowy),
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
+                "net/minecraft/world/level/block/PotentSulfurBlock" => {
+                    Some(StateSchema::PotentSulfur)
+                }
+                "net/minecraft/world/level/block/SulfurSpikeBlock" => {
+                    Some(StateSchema::SulfurSpike)
+                }
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
                 "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
@@ -966,6 +996,8 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Slab
                 | StateSchema::Waterlogged
                 | StateSchema::Liquid
+                | StateSchema::PotentSulfur
+                | StateSchema::SulfurSpike
         ) {
             return Ok(properties.clone());
         }

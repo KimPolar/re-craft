@@ -172,6 +172,10 @@ fn generated_block_defaults_match_java() {
         .arg(&cp)
         .arg(&source));
     let mut cases = vec![
+        serde_json::json!("minecraft:potent_sulfur"),
+        serde_json::json!({"id":"minecraft:potent_sulfur","properties":{"potent_sulfur_state":"invalid"}}),
+        serde_json::json!("minecraft:sulfur_spike"),
+        serde_json::json!({"id":"minecraft:sulfur_spike","properties":{"thickness":"invalid","vertical_direction":"north","waterlogged":"false"}}),
         serde_json::json!("minecraft:glow_lichen"),
         serde_json::json!({"id":"minecraft:glow_lichen","properties":{"down":"true","north":"true","waterlogged":"true"}}),
         serde_json::json!({"id":"minecraft:glow_lichen","properties":{"up":"invalid","east":"true"}}),
@@ -252,6 +256,16 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for state in ["dry", "wet", "dormant", "erupting", "continuous"] {
+        cases.push(serde_json::json!({"id":"minecraft:potent_sulfur","properties":{"potent_sulfur_state":state}}));
+    }
+    for thickness in ["tip_merge", "tip", "frustum", "middle", "base"] {
+        for direction in ["up", "down"] {
+            for waterlogged in ["true", "false"] {
+                cases.push(serde_json::json!({"id":"minecraft:sulfur_spike","properties":{"thickness":thickness,"vertical_direction":direction,"waterlogged":waterlogged}}));
+            }
+        }
+    }
     for axis in ["x", "y", "z", "invalid"] {
         for waterlogged in ["true", "false"] {
             cases.push(serde_json::json!({"id":"minecraft:iron_chain", "properties":{"axis":axis,"waterlogged":waterlogged}}));

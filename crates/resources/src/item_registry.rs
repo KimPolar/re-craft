@@ -699,6 +699,15 @@ impl Class {
                         return Ok(None);
                     }
                 }
+                0xb6 if class == "net/minecraft/world/level/block/SulfurSpikeBlock" => {
+                    let (owner, method, descriptor) = self.member(r.u16()?)?;
+                    if owner != "net/minecraft/world/level/block/Block"
+                        || method != "defaultBlockState"
+                        || descriptor != "()Lnet/minecraft/world/level/block/state/BlockState;"
+                    {
+                        return Ok(None);
+                    }
+                }
                 0xb7 => {
                     let (owner, method, _) = self.member(r.u16()?)?;
                     if method != "<init>" {

@@ -835,6 +835,10 @@ pub struct LoadedSession {
     fluid_sequence: u64,
     generated_fluid_order: Option<GeneratedTickOrder>,
     generated_block_order: Option<GeneratedTickOrder>,
+    air_ticks: BTreeMap<(i128, i32, i64, u64), AirTickKey>,
+    air_deferred: BTreeMap<(i128, i32, i64, u64), AirTickKey>,
+    air_deferred_revision: Option<u64>,
+    air_pending: BTreeSet<AirTickKey>,
     leaf_tags: Option<Arc<native_resources::ore_feature::OreBlockTags>>,
     leaf_ticks: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
     leaf_deferred: BTreeMap<(i128, i32, i64, u64), LeafTickKey>,
@@ -1037,6 +1041,7 @@ enum BubbleTickKind {
 
 #[derive(Clone, Copy)]
 enum GeneratedBlockTickKind {
+    Air(AirKind),
     Falling(FallingKind),
     Button(native_core::button::Button),
     Lamp,
@@ -1059,6 +1064,9 @@ impl GeneratedBlockTickKind {
             return Some(Self::Leaf(kind));
         }
         match id {
+            "minecraft:air" | "air" => Some(Self::Air(AirKind::Air)),
+            "minecraft:cave_air" | "cave_air" => Some(Self::Air(AirKind::Cave)),
+            "minecraft:void_air" | "void_air" => Some(Self::Air(AirKind::Void)),
             "minecraft:redstone_lamp" => Some(Self::Lamp),
             "minecraft:frosted_ice" => Some(Self::Ice),
             "minecraft:sculk_sensor" => Some(Self::Sensor(false)),
@@ -1068,6 +1076,40 @@ impl GeneratedBlockTickKind {
                 .or_else(|| SoilKind::from_name(id).map(Self::Soil)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum AirKind {
+    Air,
+    Cave,
+    Void,
+}
+
+impl AirKind {
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "minecraft:air" | "air" => Some(Self::Air),
+            "minecraft:cave_air" | "cave_air" => Some(Self::Cave),
+            "minecraft:void_air" | "void_air" => Some(Self::Void),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Air => "minecraft:air",
+            Self::Cave => "minecraft:cave_air",
+            Self::Void => "minecraft:void_air",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AirTickKey {
+    x: i32,
+    y: i32,
+    z: i32,
+    kind: AirKind,
 }
 
 impl BubbleTickKind {
@@ -1097,6 +1139,7 @@ struct BubbleTickKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectedBlockTick {
+    Air(AirTickKey),
     Sand(SandTickKey),
     Button(ButtonTickKey),
     Soil(IVec3, SoilKind),
@@ -1110,6 +1153,7 @@ enum CollectedBlockTick {
 impl CollectedBlockTick {
     fn identity(self) -> (&'static str, [i32; 3]) {
         match self {
+            Self::Air(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Sand(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Button(k) => (k.kind.id(), [k.x, k.y, k.z]),
             Self::Soil(p, k) => (k.id(), p.to_array()),
@@ -1134,6 +1178,7 @@ fn generated_block_key(
 ) -> Option<CollectedBlockTick> {
     let [x, y, z] = tick.position;
     Some(match GeneratedBlockTickKind::from_id(&tick.kind)? {
+        GeneratedBlockTickKind::Air(kind) => CollectedBlockTick::Air(AirTickKey { x, y, z, kind }),
         GeneratedBlockTickKind::Falling(kind) => {
             CollectedBlockTick::Sand(SandTickKey { x, y, z, kind })
         }
@@ -6123,6 +6168,11 @@ impl LoadedSession {
             );
             self.tick_chunks_needing_dirty.insert(chunk);
             match kind {
+                GeneratedBlockTickKind::Air(kind) => {
+                    let key = AirTickKey { x, y, z, kind };
+                    self.air_pending.insert(key);
+                    self.air_ticks.insert(order, key);
+                }
                 GeneratedBlockTickKind::Falling(kind) => {
                     let key = SandTickKey { x, y, z, kind };
                     self.sand_pending.insert(key);
@@ -6261,6 +6311,7 @@ impl LoadedSession {
         count_ticks!(self.bubble_ticks, CollectedBlockTick::Bubble);
         count_ticks!(self.sensor_ticks, CollectedBlockTick::Sensor);
         count_ticks!(self.leaf_ticks, CollectedBlockTick::Leaf);
+        count_ticks!(self.air_ticks, CollectedBlockTick::Air);
         ensure!(
             actual == expected,
             "session block ticks changed before ordering was installed"
@@ -6915,6 +6966,10 @@ impl LoadedSession {
             fluid_sequence: 0,
             generated_fluid_order: None,
             generated_block_order: None,
+            air_ticks: BTreeMap::new(),
+            air_deferred: BTreeMap::new(),
+            air_deferred_revision: None,
+            air_pending: BTreeSet::new(),
             leaf_tags: None,
             leaf_ticks: BTreeMap::new(),
             leaf_deferred: BTreeMap::new(),
@@ -7007,6 +7062,7 @@ impl LoadedSession {
             session.enqueue_saved_bubble(&ticks);
             session.enqueue_saved_soil(&ticks);
             session.enqueue_saved_leaves(&ticks);
+            session.enqueue_saved_air(&ticks);
         }
         let resident: Vec<_> = session.world.chunks.keys().copied().collect();
         for chunk in resident {
@@ -9742,6 +9798,7 @@ impl LoadedSession {
                     FallingKind::from_id(&tick.block).is_some()
                         || SoilKind::from_name(&tick.block).is_some()
                         || LeafKind::from_id(&tick.block).is_some()
+                        || AirKind::from_id(&tick.block).is_some()
                         || native_core::button::Button::from_id(&tick.block).is_some()
                         || BubbleTickKind::from_id(&tick.block).is_some()
                         || matches!(
@@ -9913,6 +9970,34 @@ impl LoadedSession {
                 .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
                 .all(|key| queued_leaves.contains(key)),
             "leaf tick is missing its scheduled order"
+        );
+        let mut queued_air = BTreeSet::new();
+        for (order, &key) in self
+            .air_ticks
+            .iter()
+            .chain(&self.air_deferred)
+            .filter(|(_, key)| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+        {
+            queued_air.insert(key);
+            let delay = i32::try_from(order.0 - self.scheduled_tick())
+                .context("air tick delay cannot be represented in NBT")?;
+            scheduled.push((
+                order.2,
+                order.3,
+                SavedBlockTick {
+                    block: key.kind.id().into(),
+                    position: [key.x, key.y, key.z],
+                    delay,
+                    priority: order.1,
+                },
+            ));
+        }
+        ensure!(
+            self.air_pending
+                .iter()
+                .filter(|key| key.x.div_euclid(16) == pos.x && key.z.div_euclid(16) == pos.z)
+                .all(|key| queued_air.contains(key)),
+            "air tick is missing its scheduled order"
         );
         // Java packs saved ticks by sub-tick order, independently of target
         // time and priority. The shared sequence breaks new-tick ties.
@@ -15462,6 +15547,7 @@ impl LoadedSession {
         self.enqueue_saved_bubble(blocks);
         self.enqueue_saved_soil(blocks);
         self.enqueue_saved_leaves(blocks);
+        self.enqueue_saved_air(blocks);
         if let Some(order) = &mut fluid_order {
             let supported = fluids.iter().all(|tick| {
                 matches!(
@@ -16056,6 +16142,35 @@ impl LoadedSession {
         }
     }
 
+    fn enqueue_saved_air(&mut self, ticks: &[SavedBlockTick]) {
+        self.generated_block_order = None;
+        for (index, tick) in ticks.iter().enumerate() {
+            let Some(kind) = AirKind::from_id(&tick.block) else {
+                continue;
+            };
+            let [x, y, z] = tick.position;
+            let key = AirTickKey { x, y, z, kind };
+            let subtick = i64::try_from(index).unwrap_or(i64::MAX)
+                - i64::try_from(ticks.len()).unwrap_or(i64::MAX);
+            self.tick_chunks_needing_dirty.insert(ChunkPos {
+                x: x.div_euclid(16),
+                z: z.div_euclid(16),
+            });
+            self.air_pending.insert(key);
+            let sequence = self.block_tick_sequence;
+            self.block_tick_sequence = self.block_tick_sequence.wrapping_add(1);
+            self.air_ticks.insert(
+                (
+                    self.scheduled_tick() + i128::from(tick.delay),
+                    tick.priority.clamp(-3, 3),
+                    subtick,
+                    sequence,
+                ),
+                key,
+            );
+        }
+    }
+
     fn schedule_leaf(&mut self, relative: IVec3, kind: LeafKind) {
         let Some(absolute) = add(self.origin, relative) else {
             return;
@@ -16330,6 +16445,7 @@ impl LoadedSession {
                 .first_key_value()
                 .map(|(order, _)| order.0),
             self.leaf_ticks.first_key_value().map(|(order, _)| order.0),
+            self.air_ticks.first_key_value().map(|(order, _)| order.0),
         ];
         if next
             .into_iter()
@@ -16394,6 +16510,9 @@ impl LoadedSession {
                 CollectedBlockTick::Leaf(_) => {
                     find_order!(self.leaf_ticks, CollectedBlockTick::Leaf, 7)
                 }
+                CollectedBlockTick::Air(_) => {
+                    find_order!(self.air_ticks, CollectedBlockTick::Air, 8)
+                }
             };
             let (_, position) = entry.identity();
             let relative = subtract(IVec3::from_array(position), self.origin)?;
@@ -16444,6 +16563,10 @@ impl LoadedSession {
                 CollectedBlockTick::Leaf(key) => {
                     self.leaf_ticks.remove(order);
                     self.leaf_pending.remove(&key);
+                }
+                CollectedBlockTick::Air(key) => {
+                    self.air_ticks.remove(order);
+                    self.air_pending.remove(&key);
                 }
             }
         }
@@ -16498,6 +16621,9 @@ impl LoadedSession {
         if process_leaves && self.leaf_deferred_revision != Some(revision) {
             self.leaf_ticks.append(&mut self.leaf_deferred);
         }
+        if process_leaves && self.air_deferred_revision != Some(revision) {
+            self.air_ticks.append(&mut self.air_deferred);
+        }
         let mut deferred_sand = Vec::new();
         let mut deferred_buttons = Vec::new();
         let mut deferred_soil = Vec::new();
@@ -16506,6 +16632,7 @@ impl LoadedSession {
         let mut deferred_bubble = Vec::new();
         let mut deferred_sensors = Vec::new();
         let mut deferred_leaves = Vec::new();
+        let mut deferred_air = Vec::new();
         let indexed = if process_sand
             && process_buttons
             && process_soil
@@ -16547,6 +16674,9 @@ impl LoadedSession {
             let leaf_order = process_leaves
                 .then(|| self.leaf_ticks.first_key_value().map(|(order, _)| *order))
                 .flatten();
+            let air_order = process_leaves
+                .then(|| self.air_ticks.first_key_value().map(|(order, _)| *order))
+                .flatten();
             let Some((order, kind)) = [
                 (sand_order, 0),
                 (button_order, 1),
@@ -16556,6 +16686,7 @@ impl LoadedSession {
                 (bubble_order, 5),
                 (sensor_order, 6),
                 (leaf_order, 7),
+                (air_order, 8),
             ]
             .into_iter()
             .filter_map(|(order, kind)| order.map(|order| (order, kind)))
@@ -16593,6 +16724,10 @@ impl LoadedSession {
                 }
                 7 => {
                     let key = self.leaf_ticks[&order];
+                    IVec3::new(key.x, key.y, key.z)
+                }
+                8 => {
+                    let key = self.air_ticks[&order];
                     IVec3::new(key.x, key.y, key.z)
                 }
                 _ => unreachable!(),
@@ -16669,6 +16804,13 @@ impl LoadedSession {
                         self.leaf_pending.remove(&key);
                     }
                     CollectedBlockTick::Leaf(key)
+                }
+                8 => {
+                    let key = self.air_ticks.pop_first().unwrap().1;
+                    if available {
+                        self.air_pending.remove(&key);
+                    }
+                    CollectedBlockTick::Air(key)
                 }
                 _ => unreachable!(),
             };
@@ -17149,6 +17291,29 @@ impl LoadedSession {
                         }
                     }
                 }
+            } else if let CollectedBlockTick::Air(key) = entry {
+                let available = subtract(IVec3::new(key.x, key.y, key.z), self.origin).is_some_and(
+                    |relative| {
+                        matches!(
+                            cell(
+                                &self.world,
+                                self.origin,
+                                self.bounds,
+                                relative,
+                                self.states[0]
+                            ),
+                            Cell::State(_)
+                        )
+                    },
+                );
+                if !available {
+                    self.air_pending.insert(key);
+                    deferred_air.push((order, key));
+                    continue;
+                }
+                // All three AirBlock types inherit the empty scheduled tick.
+                // Java consumes the scheduled identity even if the block changed.
+                self.mark_tick_chunk_dirty(key.x, key.z);
             } else if let CollectedBlockTick::Leaf(key) = entry {
                 let Some(relative) = subtract(IVec3::new(key.x, key.y, key.z), self.origin) else {
                     self.leaf_pending.insert(key);
@@ -17303,6 +17468,8 @@ impl LoadedSession {
         if process_leaves {
             self.leaf_deferred.extend(deferred_leaves);
             self.leaf_deferred_revision = Some(revision);
+            self.air_deferred.extend(deferred_air);
+            self.air_deferred_revision = Some(revision);
         }
     }
 
@@ -25007,6 +25174,282 @@ pub(crate) mod tests {
             z: -1_000_000
         }));
         assert!(session.install_generated_ticks(&ticks).is_err());
+    }
+
+    #[test]
+    fn generated_air_ticks_keep_order_until_consumed() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        for indexed in [false, true] {
+            let mut session = session();
+            let home = *session.world.chunks.keys().next().unwrap();
+            let p = |x| (session.origin + IVec3::new(x, 2, 2)).to_array();
+            let positions = [p(1), p(2), p(3)];
+            let cave = session.intern_block(state("minecraft:cave_air", &[]));
+            let void = session.intern_block(state("minecraft:void_air", &[]));
+            let stone = session.intern_block(state("minecraft:stone", &[]));
+            let world = Arc::make_mut(&mut session.world);
+            world
+                .set_block_id(positions[0][0], positions[0][1], positions[0][2], cave)
+                .unwrap();
+            world
+                .set_block_id(positions[1][0], positions[1][1], positions[1][2], stone)
+                .unwrap();
+            world
+                .set_block_id(positions[2][0], positions[2][1], positions[2][2], void)
+                .unwrap();
+            let saved = [
+                SavedTick {
+                    kind: "minecraft:cave_air".into(),
+                    position: positions[0],
+                    delay: 2,
+                    priority: 0,
+                },
+                SavedTick {
+                    kind: "minecraft:air".into(),
+                    position: positions[1],
+                    delay: 1,
+                    priority: -1,
+                },
+                SavedTick {
+                    kind: "minecraft:void_air".into(),
+                    position: positions[2],
+                    delay: 3,
+                    priority: 1,
+                },
+            ];
+            let region = RegionTicks::new(
+                BTreeMap::from([(
+                    home,
+                    ConvertedChunkTicks {
+                        blocks: ChunkTicks::from_saved(home, saved.to_vec()).unwrap(),
+                        fluids: ChunkTicks::from_saved(home, vec![]).unwrap(),
+                    },
+                )]),
+                42,
+                0,
+            )
+            .unwrap();
+            let snapshot = region.activated_snapshot();
+            session.install_generated_ticks(&snapshot).unwrap();
+            if indexed {
+                session
+                    .install_generated_block_order(
+                        &snapshot,
+                        region
+                            .captured_indexed_queue(TickRegistry::Block, &[home])
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let drafted = session.draft_block_ticks(home).unwrap();
+            assert_eq!(
+                drafted
+                    .iter()
+                    .map(|t| (t.block.as_str(), t.position, t.delay, t.priority))
+                    .collect::<Vec<_>>(),
+                saved
+                    .iter()
+                    .map(|t| (t.kind.as_str(), t.position, t.delay, t.priority))
+                    .collect::<Vec<_>>()
+            );
+            let random = session.level_random.state();
+            let before = Arc::clone(&session.world);
+            for tick in 1..=3 {
+                session.tick = tick;
+                session.advance_block_ticks();
+                assert_eq!(session.air_ticks.len(), 3 - tick as usize);
+                assert_eq!(
+                    session.draft_block_ticks(home).unwrap().len(),
+                    3 - tick as usize
+                );
+                assert_eq!(session.level_random.state(), random);
+            }
+            assert!(Arc::ptr_eq(&before, &session.world));
+            assert!(session.air_pending.is_empty());
+            assert_eq!(session.generated_block_order.is_some(), indexed);
+        }
+    }
+
+    #[test]
+    fn saved_air_ticks_are_restored_and_redrafted() {
+        let (mut world, origin, player) = fixture();
+        let home = *world.chunks.keys().next().unwrap();
+        let saved = vec![SavedBlockTick {
+            block: "minecraft:cave_air".into(),
+            position: (origin + IVec3::new(1, 2, 2)).to_array(),
+            delay: 4,
+            priority: 1,
+        }];
+        world.saved_block_ticks.insert(home, saved.clone());
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        assert_eq!(session.draft_block_ticks(home).unwrap(), saved);
+        session.tick = 4;
+        session.advance_block_ticks();
+        assert!(session.draft_block_ticks(home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn air_ticks_wait_for_parked_chunks() {
+        use crate::worldgen::chunk_ticks::{
+            ChunkTicks, ConvertedChunkTicks, RegionTicks, SavedTick, TickRegistry,
+        };
+        for indexed in [false, true] {
+            let (mut world, origin, player) = fixture();
+            let home = *world.chunks.keys().next().unwrap();
+            let neighbor = ChunkPos {
+                x: home.x + 1,
+                z: home.z,
+            };
+            let mut other = world.chunks[&home].as_ref().clone();
+            other.position = neighbor;
+            world.chunks.insert(neighbor, Arc::new(other));
+            let make = |pos, position| ConvertedChunkTicks {
+                blocks: ChunkTicks::from_saved(
+                    pos,
+                    vec![SavedTick {
+                        kind: "minecraft:cave_air".into(),
+                        position,
+                        delay: 1,
+                        priority: 0,
+                    }],
+                )
+                .unwrap(),
+                fluids: ChunkTicks::from_saved(pos, vec![]).unwrap(),
+            };
+            let a = (origin + IVec3::new(1, 2, 1)).to_array();
+            let b = (origin + IVec3::new(17, 2, 1)).to_array();
+            let region = RegionTicks::new_ordered(
+                BTreeMap::from([(home, make(home, a)), (neighbor, make(neighbor, b))]),
+                42,
+                0,
+                &[home, neighbor],
+            )
+            .unwrap();
+            let snapshot = region.activated_snapshot();
+            let mut session = LoadedSession::new(
+                world,
+                origin,
+                BuildBounds {
+                    min_y: 0,
+                    max_y: 32,
+                },
+                player,
+            )
+            .unwrap();
+            session.install_generated_ticks(&snapshot).unwrap();
+            if indexed {
+                session
+                    .install_generated_block_order(
+                        &snapshot,
+                        region
+                            .captured_indexed_queue(TickRegistry::Block, &[home, neighbor])
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            session.queue_chunk_window(home, 0);
+            session.apply_streaming();
+            assert!(session.parked_chunks.contains_key(&neighbor));
+            session.tick = 1;
+            session.advance_block_ticks();
+            assert_eq!(session.air_pending.len(), 1);
+            assert!(
+                session
+                    .air_pending
+                    .iter()
+                    .any(|key| [key.x, key.y, key.z] == b)
+            );
+            session.queue_chunk_window(home, 1);
+            session.apply_streaming();
+            session.tick = 2;
+            session.advance_block_ticks();
+            assert!(session.air_pending.is_empty());
+            assert!(session.air_ticks.is_empty() && session.air_deferred.is_empty());
+            assert_eq!(session.generated_block_order.is_some(), indexed);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn air_scheduled_ticks_match_java() {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let _verified = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+            .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir().unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        assert_eq!(manifest["id"], "26.3");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let source = temp.path().join("AirScheduledTickOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/AirScheduledTickOracle.java"),
+        )
+        .unwrap();
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("AirScheduledTickOracle")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("A "))
+            .map(str::to_owned)
+            .collect();
+        let expected: Vec<_> = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"]
+            .into_iter()
+            .map(|name| {
+                format!(
+                    "A {name} {}",
+                    native_core::random::LegacyRandom::new(42).next_long()
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

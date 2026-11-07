@@ -21,6 +21,8 @@ pub fn vanilla_full_occlusion(name: &str) -> Option<bool> {
         | "minecraft:cave_vines"
         | "minecraft:cave_vines_plant" => Some(false),
         "minecraft:stone"
+        | "minecraft:cinnabar"
+        | "minecraft:sulfur"
         | "minecraft:deepslate"
         | "minecraft:netherrack"
         | "minecraft:basalt"

@@ -26,6 +26,10 @@ public class UnderwaterMagmaOracle {
     var out=System.out;SharedConstants.tryDetectVersion();Bootstrap.bootStrap();
     String[] names={"air","cave_air","void_air","water","lava","stone","deepslate","netherrack","basalt","blackstone","ancient_debris","dirt","grass_block","mud","clay","sand","sandstone","gravel","snow_block","podzol","coarse_dirt","mycelium","tuff","calcite","granite","diorite","andesite","bedrock","red_sand","moss_block","magma_block","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore"};
     for(String name:names){var b=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));for(var s:b.getStateDefinition().getPossibleStates())for(var d:Direction.values())out.printf("O minecraft:%s %s%n",name,Block.isShapeFullBlock(s.getFaceOcclusionShape(d)));}
+    for(var b:List.of(Blocks.CINNABAR,Blocks.SULFUR))for(var s:b.getStateDefinition().getPossibleStates())for(var d:Direction.values()){
+      out.printf("O %s %s%n",BuiltInRegistries.BLOCK.getKey(b),Block.isShapeFullBlock(s.getFaceOcclusionShape(d)));
+      out.printf("Q %s %s%n",BuiltInRegistries.BLOCK.getKey(b),s.isFaceSturdy(EmptyBlockGetter.INSTANCE,BlockPos.ZERO,d));
+    }
     for(String name:new String[]{"cave_vines","cave_vines_plant"}){var b=BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));for(var s:b.getStateDefinition().getPossibleStates())for(var d:Direction.values())out.printf("O minecraft:%s %s%n",name,Block.isShapeFullBlock(s.getFaceOcclusionShape(d)));}
     var magma=Blocks.MAGMA_BLOCK.defaultBlockState();out.println("E "+magma.hasBlockEntity()+" "+PoiTypes.hasPoi(magma)+" "+magma.getPostProcessPos(null,BlockPos.ZERO));
     int number=0;

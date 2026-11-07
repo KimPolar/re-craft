@@ -252,6 +252,20 @@ mod tests {
         let writable = terrain.snapshot().chunks.keys().copied().collect();
         let mut region = terrain.decoration_region(&tags, &motion, writable)?;
         for name in ["minecraft:sulfur", "minecraft:cinnabar"] {
+            let support = BlockState {
+                name: name.into(),
+                properties: BTreeMap::new(),
+            };
+            for direction in [
+                [0, -1, 0],
+                [0, 1, 0],
+                [0, 0, -1],
+                [0, 0, 1],
+                [-1, 0, 0],
+                [1, 0, 0],
+            ] {
+                assert!(generation_face_sturdy(&support, direction)?);
+            }
             assert_eq!(
                 monster_block_flags(&BlockState {
                     name: name.into(),

@@ -547,7 +547,6 @@ impl PreparedStructureStages {
                             && simple.is_none() && jigsaw.is_none() && mineshaft.is_none()
                             && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
                             && start.chunk == [source.x, source.z]
-                            && start.template.entities.is_empty()
                             && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }
                     if let Some(start) = mineshaft {

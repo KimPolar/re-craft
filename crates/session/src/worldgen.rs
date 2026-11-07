@@ -7916,22 +7916,29 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_or_rolls_back_jigsaw() -> Result<()> {
-        run_fresh_template_batch(0)
+        run_fresh_template_batch(0, None)
     }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_ruined_portal() -> Result<()> {
-        run_fresh_template_batch(9)
+        run_fresh_template_batch(9, None)
     }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_decorates_installed_ruined_portal_template() -> Result<()> {
-        run_fresh_template_batch(10)
+        run_fresh_template_batch(10, None)
     }
 
-    fn run_fresh_template_batch(portal_kind: u8) -> Result<()> {
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_portal_batch_records_only_successful_entity_clips() -> Result<()> {
+        run_fresh_template_batch(9, Some(500))?;
+        run_fresh_template_batch(9, Some(0))
+    }
+
+    fn run_fresh_template_batch(portal_kind: u8, entity_anchor: Option<i32>) -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
             heightmap::BlockHeightFlags,
@@ -8088,8 +8095,10 @@ mod tests {
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
-        .filter(|(_, _, _, kind)| {
-            if portal_kind == 0 {
+        .filter(|(unsupported, _, _, kind)| {
+            if entity_anchor.is_some() && *unsupported {
+                false
+            } else if portal_kind == 0 {
                 !(9..=29).contains(kind)
             } else if portal_kind == 10 {
                 (10..=29).contains(kind)
@@ -8141,7 +8150,44 @@ mod tests {
                         "blocks".into(),
                         list(TagType::Compound, vec![Tag::Compound(block)]),
                     ),
-                    ("entities".into(), list(TagType::Compound, vec![])),
+                    (
+                        "entities".into(),
+                        list(
+                            TagType::Compound,
+                            entity_anchor
+                                .map(|x| {
+                                    Tag::Compound(vec![
+                                        (
+                                            "blockPos".into(),
+                                            list(
+                                                TagType::Int,
+                                                vec![Tag::Int(x), Tag::Int(0), Tag::Int(0)],
+                                            ),
+                                        ),
+                                        (
+                                            "pos".into(),
+                                            list(
+                                                TagType::Double,
+                                                vec![
+                                                    Tag::Double(f64::from(x) + 0.5),
+                                                    Tag::Double(0.5),
+                                                    Tag::Double(0.5),
+                                                ],
+                                            ),
+                                        ),
+                                        (
+                                            "nbt".into(),
+                                            Tag::Compound(vec![(
+                                                "id".into(),
+                                                Tag::String("minecraft:pig".into()),
+                                            )]),
+                                        ),
+                                    ])
+                                })
+                                .into_iter()
+                                .collect(),
+                        ),
+                    ),
                 ]),
             };
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -8314,9 +8360,11 @@ mod tests {
                 match result {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
-                    Err(error) if unsupported => {
+                    Err(error) if unsupported || entity_anchor == Some(0) => {
                         ensure!(
-                            format!("{error:#}").contains(if feature_kind == 9 {
+                            format!("{error:#}").contains(if entity_anchor == Some(0) {
+                                "portal template entity placement is unsupported"
+                            } else if feature_kind == 9 {
                                 "portal block entities are not yet supported"
                             } else {
                                 "jigsaw block entity placement"
@@ -8345,8 +8393,8 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(failed, unsupported);
-            if !unsupported {
+            assert_eq!(failed, unsupported || entity_anchor == Some(0));
+            if !failed {
                 assert_eq!(
                     batch.schedule().completed(target),
                     Some(schedule::GenerationStage::Features)

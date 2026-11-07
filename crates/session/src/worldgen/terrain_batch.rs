@@ -4620,8 +4620,9 @@ impl FreshTerrainBatch {
                                 entry.starts.iter().filter_map(|start| {
                                     let chunk = match start {
                                         super::structure_batch::PlannedStructureStart::Jigsaw(start) => start.chunk,
-                                        super::structure_batch::PlannedStructureStart::RuinedPortal(start)
-                                            if start.template.entities.is_empty() => start.chunk,
+                                        // A successful portal pass either proves that no
+                                        // template entity intersects its clip or rejects it.
+                                        super::structure_batch::PlannedStructureStart::RuinedPortal(start) => start.chunk,
                                         _ => return None,
                                     };
                                     let key = (
@@ -5499,14 +5500,30 @@ mod entity_source_tests {
                 .template,
         )
         .entities
-        .push(Tag::Compound(vec![]));
-        assert!(!stages.only_accounted_structure_references(
+        .push(Tag::Compound(vec![(
+            "blockPos".into(),
+            Tag::IntArray(vec![500, 0, 0]),
+        )]));
+        // Evidence is recorded only after the entire FEATURES pass succeeds;
+        // a nonempty template may have no entities inside that pass's clip.
+        assert!(stages.only_accounted_structure_references(
             source,
             &registered,
             false,
             Some(&evidence),
             None
         ));
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            None,
+            None
+        ));
+        recorded.insert(source, evidence.clone());
+        assert!(covered(&stages, &recorded));
+        recorded.remove(&source);
+        assert!(!covered(&stages, &recorded));
         Arc::make_mut(
             &mut stages
                 .ruined_portal_starts

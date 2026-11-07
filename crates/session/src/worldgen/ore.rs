@@ -6281,6 +6281,11 @@ impl DiskWorld for DecorationRegion<'_> {
         if let Ok(kind) = simple_plant_kind(state) {
             return Ok(matches!(kind, SimplePlantKind::Unconditional));
         }
+        // Dungeon generation already validates these additional state
+        // families against the same vanilla BlockState.isSolid predicate.
+        if let Ok((solid, _)) = monster_block_flags(state) {
+            return Ok(solid);
+        }
         bail!("unsupported disk solid predicate block {}", state.name)
     }
     fn is_liquid(&mut self, state: &BlockState) -> Result<bool> {
@@ -18399,19 +18404,25 @@ mod tests {
 
     #[test]
     fn monster_room_handles_mineshaft_lights_rails_and_webs() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut torch = state("wall_torch");
         torch.properties.insert("facing".into(), "east".into());
         assert_eq!(monster_block_flags(&torch).unwrap(), (false, false));
+        assert!(!DiskWorld::is_solid(&mut region, &torch).unwrap());
         assert_eq!(
             monster_block_flags(&state("cobweb")).unwrap(),
             (true, false)
         );
+        assert!(DiskWorld::is_solid(&mut region, &state("cobweb")).unwrap());
         let mut rail = state("rail");
         rail.properties = BTreeMap::from([
             ("shape".into(), "north_south".into()),
             ("waterlogged".into(), "true".into()),
         ]);
         assert_eq!(monster_block_flags(&rail).unwrap(), (false, false));
+        assert!(!DiskWorld::is_solid(&mut region, &rail).unwrap());
         assert!(!tree_sturdy_up(&rail).unwrap());
         assert!(!tree_solid_render(&rail).unwrap());
         for direction in [
@@ -18427,6 +18438,7 @@ mod tests {
         rail.properties.insert("shape".into(), "invalid".into());
         assert!(monster_block_flags(&rail).is_err());
         assert!(tree_sturdy_up(&rail).is_err());
+        assert!(DiskWorld::is_solid(&mut region, &rail).is_err());
         let mut slab = state("oak_slab");
         slab.properties = BTreeMap::from([
             ("type".into(), "bottom".into()),
@@ -18484,6 +18496,9 @@ mod tests {
             .arg("-classpath")
             .arg(&cp)
             .arg("MonsterRoomBlockOracle"));
+        let (mut terrain, tags, motion, _) = fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
         let mut count = 0;
         for line in output.lines().filter_map(|v| v.strip_prefix("C ")) {
             let parts = line.split_whitespace().collect::<Vec<_>>();
@@ -18500,6 +18515,17 @@ mod tests {
                 parts[3].parse::<bool>().unwrap(),
             );
             assert_eq!(monster_block_flags(&block).unwrap(), expected, "{line}");
+            if generation_non_sturdy_structure(&block)
+                || jigsaw::jigsaw_wood(&block)
+                || native_world::collision::door_open(&block).is_some()
+                || native_world::collision::slab_stair_solid(&block).is_some()
+            {
+                assert_eq!(
+                    DiskWorld::is_solid(&mut region, &block).unwrap(),
+                    expected.0,
+                    "disk predicate: {line}"
+                );
+            }
             assert_eq!(
                 parts[4].parse::<bool>().unwrap(),
                 matches!(parts[0], "chest" | "spawner"),

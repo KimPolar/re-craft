@@ -1034,6 +1034,19 @@ impl FreshTerrainBatch {
             .mixed_decoration_plan_with_jigsaw(pos, schedule)
     }
 
+    /// Inspect a plan including portals for a prepared mixed executor.
+    pub fn mixed_decoration_plan_with_portals<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a native_resources::structure_decoration::StructureDecorationSchedule,
+    ) -> Result<Vec<super::structure_batch::PlannedMixedStructureDecoration<'a>>> {
+        ensure!(!self.failed, "terrain batch failed and must be discarded");
+        self.structures
+            .as_ref()
+            .context("structure generation is disabled")?
+            .mixed_decoration_plan_with_portals(pos, schedule)
+    }
+
     /// Build intermediate 26.3 structure NBT after the batch finishes FEATURES.
     /// The returned data does not establish that the world is safe to save.
     pub fn structure_data(&self, pos: ChunkPos) -> Result<native_persistence::nbt::Tag> {
@@ -4564,6 +4577,7 @@ impl FreshTerrainBatch {
                                     super::structure_batch::PlannedStructureStart::OceanRuin(_) => true,
                                     super::structure_batch::PlannedStructureStart::Mineshaft(_) => true,
                                     super::structure_batch::PlannedStructureStart::Jigsaw(_) => true,
+                                    super::structure_batch::PlannedStructureStart::RuinedPortal(_) => true,
                                     super::structure_batch::PlannedStructureStart::Simple(start) => allow_huts && start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut,
                                 }
                             })

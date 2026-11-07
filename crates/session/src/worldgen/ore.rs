@@ -123,6 +123,133 @@ pub trait MixedOceanRuinPlacement {
     ) -> Result<()> {
         bail!("jigsaw mixed decoration context is missing")
     }
+
+    fn place_ruined_portal(
+        &mut self,
+        _region: &mut DecorationRegion<'_>,
+        _key: &super::structure_batch::TerrainStartKey,
+        _start: &mut super::ruined_portal::PreparedStart,
+        _clip: native_core::beardifier::BoundingBox,
+        _random: &mut DecorationRandom,
+    ) -> Result<()> {
+        bail!("ruined portal mixed decoration context is missing")
+    }
+}
+
+/// Adds preflighted ruined portals to an existing mixed decoration context.
+#[derive(Clone)]
+pub struct MixedPortalPlacementContext<'a, R> {
+    pub other: R,
+    pub starts: Arc<BTreeMap<super::structure_batch::TerrainStartKey, PreparedPortalPlacement<'a>>>,
+}
+
+impl<'a, R> MixedPortalPlacementContext<'a, R> {
+    pub fn load(
+        other: R,
+        plan: &[PlannedMixedStructureDecoration<'_>],
+        provider: &mut impl ResourceProvider,
+        blocks: &'a BTreeSet<String>,
+        registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+    ) -> Result<Self> {
+        let resources = PortalPlacementResources::load(provider, blocks, registry)?;
+        let mut starts = BTreeMap::new();
+        for entry in plan {
+            for start in &entry.starts {
+                let PlannedStructureStart::RuinedPortal(start) = start else {
+                    continue;
+                };
+                let key = (
+                    entry.entry.id.clone(),
+                    ChunkPos {
+                        x: start.chunk[0],
+                        z: start.chunk[1],
+                    },
+                );
+                ensure!(
+                    starts
+                        .insert(key, resources.prepare(provider, start)?)
+                        .is_none(),
+                    "duplicate ruined portal placement start"
+                );
+            }
+        }
+        Ok(Self {
+            other,
+            starts: Arc::new(starts),
+        })
+    }
+}
+
+impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedPortalPlacementContext<'_, R> {
+    fn needs_ruin_revisions(&self) -> bool {
+        self.other.needs_ruin_revisions()
+    }
+    fn place(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place(region, start, clip, random)
+    }
+    fn place_with_context(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ocean_ruin::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other
+            .place_with_context(region, key, start, clip, random, revisions)
+    }
+    fn place_hut(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut native_resources::structure_start::SimpleStructureStart,
+        clip: native_core::beardifier::BoundingBox,
+        revisions: &[super::structure_batch::StructurePieceRevision],
+    ) -> Result<()> {
+        self.other.place_hut(region, key, start, clip, revisions)
+    }
+    fn place_mineshaft(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        start: &mut super::mineshaft::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+        biomes: &super::BiomeNeighborhood,
+    ) -> Result<()> {
+        self.other
+            .place_mineshaft(region, start, clip, random, biomes)
+    }
+    fn place_jigsaw(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::jigsaw::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place_jigsaw(region, key, start, clip, random)
+    }
+    fn place_ruined_portal(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ruined_portal::PreparedStart,
+        mut clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.starts
+            .get(key)
+            .context("ruined portal placement context is missing")?
+            .place(region, start, &mut clip, random)?;
+        Ok(())
+    }
 }
 
 /// Adds preflighted jigsaw starts to another mixed decoration context.
@@ -273,6 +400,18 @@ impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedJigsawPlacemen
         region.place_jigsaw_start(prepared, start, self.registry, clip, random)?;
         Ok(())
     }
+
+    fn place_ruined_portal(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ruined_portal::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other
+            .place_ruined_portal(region, key, start, clip, random)
+    }
 }
 
 /// Add a transactional mineshaft context to an existing mixed runner. The
@@ -349,6 +488,18 @@ where
         random: &mut DecorationRandom,
     ) -> Result<()> {
         self.other.place_jigsaw(region, key, start, clip, random)
+    }
+
+    fn place_ruined_portal(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::ruined_portal::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other
+            .place_ruined_portal(region, key, start, clip, random)
     }
 }
 
@@ -1817,6 +1968,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                         PlannedStructureStart::Jigsaw(start) => {
                             PreparedStructureStart::Jigsaw((*start).clone())
                         }
+                        PlannedStructureStart::RuinedPortal(start) => {
+                            PreparedStructureStart::RuinedPortal((*start).clone())
+                        }
                     })
                     .collect()
             })
@@ -2391,6 +2545,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                         }),
                                                     );
                                                 }
+                                                PreparedStructureStart::RuinedPortal(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.push((key, start.piece.bounds));
+                                                }
                                             }
                                         }
                                     }
@@ -2470,6 +2634,32 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                     == start.liquid_settings
                                                 && original.pieces == start.pieces,
                                             "jigsaw start changed during decoration"
+                                        );
+                                    }
+                                    PreparedStructureStart::RuinedPortal(start) => {
+                                        let original = start.clone();
+                                        let key = (
+                                            plan[index].entry.id.clone(),
+                                            ChunkPos {
+                                                x: start.chunk[0],
+                                                z: start.chunk[1],
+                                            },
+                                        );
+                                        ocean.place_ruined_portal(
+                                            &mut region,
+                                            &key,
+                                            start,
+                                            clip,
+                                            &mut random,
+                                        )?;
+                                        ensure!(
+                                            original.chunk == start.chunk
+                                                && original.point == start.point
+                                                && original.terrain_adjustment
+                                                    == start.terrain_adjustment
+                                                && original.piece == start.piece
+                                                && Arc::ptr_eq(&original.template, &start.template),
+                                            "ruined portal start changed during decoration"
                                         );
                                     }
                                 }
@@ -23721,6 +23911,148 @@ mod tests {
             failing.draws.is_empty(),
             "failed callback state must not be committed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_portals_share_random_and_roll_back_failures() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            ruined_portal::{GenerationPoint, InitialSelection, Setup, VerticalPlacement},
+            structure_decoration::StructureDecorationEntry,
+            structure_transform::{Mirror, Rotation},
+        };
+        #[derive(Clone, Default)]
+        struct Runner {
+            draws: Vec<i64>,
+            fail: bool,
+            corrupt: bool,
+        }
+        impl MixedOceanRuinPlacement for Runner {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_ruined_portal(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &super::super::structure_batch::TerrainStartKey,
+                start: &mut super::super::ruined_portal::PreparedStart,
+                _: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                self.draws.push(random.next_long());
+                if self.corrupt {
+                    start.chunk[0] += 1;
+                }
+                ensure!(
+                    !self.fail || self.draws.len() < 2,
+                    "injected portal failure"
+                );
+                Ok(())
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let registry = batch_registry();
+        let prepared = PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test)?;
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:ruined_portal")?,
+            step: 0,
+            index: 0,
+        };
+        let selection = InitialSelection {
+            setup_index: 0,
+            air_pocket: false,
+            template: ResourceId::parse("minecraft:ruined_portal/portal_1")?,
+            rotation: Rotation::None,
+            mirror: Mirror::None,
+        };
+        let setup = Setup {
+            placement: VerticalPlacement::OnLandSurface,
+            air_pocket_probability: 0.0,
+            mossiness: 0.0,
+            overgrown: false,
+            vines: false,
+            can_be_cold: false,
+            replace_with_blackstone: false,
+            weight: 1.0,
+        };
+        let point = GenerationPoint {
+            position: [2, 7, 2],
+            pivot: [1, 0, 1],
+            bounds: BoundingBox::new([2, 7, 2], [4, 9, 4]).unwrap(),
+        };
+        let piece = super::super::ruined_portal::SavedRuinedPortalPiece::capture(
+            &selection,
+            &setup,
+            &point,
+            [3, 3, 3],
+            false,
+        )?;
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [3, 3, 3],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let make_start = |chunk| super::super::ruined_portal::PreparedStart {
+            chunk,
+            point: point.clone(),
+            terrain_adjustment: TerrainAdjustment::None,
+            template: Arc::clone(&template),
+            piece: piece.clone(),
+        };
+        let first = make_start([0, 0]);
+        let second = make_start([1, 0]);
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![
+                PlannedStructureStart::RuinedPortal(&first),
+                PlannedStructureStart::RuinedPortal(&second),
+            ],
+        }];
+        let mut expected = entry.random(plan.decoration_seed());
+        let draws = [expected.next_long(), expected.next_long()];
+        let (mut terrain, _, _, _) = fixture();
+        let mut runner = Runner::default();
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)?;
+        assert_eq!(runner.draws, draws);
+        assert!(matches!(
+            &updated[0][0],
+            PreparedStructureStart::RuinedPortal(_)
+        ));
+        for (fail, corrupt) in [(true, false), (false, true)] {
+            let (mut terrain, _, _, _) = fixture();
+            let before = terrain.snapshot();
+            let mut runner = Runner {
+                fail,
+                corrupt,
+                ..Default::default()
+            };
+            assert!(
+                prepared
+                    .execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert!(runner.draws.is_empty());
+        }
         Ok(())
     }
 

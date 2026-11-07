@@ -336,5 +336,8 @@ fn ruined_portal_candidates_match_vanilla_biomes() -> Result<()> {
             .mixed_decoration_plan_with_jigsaw(chunk, &schedule)
             .is_err()
     );
+    let plan = terrain.mixed_decoration_plan_with_portals(chunk, &schedule)?;
+    assert!(plan.iter().any(|entry| entry.entry.id == id && entry.starts.iter().any(|start|
+        matches!(start, native_session::worldgen::structure_batch::PlannedStructureStart::RuinedPortal(start) if start.chunk == [x, z]))));
     Ok(())
 }

@@ -63,6 +63,7 @@ pub enum PlannedStructureStart<'a> {
     OceanRuin(&'a super::ocean_ruin::PreparedStart),
     Mineshaft(&'a super::mineshaft::PreparedStart),
     Jigsaw(&'a super::jigsaw::PreparedStart),
+    RuinedPortal(&'a super::ruined_portal::PreparedStart),
 }
 
 impl PlannedStructureStart<'_> {
@@ -72,6 +73,7 @@ impl PlannedStructureStart<'_> {
             Self::OceanRuin(start) => start.chunk,
             Self::Mineshaft(start) => start.chunk,
             Self::Jigsaw(start) => start.chunk,
+            Self::RuinedPortal(start) => start.chunk,
         }
     }
 }
@@ -644,6 +646,24 @@ impl PreparedStructureStages {
         )
     }
 
+    /// Include portals for an executor which has a prepared portal context.
+    pub(super) fn mixed_decoration_plan_with_portals<'a>(
+        &'a self,
+        pos: ChunkPos,
+        schedule: &'a StructureDecorationSchedule,
+    ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+        mixed_plan_with_portals(
+            &self.starts,
+            &self.ocean_starts,
+            &self.mineshafts,
+            Some(&self.jigsaw_starts),
+            Some(&self.ruined_portal_starts),
+            &self.references,
+            pos,
+            schedule,
+        )
+    }
+
     /// Prove that every mixed-plan key points to exactly one retained start.
     /// The mixed executor preserves this shape and validates ruin mutations.
     pub(super) fn mixed_commit_keys(
@@ -681,6 +701,10 @@ impl PreparedStructureStages {
                 PlannedStructureStart::Jigsaw(start) => {
                     let current = self.jigsaw_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("jigsaw start missing")?;
                     ensure!(std::ptr::eq(*start, current), "mixed plan has stale jigsaw start");
+                }
+                PlannedStructureStart::RuinedPortal(start) => {
+                    let current = self.ruined_portal_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("ruined portal start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale ruined portal start");
                 }
             }
             Ok(key)
@@ -736,6 +760,13 @@ impl PreparedStructureStages {
                             .and_then(|s| s.get_mut(&key.0))
                             .expect("validated jigsaw start") = start
                     }
+                    super::PreparedStructureStart::RuinedPortal(start) => {
+                        *self
+                            .ruined_portal_starts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated ruined portal start") = start;
+                    }
                 }
             }
         }
@@ -773,6 +804,9 @@ fn decoration_plan<'a>(
                     bail!("mineshaft decoration context is missing")
                 }
                 PlannedStructureStart::Jigsaw(_) => bail!("jigsaw decoration context is missing"),
+                PlannedStructureStart::RuinedPortal(_) => {
+                    bail!("ruined portal decoration context is missing")
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(PlannedStructureDecoration {
@@ -807,6 +841,29 @@ fn mixed_plan_with_jigsaw<'a>(
     ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
     mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
     jigsaws_by_chunk: Option<&'a BTreeMap<ChunkPos, JigsawStarts>>,
+    references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
+    pos: ChunkPos,
+    schedule: &'a StructureDecorationSchedule,
+) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
+    mixed_plan_with_portals(
+        starts_by_chunk,
+        ocean_by_chunk,
+        mineshafts_by_chunk,
+        jigsaws_by_chunk,
+        None,
+        references_by_chunk,
+        pos,
+        schedule,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mixed_plan_with_portals<'a>(
+    starts_by_chunk: &'a BTreeMap<ChunkPos, SimpleStarts>,
+    ocean_by_chunk: &'a BTreeMap<ChunkPos, OceanRuinStarts>,
+    mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
+    jigsaws_by_chunk: Option<&'a BTreeMap<ChunkPos, JigsawStarts>>,
+    portals_by_chunk: Option<&'a BTreeMap<ChunkPos, RuinedPortalStarts>>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
@@ -852,21 +909,25 @@ fn mixed_plan_with_jigsaw<'a>(
             let jigsaw = jigsaws_by_chunk
                 .and_then(|chunks| chunks.get(&source))
                 .and_then(|starts| starts.get(&entry.id));
-            let start = match (simple, ocean, mineshaft, jigsaw) {
-                (Some(start), None, None, None) => PlannedStructureStart::Simple(start),
-                (None, Some(start), None, None) => {
+            let portal = portals_by_chunk
+                .and_then(|chunks| chunks.get(&source))
+                .and_then(|starts| starts.get(&entry.id));
+            let start = match (simple, ocean, mineshaft, jigsaw, portal) {
+                (Some(start), None, None, None, None) => PlannedStructureStart::Simple(start),
+                (None, Some(start), None, None, None) => {
                     ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
                     PlannedStructureStart::OceanRuin(start)
                 }
-                (None, None, Some(start), None) => {
+                (None, None, Some(start), None, None) => {
                     ensure!(!start.pieces.is_empty(), "mineshaft start has no pieces");
                     PlannedStructureStart::Mineshaft(start)
                 }
-                (None, None, None, Some(start)) => {
+                (None, None, None, Some(start), None) => {
                     ensure!(!start.pieces.is_empty(), "jigsaw start has no pieces");
                     PlannedStructureStart::Jigsaw(start)
                 }
-                (None, None, None, None) => bail!("referenced structure start is missing"),
+                (None, None, None, None, Some(start)) => PlannedStructureStart::RuinedPortal(start),
+                (None, None, None, None, None) => bail!("referenced structure start is missing"),
                 _ => bail!("duplicate referenced structure start"),
             };
             ensure!(
@@ -1681,7 +1742,10 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
-                            super::BatchPreparedStructureStart::RuinedPortal(start) => {
+                            super::BatchPreparedStructureStart::RuinedPortal(start)
+                            | super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::RuinedPortal(start),
+                            ) => {
                                 bounds.push(start.reference_bounds(structure.clone())?);
                                 ensure!(
                                     ruined_portal_starts.insert(structure, start).is_none(),

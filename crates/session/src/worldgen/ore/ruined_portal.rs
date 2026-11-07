@@ -1125,9 +1125,25 @@ mod tests {
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn installed_portal_templates_place_and_finalize_jigsaw_markers() -> Result<()> {
         use super::super::super::ruined_portal::{PreparedStart, SavedRuinedPortalPiece};
+        use super::super::{MixedOceanRuinPlacement, MixedPortalPlacementContext};
         use native_core::beardifier::{BoundingBox, TerrainAdjustment};
         use native_persistence::structure_template::StructureTemplate;
+        use native_resources::structure_decoration::StructureDecorationEntry;
         use native_world::loaded::{BLOCK_COUNT, BlockStateId, Section};
+
+        #[derive(Clone)]
+        struct NoOther;
+        impl MixedOceanRuinPlacement for NoOther {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                anyhow::bail!("unexpected ocean ruin")
+            }
+        }
 
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
@@ -1232,8 +1248,33 @@ mod tests {
             assert_eq!(clip, old_clip);
             assert_eq!(random.next_long(), expected_random.next_long());
             let mut random = DecorationRandom::new(42);
-            let placed = prepared.place(&mut region, &start, &mut clip, &mut random);
-            ensure!(placed.with_context(|| format!("placing {name}"))?);
+            if name == "portal_1" {
+                let entry = StructureDecorationEntry {
+                    id: ResourceId::parse("minecraft:ruined_portal")?,
+                    step: 0,
+                    index: 0,
+                };
+                let plan = [super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                    entry: &entry, starts: vec![super::super::super::structure_batch::PlannedStructureStart::RuinedPortal(&start)] }];
+                let mut context = MixedPortalPlacementContext::load(
+                    NoOther,
+                    &plan,
+                    &mut resources,
+                    &ids,
+                    &registry,
+                )?;
+                let mut placed_start = start.clone();
+                context.place_ruined_portal(
+                    &mut region,
+                    &(entry.id.clone(), ChunkPos { x: 0, z: 0 }),
+                    &mut placed_start,
+                    clip,
+                    &mut random,
+                )?;
+            } else {
+                let placed = prepared.place(&mut region, &start, &mut clip, &mut random);
+                ensure!(placed.with_context(|| format!("placing {name}"))?);
+            }
             region
                 .finish()
                 .with_context(|| format!("finishing {name}"))?;

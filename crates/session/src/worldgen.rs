@@ -91,9 +91,9 @@ pub use mob_spawner::{
 };
 pub use ore::{
     DecorationRegion, MixedHutOceanPlacementContext, MixedJigsawPlacementContext,
-    MixedMineshaftPlacementContext, MixedOceanRuinPlacement, OceanRuinPlacementContext,
-    PlacedDecorationFeature, PortalPlacementResources, PreparedDecoration, PreparedPortalPlacement,
-    ScheduledDecorationFeature,
+    MixedMineshaftPlacementContext, MixedOceanRuinPlacement, MixedPortalPlacementContext,
+    OceanRuinPlacementContext, PlacedDecorationFeature, PortalPlacementResources,
+    PreparedDecoration, PreparedPortalPlacement, ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,
@@ -2411,6 +2411,7 @@ pub enum PreparedStructureStart {
     OceanRuin(ocean_ruin::PreparedStart),
     Mineshaft(mineshaft::PreparedStart),
     Jigsaw(jigsaw::PreparedStart),
+    RuinedPortal(ruined_portal::PreparedStart),
 }
 
 /// Batch-only extension; decoration cannot consume jigsaw pieces yet.
@@ -3028,7 +3029,8 @@ impl TerrainGenerator {
                         BatchPreparedStructureStart::Supported(
                             PreparedStructureStart::OceanRuin(_)
                             | PreparedStructureStart::Mineshaft(_)
-                            | PreparedStructureStart::Jigsaw(_),
+                            | PreparedStructureStart::Jigsaw(_)
+                            | PreparedStructureStart::RuinedPortal(_),
                         )
                         | BatchPreparedStructureStart::Jigsaw(_)
                         | BatchPreparedStructureStart::RuinedPortal(_),
@@ -9403,6 +9405,9 @@ mod tests {
                             }
                             structure_batch::PlannedStructureStart::Jigsaw(start) => {
                                 PreparedStructureStart::Jigsaw((*start).clone())
+                            }
+                            structure_batch::PlannedStructureStart::RuinedPortal(start) => {
+                                PreparedStructureStart::RuinedPortal((*start).clone())
                             }
                         })
                         .collect()

@@ -533,7 +533,7 @@ pub struct DecorationRegion<'a> {
     light_guard: Option<DecorationLightGuard<'a>>,
     tree_block_write: bool,
     pile_block_write: bool,
-    jigsaw_wood_write: bool,
+    jigsaw_block_write: bool,
     column_block_write: bool,
     patch_block_write: bool,
     multiface_block_write: bool,
@@ -3188,7 +3188,7 @@ impl CarvedTerrainWorld {
             light_guard: None,
             tree_block_write: false,
             pile_block_write: false,
-            jigsaw_wood_write: false,
+            jigsaw_block_write: false,
             column_block_write: false,
             patch_block_write: false,
             multiface_block_write: false,
@@ -7117,8 +7117,23 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let pile_light_update = self.pile_block_write
                         && old_air
                         && (pile_safe_full_block(state) || pile_snow_layer(state));
-                    let jigsaw_wood_light_update =
-                        self.jigsaw_wood_write && old_air && jigsaw::jigsaw_wood(state);
+                    let jigsaw_shape = self.jigsaw_block_write
+                        && native_world::collision::slab_stair_solid(state).is_some()
+                        && native_world::block_light::same_light_behavior(&old, state).is_some();
+                    let jigsaw_water = old.name == "minecraft:water"
+                        && old.properties.len() == 1
+                        && old.properties.get("level").is_some_and(|level| {
+                            level.parse::<u8>().is_ok_and(|level| level <= 15)
+                        });
+                    let jigsaw_waterlog = old.name == state.name
+                        && old.properties.get("waterlogged").map(String::as_str) == Some("false")
+                        && state.properties.get("waterlogged").map(String::as_str) == Some("true")
+                        && old.properties.iter().all(|(key, value)| {
+                            key == "waterlogged" || state.properties.get(key) == Some(value)
+                        });
+                    let jigsaw_light_update = self.jigsaw_block_write
+                        && ((old_air && jigsaw::jigsaw_wood(state))
+                            || (jigsaw_shape && (old_air || jigsaw_water || jigsaw_waterlog)));
                     let patch_water = self.patch_block_write
                         && old.name == "minecraft:clay"
                         && old.properties.is_empty()
@@ -7198,7 +7213,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         ensure!(
                             tree_light_update
                                 || pile_light_update
-                                || jigsaw_wood_light_update
+                                || jigsaw_light_update
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
@@ -7215,7 +7230,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     ensure!(
                         tree_light_update
                             || pile_light_update
-                            || jigsaw_wood_light_update
+                            || jigsaw_light_update
                             || fresh_patch_water
                             || staged_patch_water
                             || fresh_water_dripleaf
@@ -7258,7 +7273,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && (tree_light_update
                                 || vine_write
                                 || pile_light_update
-                                || jigsaw_wood_light_update);
+                                || jigsaw_light_update);
                         ensure!(
                             if old_air {
                                 count > 0 || new_section
@@ -7276,7 +7291,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     }
                     if tree_light_update
                         || pile_light_update
-                        || jigsaw_wood_light_update
+                        || jigsaw_light_update
                         || fresh_patch_water
                         || staged_patch_water
                         || fresh_water_dripleaf
@@ -7291,7 +7306,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         guard.light_replay_positions.insert(p);
                         if vine_write
                             || (pile_light_update && guard.require_unchanged_light)
-                            || (jigsaw_wood_light_update && guard.require_unchanged_light)
+                            || (jigsaw_light_update && guard.require_unchanged_light)
                             || water_lichen_write
                             || lake_light_update
                             || magma_light_update
@@ -7301,7 +7316,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         }
                         if tree_light_update
                             || pile_light_update
-                            || jigsaw_wood_light_update
+                            || jigsaw_light_update
                             || vine_check
                             || lichen_check
                             || lake_light_update
@@ -11481,6 +11496,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_shapes_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_slab",
+            "vine_active_self_jigsaw_stairs",
+            "vine_active_empty_jigsaw_slab",
+            "vine_active_self_empty_jigsaw_stairs",
+            "vine_active_jigsaw_wet_slab",
+            "vine_active_self_jigsaw_wet_stairs",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11589,6 +11617,12 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if mode.contains("_jigsaw_wet_") {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let id = world.intern_state(water);
+                world.set_block_id(16, 10, 8, id).unwrap();
+            }
             if mode.ends_with("_patch_water") {
                 let clay = world.intern_state(state("clay"));
                 world.set_block_id(16, 10, 8, clay).unwrap();
@@ -11674,13 +11708,36 @@ mod tests {
                 if mode.contains("_jigsaw_") {
                     let mut block = state(if mode.ends_with("_log") {
                         "oak_log"
+                    } else if mode.ends_with("_slab") {
+                        "oak_slab"
+                    } else if mode.ends_with("_stairs") {
+                        "oak_stairs"
                     } else {
                         "oak_planks"
                     });
                     if mode.ends_with("_log") {
                         block.properties.insert("axis".into(), "y".into());
+                    } else if mode.ends_with("_slab") {
+                        block.properties = BTreeMap::from([
+                            ("type".into(), "bottom".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]);
+                    } else if mode.ends_with("_stairs") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("half".into(), "bottom".into()),
+                            ("shape".into(), "straight".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]);
                     }
-                    jigsaw::place_wood_for_light_test(&mut draft, &registry, p, &block).unwrap();
+                    jigsaw::place_block_for_light_test(
+                        &mut draft,
+                        &registry,
+                        p,
+                        &block,
+                        mode.contains("_jigsaw_wet_"),
+                    )
+                    .unwrap();
                     continue;
                 }
                 if mode.contains("_pile_") {
@@ -11782,7 +11839,9 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_iron_ore_") {
+            let expected_checks = if mode.contains("_jigsaw_wet_") {
+                2
+            } else if mode.contains("_iron_ore_") {
                 0
             } else if mode.contains("_lake_") && mode.ends_with("_mixed") {
                 3

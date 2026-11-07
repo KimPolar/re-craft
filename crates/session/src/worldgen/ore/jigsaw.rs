@@ -16,19 +16,20 @@ struct JigsawRegion<'r, 'a, 'g> {
 }
 
 #[cfg(test)]
-pub(super) fn place_wood_for_light_test(
+pub(super) fn place_block_for_light_test(
     region: &mut DecorationRegion<'_>,
     registry: &GeneratedBlockRegistry,
     pos: [i32; 3],
     state: &BlockState,
+    waterlog: bool,
 ) -> Result<()> {
     let mut random = DecorationRandom::new(42);
-    ensure!(JigsawRegion { region, registry }.place_template_block(
-        pos,
-        state,
-        None,
-        &mut random
-    )?);
+    let mut draft = JigsawRegion { region, registry };
+    let fluid = if waterlog { draft.fluid_at(pos)? } else { None };
+    ensure!(draft.place_template_block(pos, state, None, &mut random)?);
+    if waterlog {
+        draft.place_liquid(pos, state, fluid)?;
+    }
     Ok(())
 }
 
@@ -54,13 +55,10 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
         monster_block_flags(state)?;
         return Ok(false);
     }
-    if matches!(
-        state.name.as_str(),
-        "minecraft:cobbled_deepslate_slab"
-            | "minecraft:polished_deepslate_slab"
-            | "minecraft:deepslate_brick_slab"
-            | "minecraft:deepslate_tile_slab"
-    ) {
+    if state.name.starts_with("minecraft:")
+        && state.name.ends_with("_slab")
+        && native_world::collision::slab_stair_solid(state).is_some()
+    {
         return match state.properties.get("type").map(String::as_str) {
             Some("double") => Ok(true),
             Some("top" | "bottom") => Ok(false),
@@ -208,9 +206,10 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             );
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         } else {
-            self.region.jigsaw_wood_write = jigsaw_wood(state);
+            self.region.jigsaw_block_write =
+                jigsaw_wood(state) || native_world::collision::slab_stair_solid(state).is_some();
             let result = self.region.set_proto_block(pos, state);
-            self.region.jigsaw_wood_write = false;
+            self.region.jigsaw_block_write = false;
             result?;
         }
         Ok(true)
@@ -248,7 +247,11 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 } else {
                     None
                 };
-                self.region.set_proto_block(pos, &wet)?;
+                self.region.jigsaw_block_write =
+                    native_world::collision::slab_stair_solid(state).is_some();
+                let result = self.region.set_proto_block(pos, &wet);
+                self.region.jigsaw_block_write = false;
+                result?;
                 if let Some(mut chest) = chest {
                     chest.update_state(wet)?;
                     Arc::make_mut(&mut self.region.monster_entities).insert(
@@ -721,6 +724,7 @@ mod tests {
         }
         assert_eq!(axes_checked, 36);
         let mut slabs_checked = 0;
+        let mut slab_names = BTreeSet::new();
         for line in output.lines().filter(|line| line.starts_with("SLAB\t")) {
             let fields: Vec<_> = line.split('\t').collect();
             let [
@@ -752,6 +756,7 @@ mod tests {
                 _ => bail!("unknown Java rotation"),
             };
             let name = format!("minecraft:{name}");
+            slab_names.insert(name.clone());
             let properties = BTreeMap::from([
                 ("type".into(), (*kind).to_owned()),
                 ("waterlogged".into(), (*wet).to_owned()),
@@ -760,7 +765,10 @@ mod tests {
                 name: name.clone(),
                 properties: properties.clone(),
             };
-            assert!(registry.is_canonical_state(&name, &properties));
+            assert!(
+                registry.is_canonical_state(&name, &properties),
+                "{name}: {properties:?}"
+            );
             assert_eq!(jigsaw_static_full(&state)?, *full == "true");
             assert_eq!(
                 FluidState::from_block(&state)
@@ -773,7 +781,13 @@ mod tests {
             assert_eq!(actual["waterlogged"], *expected_wet);
             slabs_checked += 1;
         }
-        assert_eq!(slabs_checked, 288);
+        let expected_slabs: BTreeSet<_> = registry
+            .ids()
+            .filter(|name| name.starts_with("minecraft:") && name.ends_with("_slab"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(slab_names, expected_slabs);
+        assert_eq!(slabs_checked, expected_slabs.len() * 72);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
@@ -802,7 +816,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn vanilla_plains_house_wood_is_placed_from_template() -> Result<()> {
+    fn vanilla_plains_house_wood_and_shapes_are_placed_from_template() -> Result<()> {
         use native_persistence::{
             jigsaw_template::resolve_template_state, structure_template::StructureTemplate,
         };
@@ -832,6 +846,8 @@ mod tests {
                 let id = String::from_utf16(&id.0)?;
                 if native_core::wood::Wood::from_id(&id).is_none()
                     && native_core::wood::Planks::from_id(&id).is_none()
+                    && !(id.starts_with("minecraft:")
+                        && (id.ends_with("_slab") || id.ends_with("_stairs")))
                 {
                     continue;
                 }
@@ -858,6 +874,7 @@ mod tests {
         }
         assert!(found.contains("minecraft:oak_log"), "{found:?}");
         assert!(found.contains("minecraft:oak_planks"), "{found:?}");
+        assert!(found.contains("minecraft:oak_stairs"), "{found:?}");
         Ok(())
     }
 
@@ -913,6 +930,15 @@ mod tests {
                 placed.properties["waterlogged"],
                 if kind == "double" { "false" } else { "true" }
             );
+            let ticks = world.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 });
+            if kind == "double" {
+                assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
+            } else {
+                let ticks = ticks.context("waterlogged slab tick missing")?;
+                assert_eq!(ticks.len(), 1);
+                assert_eq!(ticks[0].position, pos);
+                assert_eq!(ticks[0].fluid, "minecraft:water");
+            }
         }
         Ok(())
     }

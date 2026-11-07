@@ -379,6 +379,10 @@ impl GeneratedBlockRegistry {
         const SLAB_FACTORY_FF: &str = "(Lnet/minecraft/references/BlockItemId;Lnet/minecraft/world/level/block/Block;FF)Lnet/minecraft/world/level/block/Block;";
         const COLOR_COLLECTION: &str = "net/minecraft/world/level/block/ColorCollection";
         const COLOR_FACTORY: &str = "(Lnet/minecraft/world/level/block/ColorCollection;Lorg/apache/commons/lang3/function/TriFunction;Ljava/util/function/BiFunction;Ljava/util/function/Function;)Lnet/minecraft/world/level/block/ColorCollection;";
+        const COLOR_ZIP_FACTORY: &str = "(Lnet/minecraft/world/level/block/ColorCollection;Lnet/minecraft/world/level/block/ColorCollection;Ljava/util/function/BiFunction;)Lnet/minecraft/world/level/block/ColorCollection;";
+        const COPPER_COLLECTION: &str =
+            "net/minecraft/world/level/block/WeatheringCopperCollection";
+        const COPPER_FACTORY: &str = "(Lnet/minecraft/world/level/block/WeatheringCopperCollection;Lorg/apache/commons/lang3/function/TriFunction;Ljava/util/function/BiFunction;Ljava/util/function/BiFunction;Ljava/util/function/Function;)Lnet/minecraft/world/level/block/WeatheringCopperCollection;";
         const BASE: &str = "net/minecraft/world/level/block/Block";
         let mut load = |name: &str| -> Result<crate::item_registry::Class> {
             let bytes = read_class(&format!("{name}.class"))?
@@ -394,6 +398,7 @@ impl GeneratedBlockRegistry {
         let mut registration = None;
         let mut constructors = BTreeSet::new();
         let mut color_factory = false;
+        let mut copper_factory = false;
         let mut registered_classes = BTreeMap::new();
         for ins in blocks.instructions()? {
             if ins.op == 0xba {
@@ -447,11 +452,57 @@ impl GeneratedBlockRegistry {
                 constructors.insert("net/minecraft/world/level/block/SlabBlock".to_owned());
             } else if ins.op == 0xb8
                 && owner == COLOR_COLLECTION
-                && member == "registerBlocks"
-                && descriptor == COLOR_FACTORY
+                && ((member == "registerBlocks" && descriptor == COLOR_FACTORY)
+                    || (member == "zipMap" && descriptor == COLOR_ZIP_FACTORY))
             {
                 color_factory = true;
+            } else if ins.op == 0xb8
+                && owner == COPPER_COLLECTION
+                && member == "registerBlocks"
+                && descriptor == COPPER_FACTORY
+            {
+                copper_factory = true;
             } else if ins.op == 0xb3 && owner == BLOCKS {
+                if member == "CUT_COPPER_SLAB"
+                    && copper_factory
+                    && registration.is_none()
+                    && candidates.len() == 1
+                    && candidates
+                        .first()
+                        .is_some_and(|(owner, field)| owner == IDS && field == member)
+                {
+                    for (stage, prefix) in [
+                        ("", ""),
+                        ("exposed_", ""),
+                        ("weathered_", ""),
+                        ("oxidized_", ""),
+                        ("", "waxed_"),
+                        ("exposed_", "waxed_"),
+                        ("weathered_", "waxed_"),
+                        ("oxidized_", "waxed_"),
+                    ] {
+                        let class = if prefix.is_empty() {
+                            "net/minecraft/world/level/block/WeatheringCopperSlabBlock"
+                        } else {
+                            "net/minecraft/world/level/block/SlabBlock"
+                        };
+                        ensure!(
+                            registered_classes
+                                .insert(
+                                    format!("minecraft:{prefix}{stage}cut_copper_slab"),
+                                    class.to_owned()
+                                )
+                                .is_none(),
+                            "duplicate copper slab registration"
+                        );
+                    }
+                    candidates.clear();
+                    constructors.clear();
+                    registration = None;
+                    color_factory = false;
+                    copper_factory = false;
+                    continue;
+                }
                 let collection = match member {
                     "GLAZED_TERRACOTTA" => Some((
                         "glazed_terracotta",
@@ -459,6 +510,17 @@ impl GeneratedBlockRegistry {
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
                     "WOOL" => Some(("wool", BASE)),
+                    "WOOL_SLAB" => Some(("wool_slab", "net/minecraft/world/level/block/SlabBlock")),
+                    "CONCRETE_SLAB" => {
+                        Some(("concrete_slab", "net/minecraft/world/level/block/SlabBlock"))
+                    }
+                    "WOOL_STAIRS" => {
+                        Some(("wool_stairs", "net/minecraft/world/level/block/StairBlock"))
+                    }
+                    "CONCRETE_STAIRS" => Some((
+                        "concrete_stairs",
+                        "net/minecraft/world/level/block/StairBlock",
+                    )),
                     _ => None,
                 };
                 if let Some((suffix, class)) = collection
@@ -500,6 +562,7 @@ impl GeneratedBlockRegistry {
                     constructors.clear();
                     registration = None;
                     color_factory = false;
+                    copper_factory = false;
                     continue;
                 }
                 let class = match registration {
@@ -522,6 +585,7 @@ impl GeneratedBlockRegistry {
                         constructors.clear();
                         registration = None;
                         color_factory = false;
+                        copper_factory = false;
                         continue;
                     }
                     let id = ResourceId::parse(name)?;
@@ -540,6 +604,7 @@ impl GeneratedBlockRegistry {
                 constructors.clear();
                 registration = None;
                 color_factory = false;
+                copper_factory = false;
             }
         }
         drop(load);
@@ -558,7 +623,10 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
-                "net/minecraft/world/level/block/SlabBlock" => Some(StateSchema::Slab),
+                "net/minecraft/world/level/block/SlabBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperSlabBlock" => {
+                    Some(StateSchema::Slab)
+                }
                 "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
                 "net/minecraft/world/level/block/GlazedTerracottaBlock"
                 | "net/minecraft/world/level/block/CarvedPumpkinBlock" => {

@@ -86,12 +86,16 @@ public class JigsawChestOracle {
             var state = Blocks.DEEPSLATE.defaultBlockState().setValue(RotatedPillarBlock.AXIS, axis).mirror(mirror).rotate(rotation);
             out.printf("AXIS\t%s\t%s\t%s\t%s%n", axis.getSerializedName(), mirror.name(), rotation.name(), state.getValue(RotatedPillarBlock.AXIS).getSerializedName());
         }
-        for (var name : new String[]{"cobbled_deepslate_slab", "polished_deepslate_slab", "deepslate_brick_slab", "deepslate_tile_slab"}) {
-            var block = BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:" + name));
-            if (block.getClass() != SlabBlock.class) throw new AssertionError(name);
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            if (!id.getNamespace().equals("minecraft") || !id.getPath().endsWith("_slab")) continue;
+            var name = id.getPath();
+            var block = BuiltInRegistries.BLOCK.getValue(id);
+            if (!(block instanceof SlabBlock)) throw new AssertionError(name);
             for (var type : SlabType.values()) for (var wet : new boolean[]{false, true})
                 for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
                     var state = block.defaultBlockState().setValue(SlabBlock.TYPE, type).setValue(SlabBlock.WATERLOGGED, wet);
+                    if (state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null, BlockPos.ZERO) != null)
+                        throw new AssertionError("unexpected slab side effect: " + name);
                     var transformed = state.mirror(mirror).rotate(rotation);
                     out.printf("SLAB\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n", name, type.getSerializedName(), wet,
                         mirror.name(), rotation.name(), state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),

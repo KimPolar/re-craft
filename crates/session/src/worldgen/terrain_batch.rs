@@ -999,7 +999,8 @@ impl FreshTerrainBatch {
                 (!structures.ocean_starts.contains_key(&pos)
                     && !structures.mineshafts.contains_key(&pos)
                     && !structures.jigsaw_starts.contains_key(&pos)
-                    && !structures.ruined_portal_starts.contains_key(&pos))
+                    && !structures.ruined_portal_starts.contains_key(&pos)
+                    && !structures.shipwreck_starts.contains_key(&pos))
                 .then(|| structures.starts.get(&pos))
                 .flatten()
             })
@@ -1040,6 +1041,16 @@ impl FreshTerrainBatch {
     ) -> Option<&super::structure_batch::RuinedPortalStarts> {
         (!self.failed)
             .then(|| self.structures.as_ref()?.ruined_portal_starts.get(&pos))
+            .flatten()
+    }
+
+    /// Intermediate shipwreck starts retained for later decoration.
+    pub fn shipwreck_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<&super::structure_batch::ShipwreckStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.shipwreck_starts.get(&pos))
             .flatten()
     }
 
@@ -1084,6 +1095,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
+        structures.ensure_no_shipwreck_references(pos)?;
         super::structure_data::pack_structure_data_with_portals(
             pos,
             structures
@@ -1128,6 +1140,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
+        structures.ensure_no_shipwreck_references(pos)?;
         super::structure_data::referenced_start_chunks_with_portals(
             pos,
             &structures.starts,
@@ -1428,12 +1441,17 @@ fn structures_with_piece_at(
                 .ruined_portal_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let shipwreck = structures
+                .shipwreck_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
                 usize::from(simple.is_some())
                     + usize::from(ocean.is_some())
                     + usize::from(mineshaft.is_some())
                     + usize::from(jigsaw.is_some())
                     + usize::from(portal.is_some())
+                    + usize::from(shipwreck.is_some())
                     == 1,
                 "spawn referenced structure is missing or ambiguous"
             );
@@ -1467,6 +1485,12 @@ fn structures_with_piece_at(
                     "spawn structure source differs"
                 );
                 contains(&start.piece.bounds)
+            } else if let Some(start) = shipwreck {
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                contains(&start.bounds)
             } else {
                 let start = jigsaw.expect("one start was validated");
                 ensure!(
@@ -1786,6 +1810,13 @@ impl FreshTerrainBatch {
                 .all(|pos| !existing.ruined_portal_starts.contains_key(pos)),
             "expanded ruined portal state already exists"
         );
+        ensure!(
+            added
+                .shipwreck_starts
+                .keys()
+                .all(|pos| !existing.shipwreck_starts.contains_key(pos)),
+            "expanded shipwreck state already exists"
+        );
         existing.starts.extend(added.starts);
         existing.ocean_starts.extend(added.ocean_starts);
         existing.mineshafts.extend(added.mineshafts);
@@ -1793,6 +1824,7 @@ impl FreshTerrainBatch {
         existing
             .ruined_portal_starts
             .extend(added.ruined_portal_starts);
+        existing.shipwreck_starts.extend(added.shipwreck_starts);
         existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);

@@ -5925,6 +5925,7 @@ mod tests {
             mineshafts: BTreeMap::new(),
             jigsaw_starts: BTreeMap::new(),
             ruined_portal_starts: BTreeMap::new(),
+            shipwreck_starts: BTreeMap::new(),
             huts: BTreeMap::new(),
             references: BTreeMap::from([(center, references)]),
             terrain: BTreeMap::new(),
@@ -5997,6 +5998,7 @@ mod tests {
             mineshafts: BTreeMap::from([(center, BTreeMap::from([(mine_id, mine)]))]),
             jigsaw_starts: BTreeMap::new(),
             ruined_portal_starts: BTreeMap::new(),
+            shipwreck_starts: BTreeMap::new(),
             huts: BTreeMap::new(),
             references: BTreeMap::from([(center, refs)]),
             terrain: BTreeMap::new(),
@@ -9846,11 +9848,26 @@ mod tests {
                     .unwrap();
                 assert!(order.contains(&(structure_id.clone(), target)));
                 assert!(batch.beardifier_for_chunk(target, &order).is_ok());
-                let error = batch
+                let saved = generated.saved_piece_tag().unwrap();
+                let plan = structure_batch::StructurePreparationPlan::new([(
+                    target,
+                    schedule::GenerationStage::StructureReferences,
+                )])
+                .unwrap();
+                let additional = batch.prepare_additional_stages(&plan, None).unwrap();
+                assert_eq!(
+                    additional.shipwreck_starts[&target][&structure_id]
+                        .saved_piece_tag()
+                        .unwrap(),
+                    saved
+                );
+                assert!(additional.ensure_no_shipwreck_references(target).is_err());
+                let (_, stages) = batch
                     .into_terrain_stages(BTreeMap::from([(target, order)]))
-                    .err()
-                    .expect("unimplemented transfer must fail");
-                assert!(format!("{error:#}").contains("shipwreck structure transfer"));
+                    .unwrap();
+                let transferred = &stages.shipwreck_starts[&target][&structure_id];
+                assert_eq!(transferred.saved_piece_tag().unwrap(), saved);
+                assert!(stages.ensure_no_shipwreck_references(target).is_err());
             }
             let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"step":"surface_structures","biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
             data.0

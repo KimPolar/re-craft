@@ -66,6 +66,7 @@ pub enum PlannedStructureStart<'a> {
     Mineshaft(&'a super::mineshaft::PreparedStart),
     Jigsaw(&'a super::jigsaw::PreparedStart),
     RuinedPortal(&'a super::ruined_portal::PreparedStart),
+    Shipwreck(&'a super::shipwreck::PreparedStart),
 }
 
 impl PlannedStructureStart<'_> {
@@ -76,6 +77,7 @@ impl PlannedStructureStart<'_> {
             Self::Mineshaft(start) => start.chunk,
             Self::Jigsaw(start) => start.chunk,
             Self::RuinedPortal(start) => start.chunk,
+            Self::Shipwreck(start) => start.chunk,
         }
     }
 }
@@ -809,6 +811,10 @@ impl PreparedStructureStages {
                     let current = self.ruined_portal_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("ruined portal start missing")?;
                     ensure!(std::ptr::eq(*start, current), "mixed plan has stale ruined portal start");
                 }
+                PlannedStructureStart::Shipwreck(start) => {
+                    let current = self.shipwreck_starts.get(&key.1).and_then(|s| s.get(&key.0)).context("shipwreck start missing")?;
+                    ensure!(std::ptr::eq(*start, current), "mixed plan has stale shipwreck start");
+                }
             }
             Ok(key)
         }).collect()).collect()
@@ -870,6 +876,13 @@ impl PreparedStructureStages {
                             .and_then(|s| s.get_mut(&key.0))
                             .expect("validated ruined portal start") = start;
                     }
+                    super::PreparedStructureStart::Shipwreck(start) => {
+                        *self
+                            .shipwreck_starts
+                            .get_mut(&key.1)
+                            .and_then(|s| s.get_mut(&key.0))
+                            .expect("validated shipwreck start") = start;
+                    }
                 }
             }
         }
@@ -909,6 +922,9 @@ fn decoration_plan<'a>(
                 PlannedStructureStart::Jigsaw(_) => bail!("jigsaw decoration context is missing"),
                 PlannedStructureStart::RuinedPortal(_) => {
                     bail!("ruined portal decoration context is missing")
+                }
+                PlannedStructureStart::Shipwreck(_) => {
+                    bail!("shipwreck decoration context is missing")
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1914,7 +1930,10 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
-                            super::BatchPreparedStructureStart::Shipwreck(start) => {
+                            super::BatchPreparedStructureStart::Shipwreck(start)
+                            | super::BatchPreparedStructureStart::Supported(
+                                PreparedStructureStart::Shipwreck(start),
+                            ) => {
                                 bounds.push(start.reference_bounds(structure.clone())?);
                                 ensure!(
                                     shipwreck_starts.insert(structure, start).is_none(),

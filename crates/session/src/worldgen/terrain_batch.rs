@@ -4640,6 +4640,7 @@ impl FreshTerrainBatch {
                                     super::structure_batch::PlannedStructureStart::Mineshaft(_) => true,
                                     super::structure_batch::PlannedStructureStart::Jigsaw(_) => true,
                                     super::structure_batch::PlannedStructureStart::RuinedPortal(_) => true,
+                                    super::structure_batch::PlannedStructureStart::Shipwreck(_) => true,
                                     super::structure_batch::PlannedStructureStart::Simple(start) => allow_huts && start.kind == native_resources::structure_start::SimpleStructureKind::SwampHut,
                                 }
                             })

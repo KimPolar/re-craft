@@ -143,6 +143,17 @@ pub trait MixedOceanRuinPlacement {
     ) -> Result<()> {
         bail!("ruined portal mixed decoration context is missing")
     }
+
+    fn place_shipwreck(
+        &mut self,
+        _region: &mut DecorationRegion<'_>,
+        _key: &super::structure_batch::TerrainStartKey,
+        _start: &mut super::shipwreck::PreparedStart,
+        _clip: native_core::beardifier::BoundingBox,
+        _random: &mut DecorationRandom,
+    ) -> Result<()> {
+        bail!("shipwreck mixed decoration context is missing")
+    }
 }
 
 /// Adds preflighted ruined portals to an existing mixed decoration context.
@@ -2118,6 +2129,9 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                         PlannedStructureStart::RuinedPortal(start) => {
                             PreparedStructureStart::RuinedPortal((*start).clone())
                         }
+                        PlannedStructureStart::Shipwreck(start) => {
+                            PreparedStructureStart::Shipwreck((*start).clone())
+                        }
                     })
                     .collect()
             })
@@ -2704,6 +2718,16 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                     );
                                                     revisions.push((key, start.piece.bounds));
                                                 }
+                                                PreparedStructureStart::Shipwreck(start) => {
+                                                    let key = (
+                                                        entry.entry.id.clone(),
+                                                        ChunkPos {
+                                                            x: start.chunk[0],
+                                                            z: start.chunk[1],
+                                                        },
+                                                    );
+                                                    revisions.push((key, start.bounds));
+                                                }
                                             }
                                         }
                                     }
@@ -2810,6 +2834,56 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                                                 && Arc::ptr_eq(&original.template, &start.template),
                                             "ruined portal start changed during decoration"
                                         );
+                                    }
+                                    PreparedStructureStart::Shipwreck(start) => {
+                                        let intersects = [0, 2].into_iter().all(|axis| {
+                                            start.bounds.max[axis] >= clip.min[axis]
+                                                && start.bounds.min[axis] <= clip.max[axis]
+                                        });
+                                        if intersects {
+                                            let original = start.clone();
+                                            let key = (
+                                                plan[index].entry.id.clone(),
+                                                ChunkPos {
+                                                    x: start.chunk[0],
+                                                    z: start.chunk[1],
+                                                },
+                                            );
+                                            ocean.place_shipwreck(
+                                                &mut region,
+                                                &key,
+                                                start,
+                                                clip,
+                                                &mut random,
+                                            )?;
+                                            ensure!(
+                                                original.chunk == start.chunk
+                                                    && original.generation_point
+                                                        == start.generation_point
+                                                    && original.terrain_adjustment
+                                                        == start.terrain_adjustment
+                                                    && original.piece.template
+                                                        == start.piece.template
+                                                    && original.piece.rotation
+                                                        == start.piece.rotation
+                                                    && original.piece.beached
+                                                        == start.piece.beached
+                                                    && original.piece.position[0]
+                                                        == start.piece.position[0]
+                                                    && original.piece.position[2]
+                                                        == start.piece.position[2]
+                                                    && (!original.height_adjusted
+                                                        || (start.height_adjusted
+                                                            && original.piece.position[1]
+                                                                == start.piece.position[1]))
+                                                    && Arc::ptr_eq(
+                                                        &original.template,
+                                                        &start.template
+                                                    ),
+                                                "shipwreck start changed unexpectedly during decoration"
+                                            );
+                                            start.saved_piece_tag()?;
+                                        }
                                     }
                                 }
                             }
@@ -24585,6 +24659,243 @@ mod tests {
         assert!(
             failing.draws.is_empty(),
             "failed callback state must not be committed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_shipwrecks_share_random_and_roll_back_failures() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            shipwreck::Piece, structure_decoration::StructureDecorationEntry,
+            structure_transform::Rotation,
+        };
+        #[derive(Clone, Default)]
+        struct Runner {
+            draws: Vec<i64>,
+            fail: bool,
+            corrupt: bool,
+        }
+        impl MixedOceanRuinPlacement for Runner {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_shipwreck(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &super::super::structure_batch::TerrainStartKey,
+                start: &mut super::super::shipwreck::PreparedStart,
+                _: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                self.draws.push(random.next_long());
+                if self.corrupt {
+                    start.piece.position[0] += 1;
+                }
+                ensure!(
+                    !self.fail || self.draws.len() < 2,
+                    "injected shipwreck failure"
+                );
+                Ok(())
+            }
+        }
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let registry = batch_registry();
+        let prepared = PreparedDecoration::load(&mut data, &plan, &registry, &mut resolve_test)?;
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:shipwreck")?,
+            step: 0,
+            index: 0,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [2, 2, 2],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let make_start = |chunk, position| {
+            let piece = Piece {
+                template: "minecraft:shipwreck/with_mast".into(),
+                position,
+                rotation: Rotation::None,
+                beached: false,
+            };
+            super::super::shipwreck::PreparedStart {
+                chunk,
+                generation_point: [8, 8, 8],
+                terrain_adjustment: TerrainAdjustment::None,
+                bounds: piece.bounds(template.size).unwrap(),
+                piece,
+                template: Arc::clone(&template),
+                height_adjusted: false,
+            }
+        };
+        let first = make_start([0, 0], [2, 90, 2]);
+        let second = make_start([1, 0], [4, 90, 4]);
+        let outside = make_start([2, 0], [100, 90, 100]);
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![
+                PlannedStructureStart::Shipwreck(&first),
+                PlannedStructureStart::Shipwreck(&second),
+                PlannedStructureStart::Shipwreck(&outside),
+            ],
+        }];
+        let mut expected = entry.random(plan.decoration_seed());
+        let draws = [expected.next_long(), expected.next_long()];
+        let (mut terrain, _, _, _) = fixture();
+        let mut runner = Runner::default();
+        let (_, updated) =
+            prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)?;
+        assert_eq!(runner.draws, draws);
+        assert!(matches!(
+            &updated[0][0],
+            PreparedStructureStart::Shipwreck(_)
+        ));
+        for (fail, corrupt) in [(true, false), (false, true)] {
+            let (mut terrain, _, _, _) = fixture();
+            let before = terrain.snapshot();
+            let mut runner = Runner {
+                fail,
+                corrupt,
+                ..Default::default()
+            };
+            assert!(
+                prepared
+                    .execute_with_mixed_structure_plan(&mut terrain, &structures, &mut runner)
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            assert!(runner.draws.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn mixed_shipwreck_placement_updates_terrain_draft() -> Result<()> {
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::{StructureTemplate, TemplateBlock},
+        };
+        use native_resources::{
+            packs::ResourceStack, shipwreck::Piece, structure_decoration::StructureDecorationEntry,
+            structure_transform::Rotation,
+        };
+        #[derive(Clone)]
+        struct Runner<'a> {
+            registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+            tags: &'a super::ruined_portal::PortalUpdateTags,
+        }
+        impl MixedOceanRuinPlacement for Runner<'_> {
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                bail!("unexpected ocean ruin")
+            }
+            fn place_shipwreck(
+                &mut self,
+                region: &mut DecorationRegion<'_>,
+                _: &super::super::structure_batch::TerrainStartKey,
+                start: &mut super::super::shipwreck::PreparedStart,
+                clip: BoundingBox,
+                random: &mut DecorationRandom,
+            ) -> Result<()> {
+                region.place_shipwreck_start(start, self.registry, self.tags, clip, random)?;
+                Ok(())
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let tags = super::ruined_portal::PortalUpdateTags::load(&mut resources, &blocks)?;
+        let (mut data, schedule, neighborhood) = scheduled_fixture(None);
+        let plan = fixture_plan(&schedule, &neighborhood);
+        let mut feature_registry = batch_registry();
+        feature_registry.insert("minecraft:oak_planks".into());
+        let prepared =
+            PreparedDecoration::load(&mut data, &plan, &feature_registry, &mut resolve_test)?;
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [1, 1, 1],
+            palettes: vec![vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:oak_planks".into()),
+            )])]],
+            blocks: vec![TemplateBlock {
+                position: [0, 0, 0],
+                state: 0,
+                nbt: None,
+            }],
+            entities: vec![],
+        });
+        let piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [4, 8, 4],
+            rotation: Rotation::None,
+            beached: false,
+        };
+        let start = super::super::shipwreck::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            bounds: piece.bounds(template.size)?,
+            piece,
+            template,
+            height_adjusted: true,
+        };
+        let entry = StructureDecorationEntry {
+            id: ResourceId::parse("minecraft:shipwreck")?,
+            step: 0,
+            index: 0,
+        };
+        let structures = [PlannedMixedStructureDecoration {
+            entry: &entry,
+            starts: vec![PlannedStructureStart::Shipwreck(&start)],
+        }];
+        let (mut terrain, _, _, _) = fixture();
+        let (_, updated) = prepared.execute_with_mixed_structure_plan(
+            &mut terrain,
+            &structures,
+            &mut Runner {
+                registry: &registry,
+                tags: &tags,
+            },
+        )?;
+        assert_eq!(
+            terrain.snapshot().block(4, 8, 4).unwrap().name,
+            "minecraft:oak_planks"
+        );
+        assert!(
+            matches!(&updated[0][0], PreparedStructureStart::Shipwreck(start) if start.height_adjusted)
         );
         Ok(())
     }

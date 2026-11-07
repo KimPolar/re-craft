@@ -2422,6 +2422,7 @@ pub enum PreparedStructureStart {
     Mineshaft(mineshaft::PreparedStart),
     Jigsaw(jigsaw::PreparedStart),
     RuinedPortal(ruined_portal::PreparedStart),
+    Shipwreck(shipwreck::PreparedStart),
 }
 
 /// Batch-only extension; decoration cannot consume jigsaw pieces yet.
@@ -3114,7 +3115,8 @@ impl TerrainGenerator {
                             PreparedStructureStart::OceanRuin(_)
                             | PreparedStructureStart::Mineshaft(_)
                             | PreparedStructureStart::Jigsaw(_)
-                            | PreparedStructureStart::RuinedPortal(_),
+                            | PreparedStructureStart::RuinedPortal(_)
+                            | PreparedStructureStart::Shipwreck(_),
                         )
                         | BatchPreparedStructureStart::Jigsaw(_)
                         | BatchPreparedStructureStart::RuinedPortal(_)
@@ -10014,6 +10016,9 @@ mod tests {
                             }
                             structure_batch::PlannedStructureStart::RuinedPortal(start) => {
                                 PreparedStructureStart::RuinedPortal((*start).clone())
+                            }
+                            structure_batch::PlannedStructureStart::Shipwreck(start) => {
+                                PreparedStructureStart::Shipwreck((*start).clone())
                             }
                         })
                         .collect()

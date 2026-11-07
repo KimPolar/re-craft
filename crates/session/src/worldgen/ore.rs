@@ -53,6 +53,8 @@ use super::{
 };
 
 mod buried_treasure;
+#[cfg(test)]
+mod double_plant_tests;
 mod jigsaw;
 #[cfg(test)]
 mod kelp_tests;
@@ -7278,6 +7280,7 @@ impl SimpleBlockWorld for DecorationRegion<'_> {
                         | "minecraft:large_fern" => true,
                         _ if disk_safe_solid(&upper.name).is_some()
                             || tree_cave_vines(&upper)?
+                            || tree_generated_leaf(&upper)?
                             || simple_plant_kind(&upper).is_ok() =>
                         {
                             false

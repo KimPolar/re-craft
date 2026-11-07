@@ -5765,10 +5765,13 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
         ensure!(valid_vine(state), "invalid vine state");
         return Ok(false);
     }
-    if native_world::collision::fence_waterlogged(state).is_some() {
+    if native_world::collision::fence_waterlogged(state).is_some()
+        || generation_rail_state(state)
+        || jigsaw::jigsaw_torch(state)
+    {
         return Ok(false);
     }
-    if tree_generated_log(state) || tree_generated_leaf(state)? {
+    if jigsaw::jigsaw_wood(state) || tree_generated_log(state) || tree_generated_leaf(state)? {
         return Ok(true);
     }
     if tree_mushroom_block(state)? || tree_grass_block(state) {
@@ -14954,6 +14957,51 @@ mod tests {
                 "missing Java faces for {name}"
             );
         }
+        for name in [
+            "oak_planks",
+            "spruce_planks",
+            "birch_planks",
+            "jungle_planks",
+            "acacia_planks",
+            "dark_oak_planks",
+            "mangrove_planks",
+            "cherry_planks",
+            "pale_oak_planks",
+            "bamboo_planks",
+            "crimson_planks",
+            "warped_planks",
+            "poplar_planks",
+            "torch",
+            "soul_torch",
+        ] {
+            assert_eq!(
+                families.get(name),
+                Some(&6),
+                "missing Java faces for {name}"
+            );
+        }
+        for wood in native_core::wood::Wood::all() {
+            let name = wood.id().strip_prefix("minecraft:").unwrap();
+            assert_eq!(
+                families.get(name),
+                Some(&18),
+                "missing Java faces for {name}"
+            );
+        }
+        for (name, states) in [
+            ("wall_torch", 4),
+            ("soul_wall_torch", 4),
+            ("rail", 20),
+            ("powered_rail", 24),
+            ("detector_rail", 24),
+            ("activator_rail", 24),
+        ] {
+            assert_eq!(
+                families.get(name),
+                Some(&(states * 6)),
+                "missing Java faces for {name}"
+            );
+        }
         let plants = [
             "short_grass",
             "fern",
@@ -15062,7 +15110,7 @@ mod tests {
     }
 
     #[test]
-    fn multiface_support_rejects_fences_and_invalid_states() {
+    fn multiface_support_handles_structure_blocks_and_rejects_invalid_states() {
         let mut fence = state("oak_fence");
         fence.properties = ["north", "east", "south", "west", "waterlogged"]
             .into_iter()
@@ -15071,6 +15119,16 @@ mod tests {
         assert!(!multiface_support(&fence).unwrap());
         fence.properties.insert("north".into(), "invalid".into());
         assert!(multiface_support(&fence).is_err());
+        assert!(multiface_support(&state("oak_planks")).unwrap());
+        assert!(!multiface_support(&state("torch")).unwrap());
+        let mut rail = state("rail");
+        rail.properties = BTreeMap::from([
+            ("shape".into(), "north_south".into()),
+            ("waterlogged".into(), "false".into()),
+        ]);
+        assert!(!multiface_support(&rail).unwrap());
+        rail.properties.insert("shape".into(), "invalid".into());
+        assert!(multiface_support(&rail).is_err());
     }
 
     #[test]

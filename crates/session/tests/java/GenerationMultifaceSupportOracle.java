@@ -17,6 +17,14 @@ public class GenerationMultifaceSupportOracle {
     var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     var names=new ArrayList<>(List.of("moss_block","dirt","coarse_dirt","rooted_dirt","clay","gravel","sand","red_sand","sandstone","red_sandstone","ice","packed_ice","blue_ice","snow_block","magma_block","netherrack","blackstone","grass_block","oak_log","dark_oak_log","oak_leaves","dark_oak_leaves","azalea_leaves","flowering_azalea_leaves","red_mushroom_block","brown_mushroom_block","mushroom_stem","leaf_litter","cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf","glow_lichen","short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac","seagrass","tall_seagrass","spore_blossom"));
     names.addAll(List.of("oak_fence","spruce_fence","birch_fence","jungle_fence","acacia_fence","dark_oak_fence","mangrove_fence","cherry_fence","pale_oak_fence","bamboo_fence","crimson_fence","warped_fence","poplar_fence","nether_brick_fence"));
+    names.addAll(List.of("oak_planks","spruce_planks","birch_planks","jungle_planks","acacia_planks","dark_oak_planks","mangrove_planks","cherry_planks","pale_oak_planks","bamboo_planks","crimson_planks","warped_planks","poplar_planks","torch","soul_torch","wall_torch","soul_wall_torch","rail","powered_rail","detector_rail","activator_rail"));
+    for(var family:List.of("oak","spruce","birch","jungle","acacia","dark_oak","mangrove","cherry","pale_oak","poplar"))
+      for(var suffix:List.of("_log","_wood"))for(var prefix:List.of("","stripped_")) {
+        var name=prefix+family+suffix;if(!names.contains(name))names.add(name);
+      }
+    for(var family:List.of("crimson","warped"))
+      for(var suffix:List.of("_stem","_hyphae"))for(var prefix:List.of("","stripped_"))names.add(prefix+family+suffix);
+    names.addAll(List.of("bamboo_block","stripped_bamboo_block"));
     var pos=new BlockPos(8,8,8);
     for(var name:names){
       var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));

@@ -305,6 +305,55 @@ pub fn covers_full_face(boxes: &[Aabb], direction: IVec3) -> bool {
     merged_face_occludes(boxes, &[], direction)
 }
 
+/// Whether a union of local outline boxes is exactly the unit cube.
+pub fn is_full_cube(boxes: &[Aabb]) -> bool {
+    if boxes.is_empty() {
+        return false;
+    }
+    let mut axes = [vec![0.0_f32, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]];
+    for b in boxes {
+        for (axis, cuts) in axes.iter_mut().enumerate() {
+            let (min, max) = (b.min[axis], b.max[axis]);
+            if !min.is_finite() || !max.is_finite() || min < 0.0 || max > 1.0 || min >= max {
+                return false;
+            }
+            cuts.extend([min, max]);
+        }
+    }
+    for cuts in &mut axes {
+        cuts.sort_by(f32::total_cmp);
+        cuts.dedup();
+    }
+    for x in axes[0].windows(2) {
+        for y in axes[1].windows(2) {
+            for z in axes[2].windows(2) {
+                let point = Vec3::new(
+                    (x[0] + x[1]) / 2.0,
+                    (y[0] + y[1]) / 2.0,
+                    (z[0] + z[1]) / 2.0,
+                );
+                if !boxes
+                    .iter()
+                    .any(|b| point.cmpge(b.min).all() && point.cmplt(b.max).all())
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn full_cube_checks_union_and_outside_volume() {
+    assert!(is_full_cube(FULL));
+    assert!(is_full_cube(&[BOTTOM_SLAB[0], TOP_SLAB[0]]));
+    assert!(!is_full_cube(BOTTOM_SLAB));
+    assert!(!is_full_cube(&[cuboid(-0.1, 0.0, 0.0, 1.0, 1.0, 1.0)]));
+    assert!(!is_full_cube(EMPTY));
+}
+
 /// Full-face support for the currently verified block families. Some blocks
 /// override the support shape, so unknown families must not be inferred from
 /// collision geometry alone.

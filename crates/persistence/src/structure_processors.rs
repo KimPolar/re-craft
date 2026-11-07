@@ -63,6 +63,8 @@ enum Processor {
         tags: crate::structure_block_age::AgeTags,
     },
     BlackstoneReplace,
+    Ignore(BTreeSet<String>),
+    LavaSubmerged,
 }
 
 /// Decoded, ordered processors with data-pack tags already resolved.
@@ -165,6 +167,76 @@ fn predicate(
 }
 
 impl PreparedProcessors {
+    /// Java 26.3's built-in ruined-portal processor sequence.
+    pub fn ruined_portal(
+        provider: &mut impl ResourceProvider,
+        blocks: &BTreeSet<String>,
+        placement: native_resources::ruined_portal::VerticalPlacement,
+        air_pocket: bool,
+        cold: bool,
+        mossiness: f32,
+        blackstone: bool,
+    ) -> Result<Self> {
+        use native_resources::ruined_portal::VerticalPlacement;
+        ensure!(mossiness.is_finite(), "invalid portal mossiness");
+        let id = |name: &str| format!("minecraft:{name}");
+        for name in [
+            "structure_block",
+            "air",
+            "gold_block",
+            "lava",
+            "netherrack",
+            "magma_block",
+        ] {
+            ensure!(blocks.contains(&id(name)), "missing portal block {name}");
+        }
+        let output = |name: &str| BlockState {
+            name: id(name),
+            properties: Default::default(),
+        };
+        let rule = |input: Predicate, name: &str| Rule {
+            input,
+            location: Predicate::Always,
+            output: output(name),
+        };
+        let mut rules = vec![rule(Predicate::RandomBlock(id("gold_block"), 0.3), "air")];
+        rules.push(if placement == VerticalPlacement::OnOceanFloor {
+            rule(Predicate::Block(id("lava")), "magma_block")
+        } else if cold {
+            rule(Predicate::Block(id("lava")), "netherrack")
+        } else {
+            rule(Predicate::RandomBlock(id("lava"), 0.2), "magma_block")
+        });
+        if !cold {
+            rules.push(rule(
+                Predicate::RandomBlock(id("netherrack"), 0.07),
+                "magma_block",
+            ));
+        }
+        let mut ignored = BTreeSet::from([id("structure_block")]);
+        if !air_pocket {
+            ignored.insert(id("air"));
+        }
+        let mut processors = vec![
+            Processor::Ignore(ignored),
+            Processor::Rule(rules),
+            Processor::Age {
+                mossiness,
+                tags: crate::structure_block_age::AgeTags::load(provider, blocks)?,
+            },
+            Processor::Protected(resolve_block_tag(
+                provider,
+                &ResourceId::parse("minecraft:features_cannot_replace")?,
+                blocks,
+            )?),
+            Processor::LavaSubmerged,
+        ];
+        if blackstone {
+            processors.push(Processor::BlackstoneReplace);
+        }
+        Ok(Self(processors))
+    }
+
     pub fn load(
         holder: &HolderValue,
         provider: &mut impl ResourceProvider,
@@ -219,6 +291,7 @@ impl PreparedProcessors {
                     tags: crate::structure_block_age::AgeTags::load(provider, blocks)?,
                 },
                 "minecraft:blackstone_replace" => Processor::BlackstoneReplace,
+                "minecraft:lava_submerged_block" => Processor::LavaSubmerged,
                 "minecraft:rule" => {
                     let values = entry
                         .get("rules")
@@ -318,6 +391,21 @@ impl PreparedProcessors {
                 Processor::BlackstoneReplace => {
                     block.state = blackstone_replace(&block.state)?;
                 }
+                Processor::Ignore(blocks) => {
+                    if blocks.contains(&block.state.name) {
+                        return Ok(None);
+                    }
+                }
+                Processor::LavaSubmerged => {
+                    if world(block.position)?.name == "minecraft:lava" {
+                        if !lava_shape_is_full(&block.state)? {
+                            block.state = BlockState {
+                                name: "minecraft:lava".into(),
+                                properties: [("level".into(), "0".into())].into_iter().collect(),
+                            };
+                        }
+                    }
+                }
             }
         }
         Ok(Some(block))
@@ -347,6 +435,67 @@ impl PreparedProcessors {
             },
         )
     }
+}
+
+fn lava_shape_is_full(state: &BlockState) -> Result<bool> {
+    if matches!(
+        state.name.as_str(),
+        "minecraft:crying_obsidian"
+            | "minecraft:cracked_stone_bricks"
+            | "minecraft:mossy_stone_bricks"
+    ) {
+        ensure!(state.properties.is_empty(), "invalid full block state");
+        return Ok(true);
+    }
+    // The four portal walls have no corner voxels, regardless of connection state.
+    if matches!(
+        state.name.as_str(),
+        "minecraft:stone_brick_wall"
+            | "minecraft:mossy_stone_brick_wall"
+            | "minecraft:cobblestone_wall"
+            | "minecraft:mossy_cobblestone_wall"
+    ) {
+        ensure!(
+            state.properties.len() == 6
+                && ["east", "north", "south", "west"]
+                    .into_iter()
+                    .all(|key| matches!(
+                        state.properties.get(key).map(String::as_str),
+                        Some("none" | "low" | "tall")
+                    ))
+                && ["up", "waterlogged"].into_iter().all(|key| matches!(
+                    state.properties.get(key).map(String::as_str),
+                    Some("true" | "false")
+                )),
+            "invalid wall state"
+        );
+        return Ok(false);
+    }
+    ensure!(
+        matches!(
+            state.name.as_str(),
+            "minecraft:air"
+                | "minecraft:lava"
+                | "minecraft:stone"
+                | "minecraft:stone_bricks"
+                | "minecraft:gold_block"
+                | "minecraft:netherrack"
+                | "minecraft:magma_block"
+                | "minecraft:obsidian"
+                | "minecraft:chest"
+                | "minecraft:iron_bars"
+                | "minecraft:stone_brick_stairs"
+                | "minecraft:mossy_stone_brick_stairs"
+                | "minecraft:stone_slab"
+                | "minecraft:stone_brick_slab"
+                | "minecraft:mossy_stone_brick_slab"
+        ),
+        "unverified outline for lava-submerged {}",
+        state.name
+    );
+    let outline = native_world::collision::block_outline(state)
+        .with_context(|| format!("unsupported outline for lava-submerged {}", state.name))?;
+    Ok(native_world::collision::is_full_cube(&outline))
 }
 
 fn blackstone_replace(state: &BlockState) -> Result<BlockState> {
@@ -484,6 +633,29 @@ mod tests {
         assert_eq!(result.state.properties["shape"], "straight");
         assert_eq!(result.state.properties["waterlogged"], "false");
         assert!(result.nbt.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn submerged_lava_uses_outline_and_preserves_nbt() -> Result<()> {
+        let processors = PreparedProcessors(vec![Processor::LavaSubmerged]);
+        let mut world = |_| Ok(block("lava", [0; 3]).state);
+        let mut slab = block("stone_slab", [1, 2, 3]);
+        slab.state.properties = [
+            ("type".into(), "bottom".into()),
+            ("waterlogged".into(), "false".into()),
+        ]
+        .into_iter()
+        .collect();
+        let result = processors.process(slab.clone(), &mut world)?.unwrap();
+        assert_eq!(result.state.name, "minecraft:lava");
+        assert_eq!(result.state.properties["level"], "0");
+        assert_eq!(result.nbt, slab.nbt);
+        slab.state.properties.insert("type".into(), "double".into());
+        assert_eq!(
+            processors.process(slab.clone(), &mut world)?.unwrap().state,
+            slab.state
+        );
         Ok(())
     }
 

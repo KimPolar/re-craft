@@ -116,6 +116,24 @@ pub struct SavedRuinedPortalPiece {
 }
 
 impl SavedRuinedPortalPiece {
+    /// Prepare the template processor chain from this piece's saved settings.
+    pub fn prepare_processors(
+        &self,
+        provider: &mut impl ResourceProvider,
+        blocks: &std::collections::BTreeSet<String>,
+    ) -> Result<native_persistence::structure_processors::PreparedProcessors> {
+        self.validate()?;
+        native_persistence::structure_processors::PreparedProcessors::ruined_portal(
+            provider,
+            blocks,
+            self.placement,
+            self.properties.air_pocket,
+            self.properties.cold,
+            self.properties.mossiness,
+            self.properties.replace_with_blackstone,
+        )
+    }
+
     pub fn capture(
         selection: &InitialSelection,
         setup: &Setup,

@@ -7882,6 +7882,8 @@ mod tests {
             (false, false, "minecraft:oak_log", 0),
             (false, false, "minecraft:oak_slab", 0),
             (false, true, "minecraft:oak_stairs", 0),
+            (false, false, "minecraft:oak_fence", 0),
+            (false, true, "minecraft:spruce_fence", 0),
             (false, false, "minecraft:sandstone_slab", 0),
             (false, true, "minecraft:stripped_spruce_log", 0),
             (false, false, "minecraft:deepslate_tile_slab", 0),

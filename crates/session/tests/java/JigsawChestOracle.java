@@ -15,6 +15,9 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.RotatedPillarBlock;
 import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.FenceBlock;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
@@ -101,6 +104,28 @@ public class JigsawChestOracle {
                         mirror.name(), rotation.name(), state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
                         state.getFluidState().isSource(), transformed.getValue(SlabBlock.TYPE).getSerializedName(), transformed.getValue(SlabBlock.WATERLOGGED));
                 }
+        }
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            if (!id.getNamespace().equals("minecraft") || !id.getPath().endsWith("_fence")) continue;
+            var block = BuiltInRegistries.BLOCK.getValue(id);
+            if (!(block instanceof FenceBlock)) throw new AssertionError(id);
+            for (var state : block.getStateDefinition().getPossibleStates()) {
+                if (state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null, BlockPos.ZERO) != null || state.useShapeForLightOcclusion()
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) throw new AssertionError("unsupported fence: "+state);
+                boolean wet=state.getValue(BlockStateProperties.WATERLOGGED);
+                if (LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)!=wet
+                    || LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state)==wet)
+                    throw new AssertionError("unexpected fence light check: "+state);
+                for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var transformed=state.mirror(mirror).rotate(rotation);
+                    int before=0, after=0;
+                    var props=new net.minecraft.world.level.block.state.properties.BooleanProperty[]{BlockStateProperties.NORTH,BlockStateProperties.EAST,BlockStateProperties.SOUTH,BlockStateProperties.WEST};
+                    for(int i=0;i<4;i++) { if(state.getValue(props[i])) before|=1<<i; if(transformed.getValue(props[i])) after|=1<<i; }
+                    out.printf("FENCE\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s%n", id.getPath(), before, wet, mirror.name(), rotation.name(), after,
+                        transformed.getValue(BlockStateProperties.WATERLOGGED),state.getFluidState().isSource());
+                }
+            }
         }
     }
 }

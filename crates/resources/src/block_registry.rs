@@ -774,6 +774,28 @@ impl GeneratedBlockRegistry {
             }
             return Ok(result);
         }
+        if matches!(schema, StateSchema::Fence) {
+            let directions = ["north", "east", "south", "west"];
+            let mut result = properties.clone();
+            for (index, name) in directions.iter().enumerate() {
+                let mut direction = index;
+                if (mirror == Mirror::LeftRight && index % 2 == 0)
+                    || (mirror == Mirror::FrontBack && index % 2 == 1)
+                {
+                    direction = (direction + 2) % 4;
+                }
+                direction = (direction
+                    + match rotation {
+                        Rotation::None => 0,
+                        Rotation::Clockwise90 => 1,
+                        Rotation::Clockwise180 => 2,
+                        Rotation::Counterclockwise90 => 3,
+                    })
+                    % 4;
+                result.insert(directions[direction].into(), properties[*name].clone());
+            }
+            return Ok(result);
+        }
         ensure!(
             matches!(
                 schema,

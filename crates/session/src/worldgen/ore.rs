@@ -7788,7 +7788,14 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let lichen_check = water_lichen_write;
                     let lake_source = (matches!(
                         old.name.as_str(),
-                        "minecraft:stone" | "minecraft:cinnabar" | "minecraft:sulfur"
+                        "minecraft:stone"
+                            | "minecraft:cinnabar"
+                            | "minecraft:sulfur"
+                            | "minecraft:granite"
+                            | "minecraft:diorite"
+                            | "minecraft:andesite"
+                            | "minecraft:tuff"
+                            | "minecraft:calcite"
                     ) && old.properties.is_empty())
                         || (old.name == "minecraft:deepslate"
                             && old.properties.len() == 1
@@ -12095,6 +12102,23 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_lake_stone_variants_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_granite_air",
+            "vine_active_self_lake_granite_water",
+            "vine_active_lake_diorite_air",
+            "vine_active_self_lake_diorite_water",
+            "vine_active_lake_andesite_air",
+            "vine_active_self_lake_andesite_water",
+            "vine_active_lake_tuff_air",
+            "vine_active_self_lake_tuff_water",
+            "vine_active_lake_calcite_air",
+            "vine_active_self_lake_calcite_water",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_clay_to_water_matches_java_light_across_25_columns() {
         check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
     }
@@ -12420,6 +12444,16 @@ mod tests {
                     "cinnabar"
                 } else if mode.contains("_sulfur_") {
                     "sulfur"
+                } else if mode.contains("_granite_") {
+                    "granite"
+                } else if mode.contains("_diorite_") {
+                    "diorite"
+                } else if mode.contains("_andesite_") {
+                    "andesite"
+                } else if mode.contains("_tuff_") {
+                    "tuff"
+                } else if mode.contains("_calcite_") {
+                    "calcite"
                 } else if mode.contains("_deepslate_") {
                     "deepslate"
                 } else {

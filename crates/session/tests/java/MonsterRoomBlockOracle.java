@@ -47,7 +47,7 @@ public class MonsterRoomBlockOracle {
     var properties=new TreeMap<String,String>();state.getValues().forEach(entry->properties.put(entry.property().getName(),entry.valueName()));
     var pairs=new ArrayList<String>();for(var entry:properties.entrySet())pairs.add(entry.getKey()+"="+entry.getValue());
     var post=state.getPostProcessPos(world,new BlockPos(1,4,1));
-    out.printf("C %s %s %s %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isSolid(),state.isSolidRender(),state.hasBlockEntity(),post!=null);
+    out.printf("C %s %s %s %s %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isSolid(),state.isSolidRender(),state.hasBlockEntity(),post!=null,state.liquid());
     if(supportNames.contains(name)) {
      out.printf("S %s %s %s",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isSolidRender());
      for(var direction:Direction.values())out.printf(" %s",state.isFaceSturdy(world,new BlockPos(1,4,1),direction));

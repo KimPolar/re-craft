@@ -6295,6 +6295,12 @@ impl DiskWorld for DecorationRegion<'_> {
         if geode_crystal(state)? {
             return Ok(false);
         }
+        // Waterlogged blocks contain fluid, but Java's BlockState.liquid()
+        // only marks liquid blocks. Reuse the independently verified state
+        // families rather than treating their contained fluid as the block.
+        if monster_block_flags(state).is_ok() {
+            return Ok(false);
+        }
         ensure!(
             disk_safe_solid(&state.name).is_some()
                 || generated_ore_state(state)?
@@ -18423,6 +18429,8 @@ mod tests {
         ]);
         assert_eq!(monster_block_flags(&rail).unwrap(), (false, false));
         assert!(!DiskWorld::is_solid(&mut region, &rail).unwrap());
+        assert!(!DiskWorld::is_liquid(&mut region, &rail).unwrap());
+        assert!(DiskWorld::is_liquid(&mut region, &state("water")).unwrap());
         assert!(!tree_sturdy_up(&rail).unwrap());
         assert!(!tree_solid_render(&rail).unwrap());
         for direction in [
@@ -18439,6 +18447,7 @@ mod tests {
         assert!(monster_block_flags(&rail).is_err());
         assert!(tree_sturdy_up(&rail).is_err());
         assert!(DiskWorld::is_solid(&mut region, &rail).is_err());
+        assert!(DiskWorld::is_liquid(&mut region, &rail).is_err());
         let mut slab = state("oak_slab");
         slab.properties = BTreeMap::from([
             ("type".into(), "bottom".into()),
@@ -18502,7 +18511,7 @@ mod tests {
         let mut count = 0;
         for line in output.lines().filter_map(|v| v.strip_prefix("C ")) {
             let parts = line.split_whitespace().collect::<Vec<_>>();
-            assert_eq!(parts.len(), 6);
+            assert_eq!(parts.len(), 7);
             let mut block = state(parts[0]);
             if parts[1] != "-" {
                 for entry in parts[1].split(',') {
@@ -18526,6 +18535,11 @@ mod tests {
                     "disk predicate: {line}"
                 );
             }
+            assert_eq!(
+                DiskWorld::is_liquid(&mut region, &block).unwrap(),
+                parts[6].parse::<bool>().unwrap(),
+                "disk liquid predicate: {line}"
+            );
             assert_eq!(
                 parts[4].parse::<bool>().unwrap(),
                 matches!(parts[0], "chest" | "spawner"),

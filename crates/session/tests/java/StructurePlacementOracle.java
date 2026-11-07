@@ -32,7 +32,13 @@ public class StructurePlacementOracle {
                 Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,
                 Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
                 Blocks.CHISELED_POLISHED_BLACKSTONE, Blocks.IRON_BARS, Blocks.JUNGLE_LEAVES,
-                Blocks.VINE, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR))
+                Blocks.VINE, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR,
+                Blocks.STONE_BRICK_STAIRS, Blocks.MOSSY_STONE_BRICK_STAIRS, Blocks.STONE_STAIRS,
+                Blocks.COBBLESTONE_STAIRS, Blocks.MOSSY_COBBLESTONE_STAIRS, Blocks.BLACKSTONE_STAIRS,
+                Blocks.POLISHED_BLACKSTONE_STAIRS, Blocks.POLISHED_BLACKSTONE_BRICK_STAIRS,
+                Blocks.STONE_SLAB, Blocks.STONE_BRICK_SLAB, Blocks.MOSSY_STONE_BRICK_SLAB,
+                Blocks.COBBLESTONE_SLAB, Blocks.MOSSY_COBBLESTONE_SLAB, Blocks.SMOOTH_STONE_SLAB,
+                Blocks.BLACKSTONE_SLAB, Blocks.POLISHED_BLACKSTONE_SLAB, Blocks.POLISHED_BLACKSTONE_BRICK_SLAB))
             for (var state : b.getStateDefinition().getPossibleStates()) {
                 var actual = state.getPostProcessPos(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
                 var expected = b == Blocks.MAGMA_BLOCK ? BlockPos.ZERO.above() : null;
@@ -41,9 +47,13 @@ public class StructurePlacementOracle {
             }
         var root=new CompoundTag(); root.put("size",ints(4,2,4));
         var palette=new ListTag(); palette.add(NbtUtils.writeBlockState(Blocks.STONE.defaultBlockState()));
-        palette.add(NbtUtils.writeBlockState(Blocks.IRON_BARS.defaultBlockState())); root.put("palette",palette);
+        palette.add(NbtUtils.writeBlockState(Blocks.IRON_BARS.defaultBlockState()));
+        palette.add(NbtUtils.writeBlockState(Blocks.STONE_BRICK_STAIRS.defaultBlockState()));
+        palette.add(NbtUtils.writeBlockState(Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.EAST)));
+        palette.add(NbtUtils.writeBlockState(Blocks.STONE_SLAB.defaultBlockState())); root.put("palette",palette);
         var blocks=new ListTag();
-        for (int[] b:new int[][]{{0,0,0,0},{2,0,0,0},{1,0,0,1},{1,0,1,1},{3,1,1,1}}) {
+        for (int[] b:new int[][]{{0,0,0,0},{2,0,0,0},{1,0,0,1},{1,0,1,1},{3,1,1,1},
+                {2,1,1,2},{2,1,0,3},{0,1,1,4}}) {
             var tag=new CompoundTag(); tag.put("pos",ints(b[0],b[1],b[2])); tag.putInt("state",b[3]); blocks.add(tag);
         }
         root.put("blocks",blocks); root.put("entities",new ListTag());

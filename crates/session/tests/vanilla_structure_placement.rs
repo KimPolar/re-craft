@@ -112,7 +112,9 @@ fn structure_placement_matches_java() -> Result<()> {
             anyhow::bail!("unexpected jigsaw write")
         }
         fn is_liquid_container(&mut self, s: &BlockState) -> Result<bool> {
-            Ok(s.name == "minecraft:iron_bars")
+            Ok(s.name == "minecraft:iron_bars"
+                || s.name.ends_with("_stairs")
+                || s.name.ends_with("_slab"))
         }
         fn place_liquid(
             &mut self,
@@ -142,13 +144,28 @@ fn structure_placement_matches_java() -> Result<()> {
         }
         fn update_shape(
             &mut self,
-            _: [i32; 3],
+            pos: [i32; 3],
             state: &BlockState,
             d: [i32; 3],
             _: [i32; 3],
             neighbor: &BlockState,
         ) -> Result<BlockState> {
             let mut result = state.clone();
+            if state.name.ends_with("_stairs") && d[1] == 0 {
+                use native_world::stairs::{Neighbor, Stair};
+                let stair = Stair::from_state(state).context("invalid stair")?;
+                let shape = native_world::stairs::shape(stair, |offset| {
+                    let at = [pos[0] + offset.x, pos[1], pos[2] + offset.z];
+                    match self.states.get(&at) {
+                        Some(other) if other.name.ends_with("_stairs") => {
+                            Stair::from_state(other).map_or(Neighbor::Unknown, Neighbor::Stair)
+                        }
+                        _ => Neighbor::Other,
+                    }
+                })
+                .context("missing stair neighbor")?;
+                result.properties.insert("shape".into(), shape.into());
+            }
             if state.name == "minecraft:iron_bars" {
                 let face = match d {
                     [0, 0, -1] => Some("north"),
@@ -158,14 +175,17 @@ fn structure_placement_matches_java() -> Result<()> {
                     _ => None,
                 };
                 if let Some(face) = face {
-                    result.properties.insert(
-                        face.into(),
-                        matches!(
-                            neighbor.name.as_str(),
-                            "minecraft:stone" | "minecraft:iron_bars"
+                    let connected = matches!(
+                        neighbor.name.as_str(),
+                        "minecraft:stone" | "minecraft:iron_bars"
+                    ) || (native_world::collision::slab_stair_solid(neighbor)
+                        .is_some()
+                        && native_world::collision::button_support_face(
+                            neighbor,
+                            glam::IVec3::from_array(d.map(|v| -v)),
                         )
-                        .to_string(),
-                    );
+                        .unwrap());
+                    result.properties.insert(face.into(), connected.to_string());
                 }
             }
             Ok(result)
@@ -234,6 +254,9 @@ fn structure_placement_matches_java() -> Result<()> {
         ([1, 0, 0], 1),
         ([1, 0, 1], 1),
         ([3, 1, 1], 1),
+        ([2, 1, 1], 2),
+        ([2, 1, 0], 3),
+        ([0, 1, 1], 4),
     ];
     let mirrors = [Mirror::None, Mirror::LeftRight, Mirror::FrontBack];
     let rotations = [
@@ -293,6 +316,24 @@ fn structure_placement_matches_java() -> Result<()> {
                         Tag::Compound(vec![(
                             "id".into(),
                             Tag::String("minecraft:iron_bars".into()),
+                        )]),
+                        Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:stone_brick_stairs".into()),
+                        )]),
+                        Tag::Compound(vec![
+                            (
+                                "id".into(),
+                                Tag::String("minecraft:stone_brick_stairs".into()),
+                            ),
+                            (
+                                "properties".into(),
+                                Tag::Compound(vec![("facing".into(), Tag::String("east".into()))]),
+                            ),
+                        ]),
+                        Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:stone_slab".into()),
                         )]),
                     ]],
                     blocks: positions

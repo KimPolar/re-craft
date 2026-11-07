@@ -38,6 +38,9 @@ fn portal_template_full(state: &BlockState) -> Result<bool> {
     if portal_full(state) {
         return Ok(true);
     }
+    if native_world::collision::slab_stair_solid(state).is_some() {
+        return Ok(state.name.ends_with("_slab") && state.properties["type"] == "double");
+    }
     if is_air(state)
         || (state.name == "minecraft:iron_bars"
             && native_world::collision::pane_waterlogged(state).is_some())
@@ -114,6 +117,60 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties),
             "invalid portal edge state"
         );
+        if native_world::collision::slab_stair_solid(state).is_some() {
+            if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
+                SpringWorld::schedule_spring_tick(
+                    self.inner.region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            if state.name.ends_with("_slab") || direction[1] != 0 {
+                return Ok(state.clone());
+            }
+            use native_world::stairs::{Neighbor, Stair};
+            let stair = Stair::from_state(state).context("invalid portal stair")?;
+            let shape = native_world::stairs::shape(stair, |offset| {
+                let Some(x) = pos[0].checked_add(offset.x) else {
+                    return Neighbor::Unknown;
+                };
+                let Some(z) = pos[2].checked_add(offset.z) else {
+                    return Neighbor::Unknown;
+                };
+                if self.inner.region.is_outside(pos[1]) {
+                    return if self
+                        .inner
+                        .region
+                        .world
+                        .chunks
+                        .contains_key(&chunk([x, pos[1], z]))
+                    {
+                        Neighbor::Other
+                    } else {
+                        Neighbor::Unknown
+                    };
+                }
+                let Ok(other) = self.inner.region.read([x, pos[1], z]) else {
+                    return Neighbor::Unknown;
+                };
+                if !self
+                    .inner
+                    .registry
+                    .is_canonical_state(&other.name, &other.properties)
+                {
+                    return Neighbor::Unknown;
+                }
+                if other.name.starts_with("minecraft:") && other.name.ends_with("_stairs") {
+                    Stair::from_state(&other).map_or(Neighbor::Unknown, Neighbor::Stair)
+                } else {
+                    Neighbor::Other
+                }
+            })
+            .context("portal stair needs unavailable neighbors")?;
+            let mut next = state.clone();
+            next.properties.insert("shape".into(), shape.into());
+            return Ok(next);
+        }
         if state.name == "minecraft:iron_bars"
             && native_world::collision::pane_waterlogged(state).is_some()
         {
@@ -144,6 +201,10 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                         && native_world::collision::pane_waterlogged(neighbor).is_some())
                 {
                     true
+                } else if native_world::collision::slab_stair_solid(neighbor).is_some() {
+                    let opposite = glam::IVec3::from_array(direction.map(|value| -value));
+                    native_world::collision::button_support_face(neighbor, opposite)
+                        .context("unsupported portal stair or slab support face")?
                 } else if is_air(neighbor) {
                     false
                 } else {
@@ -182,7 +243,9 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         random: &mut DecorationRandom,
     ) -> Result<bool> {
         ensure!(nbt.is_none(), "portal block entities are not yet supported");
-        if state.name == "minecraft:iron_bars" {
+        if state.name == "minecraft:iron_bars"
+            || native_world::collision::slab_stair_solid(state).is_some()
+        {
             return self.inner.place_template_block(pos, state, None, random);
         }
         ensure!(
@@ -344,7 +407,9 @@ impl PortalDecorationWorld for PortalRegion<'_, '_, '_> {
         ensure!(
             self.registry.is_canonical_state(&old.name, &old.properties)
                 && self.registry.has_block_entity(&old.name) == Some(false)
-                && (disk_safe_solid(&old.name).is_some() || portal_state)
+                && (disk_safe_solid(&old.name).is_some()
+                    || portal_state
+                    || native_world::collision::slab_stair_solid(&old).is_some())
                 && !self.region.monster_entities.contains_key(&pos)
                 && !self.region.bee_nests.contains_key(&pos),
             "unsupported portal replacement source at {pos:?}: {old:?}"
@@ -551,7 +616,14 @@ mod tests {
         )?;
         let motion = HeightmapTags::load(&mut resources, &ids)?;
         let piece = piece()?;
-        let processors = piece.prepare_processors(&mut resources, &ids)?;
+        let processors = native_persistence::structure_processors::PreparedProcessors::load(
+            &native_resources::structure_pool::HolderValue::Inline(
+                serde_json::json!({"processors":[]}),
+            ),
+            &mut resources,
+            &ids,
+            &registry,
+        )?;
         let template = StructureTemplate {
             document: NamedTag {
                 name: "".into(),
@@ -568,6 +640,24 @@ mod tests {
                     "id".into(),
                     Tag::String("minecraft:iron_bars".into()),
                 )]),
+                Tag::Compound(vec![(
+                    "id".into(),
+                    Tag::String("minecraft:stone_brick_stairs".into()),
+                )]),
+                Tag::Compound(vec![
+                    (
+                        "id".into(),
+                        Tag::String("minecraft:stone_brick_stairs".into()),
+                    ),
+                    (
+                        "properties".into(),
+                        Tag::Compound(vec![("facing".into(), Tag::String("east".into()))]),
+                    ),
+                ]),
+                Tag::Compound(vec![(
+                    "id".into(),
+                    Tag::String("minecraft:stone_slab".into()),
+                )]),
             ]],
             blocks: vec![
                 TemplateBlock {
@@ -578,6 +668,21 @@ mod tests {
                 TemplateBlock {
                     position: [1, 1, 0],
                     state: 1,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [2, 1, 1],
+                    state: 2,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [2, 1, 0],
+                    state: 3,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [0, 1, 1],
+                    state: 4,
                     nbt: None,
                 },
             ],
@@ -618,6 +723,10 @@ mod tests {
         let bars = world.block(7, 8, 6).unwrap();
         assert_eq!(bars.name, "minecraft:iron_bars");
         assert_eq!(bars.properties["west"], "true");
+        let stair = world.block(8, 8, 7).unwrap();
+        assert_eq!(stair.name, "minecraft:stone_brick_stairs");
+        assert_eq!(stair.properties["shape"], "outer_right");
+        assert_eq!(world.block(6, 8, 7).unwrap().name, "minecraft:stone_slab");
         assert!(
             (-6..=22).any(
                 |x| (-6..=22).any(|z| world.block(x, 7, z).is_some_and(|s| matches!(
@@ -657,8 +766,8 @@ mod tests {
             Tag::String("minecraft:chest".into()),
         )]));
         template.blocks.push(TemplateBlock {
-            position: [2, 1, 0],
-            state: 2,
+            position: [3, 1, 0],
+            state: 5,
             nbt: Some(Tag::Compound(vec![(
                 "id".into(),
                 Tag::String("minecraft:chest".into()),
@@ -693,7 +802,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn magma_writes_mark_the_block_above_in_order() -> Result<()> {
+    fn magma_marks_and_waterlogged_template_ticks_are_recorded() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -749,15 +858,31 @@ mod tests {
                     bars
                 );
             }
+            for (name, pos) in [
+                ("minecraft:stone_brick_stairs", [7, 8, 4]),
+                ("minecraft:stone_slab", [8, 8, 4]),
+            ] {
+                let (name, mut properties) = registry.resolve(&serde_json::json!(name))?;
+                properties.insert("waterlogged".into(), "true".into());
+                let state = BlockState { name, properties };
+                for _ in 0..2 {
+                    assert_eq!(
+                        world.update_shape(pos, &state, [0, 1, 0], [pos[0], 9, pos[2]], &air)?,
+                        state
+                    );
+                }
+            }
         }
         let ticks = &region.world.saved_fluid_ticks[&ChunkPos { x: 0, z: 0 }];
-        assert_eq!(
-            ticks
-                .iter()
-                .filter(|tick| tick.position == [6, 8, 4] && tick.fluid == "minecraft:water")
-                .count(),
-            1
-        );
+        for pos in [[6, 8, 4], [7, 8, 4], [8, 8, 4]] {
+            assert_eq!(
+                ticks
+                    .iter()
+                    .filter(|tick| tick.position == pos && tick.fluid == "minecraft:water")
+                    .count(),
+                1
+            );
+        }
         Ok(())
     }
 

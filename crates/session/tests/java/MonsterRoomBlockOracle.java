@@ -21,6 +21,20 @@ public class MonsterRoomBlockOracle {
   var names=List.of("air","cave_air","void_air","water","lava","leaf_litter","oak_leaves","dark_oak_leaves","birch_leaves","azalea_leaves","flowering_azalea_leaves","chest","spawner","stone","deepslate","tuff","granite","diorite","andesite","calcite","dirt","grass_block","podzol","mycelium","coarse_dirt","rooted_dirt","mud","packed_mud","moss_block","clay","gravel","sand","red_sand","sandstone","bedrock","cobblestone","mossy_cobblestone","cobbled_deepslate","coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","netherrack","basalt","smooth_basalt","amethyst_block","budding_amethyst","blackstone","ancient_debris");
   var expandedNames=new ArrayList<>(names);
   expandedNames.addAll(List.of("moss_carpet","short_grass","tall_grass","fern","large_fern","azalea","flowering_azalea","oak_log","birch_log","dark_oak_log","brown_mushroom_block","red_mushroom_block","mushroom_stem"));
+  for(var block:BuiltInRegistries.BLOCK) if(block instanceof net.minecraft.world.level.block.FenceBlock
+      || block instanceof net.minecraft.world.level.block.FenceGateBlock
+      || block instanceof net.minecraft.world.level.block.DoorBlock)
+   expandedNames.add(BuiltInRegistries.BLOCK.getKey(block).getPath());
+  for(var family:List.of("oak","spruce","birch","jungle","acacia","cherry","dark_oak","pale_oak","mangrove","poplar","bamboo","crimson","warped")) {
+   var wood=new ArrayList<String>();wood.add(family+"_planks");
+   if(family.equals("bamboo")) wood.addAll(List.of("bamboo_block","stripped_bamboo_block"));
+   else {
+    var nether=family.equals("crimson") || family.equals("warped");
+    for(var suffix:nether?List.of("stem","hyphae"):List.of("log","wood"))
+     for(var prefix:List.of("","stripped_")) wood.add(prefix+family+"_"+suffix);
+   }
+   for(var name:wood) if(!expandedNames.contains(name)) expandedNames.add(name);
+  }
   for(var name:expandedNames){
    var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
    for(var state:block.getStateDefinition().getPossibleStates()){

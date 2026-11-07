@@ -4709,6 +4709,15 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if is_air(state) {
         return Ok((false, false));
     }
+    if native_world::collision::fence_waterlogged(state).is_some()
+        || native_world::collision::fence_gate_open(state).is_some()
+        || native_world::collision::door_open(state).is_some()
+    {
+        return Ok((true, false));
+    }
+    if jigsaw::jigsaw_wood(state) {
+        return Ok((true, true));
+    }
     if tree_leaf_litter(state)? {
         return Ok((false, false));
     }
@@ -18244,6 +18253,62 @@ mod tests {
         (schedule, neighborhood, registry)
     }
     #[test]
+    fn monster_room_accepts_valid_fences_gates_and_doors() {
+        for (name, properties) in [
+            (
+                "oak_fence",
+                vec![
+                    ("north", "true"),
+                    ("east", "false"),
+                    ("south", "false"),
+                    ("west", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            (
+                "oak_fence_gate",
+                vec![
+                    ("facing", "north"),
+                    ("in_wall", "false"),
+                    ("open", "true"),
+                    ("powered", "false"),
+                ],
+            ),
+            (
+                "oak_door",
+                vec![
+                    ("facing", "north"),
+                    ("half", "lower"),
+                    ("hinge", "left"),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            ),
+        ] {
+            let mut block = state(name);
+            block.properties = properties
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect();
+            assert_eq!(
+                monster_block_flags(&block).unwrap(),
+                (true, false),
+                "{name}"
+            );
+            block.properties.remove("north");
+            block.properties.remove("facing");
+            assert!(monster_block_flags(&block).is_err(), "malformed {name}");
+        }
+        assert_eq!(
+            monster_block_flags(&state("oak_planks")).unwrap(),
+            (true, true)
+        );
+        let mut invalid = state("oak_planks");
+        invalid.properties.insert("extra".into(), "true".into());
+        assert!(monster_block_flags(&invalid).is_err());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn monster_room_block_flags_match_java() {
         use std::{path::PathBuf, process::Command};
@@ -18317,7 +18382,7 @@ mod tests {
             );
             count += 1;
         }
-        assert!(count >= 70, "missing block states");
+        assert!(count >= 2_000, "missing block states: {count}");
     }
 
     #[test]

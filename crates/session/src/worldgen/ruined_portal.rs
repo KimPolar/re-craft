@@ -143,6 +143,23 @@ pub struct SavedRuinedPortalPiece {
 }
 
 impl SavedRuinedPortalPiece {
+    /// Decorate an unpublished region after its template has been placed.
+    pub fn decorate(
+        &self,
+        world: &mut impl native_resources::ruined_portal_decoration::PortalDecorationWorld,
+        random: &mut native_core::random::DecorationRandom,
+    ) -> Result<()> {
+        self.validate()?;
+        native_resources::ruined_portal_decoration::PortalDecoration {
+            bounds: self.bounds,
+            placement: self.placement,
+            cold: self.properties.cold,
+            overgrown: self.properties.overgrown,
+            vines: self.properties.vines,
+        }
+        .apply(world, random)
+    }
+
     /// Prepare the template processor chain from this piece's saved settings.
     pub fn prepare_processors(
         &self,

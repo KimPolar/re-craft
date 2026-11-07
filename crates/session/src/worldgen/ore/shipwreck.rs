@@ -320,8 +320,8 @@ mod tests {
     use native_resources::{packs::ResourceStack, shipwreck::Piece, structure_transform::Rotation};
 
     #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn places_installed_shipwreck_templates_in_generation_draft() -> Result<()> {
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn installed_shipwreck_drafts_match_java() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -331,6 +331,24 @@ mod tests {
         let motion = HeightmapTags::load(&mut resources, &ids)?;
         let update_tags =
             super::super::ruined_portal::PortalUpdateTags::load(&mut resources, &ids)?;
+        for id in &ids {
+            for (tag, expected) in [
+                ("minecraft:fences", id.ends_with("_fence")),
+                (
+                    "minecraft:wooden_fences",
+                    id.ends_with("_fence") && id != "minecraft:nether_brick_fence",
+                ),
+                ("minecraft:shulker_boxes", id.ends_with("shulker_box")),
+            ] {
+                ensure!(
+                    update_tags
+                        .fence_tags
+                        .contains(&ResourceId::parse(tag)?, id)?
+                        == expected,
+                    "Java oracle tag setup differs for {tag}: {id}"
+                );
+            }
+        }
         let names = [
             "with_mast",
             "upsidedown_full",
@@ -353,17 +371,100 @@ mod tests {
             "rightsideup_fronthalf_degraded",
             "rightsideup_backhalf_degraded",
         ];
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let source = temp.path().join("ShipwreckDraftOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/ShipwreckDraftOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("ShipwreckDraftOracle")
+            .args(names)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        let mut oracle = BTreeMap::<(String, usize), BTreeMap<[i32; 3], String>>::new();
+        let mut current = None;
+        for line in text.lines() {
+            let row: Vec<_> = line.split('\t').collect();
+            match row.as_slice() {
+                ["C", name, rotation] => {
+                    let key = ((*name).to_owned(), rotation.parse()?);
+                    ensure!(
+                        oracle.insert(key.clone(), BTreeMap::new()).is_none(),
+                        "duplicate Java case"
+                    );
+                    current = Some(key);
+                }
+                ["B", x, y, z, state] => {
+                    let case = current.as_ref().context("Java block before case")?;
+                    let position = [x.parse()?, y.parse()?, z.parse()?];
+                    ensure!(
+                        oracle
+                            .get_mut(case)
+                            .unwrap()
+                            .insert(position, (*state).to_owned())
+                            .is_none(),
+                        "duplicate Java block"
+                    );
+                }
+                _ => {}
+            }
+        }
+        ensure!(oracle.len() == names.len() * 4, "missing Java cases");
         for name in names {
             let id = ResourceId::parse(&format!("minecraft:shipwreck/{name}"))?;
             let template = Arc::new(
                 StructureTemplate::load(&mut resources, &id)?.context("missing template")?,
             );
-            for rotation in [
+            for (rotation_index, rotation) in [
                 Rotation::None,
                 Rotation::Clockwise90,
                 Rotation::Clockwise180,
                 Rotation::Counterclockwise90,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let piece = Piece {
                     template: format!("minecraft:shipwreck/{name}"),
                     position: [0, 5, 0],
@@ -395,7 +496,7 @@ mod tests {
                     .with_context(|| format!("placing {name} {rotation:?}"))?;
                 region.finish()?;
                 let snapshot = terrain.snapshot();
-                let mut placed = 0;
+                let mut placed = BTreeMap::new();
                 for y in 0..16 {
                     for z in -16..32 {
                         for x in -16..32 {
@@ -406,12 +507,32 @@ mod tests {
                                 "minecraft:air"
                             };
                             if state.name != original {
-                                placed += 1;
+                                let properties = state
+                                    .properties
+                                    .iter()
+                                    .map(|(key, value)| format!("{key}={value}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                placed.insert([x, y, z], format!("{}|{properties}", state.name));
                             }
                         }
                     }
                 }
-                ensure!(placed > 0, "template {name} {rotation:?} placed no blocks");
+                ensure!(
+                    !placed.is_empty(),
+                    "template {name} {rotation:?} placed no blocks"
+                );
+                let expected = oracle
+                    .remove(&(name.to_owned(), rotation_index))
+                    .context("missing Java case")?;
+                for pos in placed.keys().chain(expected.keys()) {
+                    ensure!(
+                        placed.get(pos) == expected.get(pos),
+                        "{name} {rotation:?} at {pos:?}: Rust {:?}, Java {:?}",
+                        placed.get(pos),
+                        expected.get(pos)
+                    );
+                }
             }
         }
         Ok(())

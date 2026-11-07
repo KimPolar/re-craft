@@ -91,6 +91,28 @@ fn all_trapdoor_shapes_and_fluids_match_java() -> Result<(), Box<dyn std::error:
             assert_eq!(f.kind, FluidKind::Water);
             assert!(f.source);
         }
+        let air = BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        let water = BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        };
+        assert_eq!(
+            row[14], "false",
+            "shape-dependent light needs separate handling: {line}"
+        );
+        assert_eq!(
+            native_world::block_light::same_light_behavior(&air, &state),
+            Some(!row[15].parse::<bool>()?),
+            "{line}"
+        );
+        assert_eq!(
+            native_world::block_light::same_light_behavior(&water, &state),
+            Some(!row[16].parse::<bool>()?),
+            "{line}"
+        );
         families.insert(state.name);
         count += 1;
     }

@@ -4,6 +4,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.TrapDoorBlock;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.lighting.LightEngine;
 
 public class TrapdoorCollisionOracle {
   public static void main(String[] args) {
@@ -15,7 +17,7 @@ public class TrapdoorCollisionOracle {
         var boxes=shape.toAabbs();var outlines=outline.toAabbs();
         if(boxes.size()!=1||outlines.size()!=1||!boxes.get(0).equals(outlines.get(0))) throw new AssertionError("unexpected shape");
         var b=boxes.get(0);
-        out.printf("S %s %s %s %s %s %s %s %s %s %s %s %s %s%n",BuiltInRegistries.BLOCK.getKey(block),state.getValue(TrapDoorBlock.FACING).getName(),state.getValue(TrapDoorBlock.HALF).getSerializedName(),state.getValue(TrapDoorBlock.OPEN),state.getValue(TrapDoorBlock.POWERED),state.getValue(TrapDoorBlock.WATERLOGGED),b.minX,b.minY,b.minZ,b.maxX,b.maxY,b.maxZ,state.getFluidState().isEmpty());
+        out.printf("S %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s%n",BuiltInRegistries.BLOCK.getKey(block),state.getValue(TrapDoorBlock.FACING).getName(),state.getValue(TrapDoorBlock.HALF).getSerializedName(),state.getValue(TrapDoorBlock.OPEN),state.getValue(TrapDoorBlock.POWERED),state.getValue(TrapDoorBlock.WATERLOGGED),b.minX,b.minY,b.minZ,b.maxX,b.maxY,b.maxZ,state.getFluidState().isEmpty(),state.useShapeForLightOcclusion(),LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state),LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state));
       }
     }
   }

@@ -132,6 +132,43 @@ impl ShapeEdgeWorld for ShipwreckRegion<'_, '_, '_> {
         if super::jigsaw::jigsaw_wood(state) {
             return Ok(state.clone());
         }
+        if let Some(waterlogged) = native_world::collision::fence_waterlogged(state) {
+            ensure!(
+                self.template
+                    .inner
+                    .registry
+                    .is_canonical_state(&neighbor.name, &neighbor.properties),
+                "invalid shipwreck fence neighbor"
+            );
+            if waterlogged {
+                SpringWorld::schedule_spring_tick(
+                    self.template.inner.region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            let side = match direction {
+                [-1, 0, 0] => Some("west"),
+                [1, 0, 0] => Some("east"),
+                [0, 0, -1] => Some("north"),
+                [0, 0, 1] => Some("south"),
+                [0, -1, 0] | [0, 1, 0] => None,
+                _ => bail!("invalid shipwreck fence direction"),
+            };
+            let mut updated = state.clone();
+            if let Some(side) = side {
+                let connected = super::super::postprocessing_world::fence_connection(
+                    &self.template.wall_tags.fence_tags,
+                    state,
+                    neighbor,
+                    direction,
+                )?;
+                updated
+                    .properties
+                    .insert(side.into(), connected.to_string());
+            }
+            return Ok(updated);
+        }
         if native_world::collision::door_open(state).is_some() {
             ensure!(
                 self.template
@@ -188,6 +225,7 @@ impl ShapeEdgeWorld for ShipwreckRegion<'_, '_, '_> {
         let old = JigsawPlacementWorld::block(self, pos)?;
         if super::jigsaw::jigsaw_wood(state)
             || native_world::collision::door_open(state).is_some()
+            || native_world::collision::fence_waterlogged(state).is_some()
             || (is_air(state) && native_world::collision::door_open(&old).is_some())
         {
             ensure!(matches!(flags, 2 | 18), "unsupported shipwreck shape flags");
@@ -211,7 +249,9 @@ impl StructurePlacementWorld for ShipwreckRegion<'_, '_, '_> {
         nbt: Option<&Tag>,
         random: &mut DecorationRandom,
     ) -> Result<bool> {
-        if super::jigsaw::jigsaw_wood(state) || native_world::collision::door_open(state).is_some()
+        if super::jigsaw::jigsaw_wood(state)
+            || native_world::collision::door_open(state).is_some()
+            || native_world::collision::fence_waterlogged(state).is_some()
         {
             ensure!(nbt.is_none(), "wood block entity is unsupported");
             return self
@@ -281,7 +321,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn places_shipwreck_wood_trapdoor_and_chest_in_generation_draft() -> Result<()> {
+    fn places_shipwreck_blocks_in_generation_draft() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -312,7 +352,7 @@ mod tests {
                 value: Tag::Compound(vec![]),
             },
             data_version: Some(5023),
-            size: [4, 2, 1],
+            size: [6, 2, 1],
             palettes: vec![vec![
                 palette("minecraft:oak_planks"),
                 palette("minecraft:chest"),
@@ -326,6 +366,7 @@ mod tests {
                         Tag::Compound(vec![("half".into(), Tag::String("upper".into()))]),
                     ),
                 ]),
+                palette("minecraft:oak_fence"),
             ]],
             blocks: vec![
                 TemplateBlock {
@@ -356,6 +397,16 @@ mod tests {
                 TemplateBlock {
                     position: [3, 1, 0],
                     state: 5,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [4, 0, 0],
+                    state: 0,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [5, 0, 0],
+                    state: 6,
                     nbt: None,
                 },
             ],
@@ -406,6 +457,10 @@ mod tests {
         );
         assert_eq!(snapshot.block(7, 8, 4).unwrap().properties["half"], "lower");
         assert_eq!(snapshot.block(7, 9, 4).unwrap().properties["half"], "upper");
+        let fence = snapshot.block(9, 8, 4).unwrap();
+        assert_eq!(fence.name, "minecraft:oak_fence");
+        assert_eq!(fence.properties["east"], "false");
+        assert_eq!(fence.properties["west"], "true");
         let Tag::List { values, .. } =
             terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
         else {
@@ -417,9 +472,49 @@ mod tests {
         );
         assert_eq!(values[0].get("LootTableSeed"), Some(&Tag::Long(loot_seed)));
 
+        let (mut wet_terrain, wet_tags, _, _) = super::super::tests::fixture();
+        let writable = wet_terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = wet_terrain.decoration_region(&wet_tags, &motion, writable)?;
+        let (name, properties) = registry.resolve(&serde_json::json!("minecraft:oak_fence"))?;
+        let mut wet = BlockState { name, properties };
+        wet.properties.insert("waterlogged".into(), "true".into());
+        let stone = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        };
+        let mut world = ShipwreckRegion {
+            template: super::super::ruined_portal::PortalTemplateRegion {
+                inner: super::super::jigsaw::JigsawRegion {
+                    region: &mut region,
+                    registry: &registry,
+                },
+                wall_tags: &update_tags,
+                temporary_jigsaws: BTreeSet::new(),
+            },
+        };
+        let updated = ShapeEdgeWorld::update_shape(
+            &mut world,
+            [8, 8, 4],
+            &wet,
+            [1, 0, 0],
+            [9, 8, 4],
+            &stone,
+        )?;
+        assert_eq!(updated.properties["east"], "true");
+        assert_eq!(updated.properties["waterlogged"], "true");
+        region.finish()?;
+        let wet_snapshot = wet_terrain.snapshot();
+        let ticks = wet_snapshot
+            .saved_fluid_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .context("waterlogged fence tick missing")?;
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].position, [8, 8, 4]);
+        assert_eq!(ticks[0].fluid, "minecraft:water");
+
         let template = Arc::make_mut(&mut start.template);
-        template.palettes[0].push(palette("minecraft:oak_fence"));
-        template.blocks[0].state = 6;
+        template.palettes[0].push(palette("minecraft:lever"));
+        template.blocks[0].state = 7;
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();

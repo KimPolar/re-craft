@@ -75,6 +75,7 @@ pub struct PortalUpdateTags {
     bubble_fluids: BTreeSet<String>,
     bubble_drag: BTreeSet<String>,
     bubble_push: BTreeSet<String>,
+    pub(super) fence_tags: Arc<OreBlockTags>,
 }
 
 impl PortalUpdateTags {
@@ -82,7 +83,16 @@ impl PortalUpdateTags {
         resources: &mut impl native_resources::packs::ResourceProvider,
         blocks: &BTreeSet<String>,
     ) -> Result<Self> {
+        let fence_tags = [
+            "minecraft:fences",
+            "minecraft:wooden_fences",
+            "minecraft:shulker_boxes",
+        ]
+        .into_iter()
+        .map(ResourceId::parse)
+        .collect::<Result<BTreeSet<_>>>()?;
         Ok(Self {
+            fence_tags: Arc::new(OreBlockTags::load(resources, blocks, &fence_tags)?),
             walls: resolve_block_tag(resources, &ResourceId::parse("minecraft:walls")?, blocks)?,
             post_override: resolve_block_tag(
                 resources,
@@ -1747,6 +1757,7 @@ mod tests {
             bubble_fluids: wall_tags.bubble_fluids.clone(),
             bubble_drag: wall_tags.bubble_drag.clone(),
             bubble_push: wall_tags.bubble_push.clone(),
+            fence_tags: Arc::clone(&wall_tags.fence_tags),
         };
         custom_tags.walls.insert("minecraft:air".into());
         custom_tags.post_override.insert("minecraft:air".into());

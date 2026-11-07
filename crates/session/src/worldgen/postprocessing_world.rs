@@ -1170,71 +1170,68 @@ fn bonus_falling_shape_schedules(state: &BlockState) -> bool {
     ) && state.properties.is_empty()
 }
 
-impl GeneratedBlockView<'_> {
-    fn fence_connection(
-        &self,
-        state: &BlockState,
-        neighbor: &BlockState,
-        direction: [i32; 3],
-    ) -> Result<bool> {
-        use native_resources::packs::ResourceId;
-        let tags = self
-            .fence_tags
-            .context("fence connection tags unavailable")?;
-        let fences = ResourceId::parse("minecraft:fences")?;
-        let wooden = ResourceId::parse("minecraft:wooden_fences")?;
-        let shulkers = ResourceId::parse("minecraft:shulker_boxes")?;
-        if tags.contains(&fences, &neighbor.name)?
-            && tags.contains(&wooden, &neighbor.name)? == tags.contains(&wooden, &state.name)?
-        {
-            return Ok(true);
-        }
-        let gate = neighbor
-            .name
-            .strip_prefix("minecraft:")
-            .and_then(|name| name.strip_suffix("_fence_gate"))
-            .is_some_and(|family| {
-                native_core::wood::Planks::ALL.into_iter().any(|wood| {
-                    wood.id()
-                        .strip_prefix("minecraft:")
-                        .and_then(|id| id.strip_suffix("_planks"))
-                        == Some(family)
-                })
-            });
-        if gate {
-            ensure!(
-                neighbor.properties.len() == 4
-                    && ["in_wall", "open", "powered"].iter().all(|key| matches!(
-                        neighbor.properties.get(*key).map(String::as_str),
-                        Some("true" | "false")
-                    )),
-                "invalid fence gate state"
-            );
-            let gate_x = match neighbor.properties.get("facing").map(String::as_str) {
-                Some("east" | "west") => true,
-                Some("north" | "south") => false,
-                _ => anyhow::bail!("invalid fence gate facing"),
-            };
-            return Ok(gate_x != (direction[0] != 0));
-        }
-        let except = leaf_distance(neighbor)?.is_some()
-            || matches!(
-                neighbor.name.as_str(),
-                "minecraft:barrier"
-                    | "minecraft:carved_pumpkin"
-                    | "minecraft:jack_o_lantern"
-                    | "minecraft:melon"
-                    | "minecraft:pumpkin"
-            )
-            || tags.contains(&shulkers, &neighbor.name)?;
-        if except {
-            return Ok(false);
-        }
-        let face = glam::IVec3::new(-direction[0], -direction[1], -direction[2]);
-        native_world::collision::button_support_face(neighbor, face)
-            .with_context(|| format!("unsupported fence neighbor support: {}", neighbor.name))
+pub(super) fn fence_connection(
+    tags: &native_resources::ore_feature::OreBlockTags,
+    state: &BlockState,
+    neighbor: &BlockState,
+    direction: [i32; 3],
+) -> Result<bool> {
+    use native_resources::packs::ResourceId;
+    let fences = ResourceId::parse("minecraft:fences")?;
+    let wooden = ResourceId::parse("minecraft:wooden_fences")?;
+    let shulkers = ResourceId::parse("minecraft:shulker_boxes")?;
+    if tags.contains(&fences, &neighbor.name)?
+        && tags.contains(&wooden, &neighbor.name)? == tags.contains(&wooden, &state.name)?
+    {
+        return Ok(true);
     }
+    let gate = neighbor
+        .name
+        .strip_prefix("minecraft:")
+        .and_then(|name| name.strip_suffix("_fence_gate"))
+        .is_some_and(|family| {
+            native_core::wood::Planks::ALL.into_iter().any(|wood| {
+                wood.id()
+                    .strip_prefix("minecraft:")
+                    .and_then(|id| id.strip_suffix("_planks"))
+                    == Some(family)
+            })
+        });
+    if gate {
+        ensure!(
+            neighbor.properties.len() == 4
+                && ["in_wall", "open", "powered"].iter().all(|key| matches!(
+                    neighbor.properties.get(*key).map(String::as_str),
+                    Some("true" | "false")
+                )),
+            "invalid fence gate state"
+        );
+        let gate_x = match neighbor.properties.get("facing").map(String::as_str) {
+            Some("east" | "west") => true,
+            Some("north" | "south") => false,
+            _ => anyhow::bail!("invalid fence gate facing"),
+        };
+        return Ok(gate_x != (direction[0] != 0));
+    }
+    let except = leaf_distance(neighbor)?.is_some()
+        || matches!(
+            neighbor.name.as_str(),
+            "minecraft:barrier"
+                | "minecraft:carved_pumpkin"
+                | "minecraft:jack_o_lantern"
+                | "minecraft:melon"
+                | "minecraft:pumpkin"
+        )
+        || tags.contains(&shulkers, &neighbor.name)?;
+    if except {
+        return Ok(false);
+    }
+    let face = glam::IVec3::new(-direction[0], -direction[1], -direction[2]);
+    native_world::collision::button_support_face(neighbor, face)
+        .with_context(|| format!("unsupported fence neighbor support: {}", neighbor.name))
+}
 
+impl GeneratedBlockView<'_> {
     fn slab(&self, state: &BlockState) -> Option<(bool, bool)> {
         if !state.name.starts_with("minecraft:")
             || !state.name.ends_with("_slab")
@@ -2354,8 +2351,14 @@ impl ShapeEdgeWorld for GeneratedBlockView<'_> {
                 let mut updated = state.clone();
                 updated.properties.insert(
                     side.into(),
-                    self.fence_connection(state, neighbor, direction)?
-                        .to_string(),
+                    fence_connection(
+                        self.fence_tags
+                            .context("fence connection tags unavailable")?,
+                        state,
+                        neighbor,
+                        direction,
+                    )?
+                    .to_string(),
                 );
                 return Ok(updated);
             }

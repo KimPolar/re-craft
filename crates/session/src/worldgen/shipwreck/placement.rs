@@ -45,7 +45,79 @@ pub struct DataMarker {
     pub metadata: JavaString,
 }
 
+struct JigsawMarker {
+    position: [i32; 3],
+    final_state: BlockState,
+}
+
 impl PreparedStart {
+    fn jigsaw_markers(
+        &self,
+        registry: &GeneratedBlockRegistry,
+        clip: BoundingBox,
+    ) -> Result<Vec<JigsawMarker>> {
+        let count =
+            i32::try_from(self.template.palettes.len()).context("too many shipwreck palettes")?;
+        let [x, y, z] = self.piece.position;
+        let index = LegacyRandom::new(positional_seed(x, y, z))
+            .next_int_bound(count)
+            .context("shipwreck has no palettes")? as usize;
+        let palette = &self.template.palettes[index];
+        let mut markers = Vec::new();
+        for block in &self.template.blocks {
+            let Some(Tag::String(name)) = palette
+                .get(block.state)
+                .context("shipwreck palette index out of bounds")?
+                .get("id")
+            else {
+                anyhow::bail!("template block identifier missing")
+            };
+            if !(name.matches("minecraft:jigsaw") || name.matches("jigsaw")) {
+                continue;
+            }
+            let Some(nbt) = &block.nbt else { continue };
+            let Tag::Compound(fields) = nbt else {
+                anyhow::bail!("jigsaw marker is not a compound")
+            };
+            let position = native_resources::structure_transform::block_world_position(
+                block.position,
+                self.piece.position,
+                Mirror::None,
+                self.piece.rotation,
+                shipwreck::PIVOT,
+            );
+            if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&position[axis])) {
+                continue;
+            }
+            ensure!(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key.matches("final_state"))
+                    .count()
+                    <= 1,
+                "duplicate jigsaw final_state"
+            );
+            let raw = match nbt.get("final_state") {
+                Some(Tag::String(value)) => value.to_string_lossy(),
+                _ => "minecraft:air".to_owned(),
+            };
+            let final_state =
+                native_persistence::jigsaw_replacement::parse_final_state(registry, &raw)?
+                    .unwrap_or_else(|| BlockState {
+                        name: "minecraft:air".into(),
+                        properties: Default::default(),
+                    });
+            markers.push((
+                block.position,
+                JigsawMarker {
+                    position,
+                    final_state,
+                },
+            ));
+        }
+        markers.sort_by_key(|(position, _)| (position[1], position[0], position[2]));
+        Ok(markers.into_iter().map(|(_, marker)| marker).collect())
+    }
     /// Prepare ordered block writes and DATA markers for one clipped chunk.
     /// State rotation happens later, when each record is placed.
     pub fn block_records(
@@ -101,9 +173,6 @@ impl PreparedStart {
                         metadata,
                     });
                 }
-                "minecraft:jigsaw" => {
-                    anyhow::bail!("shipwreck jigsaw final-state processing is unsupported")
-                }
                 _ => blocks.push(record),
             }
         }
@@ -139,6 +208,7 @@ impl PreparedStart {
             *random = next;
             return Ok(false);
         }
+        let jigsaws = staged.jigsaw_markers(registry, clip)?;
         let shared = std::cell::RefCell::new(world);
         let (blocks, markers) =
             staged.block_records(registry, clip, is_static_full, &mut |position| {
@@ -168,6 +238,10 @@ impl PreparedStart {
                 .context("invalid shipwreck marker metadata")?;
             shipwreck::handle_data_marker(world, &mut next, &name, marker.position)?;
         }
+        for marker in jigsaws {
+            world.finalize_jigsaw_marker(marker.position, &marker.final_state)?;
+        }
+        world.finish_jigsaw_markers()?;
         *self = staged;
         *random = next;
         Ok(true)

@@ -271,6 +271,12 @@ impl StructurePlacementWorld for ShipwreckRegion<'_, '_, '_> {
     fn update_neighbors_at(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
         self.template.update_neighbors_at(pos, state)
     }
+    fn finalize_jigsaw_marker(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        self.template.finalize_jigsaw_marker(pos, state)
+    }
+    fn finish_jigsaw_markers(&mut self) -> Result<()> {
+        self.template.finish_jigsaw_markers()
+    }
 }
 impl ShipwreckPlacementWorld for ShipwreckRegion<'_, '_, '_> {}
 
@@ -732,8 +738,40 @@ mod tests {
         assert_eq!(ticks[0].fluid, "minecraft:water");
 
         let template = Arc::make_mut(&mut start.template);
+        template.palettes[0].push(palette("minecraft:jigsaw"));
+        let jigsaw_index = template.palettes[0].len() - 1;
+        for (position, final_state) in [
+            ([4, 1, 0], "minecraft:stone"),
+            ([5, 1, 0], "minecraft:stone[missing=value]"),
+        ] {
+            template.blocks.push(TemplateBlock {
+                position,
+                state: jigsaw_index,
+                nbt: Some(Tag::Compound(vec![(
+                    "final_state".into(),
+                    Tag::String(final_state.into()),
+                )])),
+            });
+        }
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut random = DecorationRandom::new(42);
+        region.place_shipwreck_start(&mut start, &registry, &update_tags, clip, &mut random)?;
+        region.finish()?;
+        let snapshot = terrain.snapshot();
+        assert_eq!(snapshot.block(8, 9, 4).unwrap().name, "minecraft:stone");
+        assert_eq!(snapshot.block(9, 9, 4).unwrap().name, "minecraft:air");
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing entities")
+        };
+        assert_eq!(values.len(), 1, "temporary jigsaw entities must be removed");
+
+        let template = Arc::make_mut(&mut start.template);
         template.palettes[0].push(palette("minecraft:lever"));
-        template.blocks[0].state = 7;
+        template.blocks[0].state = template.palettes[0].len() - 1;
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();

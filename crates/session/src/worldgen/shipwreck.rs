@@ -14,7 +14,9 @@ use native_resources::{
 };
 use serde_json::Value;
 
+mod placement;
 mod saved_piece;
+pub use placement::{DataMarker, ShipwreckPlacementWorld};
 pub use saved_piece::SavedShipwreckPiece;
 
 #[derive(Clone)]

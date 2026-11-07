@@ -763,8 +763,18 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn shipwreck_structure_data_matches_java_and_reloads() -> Result<()> {
-        use native_persistence::{nbt::NamedTag, structure_template::StructureTemplate};
-        use native_resources::{shipwreck::Piece, structure_transform::Rotation};
+        use native_persistence::{
+            generated_chunk::{FullChunkComponents, assemble_full_chunk},
+            generated_section::encode_generated_sections,
+            heightmap::{GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps},
+            nbt::NamedTag,
+            save::{FreshRegionDraft, FreshRegionKind},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            shipwreck::Piece, structure_start::HorizontalDirection, structure_transform::Rotation,
+        };
+        use native_world::loaded::{BIOME_COUNT, BLOCK_COUNT, BlockState, Chunk, Section, World};
         use std::{path::PathBuf, process::Command, sync::Arc};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
@@ -859,12 +869,121 @@ mod tests {
                 value: actual.clone(),
             })?,
         )?;
+        // Build an isolated FULL chunk and a temporary region. These synthetic
+        // components are test inputs, not a complete playable world.
+        let mut world = World::new("minecraft:overworld");
+        let air = world.intern_state(BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        });
+        let plank = world.intern_state(BlockState {
+            name: "minecraft:oak_planks".into(),
+            properties: BTreeMap::new(),
+        });
+        let chest = super::super::GeneratedLootChest::new(
+            [1, 8, 0],
+            HorizontalDirection::West,
+            "minecraft:chests/shipwreck_map",
+            -7,
+        )?;
+        let chest_state = world.intern_state(BlockState {
+            name: "minecraft:chest".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "west".into()),
+                ("type".into(), "single".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        });
+        let biome = world.intern_biome("minecraft:plains".into());
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        blocks[8 * 256] = plank;
+        blocks[1 + 8 * 256] = chest_state;
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: Some(Box::new([biome; BIOME_COUNT])),
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        let sections = encode_generated_sections(&world, pos, 0, 16, false, |_| true, |_| true)?;
+        let mut heights = [0; 256];
+        heights[0] = 9;
+        heights[1] = 9;
+        let heightmaps = encode_generated_heightmaps(
+            HeightBounds {
+                min_y: 0,
+                max_y: 16,
+            },
+            &GeneratedHeightmaps {
+                world_surface: Some(&heights),
+                ocean_floor: Some(&heights),
+                motion_blocking: Some(&heights),
+                motion_blocking_no_leaves: Some(&heights),
+                ..Default::default()
+            },
+        )?;
+        let empty = || Tag::List {
+            element_type: TagType::End,
+            values: vec![],
+        };
+        let mut chunk = assemble_full_chunk(FullChunkComponents {
+            position: pos,
+            min_y: 0,
+            height: 16,
+            last_update: 42,
+            sections,
+            heightmaps,
+            block_ticks: empty(),
+            fluid_ticks: empty(),
+            block_entities: Tag::List {
+                element_type: TagType::Compound,
+                values: vec![chest.block_entity()],
+            },
+        })?;
+        let Tag::Compound(fields) = &mut chunk.value else {
+            anyhow::bail!("invalid generated chunk")
+        };
+        let structure_field = fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("structures"))
+            .context("missing structure field")?;
+        structure_field.1 = actual.clone();
+        let directory = temp.path().join("region");
+        std::fs::create_dir(&directory)?;
+        let region_path = directory.join("r.0.0.mca");
+        let mut draft = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        draft.add(
+            native_persistence::world::ChunkPos { x: 0, z: 0 },
+            &chunk,
+            42,
+        )?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&region_path)?;
+        ensure!(
+            draft.write_staged(&mut file)?.is_empty(),
+            "unexpected external chunk"
+        );
+        drop(file);
         let result = Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(cp)
             .arg("ShipwreckStructureDataOracle")
             .arg(&java_path)
             .arg(&rust_path)
+            .arg(&directory)
             .output()?;
         ensure!(
             result.status.success(),
@@ -873,7 +992,54 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         let expected = native_persistence::nbt::read(&std::fs::read(java_path)?)?.value;
-        assert_eq!(canonical(actual), canonical(expected));
+        assert_eq!(canonical(actual.clone()), canonical(expected));
+        let reopened = native_persistence::anvil::RegionReader::open(&region_path)?
+            .read_chunk(0, 0)?
+            .context("Java rewrote no chunk")?;
+        assert_eq!(
+            canonical(
+                reopened
+                    .value
+                    .get("structures")
+                    .context("rewritten structures missing")?
+                    .clone()
+            ),
+            canonical(actual)
+        );
+        let sections = native_persistence::palette::decode_sections(&reopened.value)?;
+        let state = sections
+            .iter()
+            .find(|section| section.y == 0)
+            .and_then(|section| section.blocks.as_ref())
+            .and_then(|blocks| blocks.block(0, 8, 0))
+            .context("rewritten block missing")?;
+        ensure!(
+            state.name.matches("minecraft:oak_planks"),
+            "Java changed block state"
+        );
+        let chest = sections
+            .iter()
+            .find(|section| section.y == 0)
+            .and_then(|section| section.blocks.as_ref())
+            .and_then(|blocks| blocks.block(1, 8, 0))
+            .context("rewritten chest missing")?;
+        ensure!(
+            chest.name.matches("minecraft:chest"),
+            "Java changed chest state"
+        );
+        let Tag::List { values, .. } = reopened
+            .value
+            .get("block_entities")
+            .context("rewritten chest entity missing")?
+        else {
+            anyhow::bail!("invalid chest entities")
+        };
+        ensure!(
+            values.len() == 1
+                && matches!(values[0].get("LootTable"), Some(Tag::String(id)) if id.matches("minecraft:chests/shipwreck_map"))
+                && values[0].get("LootTableSeed") == Some(&Tag::Long(-7)),
+            "Java changed chest loot data"
+        );
         Ok(())
     }
 

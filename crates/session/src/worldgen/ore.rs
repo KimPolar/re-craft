@@ -7466,9 +7466,8 @@ impl LakeWorld for DecorationRegion<'_> {
                 "generation block chunk is missing"
             );
             let valid = match state.name.as_str() {
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:stone" | "minecraft:ice" => {
-                    state.properties.is_empty()
-                }
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:stone" | "minecraft:ice"
+                | "minecraft:sulfur" => state.properties.is_empty(),
                 "minecraft:water" | "minecraft:lava" => {
                     native_world::fluid::FluidState::from_block(state)
                         .map_err(anyhow::Error::msg)?
@@ -7476,7 +7475,7 @@ impl LakeWorld for DecorationRegion<'_> {
                 }
                 _ => false,
             };
-            ensure!(valid, "unsupported lake replacement effects");
+            ensure!(valid, "unsupported lake replacement effects: {state:?}");
             if self.is_outside(pos[1]) {
                 return Ok(true);
             }
@@ -7718,7 +7717,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     // A source-water block emits no light; a lichen with a
                     // face emits light and always requires a block check.
                     let lichen_check = water_lichen_write;
-                    let lake_source = (old.name == "minecraft:stone" && old.properties.is_empty())
+                    let lake_source = (matches!(
+                        old.name.as_str(),
+                        "minecraft:stone" | "minecraft:cinnabar" | "minecraft:sulfur"
+                    ) && old.properties.is_empty())
                         || (old.name == "minecraft:deepslate"
                             && old.properties.len() == 1
                             && matches!(
@@ -7728,8 +7730,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let lake_light_update = self.lake_block_write
                         && lake_source
                         && ((state.name == "minecraft:cave_air" && state.properties.is_empty())
-                            || (state.name == "minecraft:lava"
-                                && state.properties.len() == 1
+                            || (matches!(
+                                state.name.as_str(),
+                                "minecraft:lava" | "minecraft:water"
+                            ) && state.properties.len() == 1
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
@@ -12009,6 +12013,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_sulfur_lake_light_matches_java_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_cinnabar_water",
+            "vine_active_lake_cinnabar_air",
+            "vine_active_lake_cinnabar_sulfur",
+            "vine_active_self_lake_sulfur_water",
+            "vine_active_self_lake_sulfur_air",
+            "vine_active_self_lake_stone_sulfur",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_clay_to_water_matches_java_light_across_25_columns() {
         check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
     }
@@ -12330,6 +12347,10 @@ mod tests {
             if mode.contains("_lake_") {
                 let mut source = state(if mode.contains("_iron_ore_") {
                     "deepslate_iron_ore"
+                } else if mode.contains("_cinnabar_") {
+                    "cinnabar"
+                } else if mode.contains("_sulfur_") {
+                    "sulfur"
                 } else if mode.contains("_deepslate_") {
                     "deepslate"
                 } else {
@@ -12542,14 +12563,19 @@ mod tests {
                 }
                 if mode.contains("_lake_") {
                     let lava = mode.ends_with("_lava") || (mode.ends_with("_mixed") && i == 1);
+                    let water = mode.ends_with("_water");
                     let mut block = state(if mode.ends_with("_stone") {
                         "stone"
+                    } else if mode.ends_with("_sulfur") {
+                        "sulfur"
+                    } else if water {
+                        "water"
                     } else if lava {
                         "lava"
                     } else {
                         "cave_air"
                     });
-                    if lava {
+                    if lava || water {
                         block.properties.insert("level".into(), "0".into());
                     }
                     assert!(draft.set_lake_block(p, &block).unwrap());
@@ -12611,6 +12637,8 @@ mod tests {
             } else if mode.ends_with("_jigsaw_fence") {
                 0
             } else if mode.contains("_iron_ore_") {
+                0
+            } else if mode.contains("_lake_") && mode.ends_with("_sulfur") {
                 0
             } else if mode.contains("_lake_") && mode.ends_with("_mixed") {
                 3
@@ -23491,6 +23519,46 @@ mod tests {
             assert_eq!(random.next_long(), next_random[name], "random state {name}");
             region.finish().unwrap();
         }
+    }
+
+    #[test]
+    fn sulfur_lake_writes_preserve_transaction_boundaries() {
+        let (mut terrain, tags, _, _) = fixture();
+        let names = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "diamond_ore",
+            "cinnabar",
+            "sulfur",
+            "water",
+        ]
+        .into_iter()
+        .map(|name| format!("minecraft:{name}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut Data, &names).unwrap();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        for pos in [[1, 7, 1], [2, 7, 1]] {
+            region.set_proto_block(pos, &state("cinnabar")).unwrap();
+        }
+        assert!(region.set_lake_block([1, 7, 1], &state("sulfur")).unwrap());
+        let mut water = state("water");
+        water.properties.insert("level".into(), "0".into());
+        assert!(region.set_lake_block([2, 7, 1], &water).unwrap());
+        region.finish().unwrap();
+        let before = terrain.snapshot();
+        assert_eq!(before.block(1, 7, 1).unwrap().name, "minecraft:sulfur");
+        assert_eq!(before.block(2, 7, 1).unwrap(), &water);
+
+        let writable = before.chunks.keys().copied().collect();
+        let mut failed = terrain.decoration_region(&tags, &motion, writable).unwrap();
+        let mut invalid = state("sulfur");
+        invalid.properties.insert("invalid".into(), "true".into());
+        assert!(failed.set_lake_block([1, 7, 1], &invalid).is_err());
+        assert!(failed.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]

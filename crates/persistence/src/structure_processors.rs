@@ -58,6 +58,10 @@ enum Processor {
     },
     Rule(Vec<Rule>),
     Protected(BTreeSet<String>),
+    Age {
+        mossiness: f32,
+        tags: crate::structure_block_age::AgeTags,
+    },
 }
 
 /// Decoded, ordered processors with data-pack tags already resolved.
@@ -209,6 +213,10 @@ impl PreparedProcessors {
                     provider,
                     blocks,
                 )?),
+                "minecraft:block_age" => Processor::Age {
+                    mossiness: number(entry, "mossiness")?,
+                    tags: crate::structure_block_age::AgeTags::load(provider, blocks)?,
+                },
                 "minecraft:rule" => {
                     let values = entry
                         .get("rules")
@@ -300,6 +308,10 @@ impl PreparedProcessors {
                             break;
                         }
                     }
+                }
+                Processor::Age { mossiness, tags } => {
+                    let mut random = LegacyRandom::new(positional_seed(x, y, z));
+                    block.state = tags.process(&block.state, *mossiness, &mut random)?;
                 }
             }
         }

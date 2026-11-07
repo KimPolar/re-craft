@@ -19,6 +19,7 @@ pub mod random_sequences;
 pub mod save;
 mod save_transaction;
 pub mod snbt;
+pub mod structure_block_age;
 pub mod structure_processors;
 pub mod structure_template;
 pub mod world;

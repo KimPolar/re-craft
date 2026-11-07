@@ -7941,7 +7941,7 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 let value = match path {
                     "data/example/worldgen/structure/test.json" => {
-                        Some(if (9..=13).contains(&self.feature_kind) {
+                        Some(if (9..=29).contains(&self.feature_kind) {
                             json!({"type":"minecraft:ruined_portal","biomes":["minecraft:plains"],"step":"surface_structures",
                             "setups":[{"placement":"on_land_surface","air_pocket_probability":0.0,
                                 "mossiness":0.0,"overgrown":false,"vines":false,"can_be_cold":false,
@@ -8028,6 +8028,7 @@ mod tests {
             element_type,
             values,
         };
+        let mut installed_templates = BTreeSet::new();
         for (unsupported, terrain_matching, block_name, feature_kind) in [
             (false, false, "minecraft:stone_bricks", 0),
             (true, false, "minecraft:stone_bricks", 0),
@@ -8068,17 +8069,14 @@ mod tests {
             (false, false, "minecraft:packed_ice", 8),
             (false, false, "minecraft:obsidian", 9),
             (true, false, "minecraft:obsidian", 9),
-            (false, false, "minecraft:obsidian", 10),
-            (false, false, "minecraft:obsidian", 11),
-            (false, false, "minecraft:obsidian", 12),
-            (false, false, "minecraft:obsidian", 13),
         ]
         .into_iter()
+        .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
         .filter(|(_, _, _, kind)| {
             if portal_kind == 0 {
-                !(9..=13).contains(kind)
+                !(9..=29).contains(kind)
             } else if portal_kind == 10 {
-                (10..=13).contains(kind)
+                (10..=29).contains(kind)
             } else {
                 *kind == portal_kind
             }
@@ -8144,13 +8142,13 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if (4..=13).contains(&feature_kind) {
+            if (4..=29).contains(&feature_kind) {
                 terrain_definition["settings"]["noise_router"]["final_density"] = json!({
                     "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
                     "from_value":1.0, "to_value":-1.0
                 });
             }
-            let height = if (10..=13).contains(&feature_kind) {
+            let height = if (10..=29).contains(&feature_kind) {
                 48
             } else {
                 16
@@ -8186,7 +8184,7 @@ mod tests {
                     has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
                 })
             };
-            let target = if (10..=13).contains(&feature_kind) {
+            let target = if (10..=29).contains(&feature_kind) {
                 structures.request_starts(source)?;
                 while structures
                     .step(&mut data, &mut classify_structure)?
@@ -8215,7 +8213,17 @@ mod tests {
                 .step(&mut data, &mut classify_structure)?
                 .is_some()
             {}
-            let portal_bounds = if (9..=13).contains(&feature_kind) {
+            if (10..=29).contains(&feature_kind) {
+                installed_templates.insert(
+                    structures
+                        .ruined_portal_starts(source)
+                        .context("missing portal")?[&structure]
+                        .piece
+                        .template
+                        .clone(),
+                );
+            }
+            let portal_bounds = if (9..=29).contains(&feature_kind) {
                 Some(
                     structures
                         .ruined_portal_starts(source)
@@ -8226,7 +8234,7 @@ mod tests {
             } else {
                 None
             };
-            let mut origin = if (9..=13).contains(&feature_kind) {
+            let mut origin = if (9..=29).contains(&feature_kind) {
                 structures
                     .ruined_portal_starts(source)
                     .context("missing portal")?[&structure]
@@ -8311,7 +8319,10 @@ mod tests {
                         failed = true;
                         break;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("seed {seed}, fixture {feature_kind}"));
+                    }
                 }
             }
             assert_eq!(failed, unsupported);
@@ -8332,7 +8343,7 @@ mod tests {
                         })
                     });
                     assert!(found, "{block_name} pile produced no matching blocks");
-                } else if (10..=13).contains(&feature_kind) {
+                } else if (10..=29).contains(&feature_kind) {
                     let bounds = portal_bounds.context("missing portal bounds")?;
                     let found = (bounds.min[0]..=bounds.max[0]).any(|x| {
                         (bounds.min[1]..=bounds.max[1]).any(|y| {
@@ -8366,9 +8377,9 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=13).contains(&feature_kind)
+                    feature_kind == 0 || feature_kind == 2 || (4..=29).contains(&feature_kind)
                 );
-                if (9..=13).contains(&feature_kind) {
+                if (9..=29).contains(&feature_kind) {
                     let saved = batch.structure_data(target)?;
                     if source == target {
                         assert!(
@@ -8381,13 +8392,19 @@ mod tests {
                     }
                     assert!(batch.structure_reference_sources(target)?.contains(&source));
                 }
-                if !(9..=13).contains(&feature_kind) {
+                if !(9..=29).contains(&feature_kind) {
                     assert!(
                         batch
                             .recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
                     );
                 }
             }
+        }
+        if portal_kind == 10 {
+            assert!(
+                installed_templates.len() >= 2,
+                "fixture must cover multiple installed templates"
+            );
         }
         Ok(())
     }

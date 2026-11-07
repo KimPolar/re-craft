@@ -2417,6 +2417,7 @@ pub enum PreparedStructureStart {
 pub(super) enum BatchPreparedStructureStart {
     Supported(PreparedStructureStart),
     Jigsaw(jigsaw::PreparedStart),
+    RuinedPortal(ruined_portal::PreparedStart),
 }
 
 /// A generator configured from the dimension's active biome source and noise
@@ -3029,7 +3030,8 @@ impl TerrainGenerator {
                             | PreparedStructureStart::Mineshaft(_)
                             | PreparedStructureStart::Jigsaw(_),
                         )
-                        | BatchPreparedStructureStart::Jigsaw(_),
+                        | BatchPreparedStructureStart::Jigsaw(_)
+                        | BatchPreparedStructureStart::RuinedPortal(_),
                     ..
                 } => unreachable!("ocean ruins are disabled"),
             },
@@ -3073,7 +3075,9 @@ impl TerrainGenerator {
                     start: BatchPreparedStructureStart::Supported(start),
                 } => StructureSetStart::Generated { structure, start },
                 StructureSetStart::Generated {
-                    start: BatchPreparedStructureStart::Jigsaw(_),
+                    start:
+                        BatchPreparedStructureStart::Jigsaw(_)
+                        | BatchPreparedStructureStart::RuinedPortal(_),
                     ..
                 } => unreachable!("jigsaws are disabled"),
             },
@@ -3211,6 +3215,9 @@ impl TerrainGenerator {
                         chunk,
                     )
                     .with_context(|| format!("in structure {path}"))?;
+                    if jigsaws {
+                        return Ok(start.map(BatchPreparedStructureStart::RuinedPortal));
+                    }
                     if start.is_none() {
                         return Ok(None);
                     }

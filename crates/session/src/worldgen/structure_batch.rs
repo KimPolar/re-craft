@@ -40,6 +40,8 @@ pub type OceanRuinStarts = BTreeMap<ResourceId, super::ocean_ruin::PreparedStart
 pub type MineshaftStarts = BTreeMap<ResourceId, super::mineshaft::PreparedStart>;
 /// Multi-piece jigsaw starts belonging to one source chunk.
 pub type JigsawStarts = BTreeMap<ResourceId, super::jigsaw::PreparedStart>;
+/// Ruined-portal starts retained with their original template and piece.
+pub type RuinedPortalStarts = BTreeMap<ResourceId, super::ruined_portal::PreparedStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
@@ -797,6 +799,7 @@ pub struct StructureGenerationBatch {
     ocean_starts: BTreeMap<ChunkPos, OceanRuinStarts>,
     mineshafts: BTreeMap<ChunkPos, MineshaftStarts>,
     jigsaw_starts: BTreeMap<ChunkPos, JigsawStarts>,
+    ruined_portal_starts: BTreeMap<ChunkPos, RuinedPortalStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
     references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
@@ -815,6 +818,10 @@ impl StructureGenerationBatch {
         );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
+            ensure!(
+                !self.ruined_portal_starts.contains_key(&pos),
+                "ruined portal terrain transfer is not yet supported"
+            );
             let starts = self
                 .starts
                 .get(&pos)
@@ -924,6 +931,10 @@ impl StructureGenerationBatch {
             self.generator.structure_context,
             "generator lacks structure context"
         );
+        ensure!(
+            self.ruined_portal_starts.is_empty(),
+            "ruined portal terrain transfer is not yet supported"
+        );
         let mut terrain = BTreeMap::new();
         for (pos, order) in orders {
             terrain.insert(pos, self.beardifier_for_chunk(pos, &order)?);
@@ -983,6 +994,7 @@ impl StructureGenerationBatch {
             ocean_starts: BTreeMap::new(),
             mineshafts: BTreeMap::new(),
             jigsaw_starts: BTreeMap::new(),
+            ruined_portal_starts: BTreeMap::new(),
             bounds: BTreeMap::new(),
             references: BTreeMap::new(),
             failed: false,
@@ -1011,7 +1023,8 @@ impl StructureGenerationBatch {
         (!self.failed
             && !self.ocean_starts.contains_key(&pos)
             && !self.mineshafts.contains_key(&pos)
-            && !self.jigsaw_starts.contains_key(&pos))
+            && !self.jigsaw_starts.contains_key(&pos)
+            && !self.ruined_portal_starts.contains_key(&pos))
         .then(|| self.starts.get(&pos))
         .flatten()
     }
@@ -1042,6 +1055,13 @@ impl StructureGenerationBatch {
             .flatten()
     }
 
+    /// Return ruined portals retained for a completed start chunk.
+    pub fn ruined_portal_starts(&self, pos: ChunkPos) -> Option<&RuinedPortalStarts> {
+        (!self.failed && self.starts.contains_key(&pos))
+            .then(|| self.ruined_portal_starts.get(&pos))
+            .flatten()
+    }
+
     fn ensure_jigsaw_decoration_supported(&self, pos: ChunkPos) -> Result<()> {
         let references = self
             .references
@@ -1060,6 +1080,13 @@ impl StructureGenerationBatch {
                         .get(&source)
                         .is_some_and(|starts| starts.contains_key(id)),
                     "jigsaw structure decoration is not yet supported"
+                );
+                ensure!(
+                    !self
+                        .ruined_portal_starts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "ruined portal structure decoration is not yet supported"
                 );
             }
         }
@@ -1133,6 +1160,27 @@ impl StructureGenerationBatch {
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
         ensure!(!self.failed, "structure batch failed and must be discarded");
+        for (id, sources) in self
+            .references
+            .get(&pos)
+            .context("structure references are unavailable")?
+            .membership()
+        {
+            for &packed in sources {
+                let bits = packed as u64;
+                let source = ChunkPos {
+                    x: bits as u32 as i32,
+                    z: (bits >> 32) as u32 as i32,
+                };
+                ensure!(
+                    !self
+                        .ruined_portal_starts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "ruined portal structure decoration is not yet supported"
+                );
+            }
+        }
         mixed_plan_with_jigsaw(
             &self.starts,
             &self.ocean_starts,
@@ -1169,6 +1217,12 @@ impl StructureGenerationBatch {
                         start.terrain_adjustment
                     } else if let Some(start) = self
                         .jigsaw_starts
+                        .get(&source)
+                        .and_then(|s| s.get(structure))
+                    {
+                        start.terrain_adjustment
+                    } else if let Some(start) = self
+                        .ruined_portal_starts
                         .get(&source)
                         .and_then(|s| s.get(structure))
                     {
@@ -1254,6 +1308,12 @@ impl StructureGenerationBatch {
                             .and_then(|n| n.checked_add(piece.junctions.len()))
                             .context("too many jigsaw terrain contributions")
                     })?
+                } else if self
+                    .ruined_portal_starts
+                    .get(pos)
+                    .is_some_and(|s| s.contains_key(id))
+                {
+                    1
                 } else {
                     self.mineshafts
                         .get(pos)
@@ -1362,6 +1422,18 @@ impl StructureGenerationBatch {
                 .and_then(|starts| starts.get(structure))
             {
                 pieces.extend(start.terrain_pieces()?);
+            } else if let Some(start) = self
+                .ruined_portal_starts
+                .get(source)
+                .and_then(|starts| starts.get(structure))
+            {
+                pieces.push(StructurePiece {
+                    bounds: start.piece.bounds,
+                    adjustment: start.terrain_adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: vec![],
+                });
             } else {
                 let start = self
                     .mineshafts
@@ -1442,6 +1514,7 @@ impl StructureGenerationBatch {
                 let mut ocean_starts = OceanRuinStarts::new();
                 let mut mineshafts = MineshaftStarts::new();
                 let mut jigsaw_starts = JigsawStarts::new();
+                let mut ruined_portal_starts = RuinedPortalStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
                     let outcome = self
@@ -1457,7 +1530,8 @@ impl StructureGenerationBatch {
                                 Ok(starts.contains_key(id)
                                     || ocean_starts.contains_key(id)
                                     || mineshafts.contains_key(id)
-                                    || jigsaw_starts.contains_key(id))
+                                    || jigsaw_starts.contains_key(id)
+                                    || ruined_portal_starts.contains_key(id))
                             },
                             &mut *classify,
                         )
@@ -1509,6 +1583,13 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
+                            super::BatchPreparedStructureStart::RuinedPortal(start) => {
+                                bounds.push(start.reference_bounds(structure.clone())?);
+                                ensure!(
+                                    ruined_portal_starts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
                         }
                     }
                 }
@@ -1522,6 +1603,9 @@ impl StructureGenerationBatch {
                 }
                 if !jigsaw_starts.is_empty() {
                     self.jigsaw_starts.insert(pos, jigsaw_starts);
+                }
+                if !ruined_portal_starts.is_empty() {
+                    self.ruined_portal_starts.insert(pos, ruined_portal_starts);
                 }
                 self.bounds.insert(pos, bounds);
                 Ok(())

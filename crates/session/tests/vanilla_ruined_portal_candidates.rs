@@ -7,13 +7,15 @@ use native_resources::{
     structure_biomes::StructureBiomes,
     structure_placement::{StructureSetCache, StructureSetStart},
 };
-use native_session::worldgen::TerrainGenerator;
+use native_session::worldgen::{TerrainGenerator, structure_batch::StructureGenerationBatch};
+use native_world::loaded::ChunkPos;
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
 struct SingleSet {
     resources: ResourceStack,
     structure: String,
+    terrain_override: bool,
 }
 impl ResourceProvider for SingleSet {
     fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -28,6 +30,23 @@ impl ResourceProvider for SingleSet {
                 "placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0},
                 "structures":[{"structure":self.structure,"weight":1}]
             }))?));
+        }
+        if self.terrain_override
+            && path
+                == format!(
+                    "data/{}/worldgen/structure/{}.json",
+                    "minecraft",
+                    self.structure.strip_prefix("minecraft:").unwrap_or("")
+                )
+        {
+            let mut definition: Value = serde_json::from_slice(
+                &self
+                    .resources
+                    .read_data(path)?
+                    .context("portal definition missing")?,
+            )?;
+            definition["terrain_adaptation"] = json!("beard_thin");
+            return Ok(Some(serde_json::to_vec(&definition)?));
         }
         self.resources.read_data(path)
     }
@@ -131,6 +150,7 @@ fn ruined_portal_candidates_match_vanilla_biomes() -> Result<()> {
     let mut provider = SingleSet {
         resources,
         structure: String::new(),
+        terrain_override: false,
     };
     let preset: Value = serde_json::from_slice(
         &provider
@@ -153,6 +173,7 @@ fn ruined_portal_candidates_match_vanilla_biomes() -> Result<()> {
     let mut evaluator = DensityEvaluator::default();
     let mut accepted = 0;
     let mut rejected = 0;
+    let mut accepted_case = None;
     for (case, line) in cases.iter().zip(lines) {
         let words: Vec<_> = line.split_whitespace().collect();
         assert_eq!(words[1], case["structure"].as_str().unwrap(), "{line}");
@@ -199,10 +220,101 @@ fn ruined_portal_candidates_match_vanilla_biomes() -> Result<()> {
                     "{line}: {error:#}"
                 );
                 accepted += 1;
+                accepted_case.get_or_insert((provider.structure.clone(), x, z));
             }
             _ => anyhow::bail!("invalid Java result: {line}"),
         }
     }
     assert!(accepted > 0 && rejected > 0, "both outcomes are required");
+    let (structure, x, z) = accepted_case.context("no accepted portal")?;
+    provider.structure = structure.clone();
+    provider.terrain_override = true;
+    let mut batch = StructureGenerationBatch::new(generator, rules, vec![set])?;
+    let chunk = ChunkPos { x, z };
+    batch.request_starts(chunk)?;
+    while !batch.is_complete() {
+        batch.step(&mut provider, &mut |value| {
+            let name = value
+                .as_str()
+                .or_else(|| value.get("id").and_then(Value::as_str))
+                .context("block ID missing")?;
+            Ok(BlockHeightFlags {
+                is_air: name == "minecraft:air",
+                blocks_motion: name == "minecraft:stone",
+                blocks_motion_no_leaves: name == "minecraft:stone",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        })?;
+    }
+    let id = ResourceId::parse(&structure)?;
+    let starts = batch
+        .ruined_portal_starts(chunk)
+        .context("accepted portal start missing")?;
+    let start = starts
+        .get(&id)
+        .context("accepted portal structure missing")?;
+    assert_eq!(start.chunk, [x, z]);
+    assert_eq!(
+        start.reference_bounds(id)?.bounds,
+        native_core::beardifier::structure_start_bounds(
+            &[start.piece.bounds],
+            start.terrain_adjustment
+        )
+        .map_err(anyhow::Error::msg)?
+    );
+    assert!(batch.starts(chunk).is_none());
+    batch.request_references(chunk)?;
+    while !batch.is_complete() {
+        batch.step(&mut provider, &mut |value| {
+            let name = value
+                .as_str()
+                .or_else(|| value.get("id").and_then(Value::as_str))
+                .context("block ID missing")?;
+            Ok(BlockHeightFlags {
+                is_air: name == "minecraft:air",
+                blocks_motion: name == "minecraft:stone",
+                blocks_motion_no_leaves: name == "minecraft:stone",
+                has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
+            })
+        })?;
+    }
+    let id = ResourceId::parse(&structure)?;
+    let packed = i64::from(x as u32) | (i64::from(z) << 32);
+    assert!(batch.references(chunk).context("references missing")?[&id].contains(&packed));
+    let order = batch
+        .unambiguous_terrain_start_order(chunk)?
+        .context("portal terrain order is ambiguous")?;
+    assert!(order.contains(&(id.clone(), chunk)));
+    let pieces: Vec<_> = order
+        .iter()
+        .map(|(id, source)| {
+            let start = &batch.ruined_portal_starts(*source).unwrap()[id];
+            native_core::beardifier::StructurePiece {
+                bounds: start.piece.bounds,
+                adjustment: start.terrain_adjustment,
+                ground_delta: 0,
+                projection: native_core::beardifier::PieceProjection::NonPool,
+                junctions: vec![],
+            }
+        })
+        .collect();
+    let expected = native_core::beardifier::Beardifier::for_chunk([x, z], &pieces)
+        .map_err(anyhow::Error::msg)?;
+    let actual = batch.beardifier_for_chunk(chunk, &order)?;
+    for y in [-64, 0, 32, 64, 96, 128] {
+        for dx in [0, 7, 15] {
+            assert_eq!(
+                actual.sample(x * 16 + dx, y, z * 16 + 8).to_bits(),
+                expected.sample(x * 16 + dx, y, z * 16 + 8).to_bits()
+            );
+        }
+    }
+    let schedule =
+        native_resources::structure_decoration::StructureDecorationSchedule::load(&mut provider)?;
+    assert!(
+        batch
+            .mixed_decoration_plan_with_jigsaw(chunk, &schedule)
+            .is_err()
+    );
     Ok(())
 }

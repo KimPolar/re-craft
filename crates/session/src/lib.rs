@@ -33,6 +33,7 @@ pub mod experience;
 pub mod fall;
 pub mod falling_block;
 pub mod farmland;
+pub mod fence_placement;
 pub mod gamemode_command;
 mod interaction;
 pub mod inventory;

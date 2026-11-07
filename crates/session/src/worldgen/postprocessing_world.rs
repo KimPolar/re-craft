@@ -1170,7 +1170,7 @@ fn bonus_falling_shape_schedules(state: &BlockState) -> bool {
     ) && state.properties.is_empty()
 }
 
-pub(super) fn fence_connection(
+pub(crate) fn fence_connection(
     tags: &native_resources::ore_feature::OreBlockTags,
     state: &BlockState,
     neighbor: &BlockState,

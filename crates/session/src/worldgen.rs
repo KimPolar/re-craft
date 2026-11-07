@@ -57,6 +57,7 @@ pub mod ocean_ruin;
 mod ore;
 pub mod postprocessing;
 mod postprocessing_world;
+pub(crate) use postprocessing_world::fence_connection;
 pub mod ruined_portal;
 pub mod schedule;
 pub mod shipwreck;

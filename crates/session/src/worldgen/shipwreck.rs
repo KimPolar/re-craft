@@ -35,6 +35,41 @@ impl PreparedStart {
     pub fn saved_piece_tag(&self) -> Result<native_persistence::nbt::Tag> {
         SavedShipwreckPiece::capture(self)?.to_tag()
     }
+
+    /// Serialize a fresh start and its piece; this does not authorize a world save.
+    pub fn to_tag(&self, structure: &ResourceId) -> Result<native_persistence::nbt::Tag> {
+        use native_persistence::nbt::{Tag, TagType};
+        let name = format!("{}:{}", structure.namespace, structure.path);
+        ensure!(
+            ResourceId::parse(&name)? == *structure,
+            "invalid shipwreck structure identifier"
+        );
+        let x = self.chunk[0]
+            .checked_mul(16)
+            .context("shipwreck chunk X overflow")?;
+        let z = self.chunk[1]
+            .checked_mul(16)
+            .context("shipwreck chunk Z overflow")?;
+        ensure!(
+            self.template.data_version == Some(5023)
+                && self.piece.position[0] == x
+                && self.piece.position[2] == z,
+            "shipwreck start differs from its chunk or template"
+        );
+        Ok(Tag::Compound(vec![
+            ("id".into(), Tag::String(name.as_str().into())),
+            ("ChunkX".into(), Tag::Int(self.chunk[0])),
+            ("ChunkZ".into(), Tag::Int(self.chunk[1])),
+            ("references".into(), Tag::Int(0)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![self.saved_piece_tag()?],
+                },
+            ),
+        ]))
+    }
     pub fn generate(
         provider: &mut impl ResourceProvider,
         definition: &Value,

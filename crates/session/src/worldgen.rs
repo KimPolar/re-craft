@@ -8764,8 +8764,20 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=29).contains(&feature_kind)
+                    feature_kind == 0 || feature_kind == 2 || (4..=30).contains(&feature_kind)
                 );
+                if feature_kind == 30 {
+                    let data = batch.structure_data(target)?;
+                    assert!(batch.structure_reference_sources(target)?.contains(&source));
+                    if target == source {
+                        assert!(
+                            data.get("starts")
+                                .and_then(|starts| starts.get("example:test"))
+                                .and_then(|start| start.get("Children"))
+                                .is_some()
+                        );
+                    }
+                }
                 if (9..=29).contains(&feature_kind) {
                     assert!(
                         batch.recorded_template_feature_for_test(

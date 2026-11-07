@@ -1095,8 +1095,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        structures.ensure_no_shipwreck_references(pos)?;
-        super::structure_data::pack_structure_data_with_portals(
+        super::structure_data::pack_structure_data_with_shipwrecks(
             pos,
             structures
                 .starts
@@ -1116,6 +1115,10 @@ impl FreshTerrainBatch {
                 .unwrap_or(&Default::default()),
             structures
                 .ruined_portal_starts
+                .get(&pos)
+                .unwrap_or(&Default::default()),
+            structures
+                .shipwreck_starts
                 .get(&pos)
                 .unwrap_or(&Default::default()),
             structures
@@ -1140,14 +1143,14 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        structures.ensure_no_shipwreck_references(pos)?;
-        super::structure_data::referenced_start_chunks_with_portals(
+        super::structure_data::referenced_start_chunks_with_shipwrecks(
             pos,
             &structures.starts,
             &structures.ocean_starts,
             &structures.mineshafts,
             &structures.jigsaw_starts,
             &structures.ruined_portal_starts,
+            &structures.shipwreck_starts,
             structures
                 .references
                 .get(&pos)

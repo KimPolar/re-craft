@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     SavedSwampHutPiece,
     structure_batch::{
-        JigsawStarts, MineshaftStarts, OceanRuinStarts, RuinedPortalStarts, SimpleStarts,
-        TerrainStartKey,
+        JigsawStarts, MineshaftStarts, OceanRuinStarts, RuinedPortalStarts, ShipwreckStarts,
+        SimpleStarts, TerrainStartKey,
     },
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
@@ -92,6 +92,7 @@ pub(super) fn referenced_start_chunks_with_jigsaw(
 }
 
 /// Recompute references from all retained starts before building a save draft.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn referenced_start_chunks_with_portals(
     pos: ChunkPos,
@@ -100,6 +101,32 @@ pub(super) fn referenced_start_chunks_with_portals(
     all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
     all_jigsaw: &BTreeMap<ChunkPos, JigsawStarts>,
     all_portals: &BTreeMap<ChunkPos, RuinedPortalStarts>,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<BTreeSet<ChunkPos>> {
+    referenced_start_chunks_with_shipwrecks(
+        pos,
+        all_starts,
+        all_ocean,
+        all_mineshafts,
+        all_jigsaw,
+        all_portals,
+        &BTreeMap::new(),
+        references,
+        huts,
+    )
+}
+
+/// Recompute references including shipwreck starts.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn referenced_start_chunks_with_shipwrecks(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
+    all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
+    all_jigsaw: &BTreeMap<ChunkPos, JigsawStarts>,
+    all_portals: &BTreeMap<ChunkPos, RuinedPortalStarts>,
+    all_shipwrecks: &BTreeMap<ChunkPos, ShipwreckStarts>,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
@@ -172,6 +199,28 @@ pub(super) fn referenced_start_chunks_with_portals(
                 bounds.push(start.reference_bounds(id.clone())?);
             }
         }
+        if let Some(shipwrecks) = all_shipwrecks.get(&source) {
+            for (id, start) in shipwrecks {
+                ensure!(
+                    !simple.contains_key(id)
+                        && !all_ocean
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_mineshafts
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_jigsaw
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_portals
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id)),
+                    "duplicate structure start"
+                );
+                validate_shipwreck_start(source, id, start)?;
+                bounds.push(start.reference_bounds(id.clone())?);
+            }
+        }
         Ok(bounds)
     })?;
     ensure!(
@@ -197,23 +246,29 @@ pub(super) fn referenced_start_chunks_with_portals(
                 .and_then(|starts| starts.get(id));
             let jigsaw = all_jigsaw.get(&source).and_then(|starts| starts.get(id));
             let portal = all_portals.get(&source).and_then(|starts| starts.get(id));
-            match (simple, ocean, mineshaft, jigsaw, portal) {
-                (Some(start), None, None, None, None) => {
+            let shipwreck = all_shipwrecks
+                .get(&source)
+                .and_then(|starts| starts.get(id));
+            match (simple, ocean, mineshaft, jigsaw, portal, shipwreck) {
+                (Some(start), None, None, None, None, None) => {
                     validate_start(source, id, start, huts)?;
                 }
-                (None, Some(start), None, None, None) => {
+                (None, Some(start), None, None, None, None) => {
                     validate_ocean_start(source, start)?;
                 }
-                (None, None, Some(start), None, None) => {
+                (None, None, Some(start), None, None, None) => {
                     validate_mineshaft_start(source, id, start)?;
                 }
-                (None, None, None, Some(start), None) => {
+                (None, None, None, Some(start), None, None) => {
                     validate_jigsaw_start(source, id, start)?;
                 }
-                (None, None, None, None, Some(start)) => {
+                (None, None, None, None, Some(start), None) => {
                     validate_portal_start(source, id, start)?;
                 }
-                (None, None, None, None, None) => {
+                (None, None, None, None, None, Some(start)) => {
+                    validate_shipwreck_start(source, id, start)?;
+                }
+                (None, None, None, None, None, None) => {
                     anyhow::bail!("referenced structure start is missing")
                 }
                 _ => anyhow::bail!("duplicate structure start"),
@@ -222,6 +277,18 @@ pub(super) fn referenced_start_chunks_with_portals(
         }
     }
     Ok(required)
+}
+
+fn validate_shipwreck_start(
+    pos: ChunkPos,
+    id: &ResourceId,
+    start: &super::shipwreck::PreparedStart,
+) -> Result<Tag> {
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "shipwreck belongs to another chunk"
+    );
+    start.to_tag(id)
 }
 
 fn validate_portal_start(
@@ -419,6 +486,7 @@ pub(super) fn pack_structure_data_with_jigsaw(
 }
 
 /// Serialize all supported fresh starts without writing an existing world.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pack_structure_data_with_portals(
     pos: ChunkPos,
@@ -427,6 +495,32 @@ pub(super) fn pack_structure_data_with_portals(
     mineshafts: &MineshaftStarts,
     jigsaws: &JigsawStarts,
     portals: &RuinedPortalStarts,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Tag> {
+    pack_structure_data_with_shipwrecks(
+        pos,
+        starts,
+        ocean,
+        mineshafts,
+        jigsaws,
+        portals,
+        &ShipwreckStarts::new(),
+        references,
+        huts,
+    )
+}
+
+/// Serialize all retained fresh starts, including shipwrecks, without writing a world.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pack_structure_data_with_shipwrecks(
+    pos: ChunkPos,
+    starts: &SimpleStarts,
+    ocean: &OceanRuinStarts,
+    mineshafts: &MineshaftStarts,
+    jigsaws: &JigsawStarts,
+    portals: &RuinedPortalStarts,
+    shipwrecks: &ShipwreckStarts,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
@@ -512,6 +606,19 @@ pub(super) fn pack_structure_data_with_portals(
         let name = format!("{}:{}", id.namespace, id.path);
         packed_starts.push((name.as_str().into(), value));
     }
+    for (id, start) in shipwrecks {
+        ensure!(
+            !starts.contains_key(id)
+                && !ocean.contains_key(id)
+                && !mineshafts.contains_key(id)
+                && !jigsaws.contains_key(id)
+                && !portals.contains_key(id),
+            "duplicate structure start"
+        );
+        let value = validate_shipwreck_start(pos, id, start)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        packed_starts.push((name.as_str().into(), value));
+    }
     let mut packed_references = Vec::with_capacity(references.membership().len());
     for (id, members) in references.membership() {
         let order = references
@@ -539,6 +646,236 @@ mod tests {
     use super::*;
     use native_core::beardifier::{BoundingBox, TerrainAdjustment};
     use native_resources::{packs::ResourceId, structure_start::SimpleStructureStart};
+
+    #[test]
+    fn shipwreck_draft_preserves_piece_and_complete_references() -> Result<()> {
+        use native_persistence::{nbt::NamedTag, structure_template::StructureTemplate};
+        use native_resources::{shipwreck::Piece, structure_transform::Rotation};
+        use std::sync::Arc;
+        let pos = ChunkPos { x: -3, z: 3 };
+        let id = ResourceId::parse("minecraft:shipwreck")?;
+        let piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [-48, 90, 48],
+            rotation: Rotation::Clockwise90,
+            beached: false,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [2, 3, 4],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let start = super::super::shipwreck::PreparedStart {
+            chunk: [pos.x, pos.z],
+            generation_point: [-40, 64, 56],
+            terrain_adjustment: TerrainAdjustment::Bury,
+            bounds: piece.bounds(template.size)?,
+            piece,
+            template,
+            height_adjusted: false,
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let refs = collect_ordered_structure_references(pos, |source| {
+            Ok(if source == pos {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })?;
+        let mut simple = BTreeMap::new();
+        for z in pos.z - 8..=pos.z + 8 {
+            for x in pos.x - 8..=pos.x + 8 {
+                simple.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        let shipwrecks =
+            BTreeMap::from([(pos, ShipwreckStarts::from([(id.clone(), start.clone())]))]);
+        assert_eq!(
+            referenced_start_chunks_with_shipwrecks(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &shipwrecks,
+                &refs,
+                &BTreeMap::new()
+            )?,
+            BTreeSet::from([pos])
+        );
+        let draft = pack_structure_data_with_shipwrecks(
+            pos,
+            &simple[&pos],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &shipwrecks[&pos],
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        assert_eq!(
+            draft
+                .get("starts")
+                .and_then(|s| s.get("minecraft:shipwreck")),
+            Some(&start.to_tag(&id)?)
+        );
+        assert!(
+            referenced_start_chunks_with_shipwrecks(
+                pos,
+                &simple,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut wrong = start.clone();
+        wrong.chunk[0] += 1;
+        assert!(
+            pack_structure_data_with_shipwrecks(
+                pos,
+                &simple[&pos],
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &ShipwreckStarts::from([(id, wrong)]),
+                &refs,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn shipwreck_structure_data_matches_java_and_reloads() -> Result<()> {
+        use native_persistence::{nbt::NamedTag, structure_template::StructureTemplate};
+        use native_resources::{shipwreck::Piece, structure_transform::Rotation};
+        use std::{path::PathBuf, process::Command, sync::Arc};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let source = temp.path().join("ShipwreckStructureDataOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/ShipwreckStructureDataOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let pos = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:wreck")?;
+        let piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [0, 90, 0],
+            rotation: Rotation::None,
+            beached: false,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [7, 4, 5],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let start = super::super::shipwreck::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 64, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            bounds: piece.bounds(template.size)?,
+            piece,
+            template,
+            height_adjusted: false,
+        };
+        let refs = collect_ordered_structure_references(pos, |source| {
+            Ok(if source == pos {
+                vec![start.reference_bounds(id.clone())?]
+            } else {
+                vec![]
+            })
+        })?;
+        let actual = pack_structure_data_with_shipwrecks(
+            pos,
+            &SimpleStarts::new(),
+            &OceanRuinStarts::new(),
+            &MineshaftStarts::new(),
+            &JigsawStarts::new(),
+            &RuinedPortalStarts::new(),
+            &ShipwreckStarts::from([(id, start)]),
+            &refs,
+            &BTreeMap::new(),
+        )?;
+        let rust_path = temp.path().join("rust.nbt");
+        let java_path = temp.path().join("java.nbt");
+        std::fs::write(
+            &rust_path,
+            native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: actual.clone(),
+            })?,
+        )?;
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("ShipwreckStructureDataOracle")
+            .arg(&java_path)
+            .arg(&rust_path)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let expected = native_persistence::nbt::read(&std::fs::read(java_path)?)?.value;
+        assert_eq!(canonical(actual), canonical(expected));
+        Ok(())
+    }
 
     #[test]
     fn portal_draft_preserves_start_and_reference_completeness() -> Result<()> {

@@ -27,6 +27,7 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     root_system_feature::{RootSystemFeature, RootSystemWorld},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
+    speleothem::SpeleothemClusterFeature,
     spring_feature::{SpringFeature, SpringWorld},
     tree_beehive::BeehiveWorld,
     tree_fallen_decorators::Direction as FallenDirection,
@@ -56,6 +57,7 @@ mod jigsaw;
 mod mineshaft;
 mod ocean_ruin;
 mod ruined_portal;
+mod speleothem;
 #[cfg(test)]
 pub(super) use ocean_ruin::attach_created_chicken_rider;
 #[cfg(test)]
@@ -773,6 +775,7 @@ enum ConfiguredDecoration {
     Simple(SimpleBlockFeature<BlockState>),
     Spring(SpringFeature<BlockState>),
     Magma(UnderwaterMagma<BlockState>),
+    Speleothem(SpeleothemClusterFeature<BlockState>),
     Column(BlockColumnFeature<BlockState>),
     Lake(LakeFeature<BlockState>),
     Tree(TreeFeature<BlockState>),
@@ -829,6 +832,7 @@ impl ConfiguredDecoration {
             Self::Pile(v) => v.required_blocks(),
             Self::Simple(v) => v.required_blocks(),
             Self::Spring(v) => v.required_blocks(),
+            Self::Speleothem(v) => v.required_blocks(),
             Self::Column(v) => v.required_blocks(),
             Self::Lake(v) => v.required_blocks(),
             Self::Tree(v) => v.required_blocks(),
@@ -913,7 +917,7 @@ impl ConfiguredDecoration {
     }
     fn needs_water_fluids(&self) -> bool {
         match self {
-            Self::Lake(_) => true,
+            Self::Lake(_) | Self::Speleothem(_) => true,
             Self::Simple(v) => v.possible_states().iter().any(|s| {
                 matches!(
                     s.name.as_str(),
@@ -1069,6 +1073,9 @@ impl ConfiguredDecoration {
             ("minecraft", "underwater_magma") => {
                 Ok(Self::Magma(UnderwaterMagma::decode(value, resolve)?))
             }
+            ("minecraft", "speleothem_cluster") => Ok(Self::Speleothem(
+                SpeleothemClusterFeature::decode(value, resolve)?,
+            )),
             ("minecraft", "block_column") => Ok(Self::Column(
                 BlockColumnFeature::decode_with_resources(provider, value, resolve)?,
             )),
@@ -1231,6 +1238,7 @@ impl ConfiguredDecoration {
             Self::Pile(v) => v.required_tags(),
             Self::Spring(v) => v.required_tags(),
             Self::Magma(_) => BTreeSet::new(),
+            Self::Speleothem(v) => v.required_tags(),
             Self::Column(v) => v.required_tags(),
             Self::Lake(v) => v.required_tags(),
             Self::Tree(v) => {
@@ -1334,6 +1342,7 @@ impl ConfiguredDecoration {
             Self::Simple(v) => v.place(world, random, pos),
             Self::Spring(v) => v.place(world, pos),
             Self::Magma(v) => v.place(world, random, pos),
+            Self::Speleothem(v) => speleothem::place_cluster(world, v, random, pos),
             Self::Column(v) => v.place(world, random, pos),
             Self::Lake(v) => v.place(world, random, pos),
             Self::FallenTree(v) => v.place(world, random, pos),
@@ -7911,7 +7920,7 @@ mod tests {
     use native_world::loaded::{BLOCK_COUNT, BlockStateId, Chunk, Section};
     use serde_json::{Value, json};
 
-    struct Data;
+    pub(super) struct Data;
     impl ResourceProvider for Data {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
             Ok(None)

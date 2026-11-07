@@ -55,6 +55,7 @@ mod buried_treasure;
 mod jigsaw;
 mod mineshaft;
 mod ocean_ruin;
+mod ruined_portal;
 #[cfg(test)]
 pub(super) use ocean_ruin::attach_created_chicken_rider;
 #[cfg(test)]

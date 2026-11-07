@@ -1297,6 +1297,9 @@ impl GeneratedBlockView<'_> {
                 falling: false,
             });
         }
+        if native_world::collision::fence_waterlogged(&state) == Some(false) {
+            return Cell::FenceDry;
+        }
         if super::ore::valid_lichen(&state) && state.properties["waterlogged"] == "true" {
             return Cell::OpenWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
@@ -1508,6 +1511,9 @@ impl GeneratedBlockView<'_> {
                     self.fluid_cell_for_spread(change.position),
                     Cell::Stairs { voxels: actual, waterlogged: false } if actual == voxels
                 ),
+                ChangedBlock::WaterloggedFence => {
+                    matches!(self.fluid_cell_for_spread(change.position), Cell::FenceDry)
+                }
                 _ => false,
             };
             ensure!(
@@ -1612,7 +1618,7 @@ impl GeneratedBlockView<'_> {
             } | Cell::Stairs {
                 waterlogged: false,
                 ..
-            }
+            } | Cell::FenceDry
         ) {
             ensure!(
                 fluid.source && !fluid.falling,
@@ -1670,8 +1676,10 @@ impl GeneratedBlockView<'_> {
         let next_fluid = liquid_state(next)?;
         let next_slab = self.slab(next);
         let next_stair = self.stair(next);
-        let contained_source =
-            next_slab.is_some_and(|(_, wet)| wet) || next_stair.is_some_and(|(_, wet)| wet);
+        let next_fence = native_world::collision::fence_waterlogged(next);
+        let contained_source = next_slab.is_some_and(|(_, wet)| wet)
+            || next_stair.is_some_and(|(_, wet)| wet)
+            || next_fence == Some(true);
         ensure!(
             next_fluid.is_some_and(|fluid| fluid.kind == native_world::fluid::FluidKind::Water)
                 || (next.name == "minecraft:air" && next.properties.is_empty())
@@ -1689,7 +1697,10 @@ impl GeneratedBlockView<'_> {
                 || (self.slab(old).is_some_and(|(_, wet)| !wet)
                     && next_slab.is_some_and(|(_, wet)| wet))
                 || (self.stair(old).is_some_and(|(_, wet)| !wet)
-                    && next_stair.is_some_and(|(_, wet)| wet)),
+                    && next_stair.is_some_and(|(_, wet)| wet))
+                || (native_world::collision::fence_waterlogged(old) == Some(false)
+                    && next_fence == Some(true)
+                    && old.name == next.name),
             "unsupported original water state"
         );
         let next_air = next.name == "minecraft:air";
@@ -1749,6 +1760,7 @@ impl GeneratedBlockView<'_> {
                     Cell::Air
                         | Cell::Solid
                         | Cell::Fluid(_)
+                        | Cell::FenceDry
                         | Cell::FenceWater(_)
                         | Cell::OpenWater(_)
                         | Cell::Slab { .. }
@@ -1814,7 +1826,7 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
-            } else if native_world::collision::fence_waterlogged(&state) == Some(true) {
+            } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let direction = [-d[0], -d[1], -d[2]];
                 let updated =
                     self.update_shape(p.to_array(), &state, direction, target.to_array(), next)?;
@@ -1885,6 +1897,7 @@ impl GeneratedBlockView<'_> {
                     Cell::Air
                         | Cell::Solid
                         | Cell::Fluid(_)
+                        | Cell::FenceDry
                         | Cell::FenceWater(_)
                         | Cell::OpenWater(_)
                         | Cell::Slab { .. }
@@ -1914,7 +1927,7 @@ impl GeneratedBlockView<'_> {
                         );
                     }
                 }
-            } else if native_world::collision::fence_waterlogged(&state) == Some(true) {
+            } else if native_world::collision::fence_waterlogged(&state).is_some() {
                 let next =
                     self.update_shape(neighbor, &state, [-d[0], -d[1], -d[2]], pos, fence)?;
                 if next != state {
@@ -2270,7 +2283,7 @@ impl native_world::fluid_sim::LiveFluidWorld for GeneratedWaterTick<'_, '_> {
                     } | Cell::Stairs {
                         waterlogged: false,
                         ..
-                    }
+                    } | Cell::FenceDry
                 ) && fluid.source)
                 && pos == self.origin + direction
                 && fluid.kind == FluidKind::Water
@@ -6244,6 +6257,20 @@ mod tests {
                 world.set_block_id(9, 8, 8, slab).unwrap();
                 world.set_block_id(9, 8, 7, water).unwrap();
             }
+            "fence_on" | "fence_off" | "fence_on_neighbor" => {
+                let fence = world.intern_state(BlockState {
+                    name: "minecraft:oak_fence".into(),
+                    properties: ["north", "east", "south", "west", "waterlogged"]
+                        .into_iter()
+                        .map(|key| (key.into(), "false".into()))
+                        .collect(),
+                });
+                world.set_block_id(9, 8, 8, fence).unwrap();
+                if case == "fence_on_neighbor" {
+                    world.set_block_id(10, 8, 8, fence).unwrap();
+                }
+                world.set_block_id(9, 8, 7, water).unwrap();
+            }
             "stair_bottom" | "stair_top" | "stair_bottom_off" => {
                 let stair = world.intern_state(BlockState {
                     name: "minecraft:oak_stairs".into(),
@@ -6647,11 +6674,18 @@ mod tests {
                 | "stair_bottom"
                 | "stair_top"
                 | "stair_bottom_off"
+                | "fence_on"
+                | "fence_off"
+                | "fence_on_neighbor"
         ) {
             stage
                 .set_water_source_conversion(!matches!(
                     case,
-                    "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off"
+                    "convert_off"
+                        | "origin_source_off"
+                        | "slab_bottom_off"
+                        | "stair_bottom_off"
+                        | "fence_off"
                 ))
                 .unwrap();
         }
@@ -6768,10 +6802,11 @@ mod tests {
         assert_eq!(
             result.water_source_conversion(),
             match case {
-                "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off" =>
-                    Some(false),
+                "convert_off" | "origin_source_off" | "slab_bottom_off" | "stair_bottom_off"
+                | "fence_off" => Some(false),
                 "convert_on" | "convert_bubble" | "origin_source_on" | "slab_bottom"
-                | "slab_top" | "slab_oak" | "stair_bottom" | "stair_top" => Some(true),
+                | "slab_top" | "slab_oak" | "stair_bottom" | "stair_top" | "fence_on"
+                | "fence_on_neighbor" => Some(true),
                 _ => None,
             }
         );
@@ -6785,7 +6820,9 @@ mod tests {
                 !native_world::block_light::same_light_behavior(old, new).unwrap()
             })
             .collect();
-        assert_eq!(result.light_checks, expected_checks);
+        if case != "fence_on_neighbor" {
+            assert_eq!(result.light_checks, expected_checks);
+        }
         let mut trace = vec![format!("case {case}")];
         for [x, y, z] in [
             [origin_x, 8, 8],
@@ -6832,7 +6869,18 @@ mod tests {
                 ));
             }
         }
-        if case.starts_with("marked_stair_corner_") {
+        if case == "fence_on_neighbor" {
+            let state = result.world.block(10, 8, 8).unwrap();
+            trace.push(format!(
+                "neighbor {} {} {} {} {}",
+                state.properties["north"],
+                state.properties["east"],
+                state.properties["south"],
+                state.properties["west"],
+                state.properties["waterlogged"]
+            ));
+        }
+        if case.starts_with("marked_stair_corner_") || case == "fence_on_neighbor" {
             for check in &result.light_checks {
                 trace.push(format!("light {},{},{}", check.x, check.y, check.z));
             }
@@ -7134,6 +7182,38 @@ mod tests {
     }
 
     #[test]
+    fn generated_water_fills_fences_only_when_a_source_forms() {
+        let enabled = water_spread_trace("fence_on");
+        assert!(
+            enabled
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:oak_fence true")
+        );
+        assert!(
+            enabled
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,8,8 5")
+        );
+        let disabled = water_spread_trace("fence_off");
+        assert!(
+            disabled
+                .iter()
+                .any(|line| line == "state 9,8,8 minecraft:oak_fence false")
+        );
+        assert!(
+            !disabled
+                .iter()
+                .any(|line| line == "fluid minecraft:water 9,8,8 5")
+        );
+        let neighbor = water_spread_trace("fence_on_neighbor");
+        assert!(
+            neighbor
+                .iter()
+                .any(|line| line == "neighbor false false false true false")
+        );
+    }
+
+    #[test]
     fn marked_waterlogged_slabs_tick_and_update_neighbor_shapes() {
         let dry = water_spread_trace("marked_slab_dry");
         assert!(!dry.iter().any(|line| line.starts_with("fluid ")));
@@ -7397,6 +7477,9 @@ mod tests {
             "marked_leaf_wet",
             "marked_leaf_side",
             "marked_leaf_down",
+            "fence_on",
+            "fence_off",
+            "fence_on_neighbor",
             "marked_fence_wet",
             "marked_fence_side",
             "marked_fence_down",

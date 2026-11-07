@@ -107,6 +107,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         leafTypes.put("pale_oak_leaves",Blocks.PALE_OAK_LEAVES); leafTypes.put("azalea_leaves",Blocks.AZALEA_LEAVES);
         leafTypes.put("flowering_azalea_leaves",Blocks.FLOWERING_AZALEA_LEAVES);
         var scenarios = new ArrayList<>(List.of("down","down_sand","sides","mixed","edge","edge_deferred","convert_off","convert_on","convert_bubble","flow_drain","flow_drain_sand","flow_weaken","flow_falling","flow_down","flow_sides","origin_source_off","origin_source_on","slab_bottom","slab_top","slab_bottom_off","slab_oak","down_wet_slab","marked_slab_dry","marked_slab_wet","marked_slab_side","marked_slab_down","stair_bottom","stair_top","stair_bottom_off","marked_stair_dry","marked_stair_wet","marked_stair_side","marked_stair_down","marked_leaf_dry","marked_leaf_wet","marked_leaf_side","marked_leaf_down"));
+        scenarios.addAll(List.of("fence_on","fence_off","fence_on_neighbor"));
         scenarios.addAll(List.of("marked_fence_wet","marked_fence_side","marked_fence_down","marked_fence_disconnect","marked_fence_disconnect_sand","marked_fence_disconnect_water","marked_fence_disconnect_neighbor"));
         scenarios.addAll(List.of("marked_lichen_wet","marked_lichen_side","marked_lichen_down","marked_lichen_sides","marked_lichen_mixed"));
         for(var name:leafTypes.keySet()) scenarios.add("marked_leaf_type_"+name);
@@ -124,7 +125,7 @@ public class GeneratedWaterSpreadPostprocessingOracle {
         for(String scenario:scenarios) {
             bind.invoke(Blocks.DIRT.builtInRegistryHolder(),scenario.equals("convert_bubble")?List.of(BlockTags.ENABLES_BUBBLE_COLUMN_DRAG_DOWN):List.of());
             pos=new BlockPos(scenario.startsWith("edge")?15:8,8,8);
-            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off"),null);
+            rules.set(GameRules.WATER_SOURCE_CONVERSION,!scenario.equals("convert_off")&&!scenario.equals("origin_source_off")&&!scenario.equals("slab_bottom_off")&&!scenario.equals("stair_bottom_off")&&!scenario.equals("fence_off"),null);
             blocks.clear();lightChecks.clear();blocks.put(pos,Blocks.WATER.defaultBlockState());
             if(scenario.startsWith("barrier_")) {
                 var barrier=(scenario.equals("barrier_sulfur")?Blocks.SULFUR:Blocks.CINNABAR).defaultBlockState();
@@ -148,6 +149,11 @@ public class GeneratedWaterSpreadPostprocessingOracle {
             }
             if(scenario.startsWith("slab_")) {
                 blocks.put(pos.east(),(scenario.equals("slab_oak")?Blocks.OAK_SLAB:Blocks.STONE_SLAB).defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE,scenario.equals("slab_top")?SlabType.TOP:SlabType.BOTTOM));
+                blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
+            }
+            if(scenario.equals("fence_on")||scenario.equals("fence_off")||scenario.equals("fence_on_neighbor")) {
+                blocks.put(pos.east(),Blocks.OAK_FENCE.defaultBlockState());
+                if(scenario.equals("fence_on_neighbor"))blocks.put(pos.east(2),Blocks.OAK_FENCE.defaultBlockState());
                 blocks.put(pos.east().north(),Blocks.WATER.defaultBlockState());
             }
             if(scenario.startsWith("marked_slab_")) {
@@ -241,7 +247,8 @@ public class GeneratedWaterSpreadPostprocessingOracle {
                 if(state.getBlock() instanceof StairBlock)out.printf("stair %d,%d,%d %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(BlockStateProperties.HORIZONTAL_FACING),state.getValue(BlockStateProperties.HALF),state.getValue(BlockStateProperties.STAIRS_SHAPE));
                 if(state.getBlock() instanceof FenceBlock)out.printf("fence %d,%d,%d %s %s %s %s%n",p.getX(),p.getY(),p.getZ(),state.getValue(FenceBlock.NORTH),state.getValue(FenceBlock.EAST),state.getValue(FenceBlock.SOUTH),state.getValue(FenceBlock.WEST));
             }
-            if(scenario.startsWith("marked_stair_corner_"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
+            if(scenario.equals("fence_on_neighbor")){var s=get(pos.east(2));out.printf("neighbor %s %s %s %s %s%n",s.getValue(FenceBlock.NORTH),s.getValue(FenceBlock.EAST),s.getValue(FenceBlock.SOUTH),s.getValue(FenceBlock.WEST),s.getValue(BlockStateProperties.WATERLOGGED));}
+            if(scenario.startsWith("marked_stair_corner_")||scenario.equals("fence_on_neighbor"))for(var p:lightChecks)out.printf("light %d,%d,%d%n",p.getX(),p.getY(),p.getZ());
             for(var tick:bt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:eastBt.pack(100)){var p=tick.pos();out.printf("block %s %d,%d,%d %d%n",BuiltInRegistries.BLOCK.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}
             for(var tick:ft.pack(100)){var p=tick.pos();out.printf("fluid %s %d,%d,%d %d%n",BuiltInRegistries.FLUID.getKey(tick.type()),p.getX(),p.getY(),p.getZ(),tick.delay());}

@@ -54,6 +54,8 @@ use super::{
 
 mod buried_treasure;
 mod jigsaw;
+#[cfg(test)]
+mod kelp_tests;
 mod mineshaft;
 mod ocean_ruin;
 #[cfg(test)]
@@ -6502,7 +6504,7 @@ impl DiskWorld for DecorationRegion<'_> {
             return Ok(None);
         };
         let bounds = match (state.name.as_str(), name) {
-            ("minecraft:cave_vines", "age") => Some((0, 25)),
+            ("minecraft:cave_vines" | "minecraft:kelp", "age") => Some((0, 25)),
             ("minecraft:sugar_cane" | "minecraft:cactus", "age") => Some((0, 15)),
             ("minecraft:sweet_berry_bush", "age") => Some((0, 3)),
             ("minecraft:water" | "minecraft:lava", "level") => Some((0, 15)),
@@ -7487,6 +7489,9 @@ impl ColumnWorld for DecorationRegion<'_> {
                 }
                 "minecraft:cactus_flower" => state.properties.is_empty(),
                 "minecraft:cave_vines_plant" | "minecraft:cave_vines" => tree_cave_vines(state)?,
+                "minecraft:kelp" | "minecraft:kelp_plant" => {
+                    native_world::block_light::same_light_behavior(state, state).is_some()
+                }
                 "minecraft:big_dripleaf"
                 | "minecraft:big_dripleaf_stem"
                 | "minecraft:small_dripleaf" => generated_dripleaf(state)?,
@@ -7500,6 +7505,18 @@ impl ColumnWorld for DecorationRegion<'_> {
                 return Ok(true);
             }
             let old = self.read(pos)?;
+            if matches!(
+                state.name.as_str(),
+                "minecraft:kelp" | "minecraft:kelp_plant"
+            ) {
+                ensure!(
+                    old.name == "minecraft:water"
+                        && native_world::fluid::FluidState::from_block(&old)
+                            .map_err(anyhow::Error::msg)?
+                            .is_some(),
+                    "unsupported kelp column source effects"
+                );
+            }
             ensure!(
                 disk_safe_solid(&old.name).is_some()
                     || old.name == "minecraft:sugar_cane"
@@ -12147,6 +12164,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_kelp_column_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_column_kelp_head",
+            "vine_active_self_column_kelp_head",
+            "vine_active_column_kelp_body",
+            "vine_active_self_column_kelp_body",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_clay_to_water_matches_java_light_across_25_columns() {
         check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
     }
@@ -12440,6 +12468,12 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if mode.contains("_kelp_") {
+                let mut water = state("water");
+                water.properties.insert("level".into(), "0".into());
+                let id = world.intern_state(water);
+                world.set_block_id(16, 10, 8, id).unwrap();
+            }
             if mode.contains("_jigsaw_wet_") || mode.contains("_jigsaw_water_") {
                 let mut water = state("water");
                 water.properties.insert("level".into(), "0".into());
@@ -12557,6 +12591,18 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_kelp_") {
+                    let mut block = state(if mode.ends_with("_head") {
+                        "kelp"
+                    } else {
+                        "kelp_plant"
+                    });
+                    if mode.ends_with("_head") {
+                        block.properties.insert("age".into(), "20".into());
+                    }
+                    assert!(draft.set_column_block(p, &block).unwrap());
+                    continue;
+                }
                 if let Some(name) = mode.split("_plant_").nth(1) {
                     let (name, half) = if let Some(name) = name.strip_suffix("_upper") {
                         (name, Some("upper"))
@@ -12771,7 +12817,7 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_plant_") {
+            let expected_checks = if mode.contains("_plant_") || mode.contains("_kelp_") {
                 0
             } else if mode.contains("_jigsaw_wet_") {
                 2

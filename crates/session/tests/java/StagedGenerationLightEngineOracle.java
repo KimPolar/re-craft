@@ -145,6 +145,16 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineSelf=vineActive && args[1].startsWith("vine_active_self_");
+        boolean kelpColumn=vineActive && args[1].contains("_kelp_");
+        if(kelpColumn) for(var kelp:List.of(Blocks.KELP,Blocks.KELP_PLANT))
+            for(var s:kelp.getStateDefinition().getPossibleStates()) {
+                if(s.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(s) || s.getPostProcessPos(null,BlockPos.ZERO)!=null || s.isSolid() || !s.getFluidState().isSource() || s.getFluidState().getType()!=net.minecraft.world.level.material.Fluids.WATER)
+                    throw new AssertionError("unsupported kelp state "+s);
+                for(int level=0;level<=15;level++) {
+                    var water=Blocks.WATER.defaultBlockState().setValue(net.minecraft.world.level.block.LiquidBlock.LEVEL,level);
+                    if(LightEngine.hasDifferentLightProperties(water,s))throw new AssertionError("kelp light check "+s+" "+level);
+                }
+            }
         boolean plantActive=vineActive && args[1].contains("_plant_");
         if(plantActive) for(var name:List.of("short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac")) {
             var plant=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
@@ -240,6 +250,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(skyMany && x==1 && z==0){ fake.section.setBlockState(0,11,9,Blocks.STONE.defaultBlockState()); fake.section.setBlockState(1,11,8,Blocks.STONE.defaultBlockState()); }
             if(x==1 && z==0 && !blockCase && !magma && !magmaActive && !treeEmpty && !treeSparse && !vineActiveEmpty) fake.section.setBlockState(1,10,8,Blocks.TORCH.defaultBlockState());
             if(x==1 && z==0 && lichenActive) {
+                var water=Blocks.WATER.defaultBlockState();
+                fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
+            }
+            if(x==1 && z==0 && kelpColumn) {
                 var water=Blocks.WATER.defaultBlockState();
                 fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
             }
@@ -458,13 +472,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     state=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
                     if(upper || lower)state=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOUBLE_BLOCK_HALF,upper ? net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER : net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
                 }
+                if(kelpColumn)state=args[1].endsWith("_head") ? Blocks.KELP.defaultBlockState().setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,20) : Blocks.KELP_PLANT.defaultBlockState();
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
                 boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(0,p[1],p[2],state); w.edits.put(pos,state);
                 if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
                 boolean changed=LightEngine.hasDifferentLightProperties(old,state);
-                if(changed!=(!plantActive && ((jigsawGate || jigsawDoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries)))))throw new AssertionError("unexpected active light check");
+                if(changed!=(!plantActive && !kelpColumn && ((jigsawGate || jigsawDoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries)))))throw new AssertionError("unexpected active light check");
                 if(changed)engine.checkBlock(pos);
                 if(jigsawWet) {
                     var wet=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true);

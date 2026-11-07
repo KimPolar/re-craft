@@ -492,6 +492,18 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         {
             (1, 0)
         }
+        "minecraft:potent_sulfur"
+            if state.properties.len() == 1
+                && matches!(
+                    state
+                        .properties
+                        .get("potent_sulfur_state")
+                        .map(String::as_str),
+                    Some("dry" | "wet" | "dormant" | "erupting" | "continuous")
+                ) =>
+        {
+            (15, 0)
+        }
         "minecraft:pointed_dripstone" | "minecraft:sulfur_spike" if state.properties.len() == 3 => {
             if !matches!(
                 state.properties.get("thickness").map(String::as_str),
@@ -2371,6 +2383,7 @@ mod tests {
             "cinnabar",
             "sulfur",
             "sulfur_spike",
+            "potent_sulfur",
             "short_grass",
             "fern",
             "vine",

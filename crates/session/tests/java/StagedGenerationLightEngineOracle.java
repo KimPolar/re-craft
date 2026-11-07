@@ -145,6 +145,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineSelf=vineActive && args[1].startsWith("vine_active_self_");
+        boolean plantActive=vineActive && args[1].contains("_plant_");
+        if(plantActive) for(var name:List.of("short_grass","fern","bush","dandelion","poppy","blue_orchid","allium","azure_bluet","red_tulip","orange_tulip","white_tulip","pink_tulip","oxeye_daisy","cornflower","lily_of_the_valley","firefly_bush","closed_eyeblossom","sweet_berry_bush","short_dry_grass","tall_dry_grass","dead_bush","sunflower","tall_grass","large_fern","rose_bush","peony","lilac")) {
+            var plant=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
+            for(var s:plant.getStateDefinition().getPossibleStates()) if(s.getLightEmission()==0)
+                for(var air:List.of(Blocks.AIR,Blocks.CAVE_AIR,Blocks.VOID_AIR))
+                    if(LightEngine.hasDifferentLightProperties(air.defaultBlockState(),s))
+                        throw new AssertionError("plant requires light check "+s);
+        }
         boolean pileActive=vineActive && args[1].contains("_pile_");
         boolean jigsawWood=vineActive && args[1].contains("_jigsaw_");
         boolean jigsawWet=jigsawWood && args[1].contains("_jigsaw_wet_");
@@ -443,13 +451,20 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 var state=jigsawWood ? (args[1].endsWith("_log") ? Blocks.OAK_LOG.defaultBlockState() : args[1].endsWith("_slab") ? Blocks.OAK_SLAB.defaultBlockState() : args[1].endsWith("_stairs") ? Blocks.OAK_STAIRS.defaultBlockState() : jigsawFence ? Blocks.OAK_FENCE.defaultBlockState() : jigsawGate ? Blocks.OAK_FENCE_GATE.defaultBlockState() : jigsawDoor ? Blocks.OAK_DOOR.defaultBlockState() : jigsawTerracotta ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:white_terracotta")).defaultBlockState() : jigsawBed ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:white_bed")).defaultBlockState() : jigsawTorch ? (args[1].endsWith("_walltorch") ? Blocks.WALL_TORCH.defaultBlockState() : Blocks.TORCH.defaultBlockState()) : jigsawGlass ? (args[1].endsWith("_pane") ? Blocks.GLASS_PANE.defaultBlockState() : Blocks.GLASS.defaultBlockState()) : Blocks.OAK_PLANKS.defaultBlockState()) : pileActive ? pile.defaultBlockState() : magmaActive ? Blocks.MAGMA_BLOCK.defaultBlockState() : patchActive ? Blocks.WATER.defaultBlockState() : patchVine ? (args[1].endsWith("_clay") ? Blocks.CLAY.defaultBlockState() : Blocks.MOSS_BLOCK.defaultBlockState()) : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : args[1].endsWith("_sulfur") ? Blocks.SULFUR.defaultBlockState() : args[1].endsWith("_water") ? Blocks.WATER.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
                     ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true).setValue(net.minecraft.world.level.block.MultifaceBlock.getFaceProperty(net.minecraft.core.Direction.UP),true)
                     : block.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,berries);
+                if(plantActive){
+                    var name=args[1].substring(args[1].indexOf("_plant_")+7);
+                    var upper=name.endsWith("_upper"); var lower=name.endsWith("_lower");
+                    if(upper || lower)name=name.substring(0,name.lastIndexOf('_'));
+                    state=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
+                    if(upper || lower)state=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOUBLE_BLOCK_HALF,upper ? net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER : net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
+                }
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
                 boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(0,p[1],p[2],state); w.edits.put(pos,state);
                 if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
                 boolean changed=LightEngine.hasDifferentLightProperties(old,state);
-                if(changed!=((jigsawGate || jigsawDoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries))))throw new AssertionError("unexpected active light check");
+                if(changed!=(!plantActive && ((jigsawGate || jigsawDoor || jigsawBed || jigsawGlass) ? (jigsawWater || jigsawWet) : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || patchVine || (lakeActive && !lakeOre && !args[1].endsWith("_sulfur")) || lichenActive || (!lakeActive && berries)))))throw new AssertionError("unexpected active light check");
                 if(changed)engine.checkBlock(pos);
                 if(jigsawWet) {
                     var wet=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true);

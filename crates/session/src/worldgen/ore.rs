@@ -7814,6 +7814,17 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 "minecraft:lava" | "minecraft:water"
                             ) && state.properties.len() == 1
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
+                    // Transparent plants do not enqueue a block light check,
+                    // but the first non-air block still allocates a section.
+                    let vegetation_allocation = old_air
+                        && matches!(
+                            simple_plant_kind(state),
+                            Ok(SimplePlantKind::Vegetation
+                                | SimplePlantKind::DryVegetation
+                                | SimplePlantKind::Double)
+                        )
+                        && native_world::block_light::same_light_behavior(&old, state)
+                            == Some(true);
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
                         && ((old.name == "minecraft:stone" && old.properties.is_empty())
@@ -7891,7 +7902,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && (tree_light_update
                                 || vine_write
                                 || pile_light_update
-                                || jigsaw_light_update);
+                                || jigsaw_light_update
+                                || vegetation_allocation);
                         ensure!(
                             if old_air {
                                 count > 0 || new_section
@@ -12122,6 +12134,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_empty_section_plants_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_empty_plant_tall_grass_upper",
+            "vine_active_self_empty_plant_tall_grass_lower",
+            "vine_active_empty_plant_large_fern_lower",
+            "vine_active_self_empty_plant_sunflower_upper",
+            "vine_active_empty_plant_short_grass",
+            "vine_active_self_empty_plant_short_grass",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_clay_to_water_matches_java_light_across_25_columns() {
         check_staged_light_modes(&["vine_active_patch_water", "vine_active_self_patch_water"]);
     }
@@ -12532,6 +12557,21 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if let Some(name) = mode.split("_plant_").nth(1) {
+                    let (name, half) = if let Some(name) = name.strip_suffix("_upper") {
+                        (name, Some("upper"))
+                    } else if let Some(name) = name.strip_suffix("_lower") {
+                        (name, Some("lower"))
+                    } else {
+                        (name, None)
+                    };
+                    let mut block = state(name);
+                    if let Some(half) = half {
+                        block.properties.insert("half".into(), half.into());
+                    }
+                    assert!(draft.write_simple_block(p, &block).unwrap());
+                    continue;
+                }
                 if mode.contains("_jigsaw_") {
                     let mut block = state(if mode.ends_with("_log") {
                         "oak_log"
@@ -12731,7 +12771,9 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_jigsaw_wet_") {
+            let expected_checks = if mode.contains("_plant_") {
+                0
+            } else if mode.contains("_jigsaw_wet_") {
                 2
             } else if mode.ends_with("_jigsaw_gate")
                 || mode.ends_with("_jigsaw_door")

@@ -48,7 +48,7 @@ fn fixtures() -> Result<Vec<SavedRuinedPortalPiece>> {
                         rotation,
                         mirror,
                     };
-                    let position = [-37, 90, 52];
+                    let position = [-48, 90, 48];
                     let size = [7, 4, 5];
                     let pivot = [3, 0, 2];
                     let point = GenerationPoint {
@@ -198,6 +198,16 @@ fn prepared_start_preserves_piece_and_checks_cold_only_after_biome() -> Result<(
         SavedRuinedPortalPiece::from_tag(&start.piece.to_tag()?, start.template.size)?,
         start.piece
     );
+    let id = ResourceId::parse("minecraft:ruined_portal")?;
+    let tag = start.to_tag(&id)?;
+    assert_eq!(tag.get("ChunkX"), Some(&Tag::Int(0)));
+    assert_eq!(tag.get("ChunkZ"), Some(&Tag::Int(0)));
+    let mut bad = start.clone();
+    bad.chunk[0] = 1;
+    assert!(bad.to_tag(&id).is_err());
+    bad = start.clone();
+    bad.point.pivot[0] += 1;
+    assert!(bad.to_tag(&id).is_err());
     assert_eq!(
         start
             .reference_bounds(ResourceId::parse("minecraft:ruined_portal")?)?
@@ -260,18 +270,51 @@ fn generated_portal_piece_nbt_matches_java() -> Result<()> {
         String::from_utf8_lossy(&compile.stderr)
     );
     let pieces = fixtures()?;
+    let first = &pieces[0];
+    let first_start = PreparedStart {
+        chunk: [-3, 3],
+        point: GenerationPoint {
+            position: first.position,
+            pivot: [3, 0, 2],
+            bounds: first.bounds,
+        },
+        terrain_adjustment: native_core::beardifier::TerrainAdjustment::None,
+        template: std::sync::Arc::new(native_persistence::structure_template::StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [7, 4, 5],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        }),
+        piece: first.clone(),
+    };
     let root = NamedTag {
         name: "".into(),
-        value: Tag::Compound(vec![(
-            "pieces".into(),
-            Tag::List {
-                element_type: TagType::Compound,
-                values: pieces
-                    .iter()
-                    .map(SavedRuinedPortalPiece::to_tag)
-                    .collect::<Result<_>>()?,
-            },
-        )]),
+        value: Tag::Compound(vec![
+            (
+                "pieces".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: pieces
+                        .iter()
+                        .map(SavedRuinedPortalPiece::to_tag)
+                        .collect::<Result<_>>()?,
+                },
+            ),
+            (
+                "starts".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![
+                        first_start.to_tag(&ResourceId::parse("minecraft:ruined_portal")?)?,
+                    ],
+                },
+            ),
+        ]),
     };
     let rust_path = temp.path().join("rust.nbt");
     let java_path = temp.path().join("java.nbt");

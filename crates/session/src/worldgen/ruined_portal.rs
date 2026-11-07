@@ -1,7 +1,7 @@
 //! Ruined-portal piece metadata and staged template placement.
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::BoundingBox;
-use native_persistence::nbt::Tag;
+use native_persistence::nbt::{Tag, TagType};
 use native_persistence::structure_template::StructureTemplate;
 use native_resources::{
     packs::{ResourceId, ResourceProvider},
@@ -309,6 +309,44 @@ impl PreparedStart {
             &[self.piece.bounds],
             self.terrain_adjustment,
         )
+    }
+
+    /// Serialize a fresh, single-piece start without authorizing a world save.
+    pub fn to_tag(&self, structure: &ResourceId) -> Result<Tag> {
+        let name = format!("{}:{}", structure.namespace, structure.path);
+        ensure!(
+            ResourceId::parse(&name)? == *structure,
+            "invalid portal structure identifier"
+        );
+        let x = self.chunk[0]
+            .checked_mul(16)
+            .context("portal chunk X overflow")?;
+        let z = self.chunk[1]
+            .checked_mul(16)
+            .context("portal chunk Z overflow")?;
+        ensure!(
+            self.template.data_version == Some(5023)
+                && self.template.size == self.piece.template_size
+                && self.point.position == self.piece.position
+                && self.point.position[0] == x
+                && self.point.position[2] == z
+                && self.point.bounds == self.piece.bounds
+                && self.point.pivot == [self.template.size[0] / 2, 0, self.template.size[2] / 2],
+            "portal start differs from its piece or template"
+        );
+        Ok(Tag::Compound(vec![
+            ("id".into(), Tag::String(name.as_str().into())),
+            ("ChunkX".into(), Tag::Int(self.chunk[0])),
+            ("ChunkZ".into(), Tag::Int(self.chunk[1])),
+            ("references".into(), Tag::Int(0)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![self.piece.to_tag()?],
+                },
+            ),
+        ]))
     }
 }
 

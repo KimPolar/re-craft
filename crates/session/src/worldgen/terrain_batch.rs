@@ -1061,11 +1061,7 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        ensure!(
-            !structures.ruined_portal_starts.contains_key(&pos),
-            "ruined portal structure serialization is not yet supported"
-        );
-        super::structure_data::pack_structure_data_with_jigsaw(
+        super::structure_data::pack_structure_data_with_portals(
             pos,
             structures
                 .starts
@@ -1081,6 +1077,10 @@ impl FreshTerrainBatch {
                 .unwrap_or(&Default::default()),
             structures
                 .jigsaw_starts
+                .get(&pos)
+                .unwrap_or(&Default::default()),
+            structures
+                .ruined_portal_starts
                 .get(&pos)
                 .unwrap_or(&Default::default()),
             structures
@@ -1105,12 +1105,13 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
-        super::structure_data::referenced_start_chunks_with_jigsaw(
+        super::structure_data::referenced_start_chunks_with_portals(
             pos,
             &structures.starts,
             &structures.ocean_starts,
             &structures.mineshafts,
             &structures.jigsaw_starts,
+            &structures.ruined_portal_starts,
             structures
                 .references
                 .get(&pos)

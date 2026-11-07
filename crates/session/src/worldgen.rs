@@ -8298,8 +8298,19 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=8).contains(&feature_kind)
+                    feature_kind == 0 || feature_kind == 2 || (4..=9).contains(&feature_kind)
                 );
+                if feature_kind == 9 {
+                    let saved = batch.structure_data(target)?;
+                    assert!(
+                        saved
+                            .get("starts")
+                            .and_then(|starts| starts.get("example:test"))
+                            .and_then(|start| start.get("Children"))
+                            .is_some()
+                    );
+                    assert!(batch.structure_reference_sources(target)?.contains(&target));
+                }
                 if feature_kind != 9 {
                     assert!(
                         batch

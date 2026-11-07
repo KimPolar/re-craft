@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     SavedSwampHutPiece,
     structure_batch::{
-        JigsawStarts, MineshaftStarts, OceanRuinStarts, SimpleStarts, TerrainStartKey,
+        JigsawStarts, MineshaftStarts, OceanRuinStarts, RuinedPortalStarts, SimpleStarts,
+        TerrainStartKey,
     },
     structure_references::{
         OrderedStructureReferences, StructureStartBounds, collect_ordered_structure_references,
@@ -68,12 +69,37 @@ pub(super) fn referenced_start_chunks_with_mineshaft(
 }
 
 /// Recompute every reference, retaining jigsaw source chunks as well.
+#[cfg(test)]
 pub(super) fn referenced_start_chunks_with_jigsaw(
     pos: ChunkPos,
     all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
     all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
     all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
     all_jigsaw: &BTreeMap<ChunkPos, JigsawStarts>,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<BTreeSet<ChunkPos>> {
+    referenced_start_chunks_with_portals(
+        pos,
+        all_starts,
+        all_ocean,
+        all_mineshafts,
+        all_jigsaw,
+        &BTreeMap::new(),
+        references,
+        huts,
+    )
+}
+
+/// Recompute references from all retained starts before building a save draft.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn referenced_start_chunks_with_portals(
+    pos: ChunkPos,
+    all_starts: &BTreeMap<ChunkPos, SimpleStarts>,
+    all_ocean: &BTreeMap<ChunkPos, OceanRuinStarts>,
+    all_mineshafts: &BTreeMap<ChunkPos, MineshaftStarts>,
+    all_jigsaw: &BTreeMap<ChunkPos, JigsawStarts>,
+    all_portals: &BTreeMap<ChunkPos, RuinedPortalStarts>,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<BTreeSet<ChunkPos>> {
@@ -127,6 +153,25 @@ pub(super) fn referenced_start_chunks_with_jigsaw(
                 bounds.push(start.reference_bounds(id.clone())?);
             }
         }
+        if let Some(portals) = all_portals.get(&source) {
+            for (id, start) in portals {
+                ensure!(
+                    !simple.contains_key(id)
+                        && !all_ocean
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_mineshafts
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id))
+                        && !all_jigsaw
+                            .get(&source)
+                            .is_some_and(|starts| starts.contains_key(id)),
+                    "duplicate structure start"
+                );
+                validate_portal_start(source, id, start)?;
+                bounds.push(start.reference_bounds(id.clone())?);
+            }
+        }
         Ok(bounds)
     })?;
     ensure!(
@@ -151,26 +196,44 @@ pub(super) fn referenced_start_chunks_with_jigsaw(
                 .get(&source)
                 .and_then(|starts| starts.get(id));
             let jigsaw = all_jigsaw.get(&source).and_then(|starts| starts.get(id));
-            match (simple, ocean, mineshaft, jigsaw) {
-                (Some(start), None, None, None) => {
+            let portal = all_portals.get(&source).and_then(|starts| starts.get(id));
+            match (simple, ocean, mineshaft, jigsaw, portal) {
+                (Some(start), None, None, None, None) => {
                     validate_start(source, id, start, huts)?;
                 }
-                (None, Some(start), None, None) => {
+                (None, Some(start), None, None, None) => {
                     validate_ocean_start(source, start)?;
                 }
-                (None, None, Some(start), None) => {
+                (None, None, Some(start), None, None) => {
                     validate_mineshaft_start(source, id, start)?;
                 }
-                (None, None, None, Some(start)) => {
+                (None, None, None, Some(start), None) => {
                     validate_jigsaw_start(source, id, start)?;
                 }
-                (None, None, None, None) => anyhow::bail!("referenced structure start is missing"),
+                (None, None, None, None, Some(start)) => {
+                    validate_portal_start(source, id, start)?;
+                }
+                (None, None, None, None, None) => {
+                    anyhow::bail!("referenced structure start is missing")
+                }
                 _ => anyhow::bail!("duplicate structure start"),
             }
             required.insert(source);
         }
     }
     Ok(required)
+}
+
+fn validate_portal_start(
+    pos: ChunkPos,
+    id: &ResourceId,
+    start: &super::ruined_portal::PreparedStart,
+) -> Result<Tag> {
+    ensure!(
+        start.chunk == [pos.x, pos.z],
+        "portal belongs to another chunk"
+    );
+    start.to_tag(id)
 }
 
 fn validate_jigsaw_start(
@@ -333,12 +396,37 @@ pub(super) fn pack_structure_data_with_mineshaft(
 }
 
 /// Serialize supported starts, including jigsaw pieces, without writing a world.
+#[cfg(test)]
 pub(super) fn pack_structure_data_with_jigsaw(
     pos: ChunkPos,
     starts: &SimpleStarts,
     ocean: &OceanRuinStarts,
     mineshafts: &MineshaftStarts,
     jigsaws: &JigsawStarts,
+    references: &OrderedStructureReferences,
+    huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
+) -> Result<Tag> {
+    pack_structure_data_with_portals(
+        pos,
+        starts,
+        ocean,
+        mineshafts,
+        jigsaws,
+        &RuinedPortalStarts::new(),
+        references,
+        huts,
+    )
+}
+
+/// Serialize all supported fresh starts without writing an existing world.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pack_structure_data_with_portals(
+    pos: ChunkPos,
+    starts: &SimpleStarts,
+    ocean: &OceanRuinStarts,
+    mineshafts: &MineshaftStarts,
+    jigsaws: &JigsawStarts,
+    portals: &RuinedPortalStarts,
     references: &OrderedStructureReferences,
     huts: &BTreeMap<TerrainStartKey, SavedSwampHutPiece>,
 ) -> Result<Tag> {
@@ -412,6 +500,18 @@ pub(super) fn pack_structure_data_with_jigsaw(
         let name = format!("{}:{}", id.namespace, id.path);
         packed_starts.push((name.as_str().into(), value));
     }
+    for (id, start) in portals {
+        ensure!(
+            !starts.contains_key(id)
+                && !ocean.contains_key(id)
+                && !mineshafts.contains_key(id)
+                && !jigsaws.contains_key(id),
+            "duplicate structure start"
+        );
+        let value = validate_portal_start(pos, id, start)?;
+        let name = format!("{}:{}", id.namespace, id.path);
+        packed_starts.push((name.as_str().into(), value));
+    }
     let mut packed_references = Vec::with_capacity(references.membership().len());
     for (id, members) in references.membership() {
         let order = references
@@ -439,6 +539,154 @@ mod tests {
     use super::*;
     use native_core::beardifier::{BoundingBox, TerrainAdjustment};
     use native_resources::{packs::ResourceId, structure_start::SimpleStructureStart};
+
+    #[test]
+    fn portal_draft_preserves_start_and_reference_completeness() -> Result<()> {
+        use native_persistence::{nbt::NamedTag, structure_template::StructureTemplate};
+        use native_resources::{
+            ruined_portal::{GenerationPoint, InitialSelection, Setup, VerticalPlacement},
+            structure_transform::{Mirror, Rotation},
+        };
+        use std::sync::Arc;
+        let pos = ChunkPos { x: -3, z: 3 };
+        let id = ResourceId::parse("minecraft:ruined_portal")?;
+        let selection = InitialSelection {
+            setup_index: 0,
+            air_pocket: false,
+            template: ResourceId::parse("minecraft:ruined_portal/portal_1")?,
+            rotation: Rotation::None,
+            mirror: Mirror::None,
+        };
+        let setup = Setup {
+            placement: VerticalPlacement::OnLandSurface,
+            air_pocket_probability: 0.0,
+            mossiness: 0.0,
+            overgrown: false,
+            vines: false,
+            can_be_cold: false,
+            replace_with_blackstone: false,
+            weight: 1.0,
+        };
+        let point = GenerationPoint {
+            position: [-48, 70, 48],
+            pivot: [1, 0, 1],
+            bounds: BoundingBox::new([-48, 70, 48], [-46, 72, 50]).unwrap(),
+        };
+        let piece = super::super::ruined_portal::SavedRuinedPortalPiece::capture(
+            &selection,
+            &setup,
+            &point,
+            [3, 3, 3],
+            false,
+        )?;
+        let start = super::super::ruined_portal::PreparedStart {
+            chunk: [-3, 3],
+            point,
+            terrain_adjustment: TerrainAdjustment::None,
+            piece,
+            template: Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [3, 3, 3],
+                palettes: vec![],
+                blocks: vec![],
+                entities: vec![],
+            }),
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let references = collect_ordered_structure_references(pos, |source| {
+            Ok(if source == pos {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })?;
+        let mut starts = BTreeMap::new();
+        for z in pos.z - 8..=pos.z + 8 {
+            for x in pos.x - 8..=pos.x + 8 {
+                starts.insert(ChunkPos { x, z }, SimpleStarts::new());
+            }
+        }
+        let portals =
+            BTreeMap::from([(pos, RuinedPortalStarts::from([(id.clone(), start.clone())]))]);
+        assert!(
+            referenced_start_chunks_with_portals(
+                pos,
+                &starts,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &portals,
+                &references,
+                &BTreeMap::new()
+            )?
+            .contains(&pos)
+        );
+        let data = pack_structure_data_with_portals(
+            pos,
+            &starts[&pos],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &portals[&pos],
+            &references,
+            &BTreeMap::new(),
+        )?;
+        assert_eq!(
+            data.get("starts")
+                .and_then(|starts| starts.get("minecraft:ruined_portal")),
+            Some(&start.to_tag(&id)?)
+        );
+        assert!(
+            referenced_start_chunks_with_portals(
+                pos,
+                &starts,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &references,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        starts.remove(&ChunkPos {
+            x: pos.x - 8,
+            z: pos.z - 8,
+        });
+        assert!(
+            referenced_start_chunks_with_portals(
+                pos,
+                &starts,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &portals,
+                &references,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let mut wrong = start.clone();
+        wrong.chunk[0] += 1;
+        assert!(
+            pack_structure_data_with_portals(
+                pos,
+                &SimpleStarts::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &RuinedPortalStarts::from([(id, wrong)]),
+                &references,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     fn mineshaft_fixture(pos: ChunkPos) -> (ResourceId, super::super::mineshaft::PreparedStart) {
         use native_resources::mineshaft::{

@@ -47,9 +47,26 @@ pub(super) fn jigsaw_wood(state: &BlockState) -> bool {
     }
 }
 
+pub(super) fn jigsaw_torch(state: &BlockState) -> bool {
+    match state.name.as_str() {
+        "minecraft:torch" | "minecraft:soul_torch" => state.properties.is_empty(),
+        "minecraft:wall_torch" | "minecraft:soul_wall_torch" => {
+            state.properties.len() == 1
+                && matches!(
+                    state.properties.get("facing").map(String::as_str),
+                    Some("north" | "south" | "east" | "west")
+                )
+        }
+        _ => false,
+    }
+}
+
 fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_wood(state) {
         return Ok(true);
+    }
+    if jigsaw_torch(state) {
+        return Ok(false);
     }
     if native_world::collision::fence_waterlogged(state).is_some() {
         return Ok(false);
@@ -219,7 +236,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::slab_stair_solid(state).is_some()
                 || native_world::collision::fence_waterlogged(state).is_some()
                 || native_world::collision::fence_gate_open(state).is_some()
-                || native_world::collision::door_open(state).is_some();
+                || native_world::collision::door_open(state).is_some()
+                || jigsaw_torch(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -1048,6 +1066,77 @@ mod tests {
         }
         assert_eq!(door_names.len(), native_core::wood::Planks::ALL.len() + 9);
         assert_eq!(doors_checked, door_names.len() * 64 * 12);
+        let mut torches_checked = 0;
+        let mut torch_names = BTreeSet::new();
+        for line in output.lines().filter(|line| line.starts_with("TORCH\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                facing,
+                mirror,
+                rotation,
+                expected_facing,
+                collision,
+                outline,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java torch result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let name = format!("minecraft:{name}");
+            let properties = if *facing == "-" {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([("facing".into(), (*facing).into())])
+            };
+            let state = BlockState {
+                name: name.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&name, &properties), "{state:?}");
+            assert_eq!(registry.has_block_entity(&name), Some(false), "{state:?}");
+            assert!(!jigsaw_static_full(&state)?);
+            assert_eq!(
+                native_shape(
+                    native_world::collision::block_shape(&state)
+                        .context("torch collision missing")?
+                ),
+                parse_shape(collision)?,
+                "{state:?}"
+            );
+            assert_eq!(
+                native_shape(
+                    native_world::collision::block_outline(&state)
+                        .context("torch outline missing")?
+                ),
+                parse_shape(outline)?,
+                "{state:?}"
+            );
+            let transformed =
+                registry.transform_template_state(&name, &properties, mirror, rotation)?;
+            assert_eq!(
+                transformed.get("facing").map(String::as_str).unwrap_or("-"),
+                *expected_facing,
+                "{state:?}"
+            );
+            torch_names.insert(name);
+            torches_checked += 1;
+        }
+        assert_eq!(torch_names.len(), 4);
+        assert_eq!(torches_checked, 10 * 12);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
@@ -1112,7 +1201,14 @@ mod tests {
                             || id.ends_with("_stairs")
                             || id.ends_with("_fence")
                             || id.ends_with("_fence_gate")
-                            || id.ends_with("_door")))
+                            || id.ends_with("_door")
+                            || matches!(
+                                id.as_str(),
+                                "minecraft:torch"
+                                    | "minecraft:wall_torch"
+                                    | "minecraft:soul_torch"
+                                    | "minecraft:soul_wall_torch"
+                            )))
                 {
                     continue;
                 }
@@ -1143,6 +1239,7 @@ mod tests {
         assert!(found.contains("minecraft:oak_fence"), "{found:?}");
         assert!(found.contains("minecraft:oak_fence_gate"), "{found:?}");
         assert!(found.contains("minecraft:oak_door"), "{found:?}");
+        assert!(found.contains("minecraft:wall_torch"), "{found:?}");
         Ok(())
     }
 

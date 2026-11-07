@@ -18,6 +18,7 @@ import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.FenceBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.WallTorchBlock;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.block.state.properties.SlabType;
@@ -164,6 +165,26 @@ public class JigsawChestOracle {
                     if(changed.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF)!=state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF)
                         || changed.getValue(BlockStateProperties.OPEN)!=state.getValue(BlockStateProperties.OPEN)
                         || changed.getValue(BlockStateProperties.POWERED)!=state.getValue(BlockStateProperties.POWERED)) throw new AssertionError(changed);
+                }
+            }
+        }
+        for (var name : new String[]{"torch", "wall_torch", "soul_torch", "soul_wall_torch"}) {
+            var block=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:"+name));
+            for(var state:block.getStateDefinition().getPossibleStates()) {
+                if(state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !state.getFluidState().isEmpty()
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)
+                    || state.useShapeForLightOcclusion() || state.getLightDampening()!=0
+                    || state.getLightEmission()!=(name.startsWith("soul_") ? 10 : 14)
+                    || !LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)
+                    || !LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state)) throw new AssertionError(state);
+                for(var mirror:Mirror.values()) for(var rotation:Rotation.values()) {
+                    var changed=state.mirror(mirror).rotate(rotation);
+                    var direction=state.hasProperty(WallTorchBlock.FACING) ? state.getValue(WallTorchBlock.FACING).getSerializedName() : "-";
+                    var next=changed.hasProperty(WallTorchBlock.FACING) ? changed.getValue(WallTorchBlock.FACING).getSerializedName() : "-";
+                    out.printf("TORCH\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",name,direction,mirror.name(),rotation.name(),next,
+                        shape(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
+                        shape(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
                 }
             }
         }

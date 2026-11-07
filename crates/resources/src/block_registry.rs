@@ -682,6 +682,7 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/StairBlock" => Some(StateSchema::Stairs),
                 "net/minecraft/world/level/block/GlazedTerracottaBlock"
+                | "net/minecraft/world/level/block/WallTorchBlock"
                 | "net/minecraft/world/level/block/CarvedPumpkinBlock" => {
                     Some(StateSchema::HorizontalFacing)
                 }

@@ -7121,7 +7121,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && (native_world::collision::slab_stair_solid(state).is_some()
                             || native_world::collision::fence_waterlogged(state).is_some()
                             || native_world::collision::fence_gate_open(state).is_some()
-                            || native_world::collision::door_open(state).is_some())
+                            || native_world::collision::door_open(state).is_some()
+                            || jigsaw::jigsaw_torch(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -11557,6 +11558,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_torches_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_torch",
+            "vine_active_self_jigsaw_walltorch",
+            "vine_active_empty_jigsaw_torch",
+            "vine_active_self_empty_jigsaw_walltorch",
+            "vine_active_jigsaw_water_torch",
+            "vine_active_self_jigsaw_water_walltorch",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11766,6 +11780,10 @@ mod tests {
                         "oak_fence_gate"
                     } else if mode.ends_with("_door") {
                         "oak_door"
+                    } else if mode.ends_with("_walltorch") {
+                        "wall_torch"
+                    } else if mode.ends_with("_torch") {
+                        "torch"
                     } else {
                         "oak_planks"
                     });
@@ -11803,6 +11821,8 @@ mod tests {
                             ("open".into(), "false".into()),
                             ("powered".into(), "false".into()),
                         ]);
+                    } else if mode.ends_with("_walltorch") {
+                        block.properties = BTreeMap::from([("facing".into(), "north".into())]);
                     }
                     jigsaw::place_block_for_light_test(
                         &mut draft,

@@ -7002,9 +7002,11 @@ impl MagmaWorld for DecorationRegion<'_> {
                 "invalid magma block state"
             );
             if !self.is_outside(pos[1]) {
+                let source = self.read(pos)?;
                 ensure!(
-                    disk_safe_solid(&self.read(pos)?.name).is_some(),
-                    "unsupported magma source effects"
+                    disk_safe_solid(&source.name).is_some(),
+                    "unsupported magma source effects for {} at {pos:?}",
+                    source.name
                 );
                 self.magma_block_write = true;
                 let write = self.set_proto_block(pos, state);
@@ -22056,6 +22058,25 @@ mod tests {
                 );
             }
         }
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut setup = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut water = state("water");
+        water.properties.insert("level".into(), "0".into());
+        setup.set_section_block([8, 8, 8], &water).unwrap();
+        setup
+            .set_section_block([8, 7, 8], &state("diamond_block"))
+            .unwrap();
+        setup.finish().unwrap();
+        let before = terrain.snapshot();
+        let error = prepared.execute(&mut terrain, false).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("minecraft:diamond_block"), "{message}");
+        assert!(message.contains("[8, 7, 8]"), "{message}");
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        assert!(terrain.feature_postprocessing(center).is_none());
     }
 
     #[test]

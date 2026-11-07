@@ -8496,6 +8496,9 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
+            if feature_kind == 31 {
+                terrain_definition["settings"]["disable_mob_generation"] = json!(true);
+            }
             if (4..=31).contains(&feature_kind) {
                 terrain_definition["settings"]["noise_router"]["final_density"] = json!({
                     "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
@@ -8572,10 +8575,32 @@ mod tests {
             } else {
                 source
             };
-            let preparation = structure_batch::StructurePreparationPlan::new([(
-                target,
-                schedule::GenerationStage::Features,
-            )])?;
+            let save_targets: BTreeSet<_> = [source, target].into_iter().collect();
+            let light_targets: BTreeSet<_> = if feature_kind == 31 {
+                save_targets
+                    .iter()
+                    .flat_map(|pos| {
+                        (-1..=1).flat_map(move |dz| {
+                            (-1..=1).map(move |dx| ChunkPos {
+                                x: pos.x + dx,
+                                z: pos.z + dz,
+                            })
+                        })
+                    })
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let preparation = structure_batch::StructurePreparationPlan::new(
+                [(target, schedule::GenerationStage::Features)]
+                    .into_iter()
+                    .chain(
+                        light_targets
+                            .iter()
+                            .copied()
+                            .map(|pos| (pos, schedule::GenerationStage::InitializeLight)),
+                    ),
+            )?;
             preparation.request_structures(&mut structures)?;
             while structures
                 .step(&mut data, &mut classify_structure)?
@@ -8649,6 +8674,9 @@ mod tests {
             batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
             batch.enable_light_initialization(registry)?;
             batch.request_features(target)?;
+            if feature_kind == 31 {
+                batch.request_light_initialization_many(light_targets.iter().copied())?;
+            }
             let mut failed = false;
             loop {
                 let before = batch.snapshot();
@@ -8715,7 +8743,11 @@ mod tests {
             if !failed {
                 assert_eq!(
                     batch.schedule().completed(target),
-                    Some(schedule::GenerationStage::Features)
+                    Some(if feature_kind == 31 {
+                        schedule::GenerationStage::InitializeLight
+                    } else {
+                        schedule::GenerationStage::Features
+                    })
                 );
                 let snapshot = batch.snapshot().context("missing terrain")?;
                 if feature_kind == 31 {
@@ -8797,7 +8829,7 @@ mod tests {
                     feature_kind == 0 || feature_kind == 2 || (4..=31).contains(&feature_kind)
                 );
                 if (30..=31).contains(&feature_kind) {
-                    let data = batch.structure_data(target)?;
+                    let structure_data = batch.structure_data(target)?;
                     assert!(batch.structure_reference_sources(target)?.contains(&source));
                     assert!(
                         batch.recorded_template_feature_for_test(
@@ -8807,11 +8839,119 @@ mod tests {
                     );
                     if target == source {
                         assert!(
-                            data.get("starts")
+                            structure_data
+                                .get("starts")
                                 .and_then(|starts| starts.get("example:test"))
                                 .and_then(|start| start.get("Children"))
                                 .is_some()
                         );
+                    }
+                    if feature_kind == 31 {
+                        batch.seal_for_light_propagation()?;
+                        for &pos in &save_targets {
+                            batch.request_light(pos)?;
+                        }
+                        while batch
+                            .step(
+                                &mut data,
+                                &mut |_| anyhow::bail!("unexpected terrain"),
+                                &mut |_| anyhow::bail!("unexpected state"),
+                            )?
+                            .is_some()
+                        {}
+                        for &pos in &save_targets {
+                            batch.request_spawn_without_mobs(pos, false)?;
+                            while batch
+                                .step(
+                                    &mut data,
+                                    &mut |_| anyhow::bail!("unexpected terrain"),
+                                    &mut |_| anyhow::bail!("unexpected state"),
+                                )?
+                                .is_some()
+                            {}
+                        }
+                        let mut stage = batch.begin_generated_postprocessing(
+                            save_targets.iter().copied(),
+                            0,
+                            0,
+                        )?;
+                        stage.set_water_source_conversion(false)?;
+                        for &pos in &save_targets {
+                            while !stage.poll(pos, 256)? {}
+                        }
+                        let processed = stage.finish()?;
+                        let prepared = batch.prepare_structure_region_drafts(
+                            &processed,
+                            save_targets.iter().copied(),
+                            1,
+                        )?;
+                        assert_eq!(prepared.chunk_count, save_targets.len());
+                        assert!(prepared.referenced_start_chunks.contains(&source));
+                        let directory = tempfile::tempdir()?;
+                        let mut reopened = BTreeSet::new();
+                        for ((kind, rx, rz), draft) in &prepared.regions {
+                            if *kind != native_persistence::save::FreshRegionKind::Terrain {
+                                continue;
+                            }
+                            let path = directory.path().join(format!("r.{rx}.{rz}.mca"));
+                            let mut file = std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)?;
+                            assert!(draft.write_staged(&mut file)?.is_empty());
+                            drop(file);
+                            let mut reader = native_persistence::anvil::RegionReader::open(&path)?;
+                            for &pos in &save_targets {
+                                if pos.x.div_euclid(32) != *rx || pos.z.div_euclid(32) != *rz {
+                                    continue;
+                                }
+                                let chunk = reader
+                                    .read_chunk(pos.x, pos.z)?
+                                    .context("generated chunk missing")?;
+                                assert!(reopened.insert(pos));
+                                assert_eq!(
+                                    chunk.value.get("structures"),
+                                    Some(&batch.structure_data(pos)?)
+                                );
+                                let sections =
+                                    native_persistence::palette::decode_sections(&chunk.value)?;
+                                for y in 0..height {
+                                    let blocks = sections
+                                        .iter()
+                                        .find(|section| i32::from(section.y) == y.div_euclid(16))
+                                        .and_then(|section| section.blocks.as_ref())
+                                        .context("generated block section missing")?;
+                                    for z in 0..16 {
+                                        for x in 0..16 {
+                                            let expected = processed
+                                                .world
+                                                .block(pos.x * 16 + x, y, pos.z * 16 + z)
+                                                .context("postprocessed block missing")?;
+                                            let actual = blocks
+                                                .block(
+                                                    x as usize,
+                                                    y.rem_euclid(16) as usize,
+                                                    z as usize,
+                                                )
+                                                .context("saved block missing")?;
+                                            assert!(actual.name.matches(&expected.name));
+                                            assert_eq!(
+                                                actual.properties.len(),
+                                                expected.properties.len()
+                                            );
+                                            for (name, value) in &actual.properties {
+                                                assert!(expected.properties.iter().any(
+                                                    |(key, expected_value)| name.matches(key)
+                                                        && value.matches(expected_value)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(reopened, save_targets);
                     }
                 }
                 if (9..=29).contains(&feature_kind) {

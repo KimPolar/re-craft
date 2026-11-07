@@ -1444,21 +1444,29 @@ impl StructureGenerationBatch {
                 let mut jigsaw_starts = JigsawStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
-                    let outcome = self.generator.try_generate_batch_structure_set(
-                        provider,
-                        &mut self.evaluator,
-                        &mut self.cache,
-                        &self.biome_rules,
-                        set,
-                        [pos.x, pos.z],
-                        |id| {
-                            Ok(starts.contains_key(id)
-                                || ocean_starts.contains_key(id)
-                                || mineshafts.contains_key(id)
-                                || jigsaw_starts.contains_key(id))
-                        },
-                        &mut *classify,
-                    )?;
+                    let outcome = self
+                        .generator
+                        .try_generate_batch_structure_set(
+                            provider,
+                            &mut self.evaluator,
+                            &mut self.cache,
+                            &self.biome_rules,
+                            set,
+                            [pos.x, pos.z],
+                            |id| {
+                                Ok(starts.contains_key(id)
+                                    || ocean_starts.contains_key(id)
+                                    || mineshafts.contains_key(id)
+                                    || jigsaw_starts.contains_key(id))
+                            },
+                            &mut *classify,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "structure set {}:{} at chunk {}, {}",
+                                set.namespace, set.path, pos.x, pos.z
+                            )
+                        })?;
                     if let StructureSetStart::Generated { structure, start } = outcome {
                         match start {
                             super::BatchPreparedStructureStart::Supported(

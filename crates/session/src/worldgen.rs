@@ -3106,10 +3106,12 @@ impl TerrainGenerator {
                 let mineshaft = ocean_ruins
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "mineshaft";
+                let monument = structure_type.namespace == "minecraft"
+                    && structure_type.path == "ocean_monument";
                 let jigsaw = jigsaws
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "jigsaw";
-                let structure = if center_heightmap.is_none() && !mineshaft && !jigsaw {
+                let structure = if center_heightmap.is_none() && !mineshaft && !jigsaw && !monument {
                     Some(
                         SimpleStructure::decode(&definition)
                             .with_context(|| format!("in structure {path}"))?,
@@ -3177,6 +3179,13 @@ impl TerrainGenerator {
                             start,
                         ))
                     }));
+                }
+                if monument
+                    && !native_resources::structure_start::center_biome_column_allows(
+                        &mut env, chunk,
+                    )?
+                {
+                    return Ok(None);
                 }
                 if let Some(heightmap) = center_heightmap
                     && native_resources::structure_start::center_generation_point(
@@ -9957,6 +9966,7 @@ mod tests {
             }
         };
         assert!(format!("{error:#}").contains("unsupported simple structure"));
+        assert!(format!("{error:#}").contains("structure set example:sparse at chunk"));
         assert!(!failing.is_complete());
         assert!(failing.starts(target).is_none());
         assert!(failing.references(target).is_none());

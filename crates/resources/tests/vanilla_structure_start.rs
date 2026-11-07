@@ -1,7 +1,7 @@
 //! Compare simple structure generation stubs and piece bounds with Java 26.3.
 use native_resources::structure_start::{
     BiomeQuery, Heightmap, HorizontalDirection, SimpleStructure, SimpleStructureKind,
-    StartEnvironment, center_generation_point,
+    StartEnvironment, center_biome_column_allows, center_generation_point,
 };
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
@@ -163,25 +163,10 @@ fn simple_starts_match_java_generation_stubs() {
         let x: i32 = words[1].parse().unwrap();
         let z: i32 = words[2].parse().unwrap();
         let mode: i32 = words[3].parse().unwrap();
-        let actual = center_generation_point(
-            &mut Environment { mode, checks: 0 },
-            [x, z],
-            Heightmap::OceanFloor,
-        )
-        .unwrap();
-        if words[4] == "X" {
-            assert!(actual.is_none(), "{line}");
-        } else {
-            assert_eq!(
-                actual,
-                Some([
-                    words[5].parse().unwrap(),
-                    words[6].parse().unwrap(),
-                    words[7].parse().unwrap(),
-                ]),
-                "{line}"
-            );
-        }
+        let allowed =
+            center_biome_column_allows(&mut Environment { mode, checks: 0 }, [x, z]).unwrap();
+        assert!(allowed || words[4] == "X", "{line}");
+        assert_eq!(allowed, mode != 2, "{line}");
         monument_cases += 1;
     }
     assert_eq!(monument_cases, 31 * 4);

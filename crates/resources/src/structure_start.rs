@@ -37,6 +37,31 @@ pub fn center_generation_point(
     chunk: [i32; 2],
     map: Heightmap,
 ) -> Result<Option<[i32; 3]>> {
+    if !center_biome_column_allows(env, chunk)? {
+        return Ok(None);
+    }
+    let x = chunk[0]
+        .checked_mul(16)
+        .and_then(|x| x.checked_add(8))
+        .context("block X overflow")?;
+    let z = chunk[1]
+        .checked_mul(16)
+        .and_then(|z| z.checked_add(8))
+        .context("block Z overflow")?;
+    let (qx, qz) = (x.div_euclid(4), z.div_euclid(4));
+    let y = env.first_occupied_height(x, z, map)?;
+    if !env.biome_allowed([qx, y.div_euclid(4), qz], BiomeQuery::Point)? {
+        return Ok(None);
+    }
+    Ok(Some([x, y, z]))
+}
+
+/// Java's independent center-column biome resolver. This is a necessary,
+/// not sufficient, condition for structures with additional biome checks.
+pub fn center_biome_column_allows(
+    env: &mut impl StartEnvironment,
+    chunk: [i32; 2],
+) -> Result<bool> {
     let (min_y, max_y) = env.vertical_bounds();
     ensure!(
         min_y <= max_y && i64::from(max_y) - i64::from(min_y) <= 4096,
@@ -51,21 +76,12 @@ pub fn center_generation_point(
         .and_then(|z| z.checked_add(8))
         .context("chunk Z overflow")?;
     let (qx, qz) = (x.div_euclid(4), z.div_euclid(4));
-    let mut possible = false;
     for qy in min_y.wrapping_sub(1).div_euclid(4)..=max_y.div_euclid(4) {
         if env.biome_allowed([qx, qy, qz], BiomeQuery::Column)? {
-            possible = true;
-            break;
+            return Ok(true);
         }
     }
-    if !possible {
-        return Ok(None);
-    }
-    let y = env.first_occupied_height(x, z, map)?;
-    if !env.biome_allowed([qx, y.div_euclid(4), qz], BiomeQuery::Point)? {
-        return Ok(None);
-    }
-    Ok(Some([x, y, z]))
+    Ok(false)
 }
 
 /// Identify necessary center checks for structures using onTopOfChunkCenter.
@@ -95,7 +111,6 @@ pub fn structure_center_precheck_heightmap(value: &Value) -> Result<Option<Heigh
             crate::ocean_ruin::Settings::decode(value)?;
             Heightmap::OceanFloor
         }
-        ("minecraft", "ocean_monument") => Heightmap::OceanFloor,
         _ => return Ok(None),
     };
     decode_terrain_adjustment(value)?;
@@ -345,13 +360,19 @@ mod tests {
         assert_eq!(structure_center_precheck_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9})).unwrap(), Some(Heightmap::OceanFloor));
         assert!(structure_center_precheck_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":1.1,"cluster_probability":0.9})).is_err());
         assert_eq!(
-            structure_center_precheck_heightmap(&json!({"type":"ocean_monument"})).unwrap(),
-            Some(Heightmap::OceanFloor)
-        );
-        assert_eq!(
             structure_center_precheck_heightmap(&json!({"type":"minecraft:village"})).unwrap(),
             None
         );
+    }
+    #[test]
+    fn center_column_check_does_not_sample_height_or_point_biome() {
+        let mut env = Env {
+            calls: vec![],
+            heights: vec![],
+        };
+        assert!(center_biome_column_allows(&mut env, [-1, 2]).unwrap());
+        assert_eq!(env.calls, vec![(BiomeQuery::Column, [-2, -17, 10])]);
+        assert!(env.heights.is_empty());
     }
     #[test]
     fn resolves_generation_biome_and_initial_piece_without_placing_blocks() {

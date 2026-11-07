@@ -8197,7 +8197,14 @@ mod tests {
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_shipwreck() -> Result<()> {
-        run_fresh_template_batch(30, None)
+        run_fresh_template_batch(30, None)?;
+        run_fresh_template_batch(30, Some(0))
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_decorates_installed_shipwreck_template() -> Result<()> {
+        run_fresh_template_batch(31, None)
     }
 
     #[test]
@@ -8239,7 +8246,7 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 let value = match path {
                     "data/example/worldgen/structure/test.json" => {
-                        Some(if self.feature_kind == 30 {
+                        Some(if (30..=31).contains(&self.feature_kind) {
                             json!({"type":"minecraft:shipwreck","biomes":["minecraft:plains"],"step":"surface_structures","is_beached":false})
                         } else if (9..=29).contains(&self.feature_kind) {
                             json!({"type":"minecraft:ruined_portal","biomes":["minecraft:plains"],"step":"surface_structures",
@@ -8376,6 +8383,7 @@ mod tests {
             (true, false, "minecraft:obsidian", 9),
             (false, false, "minecraft:oak_planks", 30),
             (true, false, "minecraft:oak_planks", 30),
+            (false, false, "minecraft:oak_planks", 31),
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
@@ -8488,13 +8496,13 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if (4..=30).contains(&feature_kind) {
+            if (4..=31).contains(&feature_kind) {
                 terrain_definition["settings"]["noise_router"]["final_density"] = json!({
                     "type":"minecraft:gradient", "axis":"y", "from_coordinate":7, "to_coordinate":8,
                     "from_value":1.0, "to_value":-1.0
                 });
             }
-            let height = if (10..=29).contains(&feature_kind) {
+            let height = if (10..=29).contains(&feature_kind) || feature_kind == 31 {
                 48
             } else {
                 16
@@ -8530,7 +8538,7 @@ mod tests {
                     has_fluid: matches!(name, "minecraft:water" | "minecraft:lava"),
                 })
             };
-            let target = if feature_kind == 30 {
+            let target = if (30..=31).contains(&feature_kind) {
                 structures.request_starts(source)?;
                 while structures
                     .step(&mut data, &mut classify_structure)?
@@ -8541,8 +8549,8 @@ mod tests {
                     .context("missing shipwreck")?[&structure]
                     .bounds;
                 ChunkPos {
-                    x: bounds.min[0].div_euclid(16),
-                    z: bounds.min[2].div_euclid(16),
+                    x: (bounds.min[0] + (bounds.max[0] - bounds.min[0]) / 2).div_euclid(16),
+                    z: (bounds.min[2] + (bounds.max[2] - bounds.min[2]) / 2).div_euclid(16),
                 }
             } else if (10..=29).contains(&feature_kind) {
                 structures.request_starts(source)?;
@@ -8594,7 +8602,7 @@ mod tests {
             } else {
                 None
             };
-            let mut origin = if feature_kind == 30 {
+            let mut origin = if (30..=31).contains(&feature_kind) {
                 structures
                     .shipwreck_starts(source)
                     .context("missing shipwreck")?[&structure]
@@ -8666,15 +8674,19 @@ mod tests {
                     Ok(None) => break,
                     Err(error) if unsupported || entity_anchor == Some(0) => {
                         ensure!(
-                            format!("{error:#}").contains(if entity_anchor == Some(0) {
-                                "portal template entity placement is unsupported"
-                            } else if feature_kind == 30 {
-                                "wood block entity is unsupported"
-                            } else if feature_kind == 9 {
-                                "portal block entities are not yet supported"
-                            } else {
-                                "jigsaw block entity placement"
-                            }),
+                            format!("{error:#}").contains(
+                                if entity_anchor == Some(0) && feature_kind == 30 {
+                                    "shipwreck template entities are not yet supported"
+                                } else if entity_anchor == Some(0) {
+                                    "portal template entity placement is unsupported"
+                                } else if feature_kind == 30 {
+                                    "wood block entity is unsupported"
+                                } else if feature_kind == 9 {
+                                    "portal block entities are not yet supported"
+                                } else {
+                                    "jigsaw block entity placement"
+                                }
+                            ),
                             "unexpected failure: {error:#}"
                         );
                         let before = before.context("missing pre-failure terrain")?;
@@ -8706,7 +8718,25 @@ mod tests {
                     Some(schedule::GenerationStage::Features)
                 );
                 let snapshot = batch.snapshot().context("missing terrain")?;
-                if feature_kind == 30 {
+                if feature_kind == 31 {
+                    let start = &batch
+                        .shipwreck_starts(source)
+                        .context("missing decorated shipwreck")?[&structure];
+                    assert!(start.height_adjusted);
+                    let found = (0..height).any(|y| {
+                        (0..16).any(|dz| {
+                            (0..16).any(|dx| {
+                                snapshot
+                                    .block(target.x * 16 + dx, y, target.z * 16 + dz)
+                                    .is_some_and(|state| {
+                                        state.name.ends_with("_planks")
+                                            || state.name.ends_with("_log")
+                                    })
+                            })
+                        })
+                    });
+                    assert!(found, "installed shipwreck template was not placed");
+                } else if feature_kind == 30 {
                     let start = &batch
                         .shipwreck_starts(source)
                         .context("missing decorated shipwreck")?[&structure];
@@ -8764,11 +8794,17 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=30).contains(&feature_kind)
+                    feature_kind == 0 || feature_kind == 2 || (4..=31).contains(&feature_kind)
                 );
-                if feature_kind == 30 {
+                if (30..=31).contains(&feature_kind) {
                     let data = batch.structure_data(target)?;
                     assert!(batch.structure_reference_sources(target)?.contains(&source));
+                    assert!(
+                        batch.recorded_template_feature_for_test(
+                            target,
+                            &(structure.clone(), source)
+                        )
+                    );
                     if target == source {
                         assert!(
                             data.get("starts")
@@ -8797,7 +8833,7 @@ mod tests {
                     }
                     assert!(batch.structure_reference_sources(target)?.contains(&source));
                 }
-                if !(9..=30).contains(&feature_kind) {
+                if !(9..=31).contains(&feature_kind) {
                     assert!(
                         batch.recorded_template_feature_for_test(
                             target,

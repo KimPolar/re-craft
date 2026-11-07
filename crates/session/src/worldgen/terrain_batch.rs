@@ -4685,6 +4685,7 @@ impl FreshTerrainBatch {
                                         // A successful portal pass either proves that no
                                         // template entity intersects its clip or rejects it.
                                         super::structure_batch::PlannedStructureStart::RuinedPortal(start) => start.chunk,
+                                        super::structure_batch::PlannedStructureStart::Shipwreck(start) if start.template.entities.is_empty() => start.chunk,
                                         _ => return None,
                                     };
                                     let key = (
@@ -4694,7 +4695,7 @@ impl FreshTerrainBatch {
                                             z: chunk[1],
                                         },
                                     );
-                                    (matches!(start, super::structure_batch::PlannedStructureStart::RuinedPortal(_))
+                                    (matches!(start, super::structure_batch::PlannedStructureStart::RuinedPortal(_) | super::structure_batch::PlannedStructureStart::Shipwreck(_))
                                         || entity_free_jigsaws.contains(&key)).then_some(key)
                                 })
                             })
@@ -5410,6 +5411,94 @@ mod entity_source_tests {
         );
         stages.jigsaw_starts.clear();
         assert!(structures_with_piece_at(Some(&stages), [13, 3, 3]).is_err());
+    }
+
+    #[test]
+    fn shipwreck_entity_evidence_requires_successful_entity_free_pass() -> Result<()> {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::TerrainAdjustment;
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{shipwreck::Piece, structure_transform::Rotation};
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:wreck")?;
+        let piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [0, 8, 0],
+            rotation: Rotation::None,
+            beached: false,
+        };
+        let template = Arc::new(StructureTemplate {
+            document: NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            },
+            data_version: Some(5023),
+            size: [3, 3, 3],
+            palettes: vec![],
+            blocks: vec![],
+            entities: vec![],
+        });
+        let start = crate::worldgen::shipwreck::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 8, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            bounds: piece.bounds(template.size)?,
+            piece,
+            template,
+            height_adjusted: true,
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let references = collect_ordered_structure_references(source, |pos| {
+            Ok(if pos == source {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })?;
+        let mut stages = PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .shipwreck_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(source, references);
+        let registered = BTreeSet::from([&id]);
+        let evidence = BTreeSet::from([(id.clone(), source)]);
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            None,
+            None
+        ));
+        assert!(stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            Some(&evidence),
+            None
+        ));
+        Arc::make_mut(
+            &mut stages
+                .shipwreck_starts
+                .get_mut(&source)
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .template,
+        )
+        .entities
+        .push(Tag::Compound(vec![]));
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            Some(&evidence),
+            None
+        ));
+        Ok(())
     }
 
     #[test]

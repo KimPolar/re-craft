@@ -635,12 +635,19 @@ impl PreparedStructureStages {
                 registered.contains(id) && positions.iter().all(|packed| {
                     let bits = *packed as u64;
                     let source = ChunkPos { x: bits as u32 as i32, z: (bits >> 32) as u32 as i32 };
-                    if self.shipwreck_starts.get(&source).is_some_and(|starts| starts.contains_key(id)) {
-                        return false;
-                    }
                     let simple = self.starts.get(&source).and_then(|starts| starts.get(id));
                     let jigsaw = self.jigsaw_starts.get(&source).and_then(|starts| starts.get(id));
                     let mineshaft = self.mineshafts.get(&source).and_then(|starts| starts.get(id));
+                    if let Some(start) = self.shipwreck_starts.get(&source).and_then(|starts| starts.get(id)) {
+                        return self.starts.contains_key(&source)
+                            && simple.is_none() && jigsaw.is_none() && mineshaft.is_none()
+                            && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && self.ruined_portal_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && start.chunk == [source.x, source.z]
+                            && start.template.entities.is_empty()
+                            && start.saved_piece_tag().is_ok()
+                            && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
+                    }
                     if let Some(start) = self.ruined_portal_starts.get(&source).and_then(|starts| starts.get(id)) {
                         return self.starts.contains_key(&source)
                             && simple.is_none() && jigsaw.is_none() && mineshaft.is_none()

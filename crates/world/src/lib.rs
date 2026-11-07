@@ -7,6 +7,7 @@ pub mod biome_blend;
 pub mod biome_zoom;
 pub mod block_light;
 pub mod collision;
+pub mod door;
 pub mod fluid;
 pub mod fluid_sim;
 pub mod generation_block_light;

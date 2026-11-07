@@ -202,6 +202,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 (u8::from(boolean("waterlogged")?), 0)
             }
         }
+        "minecraft:jigsaw" if crate::collision::jigsaw_state(state) => (15, 0),
         name if name.ends_with("_fence") => {
             (u8::from(crate::collision::fence_waterlogged(state)?), 0)
         }

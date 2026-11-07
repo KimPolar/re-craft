@@ -49,6 +49,18 @@ public class StructurePlacementOracle {
         var bind = Holder.Reference.class.getDeclaredMethod("bindTags", Collection.class); bind.setAccessible(true);
         for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL))
             bind.invoke(block.builtInRegistryHolder(), List.of(BlockTags.WALLS));
+        for (var state : Blocks.JIGSAW.getStateDefinition().getPossibleStates())
+            for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                var result = state.mirror(mirror).rotate(rotation);
+                out.printf("JSTATE\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",
+                    state.getValue(JigsawBlock.ORIENTATION).getSerializedName(), mirror.ordinal(), rotation.ordinal(),
+                    result.getValue(JigsawBlock.ORIENTATION).getSerializedName(), state.hasBlockEntity(),
+                    state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+                    state.getPostProcessPos(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) == null,
+                    state.useShapeForLightOcclusion(), net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state),
+                    net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.STONE.defaultBlockState(),state),
+                    net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state));
+            }
         for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
                 Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
                 Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,

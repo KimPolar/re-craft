@@ -10,6 +10,29 @@ pub struct Aabb {
     pub max: Vec3,
 }
 
+/// Validate the complete built-in jigsaw block state.
+pub fn jigsaw_state(state: &BlockState) -> bool {
+    state.name == "minecraft:jigsaw"
+        && state.properties.len() == 1
+        && matches!(
+            state.properties.get("orientation").map(String::as_str),
+            Some(
+                "down_east"
+                    | "down_north"
+                    | "down_south"
+                    | "down_west"
+                    | "up_east"
+                    | "up_north"
+                    | "up_south"
+                    | "up_west"
+                    | "east_up"
+                    | "north_up"
+                    | "south_up"
+                    | "west_up"
+            )
+        )
+}
+
 const EMPTY: &[Aabb] = &[];
 const FULL: &[Aabb] = &[Aabb {
     min: Vec3::ZERO,
@@ -723,6 +746,9 @@ pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "jigsaw" {
+        return jigsaw_state(state).then(|| FULL.to_vec());
+    }
     if id.ends_with("_wall") {
         return Some(wall_boxes(crate::wall::Wall::from_state(state)?, true));
     }

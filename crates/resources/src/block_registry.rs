@@ -50,6 +50,7 @@ enum StateSchema {
     Vine,
     Beehive,
     Chest,
+    Jigsaw,
     Bed,
     Rail,
     PoweredRail,
@@ -154,6 +155,7 @@ impl StateSchema {
                 ]);
             }
             Self::HorizontalFacing => return BTreeMap::from([("facing".into(), "north".into())]),
+            Self::Jigsaw => return BTreeMap::from([("orientation".into(), "north_up".into())]),
             Self::Leaves => {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
@@ -240,6 +242,11 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Jigsaw
+                if name == "orientation" && crate::jigsaw::Orientation::parse(value).is_ok() =>
+            {
+                Some(value.to_owned())
+            }
             Self::Slab
                 if (name == "type" && matches!(value, "top" | "bottom" | "double"))
                     || (name == "waterlogged" && matches!(value, "true" | "false")) =>
@@ -777,6 +784,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/LiquidBlock" => Some(StateSchema::Liquid),
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
+                "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock"
@@ -965,6 +973,15 @@ impl GeneratedBlockRegistry {
                 };
                 result.insert("axis".into(), axis.into());
             }
+            return Ok(result);
+        }
+        if matches!(schema, StateSchema::Jigsaw) {
+            let orientation = crate::jigsaw::Orientation::parse(&properties["orientation"])?;
+            let mut result = properties.clone();
+            result.insert(
+                "orientation".into(),
+                orientation.transform(mirror, rotation).name(),
+            );
             return Ok(result);
         }
         if matches!(schema, StateSchema::Fence | StateSchema::Wall) {

@@ -53,10 +53,10 @@ impl Direction {
         }
     }
 
-    fn rotate(self, rotation: Rotation) -> Self {
+    fn transform(self, mirror: Mirror, rotation: Rotation) -> Self {
         let [x, y, z] = self.step();
         let [x, _, z] =
-            crate::structure_transform::transform_block([x, y, z], Mirror::None, rotation, [0; 3]);
+            crate::structure_transform::transform_block([x, y, z], mirror, rotation, [0; 3]);
         match [x, y, z] {
             [0, -1, 0] => Self::Down,
             [0, 1, 0] => Self::Up,
@@ -65,6 +65,17 @@ impl Direction {
             [-1, 0, 0] => Self::West,
             [1, 0, 0] => Self::East,
             _ => unreachable!("rotation preserves cardinal directions"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::Up => "up",
+            Self::North => "north",
+            Self::South => "south",
+            Self::West => "west",
+            Self::East => "east",
         }
     }
 }
@@ -96,10 +107,18 @@ impl Orientation {
     }
 
     pub fn rotate(self, rotation: Rotation) -> Self {
+        self.transform(Mirror::None, rotation)
+    }
+
+    pub fn transform(self, mirror: Mirror, rotation: Rotation) -> Self {
         Self {
-            front: self.front.rotate(rotation),
-            top: self.top.rotate(rotation),
+            front: self.front.transform(mirror, rotation),
+            top: self.top.transform(mirror, rotation),
         }
+    }
+
+    pub fn name(self) -> String {
+        format!("{}_{}", self.front.name(), self.top.name())
     }
 
     pub fn default_joint(self) -> Joint {

@@ -273,9 +273,68 @@ fn structure_placement_matches_java() -> Result<()> {
     let mut marker_index = 0;
     let mut marker_cases = 0;
     let mut marker_count = 0;
+    let mut jigsaw_states = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let f: Vec<_> = line.split('\t').collect();
         match f.as_slice() {
+            [
+                "JSTATE",
+                orientation,
+                m,
+                r,
+                expected,
+                entity,
+                full,
+                no_post,
+                shape_light,
+                diff_air,
+                diff_stone,
+                poi,
+            ] => {
+                let mut properties = registry
+                    .default_properties("minecraft:jigsaw")
+                    .context("jigsaw schema missing")?;
+                properties.insert("orientation".into(), (*orientation).into());
+                assert!(registry.is_canonical_state("minecraft:jigsaw", &properties));
+                let result = registry.transform_template_state(
+                    "minecraft:jigsaw",
+                    &properties,
+                    mirrors[m.parse::<usize>()?],
+                    rotations[r.parse::<usize>()?],
+                )?;
+                assert_eq!(result["orientation"], *expected, "{line}");
+                let state = BlockState {
+                    name: "minecraft:jigsaw".into(),
+                    properties,
+                };
+                assert_eq!(
+                    registry.has_block_entity(&state.name),
+                    Some(*entity == "true")
+                );
+                assert_eq!(
+                    native_world::collision::is_full_cube(
+                        &native_world::collision::block_shape(&state)
+                            .context("missing jigsaw collision")?
+                    ),
+                    *full == "true"
+                );
+                let stone = BlockState {
+                    name: "minecraft:stone".into(),
+                    properties: BTreeMap::new(),
+                };
+                assert_eq!(
+                    !native_world::block_light::same_light_behavior(&air(), &state)
+                        .context("missing jigsaw light")?,
+                    *diff_air == "true"
+                );
+                assert_eq!(
+                    !native_world::block_light::same_light_behavior(&stone, &state)
+                        .context("missing jigsaw light")?,
+                    *diff_stone == "true"
+                );
+                assert_eq!((*no_post, *shape_light, *poi), ("true", "false", "false"));
+                jigsaw_states += 1;
+            }
             ["CASE", m, r, n] => {
                 ensure!(index == events.len(), "missing expected events");
                 let mirror = mirrors[m.parse::<usize>()?];
@@ -516,5 +575,6 @@ fn structure_placement_matches_java() -> Result<()> {
     assert_eq!(marker_index, markers.len());
     assert_eq!(marker_cases, 14 * 3 * 4 * 2);
     assert!(marker_count > 0);
+    assert_eq!(jigsaw_states, 12 * 3 * 4);
     Ok(())
 }

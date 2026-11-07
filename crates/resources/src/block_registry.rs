@@ -52,6 +52,7 @@ enum StateSchema {
     Chest,
     Fence,
     FenceGate,
+    Door,
     Slab,
     Stairs,
     HorizontalFacing,
@@ -84,6 +85,15 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("facing".into(), "north".into()),
                     ("in_wall".into(), "false".into()),
+                    ("open".into(), "false".into()),
+                    ("powered".into(), "false".into()),
+                ]);
+            }
+            Self::Door => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "lower".into()),
+                    ("hinge".into(), "left".into()),
                     ("open".into(), "false".into()),
                     ("powered".into(), "false".into()),
                 ]);
@@ -209,6 +219,15 @@ impl StateSchema {
             Self::FenceGate
                 if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
                     || (matches!(name, "in_wall" | "open" | "powered")
+                        && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Door
+                if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
+                    || (name == "half" && matches!(value, "lower" | "upper"))
+                    || (name == "hinge" && matches!(value, "left" | "right"))
+                    || (matches!(name, "open" | "powered")
                         && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
@@ -479,7 +498,7 @@ impl GeneratedBlockRegistry {
             {
                 copper_factory = true;
             } else if ins.op == 0xb3 && owner == BLOCKS {
-                if member == "CUT_COPPER_SLAB"
+                if matches!(member, "CUT_COPPER_SLAB" | "COPPER_DOOR")
                     && copper_factory
                     && registration.is_none()
                     && candidates.len() == 1
@@ -497,15 +516,28 @@ impl GeneratedBlockRegistry {
                         ("weathered_", "waxed_"),
                         ("oxidized_", "waxed_"),
                     ] {
-                        let class = if prefix.is_empty() {
-                            "net/minecraft/world/level/block/WeatheringCopperSlabBlock"
-                        } else {
-                            "net/minecraft/world/level/block/SlabBlock"
+                        let (base, class) = match (member, prefix.is_empty()) {
+                            ("CUT_COPPER_SLAB", true) => (
+                                "cut_copper_slab",
+                                "net/minecraft/world/level/block/WeatheringCopperSlabBlock",
+                            ),
+                            ("CUT_COPPER_SLAB", false) => (
+                                "cut_copper_slab",
+                                "net/minecraft/world/level/block/SlabBlock",
+                            ),
+                            ("COPPER_DOOR", true) => (
+                                "copper_door",
+                                "net/minecraft/world/level/block/WeatheringCopperDoorBlock",
+                            ),
+                            ("COPPER_DOOR", false) => {
+                                ("copper_door", "net/minecraft/world/level/block/DoorBlock")
+                            }
+                            _ => unreachable!(),
                         };
                         ensure!(
                             registered_classes
                                 .insert(
-                                    format!("minecraft:{prefix}{stage}cut_copper_slab"),
+                                    format!("minecraft:{prefix}{stage}{base}"),
                                     class.to_owned()
                                 )
                                 .is_none(),
@@ -640,6 +672,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
                 "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
+                "net/minecraft/world/level/block/DoorBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {
+                    Some(StateSchema::Door)
+                }
                 "net/minecraft/world/level/block/SlabBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperSlabBlock" => {
                     Some(StateSchema::Slab)
@@ -820,10 +856,22 @@ impl GeneratedBlockRegistry {
                     | StateSchema::Stairs
                     | StateSchema::Chest
                     | StateSchema::FenceGate
+                    | StateSchema::Door
             ),
             "template state transform is unsupported for {id}"
         );
         let mut result = properties.clone();
+        if matches!(schema, StateSchema::Door) && mirror != Mirror::None {
+            result.insert(
+                "hinge".into(),
+                if properties["hinge"] == "left" {
+                    "right"
+                } else {
+                    "left"
+                }
+                .into(),
+            );
+        }
         let facing = properties["facing"].as_str();
         let affected = match mirror {
             Mirror::None => false,

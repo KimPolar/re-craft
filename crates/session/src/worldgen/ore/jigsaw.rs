@@ -57,6 +57,9 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::fence_gate_open(state).is_some() {
         return Ok(false);
     }
+    if native_world::collision::door_open(state).is_some() {
+        return Ok(false);
+    }
     if state.name == "minecraft:chest" {
         monster_block_flags(state)?;
         return Ok(false);
@@ -215,7 +218,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             self.region.jigsaw_block_write = jigsaw_wood(state)
                 || native_world::collision::slab_stair_solid(state).is_some()
                 || native_world::collision::fence_waterlogged(state).is_some()
-                || native_world::collision::fence_gate_open(state).is_some();
+                || native_world::collision::fence_gate_open(state).is_some()
+                || native_world::collision::door_open(state).is_some();
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -966,6 +970,84 @@ mod tests {
         }
         assert_eq!(gate_names.len(), native_core::wood::Planks::ALL.len());
         assert_eq!(gates_checked, gate_names.len() * 32 * 12);
+        let mut door_names = BTreeSet::new();
+        let mut doors_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("DOOR\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                facing,
+                half,
+                hinge,
+                open,
+                powered,
+                mirror,
+                rotation,
+                expected_facing,
+                expected_hinge,
+                collision,
+                outline,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java door result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let name = format!("minecraft:{name}");
+            let properties = BTreeMap::from([
+                ("facing".into(), (*facing).into()),
+                ("half".into(), (*half).into()),
+                ("hinge".into(), (*hinge).into()),
+                ("open".into(), (*open).into()),
+                ("powered".into(), (*powered).into()),
+            ]);
+            let state = BlockState {
+                name: name.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&name, &properties), "{state:?}");
+            assert_eq!(registry.has_block_entity(&name), Some(false), "{state:?}");
+            assert!(!jigsaw_static_full(&state)?);
+            assert_eq!(
+                native_shape(
+                    native_world::collision::block_shape(&state)
+                        .context("door collision missing")?
+                ),
+                parse_shape(collision)?,
+                "{state:?}"
+            );
+            assert_eq!(
+                native_shape(
+                    native_world::collision::block_outline(&state)
+                        .context("door outline missing")?
+                ),
+                parse_shape(outline)?,
+                "{state:?}"
+            );
+            let transformed =
+                registry.transform_template_state(&name, &properties, mirror, rotation)?;
+            assert_eq!(transformed["facing"], *expected_facing, "{state:?}");
+            assert_eq!(transformed["hinge"], *expected_hinge, "{state:?}");
+            for key in ["half", "open", "powered"] {
+                assert_eq!(transformed[key], properties[key]);
+            }
+            door_names.insert(name);
+            doors_checked += 1;
+        }
+        assert_eq!(door_names.len(), native_core::wood::Planks::ALL.len() + 9);
+        assert_eq!(doors_checked, door_names.len() * 64 * 12);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
@@ -1029,7 +1111,8 @@ mod tests {
                         && (id.ends_with("_slab")
                             || id.ends_with("_stairs")
                             || id.ends_with("_fence")
-                            || id.ends_with("_fence_gate")))
+                            || id.ends_with("_fence_gate")
+                            || id.ends_with("_door")))
                 {
                     continue;
                 }
@@ -1059,6 +1142,7 @@ mod tests {
         assert!(found.contains("minecraft:oak_stairs"), "{found:?}");
         assert!(found.contains("minecraft:oak_fence"), "{found:?}");
         assert!(found.contains("minecraft:oak_fence_gate"), "{found:?}");
+        assert!(found.contains("minecraft:oak_door"), "{found:?}");
         Ok(())
     }
 

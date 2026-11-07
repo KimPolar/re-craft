@@ -111,6 +111,83 @@ pub fn fence_gate_open(state: &BlockState) -> Option<bool> {
     }
 }
 
+/// Validate a vanilla door state and return whether it is open.
+pub fn door_open(state: &BlockState) -> Option<bool> {
+    let family = state
+        .name
+        .strip_prefix("minecraft:")?
+        .strip_suffix("_door")?;
+    let wooden = native_core::wood::Planks::ALL.into_iter().any(|wood| {
+        wood.id()
+            .strip_prefix("minecraft:")
+            .and_then(|id| id.strip_suffix("_planks"))
+            == Some(family)
+    });
+    let metal = matches!(
+        family,
+        "iron"
+            | "copper"
+            | "exposed_copper"
+            | "weathered_copper"
+            | "oxidized_copper"
+            | "waxed_copper"
+            | "waxed_exposed_copper"
+            | "waxed_weathered_copper"
+            | "waxed_oxidized_copper"
+    );
+    if (!wooden && !metal)
+        || state.properties.len() != 5
+        || !matches!(
+            state.properties.get("facing").map(String::as_str),
+            Some("north" | "south" | "east" | "west")
+        )
+        || !matches!(
+            state.properties.get("half").map(String::as_str),
+            Some("lower" | "upper")
+        )
+        || !matches!(
+            state.properties.get("hinge").map(String::as_str),
+            Some("left" | "right")
+        )
+        || !matches!(
+            state.properties.get("powered").map(String::as_str),
+            Some("true" | "false")
+        )
+    {
+        return None;
+    }
+    match state.properties.get("open").map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn door_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    let open = door_open(state)?;
+    let facing = state.properties.get("facing")?.as_str();
+    let hinge = state.properties.get("hinge")?.as_str();
+    let side = match (facing, open, hinge) {
+        ("north", false, _) => "south",
+        ("south", false, _) => "north",
+        ("west", false, _) => "east",
+        ("east", false, _) => "west",
+        ("north", true, "left") | ("south", true, "right") => "west",
+        ("south", true, "left") | ("north", true, "right") => "east",
+        ("west", true, "left") | ("east", true, "right") => "south",
+        ("east", true, "left") | ("west", true, "right") => "north",
+        _ => return None,
+    };
+    let t = 3.0 / 16.0;
+    Some(vec![match side {
+        "north" => cuboid(0.0, 0.0, 0.0, 1.0, 1.0, t),
+        "south" => cuboid(0.0, 0.0, 1.0 - t, 1.0, 1.0, 1.0),
+        "west" => cuboid(0.0, 0.0, 0.0, t, 1.0, 1.0),
+        "east" => cuboid(1.0 - t, 0.0, 0.0, 1.0, 1.0, 1.0),
+        _ => unreachable!(),
+    }])
+}
+
 fn fence_gate_box(state: &BlockState, height: f32) -> Option<Aabb> {
     fence_gate_open(state)?;
     Some(match state.properties.get("facing")?.as_str() {
@@ -767,6 +844,9 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
         } else {
             Some(vec![fence_gate_box(state, 1.5)?])
         };
+    }
+    if id.ends_with("_door") {
+        return door_shape(state);
     }
     if id.ends_with("_fence") {
         return connected(state, 6.0 / 16.0, 10.0 / 16.0, 1.5);

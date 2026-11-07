@@ -148,7 +148,8 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean jigsawWet=jigsawWood && args[1].contains("_jigsaw_wet_");
         boolean jigsawFence=jigsawWood && args[1].endsWith("_fence");
         boolean jigsawGate=jigsawWood && args[1].endsWith("_gate");
-        boolean jigsawWater=jigsawGate && args[1].contains("_jigsaw_water_");
+        boolean jigsawDoor=jigsawWood && args[1].endsWith("_door");
+        boolean jigsawWater=(jigsawGate || jigsawDoor) && args[1].contains("_jigsaw_water_");
         boolean patchActive=vineActive && args[1].endsWith("_patch_water");
         boolean magmaActive=vineActive && args[1].endsWith("_magma_block");
         boolean lichenActive=vineActive && args[1].endsWith("_lichen");
@@ -398,7 +399,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 boolean berries=vineActiveTransition ? i==1 : vineActiveMany ? i!=1 : !plain;
                 var block=args[1].equals("vine_active_head") ? Blocks.CAVE_VINES : Blocks.CAVE_VINES_PLANT;
                 var pile=args[1].endsWith("_pile_snow") ? Blocks.SNOW : args[1].endsWith("_pile_hay") ? Blocks.HAY_BLOCK : args[1].endsWith("_pile_ice") ? Blocks.BLUE_ICE : args[1].endsWith("_pile_melon") ? Blocks.MELON : args[1].endsWith("_pile_pumpkin") ? Blocks.PUMPKIN : Blocks.JACK_O_LANTERN;
-                var state=jigsawWood ? (args[1].endsWith("_log") ? Blocks.OAK_LOG.defaultBlockState() : args[1].endsWith("_slab") ? Blocks.OAK_SLAB.defaultBlockState() : args[1].endsWith("_stairs") ? Blocks.OAK_STAIRS.defaultBlockState() : jigsawFence ? Blocks.OAK_FENCE.defaultBlockState() : jigsawGate ? Blocks.OAK_FENCE_GATE.defaultBlockState() : Blocks.OAK_PLANKS.defaultBlockState()) : pileActive ? pile.defaultBlockState() : magmaActive ? Blocks.MAGMA_BLOCK.defaultBlockState() : patchActive ? Blocks.WATER.defaultBlockState() : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
+                var state=jigsawWood ? (args[1].endsWith("_log") ? Blocks.OAK_LOG.defaultBlockState() : args[1].endsWith("_slab") ? Blocks.OAK_SLAB.defaultBlockState() : args[1].endsWith("_stairs") ? Blocks.OAK_STAIRS.defaultBlockState() : jigsawFence ? Blocks.OAK_FENCE.defaultBlockState() : jigsawGate ? Blocks.OAK_FENCE_GATE.defaultBlockState() : jigsawDoor ? Blocks.OAK_DOOR.defaultBlockState() : Blocks.OAK_PLANKS.defaultBlockState()) : pileActive ? pile.defaultBlockState() : magmaActive ? Blocks.MAGMA_BLOCK.defaultBlockState() : patchActive ? Blocks.WATER.defaultBlockState() : lakeActive ? (lakeOre ? Blocks.STONE.defaultBlockState() : (args[1].endsWith("_lava") || (lakeMixed && i==1)) ? Blocks.LAVA.defaultBlockState() : Blocks.CAVE_AIR.defaultBlockState()) : lichenActive
                     ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true).setValue(net.minecraft.world.level.block.MultifaceBlock.getFaceProperty(net.minecraft.core.Direction.UP),true)
                     : block.defaultBlockState().setValue(net.minecraft.world.level.block.CaveVines.BERRIES,berries);
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
@@ -407,7 +408,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(wasEmpty!=eastSection.section.hasOnlyAir()) engine.updateSectionStatus(SectionPos.of(1,0,0),eastSection.section.hasOnlyAir());
                 w.chunks.get(new ChunkPos(1,0)).sources.update(eastSection,0,p[1],p[2]);
                 boolean changed=LightEngine.hasDifferentLightProperties(old,state);
-                if(changed!=(jigsawGate ? jigsawWater : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || (lakeActive && !lakeOre) || lichenActive || (!lakeActive && berries))))throw new AssertionError("unexpected active light check");
+                if(changed!=((jigsawGate || jigsawDoor) ? jigsawWater : jigsawFence ? jigsawWet : (jigsawWood || pileActive || magmaActive || patchActive || (lakeActive && !lakeOre) || lichenActive || (!lakeActive && berries))))throw new AssertionError("unexpected active light check");
                 if(changed)engine.checkBlock(pos);
                 if(jigsawWet) {
                     var wet=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED,true);

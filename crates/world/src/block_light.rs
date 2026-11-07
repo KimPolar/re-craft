@@ -209,6 +209,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             crate::collision::fence_gate_open(state)?;
             (0, 0)
         }
+        name if name.ends_with("_door") => {
+            crate::collision::door_open(state)?;
+            (0, 0)
+        }
         "minecraft:dirt_path" if state.properties.is_empty() => (0, 0),
         "minecraft:farmland" if state.properties.len() == 1 => {
             if !matches!(

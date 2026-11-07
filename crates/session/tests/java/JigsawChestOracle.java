@@ -17,6 +17,7 @@ import net.minecraft.world.level.block.RotatedPillarBlock;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.FenceBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.block.state.properties.SlabType;
@@ -133,6 +134,34 @@ public class JigsawChestOracle {
                         shape(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
                         shape(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
                     if(changed.getValue(BlockStateProperties.IN_WALL)!=state.getValue(BlockStateProperties.IN_WALL)
+                        || changed.getValue(BlockStateProperties.OPEN)!=state.getValue(BlockStateProperties.OPEN)
+                        || changed.getValue(BlockStateProperties.POWERED)!=state.getValue(BlockStateProperties.POWERED)) throw new AssertionError(changed);
+                }
+            }
+        }
+        for (var block : BuiltInRegistries.BLOCK) {
+            if (!(block instanceof DoorBlock)) continue;
+            var id=BuiltInRegistries.BLOCK.getKey(block);
+            for(var state:block.getStateDefinition().getPossibleStates()) {
+                if(state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !state.getFluidState().isEmpty()
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)
+                    || state.useShapeForLightOcclusion() || state.getLightDampening()!=0
+                    || state.getLightEmission()!=0 || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)
+                    || !LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state)) throw new AssertionError(state);
+                for(var mirror:Mirror.values()) for(var rotation:Rotation.values()) {
+                    var changed=state.mirror(mirror).rotate(rotation);
+                    out.printf("DOOR\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",id.getPath(),
+                        state.getValue(BlockStateProperties.HORIZONTAL_FACING).getSerializedName(),
+                        state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF).getSerializedName(),
+                        state.getValue(BlockStateProperties.DOOR_HINGE).getSerializedName(),
+                        state.getValue(BlockStateProperties.OPEN), state.getValue(BlockStateProperties.POWERED),
+                        mirror.name(), rotation.name(),
+                        changed.getValue(BlockStateProperties.HORIZONTAL_FACING).getSerializedName(),
+                        changed.getValue(BlockStateProperties.DOOR_HINGE).getSerializedName(),
+                        shape(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
+                        shape(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
+                    if(changed.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF)!=state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF)
                         || changed.getValue(BlockStateProperties.OPEN)!=state.getValue(BlockStateProperties.OPEN)
                         || changed.getValue(BlockStateProperties.POWERED)!=state.getValue(BlockStateProperties.POWERED)) throw new AssertionError(changed);
                 }

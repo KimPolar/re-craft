@@ -952,6 +952,8 @@ fn inert_generated_full_cube(name: &str) -> bool {
     matches!(
         name,
         "minecraft:stone"
+            | "minecraft:sulfur"
+            | "minecraft:cinnabar"
             | "minecraft:granite"
             | "minecraft:diorite"
             | "minecraft:andesite"
@@ -3750,6 +3752,8 @@ mod tests {
     fn inert_cube_postprocessing_trace() -> Vec<String> {
         let names = [
             "stone",
+            "sulfur",
+            "cinnabar",
             "granite",
             "diorite",
             "andesite",
@@ -3974,7 +3978,7 @@ mod tests {
 
     #[test]
     fn inert_natural_cubes_complete_postprocessing_without_side_effects() {
-        assert_eq!(inert_cube_postprocessing_trace().len(), 111);
+        assert_eq!(inert_cube_postprocessing_trace().len(), 117);
         assert!(!inert_generated_full_cube("minecraft:oak_log"));
         let invalid = BlockState {
             name: "minecraft:stone".into(),
@@ -6098,7 +6102,7 @@ mod tests {
                     || path.ends_with("blocks_motion_in_heightmap_no_leaves.json")
                 {
                     return Ok(Some(
-                        br#"{"values":["minecraft:stone","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab","minecraft:oak_stairs","minecraft:oak_fence"]}"#.to_vec(),
+                        br#"{"values":["minecraft:stone","minecraft:sulfur","minecraft:cinnabar","minecraft:sand","minecraft:stone_slab","minecraft:oak_slab","minecraft:oak_stairs","minecraft:oak_fence"]}"#.to_vec(),
                     ));
                 }
                 if path == "data/minecraft/tags/block/prevents_nearby_leaf_decay.json" {
@@ -6175,6 +6179,17 @@ mod tests {
                 for [x, y, z] in [[8, 8, 7], [8, 8, 9], [7, 8, 8], [9, 8, 8]] {
                     world.set_block_id(x, y, z, air).unwrap();
                 }
+            }
+            "barrier_sulfur" | "barrier_cinnabar" => {
+                let name = case.strip_prefix("barrier_").unwrap();
+                let barrier = world.intern_state(BlockState {
+                    name: format!("minecraft:{name}"),
+                    properties: BTreeMap::new(),
+                });
+                for [x, y, z] in [[8, 7, 8], [8, 8, 7], [8, 8, 9], [7, 8, 8]] {
+                    world.set_block_id(x, y, z, barrier).unwrap();
+                }
+                world.set_block_id(9, 8, 8, air).unwrap();
             }
             "mixed" => {
                 world.set_block_id(8, 7, 8, air).unwrap();
@@ -6547,6 +6562,8 @@ mod tests {
             "air",
             "water",
             "stone",
+            "sulfur",
+            "cinnabar",
             "sand",
             "dirt",
             "chest",
@@ -7849,6 +7866,19 @@ mod tests {
                 ));
             }
         }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn sulfur_barriers_match_java_water_postprocessing() {
+        let actual = java_results_with_args(
+            "GeneratedWaterSpreadPostprocessingOracle",
+            include_str!("../../tests/java/GeneratedWaterSpreadPostprocessingOracle.java"),
+            &["sulfur"],
+        );
+        let mut expected = water_spread_trace("barrier_sulfur");
+        expected.extend(water_spread_trace("barrier_cinnabar"));
         assert_eq!(actual, expected);
     }
 

@@ -58,7 +58,7 @@ public class GeneratedInertPostprocessingOracle {
         var level=(FakeLevel)unsafe.allocateInstance(FakeLevel.class);
         var chunk=(FakeChunk)unsafe.allocateInstance(FakeChunk.class);
         set(chunk,"upgradeData",unsafe.allocateInstance(FakeUpgrade.class));
-        var names=List.of("stone","granite","diorite","andesite","tuff","calcite","dripstone_block",
+        var names=List.of("stone","sulfur","cinnabar","granite","diorite","andesite","tuff","calcite","dripstone_block",
             "cobblestone","mossy_cobblestone","dirt","coarse_dirt","rooted_dirt","moss_block","clay","bedrock",
             "netherrack","end_stone","blackstone","obsidian","crying_obsidian","coal_ore","iron_ore",
             "copper_ore","gold_ore","lapis_ore","diamond_ore","emerald_ore","deepslate_coal_ore",
@@ -71,11 +71,11 @@ public class GeneratedInertPostprocessingOracle {
             if(block.getStateDefinition().getPossibleStates().size()!=1 || !state.getFluidState().isEmpty()
                 || !Block.isShapeFullBlock(state.getCollisionShape(EmptyBlockGetter.INSTANCE,POS)))
                 throw new AssertionError("not an inert full-cube candidate: "+name);
-            if(name.equals("moss_block")) {
-                if(state.canBeReplaced())throw new AssertionError("moss block is replaceable");
+            if(List.of("moss_block","sulfur","cinnabar").contains(name)) {
+                if(state.canBeReplaced() || state.hasBlockEntity())throw new AssertionError("unexpected block properties: "+name);
                 for(var direction:Direction.values())
                     if(!Block.isShapeFullBlock(state.getFaceOcclusionShape(direction)))
-                        throw new AssertionError("moss block has a non-full occlusion face: "+direction);
+                        throw new AssertionError(name+" has a non-full occlusion face: "+direction);
             }
             ShortList[] marks={new ShortArrayList()};marks[0].add(ProtoChunk.packOffsetCoordinates(POS));
             set(chunk,"postProcessing",marks);set(chunk,"pendingBlockEntities",new HashMap<BlockPos,CompoundTag>());

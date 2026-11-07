@@ -755,6 +755,13 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
                 value.get("feature").context("root feature is missing")?,
                 depth + 1,
             ),
+            "template" => Ok(
+                super::template_feature::PreparedTemplateFeature::load_unprocessed(
+                    value,
+                    self.provider,
+                )?
+                .is_entity_free(),
+            ),
             "tree" => known_entity_free_tree(value, false),
             "fallen_tree" => known_entity_free_tree(value, true),
             _ => Ok(false),
@@ -6213,6 +6220,100 @@ mod entity_source_tests {
     }
 
     #[test]
+    fn template_entity_evidence_checks_each_active_pack_template() {
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use std::io::Write;
+        fn template(has_entity: bool, version: i32) -> Vec<u8> {
+            let list = |element_type, values| Tag::List {
+                element_type,
+                values,
+            };
+            let doc = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(version)),
+                    (
+                        "size".into(),
+                        list(TagType::Int, vec![Tag::Int(1), Tag::Int(1), Tag::Int(1)]),
+                    ),
+                    (
+                        "palette".into(),
+                        list(
+                            TagType::Compound,
+                            vec![Tag::Compound(vec![(
+                                "id".into(),
+                                Tag::String("minecraft:stone".into()),
+                            )])],
+                        ),
+                    ),
+                    ("blocks".into(), list(TagType::Compound, vec![])),
+                    (
+                        "entities".into(),
+                        list(
+                            TagType::Compound,
+                            if has_entity {
+                                vec![Tag::Compound(vec![])]
+                            } else {
+                                vec![]
+                            },
+                        ),
+                    ),
+                ]),
+            };
+            let mut gzip =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gzip.write_all(&nbt::write(&doc).unwrap()).unwrap();
+            gzip.finish().unwrap()
+        }
+        let feature = json!({"type":"minecraft:template", "templates":[
+            {"weight":1,"data":{"id":"test:first"}},
+            {"weight":1,"data":{"id":"test:second"}}
+        ]});
+        let check = |data: &mut Data, value: &Value| {
+            let registry = BTreeSet::new();
+            EntityFeatureClassifier {
+                provider: data,
+                registry: &registry,
+                tags: FeatureTags::default(),
+                active: BTreeSet::new(),
+                cache: BTreeMap::new(),
+                nodes: 0,
+            }
+            .configured(value, 0)
+            .unwrap_or(false)
+        };
+        let mut data = Data::default();
+        data.0.insert(
+            "data/test/structure/first.nbt".into(),
+            template(false, 5023),
+        );
+        data.0.insert(
+            "data/test/structure/second.nbt".into(),
+            template(false, 5023),
+        );
+        assert!(check(&mut data, &feature));
+        data.0.insert(
+            "data/test/structure/second.nbt".into(),
+            template(true, 5023),
+        );
+        assert!(!check(&mut data, &feature));
+        data.0.insert(
+            "data/test/structure/second.nbt".into(),
+            template(false, 5000),
+        );
+        assert!(!check(&mut data, &feature));
+        data.0.remove("data/test/structure/second.nbt");
+        assert!(!check(&mut data, &feature));
+        data.0.insert(
+            "data/test/structure/second.nbt".into(),
+            template(false, 5023),
+        );
+        let mut processed = feature.clone();
+        processed["processors"] = json!("minecraft:empty");
+        assert!(!check(&mut data, &processed));
+    }
+
+    #[test]
     fn entity_coverage_tracks_only_completed_selected_features() {
         let mut data = Data::default();
         for (path, value) in [
@@ -6375,7 +6476,7 @@ mod entity_source_tests {
             cache: BTreeMap::new(),
             nodes: 0,
         };
-        for name in ["minecraft:sulfur_pool"] {
+        for name in ["minecraft:sulfur_pool", "minecraft:rooted_sulfur_spring"] {
             assert!(
                 classifier
                     .named(&ResourceId::parse(name).unwrap(), true, 0)
@@ -6383,11 +6484,7 @@ mod entity_source_tests {
                 "{name}"
             );
         }
-        for name in [
-            "minecraft:rooted_sulfur_spring",
-            "minecraft:sculk_patch_deep_dark",
-            "minecraft:desert_well",
-        ] {
+        for name in ["minecraft:sculk_patch_deep_dark", "minecraft:desert_well"] {
             assert!(
                 !classifier
                     .named(&ResourceId::parse(name).unwrap(), true, 0)

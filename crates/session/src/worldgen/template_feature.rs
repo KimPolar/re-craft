@@ -30,6 +30,14 @@ pub struct PreparedTemplateFeature {
 }
 
 impl PreparedTemplateFeature {
+    /// Every selectable template is resolved from the active packs and
+    /// contains no entity records. Preparation also rejects processors.
+    pub(super) fn is_entity_free(&self) -> bool {
+        self.templates
+            .values()
+            .all(|template| template.entities.is_empty())
+    }
+
     pub fn load(
         value: &Value,
         provider: &mut impl ResourceProvider,

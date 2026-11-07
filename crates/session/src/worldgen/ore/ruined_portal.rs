@@ -42,6 +42,8 @@ fn portal_template_full(state: &BlockState) -> Result<bool> {
         return Ok(state.name.ends_with("_slab") && state.properties["type"] == "double");
     }
     if is_air(state)
+        || (state.name == "minecraft:chest"
+            && state.properties.get("type").map(String::as_str) == Some("single"))
         || (state.name == "minecraft:iron_bars"
             && native_world::collision::pane_waterlogged(state).is_some())
     {
@@ -117,6 +119,34 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties),
             "invalid portal edge state"
         );
+        if state.name == "minecraft:chest" {
+            ensure!(
+                self.inner
+                    .registry
+                    .is_canonical_state(&neighbor.name, &neighbor.properties),
+                "invalid portal chest neighbor"
+            );
+            ensure!(
+                state.properties.get("type").map(String::as_str) == Some("single"),
+                "double portal chest updates are not yet supported"
+            );
+            ensure!(
+                direction[1] != 0
+                    || !matches!(
+                        neighbor.name.as_str(),
+                        "minecraft:chest" | "minecraft:trapped_chest"
+                    ),
+                "adjacent portal chest updates are not yet supported"
+            );
+            if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
+                SpringWorld::schedule_spring_tick(
+                    self.inner.region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            return Ok(state.clone());
+        }
         if native_world::collision::slab_stair_solid(state).is_some() {
             if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
                 SpringWorld::schedule_spring_tick(
@@ -205,7 +235,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     let opposite = glam::IVec3::from_array(direction.map(|value| -value));
                     native_world::collision::button_support_face(neighbor, opposite)
                         .context("unsupported portal stair or slab support face")?
-                } else if is_air(neighbor) {
+                } else if is_air(neighbor) || neighbor.name == "minecraft:chest" {
                     false
                 } else {
                     bail!("unsupported portal bars neighbor: {neighbor:?}")
@@ -242,6 +272,9 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         nbt: Option<&native_persistence::nbt::Tag>,
         random: &mut DecorationRandom,
     ) -> Result<bool> {
+        if state.name == "minecraft:chest" && nbt.is_some() {
+            return self.inner.place_template_block(pos, state, nbt, random);
+        }
         ensure!(nbt.is_none(), "portal block entities are not yet supported");
         if state.name == "minecraft:iron_bars"
             || native_world::collision::slab_stair_solid(state).is_some()
@@ -658,6 +691,7 @@ mod tests {
                     "id".into(),
                     Tag::String("minecraft:stone_slab".into()),
                 )]),
+                Tag::Compound(vec![("id".into(), Tag::String("minecraft:chest".into()))]),
             ]],
             blocks: vec![
                 TemplateBlock {
@@ -685,6 +719,17 @@ mod tests {
                     state: 4,
                     nbt: None,
                 },
+                TemplateBlock {
+                    position: [3, 1, 0],
+                    state: 5,
+                    nbt: Some(Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:chest".into())),
+                        (
+                            "LootTable".into(),
+                            Tag::String("minecraft:chests/ruined_portal".into()),
+                        ),
+                    ])),
+                },
             ],
             entities: vec![],
         };
@@ -705,6 +750,7 @@ mod tests {
         let mut region = terrain.decoration_region(&tags, &motion, writable)?;
         let mut clip = BoundingBox::new([8, 9, 8], [8, 9, 8]).unwrap();
         let mut random = DecorationRandom::new(42);
+        let expected_loot_seed = random.clone().next_long();
         assert!(region.place_ruined_portal(
             &start,
             &registry,
@@ -727,6 +773,20 @@ mod tests {
         assert_eq!(stair.name, "minecraft:stone_brick_stairs");
         assert_eq!(stair.properties["shape"], "outer_right");
         assert_eq!(world.block(6, 8, 7).unwrap().name, "minecraft:stone_slab");
+        assert_eq!(world.block(9, 8, 6).unwrap().name, "minecraft:chest");
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing portal block entities")
+        };
+        assert_eq!(values.len(), 1);
+        assert!(
+            matches!(values[0].get("LootTable"), Some(Tag::String(id)) if id.matches("minecraft:chests/ruined_portal"))
+        );
+        assert_eq!(
+            values[0].get("LootTableSeed"),
+            Some(&Tag::Long(expected_loot_seed))
+        );
         assert!(
             (-6..=22).any(
                 |x| (-6..=22).any(|z| world.block(x, 7, z).is_some_and(|s| matches!(
@@ -761,18 +821,10 @@ mod tests {
         );
         let mut unsupported = start.clone();
         let template = Arc::make_mut(&mut unsupported.template);
-        template.palettes[0].push(Tag::Compound(vec![(
-            "id".into(),
-            Tag::String("minecraft:chest".into()),
-        )]));
-        template.blocks.push(TemplateBlock {
-            position: [3, 1, 0],
-            state: 5,
-            nbt: Some(Tag::Compound(vec![(
-                "id".into(),
-                Tag::String("minecraft:chest".into()),
-            )])),
-        });
+        let Some(Tag::Compound(fields)) = &mut template.blocks.last_mut().unwrap().nbt else {
+            bail!("missing chest data")
+        };
+        fields.push(("unsupported".into(), Tag::Int(1)));
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();
@@ -861,6 +913,7 @@ mod tests {
             for (name, pos) in [
                 ("minecraft:stone_brick_stairs", [7, 8, 4]),
                 ("minecraft:stone_slab", [8, 8, 4]),
+                ("minecraft:chest", [9, 8, 4]),
             ] {
                 let (name, mut properties) = registry.resolve(&serde_json::json!(name))?;
                 properties.insert("waterlogged".into(), "true".into());
@@ -871,10 +924,17 @@ mod tests {
                         state
                     );
                 }
+                if state.name == "minecraft:chest" {
+                    assert!(
+                        world
+                            .update_shape(pos, &state, [1, 0, 0], [10, 8, 4], &state)
+                            .is_err()
+                    );
+                }
             }
         }
         let ticks = &region.world.saved_fluid_ticks[&ChunkPos { x: 0, z: 0 }];
-        for pos in [[6, 8, 4], [7, 8, 4], [8, 8, 4]] {
+        for pos in [[6, 8, 4], [7, 8, 4], [8, 8, 4], [9, 8, 4]] {
             assert_eq!(
                 ticks
                     .iter()

@@ -32,7 +32,7 @@ public class StructurePlacementOracle {
                 Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,
                 Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
                 Blocks.CHISELED_POLISHED_BLACKSTONE, Blocks.IRON_BARS, Blocks.JUNGLE_LEAVES,
-                Blocks.VINE, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR,
+                Blocks.VINE, Blocks.CHEST, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR,
                 Blocks.STONE_BRICK_STAIRS, Blocks.MOSSY_STONE_BRICK_STAIRS, Blocks.STONE_STAIRS,
                 Blocks.COBBLESTONE_STAIRS, Blocks.MOSSY_COBBLESTONE_STAIRS, Blocks.BLACKSTONE_STAIRS,
                 Blocks.POLISHED_BLACKSTONE_STAIRS, Blocks.POLISHED_BLACKSTONE_BRICK_STAIRS,
@@ -86,6 +86,20 @@ public class StructurePlacementOracle {
                                 Blocks.AIR.defaultBlockState(), levelRandom) != s)
                             throw new AssertionError("unexpected shape change for " + s);
                 }
+                for (var facing : Direction.Plane.HORIZONTAL) {
+                    var chest = Blocks.CHEST.defaultBlockState().setValue(ChestBlock.FACING, facing);
+                    for (var d : Direction.values())
+                        for (var neighbor : List.of(Blocks.AIR, Blocks.STONE, Blocks.IRON_BARS,
+                                Blocks.STONE_BRICK_STAIRS, Blocks.STONE_SLAB))
+                            if (chest.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
+                                    neighbor.defaultBlockState(), levelRandom) != chest)
+                                throw new AssertionError("unexpected chest shape change " + facing + " " + d + " " + neighbor);
+                }
+                var bars = Blocks.IRON_BARS.defaultBlockState();
+                for (var d : Direction.Plane.HORIZONTAL)
+                    if (bars.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
+                            Blocks.CHEST.defaultBlockState(), levelRandom) != bars)
+                        throw new AssertionError("bars unexpectedly connect to chest " + d);
                 if (!events.isEmpty()) throw new AssertionError("unexpected shape effects");
             }
             var settings=new StructurePlaceSettings().setMirror(mirror).setRotation(rotation).setRotationPivot(pivot)

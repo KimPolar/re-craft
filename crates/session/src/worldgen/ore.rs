@@ -4718,6 +4718,64 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if jigsaw::jigsaw_wood(state) {
         return Ok((true, true));
     }
+    if jigsaw::jigsaw_torch(state) {
+        return Ok((false, false));
+    }
+    if native_world::collision::pane_waterlogged(state).is_some()
+        || native_world::collision::bed_leg_end(state).is_some()
+        || (name == "minecraft:cobweb" && state.properties.is_empty())
+        || (matches!(name, "minecraft:lantern" | "minecraft:soul_lantern")
+            && native_world::block_light::same_light_behavior(state, state).is_some())
+    {
+        return Ok((true, false));
+    }
+    if native_world::collision::slab_stair_solid(state).is_some()
+        && native_world::block_light::same_light_behavior(state, state).is_some()
+    {
+        return Ok((
+            true,
+            state.properties.get("type").is_some_and(|v| v == "double"),
+        ));
+    }
+    if matches!(
+        name,
+        "minecraft:rail"
+            | "minecraft:powered_rail"
+            | "minecraft:detector_rail"
+            | "minecraft:activator_rail"
+    ) {
+        let powered = name != "minecraft:rail";
+        let shape = state.properties.get("shape").map(String::as_str);
+        let valid_shape = matches!(
+            shape,
+            Some(
+                "north_south"
+                    | "east_west"
+                    | "ascending_east"
+                    | "ascending_west"
+                    | "ascending_north"
+                    | "ascending_south"
+            )
+        ) || (!powered
+            && matches!(
+                shape,
+                Some("south_east" | "south_west" | "north_west" | "north_east")
+            ));
+        if state.properties.len() == if powered { 3 } else { 2 }
+            && valid_shape
+            && matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            )
+            && (!powered
+                || matches!(
+                    state.properties.get("powered").map(String::as_str),
+                    Some("true" | "false")
+                ))
+        {
+            return Ok((false, false));
+        }
+    }
     if tree_leaf_litter(state)? {
         return Ok((false, false));
     }
@@ -18306,6 +18364,33 @@ mod tests {
         let mut invalid = state("oak_planks");
         invalid.properties.insert("extra".into(), "true".into());
         assert!(monster_block_flags(&invalid).is_err());
+    }
+
+    #[test]
+    fn monster_room_handles_mineshaft_lights_rails_and_webs() {
+        let mut torch = state("wall_torch");
+        torch.properties.insert("facing".into(), "east".into());
+        assert_eq!(monster_block_flags(&torch).unwrap(), (false, false));
+        assert_eq!(
+            monster_block_flags(&state("cobweb")).unwrap(),
+            (true, false)
+        );
+        let mut rail = state("rail");
+        rail.properties = BTreeMap::from([
+            ("shape".into(), "north_south".into()),
+            ("waterlogged".into(), "true".into()),
+        ]);
+        assert_eq!(monster_block_flags(&rail).unwrap(), (false, false));
+        rail.properties.insert("shape".into(), "invalid".into());
+        assert!(monster_block_flags(&rail).is_err());
+        let mut slab = state("oak_slab");
+        slab.properties = BTreeMap::from([
+            ("type".into(), "bottom".into()),
+            ("waterlogged".into(), "false".into()),
+        ]);
+        assert_eq!(monster_block_flags(&slab).unwrap(), (true, false));
+        slab.properties.insert("type".into(), "double".into());
+        assert_eq!(monster_block_flags(&slab).unwrap(), (true, true));
     }
 
     #[test]

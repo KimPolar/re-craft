@@ -32,6 +32,23 @@ pub(super) struct ConvertedBlockEntities {
     live: LivePositions,
 }
 
+fn materialize_pending_block_entity(
+    pos: [i32; 3],
+    state: BlockState,
+) -> Result<native_persistence::nbt::Tag> {
+    match state.name.as_str() {
+        "minecraft:chest" => Ok(super::GeneratedEmptyChest {
+            position: pos,
+            state,
+        }
+        .block_entity()),
+        "minecraft:potent_sulfur" => {
+            Ok(super::GeneratedPotentSulfur::new(pos, state)?.block_entity())
+        }
+        _ => bail!("unsupported pending generated block entity"),
+    }
+}
+
 impl ConvertedBlockEntities {
     pub(super) fn from_proto(
         data: native_persistence::nbt::Tag,
@@ -709,15 +726,9 @@ impl GeneratedPostprocessing {
                 .block(position[0], position[1], position[2])
                 .context("pending block entity state is missing")?
                 .clone();
-            ensure!(
-                state.name == "minecraft:chest",
-                "unsupported pending generated block entity"
-            );
+            let record = materialize_pending_block_entity(position, state)?;
             entities.pending.remove(position);
-            entities.records.insert(
-                position,
-                super::GeneratedEmptyChest { position, state }.block_entity(),
-            );
+            entities.records.insert(position, record);
             entities.live.insert(position);
             read_world = true;
         }
@@ -2549,18 +2560,9 @@ impl PostprocessingChunk for GeneratedBlockView<'_> {
             "pending block entity is missing"
         );
         let state = self.read(pos)?;
-        ensure!(
-            state.name == "minecraft:chest",
-            "unsupported pending generated block entity"
-        );
-        let entity = super::GeneratedEmptyChest {
-            position: pos,
-            state,
-        };
+        let entity = materialize_pending_block_entity(pos, state)?;
         self.block_entities.pending.remove(pos);
-        self.block_entities
-            .records
-            .insert(pos, entity.block_entity());
+        self.block_entities.records.insert(pos, entity);
         self.block_entities.live.insert(pos);
         Ok(())
     }
@@ -5191,6 +5193,83 @@ mod tests {
                 expected_loot
             );
             assert_eq!(random.next_long(), expected_next.parse::<i64>().unwrap());
+        }
+    }
+
+    #[test]
+    fn postprocessing_promotes_pending_potent_sulfur_transactionally() {
+        use native_persistence::nbt::{Tag, TagType};
+        let (mut stage, _, chunk) = fixture(false);
+        let mut pending = PendingPositions::default();
+        let mut values = Vec::new();
+        for (index, variant) in ["dry", "wet", "dormant", "erupting", "continuous"]
+            .into_iter()
+            .enumerate()
+        {
+            let pos = [index as i32 + 2, 8, 2];
+            let state = BlockState {
+                name: "minecraft:potent_sulfur".into(),
+                properties: BTreeMap::from([("potent_sulfur_state".into(), variant.into())]),
+            };
+            let world = Arc::make_mut(&mut stage.world);
+            let id = world.intern_state(state);
+            world.set_block_id(pos[0], pos[1], pos[2], id).unwrap();
+            pending.insert(pos);
+            values.push(Tag::Compound(vec![
+                ("id".into(), Tag::String("DUMMY".into())),
+                ("x".into(), Tag::Int(pos[0])),
+                ("y".into(), Tag::Int(pos[1])),
+                ("z".into(), Tag::Int(pos[2])),
+            ]));
+        }
+        stage.source = Arc::clone(&stage.world);
+        let source = Arc::clone(&stage.source);
+        let converted = ConvertedBlockEntities::from_proto(
+            Tag::List {
+                element_type: TagType::Compound,
+                values,
+            },
+            None,
+            Some(&pending),
+        )
+        .unwrap();
+        stage
+            .set_block_entities(BTreeMap::from([(chunk, converted)]))
+            .unwrap();
+        let mut deferred = stage.clone();
+        deferred.required.clear();
+        let Tag::List { values: saved, .. } =
+            deferred.capture_deferred_block_entities(chunk).unwrap()
+        else {
+            panic!("missing deferred entities")
+        };
+        assert_eq!(saved.len(), 5);
+        for entity in &saved {
+            assert_eq!(
+                entity.get("id"),
+                Some(&Tag::String("minecraft:potent_sulfur".into()))
+            );
+            assert_eq!(entity.get("countdown"), Some(&Tag::Int(-1)));
+            assert_eq!(entity.get("keepPacked"), Some(&Tag::Byte(0)));
+        }
+        assert_eq!(stage.block_entities[&chunk].pending.members().len(), 5);
+        while !stage.poll(chunk, 1).unwrap() {}
+        let result = stage.finish().unwrap();
+        assert!(Arc::ptr_eq(&source, &result.world));
+        let Tag::List {
+            values: promoted, ..
+        } = result.block_entity_data(chunk).unwrap()
+        else {
+            panic!("missing promoted entities")
+        };
+        assert_eq!(promoted.len(), 5);
+        for entity in promoted {
+            assert_eq!(
+                entity.get("id"),
+                Some(&Tag::String("minecraft:potent_sulfur".into()))
+            );
+            assert_eq!(entity.get("countdown"), Some(&Tag::Int(-1)));
+            assert_eq!(entity.get("keepPacked"), Some(&Tag::Byte(0)));
         }
     }
 

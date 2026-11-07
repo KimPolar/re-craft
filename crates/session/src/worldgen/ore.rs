@@ -56,6 +56,8 @@ mod buried_treasure;
 mod jigsaw;
 mod mineshaft;
 mod ocean_ruin;
+#[cfg(test)]
+mod potent_sulfur_tests;
 mod ruined_portal;
 mod speleothem;
 #[cfg(test)]
@@ -6966,6 +6968,70 @@ fn simple_plant_kind(state: &BlockState) -> Result<SimplePlantKind> {
 }
 
 impl DecorationRegion<'_> {
+    fn write_potent_sulfur(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
+        super::GeneratedPotentSulfur::new(pos, state.clone())?;
+        if !self.writable.contains(&chunk(pos)) {
+            // SimpleBlockFeature returns success after an out-of-zone setBlock.
+            return Ok(true);
+        }
+        ensure!(
+            self.world.chunks.contains_key(&chunk(pos)),
+            "generation block chunk is missing"
+        );
+        ensure!(
+            !self.is_outside(pos[1]),
+            "out-of-height potent sulfur placeholder is unsupported"
+        );
+        if let Some(registry) = self.template_registry {
+            ensure!(
+                registry.is_canonical_state(&state.name, &state.properties)
+                    && registry.has_block_entity(&state.name) == Some(true),
+                "invalid potent sulfur registry state"
+            );
+        }
+        let old = self.read(pos)?;
+        let existing = self.monster_entities.get(&pos);
+        let pending_replacement = matches!(existing, Some(Some(super::GeneratedMonsterRoomEntity::PendingPotentSulfur { position, state: previous })) if *position == pos && previous == &old);
+        ensure!(
+            !self.bee_nests.contains_key(&pos) && (existing.is_none() || pending_replacement),
+            "potent sulfur would replace a block entity"
+        );
+        if pending_replacement {
+            ensure!(
+                super::generated_potent_sulfur::is_valid_state(&old),
+                "invalid existing potent sulfur state"
+            );
+            ensure!(
+                self.pending_order
+                    .get(&chunk(pos))
+                    .is_some_and(|order| order.members().contains(&pos)),
+                "potent sulfur pending order is missing"
+            );
+        }
+        ensure!(
+            pending_replacement
+                || disk_safe_solid(&old.name).is_some()
+                || generated_dripleaf(&old)?
+                || simple_plant_kind(&old).is_ok(),
+            "unsupported potent sulfur source effects: {old:?}"
+        );
+        if pending_replacement && old != *state {
+            // The protochunk keeps the same pending map entry while the
+            // block state changes. A failed draft is never published.
+            Arc::make_mut(&mut self.monster_entities).remove(&pos);
+        }
+        self.set_proto_block(pos, state)?;
+        Arc::make_mut(&mut self.monster_entities).insert(
+            pos,
+            Some(super::GeneratedMonsterRoomEntity::PendingPotentSulfur {
+                position: pos,
+                state: state.clone(),
+            }),
+        );
+        Arc::make_mut(self.pending_order.entry(chunk(pos)).or_default()).insert(pos);
+        Ok(true)
+    }
+
     fn small_dripleaf_survival(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
         generated_dripleaf(state)?;
         let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
@@ -7086,6 +7152,9 @@ impl DecorationRegion<'_> {
 impl SimpleBlockWorld for DecorationRegion<'_> {
     fn place_simple_state(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
         let result = (|| {
+            if state.name == "minecraft:potent_sulfur" {
+                return self.write_potent_sulfur(pos, state);
+            }
             let kind = simple_plant_kind(state)?;
             let below = [pos[0], pos[1].wrapping_sub(1), pos[2]];
             let survives = match kind {
@@ -19538,6 +19607,9 @@ mod tests {
                             };
                         }
                         super::super::GeneratedMonsterRoomEntity::PendingChest { .. }
+                        | super::super::GeneratedMonsterRoomEntity::PendingPotentSulfur {
+                            ..
+                        }
                         | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
                         | super::super::GeneratedMonsterRoomEntity::CaveSpiderSpawner(_)
                         | super::super::GeneratedMonsterRoomEntity::Brushable(_) => {

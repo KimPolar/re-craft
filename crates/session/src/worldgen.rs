@@ -120,6 +120,11 @@ pub enum GeneratedMonsterRoomEntity {
         position: [i32; 3],
         state: native_world::loaded::BlockState,
     },
+    /// A protochunk DUMMY sulfur entity awaiting LevelChunk promotion.
+    PendingPotentSulfur {
+        position: [i32; 3],
+        state: native_world::loaded::BlockState,
+    },
 }
 
 /// Result of serializing one generation-time entity. Java does not add a
@@ -1750,8 +1755,9 @@ impl CarvedTerrainWorld {
                     );
                     (chest.state.clone(), chest.block_entity())
                 }
-                GeneratedMonsterRoomEntity::PendingChest { position, state } => {
-                    ensure!(p == *position, "pending chest position mismatch");
+                GeneratedMonsterRoomEntity::PendingChest { position, state }
+                | GeneratedMonsterRoomEntity::PendingPotentSulfur { position, state } => {
+                    ensure!(p == *position, "pending block entity position mismatch");
                     pending_positions.insert(p);
                     (
                         state.clone(),

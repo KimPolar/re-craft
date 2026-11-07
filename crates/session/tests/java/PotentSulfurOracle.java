@@ -10,6 +10,10 @@ import net.minecraft.world.level.*;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.chunk.*;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
+import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
+import net.minecraft.world.level.levelgen.feature.SimpleBlockFeature;
+import net.minecraft.world.level.levelgen.feature.stateproviders.BlockStateProvider;
 
 public class PotentSulfurOracle {
     public static void main(String[] args) throws Exception {
@@ -25,6 +29,10 @@ public class PotentSulfurOracle {
             var pos=new BlockPos(index,8,0); chunk.setBlockState(pos,state,2);
             var dummy=new CompoundTag();dummy.putString("id","DUMMY");dummy.putInt("x",pos.getX());dummy.putInt("y",pos.getY());dummy.putInt("z",pos.getZ());
             chunk.setBlockEntityNbt(dummy);
+            chunk.setBlockState(pos,Blocks.POTENT_SULFUR.defaultBlockState(),2);
+            chunk.setBlockEntityNbt(dummy);
+            chunk.setBlockState(pos,state,2);
+            chunk.setBlockEntityNbt(dummy);
             if(chunk.getBlockEntity(pos)!=null || !dummy.equals(chunk.getBlockEntityNbtForSaving(pos,registries)))throw new AssertionError("placeholder changed");
             var entity=((EntityBlock)Blocks.POTENT_SULFUR).newBlockEntity(pos,state);
             if(entity==null)throw new AssertionError("missing block entity");
@@ -32,6 +40,29 @@ public class PotentSulfurOracle {
             NbtIo.write(chunk.getBlockEntityNbtForSaving(pos,registries),Path.of(args[0]).resolve(index+".nbt"));
             out.printf("P %d %s %s %s %s %s %s %s%n",index,state.getValue(PotentSulfurBlock.STATE).getSerializedName(),state.canSurvive(empty,pos),state.isSolid(),state.liquid(),state.hasBlockEntity(),PoiTypes.hasPoi(state),state.getPostProcessPos(null,pos));
             index++;
+        }
+        for(var state:Blocks.POTENT_SULFUR.getStateDefinition().getPossibleStates())
+        for(var oldBlock:new Block[]{Blocks.STONE,Blocks.SULFUR,Blocks.CINNABAR,Blocks.WATER})
+        for(int restricted=0;restricted<2;restricted++)for(int scheduled=0;scheduled<2;scheduled++)for(long seed:new long[]{0,7}) {
+            var pos=new BlockPos(8,7,8); chunk.removeBlockEntity(pos); chunk.setBlockState(pos,oldBlock.defaultBlockState(),2);
+            int limit=restricted; var ticks=new java.util.ArrayList<String>();
+            var level=(WorldGenLevel)java.lang.reflect.Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
+                var p=(BlockPos)a[0];
+                return switch(m.getName()) {
+                    case "getBlockState" -> chunk.getBlockState(p);
+                    case "setBlock" -> {if((int)a[2]!=2)throw new AssertionError("wrong flags");if(limit!=0)yield false;
+                        var next=(net.minecraft.world.level.block.state.BlockState)a[1];chunk.setBlockState(p,next,2);
+                        if(next.hasBlockEntity()){var tag=new CompoundTag();tag.putString("id","DUMMY");tag.putInt("x",p.getX());tag.putInt("y",p.getY());tag.putInt("z",p.getZ());chunk.setBlockEntityNbt(tag);} yield true;}
+                    case "scheduleTick" -> {if((int)a[2]!=1)throw new AssertionError("wrong tick delay");ticks.add(net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey((Block)a[1]).toString());yield null;}
+                    default -> throw new AssertionError("unexpected feature query "+m);
+                };
+            });
+            var feature=new SimpleBlockFeature(Holder.direct(BlockStateProvider.of(state)),scheduled!=0);
+            var random=new WorldgenRandom(new XoroshiroRandomSource(seed));
+            boolean placed=feature.place(level,null,random,pos);
+            var after=chunk.getBlockState(pos);var pending=chunk.getBlockEntityNbt(pos);
+            if(ticks.size()!=(scheduled!=0?1:0))throw new AssertionError("wrong tick count");
+            out.printf("F %s %s %d %d %d %s %s %s %s %d%n",state.getValue(PotentSulfurBlock.STATE).getSerializedName(),net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(oldBlock),restricted,scheduled,seed,placed,net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(after.getBlock()),pending!=null,ticks.isEmpty()?"-":ticks.getFirst(),random.nextLong());
         }
     }
 }

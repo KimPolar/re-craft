@@ -38,8 +38,8 @@ public class SpeleothemOracle {
         bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD));
         bind.invoke(Fluids.WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
         bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
-        for(var block:List.of(Blocks.SULFUR,Blocks.SULFUR_SPIKE,Blocks.WATER)) for(var state:block.getStateDefinition().getPossibleStates()) {
-            out.printf("E %s %s %s %s%n",block,state.hasBlockEntity(),net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state),state.getPostProcessPos(null,BlockPos.ZERO));
+        for(var block:List.of(Blocks.SULFUR,Blocks.SULFUR_SPIKE,Blocks.WATER,Blocks.CINNABAR)) for(var state:block.getStateDefinition().getPossibleStates()) {
+            out.printf("E %s %s %s %s %s%n",block,state.hasBlockEntity(),net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state),state.getPostProcessPos(null,BlockPos.ZERO),state.isSolid());
         }
         for (int d=0;d<2;d++) for(int height=-1;height<=6;height++) for(int merge=0;merge<2;merge++) for(int support=0;support<4;support++) {
             var direction=d==0?Direction.UP:Direction.DOWN; int step=d==0?1:-1;

@@ -247,6 +247,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn solid_predicate_covers_sulfur_states_and_rejects_malformed_states() -> Result<()> {
+        let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        for name in ["minecraft:sulfur", "minecraft:cinnabar"] {
+            assert!(DiskWorld::is_solid(
+                &mut region,
+                &BlockState {
+                    name: name.into(),
+                    properties: BTreeMap::new()
+                }
+            )?);
+        }
+        for direction in ["up", "down"] {
+            for thickness in ["tip_merge", "tip", "frustum", "middle", "base"] {
+                for waterlogged in ["true", "false"] {
+                    let state = BlockState {
+                        name: "minecraft:sulfur_spike".into(),
+                        properties: BTreeMap::from([
+                            ("vertical_direction".into(), direction.into()),
+                            ("thickness".into(), thickness.into()),
+                            ("waterlogged".into(), waterlogged.into()),
+                        ]),
+                    };
+                    assert!(DiskWorld::is_solid(&mut region, &state)?);
+                }
+            }
+        }
+        let malformed = BlockState {
+            name: "minecraft:sulfur_spike".into(),
+            properties: BTreeMap::new(),
+        };
+        assert!(DiskWorld::is_solid(&mut region, &malformed).is_err());
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn cluster_region_applies_water_and_pointed_states_and_rejects_unknown_effects() -> Result<()> {
         let game = native_resources::default_minecraft_dir()?;
@@ -343,6 +380,22 @@ mod tests {
         }
         let pointed = OreWorld::block(&mut region, [8, 8, 7])?;
         assert_eq!(pointed.name, "minecraft:sulfur_spike");
+        assert!(DiskWorld::is_solid(&mut region, &pointed)?);
+        let sulfur = registry.resolve(&json!("minecraft:sulfur"))?;
+        assert!(DiskWorld::is_solid(
+            &mut region,
+            &BlockState {
+                name: sulfur.0,
+                properties: sulfur.1
+            }
+        )?);
+        assert!(DiskWorld::is_solid(
+            &mut region,
+            &BlockState {
+                name: "minecraft:cinnabar".into(),
+                properties: BTreeMap::new()
+            }
+        )?);
         assert_eq!(
             pointed
                 .properties

@@ -6611,6 +6611,22 @@ impl DiskWorld for DecorationRegion<'_> {
         Ok(fluids.contains(fluid))
     }
     fn is_solid(&mut self, state: &BlockState) -> Result<bool> {
+        if state.name == "minecraft:cinnabar" {
+            ensure!(state.properties.is_empty(), "invalid cinnabar state");
+            return Ok(true);
+        }
+        // Both sulfur and every sulfur-spike state report isSolid in 26.3,
+        // including waterlogged spikes. Validate the complete state first.
+        if matches!(
+            state.name.as_str(),
+            "minecraft:sulfur" | "minecraft:sulfur_spike"
+        ) {
+            ensure!(
+                native_world::block_light::same_light_behavior(state, state).is_some(),
+                "invalid sulfur solid-predicate state"
+            );
+            return Ok(true);
+        }
         if geode_crystal(state)?
             || tree_generated_leaf(state)?
             || tree_generated_log(state)

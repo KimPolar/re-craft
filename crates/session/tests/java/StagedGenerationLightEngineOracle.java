@@ -286,7 +286,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && lakeActive) {
                 int[][] positions=lakeMixed ? new int[][]{{16,10,8},{16,10,9},{16,9,8}} : new int[][]{{16,10,8}};
                 var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
-                var stone=lakeOre ? Blocks.DEEPSLATE_IRON_ORE.defaultBlockState()
+                var stone=args[1].contains("_redstone_ore_")
+                    ? (args[1].contains("_deepslate_redstone_ore_") ? Blocks.DEEPSLATE_REDSTONE_ORE : Blocks.REDSTONE_ORE).defaultBlockState().setValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT,args[1].contains("_lit_"))
+                    : lakeOre ? Blocks.DEEPSLATE_IRON_ORE.defaultBlockState()
                     : args[1].contains("_cinnabar_") ? Blocks.CINNABAR.defaultBlockState()
                     : args[1].contains("_sulfur_") ? Blocks.SULFUR.defaultBlockState()
                     : args[1].contains("_granite_") ? Blocks.GRANITE.defaultBlockState()
@@ -296,7 +298,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     : args[1].contains("_calcite_") ? Blocks.CALCITE.defaultBlockState()
                     : args[1].contains("_deepslate_") ? Blocks.DEEPSLATE.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,axis)
                     : Blocks.STONE.defaultBlockState();
-                if(lakeOre && (stone.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(stone) || stone.getPostProcessPos(null,BlockPos.ZERO)!=null || !stone.isSolid())) throw new AssertionError("unsupported lake ore effects");
+                if((lakeOre || args[1].contains("_redstone_ore_")) && (stone.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(stone) || stone.getPostProcessPos(null,BlockPos.ZERO)!=null || !stone.isSolid())) throw new AssertionError("unsupported lake ore effects");
                 for(var p:positions){ var pos=new BlockPos(p[0],p[1],p[2]);
                     fake.section.setBlockState(p[0]-16,p[1],p[2],stone); w.edits.put(pos,stone); }
             }

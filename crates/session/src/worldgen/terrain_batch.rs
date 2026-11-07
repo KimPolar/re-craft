@@ -344,17 +344,25 @@ fn group_fresh_regions(
     Ok(regions)
 }
 
-fn require_selected_structure_sources(
+fn structure_source_coverage(
     selected: &BTreeSet<ChunkPos>,
     mut references: impl FnMut(ChunkPos) -> Result<BTreeSet<ChunkPos>>,
-) -> Result<BTreeSet<ChunkPos>> {
+) -> Result<(BTreeSet<ChunkPos>, BTreeSet<ChunkPos>)> {
     ensure!(!selected.is_empty(), "no structure chunks selected");
     let mut required = BTreeSet::new();
     for &pos in selected {
         required.extend(references(pos)?);
     }
-    if !required.is_subset(selected) {
-        let missing: Vec<_> = required.difference(selected).copied().collect();
+    let missing = required.difference(selected).copied().collect();
+    Ok((required, missing))
+}
+
+fn require_selected_structure_sources(
+    selected: &BTreeSet<ChunkPos>,
+    references: impl FnMut(ChunkPos) -> Result<BTreeSet<ChunkPos>>,
+) -> Result<BTreeSet<ChunkPos>> {
+    let (required, missing) = structure_source_coverage(selected, references)?;
+    if !missing.is_empty() {
         bail!("structure start chunks are missing from the selected region: {missing:?}");
     }
     Ok(required)
@@ -1081,6 +1089,21 @@ impl FreshTerrainBatch {
                 .context("structure references are missing")?,
             &structures.huts,
         )
+    }
+
+    /// Identify source chunks which must join a structure-aware save plan.
+    /// This does not generate or authorize saving those chunks.
+    pub fn missing_structure_reference_sources(
+        &self,
+        selected: &BTreeSet<ChunkPos>,
+    ) -> Result<BTreeSet<ChunkPos>> {
+        ensure!(
+            self.structures.is_some(),
+            "structure generation is disabled"
+        );
+        let (_, missing) =
+            structure_source_coverage(selected, |pos| self.structure_reference_sources(pos))?;
+        Ok(missing)
     }
     /// The data-pack tag used for leaf distance checks in this batch.
     pub fn leaf_support_tags(&self) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
@@ -4903,6 +4926,10 @@ mod region_draft_tests {
         };
         assert!(require_selected_structure_sources(&BTreeSet::new(), refs).is_err());
         assert!(require_selected_structure_sources(&BTreeSet::from([a]), refs).is_err());
+        assert_eq!(
+            structure_source_coverage(&BTreeSet::from([a, b]), refs).unwrap(),
+            (BTreeSet::from([a, b, c]), BTreeSet::from([c]))
+        );
         let missing = require_selected_structure_sources(&BTreeSet::from([a, b]), refs)
             .unwrap_err()
             .to_string();
@@ -4916,6 +4943,42 @@ mod region_draft_tests {
                 "incomplete starts"
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn structure_source_coverage_discovers_transitive_references() {
+        let a = ChunkPos { x: 0, z: 0 };
+        let b = ChunkPos { x: 4, z: 0 };
+        let c = ChunkPos { x: 8, z: 0 };
+        let refs = |pos| {
+            Ok(match pos {
+                p if p == a => BTreeSet::from([a, b]),
+                p if p == b => BTreeSet::from([c]),
+                p if p == c => BTreeSet::from([a]),
+                _ => BTreeSet::new(),
+            })
+        };
+        let mut selected = BTreeSet::from([a]);
+        assert_eq!(
+            structure_source_coverage(&selected, refs).unwrap().1,
+            BTreeSet::from([b])
+        );
+        selected.insert(b);
+        assert_eq!(
+            structure_source_coverage(&selected, refs).unwrap().1,
+            BTreeSet::from([c])
+        );
+        selected.insert(c);
+        assert!(
+            structure_source_coverage(&selected, refs)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            require_selected_structure_sources(&selected, refs).unwrap(),
+            BTreeSet::from([a, b, c])
         );
     }
 

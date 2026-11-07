@@ -50,17 +50,24 @@ fn source(fluid: Option<FluidState>) -> bool {
     fluid.is_some_and(|value| value.source)
 }
 
-fn place_records(
+fn place_records_inner<W: JigsawPlacementWorld>(
     records: &[ProcessedTemplateBlock],
-    world: &mut impl JigsawPlacementWorld,
+    world: &mut W,
     clip: BoundingBox,
     apply_waterlogging: bool,
     random: &mut DecorationRandom,
     mut rotate: impl FnMut(&BlockState) -> Result<BlockState>,
-) -> Result<()> {
+    mut place: impl FnMut(
+        &mut W,
+        [i32; 3],
+        &BlockState,
+        Option<&Tag>,
+        &mut DecorationRandom,
+    ) -> Result<bool>,
+) -> Result<Vec<([i32; 3], bool)>> {
     let mut unresolved = Vec::new();
     let mut template_sources = BTreeSet::new();
-    let mut placed_with_nbt = Vec::new();
+    let mut placed = Vec::new();
     for record in records {
         let block = &record.block;
         if !inside(clip, block.position) {
@@ -72,12 +79,10 @@ fn place_records(
             None
         };
         let state = rotate(&block.state)?;
-        if !world.place_template_block(block.position, &state, block.nbt.as_ref(), random)? {
+        if !place(world, block.position, &state, block.nbt.as_ref(), random)? {
             continue;
         }
-        if block.nbt.is_some() {
-            placed_with_nbt.push(block.position);
-        }
+        placed.push((block.position, block.nbt.is_some()));
         if apply_waterlogging {
             if source(world.fluid_of_state(&state)?) {
                 template_sources.insert(block.position);
@@ -118,10 +123,114 @@ fn place_records(
         }
         unresolved = remaining;
     }
-    // SinglePoolElement sets knownShape, so it skips neighbor shape updates.
-    for pos in placed_with_nbt {
-        world.mark_block_entity_changed(pos)?;
+    Ok(placed)
+}
+
+fn place_records<W: JigsawPlacementWorld>(
+    records: &[ProcessedTemplateBlock],
+    world: &mut W,
+    clip: BoundingBox,
+    apply_waterlogging: bool,
+    random: &mut DecorationRandom,
+    rotate: impl FnMut(&BlockState) -> Result<BlockState>,
+) -> Result<()> {
+    let placed = place_records_inner(
+        records,
+        world,
+        clip,
+        apply_waterlogging,
+        random,
+        rotate,
+        |world, pos, state, nbt, random| world.place_template_block(pos, state, nbt, random),
+    )?;
+    // SinglePoolElement sets knownShape and skips the shape passes.
+    for (pos, has_nbt) in placed {
+        if has_nbt {
+            world.mark_block_entity_changed(pos)?;
+        }
     }
+    Ok(())
+}
+
+/// Additional ordinary-template operations omitted by known-shape jigsaws.
+pub trait StructurePlacementWorld:
+    JigsawPlacementWorld + native_resources::tree_leaf_update::ShapeEdgeWorld<State = BlockState>
+{
+    /// Place with Java's flag 2, including NBT loading and loot-seed draws.
+    fn place_structure_block(
+        &mut self,
+        position: [i32; 3],
+        state: &BlockState,
+        nbt: Option<&Tag>,
+        random: &mut DecorationRandom,
+    ) -> Result<bool>;
+    /// Java Block.updateFromNeighbourShapes, including scheduled effects.
+    fn update_from_neighbor_shapes(
+        &mut self,
+        position: [i32; 3],
+        state: &BlockState,
+    ) -> Result<BlockState>;
+    fn update_neighbors_at(&mut self, position: [i32; 3], state: &BlockState) -> Result<()>;
+}
+
+/// Place already-processed ordinary template records; a caller must discard
+/// its world draft on error. Entity and structure marker handling is separate.
+pub fn place_structure_records<W: StructurePlacementWorld>(
+    records: &[ProcessedTemplateBlock],
+    world: &mut W,
+    registry: &native_resources::block_registry::GeneratedBlockRegistry,
+    clip: BoundingBox,
+    mirror: Mirror,
+    rotation: native_resources::structure_transform::Rotation,
+    random: &mut DecorationRandom,
+) -> Result<()> {
+    use native_resources::tree_leaf_update::{ShapeEdgeWorld, TreeBounds, update_shape_at_edges};
+    let mut next = random.clone();
+    let placed = place_records_inner(
+        records,
+        world,
+        clip,
+        true,
+        &mut next,
+        |state| {
+            let properties = registry.transform_template_state(
+                &state.name,
+                &state.properties,
+                mirror,
+                rotation,
+            )?;
+            Ok(BlockState {
+                name: state.name.clone(),
+                properties,
+            })
+        },
+        |world, pos, state, nbt, random| world.place_structure_block(pos, state, nbt, random),
+    )?;
+    if !placed.is_empty() {
+        let mut min = placed[0].0;
+        let mut max = min;
+        let mut shape = BTreeSet::new();
+        for (pos, _) in &placed {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(pos[axis]);
+                max[axis] = max[axis].max(pos[axis]);
+            }
+            shape.insert(*pos);
+        }
+        update_shape_at_edges(world, TreeBounds { min, max }, &shape, 2)?;
+        for (pos, has_nbt) in placed {
+            let old = ShapeEdgeWorld::block(world, pos)?;
+            let updated = world.update_from_neighbor_shapes(pos, &old)?;
+            if updated != old {
+                ShapeEdgeWorld::set_block(world, pos, &updated, 18)?;
+            }
+            world.update_neighbors_at(pos, &updated)?;
+            if has_nbt {
+                world.mark_block_entity_changed(pos)?;
+            }
+        }
+    }
+    *random = next;
     Ok(())
 }
 

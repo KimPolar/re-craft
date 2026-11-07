@@ -22,7 +22,7 @@ use native_resources::{
 use serde_json::Value;
 
 mod placement;
-pub use placement::JigsawPlacementWorld;
+pub use placement::{JigsawPlacementWorld, StructurePlacementWorld, place_structure_records};
 
 /// Sampling must use the unadjusted generator and the structure's biome rules.
 pub trait Environment {

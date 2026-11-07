@@ -33,6 +33,97 @@ pub struct PreparedStart {
 }
 
 impl PreparedStart {
+    /// Place this template in an unpublished world. Entity placement and
+    /// jigsaw markers remain unsupported and cause an error before writing.
+    /// The caller discards its world draft on any failure.
+    pub fn place_template<W: super::jigsaw::StructurePlacementWorld>(
+        &self,
+        world: &mut W,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        processors: &native_persistence::structure_processors::PreparedProcessors,
+        clip: BoundingBox,
+        is_static_full: impl FnMut(&native_world::loaded::BlockState) -> Result<bool>,
+        random: &mut native_core::random::DecorationRandom,
+    ) -> Result<bool> {
+        self.piece.validate()?;
+        if self.template.palettes.is_empty()
+            || self.template.size.iter().any(|&size| size < 1)
+            || (self.template.blocks.is_empty() && self.template.entities.is_empty())
+        {
+            return Ok(false);
+        }
+        ensure!(
+            self.template.entities.is_empty(),
+            "portal template entity placement is unsupported"
+        );
+        let [x, y, z] = self.piece.position;
+        let count =
+            i32::try_from(self.template.palettes.len()).context("too many portal palettes")?;
+        let selected = native_core::random::LegacyRandom::new(
+            native_resources::blockstates::positional_seed(x, y, z),
+        )
+        .next_int_bound(count)
+        .context("portal template has no palettes")? as usize;
+        let palette = &self.template.palettes[selected];
+        let pivot = [self.template.size[0] / 2, 0, self.template.size[2] / 2];
+        for block in &self.template.blocks {
+            let name = match palette
+                .get(block.state)
+                .context("portal palette index out of bounds")?
+                .get("id")
+            {
+                Some(Tag::String(name)) => name,
+                _ => anyhow::bail!("template block identifier missing"),
+            };
+            let position = native_resources::structure_transform::block_world_position(
+                block.position,
+                self.piece.position,
+                self.piece.mirror,
+                self.piece.rotation,
+                pivot,
+            );
+            if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&position[axis])) {
+                continue;
+            }
+            if name.matches("minecraft:jigsaw") || name.matches("jigsaw") {
+                ensure!(block.nbt.is_none(), "portal jigsaw markers are unsupported");
+            }
+            if (name.matches("minecraft:structure_block") || name.matches("structure_block"))
+                && let Some(nbt) = &block.nbt
+            {
+                let Some(Tag::String(mode)) = nbt.get("mode") else {
+                    anyhow::bail!("portal marker mode missing")
+                };
+                ensure!(
+                    ["SAVE", "LOAD", "CORNER", "DATA"]
+                        .iter()
+                        .any(|value| mode.matches(value)),
+                    "invalid portal marker mode"
+                );
+            }
+        }
+        let shared = std::cell::RefCell::new(world);
+        let records = self.process_blocks(
+            registry,
+            processors,
+            clip,
+            is_static_full,
+            &mut |position| {
+                super::jigsaw::JigsawPlacementWorld::block(&mut **shared.borrow_mut(), position)
+            },
+        )?;
+        super::jigsaw::place_structure_records(
+            &records,
+            shared.into_inner(),
+            registry,
+            clip,
+            self.piece.mirror,
+            self.piece.rotation,
+            random,
+        )?;
+        Ok(true)
+    }
+
     /// Process template records in the piece's mirror, rotation, and pivot.
     /// State transforms, block placement, and decoration happen afterwards.
     pub fn process_blocks(

@@ -723,6 +723,9 @@ pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id.ends_with("_wall") {
+        return Some(wall_boxes(crate::wall::Wall::from_state(state)?, true));
+    }
     if id == "leaf_litter" {
         return valid_leaf_litter(state).then(|| EMPTY.to_vec());
     }
@@ -1147,6 +1150,9 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id.ends_with("_wall") {
+        return Some(wall_boxes(crate::wall::Wall::from_state(state)?, false));
+    }
     if id.ends_with("_fence_gate") {
         let height = if state.properties.get("in_wall").map(String::as_str) == Some("true") {
             13.0 / 16.0
@@ -1627,6 +1633,31 @@ fn connected(state: &BlockState, low: f32, high: f32, height: f32) -> Option<Vec
         boxes.push(cuboid(high, 0.0, low, 1.0, height, high));
     }
     Some(canonical_boxes(&boxes))
+}
+
+fn wall_boxes(wall: crate::wall::Wall, collision: bool) -> Vec<Aabb> {
+    use crate::wall::Side;
+    let mut boxes = Vec::with_capacity(5);
+    let post_height = if collision { 24.0 } else { 16.0 };
+    if wall.shape.up {
+        boxes.push(pixel_box(4.0, 0.0, 4.0, 12.0, post_height, 12.0));
+    }
+    for (index, side) in wall.shape.sides.into_iter().enumerate() {
+        let height = match (side, collision) {
+            (Side::None, _) => continue,
+            (_, true) => 24.0,
+            (Side::Low, false) => 14.0,
+            (Side::Tall, false) => 16.0,
+        };
+        boxes.push(match index {
+            0 => pixel_box(5.0, 0.0, 0.0, 11.0, height, 11.0),
+            1 => pixel_box(5.0, 0.0, 5.0, 16.0, height, 11.0),
+            2 => pixel_box(5.0, 0.0, 5.0, 11.0, height, 16.0),
+            3 => pixel_box(0.0, 0.0, 5.0, 11.0, height, 11.0),
+            _ => unreachable!(),
+        });
+    }
+    canonical_boxes(&boxes)
 }
 
 /// Merge an orthogonal union in deterministic Z, X, then Y order.

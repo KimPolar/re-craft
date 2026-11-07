@@ -205,6 +205,10 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         name if name.ends_with("_fence") => {
             (u8::from(crate::collision::fence_waterlogged(state)?), 0)
         }
+        name if name.ends_with("_wall") => (
+            u8::from(crate::wall::Wall::from_state(state)?.waterlogged),
+            0,
+        ),
         name if name.ends_with("_fence_gate") => {
             crate::collision::fence_gate_open(state)?;
             (0, 0)

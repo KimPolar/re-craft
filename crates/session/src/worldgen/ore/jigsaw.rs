@@ -83,6 +83,9 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::door_open(state).is_some() {
         return Ok(false);
     }
+    if native_world::collision::bed_leg_end(state).is_some() {
+        return Ok(false);
+    }
     if state.name == "minecraft:chest" {
         monster_block_flags(state)?;
         return Ok(false);
@@ -243,6 +246,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::fence_waterlogged(state).is_some()
                 || native_world::collision::fence_gate_open(state).is_some()
                 || native_world::collision::door_open(state).is_some()
+                || native_world::collision::bed_leg_end(state).is_some()
                 || native_world::collision::full_glass(state)
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state);
@@ -1184,6 +1188,143 @@ mod tests {
             name: "minecraft:water".into(),
             properties: BTreeMap::from([("level".into(), "0".into())]),
         };
+        let volume = |boxes: &[native_world::collision::Aabb]| -> Vec<bool> {
+            (0..16)
+                .flat_map(|y| {
+                    (0..16).flat_map(move |z| {
+                        (0..16).map(move |x| {
+                            let point = glam::Vec3::new(
+                                (x as f32 + 0.5) / 16.0,
+                                (y as f32 + 0.5) / 16.0,
+                                (z as f32 + 0.5) / 16.0,
+                            );
+                            boxes
+                                .iter()
+                                .any(|b| point.cmpgt(b.min).all() && point.cmplt(b.max).all())
+                        })
+                    })
+                })
+                .collect()
+        };
+        let parse_boxes = |raw: &str| -> Result<Vec<native_world::collision::Aabb>> {
+            raw.split(';')
+                .map(|entry| {
+                    let nums = entry
+                        .split(',')
+                        .map(str::parse::<f32>)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    ensure!(nums.len() == 6, "invalid Java bed box");
+                    Ok(native_world::collision::Aabb {
+                        min: glam::Vec3::new(nums[0], nums[1], nums[2]),
+                        max: glam::Vec3::new(nums[3], nums[4], nums[5]),
+                    })
+                })
+                .collect()
+        };
+        let mut beds_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("BED\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [_, name, facing, part, occupied, poi, collision, outline] = fields.as_slice()
+            else {
+                bail!("invalid Java bed result")
+            };
+            let state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::from([
+                    ("facing".into(), (*facing).into()),
+                    ("part".into(), (*part).into()),
+                    ("occupied".into(), (*occupied).into()),
+                ]),
+            };
+            assert!(
+                registry.is_canonical_state(&state.name, &state.properties),
+                "{state:?}"
+            );
+            assert_eq!(
+                registry.has_block_entity(&state.name),
+                Some(false),
+                "{state:?}"
+            );
+            assert_eq!(jigsaw_static_full(&state)?, false);
+            assert_eq!(*poi == "true", *part == "head");
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(true)
+            );
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&water, &state),
+                Some(false)
+            );
+            assert_eq!(
+                volume(
+                    &native_world::collision::block_shape(&state)
+                        .context("bed collision missing")?
+                ),
+                volume(&parse_boxes(collision)?),
+                "{state:?}"
+            );
+            assert_eq!(
+                volume(
+                    &native_world::collision::block_outline(&state)
+                        .context("bed outline missing")?
+                ),
+                volume(&parse_boxes(outline)?),
+                "{state:?}"
+            );
+            beds_checked += 1;
+        }
+        assert_eq!(beds_checked, 16 * 16);
+        let mut bed_transforms = 0;
+        for line in output
+            .lines()
+            .filter(|line| line.starts_with("BED_TRANS\t"))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                facing,
+                part,
+                occupied,
+                mirror,
+                rotation,
+                next_facing,
+                next_part,
+                next_occupied,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java bed transform")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown rotation"),
+            };
+            let properties = BTreeMap::from([
+                ("facing".into(), (*facing).into()),
+                ("part".into(), (*part).into()),
+                ("occupied".into(), (*occupied).into()),
+            ]);
+            let next = registry.transform_template_state(
+                &format!("minecraft:{name}"),
+                &properties,
+                mirror,
+                rotation,
+            )?;
+            assert_eq!(next["facing"], *next_facing);
+            assert_eq!(next["part"], *next_part);
+            assert_eq!(next["occupied"], *next_occupied);
+            bed_transforms += 1;
+        }
+        assert_eq!(bed_transforms, 16 * 16 * 12);
         let mut glass_names = BTreeSet::new();
         let mut glass_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("GLASS\t")) {
@@ -1327,6 +1468,7 @@ mod tests {
             let (mut terrain, tags, _, _) = super::super::tests::fixture();
             let writable = terrain.snapshot().chunks.keys().copied().collect();
             let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut expected_beds = BTreeSet::new();
             for block in &template.blocks {
                 let raw = &template.palettes[0][block.state];
                 let Some(Tag::String(id)) = raw.get("id") else {
@@ -1341,6 +1483,7 @@ mod tests {
                             || id.ends_with("_fence")
                             || id.ends_with("_fence_gate")
                             || id.ends_with("_door")
+                            || id.ends_with("_bed")
                             || id.ends_with("_stained_glass")
                             || id.ends_with("_stained_glass_pane")
                             || matches!(
@@ -1360,6 +1503,9 @@ mod tests {
                 if block.position.iter().any(|value| !(0..16).contains(value)) {
                     continue;
                 }
+                if id.ends_with("_bed") && state.properties["part"] == "head" {
+                    expected_beds.insert(block.position);
+                }
                 let mut random = DecorationRandom::new(42);
                 assert!(
                     JigsawRegion {
@@ -1376,6 +1522,36 @@ mod tests {
                 found.insert(id);
             }
             region.finish()?;
+            let poi_pos = native_persistence::world::ChunkPos { x: 0, z: 0 };
+            let snapshot = terrain.snapshot();
+            let poi = native_persistence::poi::refresh_missing_chunk(
+                poi_pos,
+                &snapshot,
+                0,
+                16,
+                |state| {
+                    ensure!(
+                        registry.is_canonical_state(&state.name, &state.properties),
+                        "unknown POI state"
+                    );
+                    Ok(())
+                },
+            )?;
+            if expected_beds.is_empty() {
+                assert!(poi.is_none());
+            } else {
+                let poi = native_persistence::world::SavedPoiChunk::from_document(
+                    poi.context("missing bed POI")?,
+                    poi_pos,
+                )?;
+                let records = &poi.sections[&0].records;
+                assert_eq!(records.len(), expected_beds.len());
+                for record in records {
+                    assert!(expected_beds.contains(&record.position));
+                    assert!(record.type_id.matches("minecraft:home"));
+                    assert_eq!(record.free_tickets, 1);
+                }
+            }
         }
         assert!(found.contains("minecraft:oak_log"), "{found:?}");
         assert!(found.contains("minecraft:oak_planks"), "{found:?}");
@@ -1385,6 +1561,8 @@ mod tests {
         assert!(found.contains("minecraft:oak_door"), "{found:?}");
         assert!(found.contains("minecraft:wall_torch"), "{found:?}");
         assert!(found.contains("minecraft:glass_pane"), "{found:?}");
+        assert!(found.contains("minecraft:white_bed"), "{found:?}");
+        assert!(found.contains("minecraft:yellow_bed"), "{found:?}");
         Ok(())
     }
 

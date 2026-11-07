@@ -7122,6 +7122,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::fence_waterlogged(state).is_some()
                             || native_world::collision::fence_gate_open(state).is_some()
                             || native_world::collision::door_open(state).is_some()
+                            || native_world::collision::bed_leg_end(state).is_some()
                             || native_world::collision::full_glass(state)
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state))
@@ -7144,6 +7145,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && ((native_world::collision::fence_waterlogged(state).is_none()
                             && native_world::collision::fence_gate_open(state).is_none()
                             && native_world::collision::door_open(state).is_none()
+                            && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
                             && native_world::collision::pane_waterlogged(state).is_none())
                             || native_world::block_light::same_light_behavior(&old, state)
@@ -11564,6 +11566,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_beds_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_bed",
+            "vine_active_self_jigsaw_bed",
+            "vine_active_empty_jigsaw_bed",
+            "vine_active_self_empty_jigsaw_bed",
+            "vine_active_jigsaw_water_bed",
+            "vine_active_self_jigsaw_water_bed",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_torches_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_torch",
@@ -11797,6 +11812,8 @@ mod tests {
                         "oak_fence_gate"
                     } else if mode.ends_with("_door") {
                         "oak_door"
+                    } else if mode.ends_with("_bed") {
+                        "white_bed"
                     } else if mode.ends_with("_walltorch") {
                         "wall_torch"
                     } else if mode.ends_with("_torch") {
@@ -11841,6 +11858,12 @@ mod tests {
                             ("hinge".into(), "left".into()),
                             ("open".into(), "false".into()),
                             ("powered".into(), "false".into()),
+                        ]);
+                    } else if mode.ends_with("_bed") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("occupied".into(), "false".into()),
+                            ("part".into(), "foot".into()),
                         ]);
                     } else if mode.ends_with("_walltorch") {
                         block.properties = BTreeMap::from([("facing".into(), "north".into())]);
@@ -11961,7 +11984,10 @@ mod tests {
             let guard = draft.light_guard.as_ref().unwrap();
             let expected_checks = if mode.contains("_jigsaw_wet_") {
                 2
-            } else if mode.ends_with("_jigsaw_gate") || mode.ends_with("_jigsaw_door") {
+            } else if mode.ends_with("_jigsaw_gate")
+                || mode.ends_with("_jigsaw_door")
+                || mode.ends_with("_jigsaw_bed")
+            {
                 0
             } else if mode.ends_with("_jigsaw_glass") || mode.ends_with("_jigsaw_pane") {
                 0

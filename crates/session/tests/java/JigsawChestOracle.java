@@ -49,10 +49,39 @@ public class JigsawChestOracle {
         var a=boxes.get(0);
         return a.minX+","+a.minY+","+a.minZ+","+a.maxX+","+a.maxY+","+a.maxZ;
     }
+    static String boxes(net.minecraft.world.phys.shapes.VoxelShape shape) {
+        var result = new java.util.ArrayList<String>();
+        for (var box : shape.toAabbs()) result.add(box.minX+","+box.minY+","+box.minZ+","+box.maxX+","+box.maxY+","+box.maxZ);
+        return String.join(";", result);
+    }
     public static void main(String[] args) throws Exception {
         var out = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            var block = BuiltInRegistries.BLOCK.getValue(id);
+            if (!(block instanceof net.minecraft.world.level.block.BedBlock)) continue;
+            for (var state : block.getStateDefinition().getPossibleStates()) {
+                var facing=state.getValue(BlockStateProperties.HORIZONTAL_FACING);
+                var part=state.getValue(BlockStateProperties.BED_PART);
+                var occupied=state.getValue(BlockStateProperties.OCCUPIED);
+                if (state.hasBlockEntity() || state.useShapeForLightOcclusion()
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null
+                    || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)
+                    || !LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state))
+                    throw new AssertionError("unexpected bed effects: "+state);
+                out.printf("BED\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",id.getPath(),facing.getName(),part.getSerializedName(),occupied,
+                    net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state),
+                    boxes(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),boxes(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
+                for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var transformed=state.mirror(mirror).rotate(rotation);
+                    out.printf("BED_TRANS\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",id.getPath(),facing.getName(),part.getSerializedName(),occupied,
+                        mirror.name(),rotation.name(),transformed.getValue(BlockStateProperties.HORIZONTAL_FACING).getName(),
+                        transformed.getValue(BlockStateProperties.BED_PART).getSerializedName(),transformed.getValue(BlockStateProperties.OCCUPIED));
+                }
+            }
+        }
         for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS}) {
             var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
             var delays=new java.util.ArrayList<Integer>();

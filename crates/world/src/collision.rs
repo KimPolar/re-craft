@@ -101,6 +101,32 @@ fn dye_color(name: &str) -> bool {
     )
 }
 
+/// Validate a vanilla bed state, returning the end bearing its legs.
+pub fn bed_leg_end(state: &BlockState) -> Option<&str> {
+    let color = state
+        .name
+        .strip_prefix("minecraft:")?
+        .strip_suffix("_bed")?;
+    if !dye_color(color) || state.properties.len() != 3 {
+        return None;
+    }
+    if !matches!(
+        state.properties.get("occupied").map(String::as_str),
+        Some("true" | "false")
+    ) {
+        return None;
+    }
+    let facing = state.properties.get("facing")?.as_str();
+    let end = match (facing, state.properties.get("part")?.as_str()) {
+        ("north", "head") | ("south", "foot") => "north",
+        ("south", "head") | ("north", "foot") => "south",
+        ("east", "head") | ("west", "foot") => "east",
+        ("west", "head") | ("east", "foot") => "west",
+        _ => return None,
+    };
+    Some(end)
+}
+
 /// Recognize the verified, transparent full glass blocks.
 pub fn full_glass(state: &BlockState) -> bool {
     let Some(name) = state.name.strip_prefix("minecraft:") else {
@@ -1333,19 +1359,7 @@ fn button_outline(state: &BlockState) -> Option<Vec<Aabb>> {
 }
 
 fn bed(state: &BlockState) -> Option<Vec<Aabb>> {
-    let facing = state.properties.get("facing")?.as_str();
-    let head = match state.properties.get("part")?.as_str() {
-        "head" => true,
-        "foot" => false,
-        _ => return None,
-    };
-    let edge = match (facing, head) {
-        ("north", true) | ("south", false) => "north",
-        ("south", true) | ("north", false) => "south",
-        ("west", true) | ("east", false) => "west",
-        ("east", true) | ("west", false) => "east",
-        _ => return None,
-    };
+    let edge = bed_leg_end(state)?;
     let d = 3.0 / 16.0;
     let height = 9.0 / 16.0;
     let mut boxes = vec![cuboid(0.0, d, 0.0, 1.0, height, 1.0)];
@@ -1643,6 +1657,30 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn bed_shape_validates_states_and_places_legs_on_the_outer_end() {
+        let mut state = BlockState {
+            name: "minecraft:red_bed".into(),
+            properties: BTreeMap::from([
+                ("facing".into(), "east".into()),
+                ("occupied".into(), "false".into()),
+                ("part".into(), "head".into()),
+            ]),
+        };
+        assert_eq!(bed_leg_end(&state), Some("east"));
+        let shape = block_shape(&state).unwrap();
+        assert_eq!(shape.len(), 3);
+        assert_eq!(shape[1].min.x, 13.0 / 16.0);
+        state.properties.insert("part".into(), "foot".into());
+        assert_eq!(bed_leg_end(&state), Some("west"));
+        assert_eq!(block_shape(&state).unwrap()[1].min.x, 0.0);
+        state.properties.insert("occupied".into(), "maybe".into());
+        assert!(block_shape(&state).is_none());
+        state.properties.insert("occupied".into(), "false".into());
+        state.name = "minecraft:invented_bed".into();
+        assert!(block_shape(&state).is_none());
+    }
 
     #[test]
     fn slab_properties_and_unknown_states_are_explicit() {

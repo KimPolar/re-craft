@@ -213,6 +213,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             crate::collision::door_open(state)?;
             (0, 0)
         }
+        _ if crate::collision::bed_leg_end(state).is_some() => (0, 0),
         "minecraft:dirt_path" if state.properties.is_empty() => (0, 0),
         "minecraft:farmland" if state.properties.len() == 1 => {
             if !matches!(

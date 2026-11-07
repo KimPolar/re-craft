@@ -50,6 +50,7 @@ enum StateSchema {
     Vine,
     Beehive,
     Chest,
+    Bed,
     Fence,
     FenceGate,
     Door,
@@ -73,6 +74,13 @@ impl StateSchema {
                     ("facing".into(), "north".into()),
                     ("type".into(), "single".into()),
                     ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::Bed => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("occupied".into(), "false".into()),
+                    ("part".into(), "foot".into()),
                 ]);
             }
             Self::Fence => {
@@ -220,6 +228,13 @@ impl StateSchema {
                 if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
                     || (matches!(name, "in_wall" | "open" | "powered")
                         && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Bed
+                if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
+                    || (name == "part" && matches!(value, "head" | "foot"))
+                    || (name == "occupied" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -566,6 +581,7 @@ impl GeneratedBlockRegistry {
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
                     "WOOL" => Some(("wool", BASE)),
+                    "BED" => Some(("bed", "net/minecraft/world/level/block/BedBlock")),
                     "STAINED_GLASS" => Some((
                         "stained_glass",
                         "net/minecraft/world/level/block/StainedGlassBlock",
@@ -693,6 +709,7 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::Fence)
                 }
                 "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
+                "net/minecraft/world/level/block/BedBlock" => Some(StateSchema::Bed),
                 "net/minecraft/world/level/block/DoorBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {
                     Some(StateSchema::Door)
@@ -877,6 +894,7 @@ impl GeneratedBlockRegistry {
                 StateSchema::HorizontalFacing
                     | StateSchema::Stairs
                     | StateSchema::Chest
+                    | StateSchema::Bed
                     | StateSchema::FenceGate
                     | StateSchema::Door
             ),

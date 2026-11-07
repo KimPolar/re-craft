@@ -89,6 +89,9 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::door_open(state).is_some() {
         return Ok(false);
     }
+    if native_world::collision::trapdoor_state(state).is_some() {
+        return Ok(false);
+    }
     if native_world::collision::bed_leg_end(state).is_some() {
         return Ok(false);
     }
@@ -285,6 +288,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::fence_waterlogged(state).is_some()
                 || native_world::collision::fence_gate_open(state).is_some()
                 || native_world::collision::door_open(state).is_some()
+                || native_world::collision::trapdoor_state(state).is_some()
                 || native_world::collision::bed_leg_end(state).is_some()
                 || native_world::collision::full_glass(state)
                 || native_world::collision::full_terracotta(state)
@@ -303,6 +307,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || state.name.ends_with("_fence")
                 || native_world::wall::Wall::from_state(state).is_some()
                 || native_world::collision::pane_waterlogged(state).is_some()
+                || native_world::collision::trapdoor_state(state).is_some()
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -336,6 +341,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     .is_some()
                     || native_world::wall::Wall::from_state(state).is_some()
                     || native_world::collision::fence_waterlogged(state).is_some()
+                    || native_world::collision::trapdoor_state(state).is_some()
                     || native_world::collision::pane_waterlogged(state).is_some();
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
@@ -825,6 +831,11 @@ mod tests {
         let output = String::from_utf8(output.stdout)?;
         assert!(output.lines().any(|line| line == expected_line));
         assert!(output.lines().any(|line| line == "PROTO_WATER_TICK\t0"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "TRAPDOOR_WATER_UPDATE\t12")
+        );
         let mut states_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("STATE\t")) {
             let fields: Vec<_> = line.split('\t').collect();
@@ -1813,6 +1824,63 @@ mod tests {
         assert!(found.contains("minecraft:glass_pane"), "{found:?}");
         assert!(found.contains("minecraft:white_bed"), "{found:?}");
         assert!(found.contains("minecraft:yellow_bed"), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_trapdoor_waterlogging_preserves_state_and_schedules_water() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let (name, mut properties) =
+            registry.resolve(&serde_json::json!("minecraft:dark_oak_trapdoor"))?;
+        properties.insert("facing".into(), "east".into());
+        properties.insert("open".into(), "true".into());
+        properties.insert("half".into(), "top".into());
+        let state = BlockState { name, properties };
+        let pos = [1, 8, 1];
+        let mut draft = JigsawRegion {
+            region: &mut region,
+            registry: &registry,
+        };
+        assert_eq!(jigsaw_static_full(&state)?, false);
+        assert!(draft.place_template_block(pos, &state, None, &mut DecorationRandom::new(42))?);
+        assert!(draft.is_liquid_container(&state)?);
+        draft.place_liquid(
+            pos,
+            &state,
+            Some(FluidState {
+                kind: FluidKind::Water,
+                source: true,
+                falling: false,
+                amount: 8,
+            }),
+        )?;
+        region.finish()?;
+        let snapshot = terrain.snapshot();
+        let placed = snapshot
+            .block(pos[0], pos[1], pos[2])
+            .context("missing trapdoor")?;
+        let mut expected = state.clone();
+        expected
+            .properties
+            .insert("waterlogged".into(), "true".into());
+        assert_eq!(placed, &expected);
+        let ticks = snapshot
+            .saved_fluid_ticks
+            .get(&ChunkPos { x: 0, z: 0 })
+            .context("missing fluid tick")?;
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].position, pos);
+        assert_eq!(ticks[0].fluid, "minecraft:water");
+        assert_eq!(ticks[0].delay, 0);
         Ok(())
     }
 

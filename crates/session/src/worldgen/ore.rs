@@ -7747,6 +7747,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::fence_waterlogged(state).is_some()
                             || native_world::collision::fence_gate_open(state).is_some()
                             || native_world::collision::door_open(state).is_some()
+                            || native_world::collision::trapdoor_state(state).is_some()
                             || native_world::collision::bed_leg_end(state).is_some()
                             || native_world::collision::full_glass(state)
                             || native_world::collision::full_terracotta(state)
@@ -7779,6 +7780,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             && native_world::wall::Wall::from_state(state).is_none()
                             && native_world::collision::fence_gate_open(state).is_none()
                             && native_world::collision::door_open(state).is_none()
+                            && native_world::collision::trapdoor_state(state).is_none()
                             && native_world::collision::bed_leg_end(state).is_none()
                             && !native_world::collision::full_glass(state)
                             && native_world::collision::pane_waterlogged(state).is_none())
@@ -12388,6 +12390,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_trapdoors_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_trapdoor",
+            "vine_active_self_jigsaw_trapdoor",
+            "vine_active_empty_jigsaw_trapdoor",
+            "vine_active_self_empty_jigsaw_trapdoor",
+            "vine_active_jigsaw_wet_trapdoor",
+            "vine_active_self_jigsaw_wet_trapdoor",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_beds_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_bed",
@@ -12805,6 +12820,8 @@ mod tests {
                         "oak_fence_gate"
                     } else if mode.ends_with("_door") {
                         "oak_door"
+                    } else if mode.ends_with("_trapdoor") {
+                        "dark_oak_trapdoor"
                     } else if mode.ends_with("_bed") {
                         "white_bed"
                     } else if mode.ends_with("_terracotta") {
@@ -12853,6 +12870,14 @@ mod tests {
                             ("hinge".into(), "left".into()),
                             ("open".into(), "false".into()),
                             ("powered".into(), "false".into()),
+                        ]);
+                    } else if mode.ends_with("_trapdoor") {
+                        block.properties = BTreeMap::from([
+                            ("facing".into(), "north".into()),
+                            ("half".into(), "bottom".into()),
+                            ("open".into(), "false".into()),
+                            ("powered".into(), "false".into()),
+                            ("waterlogged".into(), "false".into()),
                         ]);
                     } else if mode.ends_with("_bed") {
                         block.properties = BTreeMap::from([
@@ -12999,6 +13024,7 @@ mod tests {
                 2
             } else if mode.ends_with("_jigsaw_gate")
                 || mode.ends_with("_jigsaw_door")
+                || mode.ends_with("_jigsaw_trapdoor")
                 || mode.ends_with("_jigsaw_bed")
             {
                 0

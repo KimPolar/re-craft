@@ -435,6 +435,16 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
             }
             return Ok(state.clone());
         }
+        if let Some((_, waterlogged)) = native_world::collision::trapdoor_state(state) {
+            if waterlogged {
+                SpringWorld::schedule_spring_tick(
+                    self.inner.region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            return Ok(state.clone());
+        }
         if native_world::collision::slab_stair_solid(state).is_some() {
             if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
                 SpringWorld::schedule_spring_tick(
@@ -652,6 +662,7 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         if state.name == "minecraft:iron_bars"
             || native_world::collision::slab_stair_solid(state).is_some()
             || native_world::wall::Wall::from_state(state).is_some()
+            || native_world::collision::trapdoor_state(state).is_some()
         {
             return self.inner.place_template_block(pos, state, None, random);
         }
@@ -1693,6 +1704,7 @@ mod tests {
                 ("minecraft:stone_slab", [8, 8, 4]),
                 ("minecraft:chest", [9, 8, 4]),
                 ("minecraft:stone_brick_wall", [10, 8, 4]),
+                ("minecraft:dark_oak_trapdoor", [11, 8, 4]),
             ] {
                 let (name, mut properties) = registry.resolve(&serde_json::json!(name))?;
                 properties.insert("waterlogged".into(), "true".into());
@@ -1713,7 +1725,14 @@ mod tests {
             }
         }
         let ticks = &region.world.saved_fluid_ticks[&ChunkPos { x: 0, z: 0 }];
-        for pos in [[6, 8, 4], [7, 8, 4], [8, 8, 4], [9, 8, 4], [10, 8, 4]] {
+        for pos in [
+            [6, 8, 4],
+            [7, 8, 4],
+            [8, 8, 4],
+            [9, 8, 4],
+            [10, 8, 4],
+            [11, 8, 4],
+        ] {
             assert_eq!(
                 ticks
                     .iter()

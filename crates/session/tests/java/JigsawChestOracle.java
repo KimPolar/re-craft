@@ -96,7 +96,7 @@ public class JigsawChestOracle {
                 }
             }
         }
-        for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS}) {
+        for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS,Blocks.DARK_OAK_TRAPDOOR}) {
             var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
             var delays=new java.util.ArrayList<Integer>();
             var states=new java.util.ArrayList<net.minecraft.world.level.block.state.BlockState>();
@@ -116,6 +116,24 @@ public class JigsawChestOracle {
                 || !delays.equals(java.util.List.of(5)) || ticks.scheduledTicks().size()!=1 || ticks.scheduledTicks().get(0).delay()!=0) throw new AssertionError(block+" "+delays+" "+ticks.scheduledTicks());
         }
         out.println("PROTO_WATER_TICK\t0");
+        var trapdoorUpdate=net.minecraft.world.level.block.TrapDoorBlock.class.getDeclaredMethod("updateShape",
+            net.minecraft.world.level.block.state.BlockState.class,net.minecraft.world.level.LevelReader.class,
+            net.minecraft.world.level.ScheduledTickAccess.class,BlockPos.class,Direction.class,BlockPos.class,
+            net.minecraft.world.level.block.state.BlockState.class,net.minecraft.util.RandomSource.class);
+        trapdoorUpdate.setAccessible(true);
+        for(boolean wet:new boolean[]{false,true}) for(var direction:Direction.values()) {
+            var delays=new java.util.ArrayList<Integer>();
+            var level=(net.minecraft.world.level.LevelAccessor)java.lang.reflect.Proxy.newProxyInstance(
+                net.minecraft.world.level.LevelAccessor.class.getClassLoader(),new Class<?>[]{net.minecraft.world.level.LevelAccessor.class},
+                (proxy,method,values)->switch(method.getName()) {
+                    case "scheduleTick" -> {delays.add((Integer)values[2]);yield null;}
+                    default -> throw new AssertionError("unexpected trapdoor "+method);
+                });
+            var state=Blocks.DARK_OAK_TRAPDOOR.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,wet);
+            var updated=(net.minecraft.world.level.block.state.BlockState)trapdoorUpdate.invoke(Blocks.DARK_OAK_TRAPDOOR,state,level,level,BlockPos.ZERO,direction,BlockPos.ZERO.relative(direction),Blocks.AIR.defaultBlockState(),net.minecraft.util.RandomSource.create(0));
+            if(updated!=state || !delays.equals(wet?java.util.List.of(5):java.util.List.of())) throw new AssertionError("trapdoor update "+wet+" "+direction+" "+delays);
+        }
+        out.println("TRAPDOOR_WATER_UPDATE\t12");
         var lookup = VanillaRegistries.createWorldLookup();
         var registries = VanillaRegistries.createReloadableLookup(lookup);
         for (var pending : net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();

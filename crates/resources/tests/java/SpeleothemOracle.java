@@ -12,6 +12,7 @@ import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.levelgen.feature.SpeleothemUtils;
 import net.minecraft.world.level.levelgen.Column;
 import net.minecraft.world.level.levelgen.feature.SpeleothemClusterFeature;
+import net.minecraft.world.level.levelgen.feature.SpeleothemFeature;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.util.RandomSource;
@@ -102,6 +103,27 @@ public class SpeleothemOracle {
             var random=new WorldgenRandom(new XoroshiroRandomSource(seed));
             int result=(int)height.invoke(cluster,random,x,z,value,h);
             out.printf("H %d %d %d %d %d %d %d%n",x,z,h,density,seed,result,random.nextLong());
+        }
+        for(int mode=0;mode<4;mode++) for(int profile=0;profile<4;profile++) for(long seed=0;seed<32;seed++) {
+            float[] chances=switch(mode){case 0->new float[]{.2f,.7f,.5f,.5f};case 1->new float[]{0f,0f,0f,0f};case 2->new float[]{1f,1f,1f,1f};default->new float[]{.8f,.3f,.9f,.2f};};
+            var feature=new SpeleothemFeature(Blocks.SULFUR.defaultBlockState(),Blocks.SULFUR_SPIKE.defaultBlockState(),replaceable,chances[0],chances[1],chances[2],chances[3]);
+            int scenario=profile; var states=new HashMap<BlockPos,BlockState>(); var events=new ArrayList<String>();
+            var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
+                var pos=(BlockPos)a[0]; int y=pos.getY();
+                var fallback=(y>10 && (scenario&1)!=0)||(y<10 && (scenario&2)!=0)?Blocks.STONE.defaultBlockState()
+                    : y==10 && Math.floorMod(pos.getX()+pos.getZ(),3)==0?Blocks.WATER.defaultBlockState():Blocks.AIR.defaultBlockState();
+                var state=states.getOrDefault(pos,fallback);
+                return switch(m.getName()) {
+                    case "getBlockState" -> state;
+                    case "isWaterAt" -> state.getFluidState().is(FluidTags.WATER);
+                    case "setBlock" -> {var next=(BlockState)a[1];states.put(pos.immutable(),next);
+                        String detail=next.is(Blocks.SULFUR)?"base":next.getValue(PointedDripstoneBlock.TIP_DIRECTION).getSerializedName()+":"+next.getValue(PointedDripstoneBlock.THICKNESS).getSerializedName()+":"+next.getValue(BlockStateProperties.WATERLOGGED);
+                        events.add(pos.getX()+":"+y+":"+pos.getZ()+":"+detail+":"+a[2]);yield true;}
+                    default -> throw new UnsupportedOperationException(m.toString());
+                };
+            });
+            var random=new WorldgenRandom(new XoroshiroRandomSource(seed)); boolean result=feature.place(world,null,random,new BlockPos(0,10,0));
+            out.printf("I %d %d %d %s %d %s%n",mode,profile,seed,result,random.nextLong(),events.isEmpty()?"-":String.join(",",events));
         }
         for(int variable=0;variable<5;variable++) for(int wet=0;wet<2;wet++) for(int profile=0;profile<4;profile++) for(long seed=0;seed<16;seed++) {
             var densityProvider=switch(variable){case 0->ConstantFloat.of(.7f);case 1->UniformFloat.of(.3f,.7f);case 2->TrapezoidFloat.of(.3f,.7f,.1f);case 3->TrapezoidFloat.of(.3f,.7f,-.1f);default->ClampedNormalFloat.of(.5f,-.2f,.3f,.7f);};

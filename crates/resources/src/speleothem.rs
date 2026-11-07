@@ -276,15 +276,106 @@ enum Replaceable {
     Blocks(Vec<ResourceId>),
 }
 
-/// Decoded 26.3 cluster definition, with state and holder references retained
-/// for the caller's data-pack-aware world adapter.
-pub struct SpeleothemClusterFeature<S> {
-    pub config: ClusterConfig,
+/// Shared state and holder references for the two speleothem features.
+pub struct SpeleothemBlocks<S> {
     base: S,
     pointed: S,
     base_id: ResourceId,
     pointed_id: ResourceId,
     replaceable: Replaceable,
+}
+
+impl<S> SpeleothemBlocks<S> {
+    fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let field = |name: &str| {
+            value
+                .get(name)
+                .with_context(|| format!("missing speleothem {name}"))
+        };
+        let state_id = |state: &Value| -> Result<ResourceId> {
+            ResourceId::parse(
+                state
+                    .as_str()
+                    .or_else(|| state.get("id").and_then(Value::as_str))
+                    .context("missing speleothem block ID")?,
+            )
+        };
+        let base_value = field("base_block")?;
+        let pointed_value = field("pointed_block")?;
+        let raw = field("replaceable_blocks")?;
+        let replaceable = if let Some(tag) = raw.as_str().and_then(|s| s.strip_prefix('#')) {
+            Replaceable::Tag(ResourceId::parse(tag)?)
+        } else {
+            let names = if let Some(name) = raw.as_str() {
+                vec![name]
+            } else {
+                raw.as_array()
+                    .context("invalid replaceable blocks")?
+                    .iter()
+                    .map(|v| v.as_str().context("invalid replaceable block"))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            Replaceable::Blocks(
+                names
+                    .into_iter()
+                    .map(ResourceId::parse)
+                    .collect::<Result<_>>()?,
+            )
+        };
+        Ok(Self {
+            base: resolve(base_value)?,
+            pointed: resolve(pointed_value)?,
+            base_id: state_id(base_value)?,
+            pointed_id: state_id(pointed_value)?,
+            replaceable,
+        })
+    }
+    pub fn base(&self) -> &S {
+        &self.base
+    }
+    pub fn pointed(&self) -> &S {
+        &self.pointed
+    }
+    pub fn base_id(&self) -> &ResourceId {
+        &self.base_id
+    }
+    pub fn pointed_id(&self) -> &ResourceId {
+        &self.pointed_id
+    }
+    pub fn replaceable_tag(&self) -> Option<&ResourceId> {
+        if let Replaceable::Tag(tag) = &self.replaceable {
+            Some(tag)
+        } else {
+            None
+        }
+    }
+    pub fn replaceable_blocks(&self) -> Option<&[ResourceId]> {
+        if let Replaceable::Blocks(ids) = &self.replaceable {
+            Some(ids)
+        } else {
+            None
+        }
+    }
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        self.replaceable_tag().cloned().into_iter().collect()
+    }
+    pub fn required_blocks(&self) -> BTreeSet<ResourceId> {
+        let mut blocks = BTreeSet::from([
+            self.base_id.clone(),
+            self.pointed_id.clone(),
+            ResourceId::parse("minecraft:water").unwrap(),
+        ]);
+        if let Some(ids) = self.replaceable_blocks() {
+            blocks.extend(ids.iter().cloned());
+        }
+        blocks
+    }
+}
+
+/// Decoded cluster with all providers bound to one data-pack snapshot.
+pub struct SpeleothemClusterFeature<S> {
+    pub config: ClusterConfig,
+    pub blocks: SpeleothemBlocks<S>,
     height: IntProvider,
     radius: IntProvider,
     layer: IntProvider,
@@ -309,40 +400,7 @@ impl<S> SpeleothemClusterFeature<S> {
                 .get(name)
                 .with_context(|| format!("missing speleothem {name}"))
         };
-        let state_id = |state: &Value| -> Result<ResourceId> {
-            ResourceId::parse(
-                state
-                    .as_str()
-                    .or_else(|| state.get("id").and_then(Value::as_str))
-                    .context("missing speleothem block ID")?,
-            )
-        };
-        let base_value = field("base_block")?;
-        let pointed_value = field("pointed_block")?;
-        let base_id = state_id(base_value)?;
-        let pointed_id = state_id(pointed_value)?;
-        let base = resolve(base_value)?;
-        let pointed = resolve(pointed_value)?;
-        let raw = field("replaceable_blocks")?;
-        let replaceable = if let Some(tag) = raw.as_str().and_then(|s| s.strip_prefix('#')) {
-            Replaceable::Tag(ResourceId::parse(tag)?)
-        } else {
-            let names = if let Some(name) = raw.as_str() {
-                vec![name]
-            } else {
-                raw.as_array()
-                    .context("invalid replaceable blocks")?
-                    .iter()
-                    .map(|v| v.as_str().context("invalid replaceable block"))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            Replaceable::Blocks(
-                names
-                    .into_iter()
-                    .map(ResourceId::parse)
-                    .collect::<Result<_>>()?,
-            )
-        };
+        let blocks = SpeleothemBlocks::decode(value, resolve)?;
         let integer = |name: &str, lo: i32, hi: i32| -> Result<i32> {
             let n = i32::try_from(
                 field(name)?
@@ -387,11 +445,7 @@ impl<S> SpeleothemClusterFeature<S> {
                 )?,
                 center_distance: integer("max_distance_from_center_affecting_height_bias", 1, 64)?,
             },
-            base,
-            pointed,
-            base_id,
-            pointed_id,
-            replaceable,
+            blocks,
             height: provider("height", 1, 128)?,
             radius: provider("radius", 1, 128)?,
             layer: provider("speleothem_block_layer_thickness", 0, 128)?,
@@ -399,51 +453,138 @@ impl<S> SpeleothemClusterFeature<S> {
             wetness: float_provider("wetness")?,
         })
     }
-    pub fn base(&self) -> &S {
-        &self.base
-    }
-    pub fn pointed(&self) -> &S {
-        &self.pointed
-    }
-    pub fn base_id(&self) -> &ResourceId {
-        &self.base_id
-    }
-    pub fn pointed_id(&self) -> &ResourceId {
-        &self.pointed_id
-    }
-    pub fn replaceable_tag(&self) -> Option<&ResourceId> {
-        if let Replaceable::Tag(tag) = &self.replaceable {
-            Some(tag)
-        } else {
-            None
-        }
-    }
-    pub fn replaceable_blocks(&self) -> Option<&[ResourceId]> {
-        if let Replaceable::Blocks(ids) = &self.replaceable {
-            Some(ids)
-        } else {
-            None
-        }
-    }
     pub fn required_tags(&self) -> BTreeSet<ResourceId> {
-        let mut tags =
-            BTreeSet::from([ResourceId::parse("minecraft:base_stone_overworld").unwrap()]);
-        if let Some(tag) = self.replaceable_tag() {
-            tags.insert(tag.clone());
-        }
+        let mut tags = self.blocks.required_tags();
+        tags.insert(ResourceId::parse("minecraft:base_stone_overworld").unwrap());
         tags
     }
-    pub fn required_blocks(&self) -> BTreeSet<ResourceId> {
-        let mut blocks = BTreeSet::from([
-            self.base_id.clone(),
-            self.pointed_id.clone(),
-            ResourceId::parse("minecraft:water").unwrap(),
-        ]);
-        if let Some(ids) = self.replaceable_blocks() {
-            blocks.extend(ids.iter().cloned());
-        }
-        blocks
+}
+
+impl<S> std::ops::Deref for SpeleothemClusterFeature<S> {
+    type Target = SpeleothemBlocks<S>;
+    fn deref(&self) -> &Self::Target {
+        &self.blocks
     }
+}
+
+/// Queries additionally needed by the individual pointed feature.
+pub trait SingleWorld: SpeleothemWorld {
+    fn is_empty_or_water(&mut self, state: &Self::State) -> Result<bool>;
+}
+
+pub struct SpeleothemFeature<S> {
+    pub blocks: SpeleothemBlocks<S>,
+    taller: f32,
+    directional: f32,
+    radius2: f32,
+    radius3: f32,
+}
+
+impl<S> SpeleothemFeature<S> {
+    pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let id = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing speleothem feature type")?,
+        )?;
+        ensure!(
+            id.namespace == "minecraft" && id.path == "speleothem",
+            "wrong speleothem feature type"
+        );
+        let chance = |name: &str, default: f32| -> Result<f32> {
+            let number = match value.get(name) {
+                Some(v) => v.as_f64().with_context(|| format!("invalid {name}"))? as f32,
+                None => default,
+            };
+            ensure!(
+                number.is_finite() && (0.0..=1.0).contains(&number),
+                "invalid {name}"
+            );
+            Ok(number)
+        };
+        Ok(Self {
+            blocks: SpeleothemBlocks::decode(value, resolve)?,
+            taller: chance("chance_of_taller_generation", 0.2)?,
+            directional: chance("chance_of_directional_spread", 0.7)?,
+            radius2: chance("chance_of_spread_radius2", 0.5)?,
+            radius3: chance("chance_of_spread_radius3", 0.5)?,
+        })
+    }
+
+    pub fn place(
+        &self,
+        world: &mut impl SingleWorld,
+        random: &mut DecorationRandom,
+        origin: [i32; 3],
+    ) -> Result<bool> {
+        let above = world.block(offset(origin, [0, 1, 0]))?;
+        let above = world.is_base(&above)?;
+        let below = world.block(offset(origin, [0, -1, 0]))?;
+        let below = world.is_base(&below)?;
+        let direction = match (above, below) {
+            (false, false) => return Ok(false),
+            (true, true) => {
+                if random.next_bool() {
+                    VerticalDirection::Down
+                } else {
+                    VerticalDirection::Up
+                }
+            }
+            (true, false) => VerticalDirection::Down,
+            (false, true) => VerticalDirection::Up,
+        };
+        let base = offset(origin, [0, -direction.step(), 0]);
+        place_base_if_possible(world, base)?;
+        for horizontal in [[0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]] {
+            if random.next_float() > self.directional {
+                continue;
+            }
+            let first = offset(base, horizontal);
+            place_base_if_possible(world, first)?;
+            if random.next_float() > self.radius2 {
+                continue;
+            }
+            let second = offset(first, random_direction(random));
+            place_base_if_possible(world, second)?;
+            if random.next_float() > self.radius3 {
+                continue;
+            }
+            let third = offset(second, random_direction(random));
+            place_base_if_possible(world, third)?;
+        }
+        let height = if random.next_float() < self.taller {
+            let state = world.block(offset(origin, [0, direction.step(), 0]))?;
+            if world.is_empty_or_water(&state)? {
+                2
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        grow(world, origin, direction, height, false)?;
+        Ok(true)
+    }
+}
+
+fn offset(pos: [i32; 3], direction: [i32; 3]) -> [i32; 3] {
+    [
+        pos[0].wrapping_add(direction[0]),
+        pos[1].wrapping_add(direction[1]),
+        pos[2].wrapping_add(direction[2]),
+    ]
+}
+
+fn random_direction(random: &mut DecorationRandom) -> [i32; 3] {
+    [
+        [0, -1, 0],
+        [0, 1, 0],
+        [0, 0, -1],
+        [0, 0, 1],
+        [-1, 0, 0],
+        [1, 0, 0],
+    ][random.next_int_bound(6).expect("six directions") as usize]
 }
 
 impl<S> ClusterNumbers for SpeleothemClusterFeature<S> {

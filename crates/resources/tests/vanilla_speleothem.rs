@@ -35,22 +35,28 @@ struct ClusterDraft {
 impl SpeleothemWorld for ClusterDraft {
     type State = ClusterState;
     fn block(&mut self, pos: [i32; 3]) -> Result<ClusterState> {
-        Ok(*self
-            .blocks
-            .get(&pos)
-            .unwrap_or(&if self.profile == 1 && pos[1] == 10 {
+        Ok(*self.blocks.get(&pos).unwrap_or(&if self.profile >= 4 {
+            let profile = self.profile - 4;
+            if (pos[1] > 10 && profile & 1 != 0) || (pos[1] < 10 && profile & 2 != 0) {
                 ClusterState::Stone
-            } else if pos[1] <= 5 {
-                ClusterState::Stone
-            } else if self.profile != 2 && pos[1] >= 14 {
-                if self.profile == 3 {
-                    ClusterState::Lava
-                } else {
-                    ClusterState::Stone
-                }
+            } else if pos[1] == 10 && (pos[0] + pos[2]).rem_euclid(3) == 0 {
+                ClusterState::Water
             } else {
                 ClusterState::Air
-            }))
+            }
+        } else if self.profile == 1 && pos[1] == 10 {
+            ClusterState::Stone
+        } else if pos[1] <= 5 {
+            ClusterState::Stone
+        } else if self.profile != 2 && pos[1] >= 14 {
+            if self.profile == 3 {
+                ClusterState::Lava
+            } else {
+                ClusterState::Stone
+            }
+        } else {
+            ClusterState::Air
+        }))
     }
     fn is_base(&mut self, state: &ClusterState) -> Result<bool> {
         Ok(matches!(state, ClusterState::Stone | ClusterState::Base))
@@ -95,6 +101,11 @@ impl SpeleothemWorld for ClusterDraft {
             pos[0], pos[1], pos[2]
         ));
         Ok(())
+    }
+}
+impl speleothem::SingleWorld for ClusterDraft {
+    fn is_empty_or_water(&mut self, state: &ClusterState) -> Result<bool> {
+        Ok(matches!(state, ClusterState::Air | ClusterState::Water))
     }
 }
 impl speleothem::ClusterWorld for ClusterDraft {
@@ -206,6 +217,25 @@ fn speleothem_columns_match_java() -> Result<()> {
             .context("replaceable tag missing")?,
         &ResourceId::parse("minecraft:sulfur_spike_replaceable_blocks")?
     );
+    let source = resources
+        .read_data("data/minecraft/worldgen/feature/sulfur_spike.json")?
+        .context("single sulfur spike feature missing")?;
+    let actual: Value = serde_json::from_slice(&source)?;
+    for entry in actual["features"]
+        .as_array()
+        .context("spike alternatives missing")?
+    {
+        let decoded =
+            speleothem::SpeleothemFeature::decode(&entry["feature"], &mut |v| Ok(v.clone()))?;
+        assert_eq!(
+            decoded.blocks.base_id(),
+            &ResourceId::parse("minecraft:sulfur")?
+        );
+        assert_eq!(
+            decoded.blocks.pointed_id(),
+            &ResourceId::parse("minecraft:sulfur_spike")?
+        );
+    }
     let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
     for library in manifest["libraries"]
         .as_array()
@@ -247,6 +277,7 @@ fn speleothem_columns_match_java() -> Result<()> {
     let mut chances = 0;
     let mut heights = 0;
     let mut clusters = 0;
+    let mut individuals = 0;
     let mut effects = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
@@ -388,6 +419,53 @@ fn speleothem_columns_match_java() -> Result<()> {
                 assert_eq!(random.next_long(), next.parse::<i64>()?, "{line}");
                 heights += 1;
             }
+            ["I", mode, profile, seed, result, next, events] => {
+                let chances = match *mode {
+                    "0" => None,
+                    "1" => Some([0.0, 0.0, 0.0, 0.0]),
+                    "2" => Some([1.0, 1.0, 1.0, 1.0]),
+                    "3" => Some([0.8, 0.3, 0.9, 0.2]),
+                    _ => anyhow::bail!("bad individual mode"),
+                };
+                let mut value = serde_json::json!({"type":"minecraft:speleothem", "base_block":"minecraft:sulfur", "pointed_block":"minecraft:sulfur_spike", "replaceable_blocks":["minecraft:stone"]});
+                if let Some(chances) = chances {
+                    for (name, value_slot) in [
+                        "chance_of_taller_generation",
+                        "chance_of_directional_spread",
+                        "chance_of_spread_radius2",
+                        "chance_of_spread_radius3",
+                    ]
+                    .into_iter()
+                    .zip(chances)
+                    {
+                        value[name] = serde_json::json!(value_slot);
+                    }
+                }
+                let feature =
+                    speleothem::SpeleothemFeature::decode(&value, &mut |v| Ok(v.clone()))?;
+                let mut draft = ClusterDraft {
+                    profile: profile.parse::<i32>()? + 4,
+                    blocks: BTreeMap::new(),
+                    events: vec![],
+                };
+                let mut random = native_core::random::DecorationRandom::new(seed.parse()?);
+                assert_eq!(
+                    feature.place(&mut draft, &mut random, [0, 10, 0])?,
+                    result.parse::<bool>()?,
+                    "{line}"
+                );
+                assert_eq!(random.next_long(), next.parse::<i64>()?, "{line}");
+                assert_eq!(
+                    if draft.events.is_empty() {
+                        "-".into()
+                    } else {
+                        draft.events.join(",")
+                    },
+                    *events,
+                    "{line}"
+                );
+                individuals += 1;
+            }
             ["G", variable, wet, profile, seed, result, next, events] => {
                 let mut draft = ClusterDraft {
                     profile: profile.parse()?,
@@ -465,6 +543,7 @@ fn speleothem_columns_match_java() -> Result<()> {
     assert_eq!(chances, 3 * 3 * 5 * 5);
     assert_eq!(heights, 5 * 5 * 3 * 3 * 16);
     assert_eq!(clusters, 5 * 2 * 4 * 16);
+    assert_eq!(individuals, 4 * 4 * 32);
     assert_eq!(effects, 1 + 20 + 16);
     Ok(())
 }

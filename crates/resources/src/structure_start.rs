@@ -68,9 +68,10 @@ pub fn center_generation_point(
     Ok(Some([x, y, z]))
 }
 
-/// Identify supported prechecks for template-based structures. A positive
-/// candidate still needs its structure implementation before it can generate.
-pub fn template_structure_center_heightmap(value: &Value) -> Result<Option<Heightmap>> {
+/// Identify necessary center checks for structures using onTopOfChunkCenter.
+/// A positive candidate still needs its structure implementation and any
+/// additional biome checks before it can generate.
+pub fn structure_center_precheck_heightmap(value: &Value) -> Result<Option<Heightmap>> {
     let id = ResourceId::parse(
         value
             .get("type")
@@ -94,6 +95,7 @@ pub fn template_structure_center_heightmap(value: &Value) -> Result<Option<Heigh
             crate::ocean_ruin::Settings::decode(value)?;
             Heightmap::OceanFloor
         }
+        ("minecraft", "ocean_monument") => Heightmap::OceanFloor,
         _ => return Ok(None),
     };
     decode_terrain_adjustment(value)?;
@@ -323,27 +325,31 @@ mod tests {
         }
     }
     #[test]
-    fn template_prechecks_validate_type_specific_and_common_settings() {
+    fn center_prechecks_validate_type_specific_and_common_settings() {
         assert_eq!(
-            template_structure_center_heightmap(&json!({"type":"shipwreck","is_beached":false}))
+            structure_center_precheck_heightmap(&json!({"type":"shipwreck","is_beached":false}))
                 .unwrap(),
             Some(Heightmap::OceanFloor)
         );
         assert_eq!(
-            template_structure_center_heightmap(&json!({"type":"minecraft:igloo"})).unwrap(),
+            structure_center_precheck_heightmap(&json!({"type":"minecraft:igloo"})).unwrap(),
             Some(Heightmap::WorldSurface)
         );
-        assert!(template_structure_center_heightmap(&json!({"type":"shipwreck"})).is_err());
+        assert!(structure_center_precheck_heightmap(&json!({"type":"shipwreck"})).is_err());
         assert!(
-            template_structure_center_heightmap(
+            structure_center_precheck_heightmap(
                 &json!({"type":"shipwreck","is_beached":false,"terrain_adaptation":"invalid"})
             )
             .is_err()
         );
-        assert_eq!(template_structure_center_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9})).unwrap(), Some(Heightmap::OceanFloor));
-        assert!(template_structure_center_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":1.1,"cluster_probability":0.9})).is_err());
+        assert_eq!(structure_center_precheck_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9})).unwrap(), Some(Heightmap::OceanFloor));
+        assert!(structure_center_precheck_heightmap(&json!({"type":"ocean_ruin","biome_temp":"warm","large_probability":1.1,"cluster_probability":0.9})).is_err());
         assert_eq!(
-            template_structure_center_heightmap(&json!({"type":"minecraft:village"})).unwrap(),
+            structure_center_precheck_heightmap(&json!({"type":"ocean_monument"})).unwrap(),
+            Some(Heightmap::OceanFloor)
+        );
+        assert_eq!(
+            structure_center_precheck_heightmap(&json!({"type":"minecraft:village"})).unwrap(),
             None
         );
     }

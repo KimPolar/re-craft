@@ -3093,7 +3093,7 @@ impl TerrainGenerator {
                 let definition: Value = serde_json::from_slice(&bytes)
                     .with_context(|| format!("invalid structure {path}"))?;
                 let center_heightmap =
-                    native_resources::structure_start::template_structure_center_heightmap(
+                    native_resources::structure_start::structure_center_precheck_heightmap(
                         &definition,
                     )
                     .with_context(|| format!("in structure {path}"))?;
@@ -8959,6 +8959,7 @@ mod tests {
             json!({"type":"minecraft:shipwreck","biomes":["minecraft:plains"],"is_beached":true}),
             json!({"type":"minecraft:igloo","biomes":["minecraft:plains"]}),
             json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"biome_temp":"warm","large_probability":0.3,"cluster_probability":0.9}),
+            json!({"type":"minecraft:ocean_monument","biomes":["minecraft:plains"]}),
         ] {
             data.0
                 .insert(path.into(), serde_json::to_vec(&definition).unwrap());

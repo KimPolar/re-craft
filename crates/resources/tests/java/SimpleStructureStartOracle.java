@@ -1,10 +1,14 @@
 import com.mojang.serialization.MapCodec;
+import com.mojang.serialization.Lifecycle;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.server.level.WorldGenRegion;
 import net.minecraft.core.*;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.tags.BiomeTags;
 import net.minecraft.world.level.*;
 import net.minecraft.world.level.biome.*;
 import net.minecraft.world.level.chunk.*;
@@ -55,6 +59,22 @@ public class SimpleStructureStartOracle {
       Structure structure=beached==3?new OceanRuinStructure(settings,OceanRuinStructure.Type.WARM,0.3f,0.9f):beached==2?new IglooStructure(settings):new ShipwreckStructure(settings,beached!=0);
       var stub=structure.findValidGenerationPoint(ctx);
       String prefix="W "+beached+" "+x+" "+z+" "+mode+" ";
+      if(stub.isEmpty()){out.println(prefix+"X");continue;}
+      var pos=stub.get().position();out.printf("%sP %d %d %d%n",prefix,pos.getX(),pos.getY(),pos.getZ());
+    }
+    var registry=new MappedRegistry<Biome>(Registries.BIOME,Lifecycle.stable());
+    var ocean=Registry.registerForHolder(registry,Identifier.parse("example:ocean"),(Biome)unsafe.allocateInstance(Biome.class));
+    var land=Registry.registerForHolder(registry,Identifier.parse("example:land"),(Biome)unsafe.allocateInstance(Biome.class));
+    registry.bindTags(Map.of(BiomeTags.REQUIRED_OCEAN_MONUMENT_SURROUNDING,List.of(ocean)));
+    registry.freeze();
+    var oceanSource=new FixedBiomeSource(ocean);
+    var monument=new OceanMonumentStructure(new Structure.StructureSettings(HolderSet.direct(ocean)));
+    for(int index=0;index<31;index++)for(int mode=0;mode<4;mode++){
+      int x=index*17-251,z=193-index*13,base=mode==1?60:75;
+      var generator=new Generator(oceanSource,base);var random=new WorldgenRandom(new LegacyRandomSource(0));random.setLargeFeatureSeed(42,x,z);
+      final int m=mode;BiomeResolver resolver=(qx,qy,qz)->m==3?land:ocean;
+      var ctx=new Structure.GenerationContext(null,generator,oceanSource,null,resolver,null,null,random,42,new ChunkPos(x,z),LevelHeightAccessor.create(-64,384),h->m!=2&&h==ocean);
+      var stub=monument.findValidGenerationPoint(ctx);String prefix="M "+x+" "+z+" "+mode+" ";
       if(stub.isEmpty()){out.println(prefix+"X");continue;}
       var pos=stub.get().position();out.printf("%sP %d %d %d%n",prefix,pos.getX(),pos.getY(),pos.getZ());
     }

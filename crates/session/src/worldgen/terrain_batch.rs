@@ -468,7 +468,7 @@ struct DecorationConfig {
     structures: Option<StructureDecorationSchedule>,
     feature_entity_evidence: BTreeMap<FeatureKey, bool>,
     placed_features: BTreeSet<ResourceId>,
-    block_registry: BTreeSet<String>,
+    block_registry: Arc<BTreeSet<String>>,
     heightmap_tags: native_resources::heightmap_tags::HeightmapTags,
     has_skylight: bool,
     dimension_type: Option<String>,
@@ -481,6 +481,61 @@ struct DecorationConfig {
     bubble_tags: Option<Arc<native_resources::fluid_tags::BubbleColumnTags>>,
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
+    session_blocks: GeneratedSessionBlockTags,
+}
+
+/// Optional session data is resolved once from the same frozen stack used by
+/// generation, then shared by every temporary or playable generated session.
+struct GeneratedSessionBlockTags {
+    climbable: Option<Arc<BTreeSet<String>>>,
+    fire: Option<Arc<BTreeSet<String>>>,
+    bounce_suppression: Option<Arc<BTreeSet<String>>>,
+    farmland_maintainers: Option<Arc<BTreeSet<String>>>,
+    farmland_water: Option<Arc<BTreeSet<String>>>,
+    snow_support: Option<Arc<native_resources::respawn_tags::SnowSupportTags>>,
+    snowy: Option<Arc<BTreeSet<String>>>,
+    mining: Option<Arc<native_resources::mining_tags::MiningTags>>,
+    vibration_events: Option<Arc<native_resources::game_event_tags::GameEventTags>>,
+    vibration_blocks: Option<Arc<native_resources::game_event_tags::VibrationBlockTags>>,
+}
+
+impl GeneratedSessionBlockTags {
+    fn load(provider: &mut impl ResourceProvider, registry: &BTreeSet<String>) -> Self {
+        use native_resources::{fluid_tags, game_event_tags, mining_tags, respawn_tags};
+        Self {
+            climbable: respawn_tags::load_climbable_tag(provider, registry)
+                .ok()
+                .map(Arc::new),
+            fire: respawn_tags::load_fire_tag(provider, registry)
+                .ok()
+                .map(Arc::new),
+            bounce_suppression: respawn_tags::load_bounce_suppression_tag(provider, registry)
+                .ok()
+                .map(Arc::new),
+            farmland_maintainers: respawn_tags::load_farmland_maintainers(provider, registry)
+                .ok()
+                .map(Arc::new),
+            farmland_water: fluid_tags::load_water(provider).ok().map(Arc::new),
+            snow_support: respawn_tags::SnowSupportTags::load(provider, registry)
+                .ok()
+                .map(Arc::new),
+            snowy: respawn_tags::load_snow_tag(provider, registry)
+                .ok()
+                .map(Arc::new),
+            mining: mining_tags::MiningTags::load(provider, registry)
+                .ok()
+                .map(Arc::new),
+            vibration_events: game_event_tags::GameEventTags::load(
+                provider,
+                &crate::vibration::vanilla_game_events(),
+            )
+            .ok()
+            .map(Arc::new),
+            vibration_blocks: game_event_tags::VibrationBlockTags::load(provider, registry)
+                .ok()
+                .map(Arc::new),
+        }
+    }
 }
 
 /// Examine every branch without consuming generation randomness or the block
@@ -1183,6 +1238,56 @@ impl FreshTerrainBatch {
         &self,
     ) -> Option<Arc<native_resources::ore_feature::OreBlockTags>> {
         self.decoration.as_ref()?.fence_tags.clone()
+    }
+
+    /// Apply only data that was actually resolved from this batch's frozen
+    /// resource stack. Missing tags remain unavailable rather than guessed.
+    pub fn apply_session_block_support(&self, session: &mut crate::loaded::LoadedSession) -> bool {
+        let Some(config) = &self.decoration else {
+            return false;
+        };
+        let tags = &config.session_blocks;
+        session.set_vanilla_block_ids(Arc::clone(&config.block_registry));
+        if let Some(value) = &tags.climbable {
+            session.set_movement_climbable_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.fire {
+            session.set_falling_fire_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.bounce_suppression {
+            session.set_bounce_suppression_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.farmland_maintainers {
+            session.set_farmland_maintainers(Arc::clone(value));
+        }
+        if let Some(value) = &tags.farmland_water {
+            session.set_farmland_water_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.snow_support {
+            session.set_snow_support_tags(Arc::clone(value));
+        }
+        if let Some(value) = &tags.snowy {
+            session.set_snowy_tag(Arc::clone(value));
+        }
+        if let Some(value) = &tags.mining {
+            session.set_mining_tags(Arc::clone(value));
+        }
+        if let (Some(events), Some(blocks)) = (&tags.vibration_events, &tags.vibration_blocks) {
+            session.set_vibration_tags(Arc::clone(events), Arc::clone(blocks));
+        }
+        if let Some(value) = &config.leaf_tags {
+            session.set_leaf_support_tags(Arc::clone(value));
+        }
+        if let Some(value) = &config.fence_tags {
+            session.set_fence_connection_tags(Arc::clone(value));
+        }
+        if let Some(value) = &config.bubble_tags {
+            session.set_bubble_column_tags(Arc::clone(value));
+        }
+        if let Some(value) = &config.washed_blocks {
+            session.set_washed_away_blocks(Arc::clone(value));
+        }
+        true
     }
 
     pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
@@ -1955,12 +2060,13 @@ impl FreshTerrainBatch {
         let lava_fluids = native_resources::fluid_tags::load_lava(provider)
             .ok()
             .map(Arc::new);
+        let session_blocks = GeneratedSessionBlockTags::load(provider, &block_registry);
         self.decoration = Some(DecorationConfig {
             schedule,
             structures,
             feature_entity_evidence,
             placed_features: placed_features.clone(),
-            block_registry,
+            block_registry: Arc::new(block_registry),
             heightmap_tags,
             mushroom_tags,
             leaf_tags,
@@ -1969,6 +2075,7 @@ impl FreshTerrainBatch {
             bubble_tags,
             washed_blocks,
             lava_fluids,
+            session_blocks,
             has_skylight: lighting.has_skylight,
             ambient_light: lighting.ambient_light,
             dimension_type: lighting
@@ -5003,6 +5110,250 @@ impl FreshTerrainBatch {
             _ => bail!("invalid light registration history"),
         };
         Ok((self.schedule, self.biomes, self.terrain, light))
+    }
+}
+
+#[cfg(test)]
+mod session_block_support_tests {
+    use super::*;
+    use crate::{
+        GameSession, PlayerCommand, PlayerPose, PlayerState,
+        inventory::{ItemStack, PlayerInventory, PlayerSlot},
+        loaded::{BuildBounds, LoadedSession},
+    };
+    use native_persistence::nbt::Tag;
+    use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
+    use serde_json::json;
+    use std::time::Duration;
+
+    struct Data {
+        custom: bool,
+    }
+    impl ResourceProvider for Data {
+        fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            if path == "data/minecraft/worldgen/biome/plains.json" {
+                return Ok(Some(br#"{"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[]}"#.to_vec()));
+            }
+            if path.starts_with("data/minecraft/tags/block/") {
+                let values =
+                    if path.ends_with("/fences.json") || path.ends_with("/wooden_fences.json") {
+                        if self.custom {
+                            vec!["minecraft:oak_fence", "minecraft:air"]
+                        } else {
+                            vec!["minecraft:oak_fence"]
+                        }
+                    } else if path.ends_with("/mineable/pickaxe.json")
+                        || path.ends_with("/climbable.json")
+                        || path.ends_with("/blocks_motion_in_heightmap.json")
+                        || path.ends_with("/blocks_motion_in_heightmap_no_leaves.json")
+                    {
+                        vec!["minecraft:stone"]
+                    } else {
+                        vec![]
+                    };
+                return Ok(Some(serde_json::to_vec(&json!({"values": values}))?));
+            }
+            if path == "data/minecraft/tags/fluid/water.json" {
+                return Ok(Some(
+                    br#"{"values":["minecraft:water","minecraft:flowing_water"]}"#.to_vec(),
+                ));
+            }
+            if path.starts_with("data/minecraft/tags/") {
+                return Ok(Some(br#"{"values":[]}"#.to_vec()));
+            }
+            Ok(None)
+        }
+        fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+            if folder == "worldgen/biome" {
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    fn fresh_player_session() -> LoadedSession {
+        let mut world = World::new("minecraft:overworld");
+        let block = |name: &str| BlockState {
+            name: name.into(),
+            properties: BTreeMap::new(),
+        };
+        let air = world.intern_state(block("minecraft:air"));
+        let stone = world.intern_state(block("minecraft:stone"));
+        let mut blocks = Box::new([air; BLOCK_COUNT]);
+        for z in 0..16 {
+            for x in 0..16 {
+                blocks[x + z * 16] = stone;
+            }
+        }
+        blocks[8 + 7 * 16 + 256] = stone;
+        blocks[8 + 6 * 16 + 2 * 256] = stone;
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.chunks.insert(
+            pos,
+            Arc::new(Chunk {
+                position: pos,
+                status: Some("minecraft:full".into()),
+                block_light_correct: false,
+                sections: BTreeMap::from([(
+                    0,
+                    Arc::new(Section {
+                        blocks: Some(blocks),
+                        biomes: None,
+                        block_light: None,
+                        sky_light: None,
+                    }),
+                )]),
+            }),
+        );
+        LoadedSession::new(
+            world,
+            glam::IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            PlayerState {
+                position: glam::Vec3::new(8.5, 1.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: PlayerPose::Standing,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_sessions_share_active_tags_and_allow_block_placement() -> Result<()> {
+        let mut data = Data { custom: true };
+        let registry: BTreeSet<String> = [
+            "minecraft:air",
+            "minecraft:stone",
+            "minecraft:water",
+            "minecraft:oak_fence",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let tags = CarverBlockTags::load(&mut data, &registry)?;
+        let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
+            "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
+            "default_block":"minecraft:stone","default_fluid":"minecraft:water", "disable_mob_generation":true,
+            "spawn_target":[], "material_rule":{"type":"block","result_state":"minecraft:stone"},
+            "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
+        }});
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &definition, 42, 0, 16)?;
+        let mut batch =
+            FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")?;
+        let mut session = fresh_player_session();
+        assert!(!batch.apply_session_block_support(&mut session));
+        let lighting = GeneratedDimensionLighting {
+            dimension: ResourceId::parse("minecraft:overworld")?,
+            dimension_type: None,
+            inline_dimension_type: None,
+            min_y: 0,
+            height: 16,
+            has_skylight: true,
+            ambient_light: Some(0.0),
+        };
+        batch.enable_decoration(&mut data, &BTreeSet::new(), registry, &lighting)?;
+        let config = batch.decoration.as_ref().unwrap();
+        assert!(
+            config
+                .session_blocks
+                .climbable
+                .as_ref()
+                .unwrap()
+                .contains("minecraft:stone")
+        );
+        assert_ne!(
+            config
+                .session_blocks
+                .mining
+                .as_ref()
+                .unwrap()
+                .for_block("minecraft:stone")
+                .unwrap()
+                & native_resources::mining_tags::PICKAXE,
+            0
+        );
+        assert!(
+            config
+                .session_blocks
+                .farmland_water
+                .as_ref()
+                .unwrap()
+                .contains("minecraft:water")
+        );
+        data.custom = false;
+        assert!(!data.custom);
+        let shared_registry = Arc::clone(&batch.decoration.as_ref().unwrap().block_registry);
+        let owners_before = Arc::strong_count(&shared_registry);
+        assert!(batch.apply_session_block_support(&mut session));
+        assert_eq!(Arc::strong_count(&shared_registry), owners_before + 1);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:oak_fence".into(), 2, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(Duration::from_millis(50));
+        let snapshot = session.snapshot();
+        let fence = snapshot.world.loaded().unwrap().block(8, 2, 7).unwrap();
+        assert_eq!(fence.name, "minecraft:oak_fence");
+        for side in ["north", "east", "south", "west"] {
+            assert_eq!(fence.properties[side], "true");
+        }
+        assert_eq!(
+            snapshot
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn generated_session_support_loads_installed_game_tags() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_block_ids()?;
+        let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);
+        ensure!(tags.climbable.is_some(), "climbable tag unavailable");
+        ensure!(tags.fire.is_some(), "fire tag unavailable");
+        ensure!(
+            tags.bounce_suppression.is_some(),
+            "bounce suppression tag unavailable"
+        );
+        ensure!(
+            tags.farmland_maintainers.is_some(),
+            "farmland maintainer tag unavailable"
+        );
+        ensure!(
+            tags.farmland_water.is_some(),
+            "farmland water tag unavailable"
+        );
+        ensure!(tags.snow_support.is_some(), "snow support tags unavailable");
+        ensure!(tags.snowy.is_some(), "snow tag unavailable");
+        ensure!(tags.mining.is_some(), "mining tags unavailable");
+        ensure!(
+            tags.vibration_events.is_some() && tags.vibration_blocks.is_some(),
+            "vibration tags unavailable"
+        );
+        Ok(())
     }
 }
 

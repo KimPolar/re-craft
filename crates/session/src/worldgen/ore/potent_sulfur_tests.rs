@@ -9,6 +9,21 @@ fn sulfur(value: &str) -> BlockState {
 }
 
 #[test]
+fn potent_sulfur_predicates_validate_all_states() -> Result<()> {
+    let (mut terrain, tags, motion, _) = super::tests::fixture();
+    let writable = terrain.snapshot().chunks.keys().copied().collect();
+    let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+    for value in ["dry", "wet", "dormant", "erupting", "continuous"] {
+        let state = sulfur(value);
+        assert!(DiskWorld::is_solid(&mut region, &state)?);
+        assert!(!DiskWorld::is_liquid(&mut region, &state)?);
+    }
+    assert!(DiskWorld::is_solid(&mut region, &sulfur("invalid")).is_err());
+    assert!(DiskWorld::is_liquid(&mut region, &sulfur("invalid")).is_err());
+    Ok(())
+}
+
+#[test]
 fn generated_potent_sulfur_keeps_pending_entities_and_rolls_back() -> Result<()> {
     let (mut terrain, tags, _, _) = super::tests::fixture();
     let names = [

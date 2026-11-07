@@ -6626,11 +6626,11 @@ impl DiskWorld for DecorationRegion<'_> {
             ensure!(state.properties.is_empty(), "invalid cinnabar state");
             return Ok(true);
         }
-        // Both sulfur and every sulfur-spike state report isSolid in 26.3,
-        // including waterlogged spikes. Validate the complete state first.
+        // Sulfur blocks and spikes report isSolid in 26.3, including
+        // waterlogged spikes. Validate the complete state first.
         if matches!(
             state.name.as_str(),
-            "minecraft:sulfur" | "minecraft:sulfur_spike"
+            "minecraft:sulfur" | "minecraft:sulfur_spike" | "minecraft:potent_sulfur"
         ) {
             ensure!(
                 native_world::block_light::same_light_behavior(state, state).is_some(),
@@ -6668,7 +6668,10 @@ impl DiskWorld for DecorationRegion<'_> {
         }
         if matches!(
             state.name.as_str(),
-            "minecraft:cinnabar" | "minecraft:sulfur" | "minecraft:sulfur_spike"
+            "minecraft:cinnabar"
+                | "minecraft:sulfur"
+                | "minecraft:sulfur_spike"
+                | "minecraft:potent_sulfur"
         ) {
             DiskWorld::is_solid(self, state)?;
             return Ok(false);

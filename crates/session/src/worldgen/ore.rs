@@ -280,6 +280,7 @@ pub struct MixedJigsawPlacementContext<'a, R> {
     pub starts: Arc<
         BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
     >,
+    shipwreck_tags: Option<Arc<ruined_portal::PortalUpdateTags>>,
 }
 
 impl<'a, R> MixedJigsawPlacementContext<'a, R> {
@@ -313,10 +314,20 @@ impl<'a, R> MixedJigsawPlacementContext<'a, R> {
                 );
             }
         }
+        let has_shipwreck = plan.iter().any(|entry| {
+            entry
+                .starts
+                .iter()
+                .any(|start| matches!(start, PlannedStructureStart::Shipwreck(_)))
+        });
+        let shipwreck_tags = has_shipwreck
+            .then(|| ruined_portal::PortalUpdateTags::load(provider, blocks).map(Arc::new))
+            .transpose()?;
         Ok(Self {
             other,
             registry,
             starts: Arc::new(starts),
+            shipwreck_tags,
         })
     }
 }
@@ -328,6 +339,7 @@ pub(super) struct PreparedJigsawResources<'a> {
         BTreeMap<super::structure_batch::TerrainStartKey, super::jigsaw::PreparedJigsawPlacement>,
     >,
     portals: Arc<BTreeMap<super::structure_batch::TerrainStartKey, PreparedPortalPlacement<'a>>>,
+    shipwreck_tags: Option<Arc<ruined_portal::PortalUpdateTags>>,
 }
 
 impl<'a> PreparedJigsawResources<'a> {
@@ -360,6 +372,7 @@ impl<'a> PreparedJigsawResources<'a> {
             registry,
             starts: prepared.starts,
             portals,
+            shipwreck_tags: prepared.shipwreck_tags,
         })
     }
 
@@ -374,6 +387,7 @@ impl<'a> PreparedJigsawResources<'a> {
             },
             registry: self.registry,
             starts: Arc::clone(&self.starts),
+            shipwreck_tags: self.shipwreck_tags.clone(),
         }
     }
 }
@@ -450,6 +464,21 @@ impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedJigsawPlacemen
     ) -> Result<()> {
         self.other
             .place_ruined_portal(region, key, start, clip, random)
+    }
+    fn place_shipwreck(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        _: &super::structure_batch::TerrainStartKey,
+        start: &mut super::shipwreck::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        let tags = self
+            .shipwreck_tags
+            .as_deref()
+            .context("shipwreck placement context is missing")?;
+        region.place_shipwreck_start(start, self.registry, tags, clip, random)?;
+        Ok(())
     }
 }
 

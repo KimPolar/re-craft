@@ -750,19 +750,19 @@ impl PreparedStructureStages {
         )
     }
 
-    /// Include portals for an executor which has a prepared portal context.
+    /// Include template structures for an executor with prepared contexts.
     pub(super) fn mixed_decoration_plan_with_portals<'a>(
         &'a self,
         pos: ChunkPos,
         schedule: &'a StructureDecorationSchedule,
     ) -> Result<Vec<PlannedMixedStructureDecoration<'a>>> {
-        self.ensure_no_shipwreck_references(pos)?;
         mixed_plan_with_portals(
             &self.starts,
             &self.ocean_starts,
             &self.mineshafts,
             Some(&self.jigsaw_starts),
             Some(&self.ruined_portal_starts),
+            Some(&self.shipwreck_starts),
             &self.references,
             pos,
             schedule,
@@ -970,6 +970,7 @@ fn mixed_plan_with_jigsaw<'a>(
         mineshafts_by_chunk,
         jigsaws_by_chunk,
         None,
+        None,
         references_by_chunk,
         pos,
         schedule,
@@ -983,6 +984,7 @@ fn mixed_plan_with_portals<'a>(
     mineshafts_by_chunk: &'a BTreeMap<ChunkPos, MineshaftStarts>,
     jigsaws_by_chunk: Option<&'a BTreeMap<ChunkPos, JigsawStarts>>,
     portals_by_chunk: Option<&'a BTreeMap<ChunkPos, RuinedPortalStarts>>,
+    shipwrecks_by_chunk: Option<&'a BTreeMap<ChunkPos, ShipwreckStarts>>,
     references_by_chunk: &'a BTreeMap<ChunkPos, OrderedStructureReferences>,
     pos: ChunkPos,
     schedule: &'a StructureDecorationSchedule,
@@ -1031,22 +1033,32 @@ fn mixed_plan_with_portals<'a>(
             let portal = portals_by_chunk
                 .and_then(|chunks| chunks.get(&source))
                 .and_then(|starts| starts.get(&entry.id));
-            let start = match (simple, ocean, mineshaft, jigsaw, portal) {
-                (Some(start), None, None, None, None) => PlannedStructureStart::Simple(start),
-                (None, Some(start), None, None, None) => {
+            let shipwreck = shipwrecks_by_chunk
+                .and_then(|chunks| chunks.get(&source))
+                .and_then(|starts| starts.get(&entry.id));
+            let start = match (simple, ocean, mineshaft, jigsaw, portal, shipwreck) {
+                (Some(start), None, None, None, None, None) => PlannedStructureStart::Simple(start),
+                (None, Some(start), None, None, None, None) => {
                     ensure!(!start.pieces.is_empty(), "ocean ruin start has no pieces");
                     PlannedStructureStart::OceanRuin(start)
                 }
-                (None, None, Some(start), None, None) => {
+                (None, None, Some(start), None, None, None) => {
                     ensure!(!start.pieces.is_empty(), "mineshaft start has no pieces");
                     PlannedStructureStart::Mineshaft(start)
                 }
-                (None, None, None, Some(start), None) => {
+                (None, None, None, Some(start), None, None) => {
                     ensure!(!start.pieces.is_empty(), "jigsaw start has no pieces");
                     PlannedStructureStart::Jigsaw(start)
                 }
-                (None, None, None, None, Some(start)) => PlannedStructureStart::RuinedPortal(start),
-                (None, None, None, None, None) => bail!("referenced structure start is missing"),
+                (None, None, None, None, Some(start), None) => {
+                    PlannedStructureStart::RuinedPortal(start)
+                }
+                (None, None, None, None, None, Some(start)) => {
+                    PlannedStructureStart::Shipwreck(start)
+                }
+                (None, None, None, None, None, None) => {
+                    bail!("referenced structure start is missing")
+                }
                 _ => bail!("duplicate referenced structure start"),
             };
             ensure!(

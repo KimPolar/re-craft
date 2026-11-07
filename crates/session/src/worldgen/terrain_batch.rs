@@ -4563,6 +4563,7 @@ impl FreshTerrainBatch {
                                     | super::structure_batch::PlannedStructureStart::RuinedPortal(
                                         _
                                     )
+                                    | super::structure_batch::PlannedStructureStart::Shipwreck(_)
                             )
                         })
                     }) {
@@ -4625,6 +4626,7 @@ impl FreshTerrainBatch {
                                 start,
                                 super::structure_batch::PlannedStructureStart::Jigsaw(_)
                                     | super::structure_batch::PlannedStructureStart::RuinedPortal(_)
+                                    | super::structure_batch::PlannedStructureStart::Shipwreck(_)
                             )
                             })
                         });

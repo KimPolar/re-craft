@@ -234,7 +234,11 @@ impl DensityEvaluator {
             let z = (i64::from(min[2]) + i64::from(iz) * i64::from(step[2])) as i32;
             for ix in 0..size[0] {
                 let x = (i64::from(min[0]) + i64::from(ix) * i64::from(step[0])) as i32;
-                self.memo.clear();
+                // Neighboring columns share interpolated corner samples. Keep
+                // a short, bounded strip of memoized points within this volume.
+                if ix % 4 == 0 || self.memo.len() > 65_536 {
+                    self.memo.clear();
+                }
                 for iy in 0..size[1] {
                     let y = (i64::from(min[1]) + i64::from(iy) * i64::from(step[1])) as i32;
                     output.push(function.evaluate_cached(x, y, z, true, &mut self.memo));
@@ -2023,6 +2027,71 @@ mod tests {
         invalid["cell_height"] = json!(1);
         invalid["upper_bound"] = json!({"type":"mul","left":1000000,"right":1000000});
         assert!(compiler.compile(&invalid).is_err());
+    }
+
+    #[test]
+    fn neighboring_column_cache_matches_per_column_sampling() {
+        fn original(
+            function: &DensityFunction,
+            min: [i32; 3],
+            size: [u32; 3],
+            step: [i32; 3],
+        ) -> Vec<f32> {
+            let max = std::array::from_fn(|axis| min[axis] + (size[axis] as i32 - 1) * step[axis]);
+            let mut memo = SampleMemo {
+                volume: Some(BlockVolume {
+                    min,
+                    max,
+                    step,
+                    size,
+                }),
+                ..Default::default()
+            };
+            let mut result = Vec::new();
+            for z in 0..size[2] {
+                for x in 0..size[0] {
+                    memo.clear();
+                    for y in 0..size[1] {
+                        result.push(function.evaluate_cached(
+                            min[0] + x as i32 * step[0],
+                            min[1] + y as i32 * step[1],
+                            min[2] + z as i32 * step[2],
+                            true,
+                            &mut memo,
+                        ));
+                    }
+                }
+            }
+            result
+        }
+        let mut data = Data::default();
+        let mut compiler = DensityCompiler::new(&mut data);
+        let x = json!({"type":"gradient", "axis":"x", "from_coordinate":-32, "to_coordinate":32, "from_value":-0.7, "to_value":0.9});
+        let y = json!({"type":"gradient", "axis":"y", "from_coordinate":-32, "to_coordinate":32, "from_value":0.75, "to_value":-0.3});
+        let z = json!({"type":"gradient", "axis":"z", "from_coordinate":-32, "to_coordinate":32, "from_value":-0.2, "to_value":0.8});
+        let expression = json!({"type":"interpolated", "cell_size_xz":4, "cell_size_y":8, "input":{"type":"cache", "input":{"type":"mul", "left":x, "right":{"type":"add", "left":y, "right":z}}}});
+        let function = compiler.compile(&expression).unwrap();
+        let mut evaluator = DensityEvaluator::default();
+        for (min, size, step) in [
+            ([-13, -17, 9], [10, 29, 5], [1, 1, 1]),
+            ([1, 3, -5], [9, 5, 3], [2, 3, 4]),
+            ([0, -16, 0], [7, 5, 4], [4, 4, 4]),
+        ] {
+            let actual = evaluator
+                .sample_stepped_volume(&function, min, size, step)
+                .unwrap();
+            let expected = original(&function, min, size, step);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

@@ -1298,7 +1298,7 @@ impl GeneratedBlockView<'_> {
             });
         }
         if super::ore::valid_lichen(&state) && state.properties["waterlogged"] == "true" {
-            return Cell::FenceWater(native_world::fluid::FluidState {
+            return Cell::OpenWater(native_world::fluid::FluidState {
                 kind: native_world::fluid::FluidKind::Water,
                 amount: 8,
                 source: true,
@@ -1750,6 +1750,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Solid
                         | Cell::Fluid(_)
                         | Cell::FenceWater(_)
+                        | Cell::OpenWater(_)
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),
@@ -1885,6 +1886,7 @@ impl GeneratedBlockView<'_> {
                         | Cell::Solid
                         | Cell::Fluid(_)
                         | Cell::FenceWater(_)
+                        | Cell::OpenWater(_)
                         | Cell::Slab { .. }
                         | Cell::Stairs { .. }
                 ),

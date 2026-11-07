@@ -60,6 +60,17 @@ public class FluidTickOracle {
     int type=java.util.Arrays.asList(ChestType.SINGLE,ChestType.LEFT,ChestType.RIGHT).indexOf(s.getValue(ChestBlock.TYPE));
     return -200-(((block*4+dir)*3+type)*2+(s.getValue(ChestBlock.WATERLOGGED)?1:0));
   }
+  static BlockState fence(int code) {
+    int i=-300-code, wet=i%2; i/=2; int mask=i%16, family=i/16;
+    return (family==0?Blocks.OAK_FENCE:Blocks.NETHER_BRICK_FENCE).defaultBlockState()
+      .setValue(FenceBlock.NORTH,(mask&1)!=0).setValue(FenceBlock.EAST,(mask&2)!=0)
+      .setValue(FenceBlock.SOUTH,(mask&4)!=0).setValue(FenceBlock.WEST,(mask&8)!=0)
+      .setValue(BlockStateProperties.WATERLOGGED,wet==1);
+  }
+  static int fenceCode(BlockState s) {
+    int mask=(s.getValue(FenceBlock.NORTH)?1:0)|(s.getValue(FenceBlock.EAST)?2:0)|(s.getValue(FenceBlock.SOUTH)?4:0)|(s.getValue(FenceBlock.WEST)?8:0);
+    return -300-(((s.is(Blocks.OAK_FENCE)?0:1)*16+mask)*2+(s.getValue(BlockStateProperties.WATERLOGGED)?1:0));
+  }
   static class TestLevel extends ServerLevel {
     Map<BlockPos,BlockState> blocks; JsonArray changes; GameRules rules;
     EnvironmentAttributeSystem attrs; RandomSource random; boolean lava;
@@ -82,6 +93,7 @@ public class FluidTickOracle {
       else if (s.is(Blocks.OAK_SLAB)) a.add(s.getValue(SlabBlock.TYPE) == SlabType.TOP ? -17 : -16);
       else if (s.is(Blocks.OAK_STAIRS)) a.add(stairsCode(s));
       else if (s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST)) a.add(chestCode(s));
+      else if (s.is(Blocks.OAK_FENCE) || s.is(Blocks.NETHER_BRICK_FENCE)) a.add(fenceCode(s));
       else a.add(s.getValue(LiquidBlock.LEVEL) + (s.is(lava ? Blocks.WATER : Blocks.LAVA) ? 20 : 0));
       changes.add(a);
       if (trigger != null && p.equals(trigger)) { blocks.put(mutation,replacement); trigger=null; }
@@ -121,7 +133,7 @@ public class FluidTickOracle {
           case -13 -> Blocks.COPPER_GRATE.waxed().oxidized();
           default -> null;
         };
-        BlockState state=code == -18 ? Blocks.SHORT_GRASS.defaultBlockState() : code == -19 ? Blocks.FERN.defaultBlockState() : code == -20 ? Blocks.DEAD_BUSH.defaultBlockState() : code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -200 && code >= -247 ? chest(code) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
+        BlockState state=code == -364 ? Blocks.GLOW_LICHEN.defaultBlockState().setValue(MultifaceBlock.getFaceProperty(Direction.NORTH),true).setValue(BlockStateProperties.WATERLOGGED,true) : code == -18 ? Blocks.SHORT_GRASS.defaultBlockState() : code == -19 ? Blocks.FERN.defaultBlockState() : code == -20 ? Blocks.DEAD_BUSH.defaultBlockState() : code == -2 ? Blocks.STONE.defaultBlockState() : code == -3 ? Blocks.BLUE_ICE.defaultBlockState() : code == -4 ? Blocks.SOUL_SOIL.defaultBlockState() : code == -5 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.WATERLOGGED,true) : code <= -300 && code >= -363 ? fence(code) : code <= -200 && code >= -247 ? chest(code) : code <= -100 && code >= -179 ? stairs(code) : code <= -14 && code >= -17 ? Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, code == -15 || code == -17 ? SlabType.TOP : SlabType.BOTTOM).setValue(SlabBlock.WATERLOGGED, code <= -16) : grate != null ? grate.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,true) : liquid.defaultBlockState().setValue(LiquidBlock.LEVEL,code >= 20 ? code-20 : code);
         world.blocks.put(new BlockPos(a.get(0).getAsInt(),a.get(1).getAsInt(),a.get(2).getAsInt()),state);
       }
       if (s.has("mutation")) {
@@ -245,6 +257,7 @@ impl LiveFixture {
                 waterlogged: true,
             },
             ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
+            ChangedBlock::WaterloggedFence => Cell::FenceWater(liquid(FluidKind::Water, 0)),
         };
         self.blocks.insert(position, next);
         self.changes.push(fluid_sim::Change { position, block });
@@ -302,6 +315,7 @@ impl fluid_sim::LiveFluidWorld for LiveFixture {
             Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
             Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
             Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
+            Cell::FenceDry => ChangedBlock::WaterloggedFence,
             _ => ChangedBlock::Fluid(fluid),
         };
         self.set(position, block);
@@ -628,6 +642,51 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                 .push(json!({"blocks": blocks, "lava": false, "fast": false, "convert": true}));
         }
     }
+    // Fence type, all connection masks, and both wet/dry states.
+    for fence in 0..32 {
+        let dry = -300 - fence * 2;
+        let wet = dry - 1;
+        for below in [dry, wet] {
+            scenarios.push(json!({"blocks": [[0,0,0,4],[0,-1,0,below],[-1,0,0,0],[1,0,0,0]], "lava": false, "fast": false, "convert": true}));
+        }
+        for below in [-2, -14, -15, -1] {
+            let mut blocks = vec![json!([0, 0, 0, wet])];
+            if below != -1 {
+                blocks.push(json!([0, -1, 0, below]));
+            }
+            scenarios
+                .push(json!({"blocks": blocks, "lava": false, "fast": false, "convert": true}));
+        }
+        for (x, z) in directions {
+            let mut blocks = vec![
+                json!([0, 0, 0, 0]),
+                json!([0, -1, 0, -2]),
+                json!([x, 0, z, dry]),
+                json!([x, -1, z, -2]),
+            ];
+            for (dx, dz) in directions {
+                if (dx, dz) != (x, z) {
+                    blocks.push(json!([dx, 0, dz, -2]));
+                }
+                if (x + dx, z + dz) != (0, 0) {
+                    blocks.push(json!([x + dx, 0, z + dz, 0]));
+                }
+            }
+            scenarios
+                .push(json!({"blocks": blocks, "lava": false, "fast": false, "convert": true}));
+        }
+    }
+    for fence in [0, 15, 16, 31] {
+        for wet in [0, 1] {
+            for convert in [false, true] {
+                let below = -300 - fence * 2 - wet;
+                scenarios.push(json!({"blocks": [[0,0,0,4],[0,-1,0,below],[-1,0,0,0],[1,0,0,0]], "lava": true, "fast": false, "convert": convert}));
+            }
+        }
+    }
+    for convert in [false, true] {
+        scenarios.push(json!({"blocks": [[0,0,0,4],[0,-1,0,-364],[-1,0,0,0],[1,0,0,0]], "lava": true, "fast": false, "convert": convert}));
+    }
     // Lava burns these blocks without invoking the server loot manager, so the
     // isolated Java level can compare both downward and sideways replacement.
     for plant in [-18, -19, -20] {
@@ -663,6 +722,17 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
         assert!(
             waterlogged_chests.contains(&code),
             "Java did not waterlog chest {code}"
+        );
+    }
+    for fence in 0..32 {
+        let code = -301 - fence * 2;
+        assert!(
+            expected.as_array().unwrap().iter().any(|row| row
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change[3].as_i64() == Some(code))),
+            "Java did not waterlog fence {code}"
         );
     }
     for code in [-16, -17] {
@@ -723,6 +793,14 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                     Cell::Air
                 } else if level == -2 {
                     Cell::Solid
+                } else if level == -364 {
+                    Cell::OpenWater(liquid(FluidKind::Water, 0))
+                } else if (-363..=-300).contains(&level) {
+                    if (-300 - level) % 2 == 0 {
+                        Cell::FenceDry
+                    } else {
+                        Cell::FenceWater(liquid(FluidKind::Water, 0))
+                    }
                 } else if (-247..=-200).contains(&level) {
                     Cell::Chest {
                         waterlogged: (-200 - level) % 2 != 0,
@@ -810,6 +888,7 @@ fn scheduled_fluid_tick_matches_vanilla_in_simple_terrain() {
                         block_codes[&change.position] as i32 - 1
                     }
                     ChangedBlock::WaterloggedChest => block_codes[&change.position] as i32 - 1,
+                    ChangedBlock::WaterloggedFence => block_codes[&change.position] as i32 - 1,
                     ChangedBlock::Fluid(s) => {
                         let offset = if s.kind == kind { 0 } else { 20 };
                         offset

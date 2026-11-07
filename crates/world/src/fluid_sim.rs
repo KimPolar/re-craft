@@ -21,6 +21,10 @@ pub enum Cell {
     /// Source water in a fence. Its narrow collision faces cannot complete
     /// any open quadrant of the other supported shapes.
     FenceWater(FluidState),
+    /// Source water in a non-solid block with no fully occluding face.
+    OpenWater(FluidState),
+    /// A dry fence may accept a newly formed water source.
+    FenceDry,
     /// A half slab, optionally holding source water.
     Slab {
         top: bool,
@@ -133,6 +137,7 @@ pub enum ChangedBlock {
     WaterloggedSlab { top: bool },
     WaterloggedStairs { voxels: u8 },
     WaterloggedChest,
+    WaterloggedFence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,7 +219,7 @@ fn at(world: &impl Fn(IVec3) -> Cell, pos: Option<IVec3>) -> Cell {
 }
 
 fn source(cell: Cell, kind: FluidKind) -> bool {
-    matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) | Cell::BubbleWater(state) | Cell::FenceWater(state) if state.kind == kind && state.source)
+    matches!(cell, Cell::Fluid(state) | Cell::GrateWater(state) | Cell::BubbleWater(state) | Cell::FenceWater(state) | Cell::OpenWater(state) if state.kind == kind && state.source)
         || matches!(cell, Cell::Slab { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Stairs { waterlogged: true, .. } if kind == FluidKind::Water)
         || matches!(cell, Cell::Chest { waterlogged: true } if kind == FluidKind::Water)
@@ -225,7 +230,8 @@ fn fluid(cell: Cell) -> Option<FluidState> {
         Cell::Fluid(state)
         | Cell::GrateWater(state)
         | Cell::BubbleWater(state)
-        | Cell::FenceWater(state) => Some(state),
+        | Cell::FenceWater(state)
+        | Cell::OpenWater(state) => Some(state),
         Cell::Slab {
             waterlogged: true, ..
         }
@@ -245,6 +251,8 @@ fn face(cell: Cell, direction: IVec3) -> u8 {
         | Cell::Fluid(_)
         | Cell::BubbleWater(_)
         | Cell::FenceWater(_)
+        | Cell::OpenWater(_)
+        | Cell::FenceDry
         | Cell::Chest { .. } => 0,
         Cell::Solid | Cell::Unknown | Cell::GrateWater(_) => 15,
         Cell::Slab { top, .. } if direction == IVec3::Y => {
@@ -359,7 +367,12 @@ pub fn new_liquid(
         let below = at(world, offset(position, IVec3::NEG_Y));
         if matches!(
             below,
-            Cell::Solid | Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+            Cell::Solid
+                | Cell::Slab { .. }
+                | Cell::Stairs { .. }
+                | Cell::Chest { .. }
+                | Cell::FenceDry
+                | Cell::FenceWater(_)
         ) || source(below, kind)
         {
             return Some(flowing(kind, 8, false));
@@ -377,11 +390,14 @@ fn can_search(cell: Cell, kind: FluidKind) -> bool {
     match cell {
         Cell::Air => true,
         Cell::Fluid(_) => !source(cell, kind),
-        Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } => !source(cell, kind),
+        Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry => {
+            !source(cell, kind)
+        }
         Cell::Solid
         | Cell::GrateWater(_)
         | Cell::BubbleWater(_)
         | Cell::FenceWater(_)
+        | Cell::OpenWater(_)
         | Cell::Unknown => false,
     }
 }
@@ -393,7 +409,7 @@ fn is_hole(world: &impl Fn(IVec3) -> Cell, pos: IVec3, kind: FluidKind) -> bool 
     }
     match below {
         Cell::Air | Cell::Fluid(_) => true,
-        Cell::BubbleWater(_) | Cell::FenceWater(_) => kind == FluidKind::Water,
+        Cell::BubbleWater(_) | Cell::FenceWater(_) | Cell::OpenWater(_) => kind == FluidKind::Water,
         Cell::Slab {
             waterlogged: true, ..
         }
@@ -422,6 +438,7 @@ fn can_replace(
         | Cell::Chest { waterlogged: false } => {
             incoming.kind == FluidKind::Water && incoming.source
         }
+        Cell::FenceDry => incoming.kind == FluidKind::Water && incoming.source,
         Cell::Fluid(state)
             if state.kind == FluidKind::Water && incoming.kind == FluidKind::Lava =>
         {
@@ -459,7 +476,7 @@ fn slope_distance(
         let candidate = world(next);
         if matches!(
             candidate,
-            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry
         ) || !can_search(candidate, kind)
             || !can_pass(current, candidate, direction)
         {
@@ -521,7 +538,7 @@ fn side_changes_from(
         };
         if matches!(
             cell,
-            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. }
+            Cell::Slab { .. } | Cell::Stairs { .. } | Cell::Chest { .. } | Cell::FenceDry
         ) && !(new.kind == FluidKind::Water && new.source)
         {
             continue;
@@ -549,6 +566,7 @@ fn side_changes_from(
                         Cell::Slab { top, .. } => ChangedBlock::WaterloggedSlab { top },
                         Cell::Stairs { voxels, .. } => ChangedBlock::WaterloggedStairs { voxels },
                         Cell::Chest { .. } => ChangedBlock::WaterloggedChest,
+                        Cell::FenceDry => ChangedBlock::WaterloggedFence,
                         _ => ChangedBlock::Fluid(new),
                     },
                 });
@@ -597,6 +615,7 @@ pub fn tick(
                     | Cell::Chest { .. }
                     | Cell::BubbleWater(_)
                     | Cell::FenceWater(_)
+                    | Cell::OpenWater(_)
             ) {
                 original
             } else {
@@ -626,6 +645,8 @@ pub fn tick(
                 ChangedBlock::WaterloggedStairs { voxels }
             } else if let Cell::Chest { .. } = below {
                 ChangedBlock::WaterloggedChest
+            } else if let Cell::FenceDry = below {
+                ChangedBlock::WaterloggedFence
             } else {
                 ChangedBlock::Fluid(next)
             };
@@ -651,6 +672,9 @@ pub fn tick(
                                 waterlogged: true,
                             },
                             ChangedBlock::WaterloggedChest => Cell::Chest { waterlogged: true },
+                            ChangedBlock::WaterloggedFence => {
+                                Cell::FenceWater(flowing(FluidKind::Water, 8, false))
+                            }
                             _ => Cell::Solid,
                         }
                     } else {
@@ -874,7 +898,8 @@ pub fn tick_live<W: LiveFluidWorld>(
             ChangedBlock::Fluid(fluid) => fluid,
             ChangedBlock::WaterloggedSlab { .. }
             | ChangedBlock::WaterloggedStairs { .. }
-            | ChangedBlock::WaterloggedChest => flowing(FluidKind::Water, 8, false),
+            | ChangedBlock::WaterloggedChest
+            | ChangedBlock::WaterloggedFence => flowing(FluidKind::Water, 8, false),
             ChangedBlock::Air | ChangedBlock::Solid(_) => {
                 unreachable!("side planning only emits fluid")
             }

@@ -13569,6 +13569,7 @@ impl LoadedSession {
             _ if block.properties.get("waterlogged").map(String::as_str) == Some("true")
                 && (crate::stair_items::is_stair_item(&block.name)
                     || crate::slab_mining::material(&block.name).is_some()
+                    || native_world::collision::fence_waterlogged(block) == Some(true)
                     || matches!(
                         block.name.as_str(),
                         "minecraft:chest" | "minecraft:trapped_chest"
@@ -18775,6 +18776,9 @@ impl LoadedSession {
         {
             return fluid_sim::Cell::FenceWater(fluid);
         }
+        if native_world::collision::fence_waterlogged(state) == Some(false) {
+            return fluid_sim::Cell::FenceDry;
+        }
         if matches!(
             state.name.as_str(),
             "minecraft:chest" | "minecraft:trapped_chest"
@@ -18900,7 +18904,8 @@ impl LoadedSession {
             fluid_sim::ChangedBlock::Solid(block) => self.intern_solid(block),
             fluid_sim::ChangedBlock::WaterloggedSlab { .. }
             | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
-            | fluid_sim::ChangedBlock::WaterloggedChest => {
+            | fluid_sim::ChangedBlock::WaterloggedChest
+            | fluid_sim::ChangedBlock::WaterloggedFence => {
                 let expected = match change.block {
                     fluid_sim::ChangedBlock::WaterloggedSlab { top } => fluid_sim::Cell::Slab {
                         top,
@@ -18915,6 +18920,7 @@ impl LoadedSession {
                     fluid_sim::ChangedBlock::WaterloggedChest => {
                         fluid_sim::Cell::Chest { waterlogged: false }
                     }
+                    fluid_sim::ChangedBlock::WaterloggedFence => fluid_sim::Cell::FenceDry,
                     _ => unreachable!(),
                 };
                 if self.simulation_cell(change.position) != expected {
@@ -18984,6 +18990,7 @@ impl LoadedSession {
                 fluid_sim::ChangedBlock::WaterloggedSlab { .. }
                     | fluid_sim::ChangedBlock::WaterloggedStairs { .. }
                     | fluid_sim::ChangedBlock::WaterloggedChest
+                    | fluid_sim::ChangedBlock::WaterloggedFence
             ) && let Some(water) = self.simulated_fluid(id)
             {
                 self.schedule_fluid(change.position, water, settings.delay(water.kind));
@@ -21814,7 +21821,13 @@ impl fluid_sim::LiveFluidWorld for SessionFluidTick<'_> {
             {
                 ChangedBlock::WaterloggedChest
             }
-            FluidCell::Slab { .. } | FluidCell::Stairs { .. } | FluidCell::Chest { .. } => {
+            FluidCell::FenceDry if fluid.kind == FluidKind::Water && fluid.source => {
+                ChangedBlock::WaterloggedFence
+            }
+            FluidCell::Slab { .. }
+            | FluidCell::Stairs { .. }
+            | FluidCell::Chest { .. }
+            | FluidCell::FenceDry => {
                 return Ok(());
             }
             _ => ChangedBlock::Fluid(fluid),
@@ -22752,6 +22765,9 @@ fn bucket_waterloggable(block: &BlockState) -> Option<bool> {
     };
     if !matches!(wet.as_str(), "true" | "false") {
         return None;
+    }
+    if native_world::collision::fence_waterlogged(block).is_some() {
+        return Some(true);
     }
     if crate::stair_items::is_stair_item(&block.name)
         || matches!(
@@ -29989,6 +30005,26 @@ pub(crate) mod tests {
                     ("waterlogged", "true"),
                 ],
             ),
+            state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "false"),
+                    ("south", "true"),
+                    ("east", "false"),
+                    ("west", "true"),
+                    ("waterlogged", "true"),
+                ],
+            ),
+            state(
+                "minecraft:nether_brick_fence",
+                &[
+                    ("north", "false"),
+                    ("south", "false"),
+                    ("east", "false"),
+                    ("west", "false"),
+                    ("waterlogged", "true"),
+                ],
+            ),
         ];
         for block in cases {
             for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
@@ -30107,7 +30143,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 18);
+        assert_eq!(rows.len(), 30);
         const FLUID: &[Aabb] = &[Aabb {
             min: Vec3::ZERO,
             max: Vec3::new(1.0, 8.0 / 9.0, 1.0),
@@ -30122,6 +30158,17 @@ pub(crate) mod tests {
                         ("facing", "north"),
                         ("half", "bottom"),
                         ("shape", "straight"),
+                        ("waterlogged", "true"),
+                    ],
+                )
+            } else if shape.ends_with("fence") {
+                state(
+                    &format!("minecraft:{shape}"),
+                    &[
+                        ("north", "false"),
+                        ("south", "false"),
+                        ("east", "false"),
+                        ("west", "false"),
                         ("waterlogged", "true"),
                     ],
                 )
@@ -30337,6 +30384,52 @@ pub(crate) mod tests {
             block.properties.get("drag").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn water_bucket_waterlogs_fence_and_preserves_connections() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            let mut session = session();
+            session.set_water_evaporation_environment(bucket_environment(false));
+            let pos = IVec3::new(8, 2, 6);
+            let fence = session.intern_block(state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "true"),
+                    ("south", "true"),
+                    ("east", "false"),
+                    ("west", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            session.set_with_notify(pos, fence, false);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                hand,
+                ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+            );
+            session.set_player_inventory(inventory);
+            assert!(session.try_empty_bucket(hand));
+            let absolute = session.origin + pos;
+            let block = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(block.properties["waterlogged"], "true");
+            assert_eq!(block.properties["north"], "true");
+            assert_eq!(block.properties["south"], "true");
+            assert_eq!(
+                session.inventory.slot(hand).unwrap().id(),
+                "minecraft:bucket"
+            );
+            assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                && key.y == absolute.y
+                && key.z == absolute.z
+                && key.kind == FluidKind::Water
+                && key.source));
+        }
     }
 
     #[test]
@@ -31683,7 +31776,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 336);
+        assert_eq!(rows.len(), 352);
         struct PlantLoot;
         impl native_resources::packs::ResourceProvider for PlantLoot {
             fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -31722,6 +31815,30 @@ pub(crate) mod tests {
                 let id = session.intern_block(state(
                     "minecraft:stone_slab",
                     &[("type", "top"), ("waterlogged", wet)],
+                ));
+                session.set_with_notify(clicked, id, false);
+            } else if initial.starts_with("oak_fence_")
+                || initial.starts_with("nether_brick_fence_")
+            {
+                let name = if initial.starts_with("oak_") {
+                    "minecraft:oak_fence"
+                } else {
+                    "minecraft:nether_brick_fence"
+                };
+                let wet = if initial.ends_with("_wet") {
+                    "true"
+                } else {
+                    "false"
+                };
+                let id = session.intern_block(state(
+                    name,
+                    &[
+                        ("north", "false"),
+                        ("south", "false"),
+                        ("east", "false"),
+                        ("west", "false"),
+                        ("waterlogged", wet),
+                    ],
                 ));
                 session.set_with_notify(clicked, id, false);
             } else if initial.starts_with("chest_") || initial.starts_with("trapped_chest_") {
@@ -31785,6 +31902,11 @@ pub(crate) mod tests {
                     "minecraft:water" => format!("water_{}", block.properties["level"]),
                     "minecraft:lava" => format!("lava_{}", block.properties["level"]),
                     "minecraft:stone_slab" => format!("slab_{}", block.properties["waterlogged"]),
+                    "minecraft:oak_fence" | "minecraft:nether_brick_fence" => format!(
+                        "{}_{}",
+                        block.name.strip_prefix("minecraft:").unwrap(),
+                        block.properties["waterlogged"]
+                    ),
                     "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush" => {
                         block.name.strip_prefix("minecraft:").unwrap().into()
                     }
@@ -66612,6 +66734,64 @@ pub(crate) mod tests {
                         && key.kind == FluidKind::Water
                         && key.source));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn source_conversion_waterlogs_fences_and_schedules_water() {
+        for conversion in [false, true] {
+            let mut session = session();
+            session.set_source_conversion(conversion, false);
+            let pos = IVec3::new(8, 3, 8);
+            let water = FluidState {
+                kind: FluidKind::Water,
+                amount: 8,
+                source: true,
+                falling: false,
+            };
+            let water_id = session.intern_liquid(water);
+            let fence = session.intern_block(state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "true"),
+                    ("south", "false"),
+                    ("east", "true"),
+                    ("west", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            session.set_with_notify(pos, water_id, false);
+            session.set_with_notify(pos + IVec3::X, fence, false);
+            session.set_with_notify(pos + IVec3::X * 2, water_id, false);
+            for offset in [
+                IVec3::NEG_Y,
+                IVec3::X + IVec3::NEG_Y,
+                IVec3::NEG_X,
+                IVec3::NEG_Z,
+                IVec3::Z,
+            ] {
+                session.set_with_notify(pos + offset, session.states[3], false);
+            }
+            session.fluid_ticks.clear();
+            session.fluid_pending.clear();
+            session.schedule_fluid(pos, water, 0);
+            session.advance_fluid_ticks();
+            let absolute = session.origin + pos + IVec3::X;
+            let block = session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            assert_eq!(block.name, "minecraft:oak_fence");
+            assert_eq!(block.properties["north"], "true");
+            assert_eq!(block.properties["east"], "true");
+            assert_eq!(block.properties["waterlogged"], conversion.to_string());
+            if conversion {
+                assert!(session.fluid_pending.iter().any(|key| key.x == absolute.x
+                    && key.y == absolute.y
+                    && key.z == absolute.z
+                    && key.kind == FluidKind::Water
+                    && key.source));
             }
         }
     }

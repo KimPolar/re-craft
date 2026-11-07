@@ -3131,6 +3131,9 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
     if native_core::button::Button::from_id(id).is_some() && id.starts_with("minecraft:") {
         return Some(64);
     }
+    if is_fence_or_door_item(id) {
+        return Some(64);
+    }
     if let Some(max) = basic_item_max(id) {
         return Some(max);
     }
@@ -3158,6 +3161,43 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         }
     }
     None
+}
+
+fn is_fence_or_door_item(id: &str) -> bool {
+    let Some(name) = id.strip_prefix("minecraft:") else {
+        return false;
+    };
+    if name == "nether_brick_fence" {
+        return true;
+    }
+    let Some((family, metal_allowed)) = [
+        ("_fence_gate", false),
+        ("_fence", false),
+        ("_trapdoor", true),
+        ("_door", true),
+    ]
+    .into_iter()
+    .find_map(|(suffix, metal)| name.strip_suffix(suffix).map(|family| (family, metal))) else {
+        return false;
+    };
+    native_core::wood::Planks::ALL.into_iter().any(|wood| {
+        wood.id()
+            .strip_prefix("minecraft:")
+            .and_then(|name| name.strip_suffix("_planks"))
+            == Some(family)
+    }) || metal_allowed
+        && matches!(
+            family,
+            "iron"
+                | "copper"
+                | "exposed_copper"
+                | "weathered_copper"
+                | "oxidized_copper"
+                | "waxed_copper"
+                | "waxed_exposed_copper"
+                | "waxed_weathered_copper"
+                | "waxed_oxidized_copper"
+        )
 }
 
 /// Default durability for the ordinary tool families implemented above.

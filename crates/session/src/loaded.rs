@@ -22299,6 +22299,12 @@ fn picked_loaded_block_item(block: &BlockState) -> Option<ItemStack> {
         || native_core::button::Button::from_id(&block.name).is_some()
     {
         block_outline(block).is_some()
+    } else if native_world::collision::fence_waterlogged(block).is_some()
+        || native_world::collision::fence_gate_open(block).is_some()
+        || native_world::collision::door_open(block).is_some()
+        || native_world::collision::trapdoor_state(block).is_some()
+    {
+        true
     } else if crate::stair_items::is_stair_item(&block.name)
         || crate::slab_mining::material(&block.name).is_some()
     {
@@ -48971,6 +48977,178 @@ pub(crate) mod tests {
                 .id(),
             "minecraft:oak_slab"
         );
+    }
+
+    #[test]
+    fn pick_block_selects_fences_from_existing_inventory_or_creative() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for (mode, existing) in [
+            (GameMode::Survival, true),
+            (GameMode::Survival, false),
+            (GameMode::Creative, false),
+        ] {
+            let mut session = session();
+            session.set_game_mode(mode);
+            let fence = session.intern_block(state(
+                "minecraft:oak_fence",
+                &[
+                    ("north", "false"),
+                    ("south", "true"),
+                    ("east", "false"),
+                    ("west", "true"),
+                    ("waterlogged", "false"),
+                ],
+            ));
+            assert!(session.set(IVec3::new(8, 2, 6), fence));
+            let mut inventory = PlayerInventory::default();
+            if existing {
+                inventory.set_slot(
+                    PlayerSlot::Storage(12),
+                    ItemStack::new("minecraft:oak_fence".into(), 3, 64, Tag::Compound(vec![])),
+                );
+            }
+            session.set_player_inventory(inventory);
+            assert_eq!(session.ray_hit().unwrap().position, IVec3::new(8, 2, 6));
+            session.submit_command(PlayerCommand::PickBlock);
+            session.update(TICK);
+            let inventory = &session.snapshot().inventory;
+            let selected = inventory.slot(PlayerSlot::Storage(inventory.selected()));
+            if existing || mode == GameMode::Creative {
+                let item = selected.unwrap();
+                assert_eq!(item.id(), "minecraft:oak_fence");
+                assert_eq!(item.count(), if existing { 3 } else { 1 });
+            } else {
+                assert!(selected.is_none());
+            }
+        }
+        assert_eq!(
+            crate::inventory::ordinary_item_default_max("minecraft:iron_fence"),
+            None
+        );
+        assert_eq!(
+            crate::inventory::ordinary_item_default_max("example:oak_door"),
+            None
+        );
+        assert_eq!(
+            crate::inventory::ordinary_item_default_max("minecraft:stripped_oak_door"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn picked_fences_and_doors_match_java_for_all_states() -> anyhow::Result<()> {
+        use anyhow::{Context, Result};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        anyhow::ensure!(manifest["id"] == "26.3", "wrong version");
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PickFenceDoorOracle.java");
+        let output = temp.path().join("picked.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/PickFenceDoorOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        anyhow::ensure!(
+            compiled.status.success(),
+            "Java compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut names = vec!["minecraft:nether_brick_fence".to_owned()];
+        for wood in native_core::wood::Planks::ALL {
+            let family = wood.id().strip_suffix("_planks").unwrap();
+            for suffix in ["fence", "fence_gate", "door", "trapdoor"] {
+                names.push(format!("{family}_{suffix}"));
+            }
+        }
+        for family in [
+            "iron",
+            "copper",
+            "exposed_copper",
+            "weathered_copper",
+            "oxidized_copper",
+            "waxed_copper",
+            "waxed_exposed_copper",
+            "waxed_weathered_copper",
+            "waxed_oxidized_copper",
+        ] {
+            for suffix in ["door", "trapdoor"] {
+                names.push(format!("minecraft:{family}_{suffix}"));
+            }
+        }
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("PickFenceDoorOracle")
+            .arg(&output)
+            .args(&names)
+            .output()?;
+        anyhow::ensure!(
+            result.status.success(),
+            "Java pick block: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(output)?)?;
+        anyhow::ensure!(rows.len() > 3_000, "missing Java block states");
+        for row in rows {
+            let block = BlockState {
+                name: row["block"].as_str().context("missing block")?.to_owned(),
+                properties: row["properties"]
+                    .as_object()
+                    .context("missing properties")?
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            key.clone(),
+                            value.as_str().context("invalid property")?.to_owned(),
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            };
+            let item = picked_loaded_block_item(&block)
+                .with_context(|| format!("missing item for {block:?}"))?;
+            assert_eq!(item.id(), row["item"].as_str().unwrap(), "{block:?}");
+            assert_eq!(
+                u64::from(item.count()),
+                row["count"].as_u64().unwrap(),
+                "{block:?}"
+            );
+            assert_eq!(
+                item.max_count().map(u64::from),
+                row["max"].as_u64(),
+                "{block:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

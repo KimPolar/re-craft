@@ -5765,6 +5765,9 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
         ensure!(valid_vine(state), "invalid vine state");
         return Ok(false);
     }
+    if native_world::collision::fence_waterlogged(state).is_some() {
+        return Ok(false);
+    }
     if tree_generated_log(state) || tree_generated_leaf(state)? {
         return Ok(true);
     }
@@ -14929,6 +14932,28 @@ mod tests {
                 "missing Java faces for {name}"
             );
         }
+        for name in [
+            "oak_fence",
+            "spruce_fence",
+            "birch_fence",
+            "jungle_fence",
+            "acacia_fence",
+            "dark_oak_fence",
+            "mangrove_fence",
+            "cherry_fence",
+            "pale_oak_fence",
+            "bamboo_fence",
+            "crimson_fence",
+            "warped_fence",
+            "poplar_fence",
+            "nether_brick_fence",
+        ] {
+            assert_eq!(
+                families.get(name),
+                Some(&(32 * 6)),
+                "missing Java faces for {name}"
+            );
+        }
         let plants = [
             "short_grass",
             "fern",
@@ -15034,6 +15059,18 @@ mod tests {
             cases += 1;
         }
         assert_eq!(cases, 64);
+    }
+
+    #[test]
+    fn multiface_support_rejects_fences_and_invalid_states() {
+        let mut fence = state("oak_fence");
+        fence.properties = ["north", "east", "south", "west", "waterlogged"]
+            .into_iter()
+            .map(|name| (name.into(), "false".into()))
+            .collect();
+        assert!(!multiface_support(&fence).unwrap());
+        fence.properties.insert("north".into(), "invalid".into());
+        assert!(multiface_support(&fence).is_err());
     }
 
     #[test]

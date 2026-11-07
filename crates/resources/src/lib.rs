@@ -71,6 +71,7 @@ pub mod recipes;
 pub mod respawn_environment;
 pub mod respawn_tags;
 pub mod root_system_feature;
+pub mod ruined_portal;
 pub mod simple_block_feature;
 pub mod sky_light;
 pub mod sounds;

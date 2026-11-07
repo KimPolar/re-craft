@@ -4512,6 +4512,12 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
             ensure!(
                 disk_safe_solid(&old.name).is_some()
                     || tree_generated_leaf(&old)?
+                    || (tree_cave_vines(&old)?
+                        && matches!(
+                            state.name.as_str(),
+                            "minecraft:clay" | "minecraft:moss_block"
+                        )
+                        && state.properties.is_empty())
                     || generated_dripleaf(&old)?,
                 "unsupported vegetation patch source effects at {pos:?}: {old:?} -> {state:?}"
             );
@@ -7277,6 +7283,15 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && state.properties.get("level").map(String::as_str) == Some("0");
                     let fresh_patch_water = !guard.require_unchanged_light && patch_water;
                     let staged_patch_water = guard.require_unchanged_light && patch_water;
+                    let patch_vines = self.patch_block_write
+                        && tree_cave_vines(&old)?
+                        && matches!(
+                            state.name.as_str(),
+                            "minecraft:clay" | "minecraft:moss_block"
+                        )
+                        && state.properties.is_empty();
+                    let staged_patch_vines = guard.require_unchanged_light && patch_vines;
+                    let fresh_patch_vines = !guard.require_unchanged_light && patch_vines;
                     // Java checks this transition: opaque clay becomes source
                     // water with a different light-blocking state.
                     let patch_check = staged_patch_water;
@@ -7354,6 +7369,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || lake_light_update
                                 || magma_light_update
                                 || staged_patch_water
+                                || staged_patch_vines
                                 || native_world::block_light::same_light_behavior(&old, state)
                                     == Some(true),
                             "registered light behavior changed at {p:?}: {old:?} -> {state:?}"
@@ -7368,6 +7384,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || jigsaw_light_update
                             || fresh_patch_water
                             || staged_patch_water
+                            || fresh_patch_vines
+                            || staged_patch_vines
                             || fresh_water_dripleaf
                             || fresh_waterlog_dripleaf
                             || vine_write
@@ -7433,6 +7451,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || jigsaw_light_update
                         || fresh_patch_water
                         || staged_patch_water
+                        || fresh_patch_vines
+                        || staged_patch_vines
                         || fresh_water_dripleaf
                         || fresh_waterlog_dripleaf
                         || vine_check
@@ -7450,6 +7470,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || magma_light_update
                             || staged_patch_water
+                            || staged_patch_vines
                         {
                             guard.vine_light_positions.insert(p);
                         }
@@ -7461,6 +7482,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || lake_light_update
                             || magma_light_update
                             || patch_check
+                            || staged_patch_vines
                         {
                             guard.light_check_order.push(p);
                         }
@@ -11596,6 +11618,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_patch_replaces_cave_vines_like_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_patch_vine_clay",
+            "vine_active_self_glow_patch_vine_clay",
+            "vine_active_head_patch_vine_moss",
+            "vine_active_self_glow_head_patch_vine_moss",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_underwater_magma_matches_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_magma_block",
@@ -11882,6 +11915,21 @@ mod tests {
                 let clay = world.intern_state(state("clay"));
                 world.set_block_id(16, 10, 8, clay).unwrap();
             }
+            if mode.ends_with("_patch_vine_clay") || mode.ends_with("_patch_vine_moss") {
+                let mut source = state(if mode.contains("_head_") {
+                    "cave_vines"
+                } else {
+                    "cave_vines_plant"
+                });
+                source
+                    .properties
+                    .insert("berries".into(), mode.contains("_glow_").to_string());
+                if mode.contains("_head_") {
+                    source.properties.insert("age".into(), "7".into());
+                }
+                let id = world.intern_state(source);
+                world.set_block_id(16, 10, 8, id).unwrap();
+            }
             if mode.contains("_lake_") {
                 let mut source = state(if mode.contains("_iron_ore_") {
                     "deepslate_iron_ore"
@@ -12084,6 +12132,15 @@ mod tests {
                     let mut water = state("water");
                     water.properties.insert("level".into(), "0".into());
                     draft.set_patch_block(p, &water).unwrap();
+                    continue;
+                }
+                if mode.ends_with("_patch_vine_clay") || mode.ends_with("_patch_vine_moss") {
+                    let target = if mode.ends_with("_clay") {
+                        "clay"
+                    } else {
+                        "moss_block"
+                    };
+                    draft.set_patch_block(p, &state(target)).unwrap();
                     continue;
                 }
                 if mode.contains("_lake_") {
@@ -16928,6 +16985,47 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    fn vegetation_patch_replaces_cave_vine_states() {
+        let mut registry = batch_registry();
+        registry.extend([
+            "minecraft:cave_vines".into(),
+            "minecraft:cave_vines_plant".into(),
+            "minecraft:moss_block".into(),
+        ]);
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        for name in ["cave_vines", "cave_vines_plant"] {
+            for berries in [false, true] {
+                for replacement in ["clay", "moss_block"] {
+                    let (mut terrain, tags, _, _) = fixture();
+                    let center = ChunkPos { x: 0, z: 0 };
+                    let mut vine = state(name);
+                    vine.properties
+                        .insert("berries".into(), berries.to_string());
+                    if name == "cave_vines" {
+                        vine.properties.insert("age".into(), "7".into());
+                    }
+                    let mut setup = terrain
+                        .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                        .unwrap();
+                    setup.set_section_block([8, 7, 8], &vine).unwrap();
+                    setup.finish().unwrap();
+                    let mut draft = terrain
+                        .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                        .unwrap();
+                    draft
+                        .set_patch_block([8, 7, 8], &state(replacement))
+                        .unwrap();
+                    draft.finish().unwrap();
+                    assert_eq!(
+                        terrain.snapshot().block(8, 7, 8).unwrap().name,
+                        format!("minecraft:{replacement}")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

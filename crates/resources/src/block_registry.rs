@@ -55,6 +55,7 @@ enum StateSchema {
     PoweredRail,
     WaterloggedAxis,
     Fence,
+    Wall,
     FenceGate,
     Door,
     Slab,
@@ -110,6 +111,16 @@ impl StateSchema {
                     .into_iter()
                     .map(|name| (name.into(), "false".into()))
                     .collect();
+            }
+            Self::Wall => {
+                return BTreeMap::from([
+                    ("north".into(), "none".into()),
+                    ("south".into(), "none".into()),
+                    ("west".into(), "none".into()),
+                    ("east".into(), "none".into()),
+                    ("up".into(), "true".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
             }
             Self::FenceGate => {
                 return BTreeMap::from([
@@ -243,6 +254,14 @@ impl StateSchema {
             Self::Fence
                 if matches!(name, "north" | "south" | "west" | "east" | "waterlogged")
                     && matches!(value, "true" | "false") =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Wall
+                if (matches!(name, "north" | "south" | "west" | "east")
+                    && matches!(value, "none" | "low" | "tall"))
+                    || (matches!(name, "up" | "waterlogged")
+                        && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -543,6 +562,14 @@ impl GeneratedBlockRegistry {
                 constructors.insert("net/minecraft/world/level/block/StairBlock".to_owned());
             } else if ins.op == 0xb8
                 && owner == BLOCKS
+                && member == "registerWall"
+                && descriptor == STAIR_FACTORY
+            {
+                ensure!(registration.is_none(), "ambiguous block registration");
+                registration = Some(false);
+                constructors.insert("net/minecraft/world/level/block/WallBlock".to_owned());
+            } else if ins.op == 0xb8
+                && owner == BLOCKS
                 && member == "registerSlab"
                 && matches!(descriptor, STAIR_FACTORY | SLAB_FACTORY_F | SLAB_FACTORY_FF)
             {
@@ -759,6 +786,7 @@ impl GeneratedBlockRegistry {
                     Some(StateSchema::Fence)
                 }
                 "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
+                "net/minecraft/world/level/block/WallBlock" => Some(StateSchema::Wall),
                 "net/minecraft/world/level/block/BedBlock" => Some(StateSchema::Bed),
                 "net/minecraft/world/level/block/RailBlock" => Some(StateSchema::Rail),
                 "net/minecraft/world/level/block/PoweredRailBlock"
@@ -939,7 +967,7 @@ impl GeneratedBlockRegistry {
             }
             return Ok(result);
         }
-        if matches!(schema, StateSchema::Fence) {
+        if matches!(schema, StateSchema::Fence | StateSchema::Wall) {
             let directions = ["north", "east", "south", "west"];
             let mut result = properties.clone();
             for (index, name) in directions.iter().enumerate() {

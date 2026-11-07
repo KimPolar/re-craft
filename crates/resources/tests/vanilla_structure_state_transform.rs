@@ -58,10 +58,20 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     let text = String::from_utf8(output.stdout)?;
     let mut count = 0;
     let mut chain_count = 0;
+    let mut wall_count = 0;
     for line in text.lines().filter_map(|line| line.strip_prefix("STATE\t")) {
         let row: Value = serde_json::from_str(line)?;
         let id = row["id"].as_str().unwrap();
         chain_count += usize::from(id == "minecraft:iron_chain");
+        wall_count += usize::from(matches!(
+            id,
+            "minecraft:stone_brick_wall"
+                | "minecraft:mossy_stone_brick_wall"
+                | "minecraft:cobblestone_wall"
+                | "minecraft:mossy_cobblestone_wall"
+                | "minecraft:blackstone_wall"
+                | "minecraft:polished_blackstone_brick_wall"
+        ));
         let input: BTreeMap<String, String> = serde_json::from_value(row["input"].clone())?;
         let expected: BTreeMap<String, String> = serde_json::from_value(row["result"].clone())?;
         let mirror = match row["mirror"].as_u64().unwrap() {
@@ -85,6 +95,11 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     }
     assert!(count > 2000, "unexpectedly few oracle cases: {count}");
     assert_eq!(chain_count, 6 * 12, "missing iron chain state transforms");
+    assert_eq!(
+        wall_count,
+        6 * 324 * 12,
+        "missing portal wall state transforms"
+    );
     println!("verified {count} Java block-state transforms");
     Ok(())
 }

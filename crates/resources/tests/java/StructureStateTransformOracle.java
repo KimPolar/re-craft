@@ -35,6 +35,10 @@ public class StructureStateTransformOracle {
             if (block instanceof GlazedTerracottaBlock || block==Blocks.SANDSTONE_STAIRS || block==Blocks.STONE_BRICK_STAIRS || block==Blocks.IRON_CHAIN)
                 states.addAll(block.getStateDefinition().getPossibleStates());
         }
+        for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
+                Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,
+                Blocks.BLACKSTONE_WALL, Blocks.POLISHED_BLACKSTONE_BRICK_WALL))
+            states.addAll(block.getStateDefinition().getPossibleStates());
         for (var state : states) for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
             var record=new JsonObject();
             record.addProperty("id",BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());

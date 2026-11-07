@@ -62,6 +62,7 @@ pub(super) use ocean_ruin::attach_created_chicken_rider;
 pub(super) use ocean_ruin::draft_initialized_drowned;
 mod swamp_hut;
 pub use ocean_ruin::OceanRuinPlacementContext;
+pub use ruined_portal::{PortalPlacementResources, PreparedPortalPlacement};
 
 /// World-specific ocean-ruin effects used by a mixed decoration pass. Clones
 /// must isolate mutable state until the entire pass succeeds.

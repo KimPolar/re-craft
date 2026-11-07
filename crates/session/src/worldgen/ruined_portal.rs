@@ -337,6 +337,10 @@ pub struct SavedRuinedPortalPiece {
 }
 
 impl SavedRuinedPortalPiece {
+    pub(super) fn template_size(&self) -> [i32; 3] {
+        self.template_size
+    }
+
     /// Decorate an unpublished region after its template has been placed.
     pub fn decorate(
         &self,

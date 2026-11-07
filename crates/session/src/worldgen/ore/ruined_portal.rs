@@ -104,6 +104,99 @@ impl PortalUpdateTags {
     }
 }
 
+/// Resources shared by portal starts from one unchanged data-pack stack.
+pub struct PortalPlacementResources<'a> {
+    registry: &'a GeneratedBlockRegistry,
+    blocks: &'a BTreeSet<String>,
+    protected: BTreeSet<String>,
+    update_tags: PortalUpdateTags,
+}
+
+impl<'a> PortalPlacementResources<'a> {
+    pub fn load(
+        provider: &mut impl ResourceProvider,
+        blocks: &'a BTreeSet<String>,
+        registry: &'a GeneratedBlockRegistry,
+    ) -> Result<Arc<Self>> {
+        let protected = resolve_block_tag(
+            provider,
+            &ResourceId::parse("minecraft:features_cannot_replace")?,
+            blocks,
+        )?;
+        let update_tags = PortalUpdateTags::load(provider, blocks)?;
+        Ok(Arc::new(Self {
+            registry,
+            blocks,
+            protected,
+            update_tags,
+        }))
+    }
+
+    /// Prepare a start against the same unchanged data-pack stack.
+    pub fn prepare(
+        self: &Arc<Self>,
+        provider: &mut impl ResourceProvider,
+        start: &super::super::ruined_portal::PreparedStart,
+    ) -> Result<PreparedPortalPlacement<'a>> {
+        ensure!(
+            start.template.data_version == Some(5023),
+            "unsupported portal template version"
+        );
+        ensure!(
+            start.template.size == start.piece.template_size(),
+            "portal template size changed"
+        );
+        ensure!(
+            start.point.position == start.piece.position
+                && start.point.bounds == start.piece.bounds
+                && start.point.pivot == [start.template.size[0] / 2, 0, start.template.size[2] / 2],
+            "portal generation point differs from piece"
+        );
+        let processors = start.piece.prepare_processors(provider, self.blocks)?;
+        Ok(PreparedPortalPlacement {
+            source: start.clone(),
+            processors,
+            resources: Arc::clone(self),
+        })
+    }
+}
+
+/// Immutable processor chain and data-pack tags for a single portal start.
+#[derive(Clone)]
+pub struct PreparedPortalPlacement<'a> {
+    source: super::super::ruined_portal::PreparedStart,
+    processors: native_persistence::structure_processors::PreparedProcessors,
+    resources: Arc<PortalPlacementResources<'a>>,
+}
+
+impl PreparedPortalPlacement<'_> {
+    pub fn place(
+        &self,
+        region: &mut DecorationRegion<'_>,
+        start: &super::super::ruined_portal::PreparedStart,
+        clip: &mut native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<bool> {
+        ensure!(
+            self.source.chunk == start.chunk
+                && self.source.point == start.point
+                && self.source.terrain_adjustment == start.terrain_adjustment
+                && self.source.piece == start.piece
+                && Arc::ptr_eq(&self.source.template, &start.template),
+            "prepared portal start changed"
+        );
+        region.place_ruined_portal(
+            start,
+            self.resources.registry,
+            &self.processors,
+            &self.resources.protected,
+            &self.resources.update_tags,
+            clip,
+            random,
+        )
+    }
+}
+
 struct PortalTemplateRegion<'r, 'a, 'g> {
     inner: super::jigsaw::JigsawRegion<'r, 'a, 'g>,
     wall_tags: &'g PortalUpdateTags,
@@ -1042,12 +1135,7 @@ mod tests {
         let mut resources = ResourceStack::open(&game)?;
         let registry = resources.vanilla_generated_block_registry()?;
         let ids = resources.vanilla_block_ids()?;
-        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
-        let protected = resolve_block_tag(
-            &mut resources,
-            &ResourceId::parse("minecraft:features_cannot_replace")?,
-            &ids,
-        )?;
+        let portal_resources = PortalPlacementResources::load(&mut resources, &ids, &registry)?;
         let motion = HeightmapTags::load(&mut resources, &ids)?;
         let mut placed_count = 0;
         let mut marker_count = 0;
@@ -1091,7 +1179,6 @@ mod tests {
             };
             let piece =
                 SavedRuinedPortalPiece::capture(&selection, &setup, &point, template.size, false)?;
-            let processors = piece.prepare_processors(&mut resources, &ids)?;
             let start = PreparedStart {
                 chunk: [0, 0],
                 point,
@@ -1099,6 +1186,7 @@ mod tests {
                 template: Arc::new(template),
                 piece,
             };
+            let prepared = portal_resources.prepare(&mut resources, &start)?;
             let (mut terrain, tags, _, _) = super::super::tests::fixture();
             terrain.height = 48;
             let world = Arc::make_mut(&mut terrain.world);
@@ -1132,15 +1220,19 @@ mod tests {
                 BoundingBox::new([-32, 0, -32], [31, 47, 31]).map_err(anyhow::Error::msg)?;
             let mut random = DecorationRandom::new(42);
             let markers = start.jigsaw_markers(&registry, clip)?;
-            let placed = region.place_ruined_portal(
-                &start,
-                &registry,
-                &processors,
-                &protected,
-                &wall_tags,
-                &mut clip,
-                &mut random,
+            let mut stale = start.clone();
+            stale.chunk[0] += 1;
+            let old_clip = clip;
+            let mut expected_random = random.clone();
+            assert!(
+                prepared
+                    .place(&mut region, &stale, &mut clip, &mut random)
+                    .is_err()
             );
+            assert_eq!(clip, old_clip);
+            assert_eq!(random.next_long(), expected_random.next_long());
+            let mut random = DecorationRandom::new(42);
+            let placed = prepared.place(&mut region, &start, &mut clip, &mut random);
             ensure!(placed.with_context(|| format!("placing {name}"))?);
             region
                 .finish()

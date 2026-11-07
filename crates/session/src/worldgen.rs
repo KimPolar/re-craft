@@ -92,7 +92,8 @@ pub use mob_spawner::{
 pub use ore::{
     DecorationRegion, MixedHutOceanPlacementContext, MixedJigsawPlacementContext,
     MixedMineshaftPlacementContext, MixedOceanRuinPlacement, OceanRuinPlacementContext,
-    PlacedDecorationFeature, PreparedDecoration, ScheduledDecorationFeature,
+    PlacedDecorationFeature, PortalPlacementResources, PreparedDecoration, PreparedPortalPlacement,
+    ScheduledDecorationFeature,
 };
 pub use postprocessing_world::{
     GeneratedPostprocessing, InitialBonusChestAttempt, PostprocessedGeneratedRegion,

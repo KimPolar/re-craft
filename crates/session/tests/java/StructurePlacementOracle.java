@@ -5,6 +5,8 @@ import net.minecraft.core.*;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.*;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.level.block.state.properties.WallSide;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.ServerLevelAccessor;
 import net.minecraft.world.level.EmptyBlockGetter;
@@ -26,6 +28,9 @@ public class StructurePlacementOracle {
     static ListTag ints(int... values) { var list = new ListTag(); for (int v:values) list.add(IntTag.valueOf(v)); return list; }
     public static void main(String[] args) throws Exception {
         var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        var bind = Holder.Reference.class.getDeclaredMethod("bindTags", Collection.class); bind.setAccessible(true);
+        for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL))
+            bind.invoke(block.builtInRegistryHolder(), List.of(BlockTags.WALLS));
         for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
                 Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
                 Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,
@@ -36,6 +41,9 @@ public class StructurePlacementOracle {
                 Blocks.STONE_BRICK_STAIRS, Blocks.MOSSY_STONE_BRICK_STAIRS, Blocks.STONE_STAIRS,
                 Blocks.COBBLESTONE_STAIRS, Blocks.MOSSY_COBBLESTONE_STAIRS, Blocks.BLACKSTONE_STAIRS,
                 Blocks.POLISHED_BLACKSTONE_STAIRS, Blocks.POLISHED_BLACKSTONE_BRICK_STAIRS,
+                Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
+                Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,
+                Blocks.BLACKSTONE_WALL, Blocks.POLISHED_BLACKSTONE_WALL, Blocks.POLISHED_BLACKSTONE_BRICK_WALL,
                 Blocks.STONE_SLAB, Blocks.STONE_BRICK_SLAB, Blocks.MOSSY_STONE_BRICK_SLAB,
                 Blocks.COBBLESTONE_SLAB, Blocks.MOSSY_COBBLESTONE_SLAB, Blocks.SMOOTH_STONE_SLAB,
                 Blocks.BLACKSTONE_SLAB, Blocks.POLISHED_BLACKSTONE_SLAB, Blocks.POLISHED_BLACKSTONE_BRICK_SLAB))
@@ -100,6 +108,29 @@ public class StructurePlacementOracle {
                     if (bars.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
                             Blocks.CHEST.defaultBlockState(), levelRandom) != bars)
                         throw new AssertionError("bars unexpectedly connect to chest " + d);
+                for (var d : Direction.Plane.HORIZONTAL)
+                    if (bars.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
+                            Blocks.STONE_BRICK_WALL.defaultBlockState(), levelRandom) == bars)
+                        throw new AssertionError("bars failed to connect to wall " + d);
+                var wall = Blocks.STONE_BRICK_WALL.defaultBlockState();
+                var low = wall.updateShape(world, world, BlockPos.ZERO, Direction.EAST, BlockPos.ZERO.east(), wall, levelRandom);
+                if (low.getValue(WallBlock.EAST) != WallSide.LOW || !low.getValue(WallBlock.UP))
+                    throw new AssertionError("unexpected wall connection " + low);
+                states.put(BlockPos.ZERO.above(), Blocks.STONE.defaultBlockState());
+                var tall = wall.updateShape(world, world, BlockPos.ZERO, Direction.EAST, BlockPos.ZERO.east(), wall, levelRandom);
+                if (tall.getValue(WallBlock.EAST) != WallSide.TALL || !tall.getValue(WallBlock.UP))
+                    throw new AssertionError("unexpected wall with ceiling " + tall);
+                states.clear();
+                var air = Blocks.AIR.defaultBlockState();
+                bind.invoke(Blocks.AIR.builtInRegistryHolder(), List.of(BlockTags.WALLS, BlockTags.WALL_POST_OVERRIDE));
+                var tagged = wall.updateShape(world, world, BlockPos.ZERO, Direction.EAST, BlockPos.ZERO.east(), air, levelRandom);
+                if (tagged.getValue(WallBlock.EAST) != WallSide.LOW) throw new AssertionError("wall tag ignored " + tagged);
+                if (bars.updateShape(world, world, BlockPos.ZERO, Direction.EAST, BlockPos.ZERO.east(), air, levelRandom) == bars)
+                    throw new AssertionError("bars ignored wall tag");
+                var straight = wall.setValue(WallBlock.NORTH, WallSide.LOW).setValue(WallBlock.SOUTH, WallSide.LOW).setValue(WallBlock.UP, false);
+                if (!straight.updateShape(world, world, BlockPos.ZERO, Direction.UP, BlockPos.ZERO.above(), air, levelRandom).getValue(WallBlock.UP))
+                    throw new AssertionError("wall post override ignored");
+                bind.invoke(Blocks.AIR.builtInRegistryHolder(), List.of());
                 if (!events.isEmpty()) throw new AssertionError("unexpected shape effects");
             }
             var settings=new StructurePlaceSettings().setMirror(mirror).setRotation(rotation).setRotationPivot(pivot)

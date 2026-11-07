@@ -62,6 +62,9 @@ pub(super) fn jigsaw_torch(state: &BlockState) -> bool {
 }
 
 fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
+    if native_world::wall::Wall::from_state(state).is_some() {
+        return Ok(false);
+    }
     if jigsaw_wood(state) {
         return Ok(true);
     }
@@ -246,6 +249,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         } else {
             self.region.jigsaw_block_write = jigsaw_wood(state)
                 || native_world::collision::slab_stair_solid(state).is_some()
+                || native_world::wall::Wall::from_state(state).is_some()
                 || native_world::collision::fence_waterlogged(state).is_some()
                 || native_world::collision::fence_gate_open(state).is_some()
                 || native_world::collision::door_open(state).is_some()
@@ -265,6 +269,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             && (state.name.ends_with("_stairs")
                 || state.name.ends_with("_slab")
                 || state.name.ends_with("_fence")
+                || native_world::wall::Wall::from_state(state).is_some()
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || state.name == "minecraft:chest")
             && self
@@ -297,6 +302,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 };
                 self.region.jigsaw_block_write = native_world::collision::slab_stair_solid(state)
                     .is_some()
+                    || native_world::wall::Wall::from_state(state).is_some()
                     || native_world::collision::fence_waterlogged(state).is_some()
                     || native_world::collision::pane_waterlogged(state).is_some();
                 let result = self.region.set_proto_block(pos, &wet);

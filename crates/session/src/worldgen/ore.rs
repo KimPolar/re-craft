@@ -7251,6 +7251,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         && (pile_safe_full_block(state) || pile_snow_layer(state));
                     let jigsaw_shape = self.jigsaw_block_write
                         && (native_world::collision::slab_stair_solid(state).is_some()
+                            || native_world::wall::Wall::from_state(state).is_some()
                             || native_world::collision::fence_waterlogged(state).is_some()
                             || native_world::collision::fence_gate_open(state).is_some()
                             || native_world::collision::door_open(state).is_some()
@@ -7273,9 +7274,17 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         });
                     let jigsaw_light_update = self.jigsaw_block_write
                         && ((old_air && jigsaw::jigsaw_wood(state))
-                            || (jigsaw_shape && (old_air || jigsaw_water || jigsaw_waterlog)));
+                            || (jigsaw_shape
+                                && (old_air
+                                    || jigsaw_water
+                                    || jigsaw_waterlog
+                                    || (native_world::wall::Wall::from_state(state).is_some()
+                                        && (native_world::wall::Wall::from_state(&old)
+                                            .is_some()
+                                            || ruined_portal::portal_full(&old))))));
                     let jigsaw_light_check = jigsaw_light_update
                         && ((native_world::collision::fence_waterlogged(state).is_none()
+                            && native_world::wall::Wall::from_state(state).is_none()
                             && native_world::collision::fence_gate_open(state).is_none()
                             && native_world::collision::door_open(state).is_none()
                             && native_world::collision::bed_leg_end(state).is_none()

@@ -721,6 +721,7 @@ pub struct DecorationRegion<'a> {
     multiface_block_write: bool,
     lake_block_write: bool,
     magma_block_write: bool,
+    monster_room_block_write: bool,
     failed: bool,
 }
 
@@ -3535,6 +3536,7 @@ impl CarvedTerrainWorld {
             multiface_block_write: false,
             lake_block_write: false,
             magma_block_write: false,
+            monster_room_block_write: false,
             failed: false,
         })
     }
@@ -5472,7 +5474,10 @@ impl native_resources::monster_room::MonsterRoomWorld for DecorationRegion<'_> {
                 Arc::make_mut(pending).remove(pos);
             }
         }
-        self.set_proto_block(pos, &state)?;
+        self.monster_room_block_write = true;
+        let write = self.set_proto_block(pos, &state);
+        self.monster_room_block_write = false;
+        write?;
         if matches!(kind, RoomBlock::Chest(_) | RoomBlock::Spawner) {
             Arc::make_mut(self.pending_order.entry(chunk(pos)).or_default()).insert(pos);
         }
@@ -7869,6 +7874,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 "minecraft:lava" | "minecraft:water"
                             ) && state.properties.len() == 1
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
+                    let room_light_update = self.monster_room_block_write
+                        && (lake_source || generated_ore_state(&old)?)
+                        && state.name == "minecraft:cave_air"
+                        && state.properties.is_empty();
                     // Transparent plants do not enqueue a block light check,
                     // but the first non-air block still allocates a section.
                     let vegetation_allocation = old_air
@@ -7895,6 +7904,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 || vine_write
                                 || water_lichen_write
                                 || lake_light_update
+                                || room_light_update
                                 || magma_light_update
                                 || staged_patch_water
                                 || staged_patch_vines
@@ -7919,6 +7929,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || vine_write
                             || water_lichen_write
                             || lake_light_update
+                            || room_light_update
                             || magma_light_update
                             || native_world::sky_light::same_sky_behavior(&old, state)
                                 == Some(true),
@@ -7987,6 +7998,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                         || vine_check
                         || lichen_check
                         || lake_light_update
+                        || room_light_update
                         || magma_light_update
                         || new_section
                     {
@@ -7997,6 +8009,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || (jigsaw_light_update && guard.require_unchanged_light)
                             || water_lichen_write
                             || lake_light_update
+                            || room_light_update
                             || magma_light_update
                             || staged_patch_water
                             || staged_patch_vines
@@ -8009,6 +8022,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || vine_check
                             || lichen_check
                             || lake_light_update
+                            || room_light_update
                             || magma_light_update
                             || patch_check
                             || staged_patch_vines
@@ -12272,6 +12286,21 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_monster_room_carving_matches_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_room_stone_air",
+            "vine_active_self_room_stone_air",
+            "vine_active_room_deepslate_x_air",
+            "vine_active_self_room_deepslate_y_air",
+            "vine_active_room_sulfur_air",
+            "vine_active_self_room_cinnabar_air",
+            "vine_active_room_iron_ore_air",
+            "vine_active_self_room_redstone_ore_air",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_village_piles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_pile_snow",
@@ -12578,6 +12607,24 @@ mod tests {
                 let id = world.intern_state(water);
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
+            if let Some(name) = mode.split("_room_").nth(1) {
+                let name = name.strip_suffix("_air").unwrap();
+                let mut source = if name.starts_with("deepslate_") {
+                    let mut source = state("deepslate");
+                    source.properties.insert(
+                        "axis".into(),
+                        name.strip_prefix("deepslate_").unwrap().into(),
+                    );
+                    source
+                } else {
+                    state(name)
+                };
+                if name == "redstone_ore" {
+                    source.properties.insert("lit".into(), "true".into());
+                }
+                let id = world.intern_state(source);
+                world.set_block_id(16, 10, 8, id).unwrap();
+            }
             if mode.contains("_jigsaw_wet_") || mode.contains("_jigsaw_water_") {
                 let mut water = state("water");
                 water.properties.insert("level".into(), "0".into());
@@ -12709,6 +12756,15 @@ mod tests {
                 vec![[16, 10, 8]]
             };
             for (i, p) in positions.iter().copied().enumerate() {
+                if mode.contains("_room_") {
+                    native_resources::monster_room::MonsterRoomWorld::set_block(
+                        &mut draft,
+                        p,
+                        RoomBlock::CaveAir,
+                    )
+                    .unwrap();
+                    continue;
+                }
                 if mode.contains("_kelp_") {
                     let mut block = state(if mode.ends_with("_head") {
                         "kelp"
@@ -12935,7 +12991,9 @@ mod tests {
                 assert!(draft.set_column_block(p, &vine).unwrap());
             }
             let guard = draft.light_guard.as_ref().unwrap();
-            let expected_checks = if mode.contains("_plant_") || mode.contains("_kelp_") {
+            let expected_checks = if mode.contains("_room_") {
+                1
+            } else if mode.contains("_plant_") || mode.contains("_kelp_") {
                 0
             } else if mode.contains("_jigsaw_wet_") {
                 2

@@ -145,6 +145,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean skyShadow=args.length>1 && (args[1].equals("sky_inactive_shadow") || skyMany || (skyActivate && !skyDark));
         boolean vineActive=args.length>1 && args[1].startsWith("vine_active_");
         boolean vineSelf=vineActive && args[1].startsWith("vine_active_self_");
+        boolean roomActive=vineActive && args[1].contains("_room_");
         boolean kelpColumn=vineActive && args[1].contains("_kelp_");
         if(kelpColumn) for(var kelp:List.of(Blocks.KELP,Blocks.KELP_PLANT))
             for(var s:kelp.getStateDefinition().getPossibleStates()) {
@@ -256,6 +257,17 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && kelpColumn) {
                 var water=Blocks.WATER.defaultBlockState();
                 fake.section.setBlockState(0,10,8,water); w.edits.put(new BlockPos(16,10,8),water);
+            }
+            if(x==1 && z==0 && roomActive) {
+                var name=args[1].substring(args[1].indexOf("_room_")+6);
+                name=name.substring(0,name.length()-4);
+                var axis=name.startsWith("deepslate_") ? name.substring("deepslate_".length()) : "";
+                var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+(axis.isEmpty()?name:"deepslate")));
+                var source=block.defaultBlockState();
+                if(!axis.isEmpty())source=source.setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,Direction.Axis.byName(axis));
+                if(name.equals("redstone_ore"))source=source.setValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT,true);
+                if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.isSolid() || !LightEngine.hasDifferentLightProperties(source,Blocks.CAVE_AIR.defaultBlockState()))throw new AssertionError("invalid room source "+source);
+                fake.section.setBlockState(0,10,8,source);w.edits.put(new BlockPos(16,10,8),source);
             }
             if(x==1 && z==0 && (jigsawWet || jigsawWater)) {
                 var water=Blocks.WATER.defaultBlockState();
@@ -485,6 +497,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     if(upper || lower)state=state.setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.DOUBLE_BLOCK_HALF,upper ? net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER : net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER);
                 }
                 if(kelpColumn)state=args[1].endsWith("_head") ? Blocks.KELP.defaultBlockState().setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,20) : Blocks.KELP_PLANT.defaultBlockState();
+                if(roomActive)state=Blocks.CAVE_AIR.defaultBlockState();
                 if(args[1].equals("vine_active_head")) state=state.setValue(net.minecraft.world.level.block.GrowingPlantHeadBlock.AGE,7);
                 boolean wasEmpty=eastSection.section.hasOnlyAir();
                 var old=eastSection.section.setBlockState(0,p[1],p[2],state); w.edits.put(pos,state);

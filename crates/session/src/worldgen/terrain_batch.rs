@@ -51,6 +51,7 @@ pub struct FreshTerrainBatch {
     dimension: String,
     terrain: Option<CarvedTerrainWorld>,
     decoration: Option<DecorationConfig>,
+    session_content: Option<GeneratedSessionContent>,
     light_registry: Option<GeneratedBlockRegistry>,
     light_tracker: Option<FreshGenerationLightTracker>,
     light_engine: Option<StagedGenerationLightEngine>,
@@ -482,6 +483,14 @@ struct DecorationConfig {
     washed_blocks: Option<Arc<BTreeSet<String>>>,
     lava_fluids: Option<Arc<BTreeSet<String>>>,
     session_blocks: GeneratedSessionBlockTags,
+}
+
+/// Gameplay data resolved from the same frozen data-pack stack as generation.
+struct GeneratedSessionContent {
+    recipes: Arc<native_resources::recipes::CraftingRecipes>,
+    block_loot: Arc<native_resources::loot::BlockLootTables>,
+    chest_loot: Option<Arc<native_resources::chest_loot::ChestLootTables>>,
+    tools: [Arc<native_resources::transforms::BlockTransformers>; 3],
 }
 
 /// Optional session data is resolved once from the same frozen stack used by
@@ -1290,6 +1299,72 @@ impl FreshTerrainBatch {
         true
     }
 
+    /// Load gameplay resources once from the generation batch's frozen pack stack.
+    /// A failed load leaves the batch unchanged and may be retried.
+    pub fn prepare_session_content(&mut self, provider: &mut impl ResourceProvider) -> Result<()> {
+        use native_resources::{
+            chest_loot::ChestLootTables,
+            loot::BlockLootTables,
+            recipes::CraftingRecipes,
+            transforms::{BlockTransformers, ToolKind},
+        };
+        ensure!(
+            self.session_content.is_none(),
+            "session content is already prepared"
+        );
+        let recipes = CraftingRecipes::load(provider).context("cannot load crafting recipes")?;
+        let tools = [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe]
+            .map(|kind| BlockTransformers::load_for(provider, kind).map(Arc::new));
+        let [axe, shovel, hoe] = tools;
+        let tools = [axe?, shovel?, hoe?];
+        let mut block_loot =
+            BlockLootTables::load(provider).context("cannot load block loot tables")?;
+        block_loot.load_interactions(
+            provider,
+            tools.iter().flat_map(|tool| tool.referenced_loot()),
+        )?;
+        let chest_loot = match ChestLootTables::load(provider) {
+            Ok(loot) => Some(Arc::new(loot)),
+            Err(error) => {
+                eprintln!("Chest loot is unavailable: {error:#}");
+                None
+            }
+        };
+        for warning in recipes.warnings.iter().take(20) {
+            eprintln!("recipe issue: {warning}");
+        }
+        for warning in block_loot.warnings.iter().take(20) {
+            eprintln!("loot issue: {warning}");
+        }
+        self.session_content = Some(GeneratedSessionContent {
+            recipes: Arc::new(recipes),
+            block_loot: Arc::new(block_loot),
+            chest_loot,
+            tools,
+        });
+        Ok(())
+    }
+
+    /// Share prepared gameplay data with a generated session, if available.
+    pub fn apply_session_content(&self, session: &mut crate::loaded::LoadedSession) -> bool {
+        use native_resources::transforms::ToolKind;
+        let Some(content) = &self.session_content else {
+            return false;
+        };
+        session.set_crafting_recipes(Arc::clone(&content.recipes));
+        session.set_block_loot(Arc::clone(&content.block_loot));
+        if let Some(loot) = &content.chest_loot {
+            session.set_chest_loot(Arc::clone(loot));
+        }
+        for (kind, transforms) in [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe]
+            .into_iter()
+            .zip(&content.tools)
+        {
+            session.set_tool_transformers(kind, Arc::clone(transforms));
+        }
+        true
+    }
+
     pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
         ensure!(self.is_complete(), "generation batch has pending work");
         let terrain = self
@@ -1967,6 +2042,7 @@ impl FreshTerrainBatch {
             dimension: format!("{}:{}", id.namespace, id.path),
             terrain: None,
             decoration: None,
+            session_content: None,
             light_registry: None,
             light_tracker: None,
             light_engine: None,
@@ -5134,6 +5210,21 @@ mod session_block_support_tests {
             Ok(None)
         }
         fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+            if path.starts_with("data/minecraft/block_transformer/") {
+                return Ok(Some(
+                    br#"[{"block_state_provider":{"id":"minecraft:stone"}}]"#.to_vec(),
+                ));
+            }
+            if path == "data/example/recipe/test.json" {
+                let result = if self.custom {
+                    "minecraft:dirt"
+                } else {
+                    "minecraft:stone_button"
+                };
+                return Ok(Some(serde_json::to_vec(
+                    &json!({"type":"minecraft:crafting_shapeless", "ingredients":["minecraft:stone"], "result":{"id":result}}),
+                )?));
+            }
             if path == "data/minecraft/worldgen/biome/plains.json" {
                 return Ok(Some(br#"{"has_precipitation":true,"temperature":0.8,"downfall":0.4,"carvers":[],"features":[]}"#.to_vec()));
             }
@@ -5169,6 +5260,8 @@ mod session_block_support_tests {
         fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
             if folder == "worldgen/biome" {
                 Ok(vec![ResourceId::parse("minecraft:plains")?])
+            } else if folder == "recipe" {
+                Ok(vec![ResourceId::parse("example:test")?])
             } else {
                 Ok(vec![])
             }
@@ -5319,6 +5412,48 @@ mod session_block_support_tests {
                 .count(),
             1
         );
+        assert!(!batch.apply_session_content(&mut session));
+        data.custom = true;
+        batch.prepare_session_content(&mut data)?;
+        data.custom = false;
+        assert!(batch.prepare_session_content(&mut data).is_err());
+        assert!(batch.apply_session_content(&mut session));
+        let recipes = session.crafting_recipes().unwrap();
+        let shared = &batch.session_content.as_ref().unwrap().recipes;
+        assert!(Arc::ptr_eq(&recipes, shared));
+        assert_eq!(
+            recipes
+                .matching(2, 2, &[Some("minecraft:stone"), None, None, None])
+                .unwrap()
+                .result
+                .id,
+            ResourceId::parse("minecraft:dirt")?
+        );
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.toggle());
+        inventory.set_slot(
+            PlayerSlot::Crafting(0),
+            ItemStack::new("minecraft:stone".into(), 1, 64, Tag::Compound(vec![])),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::InventoryClick {
+            slot: PlayerSlot::CraftResult,
+            button: crate::inventory::ClickButton::Primary,
+        });
+        session.submit_command(PlayerCommand::InventoryClick {
+            slot: PlayerSlot::Storage(0),
+            button: crate::inventory::ClickButton::Primary,
+        });
+        session.update(Duration::from_millis(50));
+        assert_eq!(
+            session
+                .snapshot()
+                .inventory
+                .slot(PlayerSlot::Storage(0))
+                .unwrap()
+                .id(),
+            "minecraft:dirt"
+        );
         Ok(())
     }
 
@@ -5330,6 +5465,34 @@ mod session_block_support_tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let mut fixture = Data { custom: false };
+        let block_ids = ["minecraft:air", "minecraft:stone", "minecraft:water"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let carvers = CarverBlockTags::load(&mut fixture, &block_ids)?;
+        let definition = json!({"type":"noise","biome_source":{"type":"fixed","biome":"minecraft:plains"},"settings":{
+            "noise":{"min_y":0,"height":16},"legacy_random_source":false,"sea_level":8,
+            "default_block":"minecraft:stone","default_fluid":"minecraft:water","disable_mob_generation":true,
+            "spawn_target":[],"material_rule":{"type":"block","result_state":"minecraft:stone"},
+            "noise_router":{"final_density":1,"temperature":0,"vegetation":0,"continents":0,"erosion":0,"depth":0,"ridges":0,"chunk_surface_level":8}
+        }});
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut fixture, &definition, 42, 0, 16)?;
+        let mut batch =
+            FreshTerrainBatch::new_without_structures(generator, carvers, "minecraft:overworld")?;
+        batch.prepare_session_content(&mut resources)?;
+        let mut session = fresh_player_session();
+        assert!(batch.apply_session_content(&mut session));
+        let recipes = session.crafting_recipes().unwrap();
+        assert_eq!(
+            recipes
+                .matching(2, 2, &[Some("minecraft:honey_bottle"); 4])
+                .unwrap()
+                .result
+                .id,
+            ResourceId::parse("minecraft:honey_block")?
+        );
         let registry = resources.vanilla_block_ids()?;
         let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);
         ensure!(tags.climbable.is_some(), "climbable tag unavailable");

@@ -818,6 +818,7 @@ impl GenerationReady {
         }
         .map_err(anyhow::Error::msg)?;
         self.batch.apply_session_block_support(&mut session);
+        self.batch.apply_session_content(&mut session);
         if let Some(processed) = &self.postprocessed {
             let mut selected = native_session::worldgen::chunk_ticks::ActivatedRegionTicks {
                 game_time: processed.activated_ticks.game_time,
@@ -1137,6 +1138,7 @@ impl GenerationWorker {
                 (None, None) => {}
                 _ => anyhow::bail!("generation data pack snapshot does not match frozen settings"),
             }
+            ready.batch.prepare_session_content(&mut resources)?;
             let disabled = if options.spawn_mobs {
                 ready.batch.mob_generation_disabled()?
             } else {
@@ -1469,6 +1471,7 @@ impl GenerationWorker {
             ready.entity_collision_registry = entity_collision_registry;
             ready.level_settings = level_settings;
             ready.pack_snapshot = pack_snapshot;
+            ready.batch.prepare_session_content(&mut resources)?;
             let Some(mut ready) = complete_spawn_search(
                 ready,
                 &mut resources,

@@ -7847,7 +7847,10 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             == Some(true);
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
-                        && ((old.name == "minecraft:stone" && old.properties.is_empty())
+                        && ((matches!(
+                            old.name.as_str(),
+                            "minecraft:stone" | "minecraft:sulfur" | "minecraft:cinnabar"
+                        ) && old.properties.is_empty())
                             || generated_ore_state(&old)?)
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
@@ -12203,6 +12206,10 @@ mod tests {
             "vine_active_self_deepslate_coal_ore_magma_block",
             "vine_active_redstone_ore_magma_block",
             "vine_active_self_deepslate_redstone_ore_magma_block",
+            "vine_active_sulfur_magma_block",
+            "vine_active_self_sulfur_magma_block",
+            "vine_active_cinnabar_magma_block",
+            "vine_active_self_cinnabar_magma_block",
         ]);
     }
 
@@ -12445,6 +12452,14 @@ mod tests {
                         "deepslate_coal_ore"
                     } else {
                         "coal_ore"
+                    });
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
+                } else if mode.contains("_sulfur_") || mode.contains("_cinnabar_") {
+                    let source = state(if mode.contains("_sulfur_") {
+                        "sulfur"
+                    } else {
+                        "cinnabar"
                     });
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();

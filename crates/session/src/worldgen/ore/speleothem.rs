@@ -252,6 +252,13 @@ mod tests {
         let writable = terrain.snapshot().chunks.keys().copied().collect();
         let mut region = terrain.decoration_region(&tags, &motion, writable)?;
         for name in ["minecraft:sulfur", "minecraft:cinnabar"] {
+            assert_eq!(
+                monster_block_flags(&BlockState {
+                    name: name.into(),
+                    properties: BTreeMap::new()
+                })?,
+                (true, true)
+            );
             assert!(DiskWorld::is_solid(
                 &mut region,
                 &BlockState {

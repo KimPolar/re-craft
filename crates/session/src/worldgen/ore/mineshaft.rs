@@ -886,6 +886,55 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[test]
+    fn mineshaft_replaces_verified_cinnabar_and_sulfur() -> Result<()> {
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        replace_column(&mut terrain, 4, 4, "cinnabar");
+        replace_column(&mut terrain, 5, 5, "sulfur");
+        let registry = [
+            "air",
+            "cave_air",
+            "void_air",
+            "stone",
+            "oak_planks",
+            "oak_fence",
+            "cinnabar",
+            "sulfur",
+        ]
+        .into_iter()
+        .map(|v| format!("minecraft:{v}"))
+        .collect();
+        let motion = HeightmapTags::load(&mut MotionData, &registry)?;
+        let mut region =
+            terrain.decoration_region(&tags, &motion, BTreeSet::from([ChunkPos { x: 0, z: 0 }]))?;
+        let mut biome = |_: [i32; 3], _: &World| -> Result<bool> { Ok(false) };
+        {
+            let mut adapter = MineshaftRegion {
+                region: &mut region,
+                blocking_biome: &mut biome,
+            };
+            for y in [4, 5] {
+                adapter.write(
+                    [4, y, 4],
+                    BlockState {
+                        name: "minecraft:cave_air".into(),
+                        properties: BTreeMap::new(),
+                    },
+                )?;
+            }
+        }
+        region.finish()?;
+        assert_eq!(
+            terrain.snapshot().block(4, 4, 4).unwrap().name,
+            "minecraft:cave_air"
+        );
+        assert_eq!(
+            terrain.snapshot().block(4, 5, 4).unwrap().name,
+            "minecraft:cave_air"
+        );
+        Ok(())
+    }
+
     struct BiomeData(bool);
     struct MotionData;
     struct SupportData(bool);

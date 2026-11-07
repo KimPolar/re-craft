@@ -5232,6 +5232,8 @@ pub(super) fn monster_block_flags(state: &BlockState) -> Result<(bool, bool)> {
     if matches!(
         name,
         "minecraft:stone"
+            | "minecraft:cinnabar"
+            | "minecraft:sulfur"
             | "minecraft:deepslate"
             | "minecraft:tuff"
             | "minecraft:granite"

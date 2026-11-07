@@ -610,6 +610,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:budding_amethyst"
         | "minecraft:smooth_basalt"
         | "minecraft:dripstone_block"
+        | "minecraft:cinnabar"
         | "minecraft:sulfur"
         | "minecraft:cobbled_deepslate"
         | "minecraft:stone_bricks"
@@ -2367,6 +2368,7 @@ mod tests {
             "calcite",
             "dripstone_block",
             "pointed_dripstone",
+            "cinnabar",
             "sulfur",
             "sulfur_spike",
             "short_grass",

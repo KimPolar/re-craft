@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use native_resources::packs::{ResourceId, ResourceProvider};
 use native_resources::speleothem::{self, SpeleothemWorld, Thickness, VerticalDirection};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -129,40 +130,6 @@ impl speleothem::ClusterWorld for ClusterDraft {
         Ok(())
     }
 }
-struct Numbers(f32, bool);
-impl speleothem::ClusterNumbers for Numbers {
-    fn height(&self, random: &mut native_core::random::DecorationRandom) -> i32 {
-        if self.1 {
-            1 + random.next_int_bound(4).unwrap()
-        } else {
-            4
-        }
-    }
-    fn wetness(&self, _: &mut native_core::random::DecorationRandom) -> f32 {
-        self.0
-    }
-    fn density(&self, random: &mut native_core::random::DecorationRandom) -> f32 {
-        if self.1 {
-            0.3 + random.next_float() * (0.7 - 0.3)
-        } else {
-            0.7
-        }
-    }
-    fn radius(&self, random: &mut native_core::random::DecorationRandom) -> i32 {
-        if self.1 {
-            1 + random.next_int_bound(3).unwrap()
-        } else {
-            2
-        }
-    }
-    fn layer(&self, random: &mut native_core::random::DecorationRandom) -> i32 {
-        if self.1 {
-            1 + random.next_int_bound(3).unwrap()
-        } else {
-            2
-        }
-    }
-}
 impl SpeleothemWorld for Draft {
     type State = State;
     fn block(&mut self, pos: [i32; 3]) -> Result<State> {
@@ -222,6 +189,23 @@ fn speleothem_columns_match_java() -> Result<()> {
     let version = game.join("versions/26.3");
     let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
     ensure!(manifest["id"] == "26.3", "wrong Minecraft version");
+    let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+    let source = resources
+        .read_data("data/minecraft/worldgen/feature/sulfur_spike_cluster.json")?
+        .context("sulfur cluster feature missing")?;
+    let actual: Value = serde_json::from_slice(&source)?;
+    let decoded = speleothem::SpeleothemClusterFeature::decode(&actual, &mut |v| Ok(v.clone()))?;
+    assert_eq!(decoded.base_id(), &ResourceId::parse("minecraft:sulfur")?);
+    assert_eq!(
+        decoded.pointed_id(),
+        &ResourceId::parse("minecraft:sulfur_spike")?
+    );
+    assert_eq!(
+        decoded
+            .replaceable_tag()
+            .context("replaceable tag missing")?,
+        &ResourceId::parse("minecraft:sulfur_spike_replaceable_blocks")?
+    );
     let mut paths = vec![version.join("26.3.jar"), temp.path().to_owned()];
     for library in manifest["libraries"]
         .as_array()
@@ -263,9 +247,18 @@ fn speleothem_columns_match_java() -> Result<()> {
     let mut chances = 0;
     let mut heights = 0;
     let mut clusters = 0;
+    let mut effects = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
         match parts.as_slice() {
+            ["E", _, block_entity, poi, postprocessing] => {
+                assert_eq!(
+                    (*block_entity, *poi, *postprocessing),
+                    ("false", "false", "null"),
+                    "{line}"
+                );
+                effects += 1;
+            }
             ["C", direction, height, merge, support, events] => {
                 let direction = if *direction == "0" {
                     VerticalDirection::Up
@@ -401,22 +394,53 @@ fn speleothem_columns_match_java() -> Result<()> {
                     blocks: BTreeMap::new(),
                     events: vec![],
                 };
-                let config = speleothem::ClusterConfig {
-                    search_range: 12,
-                    height_difference: 1,
-                    height_deviation: 3,
-                    edge_chance: 0.1,
-                    edge_distance: 3,
-                    center_distance: 8,
+                let variable = variable.parse::<u8>()?;
+                let height = if variable != 0 {
+                    serde_json::json!({"type":"minecraft:uniform", "min_inclusive":1, "max_inclusive":4})
+                } else {
+                    serde_json::json!(4)
                 };
+                let radius = if variable != 0 {
+                    serde_json::json!({"type":"minecraft:uniform", "min_inclusive":1, "max_inclusive":3})
+                } else {
+                    serde_json::json!(2)
+                };
+                let density = match variable {
+                    0 => serde_json::json!(0.7),
+                    1 => {
+                        serde_json::json!({"type":"minecraft:uniform", "min_inclusive":0.3, "max_exclusive":0.7})
+                    }
+                    2 => {
+                        serde_json::json!({"type":"minecraft:trapezoid", "min":0.3, "max":0.7, "plateau":0.1})
+                    }
+                    3 => {
+                        serde_json::json!({"type":"minecraft:trapezoid", "min":0.3, "max":0.7, "plateau":-0.1})
+                    }
+                    4 => {
+                        serde_json::json!({"type":"minecraft:clamped_normal", "mean":0.5, "deviation":-0.2, "min":0.3, "max":0.7})
+                    }
+                    _ => anyhow::bail!("bad provider"),
+                };
+                let feature = speleothem::SpeleothemClusterFeature::decode(
+                    &serde_json::json!({
+                        "type":"minecraft:speleothem_cluster",
+                        "base_block":"minecraft:sulfur", "pointed_block":"minecraft:sulfur_spike",
+                        "replaceable_blocks":["minecraft:stone"],
+                        "floor_to_ceiling_search_range":12, "height":height,
+                        "radius":radius, "max_stalagmite_stalactite_height_diff":1,
+                        "height_deviation":3, "speleothem_block_layer_thickness":radius,
+                        "density":density, "wetness":wet.parse::<f32>()?,
+                        "chance_of_speleothem_at_max_distance_from_center":0.1,
+                        "max_distance_from_edge_affecting_chance_of_speleothem":3,
+                        "max_distance_from_center_affecting_height_bias":8
+                    }),
+                    &mut |value| Ok(value.clone()),
+                )?;
                 let mut random = native_core::random::DecorationRandom::new(seed.parse()?);
                 assert_eq!(
-                    config.place(
-                        &mut draft,
-                        &Numbers(wet.parse()?, *variable == "1"),
-                        &mut random,
-                        [0, 10, 0]
-                    )?,
+                    feature
+                        .config
+                        .place(&mut draft, &feature, &mut random, [0, 10, 0])?,
                     result.parse::<bool>()?,
                     "{line}"
                 );
@@ -440,6 +464,7 @@ fn speleothem_columns_match_java() -> Result<()> {
     assert_eq!(scans, 5 * 7);
     assert_eq!(chances, 3 * 3 * 5 * 5);
     assert_eq!(heights, 5 * 5 * 3 * 3 * 16);
-    assert_eq!(clusters, 2 * 2 * 4 * 16);
+    assert_eq!(clusters, 5 * 2 * 4 * 16);
+    assert_eq!(effects, 1 + 20 + 16);
     Ok(())
 }

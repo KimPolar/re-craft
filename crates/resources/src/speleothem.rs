@@ -1,6 +1,9 @@
 //! Shared 26.3 speleothem column placement for cluster and individual features.
-use anyhow::{Context, Result};
+use crate::{packs::ResourceId, placed_feature::IntProvider};
+use anyhow::{Context, Result, bail, ensure};
 use native_core::random::DecorationRandom;
+use serde_json::Value;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerticalDirection {
@@ -157,6 +160,308 @@ pub struct ClusterConfig {
     pub edge_chance: f32,
     pub edge_distance: i32,
     pub center_distance: i32,
+}
+
+#[derive(Clone, Debug)]
+enum FloatProvider {
+    Constant(f32),
+    Uniform(f32, f32),
+    Trapezoid(f32, f32, f32),
+    ClampedNormal {
+        mean: f32,
+        deviation: f32,
+        min: f32,
+        max: f32,
+    },
+}
+
+impl FloatProvider {
+    fn parse(value: &Value) -> Result<Self> {
+        let number = |value: &Value| -> Result<f32> {
+            let n = value.as_f64().context("invalid float provider value")? as f32;
+            ensure!(n.is_finite(), "invalid float provider value");
+            Ok(n)
+        };
+        if value.is_number() {
+            return Ok(Self::Constant(number(value)?));
+        }
+        let field = |name: &str| -> Result<f32> {
+            number(
+                value
+                    .get(name)
+                    .with_context(|| format!("missing float provider {name}"))?,
+            )
+        };
+        let id = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing float provider type")?,
+        )?;
+        ensure!(
+            id.namespace == "minecraft",
+            "unsupported float provider namespace"
+        );
+        Ok(match id.path.as_str() {
+            "constant" => Self::Constant(field("value")?),
+            "uniform" => {
+                let (min, max) = (field("min_inclusive")?, field("max_exclusive")?);
+                ensure!(min < max, "invalid uniform float range");
+                Self::Uniform(min, max)
+            }
+            "trapezoid" => {
+                let (min, max, plateau) = (field("min")?, field("max")?, field("plateau")?);
+                ensure!(
+                    min <= max && plateau <= max - min,
+                    "invalid trapezoid float range"
+                );
+                Self::Trapezoid(min, max, plateau)
+            }
+            "clamped_normal" => {
+                let (mean, deviation, min, max) = (
+                    field("mean")?,
+                    field("deviation")?,
+                    field("min")?,
+                    field("max")?,
+                );
+                ensure!(min <= max, "invalid clamped normal range");
+                Self::ClampedNormal {
+                    mean,
+                    deviation,
+                    min,
+                    max,
+                }
+            }
+            _ => bail!("unsupported speleothem float provider"),
+        })
+    }
+    fn bounds(&self) -> (f32, f32) {
+        match *self {
+            Self::Constant(v) => (v, v),
+            Self::Uniform(a, b) | Self::Trapezoid(a, b, _) => (a, b),
+            Self::ClampedNormal { min, max, .. } => (min, max),
+        }
+    }
+    fn sample(&self, random: &mut DecorationRandom) -> f32 {
+        match *self {
+            Self::Constant(v) => v,
+            Self::Uniform(a, b) => a + random.next_float() * (b - a),
+            Self::Trapezoid(a, b, p) => {
+                let left = (b - a - p) / 2.0;
+                let right = b - a - left;
+                a + random.next_float() * right + random.next_float() * left
+            }
+            Self::ClampedNormal {
+                mean,
+                deviation,
+                min,
+                max,
+            } => {
+                let value = mean + (random.next_gaussian() as f32) * deviation;
+                if value < min {
+                    min
+                } else if value > max {
+                    max
+                } else {
+                    value
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Replaceable {
+    Tag(ResourceId),
+    Blocks(Vec<ResourceId>),
+}
+
+/// Decoded 26.3 cluster definition, with state and holder references retained
+/// for the caller's data-pack-aware world adapter.
+pub struct SpeleothemClusterFeature<S> {
+    pub config: ClusterConfig,
+    base: S,
+    pointed: S,
+    base_id: ResourceId,
+    pointed_id: ResourceId,
+    replaceable: Replaceable,
+    height: IntProvider,
+    radius: IntProvider,
+    layer: IntProvider,
+    density: FloatProvider,
+    wetness: FloatProvider,
+}
+
+impl<S> SpeleothemClusterFeature<S> {
+    pub fn decode(value: &Value, resolve: &mut impl FnMut(&Value) -> Result<S>) -> Result<Self> {
+        let id = ResourceId::parse(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .context("missing speleothem feature type")?,
+        )?;
+        ensure!(
+            id.namespace == "minecraft" && id.path == "speleothem_cluster",
+            "wrong speleothem feature type"
+        );
+        let field = |name: &str| {
+            value
+                .get(name)
+                .with_context(|| format!("missing speleothem {name}"))
+        };
+        let state_id = |state: &Value| -> Result<ResourceId> {
+            ResourceId::parse(
+                state
+                    .as_str()
+                    .or_else(|| state.get("id").and_then(Value::as_str))
+                    .context("missing speleothem block ID")?,
+            )
+        };
+        let base_value = field("base_block")?;
+        let pointed_value = field("pointed_block")?;
+        let base_id = state_id(base_value)?;
+        let pointed_id = state_id(pointed_value)?;
+        let base = resolve(base_value)?;
+        let pointed = resolve(pointed_value)?;
+        let raw = field("replaceable_blocks")?;
+        let replaceable = if let Some(tag) = raw.as_str().and_then(|s| s.strip_prefix('#')) {
+            Replaceable::Tag(ResourceId::parse(tag)?)
+        } else {
+            let names = if let Some(name) = raw.as_str() {
+                vec![name]
+            } else {
+                raw.as_array()
+                    .context("invalid replaceable blocks")?
+                    .iter()
+                    .map(|v| v.as_str().context("invalid replaceable block"))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            Replaceable::Blocks(
+                names
+                    .into_iter()
+                    .map(ResourceId::parse)
+                    .collect::<Result<_>>()?,
+            )
+        };
+        let integer = |name: &str, lo: i32, hi: i32| -> Result<i32> {
+            let n = i32::try_from(
+                field(name)?
+                    .as_i64()
+                    .context("invalid speleothem integer")?,
+            )?;
+            ensure!((lo..=hi).contains(&n), "speleothem integer out of range");
+            Ok(n)
+        };
+        let provider = |name: &str, lo: i32, hi: i32| -> Result<IntProvider> {
+            let p = IntProvider::parse(field(name)?, 0)?;
+            let (min, max) = p.bounds();
+            ensure!(min >= lo && max <= hi, "speleothem provider out of range");
+            Ok(p)
+        };
+        let float_provider = |name: &str| -> Result<FloatProvider> {
+            let p = FloatProvider::parse(field(name)?)?;
+            let (min, max) = p.bounds();
+            ensure!(
+                min >= 0.0 && max <= 2.0,
+                "speleothem float provider out of range"
+            );
+            Ok(p)
+        };
+        let edge_chance = field("chance_of_speleothem_at_max_distance_from_center")?
+            .as_f64()
+            .context("invalid edge chance")? as f32;
+        ensure!(
+            edge_chance.is_finite() && (0.0..=1.0).contains(&edge_chance),
+            "invalid edge chance"
+        );
+        Ok(Self {
+            config: ClusterConfig {
+                search_range: integer("floor_to_ceiling_search_range", 1, 512)?,
+                height_difference: integer("max_stalagmite_stalactite_height_diff", 0, 64)?,
+                height_deviation: integer("height_deviation", 1, 64)?,
+                edge_chance,
+                edge_distance: integer(
+                    "max_distance_from_edge_affecting_chance_of_speleothem",
+                    1,
+                    64,
+                )?,
+                center_distance: integer("max_distance_from_center_affecting_height_bias", 1, 64)?,
+            },
+            base,
+            pointed,
+            base_id,
+            pointed_id,
+            replaceable,
+            height: provider("height", 1, 128)?,
+            radius: provider("radius", 1, 128)?,
+            layer: provider("speleothem_block_layer_thickness", 0, 128)?,
+            density: float_provider("density")?,
+            wetness: float_provider("wetness")?,
+        })
+    }
+    pub fn base(&self) -> &S {
+        &self.base
+    }
+    pub fn pointed(&self) -> &S {
+        &self.pointed
+    }
+    pub fn base_id(&self) -> &ResourceId {
+        &self.base_id
+    }
+    pub fn pointed_id(&self) -> &ResourceId {
+        &self.pointed_id
+    }
+    pub fn replaceable_tag(&self) -> Option<&ResourceId> {
+        if let Replaceable::Tag(tag) = &self.replaceable {
+            Some(tag)
+        } else {
+            None
+        }
+    }
+    pub fn replaceable_blocks(&self) -> Option<&[ResourceId]> {
+        if let Replaceable::Blocks(ids) = &self.replaceable {
+            Some(ids)
+        } else {
+            None
+        }
+    }
+    pub fn required_tags(&self) -> BTreeSet<ResourceId> {
+        let mut tags =
+            BTreeSet::from([ResourceId::parse("minecraft:base_stone_overworld").unwrap()]);
+        if let Some(tag) = self.replaceable_tag() {
+            tags.insert(tag.clone());
+        }
+        tags
+    }
+    pub fn required_blocks(&self) -> BTreeSet<ResourceId> {
+        let mut blocks = BTreeSet::from([
+            self.base_id.clone(),
+            self.pointed_id.clone(),
+            ResourceId::parse("minecraft:water").unwrap(),
+        ]);
+        if let Some(ids) = self.replaceable_blocks() {
+            blocks.extend(ids.iter().cloned());
+        }
+        blocks
+    }
+}
+
+impl<S> ClusterNumbers for SpeleothemClusterFeature<S> {
+    fn height(&self, r: &mut DecorationRandom) -> i32 {
+        self.height.sample(r)
+    }
+    fn wetness(&self, r: &mut DecorationRandom) -> f32 {
+        self.wetness.sample(r)
+    }
+    fn density(&self, r: &mut DecorationRandom) -> f32 {
+        self.density.sample(r)
+    }
+    fn radius(&self, r: &mut DecorationRandom) -> i32 {
+        self.radius.sample(r)
+    }
+    fn layer(&self, r: &mut DecorationRandom) -> i32 {
+        self.layer.sample(r)
+    }
 }
 
 impl ClusterConfig {
@@ -397,4 +702,40 @@ pub fn replace_base_layer(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cluster_codec_rejects_out_of_range_providers_and_retains_tag() {
+        let mut value = json!({
+            "type": "minecraft:speleothem_cluster",
+            "base_block": "minecraft:sulfur", "pointed_block": "minecraft:sulfur_spike",
+            "replaceable_blocks": "#minecraft:sulfur_spike_replaceable_blocks",
+            "floor_to_ceiling_search_range": 12, "height": 4, "radius": 2,
+            "max_stalagmite_stalactite_height_diff": 1, "height_deviation": 3,
+            "speleothem_block_layer_thickness": 2, "density": 0.7, "wetness": 0.0,
+            "chance_of_speleothem_at_max_distance_from_center": 0.1,
+            "max_distance_from_edge_affecting_chance_of_speleothem": 3,
+            "max_distance_from_center_affecting_height_bias": 8
+        });
+        let decode =
+            |value: &Value| SpeleothemClusterFeature::decode(value, &mut |v| Ok(v.clone()));
+        let decoded = decode(&value).unwrap();
+        assert_eq!(decoded.required_tags().len(), 2);
+        assert!(decoded.replaceable_blocks().is_none());
+        value["radius"] =
+            json!({"type":"minecraft:uniform", "min_inclusive":1, "max_inclusive":129});
+        assert!(decode(&value).is_err());
+        value["radius"] = json!(2);
+        value["density"] =
+            json!({"type":"minecraft:uniform", "min_inclusive":0.1, "max_exclusive":2.1});
+        assert!(decode(&value).is_err());
+        value["density"] = json!(0.5);
+        value["floor_to_ceiling_search_range"] = json!(0);
+        assert!(decode(&value).is_err());
+    }
 }

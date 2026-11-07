@@ -19,6 +19,8 @@ import net.minecraft.util.valueproviders.ConstantInt;
 import net.minecraft.util.valueproviders.ConstantFloat;
 import net.minecraft.util.valueproviders.UniformInt;
 import net.minecraft.util.valueproviders.UniformFloat;
+import net.minecraft.util.valueproviders.TrapezoidFloat;
+import net.minecraft.util.valueproviders.ClampedNormalFloat;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.material.Fluids;
@@ -35,6 +37,9 @@ public class SpeleothemOracle {
         bind.invoke(Blocks.STONE.builtInRegistryHolder(),List.of(BlockTags.BASE_STONE_OVERWORLD));
         bind.invoke(Fluids.WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
         bind.invoke(Fluids.FLOWING_WATER.builtInRegistryHolder(),List.of(FluidTags.WATER));
+        for(var block:List.of(Blocks.SULFUR,Blocks.SULFUR_SPIKE,Blocks.WATER)) for(var state:block.getStateDefinition().getPossibleStates()) {
+            out.printf("E %s %s %s %s%n",block,state.hasBlockEntity(),net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state),state.getPostProcessPos(null,BlockPos.ZERO));
+        }
         for (int d=0;d<2;d++) for(int height=-1;height<=6;height++) for(int merge=0;merge<2;merge++) for(int support=0;support<4;support++) {
             var direction=d==0?Direction.UP:Direction.DOWN; int step=d==0?1:-1;
             var start=new BlockPos(4,10,7); var supportPos=start.relative(direction.getOpposite());
@@ -98,8 +103,9 @@ public class SpeleothemOracle {
             int result=(int)height.invoke(cluster,random,x,z,value,h);
             out.printf("H %d %d %d %d %d %d %d%n",x,z,h,density,seed,result,random.nextLong());
         }
-        for(int variable=0;variable<2;variable++) for(int wet=0;wet<2;wet++) for(int profile=0;profile<4;profile++) for(long seed=0;seed<16;seed++) {
-            var cluster2=new SpeleothemClusterFeature(Blocks.SULFUR.defaultBlockState(),Blocks.SULFUR_SPIKE.defaultBlockState(),replaceable,12,variable==0?ConstantInt.of(4):UniformInt.of(1,4),variable==0?ConstantInt.of(2):UniformInt.of(1,3),1,3,variable==0?ConstantInt.of(2):UniformInt.of(1,3),variable==0?ConstantFloat.of(.7f):UniformFloat.of(.3f,.7f),ConstantFloat.of((float)wet),.1f,3,8);
+        for(int variable=0;variable<5;variable++) for(int wet=0;wet<2;wet++) for(int profile=0;profile<4;profile++) for(long seed=0;seed<16;seed++) {
+            var densityProvider=switch(variable){case 0->ConstantFloat.of(.7f);case 1->UniformFloat.of(.3f,.7f);case 2->TrapezoidFloat.of(.3f,.7f,.1f);case 3->TrapezoidFloat.of(.3f,.7f,-.1f);default->ClampedNormalFloat.of(.5f,-.2f,.3f,.7f);};
+            var cluster2=new SpeleothemClusterFeature(Blocks.SULFUR.defaultBlockState(),Blocks.SULFUR_SPIKE.defaultBlockState(),replaceable,12,variable==0?ConstantInt.of(4):UniformInt.of(1,4),variable==0?ConstantInt.of(2):UniformInt.of(1,3),1,3,variable==0?ConstantInt.of(2):UniformInt.of(1,3),densityProvider,ConstantFloat.of((float)wet),.1f,3,8);
             int scenario=profile; var states=new HashMap<BlockPos,BlockState>(); var events=new ArrayList<String>();
             var world=(WorldGenLevel)Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(),new Class[]{WorldGenLevel.class},(o,m,a)->{
                 var pos=(BlockPos)a[0]; int y=pos.getY();

@@ -492,7 +492,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         {
             (1, 0)
         }
-        "minecraft:pointed_dripstone" if state.properties.len() == 3 => {
+        "minecraft:pointed_dripstone" | "minecraft:sulfur_spike" if state.properties.len() == 3 => {
             if !matches!(
                 state.properties.get("thickness").map(String::as_str),
                 Some("tip_merge" | "tip" | "frustum" | "middle" | "base")
@@ -610,6 +610,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
         | "minecraft:budding_amethyst"
         | "minecraft:smooth_basalt"
         | "minecraft:dripstone_block"
+        | "minecraft:sulfur"
         | "minecraft:cobbled_deepslate"
         | "minecraft:stone_bricks"
         | "minecraft:cobblestone"
@@ -2366,6 +2367,8 @@ mod tests {
             "calcite",
             "dripstone_block",
             "pointed_dripstone",
+            "sulfur",
+            "sulfur_spike",
             "short_grass",
             "fern",
             "vine",

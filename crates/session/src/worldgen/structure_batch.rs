@@ -531,7 +531,7 @@ impl PreparedStructureStages {
         pos: ChunkPos,
         registered: &BTreeSet<&ResourceId>,
         huts_recorded: bool,
-        recorded_jigsaws: Option<&BTreeSet<TerrainStartKey>>,
+        recorded_templates: Option<&BTreeSet<TerrainStartKey>>,
         recorded_mineshafts: Option<&BTreeSet<TerrainStartKey>>,
     ) -> bool {
         self.references.get(&pos).is_some_and(|references| {
@@ -542,8 +542,13 @@ impl PreparedStructureStages {
                     let simple = self.starts.get(&source).and_then(|starts| starts.get(id));
                     let jigsaw = self.jigsaw_starts.get(&source).and_then(|starts| starts.get(id));
                     let mineshaft = self.mineshafts.get(&source).and_then(|starts| starts.get(id));
-                    if self.ruined_portal_starts.get(&source).is_some_and(|starts| starts.contains_key(id)) {
-                        return false;
+                    if let Some(start) = self.ruined_portal_starts.get(&source).and_then(|starts| starts.get(id)) {
+                        return self.starts.contains_key(&source)
+                            && simple.is_none() && jigsaw.is_none() && mineshaft.is_none()
+                            && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && start.chunk == [source.x, source.z]
+                            && start.template.entities.is_empty()
+                            && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }
                     if let Some(start) = mineshaft {
                         return simple.is_none()
@@ -557,7 +562,7 @@ impl PreparedStructureStages {
                             && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
                             && mineshaft.is_none()
                             && start.chunk == [source.x, source.z]
-                            && recorded_jigsaws.is_some_and(|keys| keys.contains(&(id.clone(), source)));
+                            && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }
                     simple.is_some_and(|start| {
                         if start.chunk != [source.x, source.z] { return false; }

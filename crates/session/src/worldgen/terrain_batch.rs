@@ -869,7 +869,7 @@ fn features_cannot_spawn_entities(
 struct GeneratedEntitySources {
     complete_spawns: BTreeSet<ChunkPos>,
     recorded_hut_features: BTreeSet<ChunkPos>,
-    recorded_jigsaw_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
+    recorded_template_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
     recorded_mineshaft_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
     completed_feature_passes: BTreeSet<ChunkPos>,
     // Only completed passes can already have contributed entities. Once an
@@ -884,7 +884,7 @@ fn structure_entities_are_accounted_for(
     pos: ChunkPos,
     completed: impl Fn(ChunkPos) -> bool,
     recorded_huts: &BTreeSet<ChunkPos>,
-    recorded_jigsaws: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
+    recorded_templates: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
     recorded_mineshafts: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
 ) -> bool {
     let registered: BTreeSet<_> = registry
@@ -907,7 +907,7 @@ fn structure_entities_are_accounted_for(
                     source,
                     &registered,
                     recorded_huts.contains(&source),
-                    recorded_jigsaws.get(&source),
+                    recorded_templates.get(&source),
                     recorded_mineshafts.get(&source),
                 )
         })
@@ -949,13 +949,13 @@ impl GeneratedEntitySources {
 
 impl FreshTerrainBatch {
     #[cfg(test)]
-    pub(super) fn recorded_jigsaw_feature_for_test(
+    pub(super) fn recorded_template_feature_for_test(
         &self,
         pos: ChunkPos,
         key: &TerrainStartKey,
     ) -> bool {
         self.entity_sources
-            .recorded_jigsaw_features
+            .recorded_template_features
             .get(&pos)
             .is_some_and(|keys| keys.contains(key))
     }
@@ -1539,7 +1539,7 @@ impl FreshTerrainBatch {
                             .is_some_and(|stage| stage >= GenerationStage::Features)
                     },
                     &self.entity_sources.recorded_hut_features,
-                    &self.entity_sources.recorded_jigsaw_features,
+                    &self.entity_sources.recorded_template_features,
                     &self.entity_sources.recorded_mineshaft_features,
                 )
             }),
@@ -4614,24 +4614,25 @@ impl FreshTerrainBatch {
                         } else {
                             BTreeSet::new()
                         };
-                        let recorded_jigsaws: BTreeSet<_> = planned
+                        let recorded_templates: BTreeSet<_> = planned
                             .iter()
                             .flat_map(|entry| {
                                 entry.starts.iter().filter_map(|start| {
-                                    let super::structure_batch::PlannedStructureStart::Jigsaw(
-                                        start,
-                                    ) = start
-                                    else {
-                                        return None;
+                                    let chunk = match start {
+                                        super::structure_batch::PlannedStructureStart::Jigsaw(start) => start.chunk,
+                                        super::structure_batch::PlannedStructureStart::RuinedPortal(start)
+                                            if start.template.entities.is_empty() => start.chunk,
+                                        _ => return None,
                                     };
                                     let key = (
                                         entry.entry.id.clone(),
                                         ChunkPos {
-                                            x: start.chunk[0],
-                                            z: start.chunk[1],
+                                            x: chunk[0],
+                                            z: chunk[1],
                                         },
                                     );
-                                    entity_free_jigsaws.contains(&key).then_some(key)
+                                    (matches!(start, super::structure_batch::PlannedStructureStart::RuinedPortal(_))
+                                        || entity_free_jigsaws.contains(&key)).then_some(key)
                                 })
                             })
                             .collect();
@@ -4701,10 +4702,10 @@ impl FreshTerrainBatch {
                                 .recorded_mineshaft_features
                                 .insert(pos, recorded_mineshafts);
                         }
-                        if !recorded_jigsaws.is_empty() {
+                        if !recorded_templates.is_empty() {
                             self.entity_sources
-                                .recorded_jigsaw_features
-                                .insert(pos, recorded_jigsaws);
+                                .recorded_template_features
+                                .insert(pos, recorded_templates);
                         }
                         if huts_recorded {
                             self.entity_sources.recorded_hut_features.insert(pos);
@@ -5424,9 +5425,107 @@ mod entity_source_tests {
         stages.references.insert(source, references);
         assert_eq!(
             structures_with_piece_at(Some(&stages), [3, 2, 3])?,
-            BTreeSet::from([id])
+            BTreeSet::from([id.clone()])
         );
         assert!(structures_with_piece_at(Some(&stages), [6, 2, 3])?.is_empty());
+        let registered = BTreeSet::from([&id]);
+        let evidence = BTreeSet::from([(id.clone(), source)]);
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            None,
+            None
+        ));
+        assert!(stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            Some(&evidence),
+            None
+        ));
+        struct PortalRegistry;
+        impl ResourceProvider for PortalRegistry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/portal.json")
+                    .then(|| br#"{"step":"surface_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:portal")?])
+            }
+        }
+        let registry = StructureDecorationSchedule::load(&mut PortalRegistry)?;
+        let mut recorded = BTreeMap::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let target = ChunkPos { x, z };
+                stages.references.insert(
+                    target,
+                    collect_ordered_structure_references(target, |pos| {
+                        Ok(if pos == source {
+                            vec![bounds.clone()]
+                        } else {
+                            vec![]
+                        })
+                    })?,
+                );
+                recorded.insert(target, evidence.clone());
+            }
+        }
+        let covered = |stages: &PreparedStructureStages, recorded: &BTreeMap<_, _>| {
+            structure_entities_are_accounted_for(
+                stages,
+                &registry,
+                source,
+                |_| true,
+                &BTreeSet::new(),
+                recorded,
+                &BTreeMap::new(),
+            )
+        };
+        assert!(covered(&stages, &recorded));
+        recorded.remove(&source);
+        assert!(!covered(&stages, &recorded));
+        Arc::make_mut(
+            &mut stages
+                .ruined_portal_starts
+                .get_mut(&source)
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .template,
+        )
+        .entities
+        .push(Tag::Compound(vec![]));
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            Some(&evidence),
+            None
+        ));
+        Arc::make_mut(
+            &mut stages
+                .ruined_portal_starts
+                .get_mut(&source)
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .template,
+        )
+        .entities
+        .clear();
+        stages.starts.remove(&source);
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            Some(&evidence),
+            None
+        ));
         Ok(())
     }
 

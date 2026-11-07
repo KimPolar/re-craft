@@ -8316,6 +8316,10 @@ mod tests {
                             batch.schedule().completed(target),
                             Some(schedule::GenerationStage::Features)
                         );
+                        assert!(!batch.recorded_template_feature_for_test(
+                            target,
+                            &(structure.clone(), source)
+                        ));
                         failed = true;
                         break;
                     }
@@ -8380,6 +8384,12 @@ mod tests {
                     feature_kind == 0 || feature_kind == 2 || (4..=29).contains(&feature_kind)
                 );
                 if (9..=29).contains(&feature_kind) {
+                    assert!(
+                        batch.recorded_template_feature_for_test(
+                            target,
+                            &(structure.clone(), source)
+                        )
+                    );
                     let saved = batch.structure_data(target)?;
                     if source == target {
                         assert!(
@@ -8394,8 +8404,10 @@ mod tests {
                 }
                 if !(9..=29).contains(&feature_kind) {
                     assert!(
-                        batch
-                            .recorded_jigsaw_feature_for_test(target, &(structure.clone(), target))
+                        batch.recorded_template_feature_for_test(
+                            target,
+                            &(structure.clone(), target)
+                        )
                     );
                 }
             }

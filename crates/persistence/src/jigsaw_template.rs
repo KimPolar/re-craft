@@ -35,6 +35,74 @@ pub struct TemplateSettings {
     pub keep_jigsaws: bool,
 }
 
+/// Settings for a non-jigsaw template with a pivot and optional mirror.
+#[derive(Clone, Copy, Debug)]
+pub struct StructureTemplateSettings {
+    pub origin: [i32; 3],
+    pub mirror: Mirror,
+    pub rotation: Rotation,
+    pub pivot: [i32; 3],
+    pub clip: BoundingBox,
+}
+
+/// Process an ordinary template without the jigsaw-specific processors.
+/// States are still untransformed, as in Java's processBlockInfos result.
+pub fn process_structure_template(
+    template: &StructureTemplate,
+    processors: &PreparedProcessors,
+    settings: StructureTemplateSettings,
+    mut resolve_state: impl FnMut(&Tag) -> Result<BlockState>,
+    mut is_static_full: impl FnMut(&BlockState) -> Result<bool>,
+    world: &mut impl FnMut([i32; 3]) -> Result<BlockState>,
+) -> Result<Vec<ProcessedTemplateBlock>> {
+    ensure!(
+        template.data_version == Some(5023),
+        "template needs unsupported data-version conversion"
+    );
+    ensure!(
+        (0..3).all(|i| settings.clip.min[i] <= settings.clip.max[i]),
+        "invalid template clipping box"
+    );
+    let count = i32::try_from(template.palettes.len()).context("too many template palettes")?;
+    let [x, y, z] = settings.origin;
+    let index = LegacyRandom::new(positional_seed(x, y, z))
+        .next_int_bound(count)
+        .context("template has no palettes")? as usize;
+    let palette = template.palettes[index]
+        .iter()
+        .map(&mut resolve_state)
+        .collect::<Result<Vec<_>>>()?;
+    let order = template.java_block_order(index, |index, _| is_static_full(&palette[index]))?;
+    let mut result = Vec::with_capacity(order.len());
+    for source_index in order {
+        let source = &template.blocks[source_index];
+        let position = block_world_position(
+            source.position,
+            settings.origin,
+            settings.mirror,
+            settings.rotation,
+            settings.pivot,
+        );
+        if !(0..3).all(|axis| {
+            (settings.clip.min[axis]..=settings.clip.max[axis]).contains(&position[axis])
+        }) {
+            continue;
+        }
+        let current = PlacementBlock {
+            position,
+            state: palette[source.state].clone(),
+            nbt: source.nbt.clone(),
+        };
+        if let Some(block) = processors.process(current, world)? {
+            result.push(ProcessedTemplateBlock {
+                source_index,
+                block,
+            });
+        }
+    }
+    Ok(result)
+}
+
 /// Decode a template palette entry with the available verified block schemas.
 /// Structure and jigsaw blocks are kept for their processors and marker pass.
 pub fn resolve_template_state(tag: &Tag, registry: &GeneratedBlockRegistry) -> Result<BlockState> {

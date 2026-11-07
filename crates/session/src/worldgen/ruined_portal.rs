@@ -33,6 +33,33 @@ pub struct PreparedStart {
 }
 
 impl PreparedStart {
+    /// Process template records in the piece's mirror, rotation, and pivot.
+    /// State transforms, block placement, and decoration happen afterwards.
+    pub fn process_blocks(
+        &self,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        processors: &native_persistence::structure_processors::PreparedProcessors,
+        clip: BoundingBox,
+        is_static_full: impl FnMut(&native_world::loaded::BlockState) -> Result<bool>,
+        world: &mut impl FnMut([i32; 3]) -> Result<native_world::loaded::BlockState>,
+    ) -> Result<Vec<native_persistence::jigsaw_template::ProcessedTemplateBlock>> {
+        self.piece.validate()?;
+        native_persistence::jigsaw_template::process_structure_template(
+            &self.template,
+            processors,
+            native_persistence::jigsaw_template::StructureTemplateSettings {
+                origin: self.piece.position,
+                mirror: self.piece.mirror,
+                rotation: self.piece.rotation,
+                pivot: [self.template.size[0] / 2, 0, self.template.size[2] / 2],
+                clip,
+            },
+            |tag| native_persistence::jigsaw_template::resolve_template_state(tag, registry),
+            is_static_full,
+            world,
+        )
+    }
+
     /// Match Java's initial selection, height and final biome check.
     /// Block placement and world saving remain separate operations.
     pub fn prepare(

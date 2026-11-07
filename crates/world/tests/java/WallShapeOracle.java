@@ -9,6 +9,9 @@ import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.WallSide;
+import net.minecraft.world.level.block.state.properties.Half;
+import net.minecraft.world.level.block.state.properties.SlabType;
+import net.minecraft.world.level.block.state.properties.StairsShape;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.core.BlockPos;
@@ -75,6 +78,12 @@ public class WallShapeOracle {
                     out.writeBoolean(LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(), state));
                     var shapesToTest = new VoxelShape[]{state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
                         state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)};
+                    var bottom = shapesToTest[0].getFaceShape(Direction.DOWN);
+                    int coverage = 0;
+                    for (int i = 0; i < 4; i++)
+                        if ((Boolean)covered.invoke(null, bottom, sideShapes.get(directions[i]))) coverage |= 1 << i;
+                    if ((Boolean)covered.invoke(null, bottom, postShape)) coverage |= 16;
+                    out.writeByte(coverage);
                     double[][] heights = {{7.5/16, 15.5/16, 23.5/16}, {7.5/16, 14.5/16, 15.5/16}};
                     for (int kind = 0; kind < 2; kind++) for (double y : heights[kind])
                         for (int z = 0; z < 16; z++) {
@@ -88,6 +97,24 @@ public class WallShapeOracle {
                             out.writeShort(mask);
                         }
                 }
+            var other = new ArrayList<BlockState>();
+            other.add(Blocks.AIR.defaultBlockState()); other.add(Blocks.STONE.defaultBlockState());
+            other.add(Blocks.CHEST.defaultBlockState()); other.add(Blocks.IRON_BARS.defaultBlockState());
+            for (var type : new SlabType[]{SlabType.BOTTOM, SlabType.TOP, SlabType.DOUBLE})
+                other.add(Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, type));
+            for (var facing : directions) for (var half : new Half[]{Half.BOTTOM, Half.TOP})
+                for (var shape : new StairsShape[]{StairsShape.STRAIGHT, StairsShape.INNER_LEFT,
+                        StairsShape.INNER_RIGHT, StairsShape.OUTER_LEFT, StairsShape.OUTER_RIGHT})
+                    other.add(Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, facing)
+                        .setValue(StairBlock.HALF, half).setValue(StairBlock.SHAPE, shape));
+            for (var state : other) {
+                var face = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).getFaceShape(Direction.DOWN);
+                int coverage = 0;
+                for (int i = 0; i < 4; i++)
+                    if ((Boolean)covered.invoke(null, face, sideShapes.get(directions[i]))) coverage |= 1 << i;
+                if ((Boolean)covered.invoke(null, face, postShape)) coverage |= 16;
+                out.writeByte(coverage);
+            }
         }
     }
 }

@@ -55,7 +55,7 @@ fn wall_sides_and_post_match_vanilla() {
     let results = std::fs::read(output).unwrap();
     assert_eq!(
         results.len(),
-        16 * 32 * 3 * 3 + 81 * 2 * 2 * (3 + 2 * 3 * 16 * 2)
+        16 * 32 * 3 * 3 + 81 * 2 * 2 * (4 + 2 * 3 * 16 * 2) + 47
     );
     let mut index = 0;
     for connection in 0..16 {
@@ -126,11 +126,16 @@ fn wall_sides_and_post_match_vanilla() {
                     );
                     index += 1;
                 }
+                let collision = native_world::collision::block_shape(&state).unwrap();
+                let above = Above::from_collision(&collision, false, false);
+                let coverage = above.sides_covered.into_iter().enumerate().fold(
+                    if above.post_covered { 16 } else { 0 },
+                    |flags, (i, covered)| flags | (u8::from(covered) << i),
+                );
+                assert_eq!(coverage, results[index], "bottom face for {state:?}");
+                index += 1;
                 for (boxes, heights) in [
-                    (
-                        native_world::collision::block_shape(&state).unwrap(),
-                        [7.5, 15.5, 23.5],
-                    ),
+                    (collision, [7.5, 15.5, 23.5]),
                     (
                         native_world::collision::block_outline(&state).unwrap(),
                         [7.5, 14.5, 15.5],
@@ -163,6 +168,72 @@ fn wall_sides_and_post_match_vanilla() {
                 }
             }
         }
+    }
+    let state = |name: &str, properties: &[(&str, &str)]| native_world::loaded::BlockState {
+        name: format!("minecraft:{name}"),
+        properties: properties
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect(),
+    };
+    let mut other = vec![
+        state("air", &[]),
+        state("stone", &[]),
+        state(
+            "chest",
+            &[
+                ("facing", "north"),
+                ("type", "single"),
+                ("waterlogged", "false"),
+            ],
+        ),
+        state(
+            "iron_bars",
+            &[
+                ("north", "false"),
+                ("east", "false"),
+                ("south", "false"),
+                ("west", "false"),
+                ("waterlogged", "false"),
+            ],
+        ),
+    ];
+    for slab in ["bottom", "top", "double"] {
+        other.push(state(
+            "stone_slab",
+            &[("type", slab), ("waterlogged", "false")],
+        ));
+    }
+    for facing in ["north", "east", "south", "west"] {
+        for half in ["bottom", "top"] {
+            for shape in [
+                "straight",
+                "inner_left",
+                "inner_right",
+                "outer_left",
+                "outer_right",
+            ] {
+                other.push(state(
+                    "stone_brick_stairs",
+                    &[
+                        ("facing", facing),
+                        ("half", half),
+                        ("shape", shape),
+                        ("waterlogged", "false"),
+                    ],
+                ));
+            }
+        }
+    }
+    for state in other {
+        let boxes = native_world::collision::block_shape(&state).unwrap();
+        let above = Above::from_collision(&boxes, false, false);
+        let coverage = above.sides_covered.into_iter().enumerate().fold(
+            if above.post_covered { 16 } else { 0 },
+            |flags, (i, covered)| flags | (u8::from(covered) << i),
+        );
+        assert_eq!(coverage, results[index], "bottom face for {state:?}");
+        index += 1;
     }
     assert_eq!(index, results.len());
 }

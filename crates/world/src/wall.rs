@@ -1,6 +1,6 @@
 //! Wall-side heights and center post selection for a verified neighborhood.
 
-use crate::loaded::BlockState;
+use crate::{collision::Aabb, loaded::BlockState};
 
 /// Order is north, east, south, west.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +21,70 @@ pub struct Above {
     pub wall_post: bool,
     /// The above block belongs to the active wall-post-override tag.
     pub post_override: bool,
+}
+
+impl Above {
+    /// Read the lower collision face of the above block. Java tests a 2-pixel
+    /// wide strip toward each side and a 2×2-pixel square at the center.
+    pub fn from_collision(boxes: &[Aabb], wall_post: bool, post_override: bool) -> Self {
+        let covers =
+            |min_x, min_z, max_x, max_z| covers_bottom_rectangle(boxes, min_x, min_z, max_x, max_z);
+        Self {
+            sides_covered: [
+                covers(7, 0, 9, 9),
+                covers(7, 7, 16, 9),
+                covers(7, 7, 9, 16),
+                covers(0, 7, 9, 9),
+            ],
+            post_covered: covers(7, 7, 9, 9),
+            wall_post,
+            post_override,
+        }
+    }
+}
+
+fn covers_bottom_rectangle(boxes: &[Aabb], x0: u8, z0: u8, x1: u8, z1: u8) -> bool {
+    let (x0, z0, x1, z1) = (
+        x0 as f32 / 16.0,
+        z0 as f32 / 16.0,
+        x1 as f32 / 16.0,
+        z1 as f32 / 16.0,
+    );
+    if boxes.iter().any(|b| {
+        b.min.y <= 0.0
+            && b.max.y > 0.0
+            && b.min.x <= x0
+            && b.max.x >= x1
+            && b.min.z <= z0
+            && b.max.z >= z1
+    }) {
+        return true;
+    }
+    if boxes.is_empty() {
+        return false;
+    }
+    let boxes: Vec<_> = boxes
+        .iter()
+        .filter(|b| b.min.y <= 0.0 && b.max.y > 0.0)
+        .collect();
+    let mut xs = vec![x0, x1];
+    let mut zs = vec![z0, z1];
+    for b in &boxes {
+        xs.extend([b.min.x.clamp(x0, x1), b.max.x.clamp(x0, x1)]);
+        zs.extend([b.min.z.clamp(z0, z1), b.max.z.clamp(z0, z1)]);
+    }
+    xs.sort_by(f32::total_cmp);
+    xs.dedup();
+    zs.sort_by(f32::total_cmp);
+    zs.dedup();
+    xs.windows(2).all(|x| {
+        zs.windows(2).all(|z| {
+            let (x, z) = ((x[0] + x[1]) * 0.5, (z[0] + z[1]) * 0.5);
+            boxes
+                .iter()
+                .any(|b| b.min.x <= x && x < b.max.x && b.min.z <= z && z < b.max.z)
+        })
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,5 +228,28 @@ mod tests {
         state.properties.insert("east".into(), "low".into());
         state.name = "minecraft:not_a_real_wall".into();
         assert!(Wall::from_state(&state).is_none());
+    }
+
+    #[test]
+    fn bottom_coverage_uses_union_and_ignores_floating_boxes() {
+        use glam::Vec3;
+        let left = Aabb {
+            min: Vec3::ZERO,
+            max: Vec3::new(0.5, 1.0, 1.0),
+        };
+        let right = Aabb {
+            min: Vec3::new(0.5, 0.0, 0.0),
+            max: Vec3::ONE,
+        };
+        let floating = Aabb {
+            min: Vec3::new(0.0, 0.5, 0.0),
+            max: Vec3::ONE,
+        };
+        let full = Above::from_collision(&[left, right], false, false);
+        assert_eq!(full.sides_covered, [true; 4]);
+        assert!(full.post_covered);
+        let partial = Above::from_collision(&[left, floating], false, false);
+        assert!(!partial.post_covered);
+        assert_ne!(partial.sides_covered, [true; 4]);
     }
 }

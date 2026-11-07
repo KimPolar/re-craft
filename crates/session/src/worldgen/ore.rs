@@ -4513,7 +4513,7 @@ impl VegetationPatchWorld for DecorationRegion<'_> {
                 disk_safe_solid(&old.name).is_some()
                     || tree_generated_leaf(&old)?
                     || generated_dripleaf(&old)?,
-                "unsupported vegetation patch source effects"
+                "unsupported vegetation patch source effects at {pos:?}: {old:?} -> {state:?}"
             );
             self.patch_block_write = true;
             let write = self.set_proto_block(pos, state);
@@ -16928,6 +16928,31 @@ mod tests {
         assert_eq!(after.block(8, 7, 8).unwrap().name, "minecraft:moss_block");
         assert_eq!(after.block(8, 8, 8).unwrap().name, "minecraft:short_grass");
         assert_eq!(before.block(8, 7, 8).unwrap().name, "minecraft:stone");
+    }
+
+    #[test]
+    fn vegetation_patch_reports_unsupported_source_and_rolls_back() {
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut setup = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        setup
+            .set_section_block([8, 7, 8], &state("diamond_block"))
+            .unwrap();
+        setup.finish().unwrap();
+        let before = terrain.snapshot();
+        let mut draft = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let error = draft
+            .set_patch_block([8, 7, 8], &state("clay"))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("minecraft:diamond_block"), "{message}");
+        assert!(message.contains("[8, 7, 8]"), "{message}");
+        assert!(draft.finish().is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
     }
 
     #[test]

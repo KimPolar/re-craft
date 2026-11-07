@@ -264,11 +264,7 @@ impl GenerationReady {
             .context("generated targets are missing")?;
         let regions = if structures {
             self.batch
-                .prepare_structure_region_drafts(
-                    &processed.region,
-                    targets.iter().copied(),
-                    region_timestamp,
-                )?
+                .prepare_converted_structure_region_drafts(&processed.region, region_timestamp)?
                 .regions
         } else {
             self.batch.postprocessed_region_drafts(
@@ -5385,6 +5381,58 @@ mod tests {
         assert_eq!(
             prepared.referenced_start_chunks,
             preview.referenced_start_chunks
+        );
+        let mut deferred_stage = ready.batch.begin_generated_postprocessing_with_neighbors(
+            [target],
+            targets.iter().copied(),
+            0,
+            0,
+        )?;
+        deferred_stage.set_water_source_conversion(false)?;
+        while !deferred_stage.poll(target, 256)? {}
+        let deferred_region = deferred_stage.finish()?;
+        assert_eq!(
+            deferred_region.deferred_chunks().count(),
+            targets.len() - 1
+        );
+        let converted = ready
+            .batch
+            .prepare_converted_structure_region_drafts(&deferred_region, 1)?;
+        assert_eq!(converted.chunk_count, targets.len());
+        assert_eq!(
+            converted.referenced_start_chunks,
+            prepared.referenced_start_chunks
+        );
+        assert!(converted.regions.keys().any(|(kind, _, _)| matches!(
+            kind,
+            native_persistence::save::FreshRegionKind::Entities
+        )));
+        let deferred_pos = deferred_region.deferred_chunks().next().unwrap();
+        let expected_marks = deferred_region.deferred_postprocessing_data(deferred_pos)?;
+        let rx = deferred_pos.x.div_euclid(32);
+        let rz = deferred_pos.z.div_euclid(32);
+        let region_draft = &converted.regions[&(
+            native_persistence::save::FreshRegionKind::Terrain,
+            rx,
+            rz,
+        )];
+        let converted_dir = tempfile::tempdir()?;
+        let converted_path = converted_dir.path().join(format!("r.{rx}.{rz}.mca"));
+        let mut converted_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&converted_path)?;
+        assert!(region_draft.write_staged(&mut converted_file)?.is_empty());
+        drop(converted_file);
+        let mut reader = native_persistence::anvil::RegionReader::open(&converted_path)?;
+        let saved = reader
+            .read_chunk(deferred_pos.x, deferred_pos.z)?
+            .context("deferred chunk missing")?;
+        assert_eq!(saved.value.get("PostProcessing"), Some(&expected_marks));
+        assert_eq!(
+            saved.value.get("structures"),
+            Some(&ready.batch.structure_data(deferred_pos)?)
         );
         let directory = tempfile::tempdir()?;
         for ((kind, rx, rz), region) in &prepared.regions {

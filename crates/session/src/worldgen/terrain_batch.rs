@@ -353,10 +353,10 @@ fn require_selected_structure_sources(
     for &pos in selected {
         required.extend(references(pos)?);
     }
-    ensure!(
-        required.is_subset(selected),
-        "structure start chunks are missing from the selected region"
-    );
+    if !required.is_subset(selected) {
+        let missing: Vec<_> = required.difference(selected).copied().collect();
+        bail!("structure start chunks are missing from the selected region: {missing:?}");
+    }
     Ok(required)
 }
 
@@ -3479,6 +3479,15 @@ impl FreshTerrainBatch {
         stage: &mut super::GeneratedPostprocessing,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
+        self.converted_chunk_drafts_with_validated_structures(stage, positions, None)
+    }
+
+    fn converted_chunk_drafts_with_validated_structures(
+        &self,
+        stage: &mut super::GeneratedPostprocessing,
+        positions: impl IntoIterator<Item = ChunkPos>,
+        validated: Option<&BTreeSet<ChunkPos>>,
+    ) -> Result<BTreeMap<ChunkPos, PostprocessedChunkDraft>> {
         let positions: Vec<_> = positions.into_iter().collect();
         let selected: BTreeSet<_> = positions.iter().copied().collect();
         ensure!(!selected.is_empty(), "no converted chunks selected");
@@ -3511,8 +3520,12 @@ impl FreshTerrainBatch {
             .map(|pos| Ok((pos, processed.deferred_postprocessing_data(pos)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let components = self.converted_chunk_components(&processed, positions, Some(&entities))?;
-        let drafts =
-            self.assemble_converted_drafts(components, processed.ticks.game_time(), None, &marks)?;
+        let drafts = self.assemble_converted_drafts(
+            components,
+            processed.ticks.game_time(),
+            validated,
+            &marks,
+        )?;
         *stage = candidate;
         Ok(drafts)
     }
@@ -3686,6 +3699,44 @@ impl FreshTerrainBatch {
             Some(&selected),
         )?;
         let poi = self.postprocessed_missing_poi_snapshot(processed, positions)?;
+        let regions = group_fresh_regions(chunks, poi, timestamp)?;
+        Ok(PreparedStructureRegions {
+            chunk_count: selected.len(),
+            referenced_start_chunks,
+            regions,
+        })
+    }
+
+    /// Prepare every converted structure chunk, preserving deferred FULL
+    /// postprocessing, block entities and ticks. This is an isolated draft;
+    /// it does not authorize publishing the generated world.
+    pub fn prepare_converted_structure_region_drafts(
+        &self,
+        processed: &super::PostprocessedGeneratedRegion,
+        timestamp: u32,
+    ) -> Result<PreparedStructureRegions> {
+        ensure!(
+            self.structures.is_some(),
+            "structure generation is disabled"
+        );
+        self.validate_postprocessing(processed)?;
+        let positions = processed.ticks().registration_order().to_vec();
+        let selected: BTreeSet<_> = positions.iter().copied().collect();
+        ensure!(
+            selected.len() == positions.len(),
+            "duplicate converted chunk"
+        );
+        let referenced_start_chunks = require_selected_structure_sources(&selected, |pos| {
+            self.structure_reference_sources(pos)
+        })?;
+        let mut stage = self.resume_generated_postprocessing(processed)?;
+        let chunks = self.converted_chunk_drafts_with_validated_structures(
+            &mut stage,
+            positions.iter().copied(),
+            Some(&selected),
+        )?;
+        let captured = stage.finish()?;
+        let poi = self.converted_missing_poi_snapshot(&captured, positions, true)?;
         let regions = group_fresh_regions(chunks, poi, timestamp)?;
         Ok(PreparedStructureRegions {
             chunk_count: selected.len(),
@@ -4852,7 +4903,10 @@ mod region_draft_tests {
         };
         assert!(require_selected_structure_sources(&BTreeSet::new(), refs).is_err());
         assert!(require_selected_structure_sources(&BTreeSet::from([a]), refs).is_err());
-        assert!(require_selected_structure_sources(&BTreeSet::from([a, b]), refs).is_err());
+        let missing = require_selected_structure_sources(&BTreeSet::from([a, b]), refs)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains(&format!("{c:?}")));
         assert_eq!(
             require_selected_structure_sources(&BTreeSet::from([a, b, c]), refs).unwrap(),
             BTreeSet::from([a, b, c])

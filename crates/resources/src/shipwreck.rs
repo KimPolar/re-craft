@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::{
     packs::ResourceId,
     structure_placement::large_feature,
+    structure_start::Heightmap,
     structure_transform::{self, Mirror, Rotation},
 };
 
@@ -123,6 +124,92 @@ pub fn beached_height(lowest: i32, template_height: i32, random_offset: i32) -> 
         .wrapping_sub(random_offset))
 }
 
+/// Current heightmaps used when the first chunk decorates a small shipwreck.
+pub trait HeightWorld {
+    fn max_y(&self) -> i32;
+    /// Returns the first available height, matching WorldGenLevel.getHeight.
+    fn height(&mut self, map: Heightmap, x: i32, z: i32) -> Result<i32>;
+}
+
+/// Align a small piece once, before placing its blocks. Large pieces are
+/// adjusted earlier at structure-start time and are intentionally skipped.
+/// The callback draws nextInt(3) from the current decoration random stream.
+pub fn align_during_decoration(
+    piece: &mut Piece,
+    size: [i32; 3],
+    height_adjusted: &mut bool,
+    world: &mut impl HeightWorld,
+    mut next_offset: impl FnMut() -> i32,
+) -> Result<()> {
+    ensure!(
+        size.iter().all(|v| *v >= 0),
+        "negative shipwreck template size"
+    );
+    if *height_adjusted || too_big_for_region(size) {
+        return Ok(());
+    }
+    let area = size[0]
+        .checked_mul(size[2])
+        .context("shipwreck template area overflow")?;
+    let map = if piece.beached {
+        Heightmap::WorldSurface
+    } else {
+        Heightmap::OceanFloor
+    };
+    let mut lowest = world.max_y().wrapping_add(1);
+    let average = if area == 0 {
+        world.height(map, piece.position[0], piece.position[2])?
+    } else {
+        let mut sum = 0_i32;
+        for z in 0..size[2] {
+            for x in 0..size[0] {
+                let y = world.height(
+                    map,
+                    piece.position[0].wrapping_add(x),
+                    piece.position[2].wrapping_add(z),
+                )?;
+                sum = sum.wrapping_add(y);
+                lowest = lowest.min(y);
+            }
+        }
+        sum / area
+    };
+    let height = if piece.beached {
+        beached_height(lowest, size[1], next_offset())?
+    } else {
+        average
+    };
+    piece.position[1] = height;
+    *height_adjusted = true;
+    Ok(())
+}
+
+/// Access the already placed block entity directly below a DATA marker.
+pub trait MarkerWorld {
+    fn is_randomizable_container(&mut self, position: [i32; 3]) -> Result<bool>;
+    fn set_loot_table(&mut self, position: [i32; 3], table: &str, seed: i64) -> Result<()>;
+}
+
+/// Unknown markers leave both the world and random stream untouched.
+pub fn handle_data_marker(
+    world: &mut impl MarkerWorld,
+    random: &mut impl crate::structure_piece::TreasureRandom,
+    marker: &str,
+    position: [i32; 3],
+) -> Result<()> {
+    let table = match marker {
+        "map_chest" => "minecraft:chests/shipwreck_map",
+        "treasure_chest" => "minecraft:chests/shipwreck_treasure",
+        "supply_chest" => "minecraft:chests/shipwreck_supply",
+        _ => return Ok(()),
+    };
+    let below = [position[0], position[1].wrapping_sub(1), position[2]];
+    if world.is_randomizable_container(below)? {
+        world.set_loot_table(below, table, random.next_long())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +224,89 @@ mod tests {
         assert!(too_big_for_region([33, 1, 1]));
         assert!(too_big_for_region([1, 33, 1]));
         assert!(beached_height(60, 9, 3).is_err());
+    }
+
+    #[test]
+    fn alignment_is_one_time_and_uses_unrotated_footprint() -> Result<()> {
+        struct World(Vec<(Heightmap, i32, i32)>);
+        impl HeightWorld for World {
+            fn max_y(&self) -> i32 {
+                319
+            }
+            fn height(&mut self, map: Heightmap, x: i32, z: i32) -> Result<i32> {
+                self.0.push((map, x, z));
+                Ok(x + z)
+            }
+        }
+        let mut piece = Piece {
+            template: "minecraft:shipwreck/with_mast".into(),
+            position: [10, 90, 20],
+            rotation: Rotation::Clockwise90,
+            beached: false,
+        };
+        let mut world = World(vec![]);
+        let mut adjusted = false;
+        align_during_decoration(&mut piece, [2, 3, 3], &mut adjusted, &mut world, || {
+            panic!("ocean piece must not draw")
+        })?;
+        assert_eq!(piece.position, [10, 31, 20]);
+        assert_eq!(
+            world.0,
+            vec![
+                (Heightmap::OceanFloor, 10, 20),
+                (Heightmap::OceanFloor, 11, 20),
+                (Heightmap::OceanFloor, 10, 21),
+                (Heightmap::OceanFloor, 11, 21),
+                (Heightmap::OceanFloor, 10, 22),
+                (Heightmap::OceanFloor, 11, 22)
+            ]
+        );
+        align_during_decoration(&mut piece, [2, 3, 3], &mut adjusted, &mut world, || {
+            panic!("already adjusted")
+        })?;
+        assert_eq!(world.0.len(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn marker_requires_an_existing_randomizable_container() -> Result<()> {
+        struct World {
+            exists: bool,
+            visits: usize,
+            loot: Option<(String, i64)>,
+        }
+        impl MarkerWorld for World {
+            fn is_randomizable_container(&mut self, pos: [i32; 3]) -> Result<bool> {
+                assert_eq!(pos, [3, 9, 4]);
+                self.visits += 1;
+                Ok(self.exists)
+            }
+            fn set_loot_table(&mut self, pos: [i32; 3], table: &str, seed: i64) -> Result<()> {
+                assert_eq!(pos, [3, 9, 4]);
+                self.loot = Some((table.into(), seed));
+                Ok(())
+            }
+        }
+        let mut world = World {
+            exists: false,
+            visits: 0,
+            loot: None,
+        };
+        let mut random = LegacyRandom::new(4);
+        let mut expected = random.clone();
+        handle_data_marker(&mut world, &mut random, "unknown", [3, 10, 4])?;
+        handle_data_marker(&mut world, &mut random, "map_chest", [3, 10, 4])?;
+        assert_eq!(world.visits, 1);
+        assert_eq!(random.next_long(), expected.next_long());
+        world.exists = true;
+        handle_data_marker(&mut world, &mut random, "map_chest", [3, 10, 4])?;
+        assert_eq!(
+            world.loot,
+            Some((
+                "minecraft:chests/shipwreck_map".into(),
+                expected.next_long()
+            ))
+        );
+        Ok(())
     }
 }

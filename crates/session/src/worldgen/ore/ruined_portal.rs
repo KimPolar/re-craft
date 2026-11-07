@@ -761,7 +761,10 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
                 .registry
                 .is_canonical_state(&state.name, &state.properties)
                 && self.inner.registry.has_block_entity(&state.name) == Some(false)
-                && (portal_full(state) || is_air(state) || state.name == "minecraft:lava"),
+                && (portal_full(state)
+                    || super::jigsaw::jigsaw_wood(state)
+                    || is_air(state)
+                    || state.name == "minecraft:lava"),
             "unsupported jigsaw final state: {state:?}"
         );
         if self.temporary_jigsaws.contains(&pos) {
@@ -786,7 +789,12 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
             self.temporary_jigsaws.remove(&pos);
         } else {
             let mut unused = DecorationRandom::new(0);
-            self.place_structure_block(pos, state, None, &mut unused)?;
+            if super::jigsaw::jigsaw_wood(state) {
+                self.inner
+                    .place_template_block(pos, state, None, &mut unused)?;
+            } else {
+                self.place_structure_block(pos, state, None, &mut unused)?;
+            }
         }
         Ok(())
     }
@@ -1141,6 +1149,11 @@ mod tests {
                 .saving_order_with_pending(actual.pending_order.get(&chunk).map(AsRef::as_ref))?,
             expected_live.saving_order_with_pending(Some(&expected_pending))?
         );
+        let (name, properties) = registry.resolve(&serde_json::json!("minecraft:oak_planks"))?;
+        let wood = BlockState { name, properties };
+        world.finalize_jigsaw_marker(pos, &wood)?;
+        assert_eq!(world.inner.region.read(pos)?, wood);
+        world.finish_jigsaw_markers()?;
         Ok(())
     }
 

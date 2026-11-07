@@ -743,6 +743,8 @@ mod tests {
         for (position, final_state) in [
             ([4, 1, 0], "minecraft:stone"),
             ([5, 1, 0], "minecraft:stone[missing=value]"),
+            ([0, 1, 0], "minecraft:oak_planks"),
+            ([2, 1, 0], "minecraft:spruce_log[axis=x]"),
         ] {
             template.blocks.push(TemplateBlock {
                 position,
@@ -762,6 +764,13 @@ mod tests {
         let snapshot = terrain.snapshot();
         assert_eq!(snapshot.block(8, 9, 4).unwrap().name, "minecraft:stone");
         assert_eq!(snapshot.block(9, 9, 4).unwrap().name, "minecraft:air");
+        assert_eq!(
+            snapshot.block(4, 9, 4).unwrap().name,
+            "minecraft:oak_planks"
+        );
+        let log = snapshot.block(6, 9, 4).unwrap();
+        assert_eq!(log.name, "minecraft:spruce_log");
+        assert_eq!(log.properties["axis"], "x");
         let Tag::List { values, .. } =
             terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
         else {

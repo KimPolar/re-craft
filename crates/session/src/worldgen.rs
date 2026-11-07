@@ -62,6 +62,7 @@ pub mod structure_batch;
 mod structure_data;
 mod structure_hash_order;
 pub mod structure_references;
+pub mod template_feature;
 mod terrain_batch;
 pub mod tick_index;
 pub use carving::CarverBlockState;

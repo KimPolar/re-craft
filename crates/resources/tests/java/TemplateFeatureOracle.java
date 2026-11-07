@@ -9,6 +9,7 @@ import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.levelgen.feature.TemplateFeature;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings;
 import java.util.List;
 
 public class TemplateFeatureOracle {
@@ -21,6 +22,10 @@ public class TemplateFeatureOracle {
         var offset = TemplateFeature.class.getDeclaredMethod("getRotatedOffset", Rotation.class, Direction.Axis.class, StructureTemplate.class);
         offset.setAccessible(true);
         var sizeField = StructureTemplate.class.getDeclaredField("size"); sizeField.setAccessible(true);
+        var paletteClass = Class.forName("net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate$Palette");
+        var paletteConstructor = paletteClass.getDeclaredConstructor(List.class); paletteConstructor.setAccessible(true);
+        var palettes = new java.util.ArrayList<StructureTemplate.Palette>();
+        for (int i=0;i<3;i++) palettes.add((StructureTemplate.Palette)paletteConstructor.newInstance(List.of()));
         for (long seed=0; seed<128; seed++) {
             var random = new WorldgenRandom(new XoroshiroRandomSource(seed));
             var selected = choices.getRandomOrThrow(random);
@@ -30,7 +35,8 @@ public class TemplateFeatureOracle {
             var x = (Vec3i) offset.invoke(feature, rotation, Direction.Axis.X, template);
             var z = (Vec3i) offset.invoke(feature, rotation, Direction.Axis.Z, template);
             var origin = new BlockPos(-48, 70, 39).offset(x).offset(z);
-            System.out.printf("T %d %s %s %d %d %d %d%n", seed, selected.template(), rotation.name(), origin.getX(), origin.getY(), origin.getZ(), random.nextLong());
+            var palette = new StructurePlaceSettings().setRandom(random).getRandomPalette(palettes, origin);
+            System.out.printf("T %d %s %s %d %d %d %d %d%n", seed, selected.template(), rotation.name(), origin.getX(), origin.getY(), origin.getZ(), palettes.indexOf(palette), random.nextLong());
         }
     }
 }

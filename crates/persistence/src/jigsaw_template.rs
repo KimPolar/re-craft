@@ -51,8 +51,8 @@ pub fn process_structure_template(
     template: &StructureTemplate,
     processors: &PreparedProcessors,
     settings: StructureTemplateSettings,
-    mut resolve_state: impl FnMut(&Tag) -> Result<BlockState>,
-    mut is_static_full: impl FnMut(&BlockState) -> Result<bool>,
+    resolve_state: impl FnMut(&Tag) -> Result<BlockState>,
+    is_static_full: impl FnMut(&BlockState) -> Result<bool>,
     world: &mut impl FnMut([i32; 3]) -> Result<BlockState>,
 ) -> Result<Vec<ProcessedTemplateBlock>> {
     ensure!(
@@ -68,7 +68,43 @@ pub fn process_structure_template(
     let index = LegacyRandom::new(positional_seed(x, y, z))
         .next_int_bound(count)
         .context("template has no palettes")? as usize;
-    let palette = template.palettes[index]
+    process_structure_template_with_palette(
+        template,
+        processors,
+        settings,
+        index,
+        resolve_state,
+        is_static_full,
+        world,
+    )
+}
+
+/// Process an ordinary template using a palette already selected by its
+/// caller. Template features supply their shared generation RNG, whereas
+/// structure pieces select a palette from a position-seeded RNG. Processor
+/// randomness here is still position-seeded; callers with shared-random
+/// processors must not use this until those semantics are implemented.
+pub fn process_structure_template_with_palette(
+    template: &StructureTemplate,
+    processors: &PreparedProcessors,
+    settings: StructureTemplateSettings,
+    index: usize,
+    mut resolve_state: impl FnMut(&Tag) -> Result<BlockState>,
+    mut is_static_full: impl FnMut(&BlockState) -> Result<bool>,
+    world: &mut impl FnMut([i32; 3]) -> Result<BlockState>,
+) -> Result<Vec<ProcessedTemplateBlock>> {
+    ensure!(
+        template.data_version == Some(5023),
+        "template needs unsupported data-version conversion"
+    );
+    ensure!(
+        (0..3).all(|i| settings.clip.min[i] <= settings.clip.max[i]),
+        "invalid template clipping box"
+    );
+    let palette = template
+        .palettes
+        .get(index)
+        .context("template palette index out of bounds")?
         .iter()
         .map(&mut resolve_state)
         .collect::<Result<Vec<_>>>()?;

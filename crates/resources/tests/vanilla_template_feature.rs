@@ -61,7 +61,7 @@ fn template_selection_and_origin_match_java() -> Result<()> {
         .filter(|line| line.starts_with("T "))
     {
         let values: Vec<_> = line.split_whitespace().collect();
-        ensure!(values.len() == 8, "bad oracle line");
+        ensure!(values.len() == 9, "bad oracle line");
         let mut random = DecorationRandom::new(values[1].parse()?);
         let (entry, rotation) = config.select(&mut random)?;
         let name = format!("{}:{}", entry.id.namespace, entry.id.path);
@@ -88,7 +88,8 @@ fn template_selection_and_origin_match_java() -> Result<()> {
                 values[6].parse::<i32>()?
             ]
         );
-        assert_eq!(random.next_long(), values[7].parse::<i64>()?);
+        assert_eq!(random.next_int_bound(3), Some(values[7].parse::<i32>()?));
+        assert_eq!(random.next_long(), values[8].parse::<i64>()?);
         cases += 1;
     }
     assert_eq!(cases, 128);

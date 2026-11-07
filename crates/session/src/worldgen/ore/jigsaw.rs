@@ -195,19 +195,45 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     && fields.iter().all(|(key, _)| {
                         (key.matches("id")
                             || key.matches("LootTable")
-                            || key.matches("LootTableSeed"))
+                            || key.matches("LootTableSeed")
+                            || key.matches("Items"))
                             && keys.insert(key.0.clone())
                     })
                     && matches!(nbt.get("id"), Some(Tag::String(id)) if id.matches("minecraft:chest"))
                     && matches!(nbt.get("LootTableSeed"), None | Some(Tag::Long(_))),
                 "jigsaw block entity placement is not yet supported"
             );
-            let Some(Tag::String(table)) = nbt.get("LootTable") else {
-                bail!("jigsaw chest loot table is missing")
+            let empty_items = match nbt.get("Items") {
+                None => true,
+                Some(Tag::List {
+                    element_type,
+                    values,
+                }) => {
+                    values.is_empty()
+                        && matches!(
+                            element_type,
+                            native_persistence::nbt::TagType::End
+                                | native_persistence::nbt::TagType::Compound
+                        )
+                }
+                _ => false,
             };
-            let table = String::from_utf16(&table.0).context("invalid chest loot table")?;
-            ResourceId::parse(&table)?;
-            Some(table)
+            match nbt.get("LootTable") {
+                Some(Tag::String(table)) => {
+                    ensure!(
+                        nbt.get("Items").is_none(),
+                        "chest loot and inventory cannot both be preserved"
+                    );
+                    let table = String::from_utf16(&table.0).context("invalid chest loot table")?;
+                    ResourceId::parse(&table)?;
+                    Some(Some(table))
+                }
+                None => {
+                    ensure!(empty_items, "nonempty chest inventory is not yet supported");
+                    Some(None)
+                }
+                _ => bail!("invalid chest loot table"),
+            }
         } else {
             None
         };
@@ -242,12 +268,15 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             let chest = super::super::GeneratedEmptyChest {
                 position: pos,
                 state: state.clone(),
-            }
-            .with_loot(&table, random.next_long())?;
-            Arc::make_mut(&mut self.region.monster_entities).insert(
-                pos,
-                Some(super::super::GeneratedMonsterRoomEntity::Chest(chest)),
-            );
+            };
+            let seed = random.next_long();
+            let entity = match table {
+                Some(table) => {
+                    super::super::GeneratedMonsterRoomEntity::Chest(chest.with_loot(&table, seed)?)
+                }
+                None => super::super::GeneratedMonsterRoomEntity::EmptyChest(chest),
+            };
+            Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(entity));
             Arc::make_mut(self.region.entity_order.entry(chunk(pos)).or_default()).insert(pos);
         } else {
             self.region.jigsaw_block_write = jigsaw_wood(state)
@@ -294,7 +323,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             wet.properties.insert("waterlogged".into(), "true".into());
             if self.region.writable.contains(&chunk(pos)) && !self.region.is_outside(pos[1]) {
                 let chest = if state.name == "minecraft:chest" {
-                    let Some(Some(super::super::GeneratedMonsterRoomEntity::Chest(chest))) =
+                    let Some(Some(chest)) =
                         Arc::make_mut(&mut self.region.monster_entities).remove(&pos)
                     else {
                         bail!("jigsaw chest entity is missing")
@@ -312,11 +341,16 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 self.region.jigsaw_block_write = false;
                 result?;
                 if let Some(mut chest) = chest {
-                    chest.update_state(wet)?;
-                    Arc::make_mut(&mut self.region.monster_entities).insert(
-                        pos,
-                        Some(super::super::GeneratedMonsterRoomEntity::Chest(chest)),
-                    );
+                    match &mut chest {
+                        super::super::GeneratedMonsterRoomEntity::Chest(chest) => {
+                            chest.update_state(wet)?
+                        }
+                        super::super::GeneratedMonsterRoomEntity::EmptyChest(chest) => {
+                            chest.state = wet
+                        }
+                        _ => bail!("unsupported waterlogged chest entity"),
+                    }
+                    Arc::make_mut(&mut self.region.monster_entities).insert(pos, Some(chest));
                 }
             }
             SpringWorld::schedule_spring_tick(
@@ -331,7 +365,10 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         ensure!(
             matches!(
                 self.region.monster_entities.get(&pos),
-                Some(Some(super::super::GeneratedMonsterRoomEntity::Chest(_)))
+                Some(Some(
+                    super::super::GeneratedMonsterRoomEntity::Chest(_)
+                        | super::super::GeneratedMonsterRoomEntity::EmptyChest(_)
+                ))
             ),
             "jigsaw block entity marking is not yet supported"
         );
@@ -490,6 +527,178 @@ mod tests {
             bytes: encoder.finish()?,
             reads: 0,
         })
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
+    fn shipwreck_empty_chest_matches_java_and_waterlogs() -> Result<()> {
+        use native_persistence::{
+            jigsaw_template::resolve_template_state, nbt, structure_template::StructureTemplate,
+        };
+        use std::{path::PathBuf, process::Command};
+
+        fn canonical(tag: Tag) -> Tag {
+            match tag {
+                Tag::Compound(fields) => {
+                    let mut fields: Vec<_> = fields
+                        .into_iter()
+                        .map(|(key, value)| (key, canonical(value)))
+                        .collect();
+                    fields.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+                    Tag::Compound(fields)
+                }
+                Tag::List {
+                    element_type,
+                    values,
+                } => Tag::List {
+                    element_type,
+                    values: values.into_iter().map(canonical).collect(),
+                },
+                other => other,
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let blocks = resources.vanilla_block_ids()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        let template = StructureTemplate::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:shipwreck/with_mast")?,
+        )?
+        .context("missing shipwreck template")?;
+        let entry = template.blocks.iter().find(|block| matches!(block.nbt.as_ref().and_then(|nbt| nbt.get("id")), Some(Tag::String(id)) if id.matches("minecraft:chest"))).context("missing shipwreck chest")?;
+        let state = resolve_template_state(&template.palettes[0][entry.state], &registry)?;
+        let tag = entry.nbt.as_ref().unwrap();
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut random = DecorationRandom::new(42);
+        let mut expected = random.clone();
+        let first_seed = expected.next_long();
+        let pos = [1, 8, 1];
+        {
+            let mut draft = JigsawRegion {
+                region: &mut region,
+                registry: &registry,
+            };
+            assert!(draft.place_template_block(pos, &state, Some(tag), &mut random)?);
+            draft.mark_block_entity_changed(pos)?;
+            draft.place_liquid(
+                pos,
+                &state,
+                Some(FluidState {
+                    kind: FluidKind::Water,
+                    source: true,
+                    falling: false,
+                    amount: 8,
+                }),
+            )?;
+        }
+        region.finish()?;
+        let next = expected.next_long();
+        assert_eq!(random.next_long(), next);
+        assert_eq!(
+            terrain
+                .snapshot()
+                .block(pos[0], pos[1], pos[2])
+                .unwrap()
+                .properties["waterlogged"],
+            "true"
+        );
+        let Tag::List { values, .. } =
+            terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
+        else {
+            bail!("missing entity list")
+        };
+        ensure!(values.len() == 1, "unexpected block entity count");
+
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java=std::env::var_os("MINECRAFT_JAVA_HOME").or_else(||std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(||PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("JigsawEmptyChestOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/JigsawEmptyChestOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output_path = temp.path().join("chest.nbt");
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(cp)
+            .arg("JigsawEmptyChestOracle")
+            .arg(&output_path)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8(output.stdout)?
+                .lines()
+                .any(|line| line == format!("E {first_seed} {next}"))
+        );
+        let java_tag = nbt::read(&std::fs::read(output_path)?)?.value;
+        assert_eq!(canonical(values[0].clone()), canonical(java_tag));
+
+        let mut invalid = tag.clone();
+        if let Tag::Compound(fields) = &mut invalid {
+            let (_, items) = fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("Items"))
+                .context("missing items")?;
+            *items = Tag::List {
+                element_type: native_persistence::nbt::TagType::Compound,
+                values: vec![Tag::Compound(vec![])],
+            };
+        }
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let before = terrain.snapshot();
+        let writable = before.chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut random = DecorationRandom::new(42);
+        let mut expected = random.clone();
+        assert!(
+            JigsawRegion {
+                region: &mut region,
+                registry: &registry
+            }
+            .place_template_block(pos, &state, Some(&invalid), &mut random)
+            .is_err()
+        );
+        assert_eq!(random.next_long(), expected.next_long());
+        drop(region);
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+        Ok(())
     }
 
     #[test]

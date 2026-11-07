@@ -18,6 +18,7 @@ import net.minecraft.world.level.levelgen.structure.Structure;
 import net.minecraft.world.level.levelgen.structure.StructureStart;
 import net.minecraft.world.level.levelgen.structure.pieces.PiecesContainer;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.storage.SerializableChunkData;
 import net.minecraft.world.level.levelgen.structure.templatesystem.*;
 
 public class RuinedPortalSavedPieceOracle {
@@ -60,10 +61,29 @@ public class RuinedPortalSavedPieceOracle {
                     if (!new RuinedPortalPiece(context, tag).createTag(context).equals(tag))
                         throw new AssertionError("Java piece round trip changed: " + tag);
                 }
-        var root = new CompoundTag(); root.put("pieces", expected); root.put("starts", starts);
+        var pos = new ChunkPos(-3, 3);
+        var structureData = new CompoundTag();
+        var startsData = new CompoundTag(); startsData.put("minecraft:ruined_portal", starts.get(0));
+        var references = new CompoundTag(); references.putLongArray("minecraft:ruined_portal", new long[] { ChunkPos.pack(-3, 3) });
+        structureData.put("starts", startsData); structureData.put("References", references);
+        var root = new CompoundTag(); root.put("pieces", expected); root.put("starts", starts); root.put("structures", structureData);
         NbtIo.write(root, Path.of(args[0]));
         output.println(expected.get(0));
-        if (args.length > 1 && !root.equals(NbtIo.read(Path.of(args[1]))))
-            throw new AssertionError("Rust piece NBT differs");
+        if (args.length > 1) {
+            var rust = NbtIo.read(Path.of(args[1]));
+            if (!root.equals(rust)) throw new AssertionError("Rust piece NBT differs");
+            var unpackStarts = SerializableChunkData.class.getDeclaredMethod("unpackStructureStart", StructurePieceSerializationContext.class, CompoundTag.class, long.class);
+            var unpackRefs = SerializableChunkData.class.getDeclaredMethod("unpackStructureReferences", RegistryAccess.class, ChunkPos.class, CompoundTag.class);
+            var pack = SerializableChunkData.class.getDeclaredMethod("packStructureData", StructurePieceSerializationContext.class, ChunkPos.class, Map.class, Map.class);
+            unpackStarts.setAccessible(true); unpackRefs.setAccessible(true); pack.setAccessible(true);
+            var actual = rust.getCompoundOrEmpty("structures");
+            var decodedStarts = (Map<?, ?>) unpackStarts.invoke(null, context, actual, 42L);
+            var decodedRefs = (Map<?, ?>) unpackRefs.invoke(null, registries, pos, actual);
+            var decoded = (StructureStart) decodedStarts.get(structure);
+            if (decoded == null || decoded.getPieces().size() != 1 || !decoded.getChunkPos().equals(pos))
+                throw new AssertionError("portal start failed to load");
+            var repacked = (CompoundTag) pack.invoke(null, context, pos, decodedStarts, decodedRefs);
+            if (!actual.equals(repacked)) throw new AssertionError("portal structure data changed in Java");
+        }
     }
 }

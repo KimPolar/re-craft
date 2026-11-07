@@ -292,6 +292,21 @@ fn generated_portal_piece_nbt_matches_java() -> Result<()> {
         }),
         piece: first.clone(),
     };
+    let start_tag = first_start.to_tag(&ResourceId::parse("minecraft:ruined_portal")?)?;
+    let packed_chunk = ((3u64 << 32) | u64::from((-3i32) as u32)) as i64;
+    let structure_data = Tag::Compound(vec![
+        (
+            "starts".into(),
+            Tag::Compound(vec![("minecraft:ruined_portal".into(), start_tag.clone())]),
+        ),
+        (
+            "References".into(),
+            Tag::Compound(vec![(
+                "minecraft:ruined_portal".into(),
+                Tag::LongArray(vec![packed_chunk]),
+            )]),
+        ),
+    ]);
     let root = NamedTag {
         name: "".into(),
         value: Tag::Compound(vec![
@@ -309,11 +324,10 @@ fn generated_portal_piece_nbt_matches_java() -> Result<()> {
                 "starts".into(),
                 Tag::List {
                     element_type: TagType::Compound,
-                    values: vec![
-                        first_start.to_tag(&ResourceId::parse("minecraft:ruined_portal")?)?,
-                    ],
+                    values: vec![start_tag],
                 },
             ),
+            ("structures".into(), structure_data),
         ]),
     };
     let rust_path = temp.path().join("rust.nbt");

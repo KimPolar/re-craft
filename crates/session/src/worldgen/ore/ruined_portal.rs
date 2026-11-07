@@ -1504,6 +1504,69 @@ mod tests {
             )
         );
 
+        // Entity anchors outside Java's expanded clip must not prevent the
+        // block pass; an intersecting entity is still rejected transactionally.
+        for (anchor, accepted) in [([50, 1, 0], true), ([0, 1, 0], false)] {
+            let mut with_entity = start.clone();
+            Arc::make_mut(&mut with_entity.template)
+                .entities
+                .push(Tag::Compound(vec![
+                    (
+                        "blockPos".into(),
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Int,
+                            values: anchor.into_iter().map(Tag::Int).collect(),
+                        },
+                    ),
+                    (
+                        "pos".into(),
+                        Tag::List {
+                            element_type: native_persistence::nbt::TagType::Double,
+                            values: anchor
+                                .into_iter()
+                                .map(|v| Tag::Double(f64::from(v) + 0.5))
+                                .collect(),
+                        },
+                    ),
+                    (
+                        "nbt".into(),
+                        Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]),
+                    ),
+                ]));
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut clip = BoundingBox::new([8, 9, 8], [8, 9, 8]).unwrap();
+            let mut random = DecorationRandom::new(42);
+            let mut expected = random.clone();
+            let result = region.place_ruined_portal(
+                &with_entity,
+                &registry,
+                &processors,
+                &protected,
+                &wall_tags,
+                &mut clip,
+                &mut random,
+            );
+            if accepted {
+                assert!(result?);
+                region.finish()?;
+                assert!(matches!(
+                    terrain.snapshot().block(6, 8, 6).unwrap().name.as_str(),
+                    "minecraft:obsidian" | "minecraft:crying_obsidian"
+                ));
+            } else {
+                assert!(
+                    format!("{:#}", result.unwrap_err())
+                        .contains("entity placement is unsupported")
+                );
+                assert_eq!(random.next_long(), expected.next_long());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            }
+        }
+
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();

@@ -482,7 +482,11 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             }
             (0, 0)
         }
-        "minecraft:seagrass" | "minecraft:kelp_plant" if state.properties.is_empty() => (1, 0),
+        "minecraft:seagrass" | "minecraft:kelp_plant" | "minecraft:spawner"
+            if state.properties.is_empty() =>
+        {
+            (1, 0)
+        }
         "minecraft:kelp" if state.properties.len() == 1 => {
             let raw = state.properties.get("age")?;
             let age = raw.parse::<u8>().ok()?;
@@ -2239,6 +2243,7 @@ mod tests {
             "glow_lichen",
             "kelp",
             "kelp_plant",
+            "spawner",
             "amethyst_block",
             "budding_amethyst",
             "smooth_basalt",

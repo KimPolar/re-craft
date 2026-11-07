@@ -2995,6 +2995,79 @@ impl TerrainGenerator {
         )
     }
 
+    /// Select and prepare a shipwreck start using the active biome source,
+    /// base terrain and data-pack templates. Placement and saving are separate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_generate_shipwreck_structure_set<P: ResourceProvider>(
+        &self,
+        provider: &mut P,
+        evaluator: &mut DensityEvaluator,
+        cache: &mut native_resources::structure_placement::StructureSetCache,
+        biome_rules: &native_resources::structure_biomes::StructureBiomes,
+        id: &ResourceId,
+        chunk: [i32; 2],
+        existing: impl FnMut(&ResourceId) -> Result<bool>,
+        mut classify: impl FnMut(&Value) -> Result<BlockHeightFlags>,
+    ) -> Result<native_resources::structure_placement::StructureSetStart<shipwreck::PreparedStart>>
+    {
+        let mut columns = HashMap::new();
+        let mut structure_evaluator = DensityEvaluator::default();
+        let mut flags = None;
+        let max_y = self
+            .min_y
+            .checked_add(self.height - 1)
+            .context("dimension height overflow")?;
+        self.try_generate_structure_set(
+            provider,
+            evaluator,
+            cache,
+            biome_rules,
+            id,
+            chunk,
+            existing,
+            |provider, entry| {
+                let path = format!(
+                    "data/{}/worldgen/structure/{}.json",
+                    entry.id.namespace, entry.id.path
+                );
+                let bytes = provider
+                    .read_data(&path)?
+                    .with_context(|| format!("missing structure {path}"))?;
+                let definition: Value = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid structure {path}"))?;
+                if flags.is_none() {
+                    flags = Some([
+                        classify(self.noise.default_block())?,
+                        classify(self.noise.default_fluid())?,
+                        classify(&serde_json::json!("minecraft:lava"))?,
+                        classify(&serde_json::json!("minecraft:air"))?,
+                    ]);
+                }
+                let mut env = StructureStartEnvironment {
+                    noise: &self.noise,
+                    evaluator: &mut structure_evaluator,
+                    biome_rules,
+                    structure: &entry.id,
+                    column_source: self.source.fresh_sampler(),
+                    point_source: self.source.fresh_sampler(),
+                    climate: None,
+                    columns: &mut columns,
+                    flags: flags.as_ref().unwrap(),
+                    min_y: self.min_y,
+                    max_y,
+                };
+                shipwreck::PreparedStart::generate(
+                    provider,
+                    &definition,
+                    &mut env,
+                    self.seed,
+                    chunk,
+                )
+                .with_context(|| format!("in structure {path}"))
+            },
+        )
+    }
+
     /// Attempt the supported simple structure types using this generator's
     /// unadjusted base heights and noise-biome source. Other structure types
     /// return an error, so they cannot silently lose their generation attempt.
@@ -9369,7 +9442,9 @@ mod tests {
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 if let Some(value) = self.0.get(path) {
                     Ok(Some(value.clone()))
-                } else if path.starts_with("data/minecraft/structure/underwater_ruin/") {
+                } else if path.starts_with("data/minecraft/structure/underwater_ruin/")
+                    || path.starts_with("data/minecraft/structure/shipwreck/")
+                {
                     Ok(self.0.get("ruin-template").cloned())
                 } else {
                     Data.read_data(path)
@@ -9661,6 +9736,56 @@ mod tests {
             encoder.write_all(&nbt::write(&template).unwrap()).unwrap();
             data.0
                 .insert("ruin-template".into(), encoder.finish().unwrap());
+            for beached in [false, true] {
+                let shipwreck = json!({"type":"minecraft:shipwreck","biomes":["minecraft:plains"],"step":"surface_structures","is_beached":beached,"terrain_adaptation":"bury"});
+                data.0
+                    .insert(path.into(), serde_json::to_vec(&shipwreck).unwrap());
+                let result = generator
+                    .try_generate_shipwreck_structure_set(
+                        &mut data,
+                        &mut evaluator,
+                        &mut cache,
+                        &rules,
+                        &set_id,
+                        [0, 0],
+                        |_| Ok(false),
+                        classify,
+                    )
+                    .unwrap();
+                let StructureSetStart::Generated { structure, start } = result else {
+                    panic!("expected shipwreck start")
+                };
+                assert_eq!(structure, structure_id);
+                assert_eq!(start.generation_point, [8, 15, 8]);
+                assert_eq!(
+                    start.piece,
+                    native_resources::shipwreck::select_for_chunk(42, [0, 0], beached).unwrap()
+                );
+                assert!(!start.height_adjusted);
+                assert_eq!(start.template.data_version, Some(5023));
+                let reference = start.reference_bounds(structure).unwrap().bounds;
+                assert_eq!(
+                    reference.min,
+                    start.bounds.min.map(|coordinate| coordinate - 12)
+                );
+                assert_eq!(
+                    reference.max,
+                    start.bounds.max.map(|coordinate| coordinate + 12)
+                );
+                let existing = generator
+                    .try_generate_shipwreck_structure_set(
+                        &mut data,
+                        &mut evaluator,
+                        &mut cache,
+                        &rules,
+                        &set_id,
+                        [0, 0],
+                        |_| Ok(true),
+                        |_| panic!("existing start must not classify blocks"),
+                    )
+                    .unwrap();
+                assert!(matches!(existing, StructureSetStart::Existing));
+            }
             let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"step":"surface_structures","biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
             data.0
                 .insert(path.into(), serde_json::to_vec(&ruin).unwrap());

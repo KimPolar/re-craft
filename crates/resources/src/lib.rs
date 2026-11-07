@@ -76,6 +76,7 @@ pub mod ruined_portal_decoration;
 pub mod simple_block_feature;
 pub mod sky_light;
 pub mod sounds;
+pub mod speleothem;
 pub mod spawn_origin;
 pub mod spring_feature;
 pub mod sprites;

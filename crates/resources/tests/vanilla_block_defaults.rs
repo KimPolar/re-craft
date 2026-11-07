@@ -28,6 +28,10 @@ public class BlockDefaultsOracle {
                 .map(value -> value.property().getName() + "=" + value.valueName()).sorted().toList();
             output.println(BuiltInRegistries.BLOCK.getKey(block) + "\t" + String.join("\t", values));
             output.println("ENTITY\t" + BuiltInRegistries.BLOCK.getKey(block) + "\t" + block.defaultBlockState().hasBlockEntity());
+            var isAir = block.defaultBlockState().isAir();
+            if (block.getStateDefinition().getPossibleStates().stream().anyMatch(state -> state.isAir() != isAir))
+                throw new AssertionError("air status varies within block " + block);
+            output.println("AIR\t" + BuiltInRegistries.BLOCK.getKey(block) + "\t" + isAir);
         }
         if (args.length > 0) {
             var digits=new JsonArray();
@@ -372,6 +376,39 @@ fn generated_block_defaults_match_java() {
             (id.to_owned(), value.parse::<bool>().unwrap())
         })
         .collect();
+    let air_expected: BTreeMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("AIR\t"))
+        .map(|line| {
+            let (id, value) = line.split_once('\t').unwrap();
+            (id.to_owned(), value.parse::<bool>().unwrap())
+        })
+        .collect();
+    let mut unsupported_states = 0;
+    for id in registry.registered_ids() {
+        let is_air = air_expected
+            .get(id)
+            .unwrap_or_else(|| panic!("unregistered Java block: {id}"));
+        assert_eq!(
+            *is_air,
+            matches!(
+                id,
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+            ),
+            "Java air classification: {id}"
+        );
+        assert!(
+            with_pack.is_registered(id),
+            "resource pack changed block registrations: {id}"
+        );
+        unsupported_states += usize::from(!registry.contains(id));
+    }
+    assert!(
+        unsupported_states > 0,
+        "expected verified blocks with unsupported state schemas"
+    );
+    assert!(!registry.is_registered("minecraft:powder_snow_bucket"));
+    assert!(!registry.is_registered("example:unknown"));
     assert!(
         registry.len() >= 100,
         "block registry is unexpectedly small"

@@ -7278,7 +7278,11 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 let block =
                                     self.world.state(*id).context("unknown section block")?;
                                 if !super::generated_state_is_air(guard.registry, block)
-                                    .context("unknown registered section block")?
+                                    .with_context(|| {
+                                        format!(
+                                            "unknown registered section block in {key:?}: {block:?}"
+                                        )
+                                    })?
                                 {
                                     count += 1;
                                 }

@@ -783,14 +783,18 @@ impl GeneratedBlockRegistry {
                 }
                 _ => None,
             };
-            if let Some(schema) = schema {
-                let has_entity = entity_block_class(
+            let has_entity = if schema.is_some() {
+                entity_block_class(
                     &class,
                     &mut read_class,
                     &mut entity_cache,
                     &mut BTreeSet::new(),
-                )?;
-                block_entities.insert(id.clone(), has_entity);
+                )?
+            } else {
+                None
+            };
+            block_entities.insert(id.clone(), has_entity);
+            if let Some(schema) = schema {
                 states.insert(id, schema);
             }
         }
@@ -806,6 +810,16 @@ impl GeneratedBlockRegistry {
 
     pub fn contains(&self, id: &str) -> bool {
         self.states.contains_key(id)
+    }
+    /// Whether the verified client registers this block, even when its state
+    /// schema or block-entity behavior is not yet implemented.
+    pub fn is_registered(&self, id: &str) -> bool {
+        self.block_entities.contains_key(id) || self.states.contains_key(id)
+    }
+    /// Block identities proven by client registration, independent of the
+    /// narrower set exposed by `ids`, whose states are implemented.
+    pub fn registered_ids(&self) -> impl Iterator<Item = &str> {
+        self.block_entities.keys().map(String::as_str)
     }
     /// Whether the verified block class implements Java's EntityBlock.
     /// None means the block or part of its inheritance graph is unavailable.
@@ -1210,6 +1224,19 @@ pub fn load(minecraft_dir: &Path, directory: &Path) -> Result<DefaultProperties>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_identity_does_not_imply_supported_states_or_entities() {
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:stone".into(), StateSchema::Stateless)]),
+            block_entities: BTreeMap::from([("minecraft:unimplemented".into(), None)]),
+        };
+        assert!(registry.is_registered("minecraft:unimplemented"));
+        assert!(!registry.contains("minecraft:unimplemented"));
+        assert_eq!(registry.has_block_entity("minecraft:unimplemented"), None);
+        assert!(!registry.is_canonical_state("minecraft:unimplemented", &BTreeMap::new()));
+        assert!(!registry.is_registered("example:unknown"));
+    }
 
     #[test]
     fn template_state_transform_preserves_java_stair_mirror_asymmetry() {

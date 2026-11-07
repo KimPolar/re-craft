@@ -243,7 +243,7 @@ fn generated_state_is_air(
     registry: &native_resources::block_registry::GeneratedBlockRegistry,
     state: &native_world::loaded::BlockState,
 ) -> Option<bool> {
-    if !registry.contains(&state.name) {
+    if !registry.is_registered(&state.name) {
         return None;
     }
     let air = matches!(
@@ -3562,6 +3562,42 @@ impl TerrainGenerator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn light_section_air_count_accepts_registered_unsupported_states() {
+        let game = native_resources::default_minecraft_dir().unwrap();
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let registry = resources.vanilla_generated_block_registry().unwrap();
+        let unsupported = registry
+            .registered_ids()
+            .find(|id| !registry.contains(id))
+            .expect("expected unsupported schema");
+        let state = native_world::loaded::BlockState {
+            name: unsupported.into(),
+            properties: BTreeMap::new(),
+        };
+        assert_eq!(
+            generated_state_is_air(&registry, &state),
+            Some(false),
+            "{unsupported}"
+        );
+        let air = native_world::loaded::BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        assert_eq!(generated_state_is_air(&registry, &air), Some(true));
+        let mut malformed_air = air.clone();
+        malformed_air
+            .properties
+            .insert("unknown".into(), "true".into());
+        assert_eq!(generated_state_is_air(&registry, &malformed_air), None);
+        let unknown = native_world::loaded::BlockState {
+            name: "example:unknown".into(),
+            properties: BTreeMap::new(),
+        };
+        assert_eq!(generated_state_is_air(&registry, &unknown), None);
+    }
 
     #[test]
     fn generated_chunks_share_a_world_without_losing_flags_or_snapshots() {

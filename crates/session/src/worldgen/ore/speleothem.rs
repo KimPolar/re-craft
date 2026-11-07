@@ -259,6 +259,13 @@ mod tests {
                     properties: BTreeMap::new()
                 }
             )?);
+            assert!(!DiskWorld::is_liquid(
+                &mut region,
+                &BlockState {
+                    name: name.into(),
+                    properties: BTreeMap::new()
+                }
+            )?);
         }
         for direction in ["up", "down"] {
             for thickness in ["tip_merge", "tip", "frustum", "middle", "base"] {
@@ -272,6 +279,7 @@ mod tests {
                         ]),
                     };
                     assert!(DiskWorld::is_solid(&mut region, &state)?);
+                    assert!(!DiskWorld::is_liquid(&mut region, &state)?);
                 }
             }
         }
@@ -280,6 +288,7 @@ mod tests {
             properties: BTreeMap::new(),
         };
         assert!(DiskWorld::is_solid(&mut region, &malformed).is_err());
+        assert!(DiskWorld::is_liquid(&mut region, &malformed).is_err());
         Ok(())
     }
 

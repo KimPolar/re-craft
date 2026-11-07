@@ -282,7 +282,7 @@ fn speleothem_columns_match_java() -> Result<()> {
     for line in String::from_utf8(output.stdout)?.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
         match parts.as_slice() {
-            ["E", block, block_entity, poi, postprocessing, solid] => {
+            ["E", block, block_entity, poi, postprocessing, solid, liquid] => {
                 assert_eq!(
                     (*block_entity, *poi, *postprocessing),
                     ("false", "false", "null"),
@@ -294,6 +294,15 @@ fn speleothem_columns_match_java() -> Result<()> {
                         "false"
                     } else {
                         "true"
+                    },
+                    "{line}"
+                );
+                assert_eq!(
+                    *liquid,
+                    if block.contains("water") {
+                        "true"
+                    } else {
+                        "false"
                     },
                     "{line}"
                 );

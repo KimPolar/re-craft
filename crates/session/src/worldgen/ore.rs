@@ -6655,6 +6655,13 @@ impl DiskWorld for DecorationRegion<'_> {
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             return Ok(true);
         }
+        if matches!(
+            state.name.as_str(),
+            "minecraft:cinnabar" | "minecraft:sulfur" | "minecraft:sulfur_spike"
+        ) {
+            DiskWorld::is_solid(self, state)?;
+            return Ok(false);
+        }
         if geode_crystal(state)? {
             return Ok(false);
         }

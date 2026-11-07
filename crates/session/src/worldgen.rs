@@ -56,6 +56,7 @@ pub mod ocean_ruin;
 mod ore;
 pub mod postprocessing;
 mod postprocessing_world;
+pub mod ruined_portal;
 pub mod schedule;
 pub mod structure_batch;
 mod structure_data;
@@ -2539,6 +2540,29 @@ impl native_resources::ruined_portal::PortalEnvironment for StructureStartEnviro
     }
 }
 
+impl ruined_portal::PortalStartEnvironment for StructureStartEnvironment<'_> {
+    fn cold_enough_to_snow(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        position: [i32; 3],
+    ) -> Result<bool> {
+        let biome = self.point_source.sample_quart(
+            self.noise.router(),
+            self.evaluator,
+            position.map(|value| value.div_euclid(4)),
+        );
+        let id = format!("{}:{}", biome.namespace, biome.path);
+        let climate = native_resources::biome_climate::BiomeClimate::load_world(provider, &id)?
+            .with_context(|| format!("portal biome climate {id} is missing"))?;
+        Ok(climate.cold_enough_to_snow(
+            position[0],
+            position[1],
+            position[2],
+            self.noise.sea_level(),
+        ))
+    }
+}
+
 impl mineshaft::MineshaftEnvironment for StructureStartEnvironment<'_> {
     fn generator_min_y(&self) -> i32 {
         self.noise.router().min_y
@@ -3178,29 +3202,15 @@ impl TerrainGenerator {
                     max_y,
                 };
                 if ruined_portal {
-                    let settings = native_resources::ruined_portal::Settings::decode(&definition)
-                        .with_context(|| format!("in structure {path}"))?;
-                    native_resources::structure_start::decode_terrain_adjustment(&definition)
-                        .with_context(|| format!("in structure {path}"))?;
-                    let (selection, mut random) = settings.select_for_chunk(self.seed, chunk)?;
-                    let template = native_persistence::structure_template::StructureTemplate::load(
+                    let start = ruined_portal::PreparedStart::prepare(
                         provider,
-                        &selection.template,
-                    )?
-                    .context("ruined portal template is missing")?;
-                    ensure!(
-                        template.data_version == Some(5023),
-                        "ruined portal template requires data-version conversion"
-                    );
-                    let point = native_resources::ruined_portal::find_generation_point(
+                        &definition,
                         &mut env,
+                        self.seed,
                         chunk,
-                        template.size,
-                        &selection,
-                        &settings.setups()[selection.setup_index],
-                        &mut random,
-                    )?;
-                    if point.is_none() {
+                    )
+                    .with_context(|| format!("in structure {path}"))?;
+                    if start.is_none() {
                         return Ok(None);
                     }
                     anyhow::bail!("ruined portal structure pieces are not yet supported");

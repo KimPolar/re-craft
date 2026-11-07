@@ -339,6 +339,10 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     var source=args[1].contains("_deepslate_coal_ore_") ? Blocks.DEEPSLATE_COAL_ORE.defaultBlockState() : Blocks.COAL_ORE.defaultBlockState();
                     if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.isSolid())throw new AssertionError("unsupported magma source effects");
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
+                } else if(args[1].contains("_potent_sulfur_")) {
+                    var source=Blocks.POTENT_SULFUR.defaultBlockState();
+                    if(!source.hasBlockEntity() || !LightEngine.hasDifferentLightProperties(source,Blocks.MAGMA_BLOCK.defaultBlockState()))throw new AssertionError("invalid potent sulfur source");
+                    fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
                 } else if(args[1].contains("_deepslate_x_") || args[1].contains("_deepslate_y_") || args[1].contains("_deepslate_z_")) {
                     var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
                     var source=Blocks.DEEPSLATE.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,axis);

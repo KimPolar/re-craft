@@ -35,6 +35,70 @@ fn potent_sulfur_predicates_validate_all_states() -> Result<()> {
 }
 
 #[test]
+fn magma_replaces_pending_sulfur_without_leaking_entities() -> Result<()> {
+    let (mut terrain, tags, _, _) = super::tests::fixture();
+    let names = [
+        "air",
+        "cave_air",
+        "void_air",
+        "stone",
+        "diamond_ore",
+        "potent_sulfur",
+        "magma_block",
+    ]
+    .into_iter()
+    .map(|name| format!("minecraft:{name}"))
+    .collect();
+    let motion = HeightmapTags::load(&mut super::tests::Data, &names)?;
+    let writable = terrain.snapshot().chunks.keys().copied().collect();
+    let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+    for (index, value) in ["dry", "wet", "dormant", "erupting", "continuous"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(SimpleBlockWorld::place_simple_state(
+            &mut region,
+            [index as i32 + 2, 7, 2],
+            &sulfur(value)
+        )?);
+    }
+    let magma = BlockState {
+        name: "minecraft:magma_block".into(),
+        properties: BTreeMap::new(),
+    };
+    for x in [3, 5] {
+        assert!(MagmaWorld::set_magma(&mut region, [x, 7, 2], &magma)?);
+        assert!(!region.monster_entities.contains_key(&[x, 7, 2]));
+        assert!(
+            !region.pending_order[&ChunkPos { x: 0, z: 0 }]
+                .members()
+                .contains(&[x, 7, 2])
+        );
+    }
+    region.finish()?;
+    let Tag::List { values, .. } = terrain
+        .generated_block_entity_data_with(ChunkPos { x: 0, z: 0 }, |state| {
+            Some(state.name == "minecraft:potent_sulfur")
+        })?
+    else {
+        anyhow::bail!("missing block entities")
+    };
+    assert_eq!(values.len(), 3);
+    for entity in values {
+        assert!(matches!(entity.get("x"), Some(Tag::Int(2 | 4 | 6))));
+        assert_eq!(entity.get("id"), Some(&Tag::String("DUMMY".into())));
+    }
+    let before = terrain.snapshot();
+    let writable = before.chunks.keys().copied().collect();
+    let mut failed = terrain.decoration_region(&tags, &motion, writable)?;
+    Arc::make_mut(&mut failed.monster_entities).remove(&[2, 7, 2]);
+    assert!(MagmaWorld::set_magma(&mut failed, [2, 7, 2], &magma).is_err());
+    assert!(failed.finish().is_err());
+    assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+    Ok(())
+}
+
+#[test]
 fn generated_potent_sulfur_keeps_pending_entities_and_rolls_back() -> Result<()> {
     let (mut terrain, tags, _, _) = super::tests::fixture();
     let names = [

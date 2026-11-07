@@ -42,6 +42,16 @@ public class PotentSulfurOracle {
             chunk.setBlockEntity(entity);
             NbtIo.write(chunk.getBlockEntityNbtForSaving(pos,registries),Path.of(args[0]).resolve(index+".nbt"));
             out.printf("P %d %s %s %s %s %s %s %s%n",index,state.getValue(PotentSulfurBlock.STATE).getSerializedName(),state.canSurvive(empty,pos),state.isSolid(),state.liquid(),state.hasBlockEntity(),PoiTypes.hasPoi(state),state.getPostProcessPos(null,pos));
+            // WorldGenRegion removes the old protochunk entity when a block
+            // with an entity is replaced by one without an entity.
+            var replacement=new BlockPos(index,7,1);
+            chunk.setBlockState(replacement,state,2);
+            var pending=new CompoundTag();pending.putString("id","DUMMY");pending.putInt("x",replacement.getX());pending.putInt("y",replacement.getY());pending.putInt("z",replacement.getZ());chunk.setBlockEntityNbt(pending);
+            if(chunk.getBlockEntityNbt(replacement)==null)throw new AssertionError("missing pending sulfur");
+            var magma=Blocks.MAGMA_BLOCK.defaultBlockState();
+            var previous=chunk.setBlockState(replacement,magma,2);
+            if(previous.hasBlockEntity() && !magma.hasBlockEntity())chunk.removeBlockEntity(replacement);
+            if(chunk.getBlockEntityNbt(replacement)!=null || chunk.getBlockEntity(replacement)!=null || chunk.getBlockEntitiesPos().contains(replacement))throw new AssertionError("stale sulfur entity");
             index++;
         }
         for(var state:Blocks.POTENT_SULFUR.getStateDefinition().getPossibleStates())

@@ -7459,11 +7459,36 @@ impl MagmaWorld for DecorationRegion<'_> {
             if !self.is_outside(pos[1]) {
                 let source = self.read(pos)?;
                 let ore = generated_ore_state(&source)?;
+                let pending_sulfur = if source.name == "minecraft:potent_sulfur" {
+                    ensure!(
+                        super::generated_potent_sulfur::is_valid_state(&source)
+                            && matches!(self.monster_entities.get(&pos), Some(Some(super::GeneratedMonsterRoomEntity::PendingPotentSulfur { position, state })) if *position == pos && *state == source)
+                            && self
+                                .pending_order
+                                .get(&chunk(pos))
+                                .is_some_and(|order| order.members().contains(&pos)),
+                        "potent sulfur block entity is unavailable or inconsistent"
+                    );
+                    true
+                } else {
+                    false
+                };
                 ensure!(
-                    disk_safe_solid(&source.name).is_some() || ore,
+                    disk_safe_solid(&source.name).is_some() || ore || pending_sulfur,
                     "unsupported magma source effects for {} at {pos:?}",
                     source.name
                 );
+                if pending_sulfur {
+                    // WorldGenRegion removes the old block entity when the
+                    // replacement has none. This draft is discarded on error.
+                    Arc::make_mut(&mut self.monster_entities).remove(&pos);
+                    if let Some(order) = self.pending_order.get_mut(&chunk(pos)) {
+                        Arc::make_mut(order).remove(pos);
+                    }
+                    if let Some(order) = self.entity_order.get_mut(&chunk(pos)) {
+                        Arc::make_mut(order).remove(pos);
+                    }
+                }
                 self.magma_block_write = true;
                 let write = self.set_proto_block(pos, state);
                 self.magma_block_write = false;
@@ -7854,7 +7879,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             == Some(true);
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
-                        && (lake_source || generated_ore_state(&old)?)
+                        && (lake_source
+                            || generated_ore_state(&old)?
+                            || super::generated_potent_sulfur::is_valid_state(&old))
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
                     if guard.require_unchanged_light {
@@ -12233,6 +12260,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_magma_replaces_potent_sulfur_like_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_potent_sulfur_magma_block",
+            "vine_active_self_potent_sulfur_magma_block",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_village_piles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_pile_snow",
@@ -12473,6 +12509,13 @@ mod tests {
                     });
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
+                } else if mode.contains("_potent_sulfur_") {
+                    let mut source = state("potent_sulfur");
+                    source
+                        .properties
+                        .insert("potent_sulfur_state".into(), "dry".into());
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
                 } else if mode.contains("_deepslate_x_")
                     || mode.contains("_deepslate_y_")
                     || mode.contains("_deepslate_z_")
@@ -12598,6 +12641,20 @@ mod tests {
                 for p in positions {
                     world.set_block_id(p[0], p[1], p[2], stone).unwrap();
                 }
+            }
+            if mode.contains("_potent_sulfur_") {
+                let pos = [16, 7, 8];
+                let state = terrain.world.block(pos[0], pos[1], pos[2]).unwrap().clone();
+                Arc::make_mut(&mut terrain.generated_monster_entities).insert(
+                    pos,
+                    Some(
+                        super::super::GeneratedMonsterRoomEntity::PendingPotentSulfur {
+                            position: pos,
+                            state,
+                        },
+                    ),
+                );
+                Arc::make_mut(terrain.generated_pending_order.entry(east).or_default()).insert(pos);
             }
             let radius = if self_active { 2 } else { 1 };
             let registered: Vec<_> = (-radius..=radius)

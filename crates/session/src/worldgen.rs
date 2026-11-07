@@ -4115,7 +4115,7 @@ mod tests {
         };
         use native_world::loaded::{BlockState, ChunkPos};
         struct FeatureData {
-            crossing: bool,
+            crossing: Option<&'static str>,
             brown: bool,
         }
         impl ResourceProvider for FeatureData {
@@ -4138,8 +4138,8 @@ mod tests {
                     let mut features = vec![
                         json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":mushroom},"schedule_tick":true},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}),
                     ];
-                    if self.crossing {
-                        features.push(json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":"minecraft:melon"}},"placement":[{"type":"minecraft:offset","x":-1,"y":8,"z":8}]}));
+                    if let Some(block) = self.crossing {
+                        features.push(json!({"feature":{"type":"minecraft:simple_block","to_place":{"id":block}},"placement":[{"type":"minecraft:offset","x":-1,"y":8,"z":8}]}));
                     }
                     return Ok(Some(serde_json::to_vec(
                         &json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[features]}),
@@ -4187,7 +4187,12 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
-        for crossing in [false, true] {
+        for crossing in [
+            None,
+            Some("minecraft:melon"),
+            Some("minecraft:brown_mushroom"),
+        ] {
+            let changes_light = crossing == Some("minecraft:brown_mushroom");
             let generated_registry = resources.vanilla_generated_block_registry().unwrap();
             let mut block_registry: BTreeSet<String> =
                 generated_registry.ids().map(str::to_owned).collect();
@@ -4290,17 +4295,20 @@ mod tests {
                 }
                 match batch.step(&mut data, &mut classify, &mut resolve) {
                     Ok(Some(_)) => {}
-                    Ok(None) if !crossing => break,
-                    Err(error) if crossing => {
+                    Ok(None) if !changes_light => break,
+                    Err(error) if changes_light => {
+                        let message = format!("{error:#}");
                         assert!(
-                            format!("{error:#}").contains("registered light chunk has changed")
+                            message.contains("registered light chunk has changed")
+                                || message.contains("registered light behavior changed"),
+                            "unexpected error: {message}"
                         );
                         break;
                     }
                     other => panic!("unexpected batch result {other:?}"),
                 }
             }
-            if crossing {
+            if changes_light {
                 assert!(Arc::ptr_eq(
                     &before_attempt.unwrap(),
                     &batch.snapshot().unwrap()
@@ -4317,7 +4325,15 @@ mod tests {
                 after.block(24, 8, 8).unwrap().name,
                 "minecraft:red_mushroom"
             );
-            assert!(Arc::ptr_eq(&before.chunks[&center], &after.chunks[&center]));
+            if crossing.is_some() {
+                assert_eq!(after.block(15, 8, 8).unwrap().name, "minecraft:melon");
+                assert!(!Arc::ptr_eq(
+                    &before.chunks[&center],
+                    &after.chunks[&center]
+                ));
+            } else {
+                assert!(Arc::ptr_eq(&before.chunks[&center], &after.chunks[&center]));
+            }
             let (schedule, _, terrain, light) = batch.into_parts().unwrap();
             assert_eq!(
                 schedule.completed(east),
@@ -4356,7 +4372,7 @@ mod tests {
             .map(|name| format!("minecraft:{name}")),
         );
         let mut data = FeatureData {
-            crossing: false,
+            crossing: None,
             brown: true,
         };
         let tags = CarverBlockTags::load(&mut data, &block_registry).unwrap();

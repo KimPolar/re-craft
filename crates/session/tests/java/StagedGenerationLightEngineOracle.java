@@ -284,7 +284,14 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 w.edits.put(new BlockPos(16,10,8),initial);
             }
             if(x==1 && z==0 && magma) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
-            if(x==1 && z==0 && magmaActive) fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
+            if(x==1 && z==0 && magmaActive) {
+                fake.section.setBlockState(0,8,8,Blocks.WATER.defaultBlockState());
+                if(args[1].contains("_coal_ore_")) {
+                    var source=args[1].contains("_deepslate_coal_ore_") ? Blocks.DEEPSLATE_COAL_ORE.defaultBlockState() : Blocks.COAL_ORE.defaultBlockState();
+                    if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.isSolid())throw new AssertionError("unsupported magma source effects");
+                    fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
+                }
+            }
             if(x==1 && z==0 && exposed) { fake.section.setBlockState(1,7,8,Blocks.AIR.defaultBlockState()); w.edits.put(new BlockPos(17,7,8),Blocks.AIR.defaultBlockState()); }
             if(w.mixed && x==0 && z==0) fake.section.setBlockState(0,10,8,Blocks.TORCH.defaultBlockState());
             if((!partial && !w.mixed) || (x==1 && z==0 && !late) || ((w.mixed || emptyPartialWide) && x==0 && z==0)){

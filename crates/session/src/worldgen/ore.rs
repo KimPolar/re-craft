@@ -7003,8 +7003,12 @@ impl MagmaWorld for DecorationRegion<'_> {
             );
             if !self.is_outside(pos[1]) {
                 let source = self.read(pos)?;
+                let coal = matches!(
+                    source.name.as_str(),
+                    "minecraft:coal_ore" | "minecraft:deepslate_coal_ore"
+                ) && source.properties.is_empty();
                 ensure!(
-                    disk_safe_solid(&source.name).is_some(),
+                    disk_safe_solid(&source.name).is_some() || coal,
                     "unsupported magma source effects for {} at {pos:?}",
                     source.name
                 );
@@ -7339,7 +7343,12 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
-                        && old.name == "minecraft:stone"
+                        && matches!(
+                            old.name.as_str(),
+                            "minecraft:stone"
+                                | "minecraft:coal_ore"
+                                | "minecraft:deepslate_coal_ore"
+                        )
                         && old.properties.is_empty()
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
@@ -11596,7 +11605,12 @@ mod tests {
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_underwater_magma_matches_java_light_across_25_columns() {
-        check_staged_light_modes(&["vine_active_magma_block", "vine_active_self_magma_block"]);
+        check_staged_light_modes(&[
+            "vine_active_magma_block",
+            "vine_active_self_magma_block",
+            "vine_active_coal_ore_magma_block",
+            "vine_active_self_deepslate_coal_ore_magma_block",
+        ]);
     }
 
     #[test]
@@ -11833,6 +11847,15 @@ mod tests {
                 water.properties.insert("level".into(), "0".into());
                 let id = world.intern_state(water);
                 world.set_block_id(16, 8, 8, id).unwrap();
+                if mode.contains("_coal_ore_") {
+                    let source = state(if mode.contains("_deepslate_coal_ore_") {
+                        "deepslate_coal_ore"
+                    } else {
+                        "coal_ore"
+                    });
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
+                }
             }
             if mode.ends_with("_existing") {
                 let mut plain = state("cave_vines_plant");
@@ -22002,7 +22025,7 @@ mod tests {
                     "data/minecraft/tags/block/blocks_motion_in_heightmap.json"
                         | "data/minecraft/tags/block/blocks_motion_in_heightmap_no_leaves.json"
                 ) {
-                    return Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:magma_block"]}"#.to_vec()));
+                    return Ok(Some(br#"{"values":["minecraft:stone","minecraft:diamond_ore","minecraft:coal_ore","minecraft:deepslate_coal_ore","minecraft:magma_block"]}"#.to_vec()));
                 }
                 Data.read_data(path)
             }
@@ -22017,7 +22040,12 @@ mod tests {
         let (_, _, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         let mut registry = batch_registry();
-        registry.extend(["minecraft:water".into(), "minecraft:magma_block".into()]);
+        registry.extend([
+            "minecraft:water".into(),
+            "minecraft:magma_block".into(),
+            "minecraft:coal_ore".into(),
+            "minecraft:deepslate_coal_ore".into(),
+        ]);
         let prepared =
             PreparedDecoration::load(&mut MagmaData, &plan, &registry, &mut resolve_test).unwrap();
         for neighbor in [None, Some("diamond_ore"), Some("oak_planks")] {
@@ -22058,6 +22086,44 @@ mod tests {
                 );
             }
         }
+        for source in ["coal_ore", "deepslate_coal_ore"] {
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut water = state("water");
+            water.properties.insert("level".into(), "0".into());
+            setup.set_section_block([8, 8, 8], &water).unwrap();
+            setup.set_section_block([8, 7, 8], &state(source)).unwrap();
+            setup.finish().unwrap();
+            assert_eq!(prepared.execute(&mut terrain, false).unwrap(), [true]);
+            assert_eq!(
+                terrain.snapshot().block(8, 7, 8).unwrap().name,
+                "minecraft:magma_block"
+            );
+            assert_eq!(
+                terrain.feature_postprocessing(center).unwrap().sections()[0],
+                [0x888]
+            );
+        }
+        let (mut terrain, tags, motion, _) = fixture();
+        let center = ChunkPos { x: 0, z: 0 };
+        let mut setup = terrain
+            .decoration_region(&tags, &motion, BTreeSet::from([center]))
+            .unwrap();
+        let mut water = state("water");
+        water.properties.insert("level".into(), "0".into());
+        let mut invalid_coal = state("coal_ore");
+        invalid_coal
+            .properties
+            .insert("unknown".into(), "true".into());
+        setup.set_section_block([8, 8, 8], &water).unwrap();
+        setup.set_section_block([8, 7, 8], &invalid_coal).unwrap();
+        setup.finish().unwrap();
+        let before = terrain.snapshot();
+        assert!(prepared.execute(&mut terrain, false).is_err());
+        assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
         let (mut terrain, tags, motion, _) = fixture();
         let center = ChunkPos { x: 0, z: 0 };
         let mut setup = terrain

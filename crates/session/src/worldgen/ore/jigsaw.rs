@@ -232,10 +232,13 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 pos,
                 &BlockState {
                     name: "minecraft:barrier".into(),
-                    properties: BTreeMap::new(),
+                    properties: BTreeMap::from([("waterlogged".into(), "false".into())]),
                 },
             )?;
             self.region.set_proto_block(pos, state)?;
+            let pending = self.region.pending_order.entry(chunk(pos)).or_default();
+            Arc::make_mut(pending).insert(pos);
+            Arc::make_mut(pending).remove(pos);
             let chest = super::super::GeneratedEmptyChest {
                 position: pos,
                 state: state.clone(),

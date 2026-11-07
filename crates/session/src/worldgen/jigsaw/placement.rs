@@ -171,6 +171,14 @@ pub trait StructurePlacementWorld:
         state: &BlockState,
     ) -> Result<BlockState>;
     fn update_neighbors_at(&mut self, position: [i32; 3], state: &BlockState) -> Result<()>;
+    /// Apply a TemplateStructurePiece jigsaw final state with Java's flag 3.
+    fn finalize_jigsaw_marker(&mut self, _position: [i32; 3], _state: &BlockState) -> Result<()> {
+        anyhow::bail!("ordinary-template jigsaw finalization is unsupported")
+    }
+    /// Refuse publication when a temporary block entity could not be removed.
+    fn finish_jigsaw_markers(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Place already-processed ordinary template records; a caller must discard

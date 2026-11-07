@@ -130,8 +130,8 @@ impl PreparedStart {
         Ok(markers.into_iter().map(|(_, marker)| marker).collect())
     }
 
-    /// Place this template in an unpublished world. Entity placement and
-    /// jigsaw markers remain unsupported and cause an error before writing.
+    /// Place this template in an unpublished world and finalize jigsaw markers
+    /// after the ordinary shape passes. Entity placement remains unsupported.
     /// The caller discards its world draft on any failure.
     pub fn place_template<W: super::jigsaw::StructurePlacementWorld>(
         &self,
@@ -157,10 +157,7 @@ impl PreparedStart {
             self.template.entities.is_empty(),
             "portal template entity placement is unsupported"
         );
-        ensure!(
-            self.jigsaw_markers(registry, clip)?.is_empty(),
-            "portal jigsaw markers are unsupported"
-        );
+        let markers = self.jigsaw_markers(registry, clip)?;
         let selected = self.selected_palette_index()?;
         let palette = &self.template.palettes[selected];
         let pivot = [self.template.size[0] / 2, 0, self.template.size[2] / 2];
@@ -207,15 +204,22 @@ impl PreparedStart {
                 super::jigsaw::JigsawPlacementWorld::block(&mut **shared.borrow_mut(), position)
             },
         )?;
+        let world = shared.into_inner();
+        let mut next_random = random.clone();
         super::jigsaw::place_structure_records(
             &records,
-            shared.into_inner(),
+            world,
             registry,
             clip,
             self.piece.mirror,
             self.piece.rotation,
-            random,
+            &mut next_random,
         )?;
+        for marker in markers {
+            world.finalize_jigsaw_marker(marker.position, &marker.final_state)?;
+        }
+        world.finish_jigsaw_markers()?;
+        *random = next_random;
         Ok(true)
     }
 

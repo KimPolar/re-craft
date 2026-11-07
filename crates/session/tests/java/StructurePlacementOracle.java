@@ -61,6 +61,14 @@ public class StructurePlacementOracle {
                     net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.STONE.defaultBlockState(),state),
                     net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state));
             }
+        for (var state : Blocks.BARRIER.getStateDefinition().getPossibleStates())
+            out.printf("BSTATE\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s%n",
+                state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.WATERLOGGED),
+                state.getLightDampening(), state.getLightEmission(), state.useShapeForLightOcclusion(),
+                state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO), state.hasBlockEntity(),
+                state.getPostProcessPos(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)==null,
+                net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state),
+                net.minecraft.world.level.lighting.LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state));
         for (var b : List.of(Blocks.STONE, Blocks.STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
                 Blocks.CRACKED_STONE_BRICKS, Blocks.CHISELED_STONE_BRICKS, Blocks.COBBLESTONE,
                 Blocks.MOSSY_COBBLESTONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.GOLD_BLOCK,
@@ -90,11 +98,14 @@ public class StructurePlacementOracle {
         palette.add(NbtUtils.writeBlockState(Blocks.IRON_BARS.defaultBlockState()));
         palette.add(NbtUtils.writeBlockState(Blocks.STONE_BRICK_STAIRS.defaultBlockState()));
         palette.add(NbtUtils.writeBlockState(Blocks.STONE_BRICK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.EAST)));
-        palette.add(NbtUtils.writeBlockState(Blocks.STONE_SLAB.defaultBlockState())); root.put("palette",palette);
+        palette.add(NbtUtils.writeBlockState(Blocks.STONE_SLAB.defaultBlockState()));
+        palette.add(NbtUtils.writeBlockState(Blocks.JIGSAW.defaultBlockState())); root.put("palette",palette);
         var blocks=new ListTag();
         for (int[] b:new int[][]{{0,0,0,0},{2,0,0,0},{1,0,0,1},{1,0,1,1},{3,1,1,1},
-                {2,1,1,2},{2,1,0,3},{0,1,1,4}}) {
-            var tag=new CompoundTag(); tag.put("pos",ints(b[0],b[1],b[2])); tag.putInt("state",b[3]); blocks.add(tag);
+                {2,1,1,2},{2,1,0,3},{0,1,1,4},{1,1,2,5}}) {
+            var tag=new CompoundTag(); tag.put("pos",ints(b[0],b[1],b[2])); tag.putInt("state",b[3]);
+            if (b[3] == 5) { var nbt = new CompoundTag(); nbt.putString("final_state", "minecraft:netherrack"); tag.put("nbt",nbt); }
+            blocks.add(tag);
         }
         root.put("blocks",blocks); root.put("entities",new ListTag());
         var template=new StructureTemplate(); template.load(BuiltInRegistries.BLOCK,root);
@@ -114,6 +125,8 @@ public class StructurePlacementOracle {
                     case "scheduleTick" -> { ticks.add(BuiltInRegistries.FLUID.getKey((Fluid)a[1])+":"+a[2]); yield null; }
                     case "setBlock" -> { var p=((BlockPos)a[0]).immutable(); var s=(BlockState)a[1];
                         states.put(p,s); events.add("W\t"+p.getX()+"\t"+p.getY()+"\t"+p.getZ()+"\t"+key(s)+"\t"+a[2]); yield true; }
+                    case "setBlockAndUpdate" -> { var p=((BlockPos)a[0]).immutable(); var s=(BlockState)a[1];
+                        states.put(p,s); events.add("W\t"+p.getX()+"\t"+p.getY()+"\t"+p.getZ()+"\t"+key(s)+"\t3"); yield true; }
                     case "updateNeighborsAt" -> {var p=(BlockPos)a[0]; events.add("N\t"+p.getX()+"\t"+p.getY()+"\t"+p.getZ()); yield null;}
                     case "getBlockEntity" -> null;
                     default -> throw new UnsupportedOperationException(m.toString());
@@ -186,6 +199,11 @@ public class StructurePlacementOracle {
                 .setBoundingBox(new BoundingBox(-20,-20,-20,20,30,20)).setIgnoreEntities(true);
             var random=new WorldgenRandom(new XoroshiroRandomSource(42));
             if (!template.placeInWorld(world,origin,origin,settings,random,2)) throw new AssertionError("empty template");
+            for (var marker : template.filterBlocks(origin,settings,Blocks.JIGSAW)) if (marker.nbt()!=null) {
+                var state=net.minecraft.commands.arguments.blocks.BlockStateParser.parseForBlock(BuiltInRegistries.BLOCK,
+                    marker.nbt().getStringOr("final_state","minecraft:air"),true).blockState();
+                world.setBlockAndUpdate(marker.pos(),state);
+            }
             out.printf("CASE\t%d\t%d\t%d%n",mirror.ordinal(),rotation.ordinal(),events.size());
             for (var e:events) out.println(e);
             out.printf("END\t%d%n",random.nextLong());

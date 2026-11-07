@@ -91,6 +91,7 @@ fn structure_placement_matches_java() -> Result<()> {
     struct World {
         states: BTreeMap<[i32; 3], BlockState>,
         events: Vec<String>,
+        fail_marker: bool,
     }
     impl JigsawPlacementWorld for World {
         fn block(&mut self, p: [i32; 3]) -> Result<BlockState> {
@@ -124,8 +125,13 @@ fn structure_placement_matches_java() -> Result<()> {
         ) -> Result<()> {
             Ok(())
         }
-        fn mark_block_entity_changed(&mut self, _: [i32; 3]) -> Result<()> {
-            anyhow::bail!("unexpected block entity")
+        fn mark_block_entity_changed(&mut self, pos: [i32; 3]) -> Result<()> {
+            ensure!(
+                self.states
+                    .get(&pos)
+                    .is_some_and(|state| state.name == "minecraft:jigsaw")
+            );
+            Ok(())
         }
         fn place_template_entities(
             &mut self,
@@ -177,7 +183,7 @@ fn structure_placement_matches_java() -> Result<()> {
                 if let Some(face) = face {
                     let connected = matches!(
                         neighbor.name.as_str(),
-                        "minecraft:stone" | "minecraft:iron_bars"
+                        "minecraft:stone" | "minecraft:iron_bars" | "minecraft:jigsaw"
                     ) || (native_world::collision::slab_stair_solid(neighbor)
                         .is_some()
                         && native_world::collision::button_support_face(
@@ -208,9 +214,24 @@ fn structure_placement_matches_java() -> Result<()> {
             &mut self,
             p: [i32; 3],
             s: &BlockState,
-            _: Option<&Tag>,
-            _: &mut DecorationRandom,
+            nbt: Option<&Tag>,
+            random: &mut DecorationRandom,
         ) -> Result<bool> {
+            if nbt.is_some() {
+                ensure!(s.name == "minecraft:jigsaw");
+                if self.fail_marker {
+                    let _ = random.next_long();
+                }
+                ShapeEdgeWorld::set_block(
+                    self,
+                    p,
+                    &BlockState {
+                        name: "minecraft:barrier".into(),
+                        properties: BTreeMap::from([("waterlogged".into(), "false".into())]),
+                    },
+                    820,
+                )?;
+            }
             ShapeEdgeWorld::set_block(self, p, s, 2)?;
             Ok(true)
         }
@@ -238,6 +259,10 @@ fn structure_placement_matches_java() -> Result<()> {
             self.events.push(format!("N\t{}\t{}\t{}", p[0], p[1], p[2]));
             Ok(())
         }
+        fn finalize_jigsaw_marker(&mut self, p: [i32; 3], s: &BlockState) -> Result<()> {
+            ensure!(!self.fail_marker, "synthetic marker failure");
+            ShapeEdgeWorld::set_block(self, p, s, 3)
+        }
     }
     let mut data = ResourceStack::open(&game)?;
     let registry = data.vanilla_generated_block_registry()?;
@@ -257,6 +282,7 @@ fn structure_placement_matches_java() -> Result<()> {
         ([2, 1, 1], 2),
         ([2, 1, 0], 3),
         ([0, 1, 1], 4),
+        ([1, 1, 2], 5),
     ];
     let mirrors = [Mirror::None, Mirror::LeftRight, Mirror::FrontBack];
     let rotations = [
@@ -274,9 +300,66 @@ fn structure_placement_matches_java() -> Result<()> {
     let mut marker_cases = 0;
     let mut marker_count = 0;
     let mut jigsaw_states = 0;
+    let mut barrier_states = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let f: Vec<_> = line.split('\t').collect();
         match f.as_slice() {
+            [
+                "BSTATE",
+                wet,
+                opacity,
+                emission,
+                shape_light,
+                full,
+                entity,
+                no_post,
+                diff_air,
+                diff_water,
+            ] => {
+                let mut properties = registry
+                    .default_properties("minecraft:barrier")
+                    .context("barrier schema missing")?;
+                properties.insert("waterlogged".into(), (*wet).into());
+                let state = BlockState {
+                    name: "minecraft:barrier".into(),
+                    properties,
+                };
+                assert!(registry.is_canonical_state(&state.name, &state.properties));
+                assert_eq!(
+                    registry.has_block_entity(&state.name),
+                    Some(*entity == "true")
+                );
+                assert_eq!(
+                    native_world::collision::barrier_waterlogged(&state),
+                    Some(*wet == "true")
+                );
+                assert_eq!(
+                    native_world::collision::is_full_cube(
+                        &native_world::collision::block_shape(&state)
+                            .context("missing barrier collision")?
+                    ),
+                    *full == "true"
+                );
+                let water = BlockState {
+                    name: "minecraft:water".into(),
+                    properties: BTreeMap::from([("level".into(), "0".into())]),
+                };
+                assert_eq!(
+                    !native_world::block_light::same_light_behavior(&air(), &state)
+                        .context("missing barrier light")?,
+                    *diff_air == "true"
+                );
+                assert_eq!(
+                    !native_world::block_light::same_light_behavior(&water, &state)
+                        .context("missing barrier light")?,
+                    *diff_water == "true"
+                );
+                assert_eq!(
+                    (*opacity, *emission, *shape_light, *no_post),
+                    (if *wet == "true" { "1" } else { "0" }, "0", "false", "true")
+                );
+                barrier_states += 1;
+            }
             [
                 "JSTATE",
                 orientation,
@@ -398,13 +481,19 @@ fn structure_placement_matches_java() -> Result<()> {
                             "id".into(),
                             Tag::String("minecraft:stone_slab".into()),
                         )]),
+                        Tag::Compound(vec![("id".into(), Tag::String("minecraft:jigsaw".into()))]),
                     ]],
                     blocks: positions
                         .iter()
                         .map(|(position, state)| TemplateBlock {
                             position: *position,
                             state: *state,
-                            nbt: None,
+                            nbt: (*state == 5).then(|| {
+                                Tag::Compound(vec![(
+                                    "final_state".into(),
+                                    Tag::String("minecraft:netherrack".into()),
+                                )])
+                            }),
                         })
                         .collect(),
                     entities: vec![],
@@ -416,6 +505,30 @@ fn structure_placement_matches_java() -> Result<()> {
                     template: std::sync::Arc::new(template),
                     piece,
                 };
+                if count == 0 {
+                    let mut failing = World {
+                        fail_marker: true,
+                        ..World::default()
+                    };
+                    let mut random = DecorationRandom::new(42);
+                    let mut expected = random.clone();
+                    assert!(
+                        start
+                            .place_template(
+                                &mut failing,
+                                &registry,
+                                &processors,
+                                BoundingBox {
+                                    min: [-20, -20, -20],
+                                    max: [20, 30, 20]
+                                },
+                                |state| Ok(state.name == "minecraft:stone"),
+                                &mut random
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(random.next_long(), expected.next_long());
+                }
                 let mut world = World::default();
                 let mut random = DecorationRandom::new(42);
                 assert!(start.place_template(
@@ -576,5 +689,6 @@ fn structure_placement_matches_java() -> Result<()> {
     assert_eq!(marker_cases, 14 * 3 * 4 * 2);
     assert!(marker_count > 0);
     assert_eq!(jigsaw_states, 12 * 3 * 4);
+    assert_eq!(barrier_states, 2);
     Ok(())
 }

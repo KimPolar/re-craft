@@ -51,6 +51,7 @@ enum StateSchema {
     Beehive,
     Chest,
     Jigsaw,
+    Waterlogged,
     Bed,
     Rail,
     PoweredRail,
@@ -156,6 +157,7 @@ impl StateSchema {
             }
             Self::HorizontalFacing => return BTreeMap::from([("facing".into(), "north".into())]),
             Self::Jigsaw => return BTreeMap::from([("orientation".into(), "north_up".into())]),
+            Self::Waterlogged => return BTreeMap::from([("waterlogged".into(), "false".into())]),
             Self::Leaves => {
                 return BTreeMap::from([
                     ("distance".into(), "7".into()),
@@ -242,6 +244,9 @@ impl StateSchema {
 
     fn parse_property(self, name: &str, value: &str) -> Option<String> {
         match self {
+            Self::Waterlogged if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
             Self::Jigsaw
                 if name == "orientation" && crate::jigsaw::Orientation::parse(value).is_ok() =>
             {
@@ -785,6 +790,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/RedStoneOreBlock" => Some(StateSchema::Lit),
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
+                "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock"
@@ -955,7 +961,10 @@ impl GeneratedBlockRegistry {
         }
         if matches!(
             schema,
-            StateSchema::Stateless | StateSchema::Dusted | StateSchema::Slab
+            StateSchema::Stateless
+                | StateSchema::Dusted
+                | StateSchema::Slab
+                | StateSchema::Waterlogged
         ) {
             return Ok(properties.clone());
         }

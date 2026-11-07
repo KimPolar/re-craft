@@ -39,6 +39,9 @@ fn portal_template_full(state: &BlockState) -> Result<bool> {
     if portal_full(state) {
         return Ok(true);
     }
+    if native_world::collision::jigsaw_state(state) {
+        return Ok(true);
+    }
     if native_world::collision::slab_stair_solid(state).is_some() {
         return Ok(state.name.ends_with("_slab") && state.properties["type"] == "double");
     }
@@ -104,6 +107,7 @@ impl PortalUpdateTags {
 struct PortalTemplateRegion<'r, 'a, 'g> {
     inner: super::jigsaw::JigsawRegion<'r, 'a, 'g>,
     wall_tags: &'g PortalUpdateTags,
+    temporary_jigsaws: BTreeSet<[i32; 3]>,
 }
 
 impl JigsawPlacementWorld for PortalTemplateRegion<'_, '_, '_> {
@@ -137,6 +141,13 @@ impl JigsawPlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         self.inner.place_liquid(pos, state, fluid)
     }
     fn mark_block_entity_changed(&mut self, pos: [i32; 3]) -> Result<()> {
+        if self.temporary_jigsaws.contains(&pos) {
+            ensure!(
+                native_world::collision::jigsaw_state(&self.inner.region.read(pos)?),
+                "temporary jigsaw changed"
+            );
+            return Ok(());
+        }
         self.inner.mark_block_entity_changed(pos)
     }
     fn place_template_entities(
@@ -169,6 +180,9 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties),
             "invalid portal edge state"
         );
+        if native_world::collision::jigsaw_state(state) {
+            return Ok(state.clone());
+        }
         if state.name == "minecraft:lava" {
             ensure!(
                 self.inner
@@ -233,6 +247,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
             };
             if let Some(index) = changed {
                 connected[index] = if self.wall_tags.walls.contains(&neighbor.name)
+                    || native_world::collision::jigsaw_state(neighbor)
                     || (neighbor.name == "minecraft:iron_bars"
                         && native_world::collision::pane_waterlogged(neighbor).is_some())
                     || portal_full(neighbor)
@@ -407,6 +422,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     "invalid portal neighbor state"
                 );
                 let connected = if portal_full(neighbor)
+                    || native_world::collision::jigsaw_state(neighbor)
                     || self.wall_tags.walls.contains(&neighbor.name)
                     || (neighbor.name == "minecraft:iron_bars"
                         && native_world::collision::pane_waterlogged(neighbor).is_some())
@@ -457,6 +473,83 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         nbt: Option<&native_persistence::nbt::Tag>,
         random: &mut DecorationRandom,
     ) -> Result<bool> {
+        if native_world::collision::jigsaw_state(state) {
+            ensure!(
+                matches!(nbt, Some(native_persistence::nbt::Tag::Compound(_))),
+                "permanent jigsaw blocks are unsupported"
+            );
+            ensure!(
+                self.inner
+                    .registry
+                    .is_canonical_state(&state.name, &state.properties)
+                    && self.inner.registry.has_block_entity(&state.name) == Some(true),
+                "invalid temporary jigsaw state"
+            );
+            if !self.inner.region.writable.contains(&chunk(pos)) {
+                return Ok(false);
+            }
+            ensure!(
+                self.inner.region.world.chunks.contains_key(&chunk(pos))
+                    && !self.inner.region.is_outside(pos[1]),
+                "temporary jigsaw is outside the supported region"
+            );
+            ensure!(
+                !self.temporary_jigsaws.contains(&pos),
+                "duplicate temporary jigsaw"
+            );
+            let old = self.inner.region.read(pos)?;
+            ensure!(
+                self.inner
+                    .registry
+                    .is_canonical_state(&old.name, &old.properties)
+                    && self.inner.registry.has_block_entity(&old.name) == Some(false)
+                    && (disk_safe_solid(&old.name).is_some()
+                        || portal_full(&old)
+                        || native_world::collision::slab_stair_solid(&old).is_some()
+                        || native_world::wall::Wall::from_state(&old).is_some()
+                        || native_world::collision::pane_waterlogged(&old).is_some())
+                    && !self.inner.region.monster_entities.contains_key(&pos)
+                    && !self.inner.region.bee_nests.contains_key(&pos),
+                "unsupported temporary jigsaw source: {old:?}"
+            );
+            ensure!(
+                !self
+                    .inner
+                    .region
+                    .light_guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.registered.contains(&chunk(pos))),
+                "temporary jigsaw placement in a registered light chunk is unsupported"
+            );
+            self.inner.region.set_proto_block(
+                pos,
+                &BlockState {
+                    name: "minecraft:barrier".into(),
+                    properties: BTreeMap::from([("waterlogged".into(), "false".into())]),
+                },
+            )?;
+            self.inner.region.set_proto_block(pos, state)?;
+            // WorldGenRegion records a DUMMY entity before the template asks
+            // for it, then ProtoChunk materializes it into the live map.
+            let pending = self
+                .inner
+                .region
+                .pending_order
+                .entry(chunk(pos))
+                .or_default();
+            Arc::make_mut(pending).insert(pos);
+            Arc::make_mut(pending).remove(pos);
+            Arc::make_mut(
+                self.inner
+                    .region
+                    .entity_order
+                    .entry(chunk(pos))
+                    .or_default(),
+            )
+            .insert(pos);
+            self.temporary_jigsaws.insert(pos);
+            return Ok(true);
+        }
         if state.name == "minecraft:chest" && nbt.is_some() {
             return self.inner.place_template_block(pos, state, nbt, random);
         }
@@ -535,6 +628,58 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
         Ok(result)
     }
     fn update_neighbors_at(&mut self, _: [i32; 3], _: &BlockState) -> Result<()> {
+        Ok(())
+    }
+
+    fn finalize_jigsaw_marker(&mut self, pos: [i32; 3], state: &BlockState) -> Result<()> {
+        if !self.inner.region.writable.contains(&chunk(pos)) {
+            return Ok(());
+        }
+        ensure!(
+            self.inner.region.world.chunks.contains_key(&chunk(pos))
+                && !self.inner.region.is_outside(pos[1]),
+            "jigsaw final state is outside the supported region"
+        );
+        ensure!(
+            self.inner
+                .registry
+                .is_canonical_state(&state.name, &state.properties)
+                && self.inner.registry.has_block_entity(&state.name) == Some(false)
+                && (portal_full(state) || is_air(state) || state.name == "minecraft:lava"),
+            "unsupported jigsaw final state: {state:?}"
+        );
+        if self.temporary_jigsaws.contains(&pos) {
+            let old = self.inner.region.read(pos)?;
+            ensure!(
+                native_world::collision::jigsaw_state(&old),
+                "temporary jigsaw was replaced"
+            );
+            self.inner.region.magma_block_write = state.name == "minecraft:magma_block";
+            let result = self.inner.region.set_proto_block(pos, state);
+            self.inner.region.magma_block_write = false;
+            result?;
+            if let Some(order) = self.inner.region.entity_order.get_mut(&chunk(pos)) {
+                Arc::make_mut(order).remove(pos);
+            }
+            if let Some(pending) = self.inner.region.pending_order.get_mut(&chunk(pos)) {
+                Arc::make_mut(pending).remove(pos);
+            }
+            if state.name == "minecraft:magma_block" {
+                mark_magma(self.inner.region, pos)?;
+            }
+            self.temporary_jigsaws.remove(&pos);
+        } else {
+            let mut unused = DecorationRandom::new(0);
+            self.place_structure_block(pos, state, None, &mut unused)?;
+        }
+        Ok(())
+    }
+
+    fn finish_jigsaw_markers(&mut self) -> Result<()> {
+        ensure!(
+            self.temporary_jigsaws.is_empty(),
+            "temporary jigsaw survived marker finalization"
+        );
         Ok(())
     }
 }
@@ -732,6 +877,7 @@ impl DecorationRegion<'_> {
                     registry,
                 },
                 wall_tags,
+                temporary_jigsaws: BTreeSet::new(),
             },
             registry,
             processors,
@@ -821,7 +967,70 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
-    fn installed_portal_templates_place_or_reject_jigsaw_markers() -> Result<()> {
+    fn temporary_jigsaw_preserves_block_entity_map_history() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let pos = [3, 7, 3];
+        let chunk = chunk(pos);
+        for i in 0..24 {
+            Arc::make_mut(region.entity_order.entry(chunk).or_default()).insert([i, 0, 0]);
+        }
+        let mut expected_live = region.entity_order[&chunk].as_ref().clone();
+        let mut expected_pending = super::super::super::entity_order::PendingPositions::default();
+        expected_pending.insert(pos);
+        expected_pending.remove(pos);
+        expected_live.insert(pos);
+        let (name, properties) = registry.resolve(&serde_json::json!("minecraft:jigsaw"))?;
+        let state = BlockState { name, properties };
+        let nbt = native_persistence::nbt::Tag::Compound(Vec::new());
+        let mut world = PortalTemplateRegion {
+            inner: super::super::jigsaw::JigsawRegion {
+                region: &mut region,
+                registry: &registry,
+            },
+            wall_tags: &wall_tags,
+            temporary_jigsaws: BTreeSet::new(),
+        };
+        assert!(world.place_structure_block(
+            pos,
+            &state,
+            Some(&nbt),
+            &mut DecorationRandom::new(0)
+        )?);
+        let actual = &world.inner.region;
+        assert_eq!(
+            actual.entity_order[&chunk]
+                .saving_order_with_pending(actual.pending_order.get(&chunk).map(AsRef::as_ref))?,
+            expected_live.saving_order_with_pending(Some(&expected_pending))?
+        );
+        let stone = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        };
+        world.finalize_jigsaw_marker(pos, &stone)?;
+        world.finish_jigsaw_markers()?;
+        expected_live.remove(pos);
+        let actual = &world.inner.region;
+        assert_eq!(
+            actual.entity_order[&chunk]
+                .saving_order_with_pending(actual.pending_order.get(&chunk).map(AsRef::as_ref))?,
+            expected_live.saving_order_with_pending(Some(&expected_pending))?
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_portal_templates_place_and_finalize_jigsaw_markers() -> Result<()> {
         use super::super::super::ruined_portal::{PreparedStart, SavedRuinedPortalPiece};
         use native_core::beardifier::{BoundingBox, TerrainAdjustment};
         use native_persistence::structure_template::StructureTemplate;
@@ -840,7 +1049,8 @@ mod tests {
             &ids,
         )?;
         let motion = HeightmapTags::load(&mut resources, &ids)?;
-        let (mut placed_count, mut guarded_count) = (0, 0);
+        let mut placed_count = 0;
+        let mut marker_count = 0;
         for name in (1..=10)
             .map(|n| format!("portal_{n}"))
             .chain((1..=3).map(|n| format!("giant_portal_{n}")))
@@ -848,7 +1058,6 @@ mod tests {
             let id = ResourceId::parse(&format!("minecraft:ruined_portal/{name}"))?;
             let template =
                 StructureTemplate::load(&mut resources, &id)?.context("missing portal template")?;
-            let has_jigsaws = !template.jigsaw_connectors(0)?.is_empty();
             let selection = InitialSelection {
                 setup_index: 0,
                 air_pocket: false,
@@ -922,6 +1131,7 @@ mod tests {
             let mut clip =
                 BoundingBox::new([-32, 0, -32], [31, 47, 31]).map_err(anyhow::Error::msg)?;
             let mut random = DecorationRandom::new(42);
+            let markers = start.jigsaw_markers(&registry, clip)?;
             let placed = region.place_ruined_portal(
                 &start,
                 &registry,
@@ -931,23 +1141,27 @@ mod tests {
                 &mut clip,
                 &mut random,
             );
-            if has_jigsaws {
-                let error = placed.expect_err("jigsaw markers must not be silently skipped");
-                ensure!(
-                    error.to_string().contains("portal jigsaw markers"),
-                    "{name}: {error:#}"
-                );
-                assert!(region.finish().is_err());
-                guarded_count += 1;
-                continue;
-            }
             ensure!(placed.with_context(|| format!("placing {name}"))?);
             region
                 .finish()
                 .with_context(|| format!("finishing {name}"))?;
+            for marker in &markers {
+                let [x, y, z] = marker.position;
+                ensure!(
+                    terrain
+                        .snapshot()
+                        .block(x, y, z)
+                        .context("marker block missing")?
+                        .name
+                        != "minecraft:jigsaw",
+                    "{name} retained a temporary jigsaw"
+                );
+            }
+            marker_count += markers.len();
             placed_count += 1;
         }
-        assert_eq!((placed_count, guarded_count), (8, 5));
+        assert_eq!(placed_count, 13);
+        assert!(marker_count >= 5);
         Ok(())
     }
 
@@ -1244,6 +1458,7 @@ mod tests {
                     registry: &registry,
                 },
                 wall_tags: &wall_tags,
+                temporary_jigsaws: BTreeSet::new(),
             };
             let state = BlockState {
                 name: "minecraft:magma_block".into(),
@@ -1267,6 +1482,7 @@ mod tests {
                     registry: &registry,
                 },
                 wall_tags: &wall_tags,
+                temporary_jigsaws: BTreeSet::new(),
             };
             for _ in 0..2 {
                 assert_eq!(
@@ -1328,6 +1544,7 @@ mod tests {
                 registry: &registry,
             },
             wall_tags: &custom_tags,
+            temporary_jigsaws: BTreeSet::new(),
         };
         let connected = world.update_shape([11, 8, 4], &wall, [1, 0, 0], [12, 8, 4], &air)?;
         assert_eq!(connected.properties["east"], "low");

@@ -33,6 +33,18 @@ pub fn jigsaw_state(state: &BlockState) -> bool {
         )
 }
 
+/// Validate a barrier state and return its contained-water flag.
+pub fn barrier_waterlogged(state: &BlockState) -> Option<bool> {
+    if state.name != "minecraft:barrier" || state.properties.len() != 1 {
+        return None;
+    }
+    match state.properties.get("waterlogged")?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 const EMPTY: &[Aabb] = &[];
 const FULL: &[Aabb] = &[Aabb {
     min: Vec3::ZERO,
@@ -748,6 +760,9 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
     if id == "jigsaw" {
         return jigsaw_state(state).then(|| FULL.to_vec());
+    }
+    if id == "barrier" {
+        return barrier_waterlogged(state).map(|_| FULL.to_vec());
     }
     if id.ends_with("_wall") {
         return Some(wall_boxes(crate::wall::Wall::from_state(state)?, true));

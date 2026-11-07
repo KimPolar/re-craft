@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use native_core::{beardifier::BoundingBox, random::LegacyRandom};
 use native_resources::{
     packs::{ResourceProvider, ResourceStack},
-    ruined_portal::{Settings, VerticalPlacement, find_suitable_y},
-    structure_start::Heightmap,
+    ruined_portal::{
+        PortalEnvironment, Settings, VerticalPlacement, find_generation_point, find_suitable_y,
+    },
+    structure_start::{BiomeQuery, Heightmap, StartEnvironment},
     structure_transform::{Mirror, Rotation},
 };
 use serde_json::{Value, json};
@@ -64,11 +66,17 @@ fn ruined_portal_selection_and_height_match_java() -> Result<()> {
         &height_source,
         include_str!("java/RuinedPortalHeightOracle.java"),
     )?;
+    let point_source = temp.path().join("RuinedPortalPointOracle.java");
+    std::fs::write(
+        &point_source,
+        include_str!("java/RuinedPortalPointOracle.java"),
+    )?;
     let compiled = Command::new(java.join("javac.exe"))
         .arg("-cp")
         .arg(&classpath)
         .arg(source)
         .arg(height_source)
+        .arg(point_source)
         .output()?;
     anyhow::ensure!(
         compiled.status.success(),
@@ -179,6 +187,91 @@ fn ruined_portal_selection_and_height_match_java() -> Result<()> {
         count += 1;
     }
     assert_eq!(count, 6 * 2 * 7 * 4 * 7);
+    struct Fixture {
+        allowed: bool,
+    }
+    impl StartEnvironment for Fixture {
+        fn vertical_bounds(&self) -> (i32, i32) {
+            (-64, 319)
+        }
+        fn sea_level(&self) -> i32 {
+            63
+        }
+        fn first_occupied_height(&mut self, x: i32, z: i32, map: Heightmap) -> Result<i32> {
+            let floor = 60 + (x * 13 + z * 7).rem_euclid(11) - 5;
+            Ok(floor + if map == Heightmap::WorldSurface { 3 } else { 0 })
+        }
+        fn biome_allowed(&mut self, _: [i32; 3], query: BiomeQuery) -> Result<bool> {
+            assert_eq!(query, BiomeQuery::Point);
+            Ok(self.allowed)
+        }
+    }
+    impl PortalEnvironment for Fixture {
+        fn heightmap_opaque(&mut self, [x, y, z]: [i32; 3], map: Heightmap) -> Result<bool> {
+            let floor = 60 + (x * 13 + z * 7).rem_euclid(11) - 5;
+            Ok((-64..320).contains(&y)
+                && (y <= floor || (map == Heightmap::WorldSurface && y <= floor + 3)))
+        }
+    }
+    let output = Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(&classpath)
+        .arg("RuinedPortalPointOracle")
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Java point oracle failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    let mut count = 0;
+    for line in text.lines().filter(|line| line.starts_with("P ")) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let placement = match fields[1] {
+            "ON_LAND_SURFACE" => "on_land_surface",
+            "PARTLY_BURIED" => "partly_buried",
+            "ON_OCEAN_FLOOR" => "on_ocean_floor",
+            "IN_MOUNTAIN" => "in_mountain",
+            "UNDERGROUND" => "underground",
+            "IN_NETHER" => "in_nether",
+            _ => anyhow::bail!("invalid portal placement"),
+        };
+        let pocket: bool = fields[2].parse()?;
+        let seed: i64 = fields[3].parse()?;
+        let chunk = [fields[4].parse()?, fields[5].parse()?];
+        let size = [fields[6].parse()?, fields[7].parse()?, fields[8].parse()?];
+        let allowed: bool = fields[9].parse()?;
+        let mut value = definition(0);
+        value["setups"][0]["placement"] = json!(placement);
+        value["setups"][0]["air_pocket_probability"] = json!(if pocket { 1.0 } else { 0.0 });
+        let settings = Settings::decode(&value)?;
+        let (selection, mut random) = settings.select_for_chunk(seed, chunk)?;
+        let actual = find_generation_point(
+            &mut Fixture { allowed },
+            chunk,
+            size,
+            &selection,
+            &settings.setups()[selection.setup_index],
+            &mut random,
+        )?;
+        if fields[10] == "X" {
+            assert!(actual.is_none(), "{line}");
+            assert_eq!(random.next_int(), fields[11].parse::<i32>()?, "{line}");
+        } else {
+            let actual = actual.context("expected portal point")?;
+            let ints = fields[10..]
+                .iter()
+                .map(|field| field.parse::<i32>())
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert_eq!(actual.position, ints[0..3], "{line}");
+            assert_eq!(actual.bounds.min, ints[3..6], "{line}");
+            assert_eq!(actual.bounds.max, ints[6..9], "{line}");
+            assert_eq!(random.next_int(), ints[9], "{line}");
+        }
+        count += 1;
+    }
+    assert_eq!(count, 6 * 2 * 7 * 11 * 2);
     let mut resources = ResourceStack::open(&game)?;
     for name in [
         "ruined_portal",

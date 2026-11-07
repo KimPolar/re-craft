@@ -2509,6 +2509,36 @@ impl StartEnvironment for StructureStartEnvironment<'_> {
     }
 }
 
+impl native_resources::ruined_portal::PortalEnvironment for StructureStartEnvironment<'_> {
+    fn heightmap_opaque(&mut self, [x, y, z]: [i32; 3], map: Heightmap) -> Result<bool> {
+        if !self.columns.contains_key(&[x, z]) {
+            self.columns
+                .insert([x, z], self.noise.base_column(self.evaluator, x, z)?);
+        }
+        let column = &self.columns[&[x, z]];
+        let Some(index) = y
+            .checked_sub(column.min_y())
+            .and_then(|i| usize::try_from(i).ok())
+        else {
+            return Ok(false);
+        };
+        let Some(&material) = column.materials().get(index) else {
+            return Ok(false);
+        };
+        let index = match material {
+            NoiseMaterial::DefaultBlock => 0,
+            NoiseMaterial::DefaultFluid => 1,
+            NoiseMaterial::Lava => 2,
+            NoiseMaterial::Air => 3,
+        };
+        let flags = self.flags[index];
+        Ok(match map {
+            Heightmap::WorldSurface => !flags.is_air,
+            Heightmap::OceanFloor => flags.blocks_motion,
+        })
+    }
+}
+
 impl mineshaft::MineshaftEnvironment for StructureStartEnvironment<'_> {
     fn generator_min_y(&self) -> i32 {
         self.noise.router().min_y
@@ -3108,10 +3138,17 @@ impl TerrainGenerator {
                     && structure_type.path == "mineshaft";
                 let monument = structure_type.namespace == "minecraft"
                     && structure_type.path == "ocean_monument";
+                let ruined_portal = structure_type.namespace == "minecraft"
+                    && structure_type.path == "ruined_portal";
                 let jigsaw = jigsaws
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "jigsaw";
-                let structure = if center_heightmap.is_none() && !mineshaft && !jigsaw && !monument {
+                let structure = if center_heightmap.is_none()
+                    && !mineshaft
+                    && !jigsaw
+                    && !monument
+                    && !ruined_portal
+                {
                     Some(
                         SimpleStructure::decode(&definition)
                             .with_context(|| format!("in structure {path}"))?,
@@ -3140,6 +3177,34 @@ impl TerrainGenerator {
                     min_y: self.min_y,
                     max_y,
                 };
+                if ruined_portal {
+                    let settings = native_resources::ruined_portal::Settings::decode(&definition)
+                        .with_context(|| format!("in structure {path}"))?;
+                    native_resources::structure_start::decode_terrain_adjustment(&definition)
+                        .with_context(|| format!("in structure {path}"))?;
+                    let (selection, mut random) = settings.select_for_chunk(self.seed, chunk)?;
+                    let template = native_persistence::structure_template::StructureTemplate::load(
+                        provider,
+                        &selection.template,
+                    )?
+                    .context("ruined portal template is missing")?;
+                    ensure!(
+                        template.data_version == Some(5023),
+                        "ruined portal template requires data-version conversion"
+                    );
+                    let point = native_resources::ruined_portal::find_generation_point(
+                        &mut env,
+                        chunk,
+                        template.size,
+                        &selection,
+                        &settings.setups()[selection.setup_index],
+                        &mut random,
+                    )?;
+                    if point.is_none() {
+                        return Ok(None);
+                    }
+                    anyhow::bail!("ruined portal structure pieces are not yet supported");
+                }
                 if jigsaw {
                     return Ok(jigsaw::PreparedStart::generate(
                         provider,

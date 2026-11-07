@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     packs::ResourceId,
-    structure_start::Heightmap,
+    structure_start::{BiomeQuery, Heightmap, StartEnvironment},
     structure_transform::{Mirror, Rotation},
 };
 
@@ -45,6 +45,84 @@ pub struct InitialSelection {
     pub template: ResourceId,
     pub rotation: Rotation,
     pub mirror: Mirror,
+}
+
+/// Additional base-noise access needed to locate a ruined portal.
+pub trait PortalEnvironment: StartEnvironment {
+    fn heightmap_opaque(&mut self, position: [i32; 3], map: Heightmap) -> Result<bool>;
+}
+
+/// The position used by Java for its final biome check, with initial bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerationPoint {
+    pub position: [i32; 3],
+    pub pivot: [i32; 3],
+    pub bounds: BoundingBox,
+}
+
+/// Resolve the selected template's initial geometry and generation point.
+/// A rejected biome returns None; successful results do not contain pieces.
+/// Discard environment and random state on error.
+pub fn find_generation_point(
+    environment: &mut impl PortalEnvironment,
+    chunk: [i32; 2],
+    template_size: [i32; 3],
+    selection: &InitialSelection,
+    setup: &Setup,
+    random: &mut LegacyRandom,
+) -> Result<Option<GenerationPoint>> {
+    ensure!(
+        template_size.into_iter().all(|size| size > 0),
+        "empty ruined portal template"
+    );
+    let x = chunk[0].checked_mul(16).context("chunk X overflow")?;
+    let z = chunk[1].checked_mul(16).context("chunk Z overflow")?;
+    let pivot = [template_size[0] / 2, 0, template_size[2] / 2];
+    let bounds = crate::structure_transform::bounding_box(
+        template_size,
+        [x, 0, z],
+        selection.mirror,
+        selection.rotation,
+        pivot,
+    )?;
+    let center_x =
+        bounds.min[0].wrapping_add(bounds.max[0].wrapping_sub(bounds.min[0]).wrapping_add(1) / 2);
+    let center_z =
+        bounds.min[2].wrapping_add(bounds.max[2].wrapping_sub(bounds.min[2]).wrapping_add(1) / 2);
+    let map = if setup.placement == VerticalPlacement::OnOceanFloor {
+        Heightmap::OceanFloor
+    } else {
+        Heightmap::WorldSurface
+    };
+    let surface = environment.first_occupied_height(center_x, center_z, map)?;
+    let min_y = environment.vertical_bounds().0;
+    let height = bounds.max[1].wrapping_sub(bounds.min[1]).wrapping_add(1);
+    let y = find_suitable_y(
+        random,
+        setup.placement,
+        selection.air_pocket,
+        surface,
+        height,
+        bounds,
+        min_y,
+        |position, map| environment.heightmap_opaque(position, map),
+    )?;
+    let position = [x, y, z];
+    if !environment.biome_allowed(position.map(|value| value.div_euclid(4)), BiomeQuery::Point)? {
+        return Ok(None);
+    }
+    let bounds = crate::structure_transform::bounding_box(
+        template_size,
+        position,
+        selection.mirror,
+        selection.rotation,
+        pivot,
+    )?;
+    Ok(Some(GenerationPoint {
+        position,
+        pivot,
+        bounds,
+    }))
 }
 
 /// Find the portal's Y using unadjusted noise columns, before biome validation.
@@ -117,6 +195,17 @@ pub fn find_suitable_y(
 impl Settings {
     pub fn setups(&self) -> &[Setup] {
         &self.setups
+    }
+
+    /// Start Java's structure RNG for a candidate chunk and select its template.
+    pub fn select_for_chunk(
+        &self,
+        seed: i64,
+        chunk: [i32; 2],
+    ) -> Result<(InitialSelection, LegacyRandom)> {
+        let mut random = crate::structure_placement::large_feature(seed, chunk[0], chunk[1]);
+        let selection = self.select_initial(&mut random)?;
+        Ok((selection, random))
     }
 
     pub fn decode(value: &Value) -> Result<Self> {

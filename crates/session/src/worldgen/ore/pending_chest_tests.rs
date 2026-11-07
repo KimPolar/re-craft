@@ -4,6 +4,73 @@ use native_persistence::nbt::{self, Tag};
 use std::{path::PathBuf, process::Command};
 
 #[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3"]
+fn generated_rails_and_chains_are_checked_without_fabricating_block_entities() {
+    let game = native_resources::default_minecraft_dir().unwrap();
+    let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+    let registry = resources.vanilla_generated_block_registry().unwrap();
+    let (mut terrain, _, _, _) = super::tests::fixture();
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    let mut states = Vec::new();
+    for name in ["rail", "powered_rail", "detector_rail", "activator_rail"] {
+        let id = format!("minecraft:{name}");
+        let mut properties = registry.default_properties(&id).unwrap();
+        properties.insert("waterlogged".into(), "true".into());
+        properties.insert("shape".into(), "ascending_east".into());
+        states.push(BlockState {
+            name: id,
+            properties,
+        });
+    }
+    let mut chain = registry.default_properties("minecraft:iron_chain").unwrap();
+    chain.insert("waterlogged".into(), "true".into());
+    states.push(BlockState {
+        name: "minecraft:iron_chain".into(),
+        properties: chain,
+    });
+    {
+        let world = Arc::make_mut(&mut terrain.world);
+        let ids: Vec<_> = states
+            .iter()
+            .cloned()
+            .map(|state| world.intern_state(state))
+            .collect();
+        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+        let blocks = Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+            .blocks
+            .as_mut()
+            .unwrap();
+        for (x, id) in ids.into_iter().enumerate() {
+            blocks[x + 8 * 256] = id;
+        }
+    }
+    let Tag::List { values, .. } = terrain
+        .generated_block_entity_data(chunk_pos, &registry)
+        .unwrap()
+    else {
+        panic!("missing block entity list")
+    };
+    assert!(values.is_empty());
+    states[0]
+        .properties
+        .insert("shape".into(), "invalid".into());
+    {
+        let world = Arc::make_mut(&mut terrain.world);
+        let id = world.intern_state(states.remove(0));
+        let chunk = Arc::make_mut(world.chunks.get_mut(&chunk_pos).unwrap());
+        Arc::make_mut(chunk.sections.get_mut(&0).unwrap())
+            .blocks
+            .as_mut()
+            .unwrap()[8 * 256] = id;
+    }
+    assert!(
+        terrain
+            .generated_block_entity_data(chunk_pos, &registry)
+            .is_err()
+    );
+}
+
+#[test]
 fn pending_chest_resolution_is_transactional_and_preserves_state() {
     let (mut terrain, tags, motion, _) = super::tests::fixture();
     let position = [9, 8, 9];

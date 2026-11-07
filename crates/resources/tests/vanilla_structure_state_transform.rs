@@ -57,9 +57,11 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     let registry = resources.vanilla_generated_block_registry()?;
     let text = String::from_utf8(output.stdout)?;
     let mut count = 0;
+    let mut chain_count = 0;
     for line in text.lines().filter_map(|line| line.strip_prefix("STATE\t")) {
         let row: Value = serde_json::from_str(line)?;
         let id = row["id"].as_str().unwrap();
+        chain_count += usize::from(id == "minecraft:iron_chain");
         let input: BTreeMap<String, String> = serde_json::from_value(row["input"].clone())?;
         let expected: BTreeMap<String, String> = serde_json::from_value(row["result"].clone())?;
         let mirror = match row["mirror"].as_u64().unwrap() {
@@ -82,6 +84,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
         count += 1;
     }
     assert!(count > 2000, "unexpectedly few oracle cases: {count}");
+    assert_eq!(chain_count, 6 * 12, "missing iron chain state transforms");
     println!("verified {count} Java block-state transforms");
     Ok(())
 }

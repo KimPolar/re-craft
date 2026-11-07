@@ -252,6 +252,11 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for axis in ["x", "y", "z", "invalid"] {
+        for waterlogged in ["true", "false"] {
+            cases.push(serde_json::json!({"id":"minecraft:iron_chain", "properties":{"axis":axis,"waterlogged":waterlogged}}));
+        }
+    }
     for id in [
         "minecraft:rail",
         "minecraft:powered_rail",
@@ -458,6 +463,11 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:grass_block"));
     assert!(registry.contains("minecraft:water"));
     assert!(registry.contains("minecraft:lava"));
+    assert!(registry.contains("minecraft:iron_chain"));
+    assert_eq!(
+        registry.has_block_entity("minecraft:iron_chain"),
+        Some(false)
+    );
     for id in [
         "minecraft:rail",
         "minecraft:powered_rail",

@@ -32,7 +32,7 @@ public class StructureStateTransformOracle {
             }
         }
         for (var block : BuiltInRegistries.BLOCK) {
-            if (block instanceof GlazedTerracottaBlock || block==Blocks.SANDSTONE_STAIRS || block==Blocks.STONE_BRICK_STAIRS)
+            if (block instanceof GlazedTerracottaBlock || block==Blocks.SANDSTONE_STAIRS || block==Blocks.STONE_BRICK_STAIRS || block==Blocks.IRON_CHAIN)
                 states.addAll(block.getStateDefinition().getPossibleStates());
         }
         for (var state : states) for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {

@@ -53,6 +53,7 @@ enum StateSchema {
     Bed,
     Rail,
     PoweredRail,
+    WaterloggedAxis,
     Fence,
     FenceGate,
     Door,
@@ -95,6 +96,12 @@ impl StateSchema {
                 return BTreeMap::from([
                     ("powered".into(), "false".into()),
                     ("shape".into(), "north_south".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::WaterloggedAxis => {
+                return BTreeMap::from([
+                    ("axis".into(), "y".into()),
                     ("waterlogged".into(), "false".into()),
                 ]);
             }
@@ -272,6 +279,12 @@ impl StateSchema {
                     || (matches!(self, Self::PoweredRail)
                         && name == "powered"
                         && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::WaterloggedAxis
+                if (name == "axis" && matches!(value, "x" | "y" | "z"))
+                    || (name == "waterlogged" && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -752,6 +765,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/DetectorRailBlock" => {
                     Some(StateSchema::PoweredRail)
                 }
+                "net/minecraft/world/level/block/ChainBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperChainBlock" => {
+                    Some(StateSchema::WaterloggedAxis)
+                }
                 "net/minecraft/world/level/block/DoorBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {
                     Some(StateSchema::Door)
@@ -906,7 +923,7 @@ impl GeneratedBlockRegistry {
         ) {
             return Ok(properties.clone());
         }
-        if matches!(schema, StateSchema::Axis) {
+        if matches!(schema, StateSchema::Axis | StateSchema::WaterloggedAxis) {
             let mut result = properties.clone();
             if matches!(
                 rotation,
@@ -1299,6 +1316,32 @@ mod tests {
         assert!(registry.is_canonical_state("minecraft:powered_rail", &powered));
         powered.remove("powered");
         assert!(!registry.is_canonical_state("minecraft:powered_rail", &powered));
+    }
+
+    #[test]
+    fn waterlogged_axis_rotation_preserves_water() {
+        use crate::structure_transform::{Mirror, Rotation};
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([("minecraft:iron_chain".into(), StateSchema::WaterloggedAxis)]),
+            block_entities: BTreeMap::new(),
+        };
+        let properties = BTreeMap::from([
+            ("axis".into(), "x".into()),
+            ("waterlogged".into(), "true".into()),
+        ]);
+        let rotated = registry
+            .transform_template_state(
+                "minecraft:iron_chain",
+                &properties,
+                Mirror::None,
+                Rotation::Clockwise90,
+            )
+            .unwrap();
+        assert_eq!(rotated["axis"], "z");
+        assert_eq!(rotated["waterlogged"], "true");
+        let mut invalid = properties;
+        invalid.insert("waterlogged".into(), "invalid".into());
+        assert!(!registry.is_canonical_state("minecraft:iron_chain", &invalid));
     }
 
     #[test]

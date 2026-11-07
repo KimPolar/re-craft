@@ -8202,9 +8202,98 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn fresh_batch_decorates_installed_shipwreck_template() -> Result<()> {
         run_fresh_template_batch(31, None)
+    }
+
+    fn java_rewrite_generated_shipwreck_regions(
+        game: &std::path::Path,
+        directory: &std::path::Path,
+        template: &str,
+        positions: &BTreeSet<native_world::loaded::ChunkPos>,
+    ) -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let classes = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let metadata: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(
+            metadata["id"] == "26.3",
+            "wrong installed Minecraft version"
+        );
+        let mut paths = vec![version.join("26.3.jar"), classes.path().to_path_buf()];
+        for library in metadata["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = classes.path().join("GeneratedShipwreckRegionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedShipwreckRegionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut command = Command::new(java.join("java.exe"));
+        command
+            .arg("-cp")
+            .arg(classpath)
+            .arg("GeneratedShipwreckRegionOracle")
+            .arg(directory)
+            .arg(template);
+        for pos in positions {
+            command.arg(pos.x.to_string()).arg(pos.z.to_string());
+        }
+        let output = command.output()?;
+        ensure!(
+            output.status.success(),
+            "Java shipwreck region: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    fn canonical_nbt(tag: native_persistence::nbt::Tag) -> native_persistence::nbt::Tag {
+        use native_persistence::nbt::Tag;
+        match tag {
+            Tag::Compound(fields) => {
+                let mut fields: Vec<_> = fields
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical_nbt(value)))
+                    .collect();
+                fields.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+                Tag::Compound(fields)
+            }
+            Tag::List {
+                element_type,
+                values,
+            } => Tag::List {
+                element_type,
+                values: values.into_iter().map(canonical_nbt).collect(),
+            },
+            other => other,
+        }
     }
 
     #[test]
@@ -8901,6 +8990,24 @@ mod tests {
                                 .open(&path)?;
                             assert!(draft.write_staged(&mut file)?.is_empty());
                             drop(file);
+                        }
+                        let template = &batch
+                            .shipwreck_starts(source)
+                            .context("missing generated shipwreck")?[&structure]
+                            .piece
+                            .template;
+                        java_rewrite_generated_shipwreck_regions(
+                            &game,
+                            directory.path(),
+                            template,
+                            &save_targets,
+                        )?;
+                        let saved_registry = data.vanilla.vanilla_generated_block_registry()?;
+                        for (kind, rx, rz) in prepared.regions.keys() {
+                            if *kind != native_persistence::save::FreshRegionKind::Terrain {
+                                continue;
+                            }
+                            let path = directory.path().join(format!("r.{rx}.{rz}.mca"));
                             let mut reader = native_persistence::anvil::RegionReader::open(&path)?;
                             for &pos in &save_targets {
                                 if pos.x.div_euclid(32) != *rx || pos.z.div_euclid(32) != *rz {
@@ -8911,8 +9018,14 @@ mod tests {
                                     .context("generated chunk missing")?;
                                 assert!(reopened.insert(pos));
                                 assert_eq!(
-                                    chunk.value.get("structures"),
-                                    Some(&batch.structure_data(pos)?)
+                                    canonical_nbt(
+                                        chunk
+                                            .value
+                                            .get("structures")
+                                            .context("structures missing")?
+                                            .clone()
+                                    ),
+                                    canonical_nbt(batch.structure_data(pos)?)
                                 );
                                 let sections =
                                     native_persistence::palette::decode_sections(&chunk.value)?;
@@ -8922,30 +9035,31 @@ mod tests {
                                         .find(|section| i32::from(section.y) == y.div_euclid(16))
                                         .and_then(|section| section.blocks.as_ref())
                                         .context("generated block section missing")?;
+                                    let states = blocks.states.iter().map(|state| {
+                                        let properties: BTreeMap<_, _> = state.properties.iter()
+                                            .map(|(key, value)| (key.to_string_lossy(), value.to_string_lossy()))
+                                            .collect();
+                                        let (name, properties) = saved_registry.resolve(&json!({
+                                            "id": state.name.to_string_lossy(), "properties": properties
+                                        }))?;
+                                        Ok(BlockState { name, properties })
+                                    }).collect::<Result<Vec<_>>>()?;
                                     for z in 0..16 {
                                         for x in 0..16 {
                                             let expected = processed
                                                 .world
                                                 .block(pos.x * 16 + x, y, pos.z * 16 + z)
                                                 .context("postprocessed block missing")?;
-                                            let actual = blocks
-                                                .block(
-                                                    x as usize,
-                                                    y.rem_euclid(16) as usize,
-                                                    z as usize,
-                                                )
+                                            let index = x as usize
+                                                + z as usize * 16
+                                                + y.rem_euclid(16) as usize * 256;
+                                            let actual = states
+                                                .get(blocks.indices[index] as usize)
                                                 .context("saved block missing")?;
-                                            assert!(actual.name.matches(&expected.name));
                                             assert_eq!(
-                                                actual.properties.len(),
-                                                expected.properties.len()
+                                                actual, expected,
+                                                "saved block at {pos:?} {x},{y},{z}"
                                             );
-                                            for (name, value) in &actual.properties {
-                                                assert!(expected.properties.iter().any(
-                                                    |(key, expected_value)| name.matches(key)
-                                                        && value.matches(expected_value)
-                                                ));
-                                            }
                                         }
                                     }
                                 }

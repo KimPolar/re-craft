@@ -26,6 +26,9 @@ public class PotentSulfurOracle {
         var empty=(LevelReader)java.lang.reflect.Proxy.newProxyInstance(LevelReader.class.getClassLoader(),new Class[]{LevelReader.class},(o,m,a)->{throw new AssertionError("unexpected survival query "+m);});
         int index=0;
         for(var state:Blocks.POTENT_SULFUR.getStateDefinition().getPossibleStates()) {
+            for(var direction:Direction.values())
+                if(!Block.isShapeFullBlock(state.getFaceOcclusionShape(direction)))
+                    throw new AssertionError("potent sulfur face is not full: "+state+" "+direction);
             var pos=new BlockPos(index,8,0); chunk.setBlockState(pos,state,2);
             var dummy=new CompoundTag();dummy.putString("id","DUMMY");dummy.putInt("x",pos.getX());dummy.putInt("y",pos.getY());dummy.putInt("z",pos.getZ());
             chunk.setBlockEntityNbt(dummy);

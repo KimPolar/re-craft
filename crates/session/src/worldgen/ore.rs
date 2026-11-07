@@ -7427,6 +7427,13 @@ impl SpringWorld for DecorationRegion<'_> {
 
 impl MagmaWorld for DecorationRegion<'_> {
     fn face_is_full(&mut self, state: &BlockState, _direction: [i32; 3]) -> Result<bool> {
+        if state.name == "minecraft:potent_sulfur" {
+            ensure!(
+                super::generated_potent_sulfur::is_valid_state(state),
+                "invalid potent sulfur state"
+            );
+            return Ok(true);
+        }
         if matches!(
             state.name.as_str(),
             "minecraft:cave_vines" | "minecraft:cave_vines_plant"

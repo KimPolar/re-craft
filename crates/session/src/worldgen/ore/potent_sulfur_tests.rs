@@ -17,9 +17,20 @@ fn potent_sulfur_predicates_validate_all_states() -> Result<()> {
         let state = sulfur(value);
         assert!(DiskWorld::is_solid(&mut region, &state)?);
         assert!(!DiskWorld::is_liquid(&mut region, &state)?);
+        for direction in [
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+            [-1, 0, 0],
+            [1, 0, 0],
+        ] {
+            assert!(MagmaWorld::face_is_full(&mut region, &state, direction)?);
+        }
     }
     assert!(DiskWorld::is_solid(&mut region, &sulfur("invalid")).is_err());
     assert!(DiskWorld::is_liquid(&mut region, &sulfur("invalid")).is_err());
+    assert!(MagmaWorld::face_is_full(&mut region, &sulfur("invalid"), [0, 1, 0]).is_err());
     Ok(())
 }
 

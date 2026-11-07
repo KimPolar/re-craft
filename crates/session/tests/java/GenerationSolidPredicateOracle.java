@@ -27,6 +27,8 @@ public class GenerationSolidPredicateOracle {
         boolean solid=new SolidPredicate(new Vec3i(1,-2,3)).test(world,pos);
         if(solid!=state.isSolid())throw new AssertionError("predicate differs from state");
         out.printf("S %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),solid);
+        if(List.of("cave_vines","cave_vines_plant","big_dripleaf","big_dripleaf_stem","small_dripleaf","glow_lichen").contains(name))
+          out.printf("L %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.liquid());
         if(name.endsWith("_ore"))out.printf("O %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.getFluidState().isEmpty());
         if(name.equals("glow_lichen")){
           out.printf("G %s %s",String.join(",",pairs),state.isSolidRender());

@@ -6307,6 +6307,9 @@ impl DiskWorld for DecorationRegion<'_> {
         if geode_crystal(state)? {
             return Ok(false);
         }
+        if tree_cave_vines(state)? || generated_dripleaf(state)? || tree_glow_lichen(state)? {
+            return Ok(false);
+        }
         // Waterlogged blocks contain fluid, but Java's BlockState.liquid()
         // only marks liquid blocks. Reuse the independently verified state
         // families rather than treating their contained fluid as the block.
@@ -6317,7 +6320,7 @@ impl DiskWorld for DecorationRegion<'_> {
             disk_safe_solid(&state.name).is_some()
                 || generated_ore_state(state)?
                 || simple_plant_kind(state).is_ok(),
-            "unsupported block liquid property"
+            "unsupported block liquid property for {state:?}"
         );
         Ok(false)
     }
@@ -14699,6 +14702,25 @@ mod tests {
             ore_states += 1;
         }
         assert_eq!(ore_states, 20);
+        let mut vegetation_liquids = 0;
+        for line in output.lines().filter_map(|line| line.strip_prefix("L ")) {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3, "{line}");
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for property in parts[1].split(',') {
+                    let (key, value) = property.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            assert_eq!(
+                DiskWorld::is_liquid(&mut region, &block).unwrap(),
+                parts[2].parse::<bool>().unwrap(),
+                "{line}"
+            );
+            vegetation_liquids += 1;
+        }
+        assert_eq!(vegetation_liquids, 238);
         let mut invalid = state("coal_ore");
         invalid
             .properties

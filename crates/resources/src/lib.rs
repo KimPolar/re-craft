@@ -89,6 +89,7 @@ pub mod structure_transform;
 pub mod surface_biomes;
 pub mod surface_pass;
 pub mod surface_rules;
+pub mod template_feature;
 pub mod transforms;
 pub mod tree_beehive;
 pub mod tree_dark_oak;

@@ -181,7 +181,7 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                 if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.getFluidState().isEmpty() || !LightEngine.hasDifferentLightProperties(source,target.defaultBlockState()))
                     throw new AssertionError("unsupported patch vine source "+source+" -> "+target);
         boolean magmaActive=vineActive && args[1].endsWith("_magma_block");
-        if(magmaActive) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore","sulfur","cinnabar")) {
+        if(magmaActive) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","redstone_ore","deepslate_redstone_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore","sulfur","cinnabar","deepslate","granite","diorite","andesite","tuff","calcite")) {
             var block=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name));
             for(var state:block.getStateDefinition().getPossibleStates())
                 if(!state.isSolid() || !state.canOcclude() || state.hasBlockEntity() || !state.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state) || state.getPostProcessPos(null,BlockPos.ZERO)!=null || !LightEngine.hasDifferentLightProperties(state,Blocks.MAGMA_BLOCK.defaultBlockState()))
@@ -339,8 +339,13 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
                     var source=args[1].contains("_deepslate_coal_ore_") ? Blocks.DEEPSLATE_COAL_ORE.defaultBlockState() : Blocks.COAL_ORE.defaultBlockState();
                     if(source.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || !source.isSolid())throw new AssertionError("unsupported magma source effects");
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
-                } else if(args[1].contains("_sulfur_") || args[1].contains("_cinnabar_")) {
-                    var source=(args[1].contains("_sulfur_") ? Blocks.SULFUR : Blocks.CINNABAR).defaultBlockState();
+                } else if(args[1].contains("_deepslate_x_") || args[1].contains("_deepslate_y_") || args[1].contains("_deepslate_z_")) {
+                    var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
+                    var source=Blocks.DEEPSLATE.defaultBlockState().setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,axis);
+                    fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
+                } else if(Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite"}).anyMatch(name->args[1].contains("_"+name+"_"))) {
+                    var name=Arrays.stream(new String[]{"sulfur","cinnabar","granite","diorite","andesite","tuff","calcite"}).filter(n->args[1].contains("_"+n+"_")).findFirst().orElseThrow();
+                    var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
                     fake.section.setBlockState(0,7,8,source); w.edits.put(new BlockPos(16,7,8),source);
                 } else if(args[1].contains("_redstone_ore_")) {
                     var source=(args[1].contains("_deepslate_redstone_ore_") ? Blocks.DEEPSLATE_REDSTONE_ORE : Blocks.REDSTONE_ORE).defaultBlockState().setValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT,true);

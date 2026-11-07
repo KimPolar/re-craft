@@ -7847,11 +7847,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             == Some(true);
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
-                        && ((matches!(
-                            old.name.as_str(),
-                            "minecraft:stone" | "minecraft:sulfur" | "minecraft:cinnabar"
-                        ) && old.properties.is_empty())
-                            || generated_ore_state(&old)?)
+                        && (lake_source || generated_ore_state(&old)?)
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
                     if guard.require_unchanged_light {
@@ -12215,6 +12211,21 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_underwater_magma_stone_variants_match_java_light() {
+        check_staged_light_modes(&[
+            "vine_active_deepslate_x_magma_block",
+            "vine_active_self_deepslate_y_magma_block",
+            "vine_active_deepslate_z_magma_block",
+            "vine_active_self_granite_magma_block",
+            "vine_active_diorite_magma_block",
+            "vine_active_self_andesite_magma_block",
+            "vine_active_tuff_magma_block",
+            "vine_active_self_calcite_magma_block",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_village_piles_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_pile_snow",
@@ -12455,12 +12466,34 @@ mod tests {
                     });
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
-                } else if mode.contains("_sulfur_") || mode.contains("_cinnabar_") {
-                    let source = state(if mode.contains("_sulfur_") {
-                        "sulfur"
+                } else if mode.contains("_deepslate_x_")
+                    || mode.contains("_deepslate_y_")
+                    || mode.contains("_deepslate_z_")
+                {
+                    let mut source = state("deepslate");
+                    let axis = if mode.contains("_deepslate_x_") {
+                        "x"
+                    } else if mode.contains("_deepslate_z_") {
+                        "z"
                     } else {
-                        "cinnabar"
-                    });
+                        "y"
+                    };
+                    source.properties.insert("axis".into(), axis.into());
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
+                } else if [
+                    "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
+                ]
+                .into_iter()
+                .any(|name| mode.contains(&format!("_{name}_")))
+                {
+                    let name = [
+                        "sulfur", "cinnabar", "granite", "diorite", "andesite", "tuff", "calcite",
+                    ]
+                    .into_iter()
+                    .find(|name| mode.contains(&format!("_{name}_")))
+                    .unwrap();
+                    let source = state(name);
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
                 } else if mode.contains("_redstone_ore_") {

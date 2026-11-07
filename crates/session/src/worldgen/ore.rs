@@ -7003,12 +7003,9 @@ impl MagmaWorld for DecorationRegion<'_> {
             );
             if !self.is_outside(pos[1]) {
                 let source = self.read(pos)?;
-                let coal = matches!(
-                    source.name.as_str(),
-                    "minecraft:coal_ore" | "minecraft:deepslate_coal_ore"
-                ) && source.properties.is_empty();
+                let ore = generated_ore_state(&source)?;
                 ensure!(
-                    disk_safe_solid(&source.name).is_some() || coal,
+                    disk_safe_solid(&source.name).is_some() || ore,
                     "unsupported magma source effects for {} at {pos:?}",
                     source.name
                 );
@@ -7343,13 +7340,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 && state.properties.get("level").map(String::as_str) == Some("0")));
                     let magma_light_update = guard.require_unchanged_light
                         && self.magma_block_write
-                        && matches!(
-                            old.name.as_str(),
-                            "minecraft:stone"
-                                | "minecraft:coal_ore"
-                                | "minecraft:deepslate_coal_ore"
-                        )
-                        && old.properties.is_empty()
+                        && ((old.name == "minecraft:stone" && old.properties.is_empty())
+                            || generated_ore_state(&old)?)
                         && state.name == "minecraft:magma_block"
                         && state.properties.is_empty();
                     if guard.require_unchanged_light {
@@ -11610,6 +11602,8 @@ mod tests {
             "vine_active_self_magma_block",
             "vine_active_coal_ore_magma_block",
             "vine_active_self_deepslate_coal_ore_magma_block",
+            "vine_active_redstone_ore_magma_block",
+            "vine_active_self_deepslate_redstone_ore_magma_block",
         ]);
     }
 
@@ -11853,6 +11847,15 @@ mod tests {
                     } else {
                         "coal_ore"
                     });
+                    let id = world.intern_state(source);
+                    world.set_block_id(16, 7, 8, id).unwrap();
+                } else if mode.contains("_redstone_ore_") {
+                    let mut source = state(if mode.contains("_deepslate_redstone_ore_") {
+                        "deepslate_redstone_ore"
+                    } else {
+                        "redstone_ore"
+                    });
+                    source.properties.insert("lit".into(), "true".into());
                     let id = world.intern_state(source);
                     world.set_block_id(16, 7, 8, id).unwrap();
                 }
@@ -22005,6 +22008,68 @@ mod tests {
         let world = terrain.snapshot();
         assert_eq!(world.block(8, 5, 8).unwrap().name, "minecraft:water");
         assert_eq!(world.saved_fluid_ticks[&center][0].position, [8, 5, 8]);
+    }
+
+    #[test]
+    fn magma_replaces_supported_ores_and_rejects_invalid_states() {
+        let names = [
+            "coal_ore",
+            "deepslate_coal_ore",
+            "iron_ore",
+            "deepslate_iron_ore",
+            "copper_ore",
+            "deepslate_copper_ore",
+            "gold_ore",
+            "deepslate_gold_ore",
+            "redstone_ore",
+            "deepslate_redstone_ore",
+            "emerald_ore",
+            "deepslate_emerald_ore",
+            "lapis_ore",
+            "deepslate_lapis_ore",
+            "diamond_ore",
+            "deepslate_diamond_ore",
+            "nether_gold_ore",
+            "nether_quartz_ore",
+        ];
+        let mut registry = batch_registry();
+        registry.insert("minecraft:magma_block".into());
+        registry.extend(names.iter().map(|name| format!("minecraft:{name}")));
+        let motion = HeightmapTags::load(&mut Data, &registry).unwrap();
+        for name in names {
+            let redstone = name.contains("redstone");
+            for lit in [false, true] {
+                if lit && !redstone {
+                    continue;
+                }
+                let (mut terrain, tags, _, _) = fixture();
+                let center = ChunkPos { x: 0, z: 0 };
+                let mut old = state(name);
+                if redstone {
+                    old.properties.insert("lit".into(), lit.to_string());
+                }
+                let mut setup = terrain
+                    .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                    .unwrap();
+                setup.set_section_block([8, 7, 8], &old).unwrap();
+                setup.finish().unwrap();
+                let mut draft = terrain
+                    .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                    .unwrap();
+                assert!(
+                    draft.set_magma([8, 7, 8], &state("magma_block")).unwrap(),
+                    "{name} {lit}"
+                );
+                draft.finish().unwrap();
+                assert_eq!(
+                    terrain.snapshot().block(8, 7, 8).unwrap().name,
+                    "minecraft:magma_block"
+                );
+            }
+        }
+        let mut invalid = state("redstone_ore");
+        invalid.properties.insert("lit".into(), "invalid".into());
+        assert!(generated_ore_state(&invalid).is_err());
     }
 
     #[test]

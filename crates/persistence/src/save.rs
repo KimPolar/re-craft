@@ -164,6 +164,7 @@ pub struct FreshWorldStage {
     _directory: tempfile::TempDir,
     root: PathBuf,
     manifest: BTreeMap<PathBuf, Option<[u8; 32]>>,
+    enabled_file_packs: Vec<String>,
 }
 
 impl FreshWorldStage {
@@ -190,6 +191,7 @@ impl FreshWorldStage {
             "staged world changed while copying data packs"
         );
         self.manifest = updated;
+        self.verify_enabled_file_packs()?;
         Ok(())
     }
 
@@ -199,6 +201,17 @@ impl FreshWorldStage {
             "staged world changed before publication"
         );
         Ok(())
+    }
+
+    /// A selected file pack must be present in the sealed snapshot. Otherwise
+    /// Java would reload the world with different generation and game rules.
+    fn verify_enabled_file_packs(&self) -> Result<()> {
+        verify_enabled_file_packs(&self.manifest, &self.enabled_file_packs)
+    }
+
+    fn verify_ready(&self) -> Result<()> {
+        self.verify()?;
+        self.verify_enabled_file_packs()
     }
 
     /// Reserve a Java-style folder and keep its session lock while copying.
@@ -217,7 +230,7 @@ impl FreshWorldStage {
         }
         #[cfg(windows)]
         {
-            self.verify()?;
+            self.verify_ready()?;
             let saves = saves
                 .canonicalize()
                 .context("cannot resolve saves directory")?;
@@ -254,6 +267,38 @@ impl FreshWorldStage {
             })
         }
     }
+}
+
+fn verify_enabled_file_packs(
+    manifest: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+    enabled: &[String],
+) -> Result<()> {
+    use std::path::Component;
+    for id in enabled.iter().filter(|id| id.starts_with("file/")) {
+        let name = id
+            .strip_prefix("file/")
+            .context("invalid file data pack ID")?;
+        let mut components = Path::new(name).components();
+        ensure!(
+            !name.contains(['/', '\\'])
+                && matches!(components.next(), Some(Component::Normal(_)))
+                && components.next().is_none(),
+            "invalid enabled data pack path {id}"
+        );
+        let path = Path::new("datapacks").join(name);
+        let present = match manifest.get(&path) {
+            Some(Some(_)) => name.ends_with(".zip"),
+            Some(None) => manifest
+                .get(&path.join("pack.mcmeta"))
+                .is_some_and(Option::is_some),
+            None => false,
+        };
+        ensure!(
+            present,
+            "enabled data pack {id} is missing from the staged world"
+        );
+    }
+    Ok(())
 }
 
 /// Published world and its still-held vanilla session lock.
@@ -497,6 +542,14 @@ pub fn recover_fresh_world(saves: &Path, staging: &Path) -> Result<PublishedFres
             && root.canonicalize()?.parent() == Some(staging.as_path()),
         "invalid staged world directory"
     );
+    ensure!(
+        staged_world_manifest(&root, false)? == manifest,
+        "staged world changed before recovery"
+    );
+    let reader =
+        crate::world::WorldReader::open(&root, DimensionId::parse("minecraft:overworld")?)?;
+    verify_enabled_file_packs(&manifest, &reader.data_pack_settings()?.enabled)?;
+    drop(reader);
     let target = saves.join(&name);
     let target_metadata = fs::symlink_metadata(&target)?;
     ensure!(
@@ -779,6 +832,12 @@ impl FreshWorldDraft {
             reader.world_clocks()? == self.clocks,
             "staged clocks did not round-trip"
         );
+        let enabled_file_packs = reader
+            .data_pack_settings()?
+            .enabled
+            .into_iter()
+            .filter(|id| id.starts_with("file/"))
+            .collect();
         let generators = reader
             .saved_dimension_generators()?
             .context("staged dimension generators are missing")?;
@@ -818,6 +877,7 @@ impl FreshWorldDraft {
             _directory: directory,
             root: world_path,
             manifest,
+            enabled_file_packs,
         })
     }
 
@@ -4209,6 +4269,169 @@ mod tests {
             .add_region(DimensionId::parse("overworld").unwrap(), terrain)
             .unwrap();
         draft.stage(parent).unwrap()
+    }
+
+    fn stage_with_selected_file_pack(parent: &Path, id: &str) -> FreshWorldStage {
+        let (mut level, worldgen, player, uuid) = fresh_world_metadata();
+        let Tag::Compound(root) = &mut level.value else {
+            unreachable!()
+        };
+        let Tag::Compound(data) = &mut root
+            .iter_mut()
+            .find(|(key, _)| key.matches("Data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        data.push((
+            "DataPacks".into(),
+            Tag::Compound(vec![
+                (
+                    "Enabled".into(),
+                    Tag::List {
+                        element_type: nbt::TagType::String,
+                        values: vec![Tag::String("vanilla".into()), Tag::String(id.into())],
+                    },
+                ),
+                (
+                    "Disabled".into(),
+                    Tag::List {
+                        element_type: nbt::TagType::String,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        ));
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(crate::world::ChunkPos { x: 0, z: 0 }, &chunk(0, "stage"), 1)
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        draft.stage(parent).unwrap()
+    }
+
+    #[test]
+    fn selected_file_packs_are_required_before_publication_and_recovery() {
+        let saves = test_world();
+        let stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        assert!(format!("{:#}", stage.verify_ready().unwrap_err()).contains("file/example"));
+        assert!(stage.publish(saves.path(), "World", "New World").is_err());
+        assert!(!saves.path().join("World").exists());
+
+        let source = test_world();
+        let absent =
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(source.path()).unwrap();
+        let mut stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        assert!(stage.install_data_packs(&absent).is_err());
+        assert!(stage.verify_ready().is_err());
+        drop(stage);
+
+        let pack = source.path().join("datapacks/example");
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"fixture","min_format":121,"max_format":121}}"#,
+        )
+        .unwrap();
+        let snapshot =
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(source.path()).unwrap();
+        let mut stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        stage.install_data_packs(&snapshot).unwrap();
+        stage.verify_ready().unwrap();
+        fs::write(
+            stage.path().join("datapacks/example/pack.mcmeta"),
+            b"changed",
+        )
+        .unwrap();
+        assert!(stage.verify_ready().is_err());
+        drop(stage);
+
+        let mut stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        stage.install_data_packs(&snapshot).unwrap();
+        let published = stage
+            .publish(saves.path(), "Data Pack World", "New World")
+            .unwrap();
+        let reader = crate::world::WorldReader::open(
+            &published.path,
+            DimensionId::parse("overworld").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reader.data_pack_settings().unwrap().enabled,
+            vec!["vanilla", "file/example"]
+        );
+        assert_eq!(
+            fs::read(published.path.join("datapacks/example/pack.mcmeta")).unwrap(),
+            fs::read(pack.join("pack.mcmeta")).unwrap()
+        );
+        drop(reader);
+        drop(published);
+
+        let stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        let reserved =
+            crate::world_creation::reserve_world_folder(saves.path(), "World", "New World")
+                .unwrap();
+        let staging = stage._directory.path().to_owned();
+        write_fresh_creation_journal(&staging, &reserved.name, &stage.manifest).unwrap();
+        let destination = reserved.path.clone();
+        drop(reserved);
+        assert_eq!(stage._directory.keep(), staging);
+        assert!(recover_fresh_world(saves.path(), &staging).is_err());
+        assert!(!destination.join("level.dat").exists());
+
+        let mut stage = stage_with_selected_file_pack(saves.path(), "file/example");
+        stage.install_data_packs(&snapshot).unwrap();
+        let reserved =
+            crate::world_creation::reserve_world_folder(saves.path(), "Recovery", "New World")
+                .unwrap();
+        let staging = stage._directory.path().to_owned();
+        write_fresh_creation_journal(&staging, &reserved.name, &stage.manifest).unwrap();
+        let destination = reserved.path.clone();
+        drop(reserved);
+        assert_eq!(stage._directory.keep(), staging);
+        let recovered = recover_fresh_world(saves.path(), &staging).unwrap();
+        assert_eq!(recovered.path, destination);
+        assert_eq!(
+            fs::read(destination.join("datapacks/example/pack.mcmeta")).unwrap(),
+            fs::read(pack.join("pack.mcmeta")).unwrap()
+        );
+    }
+
+    #[test]
+    fn enabled_file_pack_paths_and_kinds_are_checked() {
+        let mut manifest = BTreeMap::new();
+        manifest.insert(PathBuf::from("datapacks/directory"), None);
+        manifest.insert(
+            PathBuf::from("datapacks/directory/pack.mcmeta"),
+            Some([1; 32]),
+        );
+        manifest.insert(PathBuf::from("datapacks/archive.zip"), Some([2; 32]));
+        manifest.insert(PathBuf::from("datapacks/plain.txt"), Some([3; 32]));
+        for id in ["file/directory", "file/archive.zip", "vanilla"] {
+            assert!(
+                verify_enabled_file_packs(&manifest, &[id.into()]).is_ok(),
+                "{id}"
+            );
+        }
+        for id in [
+            "file/missing",
+            "file/plain.txt",
+            "file/../directory",
+            "file/",
+            "file/a\\b",
+        ] {
+            assert!(
+                verify_enabled_file_packs(&manifest, &[id.into()]).is_err(),
+                "{id}"
+            );
+        }
+        manifest.remove(Path::new("datapacks/directory/pack.mcmeta"));
+        assert!(verify_enabled_file_packs(&manifest, &["file/directory".into()]).is_err());
     }
 
     #[test]

@@ -1744,17 +1744,38 @@ impl WorldReader {
     }
 
     pub fn data_pack_settings(&self) -> Result<DataPackSettings> {
+        let Tag::Compound(root) = &self.level.value else {
+            bail!("level.dat root must be a compound")
+        };
+        ensure!(
+            root.iter().filter(|(name, _)| name.matches("Data")).count() == 1,
+            "level.dat must contain exactly one Data compound"
+        );
         let data = self
             .level
             .value
             .get("Data")
             .context("level.dat is missing Data")?;
+        let Tag::Compound(fields) = data else {
+            bail!("level.dat Data must be a compound")
+        };
+        for name in ["DataPacks", "enabled_features"] {
+            ensure!(
+                fields.iter().filter(|(key, _)| key.matches(name)).count() <= 1,
+                "duplicate {name} in level.dat"
+            );
+        }
         let mut result = DataPackSettings::default();
         if let Some(config) = data.get("DataPacks") {
-            ensure!(
-                matches!(config, Tag::Compound(_)),
-                "DataPacks must be a compound"
-            );
+            let Tag::Compound(packs) = config else {
+                bail!("DataPacks must be a compound")
+            };
+            for name in ["Enabled", "Disabled"] {
+                ensure!(
+                    packs.iter().filter(|(key, _)| key.matches(name)).count() == 1,
+                    "DataPacks must contain exactly one {name}"
+                );
+            }
             result.enabled = string_list(
                 config
                     .get("Enabled")
@@ -3290,6 +3311,52 @@ mod tests {
             std::fs::read(path.join("r.0.0.mca")).unwrap(),
             vec![0u8; 8192]
         );
+    }
+
+    #[test]
+    fn rejects_ambiguous_data_pack_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let strings = |items: &[&str]| Tag::List {
+            element_type: TagType::String,
+            values: items
+                .iter()
+                .map(|item| Tag::String((*item).into()))
+                .collect(),
+        };
+        for duplicate in ["DataPacks", "enabled_features", "Enabled", "Disabled"] {
+            let mut root = level(TARGET_DATA_VERSION);
+            let Tag::Compound(entries) = &mut root.value else {
+                unreachable!()
+            };
+            let Tag::Compound(data) = &mut entries[0].1 else {
+                unreachable!()
+            };
+            let mut packs = vec![
+                ("Enabled".into(), strings(&["vanilla"])),
+                ("Disabled".into(), strings(&[])),
+            ];
+            if duplicate == "Enabled" {
+                packs.push(("Enabled".into(), strings(&["file/missing"])));
+            }
+            if duplicate == "Disabled" {
+                packs.push(("Disabled".into(), strings(&["file/missing"])));
+            }
+            data.push(("DataPacks".into(), Tag::Compound(packs)));
+            if duplicate == "DataPacks" {
+                data.push(("DataPacks".into(), Tag::Compound(vec![])));
+            }
+            if duplicate == "enabled_features" {
+                data.push(("enabled_features".into(), strings(&["minecraft:vanilla"])));
+                data.push((
+                    "enabled_features".into(),
+                    strings(&["minecraft:trade_rebalance"]),
+                ));
+            }
+            write_gzip(&dir.path().join("level.dat"), &root);
+            let reader =
+                WorldReader::open(dir.path(), DimensionId::parse("overworld").unwrap()).unwrap();
+            assert!(reader.data_pack_settings().is_err(), "{duplicate}");
+        }
     }
 
     #[test]

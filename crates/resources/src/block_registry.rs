@@ -63,6 +63,7 @@ enum StateSchema {
     Wall,
     FenceGate,
     Door,
+    Trapdoor,
     Slab,
     Stairs,
     HorizontalFacing,
@@ -142,6 +143,15 @@ impl StateSchema {
                     ("hinge".into(), "left".into()),
                     ("open".into(), "false".into()),
                     ("powered".into(), "false".into()),
+                ]);
+            }
+            Self::Trapdoor => {
+                return BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "bottom".into()),
+                    ("open".into(), "false".into()),
+                    ("powered".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
                 ]);
             }
             Self::Stairs => {
@@ -349,6 +359,14 @@ impl StateSchema {
                     || (name == "half" && matches!(value, "lower" | "upper"))
                     || (name == "hinge" && matches!(value, "left" | "right"))
                     || (matches!(name, "open" | "powered")
+                        && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Trapdoor
+                if (name == "facing" && matches!(value, "north" | "south" | "west" | "east"))
+                    || (name == "half" && matches!(value, "bottom" | "top"))
+                    || (matches!(name, "open" | "powered" | "waterlogged")
                         && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
@@ -849,6 +867,10 @@ impl GeneratedBlockRegistry {
                 | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {
                     Some(StateSchema::Door)
                 }
+                "net/minecraft/world/level/block/TrapDoorBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperTrapDoorBlock" => {
+                    Some(StateSchema::Trapdoor)
+                }
                 "net/minecraft/world/level/block/SlabBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperSlabBlock" => {
                     Some(StateSchema::Slab)
@@ -1062,6 +1084,7 @@ impl GeneratedBlockRegistry {
                     | StateSchema::Bed
                     | StateSchema::FenceGate
                     | StateSchema::Door
+                    | StateSchema::Trapdoor
             ),
             "template state transform is unsupported for {id}"
         );

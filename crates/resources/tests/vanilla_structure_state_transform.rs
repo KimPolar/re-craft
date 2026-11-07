@@ -60,6 +60,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     let mut chain_count = 0;
     let mut wall_count = 0;
     let mut sulfur_count = 0;
+    let mut trapdoor_count = 0;
     for line in text.lines().filter_map(|line| line.strip_prefix("STATE\t")) {
         let row: Value = serde_json::from_str(line)?;
         let id = row["id"].as_str().unwrap();
@@ -68,6 +69,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
             id,
             "minecraft:potent_sulfur" | "minecraft:sulfur_spike"
         ));
+        trapdoor_count += usize::from(id == "minecraft:dark_oak_trapdoor");
         wall_count += usize::from(matches!(
             id,
             "minecraft:stone_brick_wall"
@@ -101,6 +103,7 @@ fn ocean_ruin_states_transform_like_java() -> anyhow::Result<()> {
     assert!(count > 2000, "unexpectedly few oracle cases: {count}");
     assert_eq!(chain_count, 6 * 12, "missing iron chain state transforms");
     assert_eq!(sulfur_count, 25 * 12, "missing sulfur state transforms");
+    assert_eq!(trapdoor_count, 64 * 12, "missing trapdoor state transforms");
     assert_eq!(
         wall_count,
         6 * 324 * 12,

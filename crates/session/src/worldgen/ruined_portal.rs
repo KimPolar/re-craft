@@ -1,4 +1,4 @@
-//! Ruined-portal piece metadata. Block placement is not yet implemented.
+//! Ruined-portal piece metadata and staged template placement.
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::BoundingBox;
 use native_persistence::nbt::Tag;
@@ -32,7 +32,104 @@ pub struct PreparedStart {
     pub piece: SavedRuinedPortalPiece,
 }
 
+/// A jigsaw marker from the original template, resolved for its later pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortalJigsawMarker {
+    pub source_index: usize,
+    pub position: [i32; 3],
+    pub final_state: native_world::loaded::BlockState,
+}
+
 impl PreparedStart {
+    fn selected_palette_index(&self) -> Result<usize> {
+        let [x, y, z] = self.piece.position;
+        let count =
+            i32::try_from(self.template.palettes.len()).context("too many portal palettes")?;
+        Ok(
+            native_core::random::LegacyRandom::new(native_resources::blockstates::positional_seed(
+                x, y, z,
+            ))
+            .next_int_bound(count)
+            .context("portal template has no palettes")? as usize,
+        )
+    }
+
+    /// Java filters the original selected palette after placing the template,
+    /// independently of processors. NBT-bearing entries are ordered by local
+    /// Y, X, Z and clipped after their mirror and rotation are applied.
+    pub fn jigsaw_markers(
+        &self,
+        registry: &native_resources::block_registry::GeneratedBlockRegistry,
+        clip: BoundingBox,
+    ) -> Result<Vec<PortalJigsawMarker>> {
+        self.piece.validate()?;
+        ensure!(
+            self.template.size == self.piece.template_size,
+            "portal template size changed"
+        );
+        ensure!(
+            (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
+            "invalid portal clip"
+        );
+        let palette = &self.template.palettes[self.selected_palette_index()?];
+        let pivot = [self.template.size[0] / 2, 0, self.template.size[2] / 2];
+        let mut markers = Vec::new();
+        for (source_index, block) in self.template.blocks.iter().enumerate() {
+            let Some(Tag::String(name)) = palette
+                .get(block.state)
+                .context("portal palette index out of bounds")?
+                .get("id")
+            else {
+                anyhow::bail!("template block identifier missing")
+            };
+            if !(name.matches("minecraft:jigsaw") || name.matches("jigsaw")) {
+                continue;
+            }
+            let Some(nbt) = &block.nbt else { continue };
+            let Tag::Compound(fields) = nbt else {
+                anyhow::bail!("jigsaw marker is not a compound")
+            };
+            let position = native_resources::structure_transform::block_world_position(
+                block.position,
+                self.piece.position,
+                self.piece.mirror,
+                self.piece.rotation,
+                pivot,
+            );
+            if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&position[axis])) {
+                continue;
+            }
+            ensure!(
+                fields
+                    .iter()
+                    .filter(|(key, _)| key.matches("final_state"))
+                    .count()
+                    <= 1,
+                "duplicate jigsaw final_state"
+            );
+            let raw = match nbt.get("final_state") {
+                Some(Tag::String(value)) => value.to_string_lossy(),
+                _ => "minecraft:air".to_owned(),
+            };
+            let final_state =
+                native_persistence::jigsaw_replacement::parse_final_state(registry, &raw)?
+                    .unwrap_or_else(|| native_world::loaded::BlockState {
+                        name: "minecraft:air".into(),
+                        properties: Default::default(),
+                    });
+            markers.push((
+                block.position,
+                PortalJigsawMarker {
+                    source_index,
+                    position,
+                    final_state,
+                },
+            ));
+        }
+        markers.sort_by_key(|(position, _)| (position[1], position[0], position[2]));
+        Ok(markers.into_iter().map(|(_, marker)| marker).collect())
+    }
+
     /// Place this template in an unpublished world. Entity placement and
     /// jigsaw markers remain unsupported and cause an error before writing.
     /// The caller discards its world draft on any failure.
@@ -60,14 +157,11 @@ impl PreparedStart {
             self.template.entities.is_empty(),
             "portal template entity placement is unsupported"
         );
-        let [x, y, z] = self.piece.position;
-        let count =
-            i32::try_from(self.template.palettes.len()).context("too many portal palettes")?;
-        let selected = native_core::random::LegacyRandom::new(
-            native_resources::blockstates::positional_seed(x, y, z),
-        )
-        .next_int_bound(count)
-        .context("portal template has no palettes")? as usize;
+        ensure!(
+            self.jigsaw_markers(registry, clip)?.is_empty(),
+            "portal jigsaw markers are unsupported"
+        );
+        let selected = self.selected_palette_index()?;
         let palette = &self.template.palettes[selected];
         let pivot = [self.template.size[0] / 2, 0, self.template.size[2] / 2];
         for block in &self.template.blocks {
@@ -88,9 +182,6 @@ impl PreparedStart {
             );
             if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&position[axis])) {
                 continue;
-            }
-            if name.matches("minecraft:jigsaw") || name.matches("jigsaw") {
-                ensure!(block.nbt.is_none(), "portal jigsaw markers are unsupported");
             }
             if (name.matches("minecraft:structure_block") || name.matches("structure_block"))
                 && let Some(nbt) = &block.nbt

@@ -269,6 +269,10 @@ fn structure_placement_matches_java() -> Result<()> {
     let mut index = 0;
     let mut next = 0;
     let mut count = 0;
+    let mut markers = Vec::new();
+    let mut marker_index = 0;
+    let mut marker_cases = 0;
+    let mut marker_count = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         let f: Vec<_> = line.split('\t').collect();
         match f.as_slice() {
@@ -384,9 +388,133 @@ fn structure_placement_matches_java() -> Result<()> {
                 assert_eq!(index, events.len());
                 assert_eq!(next, v.parse::<i64>()?);
             }
+            ["MCASE", name, m, r, c, n] => {
+                ensure!(marker_index == markers.len(), "missing Java marker rows");
+                let mirror = mirrors[m.parse::<usize>()?];
+                let rotation = rotations[r.parse::<usize>()?];
+                let id = ResourceId::parse(&format!("minecraft:ruined_portal/{name}"))?;
+                let template = if *name == "synthetic" {
+                    let blocks = [
+                        ([3, 3, 3], Some(Some("minecraft:stone"))),
+                        ([1, 1, 1], Some(Some("minecraft:stone[unknown=yes]"))),
+                        ([2, 1, 1], Some(None)),
+                        ([0, 0, 0], None),
+                        (
+                            [1, 2, 2],
+                            Some(Some("minecraft:stone_brick_stairs[facing=east,half=top]")),
+                        ),
+                    ];
+                    StructureTemplate {
+                        document: NamedTag {
+                            name: "".into(),
+                            value: Tag::Compound(vec![]),
+                        },
+                        data_version: Some(5023),
+                        size: [4, 4, 4],
+                        palettes: vec![vec![Tag::Compound(vec![(
+                            "id".into(),
+                            Tag::String("minecraft:jigsaw".into()),
+                        )])]],
+                        blocks: blocks
+                            .into_iter()
+                            .map(|(position, nbt)| TemplateBlock {
+                                position,
+                                state: 0,
+                                nbt: nbt.map(|raw| {
+                                    Tag::Compound(
+                                        raw.into_iter()
+                                            .map(|s| ("final_state".into(), Tag::String(s.into())))
+                                            .collect(),
+                                    )
+                                }),
+                            })
+                            .collect(),
+                        entities: vec![],
+                    }
+                } else {
+                    StructureTemplate::load(&mut data, &id)?.context("missing portal template")?
+                };
+                let origin = [4, 12, -6];
+                let pivot = [template.size[0] / 2, 0, template.size[2] / 2];
+                let bounds = bounding_box(template.size, origin, mirror, rotation, pivot)?;
+                let point = GenerationPoint {
+                    position: origin,
+                    pivot,
+                    bounds,
+                };
+                let selection = InitialSelection {
+                    setup_index: 0,
+                    air_pocket: false,
+                    template: id,
+                    mirror,
+                    rotation,
+                };
+                let setup = Setup {
+                    placement: VerticalPlacement::OnLandSurface,
+                    air_pocket_probability: 0.0,
+                    mossiness: 0.0,
+                    overgrown: false,
+                    vines: false,
+                    can_be_cold: false,
+                    replace_with_blackstone: false,
+                    weight: 1.0,
+                };
+                let piece = SavedRuinedPortalPiece::capture(
+                    &selection,
+                    &setup,
+                    &point,
+                    template.size,
+                    false,
+                )?;
+                let start = PreparedStart {
+                    chunk: [0, 0],
+                    point,
+                    terrain_adjustment: TerrainAdjustment::None,
+                    template: std::sync::Arc::new(template),
+                    piece,
+                };
+                let clip = if *c == "0" {
+                    BoundingBox {
+                        min: [-50, -20, -50],
+                        max: [50, 60, 50],
+                    }
+                } else {
+                    BoundingBox {
+                        min: [2, 10, -8],
+                        max: [6, 16, -4],
+                    }
+                };
+                if *name == "synthetic" && *m == "0" && *r == "0" && *c == "0" {
+                    let mut invalid = start.clone();
+                    let template = std::sync::Arc::make_mut(&mut invalid.template);
+                    let Some(Tag::Compound(fields)) = &mut template.blocks[0].nbt else {
+                        anyhow::bail!("synthetic marker data missing")
+                    };
+                    fields.push(("final_state".into(), Tag::String("minecraft:air".into())));
+                    assert!(invalid.jigsaw_markers(&registry, clip).is_err());
+                }
+                markers = start.jigsaw_markers(&registry, clip)?;
+                assert_eq!(markers.len(), n.parse::<usize>()?, "{line}");
+                marker_index = 0;
+                marker_cases += 1;
+            }
+            ["MARK", x, y, z, final_state] => {
+                let marker = markers.get(marker_index).context("too many Java markers")?;
+                assert_eq!(
+                    marker.position,
+                    [x.parse::<i32>()?, y.parse::<i32>()?, z.parse::<i32>()?],
+                    "{line}"
+                );
+                assert_eq!(key(&marker.final_state), *final_state, "{line}");
+                marker_index += 1;
+                marker_count += 1;
+            }
             _ => {}
         }
     }
     assert_eq!(count, 12);
+    assert_eq!(marker_index, markers.len());
+    assert_eq!(marker_cases, 14 * 3 * 4 * 2);
+    assert!(marker_count > 0);
     Ok(())
 }

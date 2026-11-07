@@ -28,6 +28,22 @@ public class StructurePlacementOracle {
         return out.toString();
     }
     static ListTag ints(int... values) { var list = new ListTag(); for (int v:values) list.add(IntTag.valueOf(v)); return list; }
+    static void markers(java.io.PrintStream out, String name, StructureTemplate template, BlockPos origin) {
+        var size = template.getSize(); var pivot = new BlockPos(size.getX()/2,0,size.getZ()/2);
+        for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) for (int c=0;c<2;c++) {
+            var clip = c==0 ? new BoundingBox(-50,-20,-50,50,60,50) : new BoundingBox(2,10,-8,6,16,-4);
+            var settings = new StructurePlaceSettings().setMirror(mirror).setRotation(rotation).setRotationPivot(pivot).setBoundingBox(clip);
+            var found = template.filterBlocks(origin, settings, Blocks.JIGSAW).stream().filter(b -> b.nbt()!=null).toList();
+            out.printf("MCASE\t%s\t%d\t%d\t%d\t%d%n",name,mirror.ordinal(),rotation.ordinal(),c,found.size());
+            for (var marker : found) {
+                var p=marker.pos(); var raw=marker.nbt().getStringOr("final_state","minecraft:air");
+                var state=Blocks.AIR.defaultBlockState();
+                try { state=net.minecraft.commands.arguments.blocks.BlockStateParser.parseForBlock(BuiltInRegistries.BLOCK,raw,true).blockState(); }
+                catch (com.mojang.brigadier.exceptions.CommandSyntaxException ignored) {}
+                out.printf("MARK\t%d\t%d\t%d\t%s%n",p.getX(),p.getY(),p.getZ(),key(state));
+            }
+        }
+    }
     public static void main(String[] args) throws Exception {
         var out=System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
         var bind = Holder.Reference.class.getDeclaredMethod("bindTags", Collection.class); bind.setAccessible(true);
@@ -162,5 +178,30 @@ public class StructurePlacementOracle {
             for (var e:events) out.println(e);
             out.printf("END\t%d%n",random.nextLong());
         }
+        var names = new ArrayList<String>();
+        for (int i=1;i<=10;i++) names.add("portal_"+i);
+        for (int i=1;i<=3;i++) names.add("giant_portal_"+i);
+        for (var name : names) {
+            try (var stream = StructurePlacementOracle.class.getClassLoader().getResourceAsStream(
+                    "data/minecraft/structure/ruined_portal/"+name+".nbt")) {
+                if (stream == null) throw new AssertionError("missing " + name);
+                var actualTemplate = new StructureTemplate();
+                actualTemplate.load(BuiltInRegistries.BLOCK, NbtIo.readCompressed(stream, NbtAccounter.unlimitedHeap()));
+                markers(out, name, actualTemplate, origin);
+            }
+        }
+        var synthetic = new CompoundTag(); synthetic.put("size",ints(4,4,4));
+        var syntheticPalette = new ListTag(); syntheticPalette.add(NbtUtils.writeBlockState(Blocks.JIGSAW.defaultBlockState())); synthetic.put("palette",syntheticPalette);
+        var syntheticBlocks = new ListTag();
+        int[][] positions = {{3,3,3},{1,1,1},{2,1,1},{0,0,0},{1,2,2}};
+        String[] finals = {"minecraft:stone", "minecraft:stone[unknown=yes]", null, "NO_NBT", "minecraft:stone_brick_stairs[facing=east,half=top]"};
+        for (int i=0;i<positions.length;i++) {
+            var block=new CompoundTag(); block.put("pos",ints(positions[i])); block.putInt("state",0);
+            if (!"NO_NBT".equals(finals[i])) { var nbt=new CompoundTag(); if (finals[i]!=null) nbt.putString("final_state",finals[i]); block.put("nbt",nbt); }
+            syntheticBlocks.add(block);
+        }
+        synthetic.put("blocks",syntheticBlocks); synthetic.put("entities",new ListTag());
+        var syntheticTemplate=new StructureTemplate(); syntheticTemplate.load(BuiltInRegistries.BLOCK,synthetic);
+        markers(out,"synthetic",syntheticTemplate,origin);
     }
 }

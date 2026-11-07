@@ -4542,6 +4542,7 @@ impl FreshTerrainBatch {
                     resolve,
                     needs_mineshaft,
                     &jigsaw_features,
+                    self.light_registry.as_ref(),
                 )?;
                 let terrain = self
                     .terrain

@@ -678,6 +678,8 @@ pub struct DecorationRegion<'a> {
     tags: &'a OreBlockTags,
     motion: &'a HeightmapTags,
     writable: BTreeSet<ChunkPos>,
+    template_registry: Option<&'a native_resources::block_registry::GeneratedBlockRegistry>,
+    template_tags: Option<&'a ruined_portal::PortalUpdateTags>,
     jigsaw_feature_bounds: Option<(i32, i32)>,
     heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
     surface_heights: BTreeMap<ChunkPos, Arc<[i32; 256]>>,
@@ -783,6 +785,7 @@ enum ConfiguredDecoration {
     HugeMushroom(HugeMushroomFeature<BlockState>),
     VegetationPatch(VegetationPatch<BlockState>, Box<PlacedDecorationFeature>),
     RootSystem(RootSystemFeature<BlockState>, Box<PlacedDecorationFeature>),
+    Template(super::template_feature::PreparedTemplateFeature),
     Sequence(Vec<PlacedDecorationFeature>),
     Selector(Vec<PlacedDecorationFeature>),
     BooleanSelector(Box<PlacedDecorationFeature>, Box<PlacedDecorationFeature>),
@@ -800,6 +803,26 @@ struct FeatureLoadState {
     registry: Option<BTreeSet<ResourceId>>,
 }
 impl ConfiguredDecoration {
+    fn needs_template(&self) -> bool {
+        match self {
+            Self::Template(_) => true,
+            Self::VegetationPatch(_, nested) | Self::RootSystem(_, nested) => {
+                nested.feature.needs_template()
+            }
+            Self::Sequence(values) | Self::Selector(values) => {
+                values.iter().any(|v| v.feature.needs_template())
+            }
+            Self::BooleanSelector(a, b) => a.feature.needs_template() || b.feature.needs_template(),
+            Self::WeightedSelector(values, default) => {
+                default.feature.needs_template()
+                    || values.iter().any(|(_, v)| v.feature.needs_template())
+            }
+            Self::WeightedListSelector(values, _) => {
+                values.iter().any(|(_, v)| v.feature.needs_template())
+            }
+            _ => false,
+        }
+    }
     fn required_blocks(&self) -> BTreeSet<ResourceId> {
         match self {
             Self::Disk(v) => v.required_blocks(),
@@ -1086,6 +1109,11 @@ impl ConfiguredDecoration {
                 )?;
                 Ok(Self::RootSystem(root, Box::new(nested)))
             }
+            ("minecraft", "template") => Ok(Self::Template(
+                super::template_feature::PreparedTemplateFeature::load_unprocessed(
+                    value, provider,
+                )?,
+            )),
             ("minecraft", "sequence" | "simple_random_selector") => {
                 let features = value.get("features").context("missing selector features")?;
                 let entries = PlacedDecorationFeature::load_holder_set(
@@ -1232,7 +1260,7 @@ impl ConfiguredDecoration {
                 tags.extend(nested.required_tags());
                 tags
             }
-            Self::Freeze | Self::Vines(_) => BTreeSet::new(),
+            Self::Freeze | Self::Vines(_) | Self::Template(_) => BTreeSet::new(),
             Self::MonsterRoom => {
                 BTreeSet::from([ResourceId::parse("minecraft:features_cannot_replace").unwrap()])
             }
@@ -1323,6 +1351,29 @@ impl ConfiguredDecoration {
             Self::RootSystem(v, nested) => v.place(world, random, pos, |world, random, origin| {
                 world.place_nested(nested, random, origin, generator_min_y, generator_height)
             }),
+            Self::Template(feature) => {
+                let registry = world
+                    .template_registry
+                    .context("template feature registry missing")?;
+                let tags = world
+                    .template_tags
+                    .context("template feature update tags missing")?;
+                let mut adapter = ruined_portal::PortalTemplateRegion {
+                    inner: jigsaw::JigsawRegion {
+                        region: world,
+                        registry,
+                    },
+                    wall_tags: tags,
+                    temporary_jigsaws: BTreeSet::new(),
+                };
+                feature.place(
+                    &mut adapter,
+                    registry,
+                    random,
+                    pos,
+                    ruined_portal::portal_template_full,
+                )
+            }
             Self::Tree(v) => {
                 world.tree_logs.clear();
                 world.tree_leaves.clear();
@@ -1438,6 +1489,8 @@ pub struct PreparedDecoration<'p, 's> {
     lake_water_fluids: Option<BTreeSet<String>>,
     bubble_column_fluids: Option<BTreeSet<String>>,
     freeze: Option<PreparedFreeze>,
+    template_registry: Option<&'p native_resources::block_registry::GeneratedBlockRegistry>,
+    template_tags: Option<ruined_portal::PortalUpdateTags>,
 }
 
 struct PreparedFreeze {
@@ -1479,6 +1532,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             resolve,
             needs_mineshaft,
             &[],
+            None,
         )
     }
 
@@ -1489,6 +1543,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
         resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
         needs_mineshaft: bool,
         jigsaw_features: &[&PlacedDecorationFeature],
+        template_registry: Option<&'p native_resources::block_registry::GeneratedBlockRegistry>,
     ) -> Result<Self> {
         let mut features = BTreeMap::new();
         let mut required = BTreeSet::new();
@@ -1550,6 +1605,24 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             }
             required.extend(feature.required_tags());
         }
+        let needs_template = features
+            .values()
+            .any(|feature| feature.placed.feature.needs_template())
+            || jigsaw_features
+                .iter()
+                .any(|feature| feature.feature.needs_template());
+        let template_tags = if needs_template {
+            ensure!(
+                template_registry.is_some(),
+                "template feature registry missing"
+            );
+            Some(ruined_portal::PortalUpdateTags::load(
+                provider,
+                block_registry,
+            )?)
+        } else {
+            None
+        };
         if needs_mineshaft {
             required.insert(ResourceId::parse("minecraft:unstable_bottom_center")?);
         }
@@ -1624,6 +1697,8 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             lake_water_fluids,
             bubble_column_fluids,
             freeze,
+            template_registry,
+            template_tags,
         })
     }
 
@@ -2474,6 +2549,8 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
             });
         }
         region.sugar_cane_fluids = self.sugar_cane_fluids.as_ref();
+        region.template_registry = self.template_registry;
+        region.template_tags = self.template_tags.as_ref();
         region.cactus_lava_fluids = self.cactus_lava_fluids.as_ref();
         region.lake_water_fluids = self.lake_water_fluids.as_ref();
         region.bubble_column_fluids = self.bubble_column_fluids.as_ref();
@@ -3401,6 +3478,8 @@ impl CarvedTerrainWorld {
             tags,
             motion,
             writable,
+            template_registry: None,
+            template_tags: None,
             jigsaw_feature_bounds: None,
             heights,
             surface_heights,

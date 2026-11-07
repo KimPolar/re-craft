@@ -6389,6 +6389,171 @@ mod tests {
             Some(1)
         );
     }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_runs_nested_template_feature_transactionally() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_persistence::nbt::{self, NamedTag, Tag, TagType};
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        use std::io::Write;
+        struct FeatureData {
+            vanilla: native_resources::packs::ResourceStack,
+            template: Vec<u8>,
+        }
+        impl ResourceProvider for FeatureData {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.vanilla.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path == "data/test/structure/template.nbt" {
+                    return Ok(Some(self.template.clone()));
+                }
+                if path == "data/minecraft/worldgen/biome/plains.json" {
+                    return Ok(Some(serde_json::to_vec(
+                        &json!({"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[[
+                            {"feature":{"type":"minecraft:sequence","features":[{"feature":{"type":"minecraft:template","templates":[{"weight":1,"data":{"id":"test:template"}}]},"placement":[]}]},"placement":[{"type":"minecraft:offset","x":8,"y":8,"z":8}]}
+                        ]]}),
+                    )?));
+                }
+                if path.starts_with("data/minecraft/tags/") {
+                    return self.vanilla.read_data(path);
+                }
+                if let Some(value) = Data.read_data(path)? {
+                    return Ok(Some(value));
+                }
+                self.vanilla.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                self.vanilla.list_data(folder)
+            }
+        }
+        let list = |element_type, values| Tag::List {
+            element_type,
+            values,
+        };
+        for (name, supported) in [("minecraft:stone", true), ("minecraft:diamond_ore", false)] {
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "size".into(),
+                        list(TagType::Int, vec![Tag::Int(1), Tag::Int(1), Tag::Int(1)]),
+                    ),
+                    (
+                        "palette".into(),
+                        list(
+                            TagType::Compound,
+                            vec![Tag::Compound(vec![("id".into(), Tag::String(name.into()))])],
+                        ),
+                    ),
+                    (
+                        "blocks".into(),
+                        list(
+                            TagType::Compound,
+                            vec![Tag::Compound(vec![
+                                (
+                                    "pos".into(),
+                                    list(TagType::Int, vec![Tag::Int(0), Tag::Int(0), Tag::Int(0)]),
+                                ),
+                                ("state".into(), Tag::Int(0)),
+                            ])],
+                        ),
+                    ),
+                    ("entities".into(), list(TagType::Compound, vec![])),
+                ]),
+            };
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&nbt::write(&document)?)?;
+            let game =
+                native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+            let mut vanilla = native_resources::packs::ResourceStack::open(&game)?;
+            let registry = vanilla.vanilla_generated_block_registry()?;
+            let blocks = vanilla.vanilla_block_ids()?;
+            let mut data = FeatureData {
+                vanilla,
+                template: encoder.finish()?,
+            };
+            let tags = CarverBlockTags::load(&mut data, &blocks)?;
+            let generator =
+                TerrainGenerator::without_terrain_adjustments(&mut data, &definition(), 42, 0, 16)?;
+            let mut batch =
+                FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")?;
+            let lighting = GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld")?,
+                dimension_type: None,
+                inline_dimension_type: None,
+                min_y: 0,
+                height: 16,
+                has_skylight: true,
+                ambient_light: Some(0.0),
+            };
+            batch.enable_decoration(&mut data, &BTreeSet::new(), blocks, &lighting)?;
+            batch.enable_light_initialization(registry)?;
+            let center = ChunkPos { x: 0, z: 0 };
+            batch.request_features(center)?;
+            loop {
+                let before = batch.snapshot();
+                let result = batch.step(
+                    &mut data,
+                    &mut |v| {
+                        let id = v.as_str().context("state ID")?;
+                        Ok(CarverBlockState {
+                            is_air: id == "minecraft:air",
+                            has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+                        })
+                    },
+                    &mut |v| {
+                        Ok(BlockState {
+                            name: v
+                                .as_str()
+                                .or_else(|| v.get("id").and_then(Value::as_str))
+                                .context("state ID")?
+                                .into(),
+                            properties: BTreeMap::new(),
+                        })
+                    },
+                );
+                match result {
+                    Ok(Some(_)) => {}
+                    Ok(None) if supported => break,
+                    Err(error) if !supported => {
+                        ensure!(
+                            format!("{error:#}")
+                                .contains("unsupported portal template static shape"),
+                            "unexpected error: {error:#}"
+                        );
+                        assert!(Arc::ptr_eq(
+                            &before.context("missing terrain")?,
+                            &batch.snapshot().context("missing terrain")?
+                        ));
+                        assert_ne!(
+                            batch.schedule().completed(center),
+                            Some(schedule::GenerationStage::Features)
+                        );
+                        break;
+                    }
+                    other => anyhow::bail!("unexpected template generation result {other:?}"),
+                }
+            }
+            if supported {
+                assert_eq!(
+                    batch
+                        .snapshot()
+                        .context("missing terrain")?
+                        .block(8, 8, 8)
+                        .context("missing block")?
+                        .name,
+                    name
+                );
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn fresh_batch_executes_features_with_initial_light_and_rolls_back_failures() {
         use native_resources::{

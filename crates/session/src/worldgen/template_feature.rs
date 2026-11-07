@@ -13,7 +13,6 @@ use native_persistence::{
 use native_resources::{
     block_registry::GeneratedBlockRegistry,
     packs::{ResourceId, ResourceProvider},
-    structure_pool::HolderValue,
     structure_transform::Mirror,
     template_feature::TemplateFeature,
 };
@@ -34,9 +33,15 @@ impl PreparedTemplateFeature {
     pub fn load(
         value: &Value,
         provider: &mut impl ResourceProvider,
-        blocks: &BTreeSet<String>,
-        registry: &GeneratedBlockRegistry,
+        _blocks: &BTreeSet<String>,
+        _registry: &GeneratedBlockRegistry,
     ) -> Result<Self> {
+        Self::load_unprocessed(value, provider)
+    }
+
+    /// Load templates that have no processor list; processor RNG semantics
+    /// require a separate implementation before other configurations can run.
+    pub fn load_unprocessed(value: &Value, provider: &mut impl ResourceProvider) -> Result<Self> {
         let feature = TemplateFeature::decode(value)?;
         // TemplateFeature supplies one shared RNG to its processors. The
         // existing structure-piece processors use positional RNG instead.
@@ -44,12 +49,7 @@ impl PreparedTemplateFeature {
             feature.processors().is_none(),
             "template feature processors are not yet supported"
         );
-        let processors = PreparedProcessors::load(
-            &HolderValue::Inline(serde_json::json!({"processors":[]})),
-            provider,
-            blocks,
-            registry,
-        )?;
+        let processors = PreparedProcessors::empty();
         let mut templates = BTreeMap::new();
         for entry in feature.entries() {
             if !templates.contains_key(&entry.id) {
@@ -118,6 +118,13 @@ impl PreparedTemplateFeature {
             is_static_full,
             &mut |position| JigsawPlacementWorld::block(&mut **shared.borrow_mut(), position),
         )?;
+        ensure!(
+            records.iter().all(|record| !matches!(
+                record.block.state.name.as_str(),
+                "minecraft:jigsaw" | "minecraft:structure_block"
+            )),
+            "template feature structure block entities are not yet supported"
+        );
         let world = shared.into_inner();
         place_structure_records(
             &records,

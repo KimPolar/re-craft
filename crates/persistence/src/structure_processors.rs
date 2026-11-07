@@ -167,6 +167,10 @@ fn predicate(
 }
 
 impl PreparedProcessors {
+    /// A template feature with no configured processors.
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
     /// Java 26.3's built-in ruined-portal processor sequence.
     pub fn ruined_portal(
         provider: &mut impl ResourceProvider,

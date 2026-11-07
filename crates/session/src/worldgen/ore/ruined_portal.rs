@@ -35,7 +35,7 @@ pub(super) fn portal_full(state: &BlockState) -> bool {
         )
 }
 
-fn portal_template_full(state: &BlockState) -> Result<bool> {
+pub(super) fn portal_template_full(state: &BlockState) -> Result<bool> {
     if portal_full(state) {
         return Ok(true);
     }
@@ -197,10 +197,10 @@ impl PreparedPortalPlacement<'_> {
     }
 }
 
-struct PortalTemplateRegion<'r, 'a, 'g> {
-    inner: super::jigsaw::JigsawRegion<'r, 'a, 'g>,
-    wall_tags: &'g PortalUpdateTags,
-    temporary_jigsaws: BTreeSet<[i32; 3]>,
+pub(super) struct PortalTemplateRegion<'r, 'a, 'g> {
+    pub(super) inner: super::jigsaw::JigsawRegion<'r, 'a, 'g>,
+    pub(super) wall_tags: &'g PortalUpdateTags,
+    pub(super) temporary_jigsaws: BTreeSet<[i32; 3]>,
 }
 
 impl JigsawPlacementWorld for PortalTemplateRegion<'_, '_, '_> {

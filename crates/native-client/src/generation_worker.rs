@@ -817,8 +817,9 @@ impl GenerationReady {
             LoadedSession::new(world, mesh.origin, BuildBounds { min_y, max_y }, player)
         }
         .map_err(anyhow::Error::msg)?;
+        session.set_player_inventory(PlayerInventory::default());
         self.batch.apply_session_block_support(&mut session);
-        self.batch.apply_session_content(&mut session);
+        self.batch.apply_session_content(&mut session)?;
         if let Some(processed) = &self.postprocessed {
             let mut selected = native_session::worldgen::chunk_ticks::ActivatedRegionTicks {
                 game_time: processed.activated_ticks.game_time,
@@ -891,7 +892,6 @@ impl GenerationReady {
                 }
             }
         }
-        session.set_player_inventory(PlayerInventory::default());
         if let Some(registry) = &self.entity_collision_registry {
             session.set_entity_collision_registry(Arc::clone(registry))?;
         }
@@ -900,6 +900,10 @@ impl GenerationReady {
             session.set_game_mode(settings.mode);
             session.set_game_master_permission(settings.allow_commands);
             session.set_world_seed(Some(settings.seed));
+            session.set_random_sequences(
+                settings.seed,
+                native_persistence::random_sequences::RandomSequences::read(None)?,
+            )?;
             session.set_survival_rules(native_session::survival::SurvivalRules {
                 difficulty: settings.difficulty,
                 ..Default::default()
@@ -7442,7 +7446,18 @@ mod tests {
                 let source_biome = pack.join("data/example/worldgen/biome/flat.json");
                 let expected_biome = std::fs::read(&source_biome)?;
                 std::fs::write(&source_biome, br#"{"changed_after_generation":true}"#)?;
-                let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+                let mut staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+                assert!(
+                    staged
+                        .initial
+                        .session
+                        .set_random_sequences(
+                            42,
+                            native_persistence::random_sequences::RandomSequences::read(None)?,
+                        )
+                        .is_err(),
+                    "initial world random sequences were not initialized"
+                );
                 let staged_biome = staged
                     .stage
                     .path()

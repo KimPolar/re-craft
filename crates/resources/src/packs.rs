@@ -64,6 +64,11 @@ impl ResourceId {
 pub trait ResourceProvider {
     fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Item registrations come from the verified client classes, not data packs.
+    fn builtin_item_registry(&mut self) -> Result<Option<crate::item_registry::ItemRegistry>> {
+        Ok(None)
+    }
+
     /// All visible versions of an asset, from the built-in pack to the highest priority.
     fn read_asset_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
         Ok(self.read_asset(path)?.into_iter().collect())
@@ -470,6 +475,10 @@ fn collect_texture_tree(
 }
 
 impl ResourceProvider for ResourceStack {
+    fn builtin_item_registry(&mut self) -> Result<Option<crate::item_registry::ItemRegistry>> {
+        ResourceStack::vanilla_item_registry(self).map(Some)
+    }
+
     fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
         validate_asset_path(path)?;
         for pack in self.packs.iter_mut().rev() {

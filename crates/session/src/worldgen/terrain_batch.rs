@@ -491,6 +491,8 @@ struct GeneratedSessionContent {
     block_loot: Arc<native_resources::loot::BlockLootTables>,
     chest_loot: Option<Arc<native_resources::chest_loot::ChestLootTables>>,
     tools: [Arc<native_resources::transforms::BlockTransformers>; 3],
+    enchantments: Arc<native_resources::enchantments::OxygenEnchantments>,
+    items: Option<Arc<native_resources::item_registry::ItemRegistry>>,
 }
 
 /// Optional session data is resolved once from the same frozen stack used by
@@ -1304,6 +1306,7 @@ impl FreshTerrainBatch {
     pub fn prepare_session_content(&mut self, provider: &mut impl ResourceProvider) -> Result<()> {
         use native_resources::{
             chest_loot::ChestLootTables,
+            enchantments::OxygenEnchantments,
             loot::BlockLootTables,
             recipes::CraftingRecipes,
             transforms::{BlockTransformers, ToolKind},
@@ -1313,6 +1316,16 @@ impl FreshTerrainBatch {
             "session content is already prepared"
         );
         let recipes = CraftingRecipes::load(provider).context("cannot load crafting recipes")?;
+        let enchantments = OxygenEnchantments::load(provider)
+            .context("cannot load enchantments from the active data packs")?;
+        let items = match provider.builtin_item_registry() {
+            Ok(Some(items)) => Some(Arc::new(items)),
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("Item registry is unavailable: {error:#}");
+                None
+            }
+        };
         let tools = [ToolKind::Axe, ToolKind::Shovel, ToolKind::Hoe]
             .map(|kind| BlockTransformers::load_for(provider, kind).map(Arc::new));
         let [axe, shovel, hoe] = tools;
@@ -1341,16 +1354,37 @@ impl FreshTerrainBatch {
             block_loot: Arc::new(block_loot),
             chest_loot,
             tools,
+            enchantments: Arc::new(enchantments),
+            items,
         });
         Ok(())
     }
 
-    /// Share prepared gameplay data with a generated session, if available.
-    pub fn apply_session_content(&self, session: &mut crate::loaded::LoadedSession) -> bool {
+    /// Initialize a new, unadvanced generated player's gameplay data.
+    pub fn apply_session_content(
+        &self,
+        session: &mut crate::loaded::LoadedSession,
+    ) -> Result<bool> {
         use native_resources::transforms::ToolKind;
         let Some(content) = &self.session_content else {
-            return false;
+            return Ok(false);
         };
+        use crate::player_data::SavedAttribute;
+        session.restore_saved_luck_attribute(SavedAttribute::with_base(0.0))?;
+        session.set_saved_breathing(
+            crate::survival::BreathingEffects::default(),
+            SavedAttribute::with_base(0.0),
+            Arc::clone(&content.enchantments),
+        )?;
+        session.set_saved_armor(
+            SavedAttribute::with_base(0.0),
+            SavedAttribute::with_base(0.0),
+        )?;
+        if let Some(items) = &content.items {
+            session.set_item_damage_rules(Arc::clone(items), Arc::clone(&content.enchantments));
+        } else {
+            session.set_orb_damage_tags(Arc::clone(&content.enchantments));
+        }
         session.set_crafting_recipes(Arc::clone(&content.recipes));
         session.set_block_loot(Arc::clone(&content.block_loot));
         if let Some(loot) = &content.chest_loot {
@@ -1362,7 +1396,7 @@ impl FreshTerrainBatch {
         {
             session.set_tool_transformers(kind, Arc::clone(transforms));
         }
-        true
+        Ok(true)
     }
 
     pub(super) fn spawn_stamp(&self) -> Result<SpawnStamp> {
@@ -5269,6 +5303,10 @@ mod session_block_support_tests {
     }
 
     fn fresh_player_session() -> LoadedSession {
+        fresh_player_session_with_loot_chest(None)
+    }
+
+    fn fresh_player_session_with_loot_chest(loot: Option<&str>) -> LoadedSession {
         let mut world = World::new("minecraft:overworld");
         let block = |name: &str| BlockState {
             name: name.into(),
@@ -5284,6 +5322,17 @@ mod session_block_support_tests {
         }
         blocks[8 + 7 * 16 + 256] = stone;
         blocks[8 + 6 * 16 + 2 * 256] = stone;
+        if loot.is_some() {
+            let chest_state = world.intern_state(BlockState {
+                name: "minecraft:chest".into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("type".into(), "single".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            });
+            blocks[8 + 7 * 16 + 2 * 256] = chest_state;
+        }
         let pos = ChunkPos { x: 0, z: 0 };
         world.chunks.insert(
             pos,
@@ -5302,6 +5351,28 @@ mod session_block_support_tests {
                 )]),
             }),
         );
+        if let Some(loot) = loot {
+            use native_persistence::nbt::{NamedTag, TagType};
+            let entity = Tag::Compound(vec![
+                ("id".into(), Tag::String("minecraft:chest".into())),
+                ("x".into(), Tag::Int(8)),
+                ("y".into(), Tag::Int(2)),
+                ("z".into(), Tag::Int(7)),
+                ("LootTable".into(), Tag::String(loot.into())),
+            ]);
+            let data = native_persistence::nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![entity],
+                },
+            })
+            .unwrap();
+            world.saved_block_entities.insert(
+                pos,
+                native_world::loaded::SavedBlockEntities::Encoded(data.into()),
+            );
+        }
         LoadedSession::new(
             world,
             glam::IVec3::ZERO,
@@ -5412,12 +5483,13 @@ mod session_block_support_tests {
                 .count(),
             1
         );
-        assert!(!batch.apply_session_content(&mut session));
+        assert!(!batch.apply_session_content(&mut session)?);
         data.custom = true;
         batch.prepare_session_content(&mut data)?;
         data.custom = false;
         assert!(batch.prepare_session_content(&mut data).is_err());
-        assert!(batch.apply_session_content(&mut session));
+        let mut session = fresh_player_session();
+        assert!(batch.apply_session_content(&mut session)?);
         let recipes = session.crafting_recipes().unwrap();
         let shared = &batch.session_content.as_ref().unwrap().recipes;
         assert!(Arc::ptr_eq(&recipes, shared));
@@ -5483,7 +5555,7 @@ mod session_block_support_tests {
             FreshTerrainBatch::new_without_structures(generator, carvers, "minecraft:overworld")?;
         batch.prepare_session_content(&mut resources)?;
         let mut session = fresh_player_session();
-        assert!(batch.apply_session_content(&mut session));
+        assert!(batch.apply_session_content(&mut session)?);
         let recipes = session.crafting_recipes().unwrap();
         assert_eq!(
             recipes
@@ -5493,6 +5565,100 @@ mod session_block_support_tests {
                 .id,
             ResourceId::parse("minecraft:honey_block")?
         );
+        let netherite = ItemStack::new(
+            "minecraft:netherite_ingot".into(),
+            1,
+            64,
+            Tag::Compound(vec![]),
+        )
+        .unwrap();
+        assert_eq!(
+            session.item_damage_resistance(&netherite, "minecraft:lava")?,
+            Some(true)
+        );
+        let dirt = ItemStack::new("minecraft:dirt".into(), 1, 64, Tag::Compound(vec![])).unwrap();
+        assert_eq!(
+            session.item_damage_resistance(&dirt, "minecraft:lava")?,
+            Some(false)
+        );
+        let mut chest_session =
+            fresh_player_session_with_loot_chest(Some("minecraft:chests/buried_treasure"));
+        chest_session.set_player_inventory(PlayerInventory::default());
+        assert!(batch.apply_session_content(&mut chest_session)?);
+        ensure!(
+            batch
+                .session_content
+                .as_ref()
+                .unwrap()
+                .chest_loot
+                .as_ref()
+                .unwrap()
+                .get(&ResourceId::parse("minecraft:chests/buried_treasure")?)
+                .is_some(),
+            "installed treasure loot table is unsupported"
+        );
+        chest_session.set_world_seed(Some(42));
+        chest_session.set_random_sequences(
+            42,
+            native_persistence::random_sequences::RandomSequences::read(None)?,
+        )?;
+        chest_session.submit_command(PlayerCommand::Place);
+        chest_session.update(Duration::from_millis(50));
+        let snapshot = chest_session.snapshot();
+        assert!(
+            snapshot.inventory.is_open(),
+            "generated loot chest did not open"
+        );
+        assert!(
+            (0..27).any(|slot| snapshot.inventory.slot(PlayerSlot::Chest(slot)).is_some()),
+            "generated loot chest was empty"
+        );
+        struct LuckLoot;
+        impl ResourceProvider for LuckLoot {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                Ok(if folder == "loot_table" {
+                    vec![ResourceId::parse("example:chests/luck")?]
+                } else {
+                    vec![]
+                })
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/loot_table/chests/luck.json").then(|| br#"{"type":"minecraft:chest","random_sequence":"example:chest","pools":[{"rolls":1,"bonus_rolls":1.0,"entries":[{"type":"minecraft:item","name":"minecraft:stone","quality":1}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(native_resources::chest_loot::ChestLootTables::load(
+            &mut LuckLoot,
+        )?);
+        assert!(
+            loot.get(&ResourceId::parse("example:chests/luck")?)
+                .unwrap()
+                .requires_luck()
+        );
+        let mut luck_session = fresh_player_session_with_loot_chest(Some("example:chests/luck"));
+        luck_session.set_player_inventory(PlayerInventory::default());
+        assert!(batch.apply_session_content(&mut luck_session)?);
+        luck_session.set_chest_loot(loot);
+        luck_session.set_random_sequences(
+            42,
+            native_persistence::random_sequences::RandomSequences::read(None)?,
+        )?;
+        luck_session.update(Duration::from_millis(50));
+        luck_session.submit_command(PlayerCommand::Place);
+        luck_session.update(Duration::from_millis(50));
+        let snapshot = luck_session.snapshot();
+        assert!(
+            snapshot.inventory.is_open(),
+            "luck-dependent loot chest did not open"
+        );
+        assert!((0..27).any(|slot| {
+            snapshot
+                .inventory
+                .slot(PlayerSlot::Chest(slot))
+                .is_some_and(|item| item.id() == "minecraft:stone")
+        }));
         let registry = resources.vanilla_block_ids()?;
         let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);
         ensure!(tags.climbable.is_some(), "climbable tag unavailable");

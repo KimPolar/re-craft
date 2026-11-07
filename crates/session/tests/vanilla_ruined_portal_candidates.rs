@@ -316,5 +316,25 @@ fn ruined_portal_candidates_match_vanilla_biomes() -> Result<()> {
             .mixed_decoration_plan_with_jigsaw(chunk, &schedule)
             .is_err()
     );
+    let blocks = provider.resources.vanilla_block_ids()?;
+    let tags = native_resources::carver::tags::CarverBlockTags::load(&mut provider, &blocks)?;
+    let terrain = native_session::worldgen::FreshTerrainBatch::new_with_unambiguous_structures(
+        batch,
+        [chunk],
+        tags,
+        "minecraft:overworld",
+    )?;
+    assert!(terrain.structure_starts(chunk).is_none());
+    assert!(
+        terrain
+            .ruined_portal_starts(chunk)
+            .context("transferred portal starts missing")?
+            .contains_key(&id)
+    );
+    assert!(
+        terrain
+            .mixed_decoration_plan_with_jigsaw(chunk, &schedule)
+            .is_err()
+    );
     Ok(())
 }

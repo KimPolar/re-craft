@@ -975,7 +975,8 @@ impl FreshTerrainBatch {
                 let structures = self.structures.as_ref()?;
                 (!structures.ocean_starts.contains_key(&pos)
                     && !structures.mineshafts.contains_key(&pos)
-                    && !structures.jigsaw_starts.contains_key(&pos))
+                    && !structures.jigsaw_starts.contains_key(&pos)
+                    && !structures.ruined_portal_starts.contains_key(&pos))
                 .then(|| structures.starts.get(&pos))
                 .flatten()
             })
@@ -1009,6 +1010,16 @@ impl FreshTerrainBatch {
             .flatten()
     }
 
+    /// Intermediate ruined-portal starts retained for later decoration.
+    pub fn ruined_portal_starts(
+        &self,
+        pos: ChunkPos,
+    ) -> Option<&super::structure_batch::RuinedPortalStarts> {
+        (!self.failed)
+            .then(|| self.structures.as_ref()?.ruined_portal_starts.get(&pos))
+            .flatten()
+    }
+
     /// Inspect the retained mixed structure order, including jigsaws. This
     /// does not advance FEATURES or mark any structure safe to save.
     pub fn mixed_decoration_plan_with_jigsaw<'a>(
@@ -1037,6 +1048,10 @@ impl FreshTerrainBatch {
             .structures
             .as_ref()
             .context("structure generation is disabled")?;
+        ensure!(
+            !structures.ruined_portal_starts.contains_key(&pos),
+            "ruined portal structure serialization is not yet supported"
+        );
         super::structure_data::pack_structure_data_with_jigsaw(
             pos,
             structures
@@ -1372,11 +1387,16 @@ fn structures_with_piece_at(
                 .jigsaw_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let portal = structures
+                .ruined_portal_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
                 usize::from(simple.is_some())
                     + usize::from(ocean.is_some())
                     + usize::from(mineshaft.is_some())
                     + usize::from(jigsaw.is_some())
+                    + usize::from(portal.is_some())
                     == 1,
                 "spawn referenced structure is missing or ambiguous"
             );
@@ -1404,6 +1424,12 @@ fn structures_with_piece_at(
                     .pieces
                     .iter()
                     .any(|piece| contains(&piece.piece.bounds))
+            } else if let Some(start) = portal {
+                ensure!(
+                    start.chunk == [source.x, source.z],
+                    "spawn structure source differs"
+                );
+                contains(&start.piece.bounds)
             } else {
                 let start = jigsaw.expect("one start was validated");
                 ensure!(
@@ -1716,10 +1742,20 @@ impl FreshTerrainBatch {
                 .all(|pos| !existing.jigsaw_starts.contains_key(pos)),
             "expanded jigsaw state already exists"
         );
+        ensure!(
+            added
+                .ruined_portal_starts
+                .keys()
+                .all(|pos| !existing.ruined_portal_starts.contains_key(pos)),
+            "expanded ruined portal state already exists"
+        );
         existing.starts.extend(added.starts);
         existing.ocean_starts.extend(added.ocean_starts);
         existing.mineshafts.extend(added.mineshafts);
         existing.jigsaw_starts.extend(added.jigsaw_starts);
+        existing
+            .ruined_portal_starts
+            .extend(added.ruined_portal_starts);
         existing.huts.extend(added.huts);
         existing.references.extend(added.references);
         existing.terrain.extend(added.terrain);
@@ -5290,6 +5326,88 @@ mod entity_source_tests {
         );
         stages.jigsaw_starts.clear();
         assert!(structures_with_piece_at(Some(&stages), [13, 3, 3]).is_err());
+    }
+
+    #[test]
+    fn animal_structure_conditions_include_ruined_portal_bounds() -> Result<()> {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            structure_template::StructureTemplate,
+        };
+        use native_resources::{
+            ruined_portal::{GenerationPoint, InitialSelection, Setup, VerticalPlacement},
+            structure_transform::{Mirror, Rotation},
+        };
+        let source = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:portal")?;
+        let selection = InitialSelection {
+            setup_index: 0,
+            air_pocket: false,
+            template: ResourceId::parse("minecraft:ruined_portal/portal_1")?,
+            rotation: Rotation::None,
+            mirror: Mirror::None,
+        };
+        let setup = Setup {
+            placement: VerticalPlacement::OnLandSurface,
+            air_pocket_probability: 0.0,
+            mossiness: 0.0,
+            overgrown: false,
+            vines: false,
+            can_be_cold: false,
+            replace_with_blackstone: false,
+            weight: 1.0,
+        };
+        let point = GenerationPoint {
+            position: [2, 1, 2],
+            pivot: [1, 0, 1],
+            bounds: BoundingBox::new([2, 1, 2], [4, 3, 4]).unwrap(),
+        };
+        let piece = crate::worldgen::ruined_portal::SavedRuinedPortalPiece::capture(
+            &selection,
+            &setup,
+            &point,
+            [3, 3, 3],
+            false,
+        )?;
+        let start = crate::worldgen::ruined_portal::PreparedStart {
+            chunk: [0, 0],
+            point,
+            terrain_adjustment: TerrainAdjustment::None,
+            piece,
+            template: Arc::new(StructureTemplate {
+                document: NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(vec![]),
+                },
+                data_version: Some(5023),
+                size: [3, 3, 3],
+                palettes: vec![],
+                blocks: vec![],
+                entities: vec![],
+            }),
+        };
+        let bounds = start.reference_bounds(id.clone())?;
+        let references = collect_ordered_structure_references(source, |pos| {
+            Ok(if pos == source {
+                vec![bounds.clone()]
+            } else {
+                vec![]
+            })
+        })?;
+        let mut stages = PreparedStructureStages::default();
+        stages.starts.insert(source, BTreeMap::new());
+        stages
+            .ruined_portal_starts
+            .insert(source, BTreeMap::from([(id.clone(), start)]));
+        stages.references.insert(source, references);
+        assert_eq!(
+            structures_with_piece_at(Some(&stages), [3, 2, 3])?,
+            BTreeSet::from([id])
+        );
+        assert!(structures_with_piece_at(Some(&stages), [6, 2, 3])?.is_empty());
+        Ok(())
     }
 
     #[test]

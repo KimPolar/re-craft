@@ -543,11 +543,16 @@ fn ruin_structures_with_piece(
                 .jigsaw_starts
                 .get(&source)
                 .and_then(|starts| starts.get(id));
+            let portal = structures
+                .ruined_portal_starts
+                .get(&source)
+                .and_then(|starts| starts.get(id));
             ensure!(
                 usize::from(simple.is_some())
                     + usize::from(ocean.is_some())
                     + usize::from(mine.is_some())
                     + usize::from(jigsaw.is_some())
+                    + usize::from(portal.is_some())
                     == 1,
                 "ruin spawn referenced structure is missing or ambiguous"
             );
@@ -556,6 +561,7 @@ fn ruin_structures_with_piece(
                 .or_else(|| ocean.map(|start| start.chunk))
                 .or_else(|| mine.map(|start| start.chunk))
                 .or_else(|| jigsaw.map(|start| start.chunk))
+                .or_else(|| portal.map(|start| start.chunk))
                 .context("ruin structure missing")?;
             ensure!(
                 actual_chunk == [source.x, source.z],
@@ -582,6 +588,8 @@ fn ruin_structures_with_piece(
                     .pieces
                     .iter()
                     .any(|piece| contains(&piece.piece.bounds))
+            } else if let Some(start) = portal {
+                contains(&start.piece.bounds)
             } else {
                 jigsaw
                     .expect("one start was validated")
@@ -1044,11 +1052,16 @@ pub(super) fn native_cat_condition(
                     .jigsaw_starts
                     .get(&source)
                     .and_then(|starts| starts.get(id));
+                let portal = all_structures
+                    .ruined_portal_starts
+                    .get(&source)
+                    .and_then(|starts| starts.get(id));
                 ensure!(
                     usize::from(simple.is_some())
                         + usize::from(ocean.is_some())
                         + usize::from(mine.is_some())
                         + usize::from(jigsaw.is_some())
+                        + usize::from(portal.is_some())
                         == 1,
                     "cat spawn referenced structure is missing or ambiguous"
                 );
@@ -1057,6 +1070,7 @@ pub(super) fn native_cat_condition(
                     .or_else(|| ocean.map(|start| start.chunk))
                     .or_else(|| mine.map(|start| start.chunk))
                     .or_else(|| jigsaw.map(|start| start.chunk))
+                    .or_else(|| portal.map(|start| start.chunk))
                     .context("cat spawn referenced structure is missing")?;
                 ensure!(
                     start_chunk == [source.x, source.z],
@@ -1082,6 +1096,8 @@ pub(super) fn native_cat_condition(
                         .pieces
                         .iter()
                         .any(|piece| contains(&piece.piece.bounds))
+                } else if let Some(start) = portal {
+                    contains(&start.piece.bounds)
                 } else {
                     jigsaw
                         .expect("one start was validated")

@@ -5985,6 +5985,8 @@ fn disk_safe_solid(name: &str) -> Option<bool> {
         "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" | "minecraft:water"
         | "minecraft:lava" => Some(false),
         "minecraft:stone"
+        | "minecraft:cinnabar"
+        | "minecraft:sulfur"
         | "minecraft:deepslate"
         | "minecraft:netherrack"
         | "minecraft:basalt"

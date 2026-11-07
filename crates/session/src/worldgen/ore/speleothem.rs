@@ -252,6 +252,7 @@ mod tests {
         let writable = terrain.snapshot().chunks.keys().copied().collect();
         let mut region = terrain.decoration_region(&tags, &motion, writable)?;
         for name in ["minecraft:sulfur", "minecraft:cinnabar"] {
+            assert_eq!(disk_safe_solid(name), Some(true));
             let support = BlockState {
                 name: name.into(),
                 properties: BTreeMap::new(),
@@ -355,6 +356,7 @@ mod tests {
             "diamond_ore",
             "water",
             "sulfur",
+            "cinnabar",
             "sulfur_spike",
             "chest",
         ]
@@ -377,7 +379,7 @@ mod tests {
         region.template_registry = Some(&registry);
         region.lake_water_fluids = Some(&fluids);
         let single = SpeleothemFeature::decode(
-            &json!({"type":"minecraft:speleothem", "base_block":"minecraft:sulfur", "pointed_block":"minecraft:sulfur_spike", "replaceable_blocks":["minecraft:stone"]}),
+            &json!({"type":"minecraft:speleothem", "base_block":"minecraft:sulfur", "pointed_block":"minecraft:sulfur_spike", "replaceable_blocks":["minecraft:stone", "minecraft:cinnabar"]}),
             &mut |v| {
                 let (name, properties) = registry.resolve(v)?;
                 Ok(BlockState { name, properties })
@@ -391,6 +393,28 @@ mod tests {
         )?);
         assert_eq!(
             OreWorld::block(&mut region, [12, 8, 12])?.name,
+            "minecraft:sulfur_spike"
+        );
+        let cinnabar = registry.resolve(&json!("minecraft:cinnabar"))?;
+        region.set_proto_block(
+            [6, 7, 6],
+            &BlockState {
+                name: cinnabar.0,
+                properties: cinnabar.1,
+            },
+        )?;
+        assert!(place_single(
+            &mut region,
+            &single,
+            &mut DecorationRandom::new(1),
+            [6, 8, 6]
+        )?);
+        assert_eq!(
+            OreWorld::block(&mut region, [6, 7, 6])?.name,
+            "minecraft:sulfur"
+        );
+        assert_eq!(
+            OreWorld::block(&mut region, [6, 8, 6])?.name,
             "minecraft:sulfur_spike"
         );
         {

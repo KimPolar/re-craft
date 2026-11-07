@@ -321,6 +321,104 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn places_installed_shipwreck_templates_in_generation_draft() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let update_tags =
+            super::super::ruined_portal::PortalUpdateTags::load(&mut resources, &ids)?;
+        let names = [
+            "with_mast",
+            "upsidedown_full",
+            "upsidedown_fronthalf",
+            "upsidedown_backhalf",
+            "sideways_full",
+            "sideways_fronthalf",
+            "sideways_backhalf",
+            "rightsideup_full",
+            "rightsideup_fronthalf",
+            "rightsideup_backhalf",
+            "with_mast_degraded",
+            "upsidedown_full_degraded",
+            "upsidedown_fronthalf_degraded",
+            "upsidedown_backhalf_degraded",
+            "sideways_full_degraded",
+            "sideways_fronthalf_degraded",
+            "sideways_backhalf_degraded",
+            "rightsideup_full_degraded",
+            "rightsideup_fronthalf_degraded",
+            "rightsideup_backhalf_degraded",
+        ];
+        for name in names {
+            let id = ResourceId::parse(&format!("minecraft:shipwreck/{name}"))?;
+            let template = Arc::new(
+                StructureTemplate::load(&mut resources, &id)?.context("missing template")?,
+            );
+            for rotation in [
+                Rotation::None,
+                Rotation::Clockwise90,
+                Rotation::Clockwise180,
+                Rotation::Counterclockwise90,
+            ] {
+                let piece = Piece {
+                    template: format!("minecraft:shipwreck/{name}"),
+                    position: [0, 5, 0],
+                    rotation,
+                    beached: false,
+                };
+                let bounds = piece.bounds(template.size)?;
+                let mut start = PreparedStart {
+                    chunk: [0, 0],
+                    generation_point: [8, 8, 8],
+                    terrain_adjustment: TerrainAdjustment::None,
+                    piece,
+                    template: Arc::clone(&template),
+                    bounds,
+                    height_adjusted: true,
+                };
+                let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                let writable = terrain.snapshot().chunks.keys().copied().collect();
+                let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                let clip = BoundingBox::new([-16, 0, -16], [31, 15, 31]).unwrap();
+                region
+                    .place_shipwreck_start(
+                        &mut start,
+                        &registry,
+                        &update_tags,
+                        clip,
+                        &mut DecorationRandom::new(42),
+                    )
+                    .with_context(|| format!("placing {name} {rotation:?}"))?;
+                region.finish()?;
+                let snapshot = terrain.snapshot();
+                let mut placed = 0;
+                for y in 0..16 {
+                    for z in -16..32 {
+                        for x in -16..32 {
+                            let state = snapshot.block(x, y, z).context("fixture block missing")?;
+                            let original = if y < 8 {
+                                "minecraft:stone"
+                            } else {
+                                "minecraft:air"
+                            };
+                            if state.name != original {
+                                placed += 1;
+                            }
+                        }
+                    }
+                }
+                ensure!(placed > 0, "template {name} {rotation:?} placed no blocks");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn places_shipwreck_blocks_in_generation_draft() -> Result<()> {
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(std::path::PathBuf::from)

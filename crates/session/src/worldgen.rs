@@ -59,6 +59,7 @@ pub mod postprocessing;
 mod postprocessing_world;
 pub mod ruined_portal;
 pub mod schedule;
+pub mod shipwreck;
 pub mod structure_batch;
 mod structure_data;
 mod structure_hash_order;

@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     packs::ResourceId,
     structure_placement::large_feature,
-    structure_start::Heightmap,
+    structure_start::{Heightmap, StartEnvironment},
     structure_transform::{self, Mirror, Rotation},
 };
 
@@ -93,13 +93,20 @@ pub fn select_piece(random: &mut LegacyRandom, position: [i32; 3], beached: bool
 }
 
 pub fn select_for_chunk(seed: i64, chunk: [i32; 2], beached: bool) -> Result<Piece> {
+    Ok(select_with_chunk_random(seed, chunk, beached)?.0)
+}
+
+/// Return the stream after selection so oversized pieces can consume it next.
+pub fn select_with_chunk_random(
+    seed: i64,
+    chunk: [i32; 2],
+    beached: bool,
+) -> Result<(Piece, LegacyRandom)> {
     let x = chunk[0].checked_mul(16).context("chunk X overflow")?;
     let z = chunk[1].checked_mul(16).context("chunk Z overflow")?;
-    Ok(select_piece(
-        &mut large_feature(seed, chunk[0], chunk[1]),
-        [x, 90, z],
-        beached,
-    ))
+    let mut random = large_feature(seed, chunk[0], chunk[1]);
+    let piece = select_piece(&mut random, [x, 90, z], beached);
+    Ok((piece, random))
 }
 
 impl Piece {
@@ -122,6 +129,54 @@ pub fn beached_height(lowest: i32, template_height: i32, random_offset: i32) -> 
     Ok(lowest
         .wrapping_sub(template_height / 2)
         .wrapping_sub(random_offset))
+}
+
+/// Align oversized pieces during start generation, before region decoration.
+/// The returned bounding box remains the constructor's initial box; Java
+/// refreshes it only when the template is subsequently postprocessed.
+pub fn align_during_start(
+    piece: &mut Piece,
+    size: [i32; 3],
+    environment: &mut impl StartEnvironment,
+    random: &mut LegacyRandom,
+) -> Result<(BoundingBox, bool)> {
+    ensure!(
+        size.iter().all(|v| *v >= 0),
+        "negative shipwreck template size"
+    );
+    let bounds = piece.bounds(size)?;
+    if !too_big_for_region(size) {
+        return Ok((bounds, false));
+    }
+    let span_x = bounds.max[0].wrapping_sub(bounds.min[0]).wrapping_add(1);
+    let span_z = bounds.max[2].wrapping_sub(bounds.min[2]).wrapping_add(1);
+    // getLowestY's parameters differ from getMeanFirstOccupiedHeight's.
+    // ShipwreckStructure passes the same arguments to both methods.
+    let (x, z, width, depth) = if piece.beached {
+        (bounds.min[0], span_x, bounds.min[2], span_z)
+    } else {
+        (bounds.min[0], bounds.min[2], span_x, span_z)
+    };
+    let mut values = [0; 4];
+    for (value, [px, pz]) in values.iter_mut().zip([
+        [x, z],
+        [x, z.wrapping_add(depth)],
+        [x.wrapping_add(width), z],
+        [x.wrapping_add(width), z.wrapping_add(depth)],
+    ]) {
+        *value = environment.first_occupied_height(px, pz, Heightmap::WorldSurface)?;
+    }
+    let y = if piece.beached {
+        beached_height(
+            *values.iter().min().unwrap(),
+            size[1],
+            random.next_int_bound(3).unwrap(),
+        )?
+    } else {
+        values.into_iter().fold(0_i32, i32::wrapping_add) / 4
+    };
+    piece.position[1] = y;
+    Ok((bounds, true))
 }
 
 /// Current heightmaps used when the first chunk decorates a small shipwreck.

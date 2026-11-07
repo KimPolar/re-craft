@@ -14,6 +14,9 @@ use native_resources::{
 };
 use serde_json::Value;
 
+mod saved_piece;
+pub use saved_piece::SavedShipwreckPiece;
+
 #[derive(Clone)]
 pub struct PreparedStart {
     pub chunk: [i32; 2],
@@ -27,6 +30,9 @@ pub struct PreparedStart {
 }
 
 impl PreparedStart {
+    pub fn saved_piece_tag(&self) -> Result<native_persistence::nbt::Tag> {
+        SavedShipwreckPiece::capture(self)?.to_tag()
+    }
     pub fn generate(
         provider: &mut impl ResourceProvider,
         definition: &Value,

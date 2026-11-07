@@ -354,6 +354,7 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             )
         }
         _ if crate::collision::full_glass(state) => (0, 0),
+        _ if crate::collision::full_terracotta(state) => (15, 0),
         "minecraft:short_grass"
         | "minecraft:fern"
         | "minecraft:bush"

@@ -136,6 +136,15 @@ pub fn full_glass(state: &BlockState) -> bool {
         && (name == "glass" || name.strip_suffix("_stained_glass").is_some_and(dye_color))
 }
 
+/// Recognize stateless vanilla terracotta, including all sixteen dyed blocks.
+pub fn full_terracotta(state: &BlockState) -> bool {
+    let Some(name) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    state.properties.is_empty()
+        && (name == "terracotta" || name.strip_suffix("_terracotta").is_some_and(dye_color))
+}
+
 /// Validate a vanilla glass pane or bars state and return its water flag.
 pub fn pane_waterlogged(state: &BlockState) -> Option<bool> {
     let name = state.name.strip_prefix("minecraft:")?;
@@ -1657,6 +1666,24 @@ pub fn unknown_barrier() -> &'static [Aabb] {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn terracotta_classifier_accepts_only_stateless_vanilla_colors() {
+        let mut state = BlockState {
+            name: "minecraft:white_terracotta".into(),
+            properties: BTreeMap::new(),
+        };
+        assert!(full_terracotta(&state));
+        state.name = "minecraft:terracotta".into();
+        assert!(full_terracotta(&state));
+        state.name = "minecraft:white_glazed_terracotta".into();
+        assert!(!full_terracotta(&state));
+        state.name = "minecraft:invented_terracotta".into();
+        assert!(!full_terracotta(&state));
+        state.name = "minecraft:white_terracotta".into();
+        state.properties.insert("extra".into(), "true".into());
+        assert!(!full_terracotta(&state));
+    }
 
     #[test]
     fn bed_shape_validates_states_and_places_legs_on_the_outer_end() {

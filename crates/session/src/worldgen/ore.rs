@@ -7124,6 +7124,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::door_open(state).is_some()
                             || native_world::collision::bed_leg_end(state).is_some()
                             || native_world::collision::full_glass(state)
+                            || native_world::collision::full_terracotta(state)
                             || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
@@ -11579,6 +11580,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_terracotta_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_terracotta",
+            "vine_active_self_jigsaw_terracotta",
+            "vine_active_empty_jigsaw_terracotta",
+            "vine_active_self_empty_jigsaw_terracotta",
+            "vine_active_jigsaw_water_terracotta",
+            "vine_active_self_jigsaw_water_terracotta",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_jigsaw_torches_match_java_light_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_jigsaw_torch",
@@ -11814,6 +11828,8 @@ mod tests {
                         "oak_door"
                     } else if mode.ends_with("_bed") {
                         "white_bed"
+                    } else if mode.ends_with("_terracotta") {
+                        "white_terracotta"
                     } else if mode.ends_with("_walltorch") {
                         "wall_torch"
                     } else if mode.ends_with("_torch") {

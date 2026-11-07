@@ -71,6 +71,9 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::full_glass(state) {
         return Ok(true);
     }
+    if native_world::collision::full_terracotta(state) {
+        return Ok(true);
+    }
     if native_world::collision::pane_waterlogged(state).is_some() {
         return Ok(false);
     }
@@ -210,7 +213,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties)
                 && self.registry.has_block_entity(&state.name) == Some(chest_table.is_some())
                 && jigsaw_static_full(state).is_ok(),
-            "unsupported jigsaw block effects"
+            "unsupported jigsaw block effects at {pos:?}: {state:?}"
         );
         let old = self.region.read(pos)?;
         ensure!(
@@ -219,7 +222,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 && (disk_safe_solid(&old.name).is_some() || jigsaw_static_full(&old).is_ok())
                 && !self.region.monster_entities.contains_key(&pos)
                 && !self.region.bee_nests.contains_key(&pos),
-            "unsupported jigsaw replacement source"
+            "unsupported jigsaw replacement source at {pos:?}: {old:?}"
         );
         if let Some(table) = chest_table {
             self.region.set_proto_block(
@@ -248,6 +251,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::door_open(state).is_some()
                 || native_world::collision::bed_leg_end(state).is_some()
                 || native_world::collision::full_glass(state)
+                || native_world::collision::full_terracotta(state)
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state);
             let result = self.region.set_proto_block(pos, state);
@@ -1188,6 +1192,34 @@ mod tests {
             name: "minecraft:water".into(),
             properties: BTreeMap::from([("level".into(), "0".into())]),
         };
+        let stone = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        };
+        let mut terracotta_checked = 0;
+        for line in output
+            .lines()
+            .filter(|line| line.starts_with("TERRACOTTA\t"))
+        {
+            let name = line.strip_prefix("TERRACOTTA\t").unwrap();
+            let state = BlockState {
+                name: format!("minecraft:{name}"),
+                properties: BTreeMap::new(),
+            };
+            assert!(registry.is_canonical_state(&state.name, &state.properties));
+            assert_eq!(registry.has_block_entity(&state.name), Some(false));
+            assert!(jigsaw_static_full(&state)?);
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&stone, &state),
+                Some(true)
+            );
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(false)
+            );
+            terracotta_checked += 1;
+        }
+        assert_eq!(terracotta_checked, 17);
         let volume = |boxes: &[native_world::collision::Aabb]| -> Vec<bool> {
             (0..16)
                 .flat_map(|y| {
@@ -2230,6 +2262,170 @@ mod tests {
         assert!(region.finish().is_err());
         assert_eq!(terrain.snapshot().block(1, 8, 1), before.block(1, 8, 1));
         assert_eq!(terrain.snapshot().block(2, 8, 1), before.block(2, 8, 1));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
+    fn vanilla_plains_small_houses_place_complete_legacy_templates() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let holder = HolderValue::Reference(ResourceId::parse("minecraft:mossify_10_percent")?);
+        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+        ));
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .context("Java 25 home is missing")?
+            .join("bin");
+        let source = temp.path().join("VillageHouseOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/VillageHouseOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("VillageHouseOracle")
+            .arg(version.join("26.3.jar"))
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java house oracle failed: {}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let output = String::from_utf8(output.stdout)?;
+        let mut expected = BTreeMap::new();
+        let mut expected_random = BTreeMap::new();
+        for line in output.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            match fields.as_slice() {
+                ["BLOCK", name, x, y, z, id, properties] => {
+                    let pos = [x.parse::<i32>()?, y.parse::<i32>()?, z.parse::<i32>()?];
+                    let state = BlockState {
+                        name: (*id).into(),
+                        properties: serde_json::from_str(properties)?,
+                    };
+                    ensure!(
+                        expected.insert(((*name).to_owned(), pos), state).is_none(),
+                        "duplicate Java house block"
+                    );
+                }
+                ["RANDOM", name, value] => {
+                    ensure!(
+                        expected_random
+                            .insert((*name).to_owned(), value.parse::<i64>()?)
+                            .is_none(),
+                        "duplicate Java random"
+                    );
+                }
+                _ => {}
+            }
+        }
+        ensure!(
+            expected.len() == 3 * 7 * 7 * 7 && expected_random.len() == 3,
+            "incomplete Java house output"
+        );
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        for name in [
+            "plains_small_house_1",
+            "plains_small_house_2",
+            "plains_small_house_3",
+        ] {
+            let piece = Piece {
+                element: PoolElement::Single {
+                    legacy: true,
+                    location: ResourceId::parse(&format!(
+                        "minecraft:village/plains/houses/{name}"
+                    ))?,
+                    processors: holder.clone(),
+                    projection: Projection::Rigid,
+                    override_liquid_settings: None,
+                },
+                origin: [1, 8, 1],
+                rotation: Rotation::None,
+                bounds: clip,
+                ground_level_delta: 0,
+                junctions: vec![],
+            };
+            let prepared = PreparedTemplatePiece::load(&piece, &processors, &mut resources)?;
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let motion = HeightmapTags::load(&mut resources, &blocks)?;
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            assert!(
+                region
+                    .place_rigid_jigsaw_piece(
+                        &prepared,
+                        &registry,
+                        clip,
+                        LiquidSettings::IgnoreWaterlogging,
+                        &mut random
+                    )
+                    .with_context(|| format!("could not place {name}"))?
+            );
+            region.finish()?;
+            let world = terrain.snapshot();
+            let mut parts = BTreeSet::new();
+            for y in 8..15 {
+                for z in 1..8 {
+                    for x in 1..8 {
+                        let state = world.block(x, y, z).context("house block missing")?;
+                        assert_eq!(
+                            state,
+                            &expected[&(name.to_owned(), [x, y, z])],
+                            "{name} at {x},{y},{z}"
+                        );
+                        if state.name.ends_with("_bed") {
+                            parts.insert(state.properties["part"].clone());
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                parts,
+                BTreeSet::from(["foot".to_owned(), "head".to_owned()]),
+                "{name}"
+            );
+            assert_eq!(
+                random.next_long(),
+                expected_random[name],
+                "random after {name}"
+            );
+        }
         Ok(())
     }
 

@@ -59,6 +59,20 @@ public class JigsawChestOracle {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         for (var id : BuiltInRegistries.BLOCK.keySet()) {
+            var name=id.getPath();
+            if (!id.getNamespace().equals("minecraft") || !(name.equals("terracotta") || name.endsWith("_terracotta") && !name.endsWith("_glazed_terracotta"))) continue;
+            var block=BuiltInRegistries.BLOCK.getValue(id);
+            var state=block.defaultBlockState();
+            if (block.getStateDefinition().getPossibleStates().size()!=1 || state.hasBlockEntity()
+                || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                || state.getPostProcessPos(null,BlockPos.ZERO)!=null || state.useShapeForLightOcclusion()
+                || !state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)
+                || LightEngine.hasDifferentLightProperties(Blocks.STONE.defaultBlockState(),state)
+                || !LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state))
+                throw new AssertionError("unexpected terracotta effects: "+state);
+            out.println("TERRACOTTA\t"+name);
+        }
+        for (var id : BuiltInRegistries.BLOCK.keySet()) {
             var block = BuiltInRegistries.BLOCK.getValue(id);
             if (!(block instanceof net.minecraft.world.level.block.BedBlock)) continue;
             for (var state : block.getStateDefinition().getPossibleStates()) {

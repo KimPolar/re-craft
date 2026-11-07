@@ -6093,17 +6093,6 @@ fn generated_ore_state(state: &BlockState) -> Result<bool> {
     Ok(true)
 }
 
-fn lake_redstone_ore(state: &BlockState) -> bool {
-    matches!(
-        state.name.as_str(),
-        "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
-    ) && state.properties.len() == 1
-        && matches!(
-            state.properties.get("lit").map(String::as_str),
-            Some("true" | "false")
-        )
-}
-
 // These complete vanilla block-state families were checked for solidness,
 // block entities, POIs and postprocessing effects against Java 26.3.
 fn disk_safe_solid(name: &str) -> Option<bool> {
@@ -7730,8 +7719,7 @@ impl LakeWorld for DecorationRegion<'_> {
             ensure!(
                 disk_safe_solid(&old.name).is_some()
                     || simple_plant_kind(&old).is_ok()
-                    || lake_redstone_ore(&old)
-                    || (old.name == "minecraft:deepslate_iron_ore" && old.properties.is_empty()),
+                    || generated_ore_state(&old)?,
                 "unsupported lake source effects at {pos:?}: {old:?} -> {state:?}"
             );
             self.lake_block_write = true;
@@ -7985,7 +7973,7 @@ impl OreVeinWorld for DecorationRegion<'_> {
                                 Some("x" | "y" | "z")
                             ));
                     let lake_light_update = self.lake_block_write
-                        && (lake_source || lake_redstone_ore(&old))
+                        && (lake_source || generated_ore_state(&old)?)
                         && ((state.name == "minecraft:cave_air" && state.properties.is_empty())
                             || (matches!(
                                 state.name.as_str(),
@@ -12305,6 +12293,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_lake_generated_ores_match_java_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_lake_genore_diamond_ore_air",
+            "vine_active_self_lake_genore_deepslate_coal_ore_water",
+            "vine_active_lake_genore_nether_gold_ore_lava",
+            "vine_active_self_lake_genore_emerald_ore_air",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn staged_sulfur_lake_light_matches_java_across_25_columns() {
         check_staged_light_modes(&[
             "vine_active_lake_cinnabar_water",
@@ -12795,7 +12794,9 @@ mod tests {
                 world.set_block_id(16, 10, 8, id).unwrap();
             }
             if mode.contains("_lake_") {
-                let mut source = state(if mode.contains("_deepslate_redstone_ore_") {
+                let mut source = state(if let Some((_, rest)) = mode.split_once("_lake_genore_") {
+                    rest.rsplit_once('_').unwrap().0
+                } else if mode.contains("_deepslate_redstone_ore_") {
                     "deepslate_redstone_ore"
                 } else if mode.contains("_redstone_ore_") {
                     "redstone_ore"
@@ -12824,7 +12825,7 @@ mod tests {
                     source
                         .properties
                         .insert("lit".into(), mode.contains("_lit_").to_string());
-                } else if mode.contains("_deepslate_") {
+                } else if !mode.contains("_lake_genore_") && mode.contains("_deepslate_") {
                     let axis = if mode.contains("_deepslate_x_") {
                         "x"
                     } else if mode.contains("_deepslate_z_") {
@@ -24072,6 +24073,7 @@ mod tests {
             "diamond_ore",
             "redstone_ore",
             "deepslate_redstone_ore",
+            "nether_gold_ore",
             "cinnabar",
             "sulfur",
             "water",
@@ -24094,6 +24096,10 @@ mod tests {
             region.set_proto_block(pos, &ore).unwrap();
             assert!(region.set_lake_block(pos, &state("cave_air")).unwrap());
         }
+        for (pos, name) in [([5, 7, 1], "diamond_ore"), ([6, 7, 1], "nether_gold_ore")] {
+            region.set_proto_block(pos, &state(name)).unwrap();
+            assert!(region.set_lake_block(pos, &state("cave_air")).unwrap());
+        }
         assert!(region.set_lake_block([1, 7, 1], &state("sulfur")).unwrap());
         let mut water = state("water");
         water.properties.insert("level".into(), "0".into());
@@ -24104,6 +24110,8 @@ mod tests {
         assert_eq!(before.block(2, 7, 1).unwrap(), &water);
         assert_eq!(before.block(3, 7, 1).unwrap().name, "minecraft:cave_air");
         assert_eq!(before.block(4, 7, 1).unwrap().name, "minecraft:cave_air");
+        assert_eq!(before.block(5, 7, 1).unwrap().name, "minecraft:cave_air");
+        assert_eq!(before.block(6, 7, 1).unwrap().name, "minecraft:cave_air");
 
         let writable = before.chunks.keys().copied().collect();
         let mut failed = terrain.decoration_region(&tags, &motion, writable).unwrap();

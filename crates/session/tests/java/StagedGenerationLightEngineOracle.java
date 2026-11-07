@@ -193,6 +193,12 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
         boolean lakeActive=vineActive && args[1].contains("_lake_");
         boolean lakeMixed=lakeActive && args[1].endsWith("_mixed");
         boolean lakeOre=lakeActive && args[1].contains("_iron_ore_");
+        boolean lakeGenerated=lakeActive && args[1].contains("_lake_genore_");
+        if(lakeGenerated) for(var name:List.of("coal_ore","deepslate_coal_ore","iron_ore","deepslate_iron_ore","copper_ore","deepslate_copper_ore","gold_ore","deepslate_gold_ore","emerald_ore","deepslate_emerald_ore","lapis_ore","deepslate_lapis_ore","diamond_ore","deepslate_diamond_ore","nether_gold_ore","nether_quartz_ore")) {
+            var source=net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+name)).defaultBlockState();
+            if(!source.isSolid() || !source.canOcclude() || source.hasBlockEntity() || !source.getFluidState().isEmpty() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(source) || source.getPostProcessPos(null,BlockPos.ZERO)!=null || LightEngine.hasDifferentLightProperties(source,Blocks.STONE.defaultBlockState()))
+                throw new AssertionError("unsupported lake ore source "+source);
+        }
         boolean vineActiveEmpty=vineActive && args[1].contains("_empty_");
         boolean vineActiveMany=vineActive && (args[1].equals("vine_active_many") || args[1].equals("vine_active_self_many"));
         boolean vineActiveTransition=vineActive && args[1].endsWith("_plain_then_glowing");
@@ -286,7 +292,9 @@ public class StagedGenerationLightEngineOracle implements LightChunkGetter, Bloc
             if(x==1 && z==0 && lakeActive) {
                 int[][] positions=lakeMixed ? new int[][]{{16,10,8},{16,10,9},{16,9,8}} : new int[][]{{16,10,8}};
                 var axis=args[1].contains("_deepslate_x_") ? Direction.Axis.X : args[1].contains("_deepslate_z_") ? Direction.Axis.Z : Direction.Axis.Y;
-                var stone=args[1].contains("_redstone_ore_")
+                var oreName=lakeGenerated ? args[1].split("_lake_genore_",2)[1].replaceFirst("_[^_]+$", "") : "stone";
+                var stone=lakeGenerated ? net.minecraft.core.registries.BuiltInRegistries.BLOCK.getValue(net.minecraft.resources.Identifier.parse("minecraft:"+oreName)).defaultBlockState()
+                    : args[1].contains("_redstone_ore_")
                     ? (args[1].contains("_deepslate_redstone_ore_") ? Blocks.DEEPSLATE_REDSTONE_ORE : Blocks.REDSTONE_ORE).defaultBlockState().setValue(net.minecraft.world.level.block.RedStoneOreBlock.LIT,args[1].contains("_lit_"))
                     : lakeOre ? Blocks.DEEPSLATE_IRON_ORE.defaultBlockState()
                     : args[1].contains("_cinnabar_") ? Blocks.CINNABAR.defaultBlockState()

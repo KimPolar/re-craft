@@ -2,7 +2,9 @@
 use super::*;
 use native_resources::{
     block_registry::GeneratedBlockRegistry,
-    speleothem::{ClusterWorld, SpeleothemWorld, Thickness, VerticalDirection},
+    speleothem::{
+        ClusterWorld, SingleWorld, SpeleothemBlocks, SpeleothemWorld, Thickness, VerticalDirection,
+    },
 };
 
 pub(super) fn place_cluster(
@@ -25,7 +27,7 @@ pub(super) fn place_cluster(
             .context("speleothem block registry missing")?;
         let mut world = SpeleothemRegion {
             region,
-            feature,
+            feature: &feature.blocks,
             registry,
             water_tag: ResourceId::parse("minecraft:water")?,
             stone_tag: ResourceId::parse("minecraft:base_stone_overworld")?,
@@ -38,9 +40,39 @@ pub(super) fn place_cluster(
     result
 }
 
+pub(super) fn place_single(
+    region: &mut DecorationRegion<'_>,
+    feature: &SpeleothemFeature<BlockState>,
+    random: &mut DecorationRandom,
+    origin: [i32; 3],
+) -> Result<bool> {
+    let result = (|| {
+        ensure!(
+            feature.blocks.base_id() == &ResourceId::parse("minecraft:sulfur")?
+                && feature.blocks.pointed_id() == &ResourceId::parse("minecraft:sulfur_spike")?,
+            "unsupported speleothem block effects"
+        );
+        let registry = region
+            .template_registry
+            .context("speleothem block registry missing")?;
+        let mut world = SpeleothemRegion {
+            region,
+            feature: &feature.blocks,
+            registry,
+            water_tag: ResourceId::parse("minecraft:water")?,
+            stone_tag: ResourceId::parse("minecraft:base_stone_overworld")?,
+        };
+        feature.place(&mut world, random, origin)
+    })();
+    if result.is_err() {
+        region.failed = true;
+    }
+    result
+}
+
 struct SpeleothemRegion<'a, 'b> {
     region: &'a mut DecorationRegion<'b>,
-    feature: &'a SpeleothemClusterFeature<BlockState>,
+    feature: &'a SpeleothemBlocks<BlockState>,
     registry: &'a GeneratedBlockRegistry,
     water_tag: ResourceId,
     stone_tag: ResourceId,
@@ -203,6 +235,12 @@ impl ClusterWorld for SpeleothemRegion<'_, '_> {
     }
 }
 
+impl SingleWorld for SpeleothemRegion<'_, '_> {
+    fn is_empty_or_water(&mut self, state: &BlockState) -> Result<bool> {
+        Ok(is_air(state) || state.name == "minecraft:water")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +252,18 @@ mod tests {
         let game = native_resources::default_minecraft_dir()?;
         let mut resources = native_resources::packs::ResourceStack::open(&game)?;
         let registry = resources.vanilla_generated_block_registry()?;
+        let placed = PlacedDecorationFeature::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:sulfur_spike")?,
+            &mut |v| {
+                let (name, properties) = registry.resolve(v)?;
+                Ok(BlockState { name, properties })
+            },
+        )?;
+        assert!(placed.needs_water_fluids());
+        assert!(placed.required_tags().contains(&ResourceId::parse(
+            "minecraft:sulfur_spike_replaceable_blocks"
+        )?));
         let feature = SpeleothemClusterFeature::decode(
             &json!({
                 "type":"minecraft:speleothem_cluster", "base_block":"minecraft:sulfur",
@@ -259,10 +309,27 @@ mod tests {
         let mut region = terrain.decoration_region(&tags, &motion, writable)?;
         region.template_registry = Some(&registry);
         region.lake_water_fluids = Some(&fluids);
+        let single = SpeleothemFeature::decode(
+            &json!({"type":"minecraft:speleothem", "base_block":"minecraft:sulfur", "pointed_block":"minecraft:sulfur_spike", "replaceable_blocks":["minecraft:stone"]}),
+            &mut |v| {
+                let (name, properties) = registry.resolve(v)?;
+                Ok(BlockState { name, properties })
+            },
+        )?;
+        assert!(place_single(
+            &mut region,
+            &single,
+            &mut DecorationRandom::new(0),
+            [12, 8, 12]
+        )?);
+        assert_eq!(
+            OreWorld::block(&mut region, [12, 8, 12])?.name,
+            "minecraft:sulfur_spike"
+        );
         {
             let mut adapter = SpeleothemRegion {
                 region: &mut region,
-                feature: &feature,
+                feature: &feature.blocks,
                 registry: &registry,
                 water_tag: ResourceId::parse("minecraft:water")?,
                 stone_tag: ResourceId::parse("minecraft:base_stone_overworld")?,

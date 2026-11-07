@@ -27,7 +27,7 @@ use native_resources::{
     placed_feature::{PlacedFeature, PlacementEnvironment},
     root_system_feature::{RootSystemFeature, RootSystemWorld},
     simple_block_feature::{SimpleBlockFeature, SimpleBlockWorld},
-    speleothem::SpeleothemClusterFeature,
+    speleothem::{SpeleothemClusterFeature, SpeleothemFeature},
     spring_feature::{SpringFeature, SpringWorld},
     tree_beehive::BeehiveWorld,
     tree_fallen_decorators::Direction as FallenDirection,
@@ -776,6 +776,7 @@ enum ConfiguredDecoration {
     Spring(SpringFeature<BlockState>),
     Magma(UnderwaterMagma<BlockState>),
     Speleothem(SpeleothemClusterFeature<BlockState>),
+    SingleSpeleothem(SpeleothemFeature<BlockState>),
     Column(BlockColumnFeature<BlockState>),
     Lake(LakeFeature<BlockState>),
     Tree(TreeFeature<BlockState>),
@@ -833,6 +834,7 @@ impl ConfiguredDecoration {
             Self::Simple(v) => v.required_blocks(),
             Self::Spring(v) => v.required_blocks(),
             Self::Speleothem(v) => v.required_blocks(),
+            Self::SingleSpeleothem(v) => v.blocks.required_blocks(),
             Self::Column(v) => v.required_blocks(),
             Self::Lake(v) => v.required_blocks(),
             Self::Tree(v) => v.required_blocks(),
@@ -917,7 +919,7 @@ impl ConfiguredDecoration {
     }
     fn needs_water_fluids(&self) -> bool {
         match self {
-            Self::Lake(_) | Self::Speleothem(_) => true,
+            Self::Lake(_) | Self::Speleothem(_) | Self::SingleSpeleothem(_) => true,
             Self::Simple(v) => v.possible_states().iter().any(|s| {
                 matches!(
                     s.name.as_str(),
@@ -1076,6 +1078,9 @@ impl ConfiguredDecoration {
             ("minecraft", "speleothem_cluster") => Ok(Self::Speleothem(
                 SpeleothemClusterFeature::decode(value, resolve)?,
             )),
+            ("minecraft", "speleothem") => Ok(Self::SingleSpeleothem(SpeleothemFeature::decode(
+                value, resolve,
+            )?)),
             ("minecraft", "block_column") => Ok(Self::Column(
                 BlockColumnFeature::decode_with_resources(provider, value, resolve)?,
             )),
@@ -1239,6 +1244,7 @@ impl ConfiguredDecoration {
             Self::Spring(v) => v.required_tags(),
             Self::Magma(_) => BTreeSet::new(),
             Self::Speleothem(v) => v.required_tags(),
+            Self::SingleSpeleothem(v) => v.blocks.required_tags(),
             Self::Column(v) => v.required_tags(),
             Self::Lake(v) => v.required_tags(),
             Self::Tree(v) => {
@@ -1343,6 +1349,7 @@ impl ConfiguredDecoration {
             Self::Spring(v) => v.place(world, pos),
             Self::Magma(v) => v.place(world, random, pos),
             Self::Speleothem(v) => speleothem::place_cluster(world, v, random, pos),
+            Self::SingleSpeleothem(v) => speleothem::place_single(world, v, random, pos),
             Self::Column(v) => v.place(world, random, pos),
             Self::Lake(v) => v.place(world, random, pos),
             Self::FallenTree(v) => v.place(world, random, pos),

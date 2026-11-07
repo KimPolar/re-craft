@@ -862,6 +862,7 @@ struct GeneratedEntitySources {
     complete_spawns: BTreeSet<ChunkPos>,
     recorded_hut_features: BTreeSet<ChunkPos>,
     recorded_jigsaw_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
+    recorded_mineshaft_features: BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
     completed_feature_passes: BTreeSet<ChunkPos>,
     // Only completed passes can already have contributed entities. Once an
     // unverified pass runs, earlier per-chunk completeness is invalid too.
@@ -876,6 +877,7 @@ fn structure_entities_are_accounted_for(
     completed: impl Fn(ChunkPos) -> bool,
     recorded_huts: &BTreeSet<ChunkPos>,
     recorded_jigsaws: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
+    recorded_mineshafts: &BTreeMap<ChunkPos, BTreeSet<TerrainStartKey>>,
 ) -> bool {
     let registered: BTreeSet<_> = registry
         .steps()
@@ -898,6 +900,7 @@ fn structure_entities_are_accounted_for(
                     &registered,
                     recorded_huts.contains(&source),
                     recorded_jigsaws.get(&source),
+                    recorded_mineshafts.get(&source),
                 )
         })
     })
@@ -1474,6 +1477,7 @@ impl FreshTerrainBatch {
                     },
                     &self.entity_sources.recorded_hut_features,
                     &self.entity_sources.recorded_jigsaw_features,
+                    &self.entity_sources.recorded_mineshaft_features,
                 )
             }),
         };
@@ -4458,6 +4462,28 @@ impl FreshTerrainBatch {
                     if has_mixed {
                         let planned = mixed.context("mixed structure plan is missing")?;
                         let keys = structures.mixed_commit_keys(&planned, allow_huts)?;
+                        let recorded_mineshafts: BTreeSet<_> = if ocean_runner
+                            .as_ref()
+                            .is_some_and(|runner| runner.records_mineshaft_entities())
+                            && prepared.mineshaft_blocking_biomes().is_some()
+                        {
+                            planned
+                                .iter()
+                                .flat_map(|entry| {
+                                    entry.starts.iter().filter_map(|start| {
+                                        let super::structure_batch::PlannedStructureStart::Mineshaft(start) = start else {
+                                            return None;
+                                        };
+                                        Some((entry.entry.id.clone(), ChunkPos {
+                                            x: start.chunk[0],
+                                            z: start.chunk[1],
+                                        }))
+                                    })
+                                })
+                                .collect()
+                        } else {
+                            BTreeSet::new()
+                        };
                         let recorded_jigsaws: BTreeSet<_> = planned
                             .iter()
                             .flat_map(|entry| {
@@ -4540,6 +4566,11 @@ impl FreshTerrainBatch {
                         drop(planned);
                         let huts_recorded = !hut_states.is_empty();
                         structures.commit_mixed_starts(keys, updated, hut_states);
+                        if !recorded_mineshafts.is_empty() {
+                            self.entity_sources
+                                .recorded_mineshaft_features
+                                .insert(pos, recorded_mineshafts);
+                        }
                         if !recorded_jigsaws.is_empty() {
                             self.entity_sources
                                 .recorded_jigsaw_features
@@ -5201,7 +5232,8 @@ mod entity_source_tests {
             center,
             |_| true,
             &BTreeSet::new(),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
         assert!(!structure_entities_are_accounted_for(
             &structures,
@@ -5209,7 +5241,8 @@ mod entity_source_tests {
             center,
             |pos| pos != ChunkPos { x: 1, z: 0 },
             &BTreeSet::new(),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
         structures.references.remove(&ChunkPos { x: -1, z: 0 });
         assert!(!structure_entities_are_accounted_for(
@@ -5218,7 +5251,8 @@ mod entity_source_tests {
             center,
             |_| true,
             &BTreeSet::new(),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
         let refs = collect_ordered_structure_references(ChunkPos { x: -1, z: 0 }, |pos| {
             Ok(if pos == center {
@@ -5242,7 +5276,8 @@ mod entity_source_tests {
             center,
             |_| true,
             &BTreeSet::new(),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
         assert!(!structure_entities_are_accounted_for(
             &structures,
@@ -5250,7 +5285,8 @@ mod entity_source_tests {
             ChunkPos { x: i32::MAX, z: 0 },
             |_| true,
             &BTreeSet::new(),
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
     }
 
@@ -5333,6 +5369,7 @@ mod entity_source_tests {
                     |_| true,
                     &BTreeSet::new(),
                     recorded,
+                    &BTreeMap::new(),
                 )
             };
         assert!(covered(&structures, &recorded));
@@ -5345,7 +5382,8 @@ mod entity_source_tests {
             center,
             |pos| pos != center,
             &BTreeSet::new(),
-            &recorded
+            &recorded,
+            &BTreeMap::new(),
         ));
         structures
             .jigsaw_starts
@@ -5356,6 +5394,131 @@ mod entity_source_tests {
             .chunk = [1, 0];
         assert!(!covered(&structures, &recorded));
         structures.jigsaw_starts.clear();
+        assert!(!covered(&structures, &recorded));
+    }
+
+    #[test]
+    fn mineshaft_entity_evidence_requires_recorded_matching_starts() {
+        use crate::worldgen::structure_references::collect_ordered_structure_references;
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_resources::mineshaft::{
+            MineshaftGraphPiece, MineshaftGraphPieceKind, MineshaftVariant,
+        };
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+
+        struct Registry;
+        impl ResourceProvider for Registry {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok((path == "data/example/worldgen/structure/mine.json")
+                    .then(|| br#"{"step":"underground_structures"}"#.to_vec()))
+            }
+            fn list_data(&mut self, _: &str) -> Result<Vec<ResourceId>> {
+                Ok(vec![ResourceId::parse("example:mine")?])
+            }
+        }
+
+        let registry = StructureDecorationSchedule::load(&mut Registry).unwrap();
+        let center = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("example:mine").unwrap();
+        let key = (id.clone(), center);
+        let room = MineshaftGraphPiece {
+            bounds: BoundingBox::new([12, 1, 2], [20, 6, 10]).unwrap(),
+            direction: None,
+            depth: 0,
+            kind: MineshaftGraphPieceKind::Room { entrances: vec![] },
+        };
+        let start = super::super::mineshaft::PreparedStart {
+            chunk: [0, 0],
+            generation_point: [8, 1, 8],
+            terrain_adjustment: TerrainAdjustment::None,
+            variant: MineshaftVariant::Normal,
+            pieces: vec![
+                super::super::SavedMineshaftPiece::capture(&room, MineshaftVariant::Normal, false)
+                    .unwrap(),
+            ],
+        };
+        let bounds = start.reference_bounds(id.clone()).unwrap();
+        let mut structures = PreparedStructureStages::default();
+        structures
+            .mineshafts
+            .insert(center, BTreeMap::from([(id.clone(), start)]));
+        let mut recorded = BTreeMap::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let pos = ChunkPos { x, z };
+                let refs = collect_ordered_structure_references(pos, |source| {
+                    Ok(if source == center {
+                        vec![bounds.clone()]
+                    } else {
+                        vec![]
+                    })
+                })
+                .unwrap();
+                if !refs.membership().is_empty() {
+                    recorded.insert(pos, BTreeSet::from([key.clone()]));
+                }
+                structures.references.insert(pos, refs);
+            }
+        }
+        let covered = |structures: &PreparedStructureStages, recorded: &BTreeMap<_, _>| {
+            structure_entities_are_accounted_for(
+                structures,
+                &registry,
+                center,
+                |_| true,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                recorded,
+            )
+        };
+        assert!(recorded.contains_key(&ChunkPos { x: 1, z: 0 }));
+        assert!(covered(&structures, &recorded));
+        let saved = recorded.remove(&center).unwrap();
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(
+            center,
+            BTreeSet::from([(id.clone(), ChunkPos { x: 1, z: 0 })]),
+        );
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(center, saved);
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let saved_neighbor = recorded.remove(&neighbor).unwrap();
+        assert!(!covered(&structures, &recorded));
+        recorded.insert(neighbor, saved_neighbor);
+        let conflicting = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [0, 0],
+            generation_point: [8, 1, 8],
+            orientation: None,
+            bounds: BoundingBox::new([8, 1, 8], [8, 1, 8]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        structures
+            .starts
+            .insert(center, BTreeMap::from([(id.clone(), conflicting)]));
+        assert!(!covered(&structures, &recorded));
+        structures.starts.clear();
+        assert!(!structure_entities_are_accounted_for(
+            &structures,
+            &registry,
+            center,
+            |pos| pos != center,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &recorded,
+        ));
+        structures
+            .mineshafts
+            .get_mut(&center)
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .chunk = [1, 0];
+        assert!(!covered(&structures, &recorded));
+        structures.mineshafts.clear();
         assert!(!covered(&structures, &recorded));
     }
 
@@ -5591,6 +5754,7 @@ mod entity_source_tests {
                 |_| true,
                 recorded,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
         };
         assert!(covered(&structures, &recorded));
@@ -5600,7 +5764,8 @@ mod entity_source_tests {
             center,
             |pos| pos != center,
             &recorded,
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         ));
         recorded.remove(&center);
         assert!(!covered(&structures, &recorded));

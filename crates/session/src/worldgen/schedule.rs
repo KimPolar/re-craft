@@ -37,6 +37,11 @@ pub(super) trait OceanFeatureRunner {
         false
     }
 
+    /// Whether successful mineshaft placement records every generated cart.
+    fn records_mineshaft_entities(&self) -> bool {
+        false
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -102,6 +107,10 @@ impl<U> OceanFeatureRunner for MineshaftFeatureCallbacks<'_, U>
 where
     U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
 {
+    fn records_mineshaft_entities(&self) -> bool {
+        true
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -290,6 +299,10 @@ where
         true
     }
 
+    fn records_mineshaft_entities(&self) -> bool {
+        true
+    }
+
     fn execute(
         &mut self,
         terrain: &mut super::CarvedTerrainWorld,
@@ -347,6 +360,10 @@ where
 {
     fn supports_huts(&self) -> bool {
         true
+    }
+
+    fn records_mineshaft_entities(&self) -> bool {
+        self.uuid_factory.is_some()
     }
 
     fn execute(
@@ -743,6 +760,10 @@ where
 {
     fn supports_huts(&self) -> bool {
         true
+    }
+
+    fn records_mineshaft_entities(&self) -> bool {
+        self.uuid_factory.is_some()
     }
 
     fn execute(

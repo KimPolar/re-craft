@@ -456,6 +456,7 @@ impl PreparedStructureStages {
         registered: &BTreeSet<&ResourceId>,
         huts_recorded: bool,
         recorded_jigsaws: Option<&BTreeSet<TerrainStartKey>>,
+        recorded_mineshafts: Option<&BTreeSet<TerrainStartKey>>,
     ) -> bool {
         self.references.get(&pos).is_some_and(|references| {
             references.membership().iter().all(|(id, positions)| {
@@ -464,10 +465,18 @@ impl PreparedStructureStages {
                     let source = ChunkPos { x: bits as u32 as i32, z: (bits >> 32) as u32 as i32 };
                     let simple = self.starts.get(&source).and_then(|starts| starts.get(id));
                     let jigsaw = self.jigsaw_starts.get(&source).and_then(|starts| starts.get(id));
+                    let mineshaft = self.mineshafts.get(&source).and_then(|starts| starts.get(id));
+                    if let Some(start) = mineshaft {
+                        return simple.is_none()
+                            && jigsaw.is_none()
+                            && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && start.chunk == [source.x, source.z]
+                            && recorded_mineshafts.is_some_and(|keys| keys.contains(&(id.clone(), source)));
+                    }
                     if let Some(start) = jigsaw {
                         return simple.is_none()
                             && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
-                            && self.mineshafts.get(&source).and_then(|starts| starts.get(id)).is_none()
+                            && mineshaft.is_none()
                             && start.chunk == [source.x, source.z]
                             && recorded_jigsaws.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }

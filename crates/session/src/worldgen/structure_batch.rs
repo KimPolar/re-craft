@@ -42,6 +42,8 @@ pub type MineshaftStarts = BTreeMap<ResourceId, super::mineshaft::PreparedStart>
 pub type JigsawStarts = BTreeMap<ResourceId, super::jigsaw::PreparedStart>;
 /// Ruined-portal starts retained with their original template and piece.
 pub type RuinedPortalStarts = BTreeMap<ResourceId, super::ruined_portal::PreparedStart>;
+/// Shipwreck starts retained until their templates can be decorated and saved.
+pub type ShipwreckStarts = BTreeMap<ResourceId, super::shipwreck::PreparedStart>;
 
 /// Identity of a referenced structure start, including its source chunk.
 pub type TerrainStartKey = (ResourceId, ChunkPos);
@@ -960,6 +962,7 @@ pub struct StructureGenerationBatch {
     mineshafts: BTreeMap<ChunkPos, MineshaftStarts>,
     jigsaw_starts: BTreeMap<ChunkPos, JigsawStarts>,
     ruined_portal_starts: BTreeMap<ChunkPos, RuinedPortalStarts>,
+    shipwreck_starts: BTreeMap<ChunkPos, ShipwreckStarts>,
     bounds: BTreeMap<ChunkPos, Vec<StructureStartBounds>>,
     references: BTreeMap<ChunkPos, OrderedStructureReferences>,
     failed: bool,
@@ -978,6 +981,10 @@ impl StructureGenerationBatch {
         );
         let mut added = PreparedStructureStages::default();
         for pos in plan.starts() {
+            ensure!(
+                !self.shipwreck_starts.contains_key(&pos),
+                "shipwreck structure transfer is not yet supported"
+            );
             let starts = self
                 .starts
                 .get(&pos)
@@ -1090,6 +1097,10 @@ impl StructureGenerationBatch {
             self.generator.structure_context,
             "generator lacks structure context"
         );
+        ensure!(
+            self.shipwreck_starts.is_empty(),
+            "shipwreck structure transfer is not yet supported"
+        );
         let mut terrain = BTreeMap::new();
         for (pos, order) in orders {
             terrain.insert(pos, self.beardifier_for_chunk(pos, &order)?);
@@ -1158,6 +1169,7 @@ impl StructureGenerationBatch {
             mineshafts: BTreeMap::new(),
             jigsaw_starts: BTreeMap::new(),
             ruined_portal_starts: BTreeMap::new(),
+            shipwreck_starts: BTreeMap::new(),
             bounds: BTreeMap::new(),
             references: BTreeMap::new(),
             failed: false,
@@ -1187,7 +1199,8 @@ impl StructureGenerationBatch {
             && !self.ocean_starts.contains_key(&pos)
             && !self.mineshafts.contains_key(&pos)
             && !self.jigsaw_starts.contains_key(&pos)
-            && !self.ruined_portal_starts.contains_key(&pos))
+            && !self.ruined_portal_starts.contains_key(&pos)
+            && !self.shipwreck_starts.contains_key(&pos))
         .then(|| self.starts.get(&pos))
         .flatten()
     }
@@ -1225,6 +1238,13 @@ impl StructureGenerationBatch {
             .flatten()
     }
 
+    /// Return shipwrecks retained for a completed start chunk.
+    pub fn shipwreck_starts(&self, pos: ChunkPos) -> Option<&ShipwreckStarts> {
+        (!self.failed && self.starts.contains_key(&pos))
+            .then(|| self.shipwreck_starts.get(&pos))
+            .flatten()
+    }
+
     fn ensure_jigsaw_decoration_supported(&self, pos: ChunkPos) -> Result<()> {
         let references = self
             .references
@@ -1250,6 +1270,13 @@ impl StructureGenerationBatch {
                         .get(&source)
                         .is_some_and(|starts| starts.contains_key(id)),
                     "ruined portal structure decoration is not yet supported"
+                );
+                ensure!(
+                    !self
+                        .shipwreck_starts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "shipwreck structure decoration is not yet supported"
                 );
             }
         }
@@ -1342,6 +1369,13 @@ impl StructureGenerationBatch {
                         .is_some_and(|starts| starts.contains_key(id)),
                     "ruined portal structure decoration is not yet supported"
                 );
+                ensure!(
+                    !self
+                        .shipwreck_starts
+                        .get(&source)
+                        .is_some_and(|starts| starts.contains_key(id)),
+                    "shipwreck structure decoration is not yet supported"
+                );
             }
         }
         mixed_plan_with_jigsaw(
@@ -1386,6 +1420,12 @@ impl StructureGenerationBatch {
                         start.terrain_adjustment
                     } else if let Some(start) = self
                         .ruined_portal_starts
+                        .get(&source)
+                        .and_then(|s| s.get(structure))
+                    {
+                        start.terrain_adjustment
+                    } else if let Some(start) = self
+                        .shipwreck_starts
                         .get(&source)
                         .and_then(|s| s.get(structure))
                     {
@@ -1475,6 +1515,10 @@ impl StructureGenerationBatch {
                     .ruined_portal_starts
                     .get(pos)
                     .is_some_and(|s| s.contains_key(id))
+                    || self
+                        .shipwreck_starts
+                        .get(pos)
+                        .is_some_and(|s| s.contains_key(id))
                 {
                     1
                 } else {
@@ -1597,6 +1641,18 @@ impl StructureGenerationBatch {
                     projection: PieceProjection::NonPool,
                     junctions: vec![],
                 });
+            } else if let Some(start) = self
+                .shipwreck_starts
+                .get(source)
+                .and_then(|starts| starts.get(structure))
+            {
+                pieces.push(StructurePiece {
+                    bounds: start.bounds,
+                    adjustment: start.terrain_adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: vec![],
+                });
             } else {
                 let start = self
                     .mineshafts
@@ -1678,6 +1734,7 @@ impl StructureGenerationBatch {
                 let mut mineshafts = MineshaftStarts::new();
                 let mut jigsaw_starts = JigsawStarts::new();
                 let mut ruined_portal_starts = RuinedPortalStarts::new();
+                let mut shipwreck_starts = ShipwreckStarts::new();
                 let mut bounds = Vec::new();
                 for set in &self.sets {
                     let outcome = self
@@ -1694,7 +1751,8 @@ impl StructureGenerationBatch {
                                     || ocean_starts.contains_key(id)
                                     || mineshafts.contains_key(id)
                                     || jigsaw_starts.contains_key(id)
-                                    || ruined_portal_starts.contains_key(id))
+                                    || ruined_portal_starts.contains_key(id)
+                                    || shipwreck_starts.contains_key(id))
                             },
                             &mut *classify,
                         )
@@ -1756,6 +1814,13 @@ impl StructureGenerationBatch {
                                     "duplicate structure start"
                                 );
                             }
+                            super::BatchPreparedStructureStart::Shipwreck(start) => {
+                                bounds.push(start.reference_bounds(structure.clone())?);
+                                ensure!(
+                                    shipwreck_starts.insert(structure, start).is_none(),
+                                    "duplicate structure start"
+                                );
+                            }
                         }
                     }
                 }
@@ -1772,6 +1837,9 @@ impl StructureGenerationBatch {
                 }
                 if !ruined_portal_starts.is_empty() {
                     self.ruined_portal_starts.insert(pos, ruined_portal_starts);
+                }
+                if !shipwreck_starts.is_empty() {
+                    self.shipwreck_starts.insert(pos, shipwreck_starts);
                 }
                 self.bounds.insert(pos, bounds);
                 Ok(())

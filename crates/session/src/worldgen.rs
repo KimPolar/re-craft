@@ -2429,6 +2429,7 @@ pub(super) enum BatchPreparedStructureStart {
     Supported(PreparedStructureStart),
     Jigsaw(jigsaw::PreparedStart),
     RuinedPortal(ruined_portal::PreparedStart),
+    Shipwreck(shipwreck::PreparedStart),
 }
 
 /// A generator configured from the dimension's active biome source and noise
@@ -3116,7 +3117,8 @@ impl TerrainGenerator {
                             | PreparedStructureStart::RuinedPortal(_),
                         )
                         | BatchPreparedStructureStart::Jigsaw(_)
-                        | BatchPreparedStructureStart::RuinedPortal(_),
+                        | BatchPreparedStructureStart::RuinedPortal(_)
+                        | BatchPreparedStructureStart::Shipwreck(_),
                     ..
                 } => unreachable!("ocean ruins are disabled"),
             },
@@ -3162,7 +3164,8 @@ impl TerrainGenerator {
                 StructureSetStart::Generated {
                     start:
                         BatchPreparedStructureStart::Jigsaw(_)
-                        | BatchPreparedStructureStart::RuinedPortal(_),
+                        | BatchPreparedStructureStart::RuinedPortal(_)
+                        | BatchPreparedStructureStart::Shipwreck(_),
                     ..
                 } => unreachable!("jigsaws are disabled"),
             },
@@ -3257,11 +3260,15 @@ impl TerrainGenerator {
                 let jigsaw = jigsaws
                     && structure_type.namespace == "minecraft"
                     && structure_type.path == "jigsaw";
+                let shipwreck = jigsaws
+                    && structure_type.namespace == "minecraft"
+                    && structure_type.path == "shipwreck";
                 let structure = if center_heightmap.is_none()
                     && !mineshaft
                     && !jigsaw
                     && !monument
                     && !ruined_portal
+                    && !shipwreck
                 {
                     Some(
                         SimpleStructure::decode(&definition)
@@ -3291,6 +3298,16 @@ impl TerrainGenerator {
                     min_y: self.min_y,
                     max_y,
                 };
+                if shipwreck {
+                    return Ok(shipwreck::PreparedStart::generate(
+                        provider,
+                        &definition,
+                        &mut env,
+                        self.seed,
+                        chunk,
+                    )?
+                    .map(BatchPreparedStructureStart::Shipwreck));
+                }
                 if ruined_portal {
                     let start = ruined_portal::PreparedStart::prepare(
                         provider,
@@ -9785,6 +9802,55 @@ mod tests {
                     )
                     .unwrap();
                 assert!(matches!(existing, StructureSetStart::Existing));
+
+                let sparse = ResourceId::parse("example:shipwreck_sparse").unwrap();
+                data.0.insert(
+                    "data/example/worldgen/structure_set/shipwreck_sparse.json".into(),
+                    serde_json::to_vec(&json!({"placement":{"type":"minecraft:random_spread","spacing":32,"separation":0,"salt":0},"structures":[{"structure":"example:pyramid","weight":1}]})).unwrap(),
+                );
+                let [x, z] = StructureSetCache::default()
+                    .load(&mut data, &sparse)
+                    .unwrap()
+                    .placement
+                    .potential_chunk(42, [0, 0]);
+                let target = ChunkPos { x, z };
+                let batch_generator =
+                    TerrainGenerator::with_structure_context(&mut data, &definition(), 42, 0, 16)
+                        .unwrap();
+                let batch_rules = StructureBiomes::load(&mut data, [structure_id.clone()]).unwrap();
+                let mut batch = structure_batch::StructureGenerationBatch::new(
+                    batch_generator,
+                    batch_rules,
+                    vec![sparse],
+                )
+                .unwrap();
+                batch.request_references(target).unwrap();
+                while batch
+                    .step(&mut data, &mut |v| classify(v))
+                    .unwrap()
+                    .is_some()
+                {}
+                assert!(batch.is_complete());
+                assert!(batch.starts(target).is_none());
+                let generated = &batch.shipwreck_starts(target).unwrap()[&structure_id];
+                assert_eq!(generated.piece.beached, beached);
+                assert_eq!(
+                    generated.piece,
+                    native_resources::shipwreck::select_for_chunk(42, [x, z], beached).unwrap()
+                );
+                let packed = (x as u32 as u64 | ((z as u32 as u64) << 32)) as i64;
+                assert!(batch.references(target).unwrap()[&structure_id].contains(&packed));
+                let order = batch
+                    .unambiguous_terrain_start_order(target)
+                    .unwrap()
+                    .unwrap();
+                assert!(order.contains(&(structure_id.clone(), target)));
+                assert!(batch.beardifier_for_chunk(target, &order).is_ok());
+                let error = batch
+                    .into_terrain_stages(BTreeMap::from([(target, order)]))
+                    .err()
+                    .expect("unimplemented transfer must fail");
+                assert!(format!("{error:#}").contains("shipwreck structure transfer"));
             }
             let ruin = json!({"type":"minecraft:ocean_ruin","biomes":["minecraft:plains"],"step":"surface_structures","biome_temp":"cold","large_probability":1.0,"cluster_probability":1.0,"terrain_adaptation":"beard_thin"});
             data.0

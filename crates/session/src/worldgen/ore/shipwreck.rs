@@ -132,6 +132,39 @@ impl ShapeEdgeWorld for ShipwreckRegion<'_, '_, '_> {
         if super::jigsaw::jigsaw_wood(state) {
             return Ok(state.clone());
         }
+        if native_world::collision::door_open(state).is_some() {
+            ensure!(
+                self.template
+                    .inner
+                    .registry
+                    .is_canonical_state(&neighbor.name, &neighbor.properties),
+                "unsupported shipwreck door neighbor"
+            );
+            let below_sturdy = if state.properties["half"] == "lower" && direction == [0, -1, 0] {
+                let below =
+                    JigsawPlacementWorld::block(self, [pos[0], pos[1].wrapping_sub(1), pos[2]])?;
+                ensure!(
+                    self.template
+                        .inner
+                        .registry
+                        .is_canonical_state(&below.name, &below.properties),
+                    "unsupported shipwreck door support"
+                );
+                Some(
+                    native_world::collision::button_support_face(&below, glam::IVec3::Y)
+                        .context("unsupported shipwreck door support shape")?,
+                )
+            } else {
+                None
+            };
+            return native_world::door::update_shape(
+                state,
+                glam::IVec3::from_array(direction),
+                neighbor,
+                below_sturdy,
+            )
+            .context("unsupported shipwreck door update");
+        }
         if matches!(state.name.as_str(), "minecraft:water" | "minecraft:lava") {
             return ShapeEdgeWorld::update_shape(
                 self.template.inner.region,
@@ -152,7 +185,11 @@ impl ShapeEdgeWorld for ShipwreckRegion<'_, '_, '_> {
         )
     }
     fn set_block(&mut self, pos: [i32; 3], state: &BlockState, flags: i32) -> Result<()> {
-        if super::jigsaw::jigsaw_wood(state) {
+        let old = JigsawPlacementWorld::block(self, pos)?;
+        if super::jigsaw::jigsaw_wood(state)
+            || native_world::collision::door_open(state).is_some()
+            || (is_air(state) && native_world::collision::door_open(&old).is_some())
+        {
             ensure!(matches!(flags, 2 | 18), "unsupported shipwreck shape flags");
             self.template.inner.place_template_block(
                 pos,
@@ -174,7 +211,8 @@ impl StructurePlacementWorld for ShipwreckRegion<'_, '_, '_> {
         nbt: Option<&Tag>,
         random: &mut DecorationRandom,
     ) -> Result<bool> {
-        if super::jigsaw::jigsaw_wood(state) {
+        if super::jigsaw::jigsaw_wood(state) || native_world::collision::door_open(state).is_some()
+        {
             ensure!(nbt.is_none(), "wood block entity is unsupported");
             return self
                 .template
@@ -274,12 +312,20 @@ mod tests {
                 value: Tag::Compound(vec![]),
             },
             data_version: Some(5023),
-            size: [3, 2, 1],
+            size: [4, 2, 1],
             palettes: vec![vec![
                 palette("minecraft:oak_planks"),
                 palette("minecraft:chest"),
                 palette("minecraft:dark_oak_trapdoor"),
                 palette("minecraft:structure_block"),
+                palette("minecraft:oak_door"),
+                Tag::Compound(vec![
+                    ("id".into(), Tag::String("minecraft:oak_door".into())),
+                    (
+                        "properties".into(),
+                        Tag::Compound(vec![("half".into(), Tag::String("upper".into()))]),
+                    ),
+                ]),
             ]],
             blocks: vec![
                 TemplateBlock {
@@ -301,6 +347,16 @@ mod tests {
                     position: [1, 1, 0],
                     state: 3,
                     nbt: Some(marker),
+                },
+                TemplateBlock {
+                    position: [3, 0, 0],
+                    state: 4,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    position: [3, 1, 0],
+                    state: 5,
+                    nbt: None,
                 },
             ],
             entities: vec![],
@@ -348,6 +404,8 @@ mod tests {
             snapshot.block(6, 8, 4).unwrap().name,
             "minecraft:dark_oak_trapdoor"
         );
+        assert_eq!(snapshot.block(7, 8, 4).unwrap().properties["half"], "lower");
+        assert_eq!(snapshot.block(7, 9, 4).unwrap().properties["half"], "upper");
         let Tag::List { values, .. } =
             terrain.generated_block_entity_data(ChunkPos { x: 0, z: 0 }, &registry)?
         else {
@@ -361,7 +419,7 @@ mod tests {
 
         let template = Arc::make_mut(&mut start.template);
         template.palettes[0].push(palette("minecraft:oak_fence"));
-        template.blocks[0].state = 4;
+        template.blocks[0].state = 6;
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
         let writable = before.chunks.keys().copied().collect();

@@ -68,6 +68,12 @@ fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_torch(state) {
         return Ok(false);
     }
+    if native_world::collision::full_glass(state) {
+        return Ok(true);
+    }
+    if native_world::collision::pane_waterlogged(state).is_some() {
+        return Ok(false);
+    }
     if native_world::collision::fence_waterlogged(state).is_some() {
         return Ok(false);
     }
@@ -237,6 +243,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::fence_waterlogged(state).is_some()
                 || native_world::collision::fence_gate_open(state).is_some()
                 || native_world::collision::door_open(state).is_some()
+                || native_world::collision::full_glass(state)
+                || native_world::collision::pane_waterlogged(state).is_some()
                 || jigsaw_torch(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
@@ -249,6 +257,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
             && (state.name.ends_with("_stairs")
                 || state.name.ends_with("_slab")
                 || state.name.ends_with("_fence")
+                || native_world::collision::pane_waterlogged(state).is_some()
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -280,7 +289,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 };
                 self.region.jigsaw_block_write = native_world::collision::slab_stair_solid(state)
                     .is_some()
-                    || native_world::collision::fence_waterlogged(state).is_some();
+                    || native_world::collision::fence_waterlogged(state).is_some()
+                    || native_world::collision::pane_waterlogged(state).is_some();
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
@@ -588,6 +598,7 @@ mod tests {
             format!("CHEST\tminecraft:chests/village/village_armorer\t{seed}\t{next_random}");
         let output = String::from_utf8(output.stdout)?;
         assert!(output.lines().any(|line| line == expected_line));
+        assert!(output.lines().any(|line| line == "PROTO_WATER_TICK\t0"));
         let mut states_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("STATE\t")) {
             let fields: Vec<_> = line.split('\t').collect();
@@ -1137,6 +1148,134 @@ mod tests {
         }
         assert_eq!(torch_names.len(), 4);
         assert_eq!(torches_checked, 10 * 12);
+        let shape_mask = |boxes: Vec<native_world::collision::Aabb>| -> Vec<u16> {
+            (0..16)
+                .map(|z| {
+                    (0..16).fold(0u16, |row, x| {
+                        let px = (x as f32 + 0.5) / 16.0;
+                        let pz = (z as f32 + 0.5) / 16.0;
+                        if boxes.iter().any(|a| {
+                            a.min.x < px
+                                && a.max.x > px
+                                && a.min.y < 0.5
+                                && a.max.y > 0.5
+                                && a.min.z < pz
+                                && a.max.z > pz
+                        }) {
+                            row | (1 << x)
+                        } else {
+                            row
+                        }
+                    })
+                })
+                .collect()
+        };
+        let parse_mask = |raw: &str| -> Result<Vec<u16>> {
+            Ok(raw
+                .split(',')
+                .map(str::parse::<u16>)
+                .collect::<std::result::Result<Vec<_>, _>>()?)
+        };
+        let air = BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        let water = BlockState {
+            name: "minecraft:water".into(),
+            properties: BTreeMap::from([("level".into(), "0".into())]),
+        };
+        let mut glass_names = BTreeSet::new();
+        let mut glass_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("GLASS\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                pane,
+                before,
+                wet,
+                mirror,
+                rotation,
+                after,
+                collision,
+                outline,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java glass result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let is_pane = *pane == "true";
+            let mask: u8 = before.parse()?;
+            let mut properties = BTreeMap::new();
+            if is_pane {
+                for (i, direction) in ["north", "east", "south", "west"].iter().enumerate() {
+                    properties.insert((*direction).into(), ((mask & (1 << i)) != 0).to_string());
+                }
+                properties.insert("waterlogged".into(), (*wet).into());
+            }
+            let name = format!("minecraft:{name}");
+            let state = BlockState {
+                name: name.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&name, &properties), "{state:?}");
+            assert_eq!(registry.has_block_entity(&name), Some(false), "{state:?}");
+            assert_eq!(jigsaw_static_full(&state)?, !is_pane);
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&air, &state),
+                Some(*wet != "true"),
+                "{state:?}"
+            );
+            assert_eq!(
+                native_world::block_light::same_light_behavior(&water, &state),
+                Some(*wet == "true"),
+                "{state:?}"
+            );
+            assert_eq!(
+                shape_mask(
+                    native_world::collision::block_shape(&state)
+                        .context("glass collision missing")?
+                ),
+                parse_mask(collision)?,
+                "{state:?}"
+            );
+            assert_eq!(
+                shape_mask(
+                    native_world::collision::block_outline(&state)
+                        .context("glass outline missing")?
+                ),
+                parse_mask(outline)?,
+                "{state:?}"
+            );
+            let transformed =
+                registry.transform_template_state(&name, &properties, mirror, rotation)?;
+            let mut actual = 0;
+            if is_pane {
+                for (i, direction) in ["north", "east", "south", "west"].iter().enumerate() {
+                    if transformed[*direction] == "true" {
+                        actual |= 1 << i;
+                    }
+                }
+                assert_eq!(transformed["waterlogged"], *wet);
+            }
+            assert_eq!(actual, after.parse::<u8>()?, "{state:?}");
+            glass_names.insert(name);
+            glass_checked += 1;
+        }
+        assert_eq!(glass_names.len(), 43);
+        assert_eq!(glass_checked, 849 * 12);
 
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let before = terrain.snapshot();
@@ -1202,12 +1341,17 @@ mod tests {
                             || id.ends_with("_fence")
                             || id.ends_with("_fence_gate")
                             || id.ends_with("_door")
+                            || id.ends_with("_stained_glass")
+                            || id.ends_with("_stained_glass_pane")
                             || matches!(
                                 id.as_str(),
                                 "minecraft:torch"
                                     | "minecraft:wall_torch"
                                     | "minecraft:soul_torch"
                                     | "minecraft:soul_wall_torch"
+                                    | "minecraft:glass"
+                                    | "minecraft:glass_pane"
+                                    | "minecraft:iron_bars"
                             )))
                 {
                     continue;
@@ -1240,6 +1384,7 @@ mod tests {
         assert!(found.contains("minecraft:oak_fence_gate"), "{found:?}");
         assert!(found.contains("minecraft:oak_door"), "{found:?}");
         assert!(found.contains("minecraft:wall_torch"), "{found:?}");
+        assert!(found.contains("minecraft:glass_pane"), "{found:?}");
         Ok(())
     }
 
@@ -1303,6 +1448,7 @@ mod tests {
                 assert_eq!(ticks.len(), 1);
                 assert_eq!(ticks[0].position, pos);
                 assert_eq!(ticks[0].fluid, "minecraft:water");
+                assert_eq!(ticks[0].delay, 0);
             }
         }
         Ok(())
@@ -1362,6 +1508,76 @@ mod tests {
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].position, pos);
         assert_eq!(ticks[0].fluid, "minecraft:water");
+        assert_eq!(ticks[0].delay, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_panes_waterlog_and_preserve_proto_water_ticks() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for name in [
+            "minecraft:glass_pane",
+            "minecraft:red_stained_glass_pane",
+            "minecraft:exposed_copper_bars",
+        ] {
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let state = BlockState {
+                name: name.into(),
+                properties: BTreeMap::from([
+                    ("north".into(), "true".into()),
+                    ("east".into(), "false".into()),
+                    ("south".into(), "false".into()),
+                    ("west".into(), "true".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            };
+            let pos = [1, 8, 1];
+            let mut draft = JigsawRegion {
+                region: &mut region,
+                registry: &registry,
+            };
+            assert!(draft.place_template_block(
+                pos,
+                &state,
+                None,
+                &mut DecorationRandom::new(42)
+            )?);
+            assert!(draft.is_liquid_container(&state)?);
+            draft.place_liquid(
+                pos,
+                &state,
+                Some(FluidState {
+                    kind: FluidKind::Water,
+                    source: true,
+                    falling: false,
+                    amount: 8,
+                }),
+            )?;
+            region.finish()?;
+            let world = terrain.snapshot();
+            let placed = world
+                .block(pos[0], pos[1], pos[2])
+                .context("pane missing")?;
+            assert_eq!(placed.properties["north"], "true");
+            assert_eq!(placed.properties["west"], "true");
+            assert_eq!(placed.properties["waterlogged"], "true");
+            let ticks = world
+                .saved_fluid_ticks
+                .get(&ChunkPos { x: 0, z: 0 })
+                .context("water tick missing")?;
+            assert_eq!(ticks.len(), 1);
+            assert_eq!(ticks[0].position, pos);
+            assert_eq!(ticks[0].fluid, "minecraft:water");
+            assert_eq!(ticks[0].delay, 0);
+        }
         Ok(())
     }
 

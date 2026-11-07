@@ -7122,6 +7122,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::fence_waterlogged(state).is_some()
                             || native_world::collision::fence_gate_open(state).is_some()
                             || native_world::collision::door_open(state).is_some()
+                            || native_world::collision::full_glass(state)
+                            || native_world::collision::pane_waterlogged(state).is_some()
                             || jigsaw::jigsaw_torch(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
@@ -7141,7 +7143,9 @@ impl OreVeinWorld for DecorationRegion<'_> {
                     let jigsaw_light_check = jigsaw_light_update
                         && ((native_world::collision::fence_waterlogged(state).is_none()
                             && native_world::collision::fence_gate_open(state).is_none()
-                            && native_world::collision::door_open(state).is_none())
+                            && native_world::collision::door_open(state).is_none()
+                            && !native_world::collision::full_glass(state)
+                            && native_world::collision::pane_waterlogged(state).is_none())
                             || native_world::block_light::same_light_behavior(&old, state)
                                 == Some(false));
                     let patch_water = self.patch_block_write
@@ -11571,6 +11575,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_glass_matches_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_glass",
+            "vine_active_self_jigsaw_pane",
+            "vine_active_empty_jigsaw_glass",
+            "vine_active_self_empty_jigsaw_pane",
+            "vine_active_jigsaw_wet_pane",
+            "vine_active_self_jigsaw_water_glass",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -11784,6 +11801,10 @@ mod tests {
                         "wall_torch"
                     } else if mode.ends_with("_torch") {
                         "torch"
+                    } else if mode.ends_with("_pane") {
+                        "glass_pane"
+                    } else if mode.ends_with("_glass") {
+                        "glass"
                     } else {
                         "oak_planks"
                     });
@@ -11823,6 +11844,11 @@ mod tests {
                         ]);
                     } else if mode.ends_with("_walltorch") {
                         block.properties = BTreeMap::from([("facing".into(), "north".into())]);
+                    } else if mode.ends_with("_pane") {
+                        block.properties = ["north", "east", "south", "west", "waterlogged"]
+                            .into_iter()
+                            .map(|key| (key.into(), "false".into()))
+                            .collect();
                     }
                     jigsaw::place_block_for_light_test(
                         &mut draft,
@@ -11936,6 +11962,8 @@ mod tests {
             let expected_checks = if mode.contains("_jigsaw_wet_") {
                 2
             } else if mode.ends_with("_jigsaw_gate") || mode.ends_with("_jigsaw_door") {
+                0
+            } else if mode.ends_with("_jigsaw_glass") || mode.ends_with("_jigsaw_pane") {
                 0
             } else if mode.ends_with("_jigsaw_fence") {
                 0

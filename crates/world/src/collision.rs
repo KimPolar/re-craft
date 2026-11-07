@@ -79,6 +79,73 @@ pub fn fence_waterlogged(state: &BlockState) -> Option<bool> {
     }
 }
 
+fn dye_color(name: &str) -> bool {
+    matches!(
+        name,
+        "white"
+            | "orange"
+            | "magenta"
+            | "light_blue"
+            | "yellow"
+            | "lime"
+            | "pink"
+            | "gray"
+            | "light_gray"
+            | "cyan"
+            | "purple"
+            | "blue"
+            | "brown"
+            | "green"
+            | "red"
+            | "black"
+    )
+}
+
+/// Recognize the verified, transparent full glass blocks.
+pub fn full_glass(state: &BlockState) -> bool {
+    let Some(name) = state.name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    state.properties.is_empty()
+        && (name == "glass" || name.strip_suffix("_stained_glass").is_some_and(dye_color))
+}
+
+/// Validate a vanilla glass pane or bars state and return its water flag.
+pub fn pane_waterlogged(state: &BlockState) -> Option<bool> {
+    let name = state.name.strip_prefix("minecraft:")?;
+    let valid = matches!(
+        name,
+        "glass_pane"
+            | "iron_bars"
+            | "copper_bars"
+            | "exposed_copper_bars"
+            | "weathered_copper_bars"
+            | "oxidized_copper_bars"
+            | "waxed_copper_bars"
+            | "waxed_exposed_copper_bars"
+            | "waxed_weathered_copper_bars"
+            | "waxed_oxidized_copper_bars"
+    ) || name
+        .strip_suffix("_stained_glass_pane")
+        .is_some_and(dye_color);
+    if !valid
+        || state.properties.len() != 5
+        || !["north", "east", "south", "west"].iter().all(|key| {
+            matches!(
+                state.properties.get(*key).map(String::as_str),
+                Some("true" | "false")
+            )
+        })
+    {
+        return None;
+    }
+    match state.properties.get("waterlogged").map(String::as_str) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
 /// Validate a vanilla fence gate state and return whether it is open.
 pub fn fence_gate_open(state: &BlockState) -> Option<bool> {
     let family = state
@@ -851,7 +918,7 @@ pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     if id.ends_with("_fence") {
         return connected(state, 6.0 / 16.0, 10.0 / 16.0, 1.5);
     }
-    if id == "glass_pane" || id == "iron_bars" || id.ends_with("_stained_glass_pane") {
+    if pane_waterlogged(state).is_some() {
         return connected(state, 7.0 / 16.0, 9.0 / 16.0, 1.0);
     }
     if matches!(
@@ -1089,6 +1156,9 @@ pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
     }
     if id.ends_with("_fence") {
         return connected(state, 6.0 / 16.0, 10.0 / 16.0, 1.0);
+    }
+    if pane_waterlogged(state).is_some() {
+        return connected(state, 7.0 / 16.0, 9.0 / 16.0, 1.0);
     }
     let shape = block_shape(state)?;
     if shape.is_empty() { None } else { Some(shape) }

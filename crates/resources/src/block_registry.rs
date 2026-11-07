@@ -498,7 +498,7 @@ impl GeneratedBlockRegistry {
             {
                 copper_factory = true;
             } else if ins.op == 0xb3 && owner == BLOCKS {
-                if matches!(member, "CUT_COPPER_SLAB" | "COPPER_DOOR")
+                if matches!(member, "CUT_COPPER_SLAB" | "COPPER_DOOR" | "COPPER_BARS")
                     && copper_factory
                     && registration.is_none()
                     && candidates.len() == 1
@@ -532,6 +532,14 @@ impl GeneratedBlockRegistry {
                             ("COPPER_DOOR", false) => {
                                 ("copper_door", "net/minecraft/world/level/block/DoorBlock")
                             }
+                            ("COPPER_BARS", true) => (
+                                "copper_bars",
+                                "net/minecraft/world/level/block/WeatheringCopperBarsBlock",
+                            ),
+                            ("COPPER_BARS", false) => (
+                                "copper_bars",
+                                "net/minecraft/world/level/block/IronBarsBlock",
+                            ),
                             _ => unreachable!(),
                         };
                         ensure!(
@@ -558,6 +566,14 @@ impl GeneratedBlockRegistry {
                     )),
                     "DYED_TERRACOTTA" => Some(("terracotta", BASE)),
                     "WOOL" => Some(("wool", BASE)),
+                    "STAINED_GLASS" => Some((
+                        "stained_glass",
+                        "net/minecraft/world/level/block/StainedGlassBlock",
+                    )),
+                    "STAINED_GLASS_PANE" => Some((
+                        "stained_glass_pane",
+                        "net/minecraft/world/level/block/StainedGlassPaneBlock",
+                    )),
                     "WOOL_SLAB" => Some(("wool_slab", "net/minecraft/world/level/block/SlabBlock")),
                     "CONCRETE_SLAB" => {
                         Some(("concrete_slab", "net/minecraft/world/level/block/SlabBlock"))
@@ -670,7 +686,12 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
-                "net/minecraft/world/level/block/FenceBlock" => Some(StateSchema::Fence),
+                "net/minecraft/world/level/block/FenceBlock"
+                | "net/minecraft/world/level/block/IronBarsBlock"
+                | "net/minecraft/world/level/block/StainedGlassPaneBlock"
+                | "net/minecraft/world/level/block/WeatheringCopperBarsBlock" => {
+                    Some(StateSchema::Fence)
+                }
                 "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
                 "net/minecraft/world/level/block/DoorBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {

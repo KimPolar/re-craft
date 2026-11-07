@@ -19,6 +19,8 @@ import net.minecraft.world.level.block.FenceBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.WallTorchBlock;
+import net.minecraft.world.level.block.IronBarsBlock;
+import net.minecraft.world.level.block.StainedGlassBlock;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.block.state.properties.SlabType;
@@ -28,6 +30,18 @@ import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.storage.TagValueInput;
 
 public class JigsawChestOracle {
+    static String mask(net.minecraft.world.phys.shapes.VoxelShape value) {
+        var boxes=value.toAabbs(); var rows=new StringBuilder();
+        for(int z=0;z<16;z++) {
+            int bits=0;
+            for(int x=0;x<16;x++) {
+                double px=(x+0.5)/16.0,pz=(z+0.5)/16.0;
+                for(var a:boxes) if(a.minX<px && a.maxX>px && a.minY<0.5 && a.maxY>0.5 && a.minZ<pz && a.maxZ>pz) { bits|=1<<x; break; }
+            }
+            if(z>0) rows.append(','); rows.append(bits);
+        }
+        return rows.toString();
+    }
     static String shape(net.minecraft.world.phys.shapes.VoxelShape value) {
         var boxes=value.toAabbs();
         if(boxes.isEmpty()) return "-";
@@ -39,6 +53,26 @@ public class JigsawChestOracle {
         var out = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        for(var block:new net.minecraft.world.level.block.Block[]{Blocks.OAK_FENCE,Blocks.OAK_SLAB,Blocks.GLASS_PANE,Blocks.IRON_BARS,Blocks.OAK_STAIRS}) {
+            var ticks=new net.minecraft.world.ticks.ProtoChunkTicks<net.minecraft.world.level.material.Fluid>();
+            var delays=new java.util.ArrayList<Integer>();
+            var states=new java.util.ArrayList<net.minecraft.world.level.block.state.BlockState>();
+            var flags=new java.util.ArrayList<Integer>();
+            var level=(net.minecraft.world.level.LevelAccessor)java.lang.reflect.Proxy.newProxyInstance(
+                net.minecraft.world.level.LevelAccessor.class.getClassLoader(),new Class<?>[]{net.minecraft.world.level.LevelAccessor.class},
+                (proxy,method,values)->switch(method.getName()) {
+                    case "isClientSide" -> false;
+                    case "setBlock" -> { states.add((net.minecraft.world.level.block.state.BlockState)values[1]); flags.add((Integer)values[2]); yield true; }
+                    case "setBlockAndUpdate" -> { states.add((net.minecraft.world.level.block.state.BlockState)values[1]); flags.add(3); yield true; }
+                    case "scheduleTick" -> { int delay=(Integer)values[2]; delays.add(delay); ticks.schedule(new net.minecraft.world.ticks.ScheduledTick<>((net.minecraft.world.level.material.Fluid)values[1],(BlockPos)values[0],delay,0)); yield null; }
+                    default -> throw new UnsupportedOperationException(method.toString());
+                });
+            var state=block.defaultBlockState();
+            boolean placed=((net.minecraft.world.level.block.SimpleWaterloggedBlock)block).placeLiquid(level,BlockPos.ZERO,state,net.minecraft.world.level.material.Fluids.WATER.defaultFluidState());
+            if(!placed || states.size()!=1 || !states.get(0).getValue(BlockStateProperties.WATERLOGGED) || !flags.equals(java.util.List.of(3))
+                || !delays.equals(java.util.List.of(5)) || ticks.scheduledTicks().size()!=1 || ticks.scheduledTicks().get(0).delay()!=0) throw new AssertionError(block+" "+delays+" "+ticks.scheduledTicks());
+        }
+        out.println("PROTO_WATER_TICK\t0");
         var lookup = VanillaRegistries.createWorldLookup();
         var registries = VanillaRegistries.createReloadableLookup(lookup);
         for (var pending : net.minecraft.core.registries.BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
@@ -185,6 +219,34 @@ public class JigsawChestOracle {
                     out.printf("TORCH\t%s\t%s\t%s\t%s\t%s\t%s\t%s%n",name,direction,mirror.name(),rotation.name(),next,
                         shape(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
                         shape(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
+                }
+            }
+        }
+        for(var block:BuiltInRegistries.BLOCK) {
+            var id=BuiltInRegistries.BLOCK.getKey(block);
+            boolean pane=block instanceof IronBarsBlock;
+            boolean glass=block==Blocks.GLASS || block instanceof StainedGlassBlock;
+            if(!pane && !glass) continue;
+            for(var state:block.getStateDefinition().getPossibleStates()) {
+                boolean wet=pane && state.getValue(BlockStateProperties.WATERLOGGED);
+                if(state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                    || state.getPostProcessPos(null,BlockPos.ZERO)!=null
+                    || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)!=glass
+                    || state.useShapeForLightOcclusion() || state.getLightDampening()!=(wet?1:0)
+                    || state.getLightEmission()!=0 || LightEngine.hasDifferentLightProperties(Blocks.AIR.defaultBlockState(),state)!=wet
+                    || LightEngine.hasDifferentLightProperties(Blocks.WATER.defaultBlockState(),state)==wet
+                    || state.getFluidState().isSource()!=wet) throw new AssertionError(state);
+                for(var mirror:Mirror.values()) for(var rotation:Rotation.values()) {
+                    var transformed=state.mirror(mirror).rotate(rotation);
+                    int before=0,after=0;
+                    if(pane) {
+                        var props=new net.minecraft.world.level.block.state.properties.BooleanProperty[]{BlockStateProperties.NORTH,BlockStateProperties.EAST,BlockStateProperties.SOUTH,BlockStateProperties.WEST};
+                        for(int i=0;i<4;i++) { if(state.getValue(props[i])) before|=1<<i; if(transformed.getValue(props[i])) after|=1<<i; }
+                        if(transformed.getValue(BlockStateProperties.WATERLOGGED)!=wet) throw new AssertionError(transformed);
+                    }
+                    out.printf("GLASS\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s%n",id.getPath(),pane,before,wet,mirror.name(),rotation.name(),after,
+                        mask(state.getCollisionShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)),
+                        mask(state.getShape(EmptyBlockGetter.INSTANCE,BlockPos.ZERO)));
                 }
             }
         }

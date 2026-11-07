@@ -352,8 +352,8 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
                 },
             )
         }
-        "minecraft:glass"
-        | "minecraft:short_grass"
+        _ if crate::collision::full_glass(state) => (0, 0),
+        "minecraft:short_grass"
         | "minecraft:fern"
         | "minecraft:bush"
         | "minecraft:short_dry_grass"
@@ -458,11 +458,8 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             bounded("age", 15)?;
             (0, 0)
         }
-        "minecraft:glass_pane" if state.properties.len() == 5 => {
-            for direction in ["north", "south", "east", "west"] {
-                boolean(direction)?;
-            }
-            (u8::from(boolean("waterlogged")?), 0)
+        _ if crate::collision::pane_waterlogged(state).is_some() => {
+            (u8::from(crate::collision::pane_waterlogged(state)?), 0)
         }
         "minecraft:vine" if state.properties.len() == 5 => {
             for direction in ["north", "south", "east", "west", "up"] {

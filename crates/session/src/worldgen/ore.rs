@@ -6127,6 +6127,9 @@ pub(super) fn multiface_support(state: &BlockState) -> Result<bool> {
     if tree_leaf_litter(state)? {
         return Ok(false);
     }
+    if generated_ore_state(state)? {
+        return Ok(true);
+    }
     if matches!(
         state.name.as_str(),
         "minecraft:moss_block"
@@ -15554,6 +15557,10 @@ mod tests {
         }
         assert!(checked > 2_000, "missing Java state comparisons: {checked}");
         for (name, states) in [
+            ("coal_ore", 1),
+            ("deepslate_coal_ore", 1),
+            ("redstone_ore", 2),
+            ("deepslate_redstone_ore", 2),
             ("cave_vines", 52),
             ("cave_vines_plant", 2),
             ("big_dripleaf", 32),

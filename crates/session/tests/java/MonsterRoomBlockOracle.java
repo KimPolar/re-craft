@@ -53,7 +53,15 @@ public class MonsterRoomBlockOracle {
      for(var direction:Direction.values())out.printf(" %s",state.isFaceSturdy(world,new BlockPos(1,4,1),direction));
      out.println();
     }
+    if(supportNames.contains(name) || block instanceof net.minecraft.world.level.block.DoorBlock || name.equals("oak_slab") || name.equals("oak_stairs"))
+     out.printf("CENTER %s %s %s%n",name,pairs.isEmpty()?"-":String.join(",",pairs),state.isFaceSturdy(world,new BlockPos(1,4,1),Direction.DOWN,net.minecraft.world.level.block.SupportType.CENTER));
    }
+  }
+  var chain=BuiltInRegistries.BLOCK.getValue(Identifier.parse("minecraft:iron_chain"));
+  for(var state:chain.getStateDefinition().getPossibleStates()) {
+   var properties=new TreeMap<String,String>();state.getValues().forEach(entry->properties.put(entry.property().getName(),entry.valueName()));
+   var pairs=new ArrayList<String>();for(var entry:properties.entrySet())pairs.add(entry.getKey()+"="+entry.getValue());
+   out.printf("CENTER iron_chain %s %s%n",String.join(",",pairs),state.isFaceSturdy(world,new BlockPos(1,4,1),Direction.DOWN,net.minecraft.world.level.block.SupportType.CENTER));
   }
  }
 }

@@ -21,6 +21,56 @@ struct CorridorRegion<'a, 'b, F, U> {
     uuid_factory: &'a mut U,
 }
 
+/// Center support on the bottom face, before applying the active unstable tag.
+pub(super) fn mineshaft_center_support(state: &BlockState) -> Option<bool> {
+    if native_world::collision::fence_waterlogged(state).is_some()
+        || native_world::collision::pane_waterlogged(state).is_some()
+        || jigsaw::jigsaw_wood(state)
+    {
+        return Some(true);
+    }
+    if generation_rail_state(state)
+        || jigsaw::jigsaw_torch(state)
+        || native_world::collision::fence_gate_open(state).is_some()
+        || native_world::collision::door_open(state).is_some()
+        || native_world::collision::bed_leg_end(state).is_some()
+        || (state.name == "minecraft:cobweb" && state.properties.is_empty())
+    {
+        return Some(false);
+    }
+    if state.name == "minecraft:iron_chain" && known_piece_block(state) {
+        return Some(state.properties.get("axis").is_some_and(|axis| axis == "y"));
+    }
+    if matches!(
+        state.name.as_str(),
+        "minecraft:lantern" | "minecraft:soul_lantern"
+    ) && native_world::block_light::same_light_behavior(state, state).is_some()
+    {
+        return Some(
+            state
+                .properties
+                .get("hanging")
+                .is_some_and(|hanging| hanging == "false"),
+        );
+    }
+    if native_world::collision::slab_stair_solid(state).is_some()
+        && native_world::block_light::same_light_behavior(state, state).is_some()
+    {
+        return Some(if state.name.ends_with("_slab") {
+            state
+                .properties
+                .get("type")
+                .is_some_and(|kind| kind != "top")
+        } else {
+            state
+                .properties
+                .get("half")
+                .is_some_and(|half| half == "bottom")
+        });
+    }
+    None
+}
+
 fn known_piece_block(state: &BlockState) -> bool {
     let p = &state.properties;
     match state.name.as_str() {
@@ -422,6 +472,9 @@ impl<F> MineshaftSupportWorld for MineshaftRegion<'_, '_, F> {
             "minecraft:sand" | "minecraft:red_sand" | "minecraft:gravel"
         ) {
             return Ok(false);
+        }
+        if let Some(sturdy) = mineshaft_center_support(state) {
+            return Ok(sturdy);
         }
         if known_piece_block(state) {
             return match state.name.as_str() {
@@ -1374,6 +1427,31 @@ mod tests {
             assert_eq!(state.properties["axis"], "y");
         }
         assert!(terrain.feature_postprocessing.is_empty());
+    }
+
+    #[test]
+    fn center_support_recognizes_fences_and_validates_states() {
+        let mut fence = BlockState {
+            name: "minecraft:oak_fence".into(),
+            properties: ["north", "south", "east", "west", "waterlogged"]
+                .into_iter()
+                .map(|key| (key.into(), "false".into()))
+                .collect(),
+        };
+        fence.properties.insert("west".into(), "true".into());
+        assert_eq!(mineshaft_center_support(&fence), Some(true));
+        fence.properties.remove("north");
+        assert_eq!(mineshaft_center_support(&fence), None);
+        let mut chain = BlockState {
+            name: "minecraft:iron_chain".into(),
+            properties: BTreeMap::from([
+                ("axis".into(), "y".into()),
+                ("waterlogged".into(), "false".into()),
+            ]),
+        };
+        assert_eq!(mineshaft_center_support(&chain), Some(true));
+        chain.properties.insert("axis".into(), "x".into());
+        assert_eq!(mineshaft_center_support(&chain), Some(false));
     }
 
     #[test]

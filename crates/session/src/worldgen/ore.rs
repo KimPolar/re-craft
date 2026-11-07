@@ -18594,6 +18594,31 @@ mod tests {
             support_states >= 1_000,
             "missing support states: {support_states}"
         );
+        let mut center_states = 0;
+        for line in output
+            .lines()
+            .filter_map(|value| value.strip_prefix("CENTER "))
+        {
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(parts.len(), 3, "{line}");
+            let mut block = state(parts[0]);
+            if parts[1] != "-" {
+                for entry in parts[1].split(',') {
+                    let (key, value) = entry.split_once('=').unwrap();
+                    block.properties.insert(key.into(), value.into());
+                }
+            }
+            assert_eq!(
+                mineshaft::mineshaft_center_support(&block),
+                Some(parts[2].parse::<bool>().unwrap()),
+                "{line}"
+            );
+            center_states += 1;
+        }
+        assert!(
+            center_states >= 2_000,
+            "missing center support states: {center_states}"
+        );
     }
 
     #[test]

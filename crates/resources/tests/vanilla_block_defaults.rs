@@ -252,6 +252,42 @@ fn generated_block_defaults_match_java() {
         serde_json::json!({"id":"minecraft:grass_block", "properties":{"snowy":"true","extra":{}}}),
         serde_json::json!({"id":"example:unknown"}),
     ];
+    for id in [
+        "minecraft:rail",
+        "minecraft:powered_rail",
+        "minecraft:detector_rail",
+        "minecraft:activator_rail",
+    ] {
+        let powered = id != "minecraft:rail";
+        for shape in [
+            "north_south",
+            "east_west",
+            "ascending_east",
+            "ascending_west",
+            "ascending_north",
+            "ascending_south",
+            "south_east",
+            "south_west",
+            "north_west",
+            "north_east",
+        ] {
+            for waterlogged in ["true", "false"] {
+                for power in if powered {
+                    &["true", "false"][..]
+                } else {
+                    &["false"][..]
+                } {
+                    let mut props = serde_json::Map::new();
+                    props.insert("shape".into(), serde_json::json!(shape));
+                    props.insert("waterlogged".into(), serde_json::json!(waterlogged));
+                    if powered {
+                        props.insert("powered".into(), serde_json::json!(power));
+                    }
+                    cases.push(serde_json::json!({"id": id, "properties": props}));
+                }
+            }
+        }
+    }
     for id in ["minecraft:oak_fence", "minecraft:nether_brick_fence"] {
         for bits in 0..32 {
             let mut properties = serde_json::Map::new();
@@ -422,6 +458,19 @@ fn generated_block_defaults_match_java() {
     assert!(registry.contains("minecraft:grass_block"));
     assert!(registry.contains("minecraft:water"));
     assert!(registry.contains("minecraft:lava"));
+    for id in [
+        "minecraft:rail",
+        "minecraft:powered_rail",
+        "minecraft:detector_rail",
+        "minecraft:activator_rail",
+    ] {
+        assert!(registry.contains(id), "missing rail state schema: {id}");
+        assert_eq!(
+            registry.has_block_entity(id),
+            Some(false),
+            "rail block entity: {id}"
+        );
+    }
     assert!(registry.contains("minecraft:deepslate"));
     for id in [
         "minecraft:bee_nest",

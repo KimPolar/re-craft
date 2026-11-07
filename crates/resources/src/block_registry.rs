@@ -51,6 +51,8 @@ enum StateSchema {
     Beehive,
     Chest,
     Bed,
+    Rail,
+    PoweredRail,
     Fence,
     FenceGate,
     Door,
@@ -81,6 +83,19 @@ impl StateSchema {
                     ("facing".into(), "north".into()),
                     ("occupied".into(), "false".into()),
                     ("part".into(), "foot".into()),
+                ]);
+            }
+            Self::Rail => {
+                return BTreeMap::from([
+                    ("shape".into(), "north_south".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
+            Self::PoweredRail => {
+                return BTreeMap::from([
+                    ("powered".into(), "false".into()),
+                    ("shape".into(), "north_south".into()),
+                    ("waterlogged".into(), "false".into()),
                 ]);
             }
             Self::Fence => {
@@ -235,6 +250,28 @@ impl StateSchema {
                 if (name == "facing" && matches!(value, "north" | "south" | "east" | "west"))
                     || (name == "part" && matches!(value, "head" | "foot"))
                     || (name == "occupied" && matches!(value, "true" | "false")) =>
+            {
+                Some(value.to_owned())
+            }
+            Self::Rail | Self::PoweredRail
+                if (name == "shape"
+                    && (matches!(
+                        value,
+                        "north_south"
+                            | "east_west"
+                            | "ascending_east"
+                            | "ascending_west"
+                            | "ascending_north"
+                            | "ascending_south"
+                    ) || (matches!(self, Self::Rail)
+                        && matches!(
+                            value,
+                            "south_east" | "south_west" | "north_west" | "north_east"
+                        ))))
+                    || (name == "waterlogged" && matches!(value, "true" | "false"))
+                    || (matches!(self, Self::PoweredRail)
+                        && name == "powered"
+                        && matches!(value, "true" | "false")) =>
             {
                 Some(value.to_owned())
             }
@@ -710,6 +747,11 @@ impl GeneratedBlockRegistry {
                 }
                 "net/minecraft/world/level/block/FenceGateBlock" => Some(StateSchema::FenceGate),
                 "net/minecraft/world/level/block/BedBlock" => Some(StateSchema::Bed),
+                "net/minecraft/world/level/block/RailBlock" => Some(StateSchema::Rail),
+                "net/minecraft/world/level/block/PoweredRailBlock"
+                | "net/minecraft/world/level/block/DetectorRailBlock" => {
+                    Some(StateSchema::PoweredRail)
+                }
                 "net/minecraft/world/level/block/DoorBlock"
                 | "net/minecraft/world/level/block/WeatheringCopperDoorBlock" => {
                     Some(StateSchema::Door)
@@ -1236,6 +1278,27 @@ mod tests {
         assert_eq!(registry.has_block_entity("minecraft:unimplemented"), None);
         assert!(!registry.is_canonical_state("minecraft:unimplemented", &BTreeMap::new()));
         assert!(!registry.is_registered("example:unknown"));
+    }
+
+    #[test]
+    fn rail_schemas_validate_shapes_power_and_waterlogging() {
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([
+                ("minecraft:rail".into(), StateSchema::Rail),
+                ("minecraft:powered_rail".into(), StateSchema::PoweredRail),
+            ]),
+            block_entities: BTreeMap::new(),
+        };
+        let mut rail = StateSchema::Rail.default_properties();
+        rail.insert("shape".into(), "north_east".into());
+        assert!(registry.is_canonical_state("minecraft:rail", &rail));
+        let mut powered = StateSchema::PoweredRail.default_properties();
+        powered.insert("shape".into(), "north_east".into());
+        assert!(!registry.is_canonical_state("minecraft:powered_rail", &powered));
+        powered.insert("shape".into(), "ascending_east".into());
+        assert!(registry.is_canonical_state("minecraft:powered_rail", &powered));
+        powered.remove("powered");
+        assert!(!registry.is_canonical_state("minecraft:powered_rail", &powered));
     }
 
     #[test]

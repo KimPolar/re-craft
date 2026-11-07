@@ -10,6 +10,8 @@ import net.minecraft.world.level.block.state.properties.WallSide;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.ServerLevelAccessor;
 import net.minecraft.world.level.EmptyBlockGetter;
+import net.minecraft.world.attribute.EnvironmentAttributeReader;
+import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
@@ -37,7 +39,7 @@ public class StructurePlacementOracle {
                 Blocks.NETHERRACK, Blocks.MAGMA_BLOCK, Blocks.BLACKSTONE, Blocks.POLISHED_BLACKSTONE,
                 Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
                 Blocks.CHISELED_POLISHED_BLACKSTONE, Blocks.IRON_BARS, Blocks.JUNGLE_LEAVES,
-                Blocks.VINE, Blocks.CHEST, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR,
+                Blocks.VINE, Blocks.CHEST, Blocks.LAVA, Blocks.AIR, Blocks.CAVE_AIR, Blocks.VOID_AIR,
                 Blocks.STONE_BRICK_STAIRS, Blocks.MOSSY_STONE_BRICK_STAIRS, Blocks.STONE_STAIRS,
                 Blocks.COBBLESTONE_STAIRS, Blocks.MOSSY_COBBLESTONE_STAIRS, Blocks.BLACKSTONE_STAIRS,
                 Blocks.POLISHED_BLACKSTONE_STAIRS, Blocks.POLISHED_BLACKSTONE_BRICK_STAIRS,
@@ -52,6 +54,8 @@ public class StructurePlacementOracle {
                 var expected = b == Blocks.MAGMA_BLOCK ? BlockPos.ZERO.above() : null;
                 if (!Objects.equals(actual, expected))
                     throw new AssertionError("unexpected postprocess state " + state + " -> " + actual);
+                if (b == Blocks.LAVA && state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO))
+                    throw new AssertionError("lava unexpectedly has a full collision shape " + state);
             }
         var root=new CompoundTag(); root.put("size",ints(4,2,4));
         var palette=new ListTag(); palette.add(NbtUtils.writeBlockState(Blocks.STONE.defaultBlockState()));
@@ -69,12 +73,17 @@ public class StructurePlacementOracle {
         var origin=new BlockPos(4,12,-6); var pivot=new BlockPos(2,0,2);
         for (var mirror:Mirror.values()) for (var rotation:Rotation.values()) {
             var states=new HashMap<BlockPos,BlockState>(); var events=new ArrayList<String>();
+            var ticks = new ArrayList<String>();
+            var attributes=(EnvironmentAttributeReader)Proxy.newProxyInstance(EnvironmentAttributeReader.class.getClassLoader(),new Class<?>[]{EnvironmentAttributeReader.class},
+                (proxy,method,values)->switch(method.getName()) { case "getDimensionValue" -> false; default -> throw new UnsupportedOperationException(method.toString()); });
             var levelRandom=RandomSource.create(17L);
             var world=(ServerLevelAccessor)Proxy.newProxyInstance(ServerLevelAccessor.class.getClassLoader(),new Class<?>[]{ServerLevelAccessor.class},
                 (proxy,m,a)->switch(m.getName()) {
                     case "getBlockState" -> states.getOrDefault((BlockPos)a[0],Blocks.AIR.defaultBlockState());
                     case "getFluidState" -> states.getOrDefault((BlockPos)a[0],Blocks.AIR.defaultBlockState()).getFluidState();
                     case "getRandom" -> levelRandom;
+                    case "environmentAttributes" -> attributes;
+                    case "scheduleTick" -> { ticks.add(BuiltInRegistries.FLUID.getKey((Fluid)a[1])+":"+a[2]); yield null; }
                     case "setBlock" -> { var p=((BlockPos)a[0]).immutable(); var s=(BlockState)a[1];
                         states.put(p,s); events.add("W\t"+p.getX()+"\t"+p.getY()+"\t"+p.getZ()+"\t"+key(s)+"\t"+a[2]); yield true; }
                     case "updateNeighborsAt" -> {var p=(BlockPos)a[0]; events.add("N\t"+p.getX()+"\t"+p.getY()+"\t"+p.getZ()); yield null;}
@@ -89,6 +98,8 @@ public class StructurePlacementOracle {
                         Blocks.POLISHED_BLACKSTONE_BRICKS, Blocks.CRACKED_POLISHED_BLACKSTONE_BRICKS,
                         Blocks.CHISELED_POLISHED_BLACKSTONE)) {
                     var s = b.defaultBlockState();
+                    if (!s.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO))
+                        throw new AssertionError("portal block is not collision-full " + s);
                     for (var d : Direction.values())
                         if (s.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d),
                                 Blocks.AIR.defaultBlockState(), levelRandom) != s)
@@ -131,6 +142,16 @@ public class StructurePlacementOracle {
                 if (!straight.updateShape(world, world, BlockPos.ZERO, Direction.UP, BlockPos.ZERO.above(), air, levelRandom).getValue(WallBlock.UP))
                     throw new AssertionError("wall post override ignored");
                 bind.invoke(Blocks.AIR.builtInRegistryHolder(), List.of());
+                for (int level = 0; level < 16; level++) for (var d : Direction.values())
+                    for (var neighbor : List.of(Blocks.AIR.defaultBlockState(), Blocks.WATER.defaultBlockState())) {
+                        ticks.clear();
+                        var lava = Blocks.LAVA.defaultBlockState().setValue(LiquidBlock.LEVEL, level);
+                        if (lava.updateShape(world, world, BlockPos.ZERO, d, BlockPos.ZERO.relative(d), neighbor, levelRandom) != lava)
+                            throw new AssertionError("lava shape changed " + level);
+                        var expectedTicks = level == 0 || neighbor.getFluidState().isSource()
+                            ? List.of((level == 0 ? "minecraft:lava" : "minecraft:flowing_lava") + ":30") : List.of();
+                        if (!ticks.equals(expectedTicks)) throw new AssertionError("lava tick mismatch " + level + " " + d + " " + ticks);
+                    }
                 if (!events.isEmpty()) throw new AssertionError("unexpected shape effects");
             }
             var settings=new StructurePlaceSettings().setMirror(mirror).setRotation(rotation).setRotationPivot(pivot)

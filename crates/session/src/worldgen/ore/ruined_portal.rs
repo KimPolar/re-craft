@@ -42,6 +42,17 @@ fn portal_template_full(state: &BlockState) -> Result<bool> {
     if native_world::collision::slab_stair_solid(state).is_some() {
         return Ok(state.name.ends_with("_slab") && state.properties["type"] == "double");
     }
+    if state.name == "minecraft:lava" {
+        ensure!(
+            state.properties.len() == 1
+                && state.properties.get("level").is_some_and(|raw| raw
+                    .parse::<u8>()
+                    .ok()
+                    .is_some_and(|level| level <= 15 && level.to_string() == *raw)),
+            "invalid portal lava state"
+        );
+        return Ok(false);
+    }
     if is_air(state)
         || native_world::wall::Wall::from_state(state).is_some()
         || (state.name == "minecraft:chest"
@@ -54,13 +65,16 @@ fn portal_template_full(state: &BlockState) -> Result<bool> {
     bail!("unsupported portal template static shape: {state:?}")
 }
 
-/// Active data-pack tags used by ordinary wall neighbor updates.
-pub struct PortalWallTags {
+/// Active data-pack tags used by ordinary portal neighbor updates.
+pub struct PortalUpdateTags {
     walls: BTreeSet<String>,
     post_override: BTreeSet<String>,
+    bubble_fluids: BTreeSet<String>,
+    bubble_drag: BTreeSet<String>,
+    bubble_push: BTreeSet<String>,
 }
 
-impl PortalWallTags {
+impl PortalUpdateTags {
     pub fn load(
         resources: &mut impl native_resources::packs::ResourceProvider,
         blocks: &BTreeSet<String>,
@@ -72,13 +86,24 @@ impl PortalWallTags {
                 &ResourceId::parse("minecraft:wall_post_override")?,
                 blocks,
             )?,
+            bubble_fluids: native_resources::fluid_tags::load_bubble_column_occupiable(resources)?,
+            bubble_drag: resolve_block_tag(
+                resources,
+                &ResourceId::parse("minecraft:enables_bubble_column_drag_down")?,
+                blocks,
+            )?,
+            bubble_push: resolve_block_tag(
+                resources,
+                &ResourceId::parse("minecraft:enables_bubble_column_push_up")?,
+                blocks,
+            )?,
         })
     }
 }
 
 struct PortalTemplateRegion<'r, 'a, 'g> {
     inner: super::jigsaw::JigsawRegion<'r, 'a, 'g>,
-    wall_tags: &'g PortalWallTags,
+    wall_tags: &'g PortalUpdateTags,
 }
 
 impl JigsawPlacementWorld for PortalTemplateRegion<'_, '_, '_> {
@@ -144,6 +169,41 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties),
             "invalid portal edge state"
         );
+        if state.name == "minecraft:lava" {
+            ensure!(
+                self.inner
+                    .registry
+                    .is_canonical_state(&neighbor.name, &neighbor.properties),
+                "invalid portal lava neighbor"
+            );
+            portal_template_full(state)?;
+            let fluid = FluidState::from_block(state)
+                .map_err(anyhow::Error::msg)?
+                .context("missing portal lava")?;
+            let adjacent = FluidState::from_block(neighbor).map_err(anyhow::Error::msg)?;
+            let fluid_id = if fluid.source {
+                "minecraft:lava"
+            } else {
+                "minecraft:flowing_lava"
+            };
+            if fluid.source || adjacent.is_some_and(|value| value.source) {
+                SpringWorld::schedule_spring_tick(
+                    self.inner.region,
+                    pos,
+                    &ResourceId::parse(fluid_id)?,
+                )?;
+            }
+            if direction == [0, -1, 0]
+                && fluid.source
+                && fluid.amount == 8
+                && self.wall_tags.bubble_fluids.contains(fluid_id)
+                && (self.wall_tags.bubble_drag.contains(&neighbor.name)
+                    || self.wall_tags.bubble_push.contains(&neighbor.name))
+            {
+                SimpleBlockWorld::schedule_simple_tick(self.inner.region, pos)?;
+            }
+            return Ok(state.clone());
+        }
         if let Some(wall) = native_world::wall::Wall::from_state(state) {
             use native_world::wall::{Above, Side};
             if wall.waterlogged {
@@ -183,6 +243,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     native_world::collision::button_support_face(neighbor, opposite)
                         .context("unsupported portal wall support face")?
                 } else if is_air(neighbor)
+                    || neighbor.name == "minecraft:lava"
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
                 {
@@ -202,8 +263,16 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     .is_canonical_state(&above.name, &above.properties),
                 "invalid block above portal wall"
             );
-            let boxes = native_world::collision::block_shape(&above)
-                .context("unsupported collision shape above portal wall")?;
+            let boxes = if portal_full(&above) {
+                vec![native_world::collision::Aabb {
+                    min: glam::Vec3::ZERO,
+                    max: glam::Vec3::ONE,
+                }]
+            } else {
+                native_world::collision::block_shape(&above).with_context(|| {
+                    format!("unsupported collision shape above portal wall: {above:?}")
+                })?
+            };
             let wall_post =
                 native_world::wall::Wall::from_state(&above).is_some_and(|above| above.shape.up);
             let top = Above::from_collision(
@@ -348,6 +417,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     native_world::collision::button_support_face(neighbor, opposite)
                         .context("unsupported portal stair or slab support face")?
                 } else if is_air(neighbor)
+                    || neighbor.name == "minecraft:lava"
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
                 {
@@ -398,7 +468,7 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
             return self.inner.place_template_block(pos, state, None, random);
         }
         ensure!(
-            portal_full(state) || is_air(state),
+            portal_full(state) || is_air(state) || state.name == "minecraft:lava",
             "unsupported portal template block: {state:?}"
         );
         if !self.inner.region.writable.contains(&chunk(pos)) {
@@ -512,6 +582,9 @@ impl PortalDecorationWorld for PortalRegion<'_, '_, '_> {
                 .is_canonical_state(&state.name, &state.properties),
             "unverified portal collision state"
         );
+        if portal_full(&state) {
+            return Ok(true);
+        }
         let shape = native_world::collision::block_shape(&state)
             .with_context(|| format!("unsupported portal collision shape for {}", state.name))?;
         Ok(native_world::collision::covers_full_face(
@@ -621,7 +694,7 @@ impl DecorationRegion<'_> {
         registry: &GeneratedBlockRegistry,
         processors: &native_persistence::structure_processors::PreparedProcessors,
         protected: &BTreeSet<String>,
-        wall_tags: &PortalWallTags,
+        wall_tags: &PortalUpdateTags,
         clip: &mut native_core::beardifier::BoundingBox,
         random: &mut DecorationRandom,
     ) -> Result<bool> {
@@ -748,6 +821,138 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn installed_portal_templates_place_or_reject_jigsaw_markers() -> Result<()> {
+        use super::super::super::ruined_portal::{PreparedStart, SavedRuinedPortalPiece};
+        use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+        use native_persistence::structure_template::StructureTemplate;
+        use native_world::loaded::{BLOCK_COUNT, BlockStateId, Section};
+
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
+        let protected = resolve_block_tag(
+            &mut resources,
+            &ResourceId::parse("minecraft:features_cannot_replace")?,
+            &ids,
+        )?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut placed_count, mut guarded_count) = (0, 0);
+        for name in (1..=10)
+            .map(|n| format!("portal_{n}"))
+            .chain((1..=3).map(|n| format!("giant_portal_{n}")))
+        {
+            let id = ResourceId::parse(&format!("minecraft:ruined_portal/{name}"))?;
+            let template =
+                StructureTemplate::load(&mut resources, &id)?.context("missing portal template")?;
+            let has_jigsaws = !template.jigsaw_connectors(0)?.is_empty();
+            let selection = InitialSelection {
+                setup_index: 0,
+                air_pocket: false,
+                template: id,
+                rotation: Rotation::None,
+                mirror: Mirror::None,
+            };
+            let setup = Setup {
+                placement: VerticalPlacement::OnLandSurface,
+                air_pocket_probability: 0.0,
+                mossiness: 0.8,
+                overgrown: false,
+                vines: false,
+                can_be_cold: false,
+                replace_with_blackstone: false,
+                weight: 1.0,
+            };
+            let position = [0, 8, 0];
+            let pivot = [template.size[0] / 2, 0, template.size[2] / 2];
+            let bounds = bounding_box(
+                template.size,
+                position,
+                selection.mirror,
+                selection.rotation,
+                pivot,
+            )?;
+            let point = GenerationPoint {
+                position,
+                pivot,
+                bounds,
+            };
+            let piece =
+                SavedRuinedPortalPiece::capture(&selection, &setup, &point, template.size, false)?;
+            let processors = piece.prepare_processors(&mut resources, &ids)?;
+            let start = PreparedStart {
+                chunk: [0, 0],
+                point,
+                terrain_adjustment: TerrainAdjustment::None,
+                template: Arc::new(template),
+                piece,
+            };
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            terrain.height = 48;
+            let world = Arc::make_mut(&mut terrain.world);
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let base = world.chunks[&ChunkPos { x: 0, z: 0 }].as_ref().clone();
+            for z in -3..=3 {
+                for x in -3..=3 {
+                    let position = ChunkPos { x, z };
+                    let mut chunk = base.clone();
+                    chunk.position = position;
+                    for y in 1..3 {
+                        chunk.sections.insert(
+                            y,
+                            Arc::new(Section {
+                                blocks: Some(Box::new([BlockStateId(air.0); BLOCK_COUNT])),
+                                biomes: None,
+                                block_light: None,
+                                sky_light: None,
+                            }),
+                        );
+                    }
+                    world.chunks.insert(position, Arc::new(chunk));
+                }
+            }
+            let writable = terrain.snapshot().chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut clip =
+                BoundingBox::new([-32, 0, -32], [31, 47, 31]).map_err(anyhow::Error::msg)?;
+            let mut random = DecorationRandom::new(42);
+            let placed = region.place_ruined_portal(
+                &start,
+                &registry,
+                &processors,
+                &protected,
+                &wall_tags,
+                &mut clip,
+                &mut random,
+            );
+            if has_jigsaws {
+                let error = placed.expect_err("jigsaw markers must not be silently skipped");
+                ensure!(
+                    error.to_string().contains("portal jigsaw markers"),
+                    "{name}: {error:#}"
+                );
+                assert!(region.finish().is_err());
+                guarded_count += 1;
+                continue;
+            }
+            ensure!(placed.with_context(|| format!("placing {name}"))?);
+            region
+                .finish()
+                .with_context(|| format!("finishing {name}"))?;
+            placed_count += 1;
+        }
+        assert_eq!((placed_count, guarded_count), (8, 5));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn portal_template_and_decoration_share_one_transaction() -> Result<()> {
         use super::super::super::ruined_portal::PreparedStart;
         use native_core::beardifier::{BoundingBox, TerrainAdjustment};
@@ -761,7 +966,7 @@ mod tests {
         let mut resources = ResourceStack::open(&game)?;
         let registry = resources.vanilla_generated_block_registry()?;
         let ids = resources.vanilla_block_ids()?;
-        let wall_tags = PortalWallTags::load(&mut resources, &ids)?;
+        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
         let protected = resolve_block_tag(
             &mut resources,
             &ResourceId::parse("minecraft:features_cannot_replace")?,
@@ -1017,7 +1222,7 @@ mod tests {
         let mut resources = ResourceStack::open(&game)?;
         let registry = resources.vanilla_generated_block_registry()?;
         let ids = resources.vanilla_block_ids()?;
-        let wall_tags = PortalWallTags::load(&mut resources, &ids)?;
+        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
         let motion = HeightmapTags::load(&mut resources, &ids)?;
         let (mut terrain, tags, _, _) = super::super::tests::fixture();
         let writable = terrain.snapshot().chunks.keys().copied().collect();
@@ -1103,12 +1308,17 @@ mod tests {
                 1
             );
         }
-        let mut custom_tags = PortalWallTags {
+        let mut custom_tags = PortalUpdateTags {
             walls: wall_tags.walls.clone(),
             post_override: wall_tags.post_override.clone(),
+            bubble_fluids: wall_tags.bubble_fluids.clone(),
+            bubble_drag: wall_tags.bubble_drag.clone(),
+            bubble_push: wall_tags.bubble_push.clone(),
         };
         custom_tags.walls.insert("minecraft:air".into());
         custom_tags.post_override.insert("minecraft:air".into());
+        custom_tags.bubble_fluids.insert("minecraft:lava".into());
+        custom_tags.bubble_drag.insert("minecraft:stone".into());
         let (name, properties) =
             registry.resolve(&serde_json::json!("minecraft:stone_brick_wall"))?;
         let wall = BlockState { name, properties };
@@ -1129,6 +1339,37 @@ mod tests {
         straight.properties.insert("up".into(), "false".into());
         let post = world.update_shape([11, 8, 4], &straight, [0, 1, 0], [11, 9, 4], &air)?;
         assert_eq!(post.properties["up"], "true");
+        let (name, properties) = registry.resolve(&serde_json::json!("minecraft:lava"))?;
+        let lava = BlockState { name, properties };
+        world.place_structure_block([11, 8, 3], &lava, None, &mut DecorationRandom::new(0))?;
+        world.update_shape([11, 8, 3], &lava, [1, 0, 0], [12, 8, 3], &air)?;
+        let stone = BlockState {
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
+        };
+        world.update_shape([11, 8, 3], &lava, [0, -1, 0], [11, 7, 3], &stone)?;
+        let mut flowing = lava.clone();
+        flowing.properties.insert("level".into(), "1".into());
+        let (name, properties) = registry.resolve(&serde_json::json!("minecraft:water"))?;
+        let water = BlockState { name, properties };
+        world.update_shape([12, 8, 3], &flowing, [1, 0, 0], [13, 8, 3], &water)?;
+        let ticks = &region.world.saved_fluid_ticks[&ChunkPos { x: 0, z: 0 }];
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| tick.position == [11, 8, 3] && tick.fluid == "minecraft:lava")
+        );
+        assert!(
+            ticks
+                .iter()
+                .any(|tick| tick.position == [12, 8, 3] && tick.fluid == "minecraft:flowing_lava")
+        );
+        let block_ticks = &region.world.saved_block_ticks[&ChunkPos { x: 0, z: 0 }];
+        assert!(
+            block_ticks
+                .iter()
+                .any(|tick| tick.position == [11, 8, 3] && tick.block == "minecraft:lava")
+        );
         Ok(())
     }
 

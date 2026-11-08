@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context, Result};
 use native_persistence::{
     heightmap::{HeightBounds, SpawnHeightmaps},
+    save::WorldReadStamp,
     world::{ChunkArea, ChunkPos as SavedChunkPos, WorldReader},
 };
 use native_resources::heightmap_tags::HeightmapTags;
@@ -43,12 +44,14 @@ struct Response {
     result: Result<Option<ChunkPayload>, String>,
     stale: bool,
     entities_only: bool,
+    stamp: Option<WorldReadStamp>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Request {
     pos: ChunkPos,
     entities_only: bool,
+    stamp: Option<WorldReadStamp>,
 }
 
 struct ChunkPayload {
@@ -76,6 +79,7 @@ pub struct ChunkStreamer {
     failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
+    observed_epoch: Option<u64>,
 }
 
 impl ChunkStreamer {
@@ -101,6 +105,16 @@ impl ChunkStreamer {
         heightmap_context: Option<(HeightBounds, Arc<HeightmapTags>)>,
     ) -> Result<Self> {
         let guard = reader.session_guard();
+        let epoch = guard
+            .as_ref()
+            .map(|guard| guard.read_stamp().map(|stamp| stamp.epoch()))
+            .transpose()?;
+        // The caller's missing set predates this stamp and may have raced a writer.
+        let missing = if guard.is_some() {
+            BTreeSet::new()
+        } else {
+            missing
+        };
         let mut streamer = Self::with_entity_source(radius, missing, move |pos, entities_only| {
             if entities_only {
                 let sidecars = reader.read_chunk_sidecars(pos.x, pos.z)?;
@@ -145,6 +159,7 @@ impl ChunkStreamer {
             }))
         })?;
         streamer._world_guard = guard;
+        streamer.observed_epoch = epoch;
         Ok(streamer)
     }
 
@@ -198,6 +213,7 @@ impl ChunkStreamer {
                             result,
                             stale,
                             entities_only: request.entities_only,
+                            stamp: request.stamp,
                         })
                         .is_err()
                     {
@@ -224,10 +240,37 @@ impl ChunkStreamer {
             failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
             _world_guard: None,
+            observed_epoch: None,
         })
     }
 
     pub fn service(&mut self, session: &mut LoadedSession) -> Result<()> {
+        let active_stamp = match &self._world_guard {
+            Some(guard) => match guard.read_stamp() {
+                Ok(stamp) => Some(stamp),
+                Err(_) => return Ok(()),
+            },
+            None => None,
+        };
+        let epoch = active_stamp.as_ref().map(WorldReadStamp::epoch);
+        if self.observed_epoch != epoch {
+            self.missing.clear();
+            self.failed.clear();
+            self.entity_retry.clear();
+            self.settled_prefix = 0;
+            self.center = None;
+            self.observed_epoch = epoch;
+        }
+        let stale = session.take_stale_streamed_chunks();
+        let stale_received = !stale.is_empty();
+        for pos in stale {
+            self.missing.remove(&pos);
+            self.failed.remove(&pos);
+            self.awaiting_attachment.remove(&pos);
+            if session.has_resident_or_parked_chunk(pos) {
+                self.entity_retry.insert(pos, (Instant::now(), 0));
+            }
+        }
         let center = session
             .player_chunk()
             .context("player is outside the supported block coordinate range")?;
@@ -285,7 +328,14 @@ impl ChunkStreamer {
                 .filter(|pos| within(**pos, windows.primary) && self.missing.contains(pos))
             {
                 if !world.missing_chunks.contains(pos) {
-                    session.queue_missing_chunk(*pos);
+                    session.queue_streamed_chunk(
+                        *pos,
+                        None,
+                        None,
+                        None,
+                        None,
+                        active_stamp.clone(),
+                    );
                 }
             }
         }
@@ -298,7 +348,13 @@ impl ChunkStreamer {
                     // The player may move while an I/O operation is running.
                     // Do not let an obsolete missing/error result poison a
                     // future visit to that chunk.
-                    if response.stale || !windows.contains(response.pos) {
+                    if response.stale
+                        || !windows.contains(response.pos)
+                        || response
+                            .stamp
+                            .as_ref()
+                            .is_some_and(|stamp| !stamp.is_current())
+                    {
                         continue;
                     }
                     match response.result {
@@ -308,18 +364,14 @@ impl ChunkStreamer {
                             poi,
                             heightmaps,
                         })) => {
-                            if let Some(world) = world {
-                                session.queue_loaded_chunk_with_poi(
-                                    response.pos,
-                                    world,
-                                    entities,
-                                    Some(poi),
-                                    heightmaps,
-                                );
-                            } else {
-                                session.queue_entity_chunk(response.pos, entities);
-                                session.queue_poi_chunk(response.pos, poi);
-                            }
+                            session.queue_streamed_chunk(
+                                response.pos,
+                                world,
+                                Some(entities),
+                                Some(poi),
+                                heightmaps,
+                                response.stamp,
+                            );
                             self.awaiting_attachment.insert(response.pos);
                         }
                         Ok(None) if response.entities_only => {
@@ -329,7 +381,14 @@ impl ChunkStreamer {
                             self.failed.remove(&response.pos);
                             self.missing.insert(response.pos);
                             if within(response.pos, (center, self.radius)) {
-                                session.queue_missing_chunk(response.pos);
+                                session.queue_streamed_chunk(
+                                    response.pos,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    response.stamp,
+                                );
                             }
                         }
                         Err(error) => {
@@ -409,7 +468,10 @@ impl ChunkStreamer {
                 && !session.has_chunk_or_pending(*pos)
         });
         let retry_due = entity_retry_due || terrain_retry_due;
-        if windows_changed || received || retry_due {
+        if windows_changed || received || retry_due || stale_received {
+            if stale_received {
+                self.settled_prefix = 0;
+            }
             while let Some(&pos) = self.targets.get(self.settled_prefix) {
                 if !self.missing.contains(&pos)
                     && !self.failed.contains_key(&pos)
@@ -447,6 +509,7 @@ impl ChunkStreamer {
                     .try_send(Request {
                         pos,
                         entities_only: retry && session.has_chunk_or_pending(pos),
+                        stamp: active_stamp.clone(),
                     }) {
                     Ok(()) => {
                         self.pending.insert(pos);
@@ -696,6 +759,86 @@ mod tests {
         assert!(native_persistence::save::WorldWriteGuard::acquire(world.path()).is_err());
         drop(streamer);
         wait_for_world_unlock(world.path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writer_invalidates_queued_results_and_retries_missing_chunks() {
+        let (_world, reader) = locked_world_fixture();
+        let guard = reader.session_guard().unwrap();
+        let stamp = guard.read_stamp().unwrap();
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let missing = ChunkPos { x: 0, z: 1 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.queue_streamed_chunk(
+            target,
+            Some(chunk_world(target)),
+            Some(SavedEntityData::Empty),
+            Some(SavedPoiData::Missing),
+            None,
+            Some(stamp.clone()),
+        );
+        session.queue_streamed_chunk(missing, None, None, None, None, Some(stamp));
+        let mut streamer =
+            ChunkStreamer::with_entity_source(1, BTreeSet::from([target]), move |pos, _| {
+                Ok((pos == target).then(|| ChunkPayload {
+                    world: Some(chunk_world(pos)),
+                    entities: SavedEntityData::Empty,
+                    poi: SavedPoiData::Missing,
+                    heightmaps: None,
+                }))
+            })
+            .unwrap();
+        streamer.observed_epoch = Some(guard.read_stamp().unwrap().epoch());
+        streamer._world_guard = Some(guard.clone());
+        drop(guard.acquire_write().unwrap());
+        session.update(Duration::from_millis(50));
+        assert!(!session.has_resident_or_parked_chunk(target));
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .missing_chunks
+                .contains(&missing)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if session.has_resident_or_parked_chunk(target) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stale chunk was not retried");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(
+            session.saved_entity_chunk(target),
+            Some(SavedEntityData::Empty)
+        ));
+        assert!(matches!(
+            session.saved_poi_chunk(target),
+            Some(SavedPoiData::Missing)
+        ));
     }
 
     #[test]
@@ -1159,6 +1302,7 @@ mod tests {
                 result: Ok(None),
                 stale: false,
                 entities_only: false,
+                stamp: None,
             })
             .unwrap();
         sender
@@ -1167,6 +1311,7 @@ mod tests {
                 result: Err("transient".into()),
                 stale: false,
                 entities_only: false,
+                stamp: None,
             })
             .unwrap();
         streamer.service(&mut session).unwrap();

@@ -14,8 +14,8 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -1967,10 +1967,47 @@ pub struct WorldSessionGuard {
     shared: Arc<SessionLock>,
 }
 
+/// Identity of the world state used for one asynchronous read request.
+#[derive(Clone)]
+pub struct WorldReadStamp {
+    session: WorldSessionGuard,
+    epoch: u64,
+}
+
+/// Keeps a writer from proceeding while a current read result is attached.
+pub struct WorldReadLease<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl WorldReadStamp {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.session
+            .read_stamp()
+            .is_ok_and(|stamp| stamp.epoch == self.epoch)
+    }
+
+    pub fn lock_current(&self) -> Result<WorldReadLease<'_>> {
+        let guard = self
+            .session
+            .shared
+            .attachment_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(self.is_current(), "world read result is stale");
+        Ok(WorldReadLease { _guard: guard })
+    }
+}
+
 struct SessionLock {
     root: PathBuf,
     _lock: WorldLock,
     writer_active: AtomicBool,
+    write_epoch: AtomicU64,
+    attachment_gate: Mutex<()>,
     region_caches: Mutex<Vec<Weak<Mutex<crate::world::WorldRegionCache>>>>,
 }
 
@@ -1981,6 +2018,8 @@ impl WorldSessionGuard {
                 root: root.to_path_buf(),
                 _lock: WorldLock::acquire(root)?,
                 writer_active: AtomicBool::new(false),
+                write_epoch: AtomicU64::new(0),
+                attachment_gate: Mutex::new(()),
                 region_caches: Mutex::new(Vec::new()),
             }),
         })
@@ -2008,10 +2047,32 @@ impl WorldSessionGuard {
         Ok(())
     }
 
+    /// Capture a token for an asynchronous read. A later writer invalidates it.
+    pub fn read_stamp(&self) -> Result<WorldReadStamp> {
+        self.ensure_reader_available()?;
+        let epoch = self.shared.write_epoch.load(Ordering::Acquire);
+        self.ensure_reader_available()?;
+        Ok(WorldReadStamp {
+            session: self.clone(),
+            epoch,
+        })
+    }
+
     /// Reuse this session's OS lock for a single writer. The caller must pause
     /// conflicting reads and coordinate the simulation before a gameplay save.
     /// Only the existing lossless rewrite operation is currently available.
     pub fn acquire_write(&self) -> Result<WorldWriteGuard> {
+        self.acquire_exclusive(true)
+    }
+
+    /// Reserve a coherent source capture without claiming that files changed.
+    pub(crate) fn acquire_capture(&self) -> Result<WorldCaptureGuard> {
+        Ok(WorldCaptureGuard {
+            _guard: self.acquire_exclusive(false)?,
+        })
+    }
+
+    fn acquire_exclusive(&self, invalidates_reads: bool) -> Result<WorldWriteGuard> {
         ensure!(
             self.shared
                 .writer_active
@@ -2023,6 +2084,22 @@ impl WorldSessionGuard {
             root: self.shared.root.clone(),
             session: self.clone(),
         };
+        if invalidates_reads {
+            self.shared
+                .write_epoch
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| anyhow::anyhow!("world write epoch exhausted"))?;
+        }
+        // A tick that has already accepted a read result finishes before the
+        // writer starts replacing files. New attachments see the new epoch.
+        drop(
+            self.shared
+                .attachment_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         {
             let mut caches = self
                 .shared
@@ -2053,6 +2130,11 @@ impl WorldSessionGuard {
 pub struct WorldWriteGuard {
     root: PathBuf,
     session: WorldSessionGuard,
+}
+
+/// A source capture cannot mutate world files through its exclusive lease.
+pub(crate) struct WorldCaptureGuard {
+    _guard: WorldWriteGuard,
 }
 
 impl Drop for WorldWriteGuard {
@@ -7013,6 +7095,56 @@ mod tests {
         assert!(WorldWriteGuard::acquire(world.path()).is_err());
         drop(session);
         assert!(WorldWriteGuard::acquire(world.path()).is_ok());
+    }
+
+    #[test]
+    fn writer_waits_for_read_attachment_and_invalidates_old_stamps() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let world = test_world();
+        fixture(world.path());
+        let reader = crate::world::WorldReader::open_for_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+        )
+        .unwrap();
+        let session = reader.session_guard().unwrap();
+        let stamp = session.read_stamp().unwrap();
+        let capture = session.acquire_capture().unwrap();
+        assert!(session.read_stamp().is_err());
+        drop(capture);
+        assert!(
+            stamp.is_current(),
+            "read-only capture must not invalidate results"
+        );
+        let lease = stamp.lock_current().unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_session = session.clone();
+        let writer = thread::spawn(move || {
+            let _guard = writer_session.acquire_write().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.shared.writer_active.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "writer did not start");
+            thread::yield_now();
+        }
+        assert!(acquired_rx.try_recv().is_err());
+        drop(lease);
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!stamp.is_current());
+        assert!(stamp.lock_current().is_err());
+        assert!(session.read_stamp().is_err());
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let fresh = session.read_stamp().unwrap();
+        assert_ne!(stamp.epoch(), fresh.epoch());
+        assert!(fresh.lock_current().is_ok());
     }
 
     #[test]

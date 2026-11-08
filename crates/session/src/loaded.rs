@@ -160,6 +160,7 @@ struct IncomingChunk {
     entities: Option<SavedEntityData>,
     poi: Option<SavedPoiData>,
     heightmaps: Option<SpawnHeightmaps>,
+    stamp: Option<native_persistence::save::WorldReadStamp>,
 }
 
 #[derive(Clone, Copy)]
@@ -851,6 +852,7 @@ pub struct LoadedSession {
     respawn_window: Option<(ChunkPos, u32)>,
     pending_respawn_window: Option<Option<(ChunkPos, u32)>>,
     incoming: VecDeque<IncomingChunk>,
+    stale_streamed_chunks: BTreeSet<ChunkPos>,
     stream_errors: Vec<String>,
     fluid_ticks: BTreeMap<(i128, i32, i64, u64), ScheduledFluid>,
     fluid_pending: BTreeSet<FluidTickKey>,
@@ -7027,6 +7029,7 @@ impl LoadedSession {
             respawn_window: None,
             pending_respawn_window: None,
             incoming: VecDeque::new(),
+            stale_streamed_chunks: BTreeSet::new(),
             stream_errors: Vec::new(),
             fluid_ticks: BTreeMap::new(),
             fluid_pending: BTreeSet::new(),
@@ -7214,6 +7217,7 @@ impl LoadedSession {
             entities: Some(entities),
             poi: None,
             heightmaps: None,
+            stamp: None,
         });
     }
 
@@ -7242,6 +7246,7 @@ impl LoadedSession {
             entities: Some(entities),
             poi,
             heightmaps,
+            stamp: None,
         });
     }
 
@@ -7253,6 +7258,7 @@ impl LoadedSession {
             entities: None,
             poi: Some(poi),
             heightmaps: None,
+            stamp: None,
         });
     }
 
@@ -10227,7 +10233,33 @@ impl LoadedSession {
             entities: None,
             poi: None,
             heightmaps: None,
+            stamp: None,
         });
+    }
+
+    /// Queue one streamed result together with the world state it was read from.
+    pub fn queue_streamed_chunk(
+        &mut self,
+        pos: ChunkPos,
+        world: Option<World>,
+        entities: Option<SavedEntityData>,
+        poi: Option<SavedPoiData>,
+        heightmaps: Option<SpawnHeightmaps>,
+        stamp: Option<native_persistence::save::WorldReadStamp>,
+    ) {
+        self.incoming.push_back(IncomingChunk {
+            pos,
+            world,
+            entities,
+            poi,
+            heightmaps,
+            stamp,
+        });
+    }
+
+    /// Return stream results discarded because a world writer invalidated them.
+    pub fn take_stale_streamed_chunks(&mut self) -> BTreeSet<ChunkPos> {
+        std::mem::take(&mut self.stale_streamed_chunks)
     }
 
     pub fn has_chunk_or_pending(&self, pos: ChunkPos) -> bool {
@@ -11341,8 +11373,19 @@ impl LoadedSession {
             entities,
             poi,
             heightmaps,
+            stamp,
         }) = self.incoming.pop_front()
         {
+            let _read_lease = match &stamp {
+                Some(stamp) => match stamp.lock_current() {
+                    Ok(lease) => Some(lease),
+                    Err(_) => {
+                        self.stale_streamed_chunks.insert(pos);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let primary = self
                 .stream_window
                 .is_none_or(|window| within_window(pos, window));
@@ -11354,16 +11397,7 @@ impl LoadedSession {
             }
             match source {
                 None => {
-                    if let Some(data) = poi {
-                        if (self.world.chunks.contains_key(&pos)
-                            || self.parked_chunks.contains_key(&pos))
-                            && let Err(error) = self.attach_poi_chunk(pos, data)
-                        {
-                            self.stream_errors
-                                .push(format!("POI chunk {}, {}: {error:#}", pos.x, pos.z));
-                        }
-                        continue;
-                    }
+                    let has_sidecars = entities.is_some() || poi.is_some();
                     if let Some(data) = entities {
                         if (self.world.chunks.contains_key(&pos)
                             || self.parked_chunks.contains_key(&pos))
@@ -11387,6 +11421,16 @@ impl LoadedSession {
                                     .push(format!("entity chunk {}, {}: {error:#}", pos.x, pos.z)),
                             }
                         }
+                    }
+                    if let Some(data) = poi
+                        && (self.world.chunks.contains_key(&pos)
+                            || self.parked_chunks.contains_key(&pos))
+                        && let Err(error) = self.attach_poi_chunk(pos, data)
+                    {
+                        self.stream_errors
+                            .push(format!("POI chunk {}, {}: {error:#}", pos.x, pos.z));
+                    }
+                    if has_sidecars {
                         continue;
                     }
                     if primary

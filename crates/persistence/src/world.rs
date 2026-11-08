@@ -1138,7 +1138,7 @@ impl WorldReader {
             .session_guard
             .clone()
             .context("generation capture requires a locked world session")?;
-        let _lease = session.acquire_write()?;
+        let _lease = session.acquire_capture()?;
         let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
         let terrain_dir = self.dimension.region_dir(&self.root);
         let entity_dir = self.dimension.entity_region_dir(&self.root);

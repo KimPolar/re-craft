@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -287,6 +287,36 @@ pub struct SavedPoiChunk {
     pub position: ChunkPos,
     pub document: Arc<NamedTag>,
     pub sections: BTreeMap<i32, SavedPoiSection>,
+}
+
+/// The original disk entries observed at one generation input position.
+pub struct GenerationChunkSource {
+    pub terrain: Option<LoadedChunk>,
+    pub entities: Option<SavedEntityChunk>,
+    pub poi: Option<SavedPoiChunk>,
+}
+
+/// A locked world's disk inputs. This does not include unsaved session state,
+/// generator settings, data packs or proof that every required chunk was read.
+pub struct GenerationSourceSnapshot {
+    pub(crate) session: crate::save::WorldSessionGuard,
+    pub(crate) dimension: DimensionId,
+    pub(crate) chunks: BTreeMap<ChunkPos, GenerationChunkSource>,
+}
+
+impl GenerationSourceSnapshot {
+    pub fn dimension(&self) -> &DimensionId {
+        &self.dimension
+    }
+
+    pub fn chunks(&self) -> &BTreeMap<ChunkPos, GenerationChunkSource> {
+        &self.chunks
+    }
+
+    /// Reuse the same world lock when the captured work is ready to save.
+    pub fn session_guard(&self) -> crate::save::WorldSessionGuard {
+        self.session.clone()
+    }
 }
 
 impl SavedPoiChunk {
@@ -660,12 +690,66 @@ pub struct WorldReader {
     dimension: DimensionId,
     root: PathBuf,
     session_guard: Option<crate::save::WorldSessionGuard>,
+    region_cache: Arc<Mutex<WorldRegionCache>>,
+}
+
+#[derive(Default)]
+pub(crate) struct WorldRegionCache {
     regions: BTreeMap<(i32, i32), RegionReader>,
     region_usage: VecDeque<(i32, i32)>,
     entity_regions: BTreeMap<(i32, i32), RegionReader>,
     entity_region_usage: VecDeque<(i32, i32)>,
     poi_regions: BTreeMap<(i32, i32), RegionReader>,
     poi_region_usage: VecDeque<(i32, i32)>,
+}
+
+impl WorldRegionCache {
+    pub(crate) fn clear(&mut self) {
+        self.regions.clear();
+        self.region_usage.clear();
+        self.entity_regions.clear();
+        self.entity_region_usage.clear();
+        self.poi_regions.clear();
+        self.poi_region_usage.clear();
+    }
+
+    fn read_terrain(&mut self, directory: &Path, x: i32, z: i32) -> Result<Option<LoadedChunk>> {
+        read_validated_region_document(
+            directory,
+            x,
+            z,
+            &mut self.regions,
+            &mut self.region_usage,
+            |document| decode_chunk(document, ChunkPos { x, z }),
+        )
+    }
+
+    fn read_entities(
+        &mut self,
+        directory: &Path,
+        x: i32,
+        z: i32,
+    ) -> Result<Option<SavedEntityChunk>> {
+        read_validated_region_document(
+            directory,
+            x,
+            z,
+            &mut self.entity_regions,
+            &mut self.entity_region_usage,
+            |document| decode_entity_chunk(document, ChunkPos { x, z }),
+        )
+    }
+
+    fn read_poi(&mut self, directory: &Path, x: i32, z: i32) -> Result<Option<SavedPoiChunk>> {
+        read_validated_region_document(
+            directory,
+            x,
+            z,
+            &mut self.poi_regions,
+            &mut self.poi_region_usage,
+            |document| decode_poi_chunk(document, ChunkPos { x, z }),
+        )
+    }
 }
 
 /// The saved pack order and feature flags, before discovery of newly added packs.
@@ -949,12 +1033,10 @@ impl WorldReader {
     pub fn set_dimension(&mut self, dimension: DimensionId) {
         if self.dimension != dimension {
             self.dimension = dimension;
-            self.regions.clear();
-            self.region_usage.clear();
-            self.entity_regions.clear();
-            self.entity_region_usage.clear();
-            self.poi_regions.clear();
-            self.poi_region_usage.clear();
+            self.region_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
     }
     /// Inspect a world without acquiring the Java session lock. This is only
@@ -983,8 +1065,16 @@ impl WorldReader {
             session.matches_root(&root),
             "session lock belongs to a different world"
         );
+        let region_cache = Arc::new(Mutex::new(WorldRegionCache::default()));
+        session.register_region_cache(&region_cache);
+        // Register before reading level.dat so a simultaneous writer waits
+        // until the reader has captured its initial metadata.
+        let gate = region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        session.ensure_reader_available()?;
         let mut reader = Self::open_inner(&root, dimension, false)?;
         ensure!(reader.root == root, "world directory changed while opening");
+        drop(gate);
+        reader.region_cache = region_cache;
         reader.session_guard = Some(session);
         Ok(reader)
     }
@@ -1006,23 +1096,71 @@ impl WorldReader {
             "unsupported world DataVersion {}; expected {TARGET_DATA_VERSION}",
             info.data_version
         );
+        let region_cache = Arc::new(Mutex::new(WorldRegionCache::default()));
+        if let Some(session) = &session_guard {
+            session.register_region_cache(&region_cache);
+        }
         Ok(Self {
             info,
             level: Arc::new(level),
             dimension,
             root,
             session_guard,
-            regions: BTreeMap::new(),
-            region_usage: VecDeque::new(),
-            entity_regions: BTreeMap::new(),
-            entity_region_usage: VecDeque::new(),
-            poi_regions: BTreeMap::new(),
-            poi_region_usage: VecDeque::new(),
+            region_cache,
         })
     }
 
     pub fn session_guard(&self) -> Option<crate::save::WorldSessionGuard> {
         self.session_guard.clone()
+    }
+
+    /// Read selected terrain, entity and POI inputs under the world's session
+    /// lock and an exclusive native writer lease. Cached region handles are
+    /// reopened so an earlier atomic save cannot leave this capture stale.
+    /// Missing entries remain distinct from malformed or unreadable entries.
+    pub fn capture_generation_sources(
+        &mut self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<GenerationSourceSnapshot> {
+        let session = self
+            .session_guard
+            .clone()
+            .context("generation capture requires a locked world session")?;
+        let _lease = session.acquire_write()?;
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let terrain_dir = self.dimension.region_dir(&self.root);
+        let entity_dir = self.dimension.entity_region_dir(&self.root);
+        let poi_dir = self.dimension.poi_region_dir(&self.root);
+        let mut chunks = BTreeMap::new();
+        for position in positions {
+            ensure!(
+                !chunks.contains_key(&position),
+                "duplicate generation source chunk"
+            );
+            let terrain = cache.read_terrain(&terrain_dir, position.x, position.z)?;
+            if let Some(chunk) = &terrain {
+                crate::save::validate_chunk(&chunk.document.value, position.x, position.z)
+                    .with_context(|| {
+                        format!("invalid generation terrain {}, {}", position.x, position.z)
+                    })?;
+            }
+            let entities = cache.read_entities(&entity_dir, position.x, position.z)?;
+            let poi = cache.read_poi(&poi_dir, position.x, position.z)?;
+            chunks.insert(
+                position,
+                GenerationChunkSource {
+                    terrain,
+                    entities,
+                    poi,
+                },
+            );
+        }
+        ensure!(!chunks.is_empty(), "no generation source chunks");
+        Ok(GenerationSourceSnapshot {
+            session,
+            dimension: self.dimension.clone(),
+            chunks,
+        })
     }
 
     pub fn singleplayer_uuid_words(&self) -> Result<Option<[i32; 4]>> {
@@ -1817,6 +1955,12 @@ impl WorldReader {
     /// Enumerate actual saved entries without decoding chunk payloads. Missing
     /// stores are empty, while malformed region headers are reported as errors.
     pub fn saved_chunk_positions(&self, store: RegionStore) -> Result<BTreeSet<ChunkPos>> {
+        // Enumeration also opens region files temporarily. Keep the same
+        // reader gate as chunk decoding until every handle is closed.
+        let _cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
         let directory = match store {
             RegionStore::Terrain => self.dimension.region_dir(&self.root),
             RegionStore::Entities => self.dimension.entity_region_dir(&self.root),
@@ -1850,14 +1994,11 @@ impl WorldReader {
 
     pub fn read_chunk(&mut self, x: i32, z: i32) -> Result<Option<LoadedChunk>> {
         let directory = self.dimension.region_dir(&self.root);
-        read_validated_region_document(
-            &directory,
-            x,
-            z,
-            &mut self.regions,
-            &mut self.region_usage,
-            |document| decode_chunk(document, ChunkPos { x, z }),
-        )
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
+        cache.read_terrain(&directory, x, z)
     }
 
     /// A missing entity-region entry represents an empty entity chunk in 26.3.
@@ -1865,28 +2006,22 @@ impl WorldReader {
     /// that an unreadable chunk is empty.
     pub fn read_entity_chunk(&mut self, x: i32, z: i32) -> Result<Option<SavedEntityChunk>> {
         let directory = self.dimension.entity_region_dir(&self.root);
-        read_validated_region_document(
-            &directory,
-            x,
-            z,
-            &mut self.entity_regions,
-            &mut self.entity_region_usage,
-            |document| decode_entity_chunk(document, ChunkPos { x, z }),
-        )
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
+        cache.read_entities(&directory, x, z)
     }
 
     /// Missing POI storage is distinct from a decoded empty entry: Java can
     /// populate or rebuild it when loading the corresponding terrain sections.
     pub fn read_poi_chunk(&mut self, x: i32, z: i32) -> Result<Option<SavedPoiChunk>> {
         let directory = self.dimension.poi_region_dir(&self.root);
-        read_validated_region_document(
-            &directory,
-            x,
-            z,
-            &mut self.poi_regions,
-            &mut self.poi_region_usage,
-            |document| decode_poi_chunk(document, ChunkPos { x, z }),
-        )
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
+        cache.read_poi(&directory, x, z)
     }
 
     pub fn read_area(&mut self, center: ChunkPos, radius: u32) -> Result<ChunkArea> {
@@ -3053,6 +3188,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn session_writer_waits_for_cached_readers_and_reopens_afterward() {
+        use super::*;
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("cache-writer-")
+            .tempdir_in(parent)
+            .unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let region_dir = dimension.region_dir(dir.path());
+        std::fs::create_dir_all(&region_dir).unwrap();
+        std::fs::write(region_dir.join("r.0.0.mca"), vec![0_u8; 8192]).unwrap();
+        let mut reader = WorldReader::open_for_session(dir.path(), dimension).unwrap();
+        assert!(reader.read_chunk(0, 0).unwrap().is_none());
+        let session = reader.session_guard().unwrap();
+        let held = reader.region_cache.lock().unwrap();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_session = session.clone();
+        let worker = std::thread::spawn(move || {
+            let writer = worker_session.acquire_write().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(writer);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.ensure_reader_available().is_ok() {
+            assert!(Instant::now() < deadline, "writer did not start");
+            std::thread::yield_now();
+        }
+        assert!(acquired_rx.try_recv().is_err());
+        drop(held);
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(reader.read_chunk(0, 0).is_err());
+        assert!(reader.saved_chunk_positions(RegionStore::Terrain).is_err());
+        assert!(
+            WorldReader::open_with_session(
+                dir.path(),
+                DimensionId::parse("overworld").unwrap(),
+                session.clone(),
+            )
+            .is_err()
+        );
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(reader.read_chunk(0, 0).unwrap().is_none());
+        assert_eq!(reader.region_cache.lock().unwrap().regions.len(), 1);
+    }
+
+    #[test]
     fn region_handles_are_bounded_and_recent_regions_remain_cached() {
         let dir = tempfile::tempdir().unwrap();
         write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
@@ -3073,9 +3264,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(reader.regions.len(), MAX_OPEN_REGIONS);
-        assert!(reader.regions.contains_key(&(0, 0)));
-        assert!(!reader.regions.contains_key(&(1, 0)));
+        let cache = reader.region_cache.lock().unwrap();
+        assert_eq!(cache.regions.len(), MAX_OPEN_REGIONS);
+        assert!(cache.regions.contains_key(&(0, 0)));
+        assert!(!cache.regions.contains_key(&(1, 0)));
     }
 
     #[test]
@@ -3181,16 +3373,19 @@ mod tests {
         assert!(reader.read_chunk(0, 0).is_err());
         assert!(reader.read_entity_chunk(0, 0).is_err());
         assert!(reader.read_poi_chunk(0, 0).is_err());
-        assert!(
-            reader.regions.is_empty()
-                && reader.entity_regions.is_empty()
-                && reader.poi_regions.is_empty()
-        );
-        assert!(
-            reader.region_usage.is_empty()
-                && reader.entity_region_usage.is_empty()
-                && reader.poi_region_usage.is_empty()
-        );
+        {
+            let cache = reader.region_cache.lock().unwrap();
+            assert!(
+                cache.regions.is_empty()
+                    && cache.entity_regions.is_empty()
+                    && cache.poi_regions.is_empty()
+            );
+            assert!(
+                cache.region_usage.is_empty()
+                    && cache.entity_region_usage.is_empty()
+                    && cache.poi_region_usage.is_empty()
+            );
+        }
         for (path, fields) in directories.iter().zip([terrain, entities, poi]) {
             write(path, fields, TARGET_DATA_VERSION);
         }
@@ -3284,11 +3479,17 @@ mod tests {
                     .get("marker"),
                 Some(&Tag::Int(index + 10))
             );
-            assert_eq!(reader.regions.len(), 1);
-            assert_eq!(reader.entity_regions.len(), 1);
+            {
+                let cache = reader.region_cache.lock().unwrap();
+                assert_eq!(cache.regions.len(), 1);
+                assert_eq!(cache.entity_regions.len(), 1);
+            }
             reader.set_dimension(DimensionId::parse(name).unwrap());
-            assert_eq!(reader.regions.len(), 1);
-            assert_eq!(reader.entity_regions.len(), 1);
+            {
+                let cache = reader.region_cache.lock().unwrap();
+                assert_eq!(cache.regions.len(), 1);
+                assert_eq!(cache.entity_regions.len(), 1);
+            }
         }
         for (path, bytes) in files {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
@@ -3466,7 +3667,7 @@ mod tests {
             assert_eq!(section.records[0].position, [-1, -1, 0]);
             assert_eq!(section.records[0].type_id, "minecraft:home".into());
             assert_eq!(section.records[0].free_tickets, 1);
-            assert_eq!(reader.poi_regions.len(), 1);
+            assert_eq!(reader.region_cache.lock().unwrap().poi_regions.len(), 1);
         }
         for (path, bytes, _) in &files {
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
@@ -3544,10 +3745,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(reader.entity_regions.len(), MAX_OPEN_REGIONS);
-        assert!(reader.entity_regions.contains_key(&(0, 0)));
-        assert!(!reader.entity_regions.contains_key(&(1, 0)));
-        assert!(reader.regions.is_empty());
+        {
+            let cache = reader.region_cache.lock().unwrap();
+            assert_eq!(cache.entity_regions.len(), MAX_OPEN_REGIONS);
+            assert!(cache.entity_regions.contains_key(&(0, 0)));
+            assert!(!cache.entity_regions.contains_key(&(1, 0)));
+            assert!(cache.regions.is_empty());
+        }
         assert_eq!(
             std::fs::read(path.join("r.0.0.mca")).unwrap(),
             vec![0u8; 8192]

@@ -14,7 +14,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -999,6 +999,7 @@ pub struct WorldSavePlan {
     entity_chunks: Vec<PlannedEntityChunk>,
     poi_chunks: Vec<PlannedEntityChunk>,
     generation_dependencies: Vec<PlannedGenerationDependency>,
+    generation_source_session: Option<WorldSessionGuard>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedSharedData>,
     weather: Option<PlannedSharedData>,
@@ -1039,6 +1040,40 @@ enum RegionKind {
     Blocks,
     Entities,
     Poi,
+}
+
+impl PlannedGenerationDependency {
+    fn capture(
+        dimension: DimensionId,
+        kind: RegionKind,
+        position: crate::world::ChunkPos,
+        source: Option<&nbt::NamedTag>,
+    ) -> Result<Self> {
+        if let Some(document) = source {
+            match kind {
+                RegionKind::Blocks => validate_chunk(&document.value, position.x, position.z)?,
+                RegionKind::Entities => {
+                    validate_entity_document(document, position)?;
+                }
+                RegionKind::Poi => {
+                    crate::world::decode_poi_chunk(document.clone(), position)?;
+                }
+            }
+        }
+        let source_nbt = source.map(nbt::write).transpose()?;
+        ensure!(
+            source_nbt
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() <= nbt::MAX_NBT_BYTES),
+            "generation dependency exceeds NBT limit"
+        );
+        Ok(Self {
+            dimension,
+            kind,
+            position,
+            source_nbt,
+        })
+    }
 }
 
 struct RegionChange {
@@ -1120,31 +1155,61 @@ impl WorldSavePlan {
             }),
             "duplicate generation dependency"
         );
-        if let Some(document) = source {
-            match kind {
-                RegionKind::Blocks => validate_chunk(&document.value, position.x, position.z)?,
-                RegionKind::Entities => {
-                    validate_entity_document(document, position)?;
-                }
-                RegionKind::Poi => {
-                    crate::world::decode_poi_chunk(document.clone(), position)?;
-                }
+        self.generation_dependencies
+            .push(PlannedGenerationDependency::capture(
+                dimension, kind, position, source,
+            )?);
+        Ok(())
+    }
+
+    /// Bind every disk entry in a locked generation capture to this save.
+    /// All captures in a plan must belong to the same locked world session.
+    /// This does not include unsaved simulation state or generation settings.
+    pub fn add_generation_sources(
+        &mut self,
+        snapshot: &crate::world::GenerationSourceSnapshot,
+    ) -> Result<()> {
+        if let Some(session) = &self.generation_source_session {
+            ensure!(
+                Arc::ptr_eq(&session.shared, &snapshot.session.shared),
+                "generation captures belong to different world sessions"
+            );
+        }
+        let existing: BTreeSet<_> = self
+            .generation_dependencies
+            .iter()
+            .map(|entry| (entry.dimension.clone(), entry.kind, entry.position))
+            .collect();
+        let mut pending = Vec::with_capacity(snapshot.chunks.len().saturating_mul(3));
+        for (&position, chunk) in &snapshot.chunks {
+            for (kind, document) in [
+                (
+                    RegionKind::Blocks,
+                    chunk.terrain.as_ref().map(|v| v.document.as_ref()),
+                ),
+                (
+                    RegionKind::Entities,
+                    chunk.entities.as_ref().map(|v| v.document.as_ref()),
+                ),
+                (
+                    RegionKind::Poi,
+                    chunk.poi.as_ref().map(|v| v.document.as_ref()),
+                ),
+            ] {
+                ensure!(
+                    !existing.contains(&(snapshot.dimension.clone(), kind, position)),
+                    "duplicate generation dependency"
+                );
+                pending.push(PlannedGenerationDependency::capture(
+                    snapshot.dimension.clone(),
+                    kind,
+                    position,
+                    document,
+                )?);
             }
         }
-        let source_nbt = source.map(nbt::write).transpose()?;
-        ensure!(
-            source_nbt
-                .as_ref()
-                .is_none_or(|bytes| bytes.len() <= nbt::MAX_NBT_BYTES),
-            "generation dependency exceeds NBT limit"
-        );
-        self.generation_dependencies
-            .push(PlannedGenerationDependency {
-                dimension,
-                kind,
-                position,
-                source_nbt,
-            });
+        self.generation_dependencies.extend(pending);
+        self.generation_source_session = Some(snapshot.session.clone());
         Ok(())
     }
 
@@ -1906,6 +1971,7 @@ struct SessionLock {
     root: PathBuf,
     _lock: WorldLock,
     writer_active: AtomicBool,
+    region_caches: Mutex<Vec<Weak<Mutex<crate::world::WorldRegionCache>>>>,
 }
 
 impl WorldSessionGuard {
@@ -1915,12 +1981,31 @@ impl WorldSessionGuard {
                 root: root.to_path_buf(),
                 _lock: WorldLock::acquire(root)?,
                 writer_active: AtomicBool::new(false),
+                region_caches: Mutex::new(Vec::new()),
             }),
         })
     }
 
     pub(crate) fn matches_root(&self, root: &Path) -> bool {
         self.shared.root == root
+    }
+
+    pub(crate) fn register_region_cache(&self, cache: &Arc<Mutex<crate::world::WorldRegionCache>>) {
+        let mut caches = self
+            .shared
+            .region_caches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        caches.retain(|cache| cache.strong_count() != 0);
+        caches.push(Arc::downgrade(cache));
+    }
+
+    pub(crate) fn ensure_reader_available(&self) -> Result<()> {
+        ensure!(
+            !self.shared.writer_active.load(Ordering::Acquire),
+            "world write is in progress"
+        );
+        Ok(())
     }
 
     /// Reuse this session's OS lock for a single writer. The caller must pause
@@ -1938,6 +2023,21 @@ impl WorldSessionGuard {
             root: self.shared.root.clone(),
             session: self.clone(),
         };
+        {
+            let mut caches = self
+                .shared
+                .region_caches
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            caches.retain(|weak| {
+                if let Some(cache) = weak.upgrade() {
+                    cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         crate::save_transaction::ensure_no_pending(&guard.root)?;
         let level = anvil::read_level(&guard.root)?;
         ensure!(
@@ -2035,6 +2135,12 @@ impl WorldWriteGuard {
         plan: WorldSavePlan,
         mut validate_change: impl FnMut(&DimensionId, &crate::edit::BlockChange) -> Result<()>,
     ) -> Result<WorldSaveResult> {
+        if let Some(session) = &plan.generation_source_session {
+            ensure!(
+                Arc::ptr_eq(&session.shared, &self.session.shared),
+                "generation capture belongs to a different world session"
+            );
+        }
         ensure!(
             !plan.chunks.is_empty()
                 || !plan.generated_chunks.is_empty()
@@ -8007,6 +8113,187 @@ mod tests {
         guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
         assert_eq!(fs::read(entity_path).unwrap(), entity_region);
         assert_eq!(fs::read(poi_path).unwrap(), poi_region);
+    }
+
+    #[test]
+    fn locked_generation_capture_refreshes_regions_and_detects_later_changes() {
+        let world = test_world();
+        fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
+        let session = reader.session_guard().unwrap();
+        let mut second_reader = crate::world::WorldReader::open_with_session(
+            world.path(),
+            dimension.clone(),
+            session.clone(),
+        )
+        .unwrap();
+        assert!(reader.read_chunk(3, 0).unwrap().is_none());
+        assert!(second_reader.read_chunk(0, 0).unwrap().is_some());
+        let mut writer = session.acquire_write().unwrap();
+        assert!(second_reader.read_chunk(0, 0).is_err());
+        assert!(
+            reader
+                .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        let mut first = WorldSavePlan::new();
+        first
+            .add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 3, z: 0 },
+                &editable_chunk(3),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        writer.write_plan(first, |_, _| Ok(())).unwrap();
+        drop(writer);
+        assert!(second_reader.read_chunk(3, 0).unwrap().is_some());
+        let snapshot = reader
+            .capture_generation_sources([
+                ChunkPos { x: 1, z: 0 },
+                ChunkPos { x: 3, z: 0 },
+                ChunkPos { x: 50, z: 0 },
+            ])
+            .unwrap();
+        assert_eq!(snapshot.dimension(), &dimension);
+        assert!(
+            snapshot.chunks()[&ChunkPos { x: 3, z: 0 }]
+                .terrain
+                .is_some()
+        );
+        assert!(
+            snapshot.chunks()[&ChunkPos { x: 50, z: 0 }]
+                .terrain
+                .is_none()
+        );
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_sources(&snapshot).unwrap();
+        assert_eq!(plan.generation_dependencies.len(), 9);
+        assert!(plan.add_generation_sources(&snapshot).is_err());
+        assert_eq!(plan.generation_dependencies.len(), 9);
+        plan.add_generated_chunk(
+            dimension.clone(),
+            ChunkPos { x: 96, z: 0 },
+            &editable_chunk(96),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let mut writer = snapshot.session_guard().acquire_write().unwrap();
+        let mut intervening = WorldSavePlan::new();
+        intervening
+            .add_generated_chunk(
+                dimension,
+                ChunkPos { x: 50, z: 0 },
+                &editable_chunk(50),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        writer.write_plan(intervening, |_, _| Ok(())).unwrap();
+        assert!(writer.write_plan(plan, |_, _| Ok(())).is_err());
+        assert!(
+            !world
+                .path()
+                .join("dimensions/minecraft/overworld/region/r.3.0.mca")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn generation_capture_rejects_unlocked_or_wrong_world_sessions() {
+        let world = test_world();
+        fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut unlocked =
+            crate::world::WorldReader::open(world.path(), dimension.clone()).unwrap();
+        assert!(
+            unlocked
+                .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        drop(unlocked);
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
+        assert!(reader.capture_generation_sources([]).is_err());
+        assert!(
+            reader
+                .capture_generation_sources([ChunkPos { x: 1, z: 0 }, ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        let snapshot = reader
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        let other = test_world();
+        fixture(other.path());
+        let mut other_locked =
+            crate::world::WorldReader::open_for_session(other.path(), dimension.clone()).unwrap();
+        let other_snapshot = other_locked
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_sources(&snapshot).unwrap();
+        assert!(plan.add_generation_sources(&other_snapshot).is_err());
+        assert_eq!(plan.generation_dependencies.len(), 3);
+        plan.add_generated_chunk(
+            dimension,
+            ChunkPos { x: 3, z: 0 },
+            &editable_chunk(3),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let mut writer = other_locked
+            .session_guard()
+            .unwrap()
+            .acquire_write()
+            .unwrap();
+        assert!(writer.write_plan(plan, |_, _| Ok(())).is_err());
+        let mut other_reader =
+            crate::world::WorldReader::open(other.path(), DimensionId::parse("overworld").unwrap())
+                .unwrap();
+        assert!(other_reader.read_chunk(3, 0).unwrap().is_none());
+        drop(reader);
+        assert!(WorldWriteGuard::acquire(world.path()).is_err());
+        drop(snapshot);
+        assert!(WorldWriteGuard::acquire(world.path()).is_ok());
+    }
+
+    #[test]
+    fn failed_generation_capture_releases_writer_and_does_not_guess_missing_data() {
+        let world = test_world();
+        fixture(world.path());
+        let entities = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir(&entities).unwrap();
+        let path = entities.join("r.0.0.mca");
+        fs::write(&path, [1_u8, 2, 3]).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension).unwrap();
+        assert!(
+            reader
+                .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        let session = reader.session_guard().unwrap();
+        let writer = session.acquire_write().unwrap();
+        drop(writer);
+        fs::remove_file(path).unwrap();
+        let snapshot = reader
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        assert!(
+            snapshot.chunks()[&ChunkPos { x: 1, z: 0 }]
+                .entities
+                .is_none()
+        );
     }
 
     #[test]

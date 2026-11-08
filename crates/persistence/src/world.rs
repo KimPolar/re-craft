@@ -289,6 +289,18 @@ pub struct SavedPoiChunk {
     pub sections: BTreeMap<i32, SavedPoiSection>,
 }
 
+/// Sidecar reads can fail independently, without discarding usable terrain.
+pub struct ChunkSidecarReads {
+    pub entities: Result<Option<SavedEntityChunk>>,
+    pub poi: Result<Option<SavedPoiChunk>>,
+}
+
+/// Terrain and sidecar reads taken during the same region-reader gate.
+pub struct ChunkBundleRead {
+    pub terrain: LoadedChunk,
+    pub sidecars: ChunkSidecarReads,
+}
+
 /// The original disk entries observed at one generation input position.
 pub struct GenerationChunkSource {
     pub terrain: Option<LoadedChunk>,
@@ -2001,6 +2013,55 @@ impl WorldReader {
         cache.read_terrain(&directory, x, z)
     }
 
+    /// With a session lock, read terrain and both sidecars without allowing a
+    /// coordinated writer between the reads. Unlocked readers require caller
+    /// coordination. Missing terrain returns None; sidecar errors stay separate.
+    /// Later simulation attachment must still be coordinated with saves.
+    pub fn read_chunk_bundle(&mut self, x: i32, z: i32) -> Result<Option<ChunkBundleRead>> {
+        self.read_chunk_bundle_inner(
+            x,
+            z,
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    fn read_chunk_bundle_inner(
+        &mut self,
+        x: i32,
+        z: i32,
+        #[cfg(test)] after_terrain: impl FnOnce(),
+    ) -> Result<Option<ChunkBundleRead>> {
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
+        let Some(terrain) = cache.read_terrain(&self.dimension.region_dir(&self.root), x, z)?
+        else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        after_terrain();
+        let sidecars = ChunkSidecarReads {
+            entities: cache.read_entities(&self.dimension.entity_region_dir(&self.root), x, z),
+            poi: cache.read_poi(&self.dimension.poi_region_dir(&self.root), x, z),
+        };
+        Ok(Some(ChunkBundleRead { terrain, sidecars }))
+    }
+
+    /// Retry entity and POI reads under one gate; unlocked readers still need
+    /// the caller to coordinate concurrent writers.
+    pub fn read_chunk_sidecars(&mut self, x: i32, z: i32) -> Result<ChunkSidecarReads> {
+        let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = &self.session_guard {
+            session.ensure_reader_available()?;
+        }
+        Ok(ChunkSidecarReads {
+            entities: cache.read_entities(&self.dimension.entity_region_dir(&self.root), x, z),
+            poi: cache.read_poi(&self.dimension.poi_region_dir(&self.root), x, z),
+        })
+    }
+
     /// A missing entity-region entry represents an empty entity chunk in 26.3.
     /// Invalid data is returned as an error so collision queries cannot assume
     /// that an unreadable chunk is empty.
@@ -3241,6 +3302,125 @@ mod tests {
         worker.join().unwrap();
         assert!(reader.read_chunk(0, 0).unwrap().is_none());
         assert_eq!(reader.region_cache.lock().unwrap().regions.len(), 1);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bundled_chunk_reads_do_not_mix_data_across_a_save() {
+        use super::*;
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        fn write_region(directory: &Path, document: &NamedTag) {
+            std::fs::create_dir_all(directory).unwrap();
+            let nbt = nbt::write(document).unwrap();
+            assert!(nbt.len() + 5 <= 4096);
+            let mut bytes = vec![0_u8; 3 * 4096];
+            bytes[0..4].copy_from_slice(&((2_u32 << 8) | 1).to_be_bytes());
+            bytes[8192..8196].copy_from_slice(&((nbt.len() + 1) as u32).to_be_bytes());
+            bytes[8196] = 3;
+            bytes[8197..8197 + nbt.len()].copy_from_slice(&nbt);
+            std::fs::write(directory.join("r.0.0.mca"), bytes).unwrap();
+        }
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+        std::fs::create_dir_all(&parent).unwrap();
+        let world = tempfile::Builder::new()
+            .prefix("bundle-read-")
+            .tempdir_in(parent)
+            .unwrap();
+        write_gzip(&world.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let terrain = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("xPos".into(), Tag::Int(0)),
+                ("zPos".into(), Tag::Int(0)),
+                ("Status".into(), Tag::String("minecraft:full".into())),
+            ]),
+        };
+        let entity = |marker| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Position".into(), Tag::IntArray(vec![0, 0])),
+                ("marker".into(), Tag::Int(marker)),
+            ]),
+        };
+        let poi = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        write_region(&dimension.region_dir(world.path()), &terrain);
+        let entities_dir = dimension.entity_region_dir(world.path());
+        write_region(&entities_dir, &entity(1));
+        write_region(&dimension.poi_region_dir(world.path()), &poi);
+        let mut reader = WorldReader::open_for_session(world.path(), dimension).unwrap();
+        let session = reader.session_guard().unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let read_worker = std::thread::spawn(move || {
+            reader
+                .read_chunk_bundle_inner(0, 0, || {
+                    read_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                })
+                .unwrap()
+                .unwrap()
+        });
+        read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_session = session.clone();
+        let corrupt_dir = entities_dir.clone();
+        let writer = std::thread::spawn(move || {
+            let guard = writer_session.acquire_write().unwrap();
+            write_region(&entities_dir, &entity(2));
+            write_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.ensure_reader_available().is_ok() {
+            assert!(Instant::now() < deadline, "writer did not start");
+            std::thread::yield_now();
+        }
+        assert!(write_rx.try_recv().is_err());
+        continue_tx.send(()).unwrap();
+        let bundle = read_worker.join().unwrap();
+        write_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            bundle
+                .sidecars
+                .entities
+                .unwrap()
+                .unwrap()
+                .document
+                .value
+                .get("marker"),
+            Some(&Tag::Int(1))
+        );
+        assert!(bundle.sidecars.poi.unwrap().is_some());
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        std::fs::write(corrupt_dir.join("r.0.0.mca"), [1_u8, 2, 3]).unwrap();
+        let mut reader = WorldReader::open_with_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+            session,
+        )
+        .unwrap();
+        let bundle = reader.read_chunk_bundle(0, 0).unwrap().unwrap();
+        assert!(bundle.sidecars.entities.is_err());
+        assert!(bundle.sidecars.poi.unwrap().is_some());
+        let retried = reader.read_chunk_sidecars(0, 0).unwrap();
+        assert!(retried.entities.is_err());
+        assert!(retried.poi.unwrap().is_some());
+        assert!(reader.read_chunk_bundle(1, 0).unwrap().is_none());
     }
 
     #[test]

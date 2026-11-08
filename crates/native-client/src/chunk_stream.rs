@@ -103,18 +103,19 @@ impl ChunkStreamer {
         let guard = reader.session_guard();
         let mut streamer = Self::with_entity_source(radius, missing, move |pos, entities_only| {
             if entities_only {
+                let sidecars = reader.read_chunk_sidecars(pos.x, pos.z)?;
                 return Ok(Some(ChunkPayload {
                     world: None,
-                    entities: read_entity_data(&mut reader, pos),
-                    poi: read_poi_data(&mut reader, pos),
+                    entities: entity_data_from_read(sidecars.entities, pos),
+                    poi: poi_data_from_read(sidecars.poi, pos),
                     heightmaps: None,
                 }));
             }
-            let Some(chunk) = reader.read_chunk(pos.x, pos.z)? else {
+            let Some(bundle) = reader.read_chunk_bundle(pos.x, pos.z)? else {
                 return Ok(None);
             };
             let saved = SavedChunkPos { x: pos.x, z: pos.z };
-            let chunk = Arc::new(chunk);
+            let chunk = Arc::new(bundle.terrain);
             let area = ChunkArea {
                 center: saved,
                 radius: 0,
@@ -122,8 +123,8 @@ impl ChunkStreamer {
                 missing: Vec::new(),
             };
             let world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
-            let entities = read_entity_data(&mut reader, pos);
-            let poi = read_poi_data(&mut reader, pos);
+            let entities = entity_data_from_read(bundle.sidecars.entities, pos);
+            let poi = poi_data_from_read(bundle.sidecars.poi, pos);
             let heightmaps = heightmap_context.as_ref().and_then(|(bounds, tags)| {
                 match native_session::spawn_heightmaps::prepare(&chunk, &world, *bounds, tags) {
                     Ok(maps) => Some(maps),
@@ -473,7 +474,14 @@ fn schedule_retry(retries: &mut BTreeMap<ChunkPos, (Instant, u32)>, pos: ChunkPo
 }
 
 pub(crate) fn read_entity_data(reader: &mut WorldReader, pos: ChunkPos) -> SavedEntityData {
-    match reader.read_entity_chunk(pos.x, pos.z) {
+    entity_data_from_read(reader.read_entity_chunk(pos.x, pos.z), pos)
+}
+
+fn entity_data_from_read(
+    result: Result<Option<native_persistence::world::SavedEntityChunk>>,
+    pos: ChunkPos,
+) -> SavedEntityData {
+    match result {
         Ok(None) => SavedEntityData::Empty,
         Ok(Some(chunk)) => SavedEntityData::Present(Arc::new(chunk)),
         Err(error) => {
@@ -487,7 +495,14 @@ pub(crate) fn read_entity_data(reader: &mut WorldReader, pos: ChunkPos) -> Saved
 }
 
 pub(crate) fn read_poi_data(reader: &mut WorldReader, pos: ChunkPos) -> SavedPoiData {
-    match reader.read_poi_chunk(pos.x, pos.z) {
+    poi_data_from_read(reader.read_poi_chunk(pos.x, pos.z), pos)
+}
+
+fn poi_data_from_read(
+    result: Result<Option<native_persistence::world::SavedPoiChunk>>,
+    pos: ChunkPos,
+) -> SavedPoiData {
+    match result {
         Ok(None) => SavedPoiData::Missing,
         Ok(Some(chunk)) => SavedPoiData::Present(Arc::new(chunk)),
         Err(error) => {

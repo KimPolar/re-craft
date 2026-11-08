@@ -287,8 +287,14 @@ impl ItemStack {
                     "minecraft:potion" | "minecraft:tipped_arrow"
                 ) && max_component_consistent(self)
                     && max_component_consistent(other)
-                    && ordinary_return_supported(self)
-                    && ordinary_return_supported(other)
+                    && crate::equippable::saved_ordinary_max_with_enchantments(
+                        self.id(),
+                        &self.components,
+                    ) == self.max_count
+                    && crate::equippable::saved_ordinary_max_with_enchantments(
+                        other.id(),
+                        &other.components,
+                    ) == other.max_count
                     && potion_components_equal(&self.components, &other.components))
                 || (max_component_consistent(self)
                     && max_component_consistent(other)
@@ -6274,6 +6280,43 @@ mod tests {
     }
 
     #[test]
+    fn enchanted_tipped_arrows_merge_equivalent_potion_encodings() {
+        let components = |potion: Tag, level: i32| {
+            Tag::Compound(vec![
+                ("minecraft:potion_contents".into(), potion),
+                (
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(level))]),
+                ),
+            ])
+        };
+        let compact = components(Tag::String("swiftness".into()), 2);
+        let expanded = components(
+            Tag::Compound(vec![(
+                "potion".into(),
+                Tag::String("minecraft:swiftness".into()),
+            )]),
+            2,
+        );
+        let different = components(Tag::String("swiftness".into()), 3);
+        let left = ItemStack::new("minecraft:tipped_arrow".into(), 7, 64, compact).unwrap();
+        let right =
+            ItemStack::new("minecraft:tipped_arrow".into(), 8, 64, expanded.clone()).unwrap();
+        let other = ItemStack::new("minecraft:tipped_arrow".into(), 1, 64, different).unwrap();
+        assert!(left.same_item_and_components(&right));
+        assert!(!left.same_item_and_components(&other));
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(PlayerSlot::Storage(0), Some(right.clone()));
+        let mut dropped = Some(left.clone());
+        assert!(inventory.pickup_stack(&mut dropped, false));
+        assert!(dropped.is_none());
+        let merged = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+        assert_eq!(merged.count(), 15);
+        assert_eq!(merged.components(), &expanded);
+        assert!(validate_item_balance([&left, &right], [merged]).is_ok());
+    }
+
+    #[test]
     fn custom_potion_effects_compare_and_merge_without_losing_components() {
         use native_persistence::nbt::TagType;
         let components = |id: &str, duration: i32, explicit_defaults: bool| {
@@ -6474,6 +6517,47 @@ mod tests {
                         let expected = format!(
                             "S {id} minecraft:{potion} {max} {color:06x} {}",
                             left.same_item_and_components(&right)
+                        );
+                        assert!(output.lines().any(|line| line == expected), "{expected}");
+                        let add_enchantment = |components: &Tag, level: i32| {
+                            let Tag::Compound(mut fields) = components.clone() else {
+                                unreachable!()
+                            };
+                            fields.push((
+                                "minecraft:enchantments".into(),
+                                Tag::Compound(vec![(
+                                    "minecraft:sharpness".into(),
+                                    Tag::Int(level),
+                                )]),
+                            ));
+                            Tag::Compound(fields)
+                        };
+                        let enchanted = ItemStack::new(
+                            id.into(),
+                            1,
+                            max,
+                            add_enchantment(left.components(), 2),
+                        )
+                        .unwrap();
+                        let canonical = ItemStack::new(
+                            id.into(),
+                            1,
+                            max,
+                            add_enchantment(right.components(), 2),
+                        )
+                        .unwrap();
+                        let other = ItemStack::new(
+                            id.into(),
+                            1,
+                            max,
+                            add_enchantment(right.components(), 3),
+                        )
+                        .unwrap();
+                        let expected = format!(
+                            "A {id} minecraft:{potion} {} {} {}",
+                            enchanted.same_item_and_components(&canonical),
+                            enchanted.same_item_and_components(&other),
+                            enchanted.same_item_and_components(&right)
                         );
                         assert!(output.lines().any(|line| line == expected), "{expected}");
                         let empty = Tag::Compound(vec![(

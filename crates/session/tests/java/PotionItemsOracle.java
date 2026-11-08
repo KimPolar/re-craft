@@ -1,6 +1,7 @@
 import net.minecraft.SharedConstants;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.resources.RegistryOps;
@@ -9,6 +10,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
 
 public class PotionItemsOracle {
     public static void main(String[] args) {
@@ -18,6 +21,7 @@ public class PotionItemsOracle {
         var registries = VanillaRegistries.createReloadableLookup(lookup);
         for (var pending : BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries)) pending.apply();
         var ops = RegistryOps.create(NbtOps.INSTANCE, registries);
+        var sharpness = registries.lookupOrThrow(Registries.ENCHANTMENT).getOrThrow(Enchantments.SHARPNESS);
         for (var item : java.util.List.of(Items.POTION, Items.TIPPED_ARROW)) {
             for (var potion : java.util.List.of(Potions.POISON, Potions.SLOWNESS, Potions.REGENERATION, Potions.STRENGTH)) {
                 var stack = PotionContents.createItemStack(item, potion);
@@ -36,6 +40,20 @@ public class PotionItemsOracle {
                 raw.put("components", components);
                 var decoded = ItemStack.CODEC.parse(ops, raw).getOrThrow();
                 var canonical = PotionContents.createItemStack(item, potion);
+                var enchantments = new net.minecraft.nbt.CompoundTag();
+                enchantments.putInt("minecraft:sharpness", 2);
+                components.put("minecraft:enchantments", enchantments);
+                var enchanted = ItemStack.CODEC.parse(ops, raw).getOrThrow();
+                var enchantmentSet = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+                enchantmentSet.set(sharpness, 2);
+                var enchantedCanonical = canonical.copy();
+                enchantedCanonical.set(DataComponents.ENCHANTMENTS, enchantmentSet.toImmutable());
+                var otherEnchantments = new ItemEnchantments.Mutable(ItemEnchantments.EMPTY);
+                otherEnchantments.set(sharpness, 3);
+                var otherLevel = canonical.copy();
+                otherLevel.set(DataComponents.ENCHANTMENTS, otherEnchantments.toImmutable());
+                System.out.printf("A %s %s %s %s %s%n", BuiltInRegistries.ITEM.getKey(item), potion.getRegisteredName(), ItemStack.isSameItemSameComponents(enchanted, enchantedCanonical), ItemStack.isSameItemSameComponents(enchanted, otherLevel), ItemStack.isSameItemSameComponents(enchanted, canonical));
+                components.remove("minecraft:enchantments");
                 int color = decoded.get(DataComponents.POTION_CONTENTS).getColor() & 0xffffff;
                 System.out.printf("S %s %s %d %06x %s%n", BuiltInRegistries.ITEM.getKey(item), potion.getRegisteredName(), decoded.getMaxStackSize(), color, ItemStack.isSameItemSameComponents(decoded, canonical));
                 var full = new net.minecraft.nbt.CompoundTag();

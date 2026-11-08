@@ -47,6 +47,26 @@ pub struct RegionReader {
     file_length: u64,
 }
 
+fn sector_allocation(location: u32, file_length: u64) -> Result<Option<(u64, u64)>> {
+    if location == 0 {
+        return Ok(None);
+    }
+    let offset = u64::from(location >> 8);
+    let sectors = u64::from(location & 0xff);
+    ensure!(offset >= 2 && sectors > 0, "invalid chunk sector location");
+    let start = offset
+        .checked_mul(SECTOR_SIZE)
+        .context("region offset overflow")?;
+    let allocation = sectors * SECTOR_SIZE;
+    ensure!(
+        start
+            .checked_add(allocation)
+            .is_some_and(|end| end <= file_length),
+        "chunk sectors exceed region file"
+    );
+    Ok(Some((start, allocation)))
+}
+
 impl RegionReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file_name = path
@@ -85,6 +105,33 @@ impl RegionReader {
             .transpose()
     }
 
+    /// Enumerate all present chunk coordinates from the location table.
+    /// Reject malformed entries rather than silently omitting saved data.
+    pub fn chunk_positions(&mut self) -> Result<Vec<(i32, i32)>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut table = [0u8; SECTOR_SIZE as usize];
+        self.file
+            .read_exact(&mut table)
+            .context("cannot read region location table")?;
+        let mut positions = Vec::new();
+        for (index, entry) in table.chunks_exact(4).enumerate() {
+            let location = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            if sector_allocation(location, self.file_length)
+                .with_context(|| format!("invalid region location at index {index}"))?
+                .is_none()
+            {
+                continue;
+            }
+            let x = i64::from(self.region_x) * i64::from(REGION_SIDE) + (index % 32) as i64;
+            let z = i64::from(self.region_z) * i64::from(REGION_SIDE) + (index / 32) as i64;
+            positions.push((
+                i32::try_from(x).context("region chunk X coordinate overflows")?,
+                i32::try_from(z).context("region chunk Z coordinate overflows")?,
+            ));
+        }
+        Ok(positions)
+    }
+
     pub(crate) fn read_chunk_nbt_bytes(
         &mut self,
         chunk_x: i32,
@@ -105,22 +152,9 @@ impl RegionReader {
             .read_exact(&mut entry)
             .context("cannot read region location table")?;
         let location = u32::from_be_bytes(entry);
-        if location == 0 {
+        let Some((start, allocation)) = sector_allocation(location, self.file_length)? else {
             return Ok(None);
-        }
-        let offset = u64::from(location >> 8);
-        let sectors = u64::from(location & 0xff);
-        ensure!(offset >= 2 && sectors > 0, "invalid chunk sector location");
-        let start = offset
-            .checked_mul(SECTOR_SIZE)
-            .context("region offset overflow")?;
-        let allocation = sectors * SECTOR_SIZE;
-        ensure!(
-            start
-                .checked_add(allocation)
-                .is_some_and(|end| end <= self.file_length),
-            "chunk sectors exceed region file"
-        );
+        };
         self.file.seek(SeekFrom::Start(start))?;
         let mut length_bytes = [0u8; 4];
         self.file.read_exact(&mut length_bytes)?;
@@ -204,6 +238,44 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&nbt::write(&chunk()).unwrap()).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn lists_present_chunks_and_keeps_reads_at_the_correct_offset() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("r.-1.-1.mca");
+        let compressed = zlib_chunk();
+        let mut data = vec![0u8; 4 * SECTOR_SIZE as usize];
+        data[0..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+        data[4092..4096].copy_from_slice(&((3u32 << 8) | 1).to_be_bytes());
+        let start = 3 * SECTOR_SIZE as usize;
+        data[start..start + 4].copy_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+        data[start + 4] = 2;
+        data[start + 5..start + 5 + compressed.len()].copy_from_slice(&compressed);
+        std::fs::write(&path, data)?;
+        let mut reader = RegionReader::open(&path)?;
+        assert_eq!(reader.chunk_positions()?, vec![(-32, -32), (-1, -1)]);
+        assert_eq!(reader.read_chunk(-1, -1)?, Some(chunk()));
+        assert_eq!(reader.chunk_positions()?, vec![(-32, -32), (-1, -1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_or_unrepresentable_chunk_locations() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("r.0.0.mca");
+        for location in [1u32, 2 << 8, (1 << 8) | 1, (2 << 8) | 1] {
+            let mut data = vec![0u8; HEADER_SIZE as usize];
+            data[0..4].copy_from_slice(&location.to_be_bytes());
+            std::fs::write(&path, data)?;
+            assert!(RegionReader::open(&path)?.chunk_positions().is_err());
+        }
+        let path = dir.path().join("r.2147483647.0.mca");
+        let mut data = vec![0u8; 3 * SECTOR_SIZE as usize];
+        data[0..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+        std::fs::write(&path, data)?;
+        assert!(RegionReader::open(&path)?.chunk_positions().is_err());
+        Ok(())
     }
 
     #[test]

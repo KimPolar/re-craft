@@ -105,6 +105,12 @@ public class NbtOracle {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             NbtIo.write(root, (DataOutput) new DataOutputStream(bytes));
             System.out.println(Base64.getEncoder().encodeToString(bytes.toByteArray()));
+        } else if (args[0].equals("duplicate-entity-fields")) {
+            byte[] bytes = Base64.getDecoder().decode(args[1]);
+            CompoundTag tag = NbtIo.read((DataInput)new DataInputStream(new ByteArrayInputStream(bytes)));
+            var position = tag.getIntArray("Position").orElseThrow();
+            var entities = tag.getListOrEmpty("Entities");
+            System.out.println(position[0] + "," + position[1] + ":" + entities.size());
         } else if (args[0].equals("random")) {
             CompoundTag root = new CompoundTag();
             root.putLongArray("legacy", randomSamples(false));
@@ -865,6 +871,63 @@ public class AllowCommandsOracle {
         )
         .unwrap();
         assert_eq!(reader.allow_commands().unwrap(), expected, "case {index}");
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_reads_the_last_duplicate_entity_chunk_fields() {
+    use native_persistence::nbt::TagType;
+    let game = minecraft_dir();
+    let java = java_bin();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("NbtOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run_checked(
+        Command::new(java.join("javac.exe"))
+            .current_dir(temp.path())
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-classpath")
+            .arg(classpath(&game, None))
+            .arg(&source),
+    );
+    let runtime_cp = classpath(&game, Some(temp.path()));
+    for reverse in [false, true] {
+        let mut positions = [Tag::IntArray(vec![-33, 5]), Tag::IntArray(vec![0, 0])];
+        let mut lists = [
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![])],
+            },
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+        ];
+        if reverse {
+            positions.swap(0, 1);
+            lists.swap(0, 1);
+        }
+        let root = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("Position".into(), positions[0].clone()),
+                ("Entities".into(), lists[0].clone()),
+                ("Position".into(), positions[1].clone()),
+                ("Entities".into(), lists[1].clone()),
+            ]),
+        };
+        let actual = run_checked(
+            Command::new(java.join("java.exe"))
+                .current_dir(temp.path())
+                .arg("-classpath")
+                .arg(&runtime_cp)
+                .arg("NbtOracle")
+                .arg("duplicate-entity-fields")
+                .arg(STANDARD.encode(nbt::write(&root).unwrap())),
+        );
+        assert_eq!(actual, if reverse { "-33,5:1" } else { "0,0:0" });
     }
 }
 

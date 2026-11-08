@@ -2031,10 +2031,19 @@ pub(crate) fn decode_entity_chunk(
     expected: ChunkPos,
 ) -> Result<SavedEntityChunk> {
     use crate::nbt::TagType;
-    ensure!(
-        matches!(&document.value, Tag::Compound(_)),
-        "entity chunk must be a compound"
-    );
+    let Tag::Compound(fields) = &document.value else {
+        bail!("entity chunk must be a compound");
+    };
+    // Java's compound map cannot retain repeated keys. Accepting an ambiguous
+    // root here could select different positions or entities than Java and
+    // discard data when that world is subsequently opened there.
+    let mut names = BTreeSet::new();
+    for (name, _) in fields {
+        ensure!(
+            names.insert(name.0.as_slice()),
+            "entity chunk contains duplicate root field {name:?}"
+        );
+    }
     match document.value.get("DataVersion") {
         Some(Tag::Int(TARGET_DATA_VERSION)) => {}
         Some(Tag::Int(version)) => {
@@ -3154,6 +3163,59 @@ mod tests {
                 .entities()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn entity_documents_reject_duplicate_root_fields_in_either_order() {
+        let position = ChunkPos { x: -33, z: 5 };
+        let fields: Vec<(crate::nbt::JavaString, Tag)> = vec![
+            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+            (
+                "Position".into(),
+                Tag::IntArray(vec![position.x, position.z]),
+            ),
+            (
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![(
+                        "id".into(),
+                        Tag::String("minecraft:pig".into()),
+                    )])],
+                },
+            ),
+            ("future".into(), Tag::Int(1)),
+        ];
+        for (index, replacement) in [
+            Tag::Int(TARGET_DATA_VERSION - 1),
+            Tag::IntArray(vec![0, 0]),
+            Tag::List {
+                element_type: TagType::End,
+                values: vec![],
+            },
+            Tag::Int(2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for prefix in [false, true] {
+                let mut duplicated = fields.clone();
+                let entry = (fields[index].0.clone(), replacement.clone());
+                if prefix {
+                    duplicated.insert(index, entry);
+                } else {
+                    duplicated.push(entry);
+                }
+                let document = NamedTag {
+                    name: "".into(),
+                    value: Tag::Compound(duplicated),
+                };
+                let error = decode_entity_chunk(document, position)
+                    .err()
+                    .expect("duplicate must fail");
+                assert!(format!("{error:#}").contains("duplicate root field"));
+            }
+        }
     }
 
     #[test]

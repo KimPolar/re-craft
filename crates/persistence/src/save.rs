@@ -5389,6 +5389,23 @@ mod tests {
             )
             .is_err()
         );
+        let mut duplicate_unknown = source.clone();
+        let Tag::Compound(fields) = &mut duplicate_unknown.value else {
+            unreachable!()
+        };
+        fields.push(("future".into(), Tag::Int(1)));
+        fields.push(("future".into(), Tag::Int(2)));
+        assert!(
+            plan.add_entity_chunk(
+                dimension.clone(),
+                ChunkPos { x: 0, z: 0 },
+                Some(&duplicate_unknown),
+                &duplicate_unknown,
+                1,
+                |_, _| Ok(())
+            )
+            .is_err()
+        );
         plan.add_entity_chunk(
             dimension,
             ChunkPos { x: 0, z: 0 },

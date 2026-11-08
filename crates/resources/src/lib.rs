@@ -67,6 +67,7 @@ pub mod ocean_ruin;
 pub mod ore_feature;
 pub mod packs;
 pub mod placed_feature;
+pub mod random_enchantment;
 pub mod recipes;
 pub mod respawn_environment;
 pub mod respawn_tags;

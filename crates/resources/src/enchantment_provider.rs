@@ -269,9 +269,9 @@ impl DifficultyProvider {
     }
 }
 
-type TagCache = BTreeMap<ResourceId, Option<Vec<ResourceId>>>;
+pub(crate) type TagCache = BTreeMap<ResourceId, Option<Vec<ResourceId>>>;
 
-fn resolve_set(
+pub(crate) fn resolve_set(
     provider: &mut impl ResourceProvider,
     folder: &str,
     registry: &BTreeSet<ResourceId>,

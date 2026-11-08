@@ -577,6 +577,32 @@ mod face_tests {
     use super::*;
 
     #[test]
+    fn iron_chain_collision_follows_axis_and_rejects_invalid_states() {
+        for (axis, min, max) in [
+            ("x", [0.0, 6.5, 6.5], [16.0, 9.5, 9.5]),
+            ("y", [6.5, 0.0, 6.5], [9.5, 16.0, 9.5]),
+            ("z", [6.5, 6.5, 0.0], [9.5, 9.5, 16.0]),
+        ] {
+            for wet in ["false", "true"] {
+                let mut state = BlockState {
+                    name: "minecraft:iron_chain".into(),
+                    properties: [
+                        ("axis".into(), axis.into()),
+                        ("waterlogged".into(), wet.into()),
+                    ]
+                    .into(),
+                };
+                let expected = vec![pixel_box(min[0], min[1], min[2], max[0], max[1], max[2])];
+                assert_eq!(block_shape(&state), Some(expected));
+                state
+                    .properties
+                    .insert("waterlogged".into(), "invalid".into());
+                assert!(block_shape(&state).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn full_face_requires_complete_coverage_on_the_requested_boundary() {
         assert!(covers_full_face(FULL, IVec3::X));
         assert!(covers_full_face(BOTTOM_SLAB, IVec3::NEG_Y));
@@ -828,6 +854,22 @@ pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
     let id = state.name.strip_prefix("minecraft:")?;
+    if id == "iron_chain" {
+        if state.properties.len() != 2
+            || !matches!(
+                state.properties.get("waterlogged").map(String::as_str),
+                Some("true" | "false")
+            )
+        {
+            return None;
+        }
+        return match state.properties.get("axis").map(String::as_str)? {
+            "x" => Some(vec![pixel_box(0.0, 6.5, 6.5, 16.0, 9.5, 9.5)]),
+            "y" => Some(vec![pixel_box(6.5, 0.0, 6.5, 9.5, 16.0, 9.5)]),
+            "z" => Some(vec![pixel_box(6.5, 6.5, 0.0, 9.5, 9.5, 16.0)]),
+            _ => None,
+        };
+    }
     if id == "jigsaw" {
         return jigsaw_state(state).then(|| FULL.to_vec());
     }

@@ -57,6 +57,8 @@ pub(super) fn portal_template_full(state: &BlockState) -> Result<bool> {
         return Ok(false);
     }
     if is_air(state)
+        || (state.name == "minecraft:iron_chain"
+            && native_world::collision::block_shape(state).is_some())
         || native_world::wall::Wall::from_state(state).is_some()
         || (state.name == "minecraft:chest"
             && state.properties.get("type").map(String::as_str) == Some("single"))
@@ -286,6 +288,18 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
         if native_world::collision::jigsaw_state(state) {
             return Ok(state.clone());
         }
+        if state.name == "minecraft:iron_chain"
+            && native_world::collision::block_shape(state).is_some()
+        {
+            if state.properties.get("waterlogged").map(String::as_str) == Some("true") {
+                SpringWorld::schedule_spring_tick(
+                    self.inner.region,
+                    pos,
+                    &ResourceId::parse("minecraft:water")?,
+                )?;
+            }
+            return Ok(state.clone());
+        }
         if state.name == "minecraft:lava" {
             ensure!(
                 self.inner
@@ -361,6 +375,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     native_world::collision::button_support_face(neighbor, opposite)
                         .context("unsupported portal wall support face")?
                 } else if is_air(neighbor)
+                    || neighbor.name == "minecraft:iron_chain"
                     || neighbor.name == "minecraft:lava"
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
@@ -546,6 +561,7 @@ impl ShapeEdgeWorld for PortalTemplateRegion<'_, '_, '_> {
                     native_world::collision::button_support_face(neighbor, opposite)
                         .context("unsupported portal stair or slab support face")?
                 } else if is_air(neighbor)
+                    || neighbor.name == "minecraft:iron_chain"
                     || neighbor.name == "minecraft:lava"
                     || neighbor.name == "minecraft:chest"
                     || native_world::wall::Wall::from_state(neighbor).is_some()
@@ -677,7 +693,11 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
             return self.inner.place_template_block(pos, state, None, random);
         }
         ensure!(
-            portal_full(state) || is_air(state) || state.name == "minecraft:lava",
+            portal_full(state)
+                || is_air(state)
+                || state.name == "minecraft:lava"
+                || (state.name == "minecraft:iron_chain"
+                    && native_world::collision::block_shape(state).is_some()),
             "unsupported portal template block: {state:?}"
         );
         if !self.inner.region.writable.contains(&chunk(pos)) {
@@ -701,6 +721,8 @@ impl StructurePlacementWorld for PortalTemplateRegion<'_, '_, '_> {
                 && self.inner.registry.has_block_entity(&old.name) == Some(false)
                 && (disk_safe_solid(&old.name).is_some()
                     || portal_full(&old)
+                    || (old.name == "minecraft:iron_chain"
+                        && native_world::collision::block_shape(&old).is_some())
                     || (old.name == "minecraft:iron_bars"
                         && native_world::collision::pane_waterlogged(&old).is_some()))
                 && !self.inner.region.monster_entities.contains_key(&pos)
@@ -892,6 +914,7 @@ impl PortalDecorationWorld for PortalRegion<'_, '_, '_> {
                 | "minecraft:stone_brick_wall"
                 | "minecraft:mossy_stone_brick_wall"
                 | "minecraft:iron_bars"
+                | "minecraft:iron_chain"
                 | "minecraft:vine"
                 | "minecraft:jungle_leaves"
         );
@@ -1089,6 +1112,152 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn portal_chain_shapes_and_updates_match_java() -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for lib in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = lib["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("PortalChainOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../../tests/java/PortalChainOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "javac failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("PortalChainOracle")
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut resources = ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let wall_tags = PortalUpdateTags::load(&mut resources, &ids)?;
+        let motion = HeightmapTags::load(&mut resources, &ids)?;
+        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+        let writable = terrain.snapshot().chunks.keys().copied().collect();
+        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+        let mut world = PortalTemplateRegion {
+            inner: super::super::jigsaw::JigsawRegion {
+                region: &mut region,
+                registry: &registry,
+            },
+            wall_tags: &wall_tags,
+            temporary_jigsaws: BTreeSet::new(),
+        };
+        let air = BlockState {
+            name: "minecraft:air".into(),
+            properties: BTreeMap::new(),
+        };
+        let pos = [3, 7, 3];
+        let mut count = 0;
+        for line in String::from_utf8(result.stdout)?
+            .lines()
+            .filter(|line| line.starts_with("SHAPE ") || line.starts_with("UPDATE "))
+        {
+            let values: Vec<_> = line.split_whitespace().collect();
+            let state = BlockState {
+                name: "minecraft:iron_chain".into(),
+                properties: BTreeMap::from([
+                    ("axis".into(), values[1].into()),
+                    ("waterlogged".into(), values[2].into()),
+                ]),
+            };
+            if values[0] == "SHAPE" {
+                let shapes = native_world::collision::block_shape(&state)
+                    .context("chain shape unavailable")?;
+                ensure!(
+                    shapes.len() == 1 && values.len() == 9,
+                    "invalid shape oracle"
+                );
+                let actual = [
+                    shapes[0].min.x,
+                    shapes[0].min.y,
+                    shapes[0].min.z,
+                    shapes[0].max.x,
+                    shapes[0].max.y,
+                    shapes[0].max.z,
+                ];
+                for (actual, expected) in actual.into_iter().zip(&values[3..]) {
+                    assert!(
+                        (f64::from(actual) - expected.parse::<f64>()?).abs() <= 0.000051,
+                        "{line}"
+                    );
+                }
+            } else {
+                let direction = match values[3] {
+                    "down" => [0, -1, 0],
+                    "up" => [0, 1, 0],
+                    "north" => [0, 0, -1],
+                    "south" => [0, 0, 1],
+                    "west" => [-1, 0, 0],
+                    "east" => [1, 0, 0],
+                    _ => anyhow::bail!("invalid direction"),
+                };
+                world.inner.region.world.saved_fluid_ticks.clear();
+                world.inner.region.fluid_tick_keys.clear();
+                let actual = world.update_shape(pos, &state, direction, pos, &air)?;
+                assert_eq!(actual == state, values[4] == "true", "{line}");
+                let ticks = world.inner.region.world.saved_fluid_ticks.get(&chunk(pos));
+                assert_eq!(
+                    ticks.map_or(0, Vec::len),
+                    usize::from(values.len() == 6),
+                    "{line}"
+                );
+                if let Some(ticks) = ticks {
+                    assert_eq!(ticks[0].fluid, "minecraft:water");
+                    assert_eq!(ticks[0].position, pos);
+                }
+                if direction[1] == 0 {
+                    for name in ["minecraft:stone_brick_wall", "minecraft:iron_bars"] {
+                        let (name, properties) = registry.resolve(&serde_json::json!(name))?;
+                        let neighbor = BlockState { name, properties };
+                        let updated = world.update_shape(pos, &neighbor, direction, pos, &state)?;
+                        assert_eq!(updated, neighbor, "{line}");
+                    }
+                }
+            }
+            count += 1;
+        }
+        assert_eq!(count, 42);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn temporary_jigsaw_preserves_block_entity_map_history() -> Result<()> {
@@ -1198,139 +1367,164 @@ mod tests {
             let id = ResourceId::parse(&format!("minecraft:ruined_portal/{name}"))?;
             let template =
                 StructureTemplate::load(&mut resources, &id)?.context("missing portal template")?;
-            let selection = InitialSelection {
-                setup_index: 0,
-                air_pocket: false,
-                template: id,
-                rotation: Rotation::None,
-                mirror: Mirror::None,
-            };
-            let setup = Setup {
-                placement: VerticalPlacement::OnLandSurface,
-                air_pocket_probability: 0.0,
-                mossiness: 0.8,
-                overgrown: false,
-                vines: false,
-                can_be_cold: false,
-                replace_with_blackstone: false,
-                weight: 1.0,
-            };
-            let position = [0, 8, 0];
-            let pivot = [template.size[0] / 2, 0, template.size[2] / 2];
-            let bounds = bounding_box(
-                template.size,
-                position,
-                selection.mirror,
-                selection.rotation,
-                pivot,
-            )?;
-            let point = GenerationPoint {
-                position,
-                pivot,
-                bounds,
-            };
-            let piece =
-                SavedRuinedPortalPiece::capture(&selection, &setup, &point, template.size, false)?;
-            let start = PreparedStart {
-                chunk: [0, 0],
-                point,
-                terrain_adjustment: TerrainAdjustment::None,
-                template: Arc::new(template),
-                piece,
-            };
-            let prepared = portal_resources.prepare(&mut resources, &start)?;
-            let (mut terrain, tags, _, _) = super::super::tests::fixture();
-            terrain.height = 48;
-            let world = Arc::make_mut(&mut terrain.world);
-            let air = world.intern_state(BlockState {
-                name: "minecraft:air".into(),
-                properties: BTreeMap::new(),
-            });
-            let base = world.chunks[&ChunkPos { x: 0, z: 0 }].as_ref().clone();
-            for z in -3..=3 {
-                for x in -3..=3 {
-                    let position = ChunkPos { x, z };
-                    let mut chunk = base.clone();
-                    chunk.position = position;
-                    for y in 1..3 {
-                        chunk.sections.insert(
-                            y,
-                            Arc::new(Section {
-                                blocks: Some(Box::new([BlockStateId(air.0); BLOCK_COUNT])),
-                                biomes: None,
-                                block_light: None,
-                                sky_light: None,
-                            }),
+            for rotation in [
+                Rotation::None,
+                Rotation::Clockwise90,
+                Rotation::Clockwise180,
+                Rotation::Counterclockwise90,
+            ] {
+                for mirror in [Mirror::None, Mirror::FrontBack] {
+                    for style in 0..3 {
+                        let selection = InitialSelection {
+                            setup_index: 0,
+                            air_pocket: false,
+                            template: id.clone(),
+                            rotation,
+                            mirror,
+                        };
+                        let setup = Setup {
+                            placement: if style == 2 {
+                                VerticalPlacement::InNether
+                            } else {
+                                VerticalPlacement::OnLandSurface
+                            },
+                            air_pocket_probability: 0.0,
+                            mossiness: if style == 2 { 0.0 } else { 0.8 },
+                            overgrown: style == 1,
+                            vines: style == 1,
+                            can_be_cold: false,
+                            replace_with_blackstone: style == 2,
+                            weight: 1.0,
+                        };
+                        let position = [0, 8, 0];
+                        let pivot = [template.size[0] / 2, 0, template.size[2] / 2];
+                        let bounds = bounding_box(
+                            template.size,
+                            position,
+                            selection.mirror,
+                            selection.rotation,
+                            pivot,
+                        )?;
+                        let point = GenerationPoint {
+                            position,
+                            pivot,
+                            bounds,
+                        };
+                        let piece = SavedRuinedPortalPiece::capture(
+                            &selection,
+                            &setup,
+                            &point,
+                            template.size,
+                            false,
+                        )?;
+                        let start = PreparedStart {
+                            chunk: [0, 0],
+                            point,
+                            terrain_adjustment: TerrainAdjustment::None,
+                            template: Arc::new(template.clone()),
+                            piece,
+                        };
+                        let prepared = portal_resources.prepare(&mut resources, &start)?;
+                        let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                        terrain.height = 48;
+                        let world = Arc::make_mut(&mut terrain.world);
+                        let air = world.intern_state(BlockState {
+                            name: "minecraft:air".into(),
+                            properties: BTreeMap::new(),
+                        });
+                        let base = world.chunks[&ChunkPos { x: 0, z: 0 }].as_ref().clone();
+                        for z in -3..=3 {
+                            for x in -3..=3 {
+                                let position = ChunkPos { x, z };
+                                let mut chunk = base.clone();
+                                chunk.position = position;
+                                for y in 1..3 {
+                                    chunk.sections.insert(
+                                        y,
+                                        Arc::new(Section {
+                                            blocks: Some(Box::new(
+                                                [BlockStateId(air.0); BLOCK_COUNT],
+                                            )),
+                                            biomes: None,
+                                            block_light: None,
+                                            sky_light: None,
+                                        }),
+                                    );
+                                }
+                                world.chunks.insert(position, Arc::new(chunk));
+                            }
+                        }
+                        let writable = terrain.snapshot().chunks.keys().copied().collect();
+                        let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                        let mut clip = BoundingBox::new([-32, 0, -32], [31, 47, 31])
+                            .map_err(anyhow::Error::msg)?;
+                        let mut random = DecorationRandom::new(42);
+                        let markers = start.jigsaw_markers(&registry, clip)?;
+                        let mut stale = start.clone();
+                        stale.chunk[0] += 1;
+                        let old_clip = clip;
+                        let mut expected_random = random.clone();
+                        assert!(
+                            prepared
+                                .place(&mut region, &stale, &mut clip, &mut random)
+                                .is_err()
                         );
+                        assert_eq!(clip, old_clip);
+                        assert_eq!(random.next_long(), expected_random.next_long());
+                        let mut random = DecorationRandom::new(42);
+                        if name == "portal_1" {
+                            let entry = StructureDecorationEntry {
+                                id: ResourceId::parse("minecraft:ruined_portal")?,
+                                step: 0,
+                                index: 0,
+                            };
+                            let plan = [super::super::super::structure_batch::PlannedMixedStructureDecoration {
+                    entry: &entry, starts: vec![super::super::super::structure_batch::PlannedStructureStart::RuinedPortal(&start)] }];
+                            let mut context = MixedPortalPlacementContext::load(
+                                NoOther,
+                                &plan,
+                                &mut resources,
+                                &ids,
+                                &registry,
+                            )?;
+                            let mut placed_start = start.clone();
+                            context.place_ruined_portal(
+                                &mut region,
+                                &(entry.id.clone(), ChunkPos { x: 0, z: 0 }),
+                                &mut placed_start,
+                                clip,
+                                &mut random,
+                            )?;
+                        } else {
+                            let placed =
+                                prepared.place(&mut region, &start, &mut clip, &mut random);
+                            ensure!(placed.with_context(|| format!(
+                                "placing {name}, {rotation:?}, {mirror:?}, style {style}"
+                            ))?);
+                        }
+                        region
+                            .finish()
+                            .with_context(|| format!("finishing {name}"))?;
+                        for marker in &markers {
+                            let [x, y, z] = marker.position;
+                            ensure!(
+                                terrain
+                                    .snapshot()
+                                    .block(x, y, z)
+                                    .context("marker block missing")?
+                                    .name
+                                    != "minecraft:jigsaw",
+                                "{name} retained a temporary jigsaw"
+                            );
+                        }
+                        marker_count += markers.len();
+                        placed_count += 1;
                     }
-                    world.chunks.insert(position, Arc::new(chunk));
                 }
             }
-            let writable = terrain.snapshot().chunks.keys().copied().collect();
-            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
-            let mut clip =
-                BoundingBox::new([-32, 0, -32], [31, 47, 31]).map_err(anyhow::Error::msg)?;
-            let mut random = DecorationRandom::new(42);
-            let markers = start.jigsaw_markers(&registry, clip)?;
-            let mut stale = start.clone();
-            stale.chunk[0] += 1;
-            let old_clip = clip;
-            let mut expected_random = random.clone();
-            assert!(
-                prepared
-                    .place(&mut region, &stale, &mut clip, &mut random)
-                    .is_err()
-            );
-            assert_eq!(clip, old_clip);
-            assert_eq!(random.next_long(), expected_random.next_long());
-            let mut random = DecorationRandom::new(42);
-            if name == "portal_1" {
-                let entry = StructureDecorationEntry {
-                    id: ResourceId::parse("minecraft:ruined_portal")?,
-                    step: 0,
-                    index: 0,
-                };
-                let plan = [super::super::super::structure_batch::PlannedMixedStructureDecoration {
-                    entry: &entry, starts: vec![super::super::super::structure_batch::PlannedStructureStart::RuinedPortal(&start)] }];
-                let mut context = MixedPortalPlacementContext::load(
-                    NoOther,
-                    &plan,
-                    &mut resources,
-                    &ids,
-                    &registry,
-                )?;
-                let mut placed_start = start.clone();
-                context.place_ruined_portal(
-                    &mut region,
-                    &(entry.id.clone(), ChunkPos { x: 0, z: 0 }),
-                    &mut placed_start,
-                    clip,
-                    &mut random,
-                )?;
-            } else {
-                let placed = prepared.place(&mut region, &start, &mut clip, &mut random);
-                ensure!(placed.with_context(|| format!("placing {name}"))?);
-            }
-            region
-                .finish()
-                .with_context(|| format!("finishing {name}"))?;
-            for marker in &markers {
-                let [x, y, z] = marker.position;
-                ensure!(
-                    terrain
-                        .snapshot()
-                        .block(x, y, z)
-                        .context("marker block missing")?
-                        .name
-                        != "minecraft:jigsaw",
-                    "{name} retained a temporary jigsaw"
-                );
-            }
-            marker_count += markers.len();
-            placed_count += 1;
         }
-        assert_eq!(placed_count, 13);
-        assert!(marker_count >= 5);
+        assert_eq!(placed_count, 312);
+        assert!(marker_count >= 120);
         Ok(())
     }
 

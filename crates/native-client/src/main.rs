@@ -1575,6 +1575,11 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_crop_soils(Arc::new(tag)),
                     Err(error) => eprintln!("Crop soil tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_crop_supports(&mut resources, &registry)
+                {
+                    Ok(tag) => session.set_crop_supports(Arc::new(tag)),
+                    Err(error) => eprintln!("Crop support tag is unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::SnowSupportTags::load(
                     &mut resources,
                     &registry,

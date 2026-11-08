@@ -623,6 +623,7 @@ pub struct LoadedSession {
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
     crop_soils: Option<Arc<BTreeSet<String>>>,
+    crop_supports: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
     washed_away_blocks: Option<Arc<BTreeSet<String>>>,
     weather: Option<crate::weather::Weather>,
@@ -5827,6 +5828,10 @@ impl LoadedSession {
         self.crop_soils = Some(tag);
     }
 
+    pub fn set_crop_supports(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.crop_supports = Some(tag);
+    }
+
     pub fn set_farmland_water_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         let bits = [
             "minecraft:empty",
@@ -6802,6 +6807,7 @@ impl LoadedSession {
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
             crop_soils: None,
+            crop_supports: None,
             farmland_water_tag: None,
             washed_away_blocks: None,
             weather: None,
@@ -13993,12 +13999,12 @@ impl LoadedSession {
                 return true;
             }
             subtract(absolute, self.origin)
-                .and_then(|relative| self.crop_brightness(relative))
+                .and_then(|relative| self.crop_brightness(relative, 9))
                 .is_none_or(|brightness| brightness >= 9)
         })
     }
 
-    fn crop_brightness(&self, relative: IVec3) -> Option<u8> {
+    fn crop_brightness(&self, relative: IVec3, minimum: u8) -> Option<u8> {
         if !self.pending_light.is_empty() || !self.sky_lighting.settled() {
             return None;
         }
@@ -14013,7 +14019,7 @@ impl LoadedSession {
         let block = self
             .world
             .light(absolute.x, absolute.y, absolute.z, false)?;
-        if block >= 9 {
+        if block >= minimum {
             return Some(block);
         }
         if self.world.dimension == "minecraft:the_end"
@@ -14024,6 +14030,113 @@ impl LoadedSession {
         self.world
             .light(absolute.x, absolute.y, absolute.z, true)
             .map(|sky| sky.max(block))
+    }
+
+    fn crop_can_survive(&self, relative: IVec3) -> Option<bool> {
+        let light = self.crop_brightness(relative, 8)?;
+        if light < 8 {
+            return Some(false);
+        }
+        let below = add(relative, IVec3::NEG_Y)?;
+        let Cell::State(id) = cell(&self.world, self.origin, self.bounds, below, self.states[0])
+        else {
+            return None;
+        };
+        let state = self.world.state(id)?;
+        if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
+            return None;
+        }
+        crate::crop::can_survive(
+            Some(light),
+            Some(self.crop_supports.as_ref()?.contains(&state.name)),
+        )
+    }
+
+    /// Apply a seed item or bonemeal to a supported crop using the selected hand.
+    fn use_crop_item(&mut self, hand: crate::inventory::PlayerSlot, hit: ShapeRayHit) -> bool {
+        let Some(item) = self.inventory.slot(hand) else {
+            return false;
+        };
+        if !crate::inventory::ordinary_return_supported(item)
+            || item.components().get("minecraft:use_remainder").is_some()
+            || item.components().get("minecraft:use_cooldown").is_some()
+        {
+            return false;
+        }
+        let id = item.id();
+        if id == "minecraft:bone_meal" {
+            let Some(absolute) = add(self.origin, hit.position) else {
+                return false;
+            };
+            let Some(current) = self
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .cloned()
+            else {
+                return false;
+            };
+            let Some((crop, age)) = crop_state(&current) else {
+                return false;
+            };
+            let mut random = self.level_random.clone();
+            let Some(next) = crate::crop::bonemeal(crop, age, &mut random) else {
+                return false;
+            };
+            if next != age {
+                let mut replacement = current;
+                replacement
+                    .properties
+                    .insert("age".into(), next.to_string());
+                let replacement = self.intern_block(replacement);
+                let Some(checked) = self.check_block_set(hit.position, replacement, false, false)
+                else {
+                    return false;
+                };
+                self.level_random = random;
+                self.apply_block_set(hit.position, replacement, false, checked);
+            } else {
+                self.level_random = random;
+            }
+        } else {
+            let name = match id {
+                "minecraft:wheat_seeds" => "minecraft:wheat",
+                "minecraft:carrot" => "minecraft:carrots",
+                "minecraft:potato" => "minecraft:potatoes",
+                "minecraft:beetroot_seeds" => "minecraft:beetroots",
+                _ => return false,
+            };
+            if item.components().get("minecraft:block_state").is_some()
+                || !self
+                    .vanilla_block_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(name))
+            {
+                return false;
+            }
+            let Some(target) = self.ordinary_placement_target(hit) else {
+                return false;
+            };
+            if self.crop_can_survive(target) != Some(true) {
+                return false;
+            }
+            let placed = self.intern_block(state(name, &[("age", "0")]));
+            if !self.set_player_placed(target, placed) {
+                return false;
+            }
+        }
+        if self.game_mode.consumes_placed_item() {
+            Arc::make_mut(&mut self.inventory).consume_held(hand);
+        }
+        let swing = if hand == crate::inventory::PlayerSlot::Offhand {
+            crate::animation::Hand::Off
+        } else {
+            crate::animation::Hand::Main
+        };
+        self.first_person.swing.start(swing);
+        if self.inventory.slot(hand).is_some() {
+            self.first_person.used(swing);
+        }
+        true
     }
 
     fn crop_growth_speed(&self, relative: IVec3, crop: &str) -> Option<f32> {
@@ -14100,7 +14213,7 @@ impl LoadedSession {
         if age >= crop.max_age() {
             return None;
         }
-        let brightness = self.crop_brightness(relative);
+        let brightness = self.crop_brightness(relative, 9);
         let mut random = self.level_random.clone();
         let next = crate::crop::random_tick_checked(
             crop,
@@ -20067,6 +20180,10 @@ impl LoadedSession {
                                         | "minecraft:lodestone"
                                         | "minecraft:chest"
                                         | "minecraft:trapped_chest"
+                                        | "minecraft:wheat_seeds"
+                                        | "minecraft:carrot"
+                                        | "minecraft:potato"
+                                        | "minecraft:beetroot_seeds"
                                 )
                         });
                         let can_place = block_item && add(hit.position, hit.face).is_some_and(|target| {
@@ -20106,6 +20223,10 @@ impl LoadedSession {
                             } else if self.game_mode != GameMode::Spectator
                                 && !bypass
                                 && self.use_cauldron(main_hand, hit.position)
+                            {
+                                handled = true;
+                            } else if self.game_mode.allows_basic_building()
+                                && self.use_crop_item(main_hand, hit)
                             {
                                 handled = true;
                             } else if self.game_mode.allows_basic_building()
@@ -20201,6 +20322,10 @@ impl LoadedSession {
                                 if self.inventory.slot(hand).is_some() {
                                     self.first_person.used(swing_hand);
                                 }
+                            } else if self.game_mode.allows_basic_building()
+                                && self.use_crop_item(crate::inventory::PlayerSlot::Offhand, hit)
+                            {
+                                handled = true;
                             }
                         }
                     }
@@ -22868,6 +22993,9 @@ fn stone_button_state(face: IVec3, yaw: f32) -> Option<BlockState> {
 /// These default block behaviors were checked with a stone-button placement
 /// context. Other replaceable states can have item-specific rules.
 fn button_can_replace(block: &BlockState) -> Option<bool> {
+    if crop_state(block).is_some() {
+        return Some(false);
+    }
     if native_world::collision::banner_item_id(block).is_some() {
         return Some(false);
     }
@@ -25581,6 +25709,16 @@ pub(crate) mod tests {
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {
+        crop_test_session_with(position, crop, age, light, true)
+    }
+
+    fn crop_test_session_with(
+        position: IVec3,
+        crop: &str,
+        age: u8,
+        light: bool,
+        planted: bool,
+    ) -> LoadedSession {
         let (mut world, origin, player) = fixture();
         let crop = world.intern_state(state(crop, &[("age", &age.to_string())]));
         let soil = world.intern_state(state("minecraft:farmland", &[("moisture", "7")]));
@@ -25589,7 +25727,9 @@ pub(crate) mod tests {
         let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
         let blocks = section.blocks.as_mut().unwrap();
         let index = |p: IVec3| (p.x + p.z * 16 + p.y * 256) as usize;
-        blocks[index(position)] = crop;
+        if planted {
+            blocks[index(position)] = crop;
+        }
         blocks[index(position - IVec3::Y)] = soil;
         if light {
             section.block_light = Some(Box::new([0; LIGHT_BYTES]));
@@ -25607,12 +25747,15 @@ pub(crate) mod tests {
         .unwrap();
         session.set_has_skylight(true).unwrap();
         session.set_crop_soils(Arc::new(BTreeSet::from(["minecraft:farmland".into()])));
+        session.set_crop_supports(Arc::new(BTreeSet::from(["minecraft:farmland".into()])));
         session.set_vanilla_block_ids(Arc::new(
             [
                 "minecraft:air",
                 "minecraft:stone",
                 "minecraft:farmland",
                 "minecraft:wheat",
+                "minecraft:carrots",
+                "minecraft:potatoes",
                 "minecraft:beetroots",
             ]
             .into_iter()
@@ -25689,6 +25832,185 @@ pub(crate) mod tests {
         assert_eq!(beet.random_tick_crop_at(position), Some(false));
         assert!(!beet.unresolved_crop_tick);
         assert_eq!(beet.level_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn crop_items_plant_and_apply_bonemeal_in_both_hands() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let pos = IVec3::new(8, 2, 8);
+        for (item, crop) in [
+            ("wheat_seeds", "wheat"),
+            ("carrot", "carrots"),
+            ("potato", "potatoes"),
+            ("beetroot_seeds", "beetroots"),
+        ] {
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                for mode in [GameMode::Survival, GameMode::Creative] {
+                    let mut session =
+                        crop_test_session_with(pos, &format!("minecraft:{crop}"), 0, true, false);
+                    let mut inventory = PlayerInventory::default();
+                    assert!(inventory.set_slot(
+                        hand,
+                        ItemStack::new(format!("minecraft:{item}"), 2, 64, Tag::Compound(vec![]))
+                    ));
+                    session.set_player_inventory(inventory);
+                    session.set_game_mode(mode);
+                    let hit = ShapeRayHit {
+                        position: pos - IVec3::Y,
+                        face: IVec3::Y,
+                        location: DVec3::ZERO,
+                        inside: false,
+                    };
+                    assert!(crate::inventory::ordinary_return_supported(
+                        session.inventory.slot(hand).unwrap()
+                    ));
+                    assert_eq!(session.ordinary_placement_target(hit), Some(pos));
+                    assert_eq!(
+                        session.crop_can_survive(pos),
+                        Some(true),
+                        "brightness {:?}, pending {}, settled {}",
+                        session.crop_brightness(pos, 8),
+                        session.pending_light.len(),
+                        session.sky_lighting.settled()
+                    );
+                    assert!(session.use_crop_item(hand, hit), "{item} {hand:?} {mode:?}");
+                    let absolute = add(session.origin, pos).unwrap();
+                    assert_eq!(
+                        session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap()
+                            .name,
+                        format!("minecraft:{crop}")
+                    );
+                    assert_eq!(
+                        session.inventory.slot(hand).unwrap().count(),
+                        if mode == GameMode::Creative { 2 } else { 1 }
+                    );
+                    assert!(session.inventory.slot(hand).is_some());
+                    let mut inventory = PlayerInventory::default();
+                    assert!(inventory.set_slot(
+                        hand,
+                        ItemStack::new("minecraft:bone_meal".into(), 2, 64, Tag::Compound(vec![]))
+                    ));
+                    session.set_player_inventory(inventory);
+                    let mut expected_random = native_core::random::LegacyRandom::new(42);
+                    let kind = crop_state(
+                        session
+                            .world
+                            .block(absolute.x, absolute.y, absolute.z)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .0;
+                    let expected_age =
+                        crate::crop::bonemeal(kind, 0, &mut expected_random).unwrap();
+                    session.level_random = native_core::random::LegacyRandom::new(42);
+                    let crop_hit = ShapeRayHit {
+                        position: pos,
+                        ..hit
+                    };
+                    assert!(session.use_crop_item(hand, crop_hit));
+                    assert_eq!(
+                        crop_state(
+                            session
+                                .world
+                                .block(absolute.x, absolute.y, absolute.z)
+                                .unwrap()
+                        )
+                        .unwrap()
+                        .1,
+                        expected_age
+                    );
+                    assert_eq!(session.level_random.next_int(), expected_random.next_int());
+                    assert_eq!(
+                        session.inventory.slot(hand).unwrap().count(),
+                        if mode == GameMode::Creative { 2 } else { 1 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crop_placement_rejects_darkness_unknown_support_and_item_state() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let pos = IVec3::new(8, 2, 8);
+        let hand = PlayerSlot::Storage(0);
+        let hit = ShapeRayHit {
+            position: pos - IVec3::Y,
+            face: IVec3::Y,
+            location: DVec3::ZERO,
+            inside: false,
+        };
+        for mode in 0..4 {
+            let mut session = crop_test_session_with(pos, "minecraft:wheat", 0, true, false);
+            if mode == 0 {
+                session.set_has_skylight(false).unwrap();
+            }
+            if mode == 1 {
+                session.crop_supports = Some(Arc::new(BTreeSet::new()));
+            }
+            if mode == 2 {
+                session.crop_supports = None;
+            }
+            let components = if mode == 3 {
+                Tag::Compound(vec![(
+                    "minecraft:block_state".into(),
+                    Tag::Compound(vec![]),
+                )])
+            } else {
+                Tag::Compound(vec![])
+            };
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                hand,
+                ItemStack::new("minecraft:wheat_seeds".into(), 2, 64, components)
+            ));
+            session.set_player_inventory(inventory);
+            assert!(!session.use_crop_item(hand, hit));
+            assert_eq!(session.inventory.slot(hand).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn crop_use_is_reached_from_player_input_and_offhand() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let pos = IVec3::new(8, 2, 7);
+        for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+            let mut session = crop_test_session_with(pos, "minecraft:wheat", 0, true, false);
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                hand,
+                ItemStack::new("minecraft:wheat_seeds".into(), 2, 64, Tag::Compound(vec![]))
+            ));
+            session.set_player_inventory(inventory);
+            let pitch = (-140..0)
+                .map(|value| value as f32 / 100.0)
+                .find(|&pitch| {
+                    session.player.pitch = pitch;
+                    session
+                        .ray_hit()
+                        .is_some_and(|hit| hit.position == pos - IVec3::Y && hit.face == IVec3::Y)
+                })
+                .expect("farmland is visible");
+            session.player.pitch = pitch;
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            let absolute = add(session.origin, pos).unwrap();
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:wheat"
+            );
+            assert_eq!(session.inventory.slot(hand).unwrap().count(), 1);
+        }
     }
 
     #[test]

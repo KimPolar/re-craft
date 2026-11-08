@@ -23,6 +23,28 @@ impl Crop {
     }
 }
 
+/// A crop survives only with enough raw light and a tagged supporting block.
+pub fn can_survive(brightness: Option<u8>, supported: Option<bool>) -> Option<bool> {
+    if brightness? < 8 {
+        return Some(false);
+    }
+    supported
+}
+
+/// Apply the crop's bonemeal increase, or return None for a mature crop.
+pub fn bonemeal(crop: Crop, age: u8, random: &mut LegacyRandom) -> Option<u8> {
+    if age >= crop.max_age() {
+        return None;
+    }
+    let roll = random.next_int_bound(4).expect("positive bound") as u8 + 2;
+    let increase = if crop == Crop::Beetroots {
+        roll / 3
+    } else {
+        roll
+    };
+    Some(age.saturating_add(increase).min(crop.max_age()))
+}
+
 /// Soil is ordered by x then z from -1 to 1. Neighbors are north, south,
 /// west, east, northwest, northeast, southeast and southwest.
 pub fn growth_speed(soil: [Soil; 9], neighbors: [bool; 8]) -> f32 {

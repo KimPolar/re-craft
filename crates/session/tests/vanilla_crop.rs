@@ -87,3 +87,90 @@ fn crop_growth_matches_java() {
         assert_eq!(i64::from(random.next_int()), row[8], "random after {row:?}");
     }
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+fn crop_survival_and_bonemeal_match_java() {
+    use native_core::random::LegacyRandom;
+    use native_session::crop::{Crop, bonemeal, can_survive};
+    use std::{path::PathBuf, process::Command};
+
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let version = game.join("versions/26.3");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for library in manifest["libraries"].as_array().unwrap() {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let cp = std::env::join_paths(paths).unwrap();
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+    let source = temp.path().join("CropUseOracle.java");
+    let output = temp.path().join("crop-use.json");
+    std::fs::write(&source, include_str!("java/CropUseOracle.java")).unwrap();
+    for command in [
+        Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source),
+        Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("CropUseOracle")
+            .arg(&output),
+    ] {
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "Java crop use oracle failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let output: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let survival = output["survival"].as_array().unwrap();
+    assert_eq!(survival.len(), 40);
+    for row in survival {
+        assert_eq!(
+            can_survive(
+                Some(row[2].as_u64().unwrap() as u8),
+                Some(row[1].as_bool().unwrap())
+            ),
+            row[3].as_bool(),
+            "{row}"
+        );
+    }
+    let rows = output["bonemeal"].as_array().unwrap();
+    assert_eq!(rows.len(), 168);
+    for row in rows {
+        let crop = [Crop::Wheat, Crop::Carrots, Crop::Potatoes, Crop::Beetroots]
+            [row[0].as_u64().unwrap() as usize];
+        let age = row[1].as_u64().unwrap() as u8;
+        let mut random = LegacyRandom::new(row[2].as_i64().unwrap());
+        let next = bonemeal(crop, age, &mut random);
+        assert_eq!(next.is_some(), row[3].as_bool().unwrap(), "{row}");
+        assert_eq!(
+            u64::from(next.unwrap_or(age)),
+            row[4].as_u64().unwrap(),
+            "{row}"
+        );
+        assert_eq!(
+            i64::from(random.next_int()),
+            row[5].as_i64().unwrap(),
+            "{row}"
+        );
+    }
+    assert_eq!(can_survive(Some(7), None), Some(false));
+    assert_eq!(can_survive(Some(8), None), None);
+}

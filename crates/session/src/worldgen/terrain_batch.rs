@@ -6171,6 +6171,55 @@ mod region_draft_tests {
             assert!(draft.write_staged(&mut stage).unwrap().is_empty());
         }
         assert!(!regions.contains_key(&(FreshRegionKind::Entities, -1, 0)));
+        let mut plan = native_persistence::save::WorldSavePlan::new();
+        plan.add_generated_regions(
+            native_persistence::world::DimensionId::parse("minecraft:overworld").unwrap(),
+            regions.into_values(),
+        )
+        .unwrap();
+        assert_eq!(plan.chunk_count(), 2);
+        assert_eq!(plan.poi_chunk_count(), 2);
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/region-test-temp");
+            std::fs::create_dir_all(&parent).unwrap();
+            let world = tempfile::Builder::new()
+                .prefix("generated-plan-")
+                .tempdir_in(parent)
+                .unwrap();
+            let level = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![(
+                    "Data".into(),
+                    Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+                )]),
+            };
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&native_persistence::nbt::write(&level).unwrap())
+                .unwrap();
+            std::fs::write(world.path().join("level.dat"), encoder.finish().unwrap()).unwrap();
+            std::fs::create_dir_all(world.path().join("dimensions/minecraft/overworld")).unwrap();
+            let mut guard =
+                native_persistence::save::WorldWriteGuard::acquire(world.path()).unwrap();
+            guard.write_plan(plan, |_, _| Ok(())).unwrap();
+            let dimension =
+                native_persistence::world::DimensionId::parse("minecraft:overworld").unwrap();
+            let mut reader =
+                native_persistence::world::WorldReader::open(world.path(), dimension).unwrap();
+            assert!(reader.read_chunk(-1, 0).unwrap().is_some());
+            assert!(reader.read_chunk(0, 0).unwrap().is_some());
+            assert!(reader.read_entity_chunk(-1, 0).unwrap().is_none());
+            assert_eq!(
+                reader.read_entity_chunk(0, 0).unwrap().unwrap().entities(),
+                &[item]
+            );
+            assert!(reader.read_poi_chunk(-1, 0).unwrap().is_none());
+            assert!(reader.read_poi_chunk(0, 0).unwrap().is_some());
+        }
     }
 }
 

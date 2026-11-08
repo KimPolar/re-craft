@@ -9,7 +9,7 @@
 //! world data can be committed in the same transaction.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -1166,6 +1166,103 @@ impl WorldSavePlan {
             replacement: poi,
             region_timestamp_seconds,
         });
+        Ok(())
+    }
+
+    /// Transfer a completed generation pass's region drafts into this plan.
+    /// Every entity and POI entry must have terrain in the same batch; missing
+    /// sidecars mean that their region entries must be absent at commit. The
+    /// caller must establish complete entity/POI coverage and all generation
+    /// dependencies before invoking this method. No session save is implied.
+    /// On error the existing plan is unchanged.
+    pub fn add_generated_regions(
+        &mut self,
+        dimension: DimensionId,
+        regions: impl IntoIterator<Item = FreshRegionDraft>,
+    ) -> Result<()> {
+        type Entries = BTreeMap<crate::world::ChunkPos, (Vec<u8>, u32)>;
+        let mut terrain = Entries::new();
+        let mut entities = Entries::new();
+        let mut poi = Entries::new();
+        let mut region_keys = BTreeSet::new();
+        for region in regions {
+            ensure!(!region.chunks.is_empty(), "generated region is empty");
+            ensure!(
+                region_keys.insert((region.kind, region.region_x, region.region_z)),
+                "duplicate generated region"
+            );
+            let entries = match region.kind {
+                FreshRegionKind::Terrain => &mut terrain,
+                FreshRegionKind::Entities => &mut entities,
+                FreshRegionKind::Poi => &mut poi,
+            };
+            for (position, data) in region.chunks {
+                ensure!(
+                    entries.insert(position, data).is_none(),
+                    "duplicate generated chunk"
+                );
+            }
+        }
+        ensure!(!terrain.is_empty(), "no generated terrain chunks");
+        ensure!(
+            entities.keys().all(|pos| terrain.contains_key(pos))
+                && poi.keys().all(|pos| terrain.contains_key(pos)),
+            "generated sidecar has no terrain in the batch"
+        );
+        let occupied: BTreeSet<_> = self
+            .chunks
+            .iter()
+            .filter(|entry| entry.dimension == dimension)
+            .map(|entry| entry.draft.position())
+            .chain(
+                self.generated_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.entity_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .chain(
+                self.poi_chunks
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension)
+                    .map(|entry| entry.position),
+            )
+            .collect();
+        ensure!(
+            terrain.keys().all(|pos| !occupied.contains(pos)),
+            "world save plan contains duplicate generated chunk data"
+        );
+        // FreshRegionDraft validated and encoded each document before it was
+        // inserted. Move those bytes directly rather than re-encoding them.
+        for (position, (document, timestamp)) in terrain {
+            self.generated_chunks.push(PlannedGeneratedChunk {
+                dimension: dimension.clone(),
+                position,
+                document,
+                region_timestamp_seconds: timestamp,
+            });
+            let entity = entities.remove(&position);
+            self.entity_chunks.push(PlannedEntityChunk {
+                dimension: dimension.clone(),
+                position,
+                source_nbt: None,
+                region_timestamp_seconds: entity.as_ref().map_or(timestamp, |(_, time)| *time),
+                replacement: entity.map(|(bytes, _)| bytes),
+            });
+            let point = poi.remove(&position);
+            self.poi_chunks.push(PlannedEntityChunk {
+                dimension: dimension.clone(),
+                position,
+                source_nbt: None,
+                region_timestamp_seconds: point.as_ref().map_or(timestamp, |(_, time)| *time),
+                replacement: point.map(|(bytes, _)| bytes),
+            });
+        }
         Ok(())
     }
 
@@ -7463,6 +7560,83 @@ mod tests {
         guard.write_plan(plan, |_, _| Ok(())).unwrap();
         let mut reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
         assert_eq!(*reader.read_chunk(0, 0).unwrap().unwrap().document, terrain);
+    }
+
+    #[test]
+    fn generated_region_batch_is_atomic_and_preserves_sidecars() {
+        let world = test_world();
+        fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let first = ChunkPos { x: 3, z: 0 };
+        let second = ChunkPos { x: 32, z: 0 };
+        let mut plan = WorldSavePlan::new();
+        let mut orphan = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+        orphan.add(first, &entity_chunk(3, vec![]), 4).unwrap();
+        assert!(
+            plan.add_generated_regions(dimension.clone(), [orphan])
+                .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 0);
+        assert_eq!(plan.poi_chunk_count(), 0);
+
+        let mut terrain_a = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        let mut terrain_b = FreshRegionDraft::new(FreshRegionKind::Terrain, 1, 0);
+        let mut entities = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+        let mut poi = FreshRegionDraft::new(FreshRegionKind::Poi, 0, 0);
+        let first_terrain = editable_chunk(3);
+        let second_terrain = editable_chunk(32);
+        let entity = entity_chunk(
+            3,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let mut poi_doc = poi_document();
+        let Tag::Compound(record) = &mut poi_records_mut(&mut poi_doc)[0] else {
+            panic!()
+        };
+        record
+            .iter_mut()
+            .find(|(name, _)| name.matches("pos"))
+            .unwrap()
+            .1 = Tag::IntArray(vec![48, 0, 0]);
+        terrain_a.add(first, &first_terrain, 10).unwrap();
+        terrain_b.add(second, &second_terrain, 11).unwrap();
+        entities.add(first, &entity, 12).unwrap();
+        poi.add(first, &poi_doc, 13).unwrap();
+        plan.add_generated_regions(dimension.clone(), [poi, terrain_b, entities, terrain_a])
+            .unwrap();
+        assert_eq!(plan.chunk_count(), 2);
+        assert_eq!(plan.poi_chunk_count(), 2);
+        let mut duplicate = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        duplicate.add(first, &first_terrain, 15).unwrap();
+        assert!(
+            plan.add_generated_regions(dimension.clone(), [duplicate])
+                .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 2);
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let mut reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
+        assert_eq!(
+            *reader.read_chunk(3, 0).unwrap().unwrap().document,
+            first_terrain
+        );
+        assert_eq!(
+            *reader.read_chunk(32, 0).unwrap().unwrap().document,
+            second_terrain
+        );
+        assert_eq!(
+            *reader.read_entity_chunk(3, 0).unwrap().unwrap().document,
+            entity
+        );
+        assert_eq!(
+            *reader.read_poi_chunk(3, 0).unwrap().unwrap().document,
+            poi_doc
+        );
+        assert!(reader.read_entity_chunk(32, 0).unwrap().is_none());
+        assert!(reader.read_poi_chunk(32, 0).unwrap().is_none());
     }
 
     #[test]

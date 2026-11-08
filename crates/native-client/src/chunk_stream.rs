@@ -42,6 +42,7 @@ struct Response {
     pos: ChunkPos,
     result: Result<Option<ChunkPayload>, String>,
     stale: bool,
+    entities_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +72,7 @@ pub struct ChunkStreamer {
     skipped_target_checks: u64,
     pending: BTreeSet<ChunkPos>,
     missing: BTreeSet<ChunkPos>,
-    failed: BTreeSet<ChunkPos>,
+    failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
     _world_guard: Option<native_persistence::save::WorldSessionGuard>,
 }
@@ -189,7 +190,15 @@ impl ChunkStreamer {
                     } else {
                         read(pos, request.entities_only).map_err(|error| format!("{error:#}"))
                     };
-                    if response_tx.send(Response { pos, result, stale }).is_err() {
+                    if response_tx
+                        .send(Response {
+                            pos,
+                            result,
+                            stale,
+                            entities_only: request.entities_only,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -209,7 +218,7 @@ impl ChunkStreamer {
             skipped_target_checks: 0,
             pending: BTreeSet::new(),
             missing,
-            failed: BTreeSet::new(),
+            failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
             _world_guard: None,
         })
@@ -242,6 +251,7 @@ impl ChunkStreamer {
                 .filter(|pos| seen.insert(*pos))
                 .collect();
             self.entity_retry.retain(|pos, _| windows.contains(*pos));
+            self.failed.retain(|pos, _| windows.contains(*pos));
             for &pos in &self.targets {
                 if matches!(
                     session.saved_entity_chunk(pos),
@@ -295,19 +305,12 @@ impl ChunkStreamer {
                             poi,
                             heightmaps,
                         })) => {
+                            self.failed.remove(&response.pos);
                             if matches!(entities, SavedEntityData::Unavailable)
                                 || (session.can_retry_poi_chunk(response.pos)
                                     && matches!(poi, SavedPoiData::Unavailable))
                             {
-                                let attempts = self
-                                    .entity_retry
-                                    .get(&response.pos)
-                                    .map_or(0, |(_, attempts)| attempts.saturating_add(1));
-                                let delay = 5_u64.saturating_mul(1_u64 << attempts.min(4));
-                                self.entity_retry.insert(
-                                    response.pos,
-                                    (Instant::now() + Duration::from_secs(delay), attempts),
-                                );
+                                schedule_retry(&mut self.entity_retry, response.pos);
                             } else {
                                 self.entity_retry.remove(&response.pos);
                             }
@@ -324,14 +327,24 @@ impl ChunkStreamer {
                                 session.queue_poi_chunk(response.pos, poi);
                             }
                         }
+                        Ok(None) if response.entities_only => {
+                            schedule_retry(&mut self.entity_retry, response.pos);
+                        }
                         Ok(None) => {
+                            self.failed.remove(&response.pos);
                             self.missing.insert(response.pos);
                             if within(response.pos, (center, self.radius)) {
                                 session.queue_missing_chunk(response.pos);
                             }
                         }
                         Err(error) => {
-                            self.failed.insert(response.pos);
+                            if response.entities_only {
+                                schedule_retry(&mut self.entity_retry, response.pos);
+                            } else if !session.has_chunk_or_pending(response.pos) {
+                                schedule_retry(&mut self.failed, response.pos);
+                            } else {
+                                self.failed.remove(&response.pos);
+                            }
                             eprintln!(
                                 "Could not load chunk {}, {}: {error}",
                                 response.pos.x, response.pos.z
@@ -345,16 +358,28 @@ impl ChunkStreamer {
                 }
             }
         }
-        let retry_due = self.entity_retry.iter().any(|(pos, (at, _))| {
-            *at <= Instant::now()
+        // Another path may have attached the chunk while its failed read was
+        // waiting. A stale terrain error must not block entity-only retries.
+        self.failed
+            .retain(|pos, _| !session.has_resident_or_parked_chunk(*pos));
+        let now = Instant::now();
+        let entity_retry_due = self.entity_retry.iter().any(|(pos, (at, _))| {
+            *at <= now
                 && !self.pending.contains(pos)
-                && !self.failed.contains(pos)
+                && !self.failed.contains_key(pos)
                 && !self.missing.contains(pos)
         });
+        let terrain_retry_due = self.failed.iter().any(|(pos, (at, _))| {
+            *at <= now
+                && !self.pending.contains(pos)
+                && !self.missing.contains(pos)
+                && !session.has_chunk_or_pending(*pos)
+        });
+        let retry_due = entity_retry_due || terrain_retry_due;
         if windows_changed || received || retry_due {
             while let Some(&pos) = self.targets.get(self.settled_prefix) {
                 if !self.missing.contains(&pos)
-                    && !self.failed.contains(&pos)
+                    && !self.failed.contains_key(&pos)
                     && !session.has_resident_or_parked_chunk(pos)
                 {
                     break;
@@ -372,9 +397,10 @@ impl ChunkStreamer {
                 let retry = self
                     .entity_retry
                     .get(&pos)
-                    .is_some_and(|(at, _)| *at <= Instant::now());
+                    .is_some_and(|(at, _)| *at <= now);
+                let terrain_retry = self.failed.get(&pos).is_some_and(|(at, _)| *at <= now);
                 if self.missing.contains(&pos)
-                    || self.failed.contains(&pos)
+                    || (self.failed.contains_key(&pos) && !terrain_retry)
                     || self.pending.contains(&pos)
                     || (session.has_chunk_or_pending(pos) && !retry)
                 {
@@ -403,6 +429,14 @@ impl ChunkStreamer {
         }
         Ok(())
     }
+}
+
+fn schedule_retry(retries: &mut BTreeMap<ChunkPos, (Instant, u32)>, pos: ChunkPos) {
+    let attempts = retries
+        .get(&pos)
+        .map_or(0, |(_, attempts)| attempts.saturating_add(1));
+    let delay = 5_u64.saturating_mul(1_u64 << attempts.min(4));
+    retries.insert(pos, (Instant::now() + Duration::from_secs(delay), attempts));
 }
 
 pub(crate) fn read_entity_data(reader: &mut WorldReader, pos: ChunkPos) -> SavedEntityData {
@@ -693,6 +727,175 @@ mod tests {
     }
 
     #[test]
+    fn transient_terrain_errors_retry_with_backoff_and_recover() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let missing: BTreeSet<_> = targets(home, 1)
+            .into_iter()
+            .filter(|&pos| pos != home && pos != target)
+            .collect();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let mut streamer = ChunkStreamer::with_source(1, missing, move |pos| {
+            assert_eq!(pos, target);
+            if worker_attempts.fetch_add(1, AtomicOrdering::SeqCst) < 2 {
+                anyhow::bail!("temporary read error")
+            }
+            Ok(Some(chunk_world(pos)))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for expected_attempt in 0..=1 {
+            loop {
+                streamer.service(&mut session).unwrap();
+                session.update(Duration::from_millis(50));
+                if streamer
+                    .failed
+                    .get(&target)
+                    .is_some_and(|(_, n)| *n == expected_attempt)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "terrain failure was not recorded"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!streamer.missing.contains(&target));
+            assert!(!session.has_resident_or_parked_chunk(target));
+            assert!(streamer.failed[&target].0 > Instant::now());
+            streamer.failed.get_mut(&target).unwrap().0 = Instant::now();
+        }
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if session.has_resident_or_parked_chunk(target) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "terrain retry did not recover");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert!(!streamer.failed.contains_key(&target));
+        assert!(!streamer.missing.contains(&target));
+    }
+
+    #[test]
+    fn entity_only_failures_do_not_mark_resident_terrain_missing() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let home = ChunkPos { x: 0, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session
+            .set_initial_entity_chunk(home, SavedEntityData::Unavailable)
+            .unwrap();
+        session
+            .set_initial_poi_chunk(home, SavedPoiData::Missing)
+            .unwrap();
+        let missing: BTreeSet<_> = targets(home, 1)
+            .into_iter()
+            .filter(|&pos| pos != home)
+            .collect();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let mut streamer =
+            ChunkStreamer::with_entity_source(1, missing, move |pos, entities_only| {
+                assert_eq!(pos, home);
+                assert!(entities_only);
+                match worker_attempts.fetch_add(1, AtomicOrdering::SeqCst) {
+                    0 => anyhow::bail!("temporary entity read failure"),
+                    1 => Ok(None),
+                    _ => Ok(Some(ChunkPayload {
+                        world: None,
+                        entities: SavedEntityData::Empty,
+                        poi: SavedPoiData::Missing,
+                        heightmaps: None,
+                    })),
+                }
+            })
+            .unwrap();
+        streamer.service(&mut session).unwrap();
+        // Another loader can supply terrain while an old failure is pending.
+        streamer.failed.insert(home, (Instant::now(), 0));
+        streamer.service(&mut session).unwrap();
+        assert!(!streamer.failed.contains_key(&home));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for expected_attempt in 1..=2 {
+            streamer.entity_retry.get_mut(&home).unwrap().0 = Instant::now();
+            loop {
+                streamer.service(&mut session).unwrap();
+                session.update(Duration::from_millis(50));
+                if streamer
+                    .entity_retry
+                    .get(&home)
+                    .is_some_and(|(_, n)| *n == expected_attempt)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "entity retry failure was not recorded"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!streamer.missing.contains(&home));
+            assert!(!streamer.failed.contains_key(&home));
+            assert!(session.has_resident_or_parked_chunk(home));
+        }
+        streamer.entity_retry.get_mut(&home).unwrap().0 = Instant::now();
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if matches!(
+                session.saved_entity_chunk(home),
+                Some(SavedEntityData::Empty)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "entity retry did not recover");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert!(!streamer.entity_retry.contains_key(&home));
+    }
+
+    #[test]
     fn obsolete_missing_and_error_responses_do_not_poison_future_loads() {
         let home = ChunkPos { x: 0, z: 0 };
         let player = PlayerState {
@@ -725,6 +928,7 @@ mod tests {
                 pos: missing,
                 result: Ok(None),
                 stale: false,
+                entities_only: false,
             })
             .unwrap();
         sender
@@ -732,11 +936,12 @@ mod tests {
                 pos: failed,
                 result: Err("transient".into()),
                 stale: false,
+                entities_only: false,
             })
             .unwrap();
         streamer.service(&mut session).unwrap();
         assert!(!streamer.missing.contains(&missing));
-        assert!(!streamer.failed.contains(&failed));
+        assert!(!streamer.failed.contains_key(&failed));
         assert!(!streamer.pending.contains(&missing));
         assert!(!streamer.pending.contains(&failed));
     }

@@ -311,6 +311,41 @@ public class RegionWriteOracle {
             } catch (Exception exception) {
                 System.out.println("LOCKED");
             }
+        } else if (args[0].equals("verifyGeneratedBatch")) {
+            net.minecraft.server.Bootstrap.bootStrap();
+            for (int x : new int[]{5, 96}) {
+                try (var region = open(dir, Math.floorDiv(x, 32), RegionFileVersion.VERSION_NONE);
+                     var in = region.getChunkDataInputStream(new ChunkPos(x, 0))) {
+                    if (in == null) throw new AssertionError("missing generated terrain " + x);
+                    var terrain = NbtIo.read((DataInput)in);
+                    if (terrain.getIntOr("xPos", -1) != x || terrain.getIntOr("DataVersion", 0) != 5023 ||
+                        !terrain.getStringOr("Status", "").equals("minecraft:full") ||
+                        !terrain.getCompoundOrEmpty("fixture_unknown").getStringOr("marker", "").equals("unknown-1"))
+                        throw new AssertionError("generated terrain differs " + x);
+                }
+            }
+            try (var region = open(dir); var in = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
+                if (!NbtIo.read((DataInput)in).equals(chunk(0))) throw new AssertionError("existing terrain changed");
+            }
+            var entities = world.resolve("dimensions/minecraft/overworld/entities");
+            try (var region = open(entities); var in = region.getChunkDataInputStream(new ChunkPos(5, 0))) {
+                var root = NbtIo.read((DataInput)in);
+                if (!Arrays.equals(root.getIntArray("Position").orElseThrow(), new int[]{5, 0}) ||
+                    !root.getListOrEmpty("Entities").getCompoundOrEmpty(0).getStringOr("id", "").equals("minecraft:pig"))
+                    throw new AssertionError("generated entity differs");
+            }
+            var ops = net.minecraft.core.RegistryAccess.fromRegistryOfRegistries(net.minecraft.core.registries.BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
+            var poi = world.resolve("dimensions/minecraft/overworld/poi");
+            try (var region = open(poi); var in = region.getChunkDataInputStream(new ChunkPos(5, 0))) {
+                var root = NbtIo.read((DataInput)in);
+                var section = net.minecraft.world.entity.ai.village.poi.PoiSection.Packed.CODEC.parse(ops, root.getCompoundOrEmpty("Sections").get("0")).getOrThrow();
+                if (!section.isValid() || section.records().size() != 1 ||
+                    !section.records().getFirst().pos().equals(new net.minecraft.core.BlockPos(81, 1, 1)) ||
+                    !section.records().getFirst().poiType().getRegisteredName().equals("minecraft:meeting") ||
+                    section.records().getFirst().freeTickets() != 32)
+                    throw new AssertionError("generated POI differs");
+            }
+            System.out.println("RE_CRAFT_GENERATED_BATCH_OK");
         } else if (args[0].equals("verifyPoi")) {
             net.minecraft.server.Bootstrap.bootStrap();
             var ops = net.minecraft.core.RegistryAccess.fromRegistryOfRegistries(net.minecraft.core.registries.BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
@@ -484,6 +519,124 @@ fn java_reads_poi_region_created_in_coordinated_save() {
     drop(writer);
     let output = invoke("verifyPoi");
     assert!(output.contains("OK"), "{output}");
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn java_reads_generated_region_batch_in_existing_world() {
+    use native_persistence::nbt::{NamedTag, Tag, TagType};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
+    std::fs::create_dir_all(&root).unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("java-generated-batch-")
+        .tempdir_in(root)
+        .unwrap();
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("APPDATA").unwrap()).join(".minecraft"));
+    let java = java_bin();
+    let cp = classpath(&game, temp.path());
+    let source = temp.path().join("RegionWriteOracle.java");
+    std::fs::write(&source, ORACLE).unwrap();
+    run(Command::new(java.join("javac.exe"))
+        .arg("-encoding")
+        .arg("UTF-8")
+        .arg("-classpath")
+        .arg(&cp)
+        .arg(&source));
+    let world = temp.path().join("world");
+    std::fs::create_dir(&world).unwrap();
+    let invoke = |action: &str| {
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("RegionWriteOracle")
+            .arg(action)
+            .arg(&world))
+    };
+    assert!(invoke("seed").lines().any(|line| line == "OK"));
+    let original =
+        RegionReader::open(&world.join("dimensions/minecraft/overworld/region/r.0.0.mca"))
+            .unwrap()
+            .read_chunk(1, 0)
+            .unwrap()
+            .unwrap();
+    let terrain = |x| {
+        let mut chunk = original.clone();
+        let Tag::Compound(fields) = &mut chunk.value else {
+            panic!()
+        };
+        fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("xPos"))
+            .unwrap()
+            .1 = Tag::Int(x);
+        chunk
+    };
+    let entity = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            ("Position".into(), Tag::IntArray(vec![5, 0])),
+            (
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![(
+                        "id".into(),
+                        Tag::String("minecraft:pig".into()),
+                    )])],
+                },
+            ),
+        ]),
+    };
+    let poi = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(5023)),
+            (
+                "Sections".into(),
+                Tag::Compound(vec![(
+                    "0".into(),
+                    Tag::Compound(vec![
+                        ("Valid".into(), Tag::Byte(1)),
+                        (
+                            "Records".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![
+                                    ("pos".into(), Tag::IntArray(vec![81, 1, 1])),
+                                    ("type".into(), Tag::String("minecraft:meeting".into())),
+                                    ("free_tickets".into(), Tag::Int(32)),
+                                ])],
+                            },
+                        ),
+                    ]),
+                )]),
+            ),
+        ]),
+    };
+    let first = ChunkPos { x: 5, z: 0 };
+    let distant = ChunkPos { x: 96, z: 0 };
+    let mut terrain_a = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+    let mut terrain_b = FreshRegionDraft::new(FreshRegionKind::Terrain, 3, 0);
+    let mut entities = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+    let mut pois = FreshRegionDraft::new(FreshRegionKind::Poi, 0, 0);
+    terrain_a.add(first, &terrain(5), 10).unwrap();
+    terrain_b.add(distant, &terrain(96), 10).unwrap();
+    entities.add(first, &entity, 10).unwrap();
+    pois.add(first, &poi, 10).unwrap();
+    let mut plan = WorldSavePlan::new();
+    plan.add_generated_regions(
+        DimensionId::parse("overworld").unwrap(),
+        [terrain_a, terrain_b, entities, pois],
+    )
+    .unwrap();
+    let mut guard = WorldWriteGuard::acquire(&world).unwrap();
+    guard.write_plan(plan, |_, _| Ok(())).unwrap();
+    drop(guard);
+    let output = invoke("verifyGeneratedBatch");
+    assert!(output.contains("RE_CRAFT_GENERATED_BATCH_OK"), "{output}");
 }
 
 #[test]

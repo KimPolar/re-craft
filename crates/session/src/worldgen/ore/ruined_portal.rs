@@ -1186,10 +1186,9 @@ mod tests {
         };
         let pos = [3, 7, 3];
         let mut count = 0;
-        for line in String::from_utf8(result.stdout)?
-            .lines()
-            .filter(|line| line.starts_with("SHAPE ") || line.starts_with("UPDATE "))
-        {
+        for line in String::from_utf8(result.stdout)?.lines().filter(|line| {
+            line.starts_with("SHAPE ") || line.starts_with("UPDATE ") || line.starts_with("LIGHT ")
+        }) {
             let values: Vec<_> = line.split_whitespace().collect();
             let state = BlockState {
                 name: "minecraft:iron_chain".into(),
@@ -1218,6 +1217,26 @@ mod tests {
                         (f64::from(actual) - expected.parse::<f64>()?).abs() <= 0.000051,
                         "{line}"
                     );
+                }
+            } else if values[0] == "LIGHT" {
+                ensure!(values.len() == 9, "invalid light oracle");
+                assert_eq!(values[3], if values[2] == "true" { "1" } else { "0" });
+                assert_eq!(&values[4..6], &["0", "false"]);
+                for (index, name) in ["minecraft:air", "minecraft:water", "minecraft:iron_bars"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let (name, properties) = registry.resolve(&serde_json::json!(name))?;
+                    let other = BlockState { name, properties };
+                    let same = native_world::block_light::same_light_behavior(&state, &other)
+                        .context("unknown chain light behavior")?;
+                    assert_eq!(!same, values[index + 6] == "true", "{line}");
+                    if index == 0 {
+                        assert_eq!(
+                            native_world::block_light::skips_light_check_for_edit(&state, &other),
+                            Some(same)
+                        );
+                    }
                 }
             } else {
                 let direction = match values[3] {
@@ -1254,7 +1273,7 @@ mod tests {
             }
             count += 1;
         }
-        assert_eq!(count, 42);
+        assert_eq!(count, 48);
         Ok(())
     }
 

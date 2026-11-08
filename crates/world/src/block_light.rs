@@ -470,6 +470,9 @@ fn properties(state: &BlockState) -> Option<(u8, u8)> {
             bounded("age", 15)?;
             (0, 0)
         }
+        "minecraft:iron_chain" if state.properties.len() == 2 && axis() => {
+            (u8::from(boolean("waterlogged")?), 0)
+        }
         _ if crate::collision::pane_waterlogged(state).is_some() => {
             (u8::from(crate::collision::pane_waterlogged(state)?), 0)
         }
@@ -802,6 +805,7 @@ pub fn skips_light_check_for_edit(a: &BlockState, b: &BlockState) -> Option<bool
                 | "minecraft:dirt"
                 | "minecraft:sand"
                 | "minecraft:gravel"
+                | "minecraft:iron_chain"
         )
     }
     if !known_without_shape(a) || !known_without_shape(b) {
@@ -1342,6 +1346,30 @@ mod tests {
             properties: lit
                 .map(|v| [("lit".to_owned(), v.to_string())].into())
                 .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn iron_chain_light_depends_on_waterlogging_and_valid_state() {
+        for axis in ["x", "y", "z"] {
+            let mut chain = state("iron_chain", None);
+            chain.properties.insert("axis".into(), axis.into());
+            chain
+                .properties
+                .insert("waterlogged".into(), "false".into());
+            assert_eq!(properties(&chain), Some((0, 0)));
+            assert_eq!(same_light_behavior(&chain, &state("air", None)), Some(true));
+            assert_eq!(
+                skips_light_check_for_edit(&chain, &state("air", None)),
+                Some(true)
+            );
+            chain.properties.insert("waterlogged".into(), "true".into());
+            assert_eq!(properties(&chain), Some((1, 0)));
+            let mut water = state("water", None);
+            water.properties.insert("level".into(), "0".into());
+            assert_eq!(same_light_behavior(&chain, &water), Some(true));
+            chain.properties.insert("axis".into(), "invalid".into());
+            assert!(light_properties(&chain).is_none());
         }
     }
 

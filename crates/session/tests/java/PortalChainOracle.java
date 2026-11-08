@@ -11,6 +11,7 @@ import net.minecraft.world.level.ServerLevelAccessor;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.lighting.LightEngine;
 
 public class PortalChainOracle {
     public static void main(String[] args) {
@@ -32,6 +33,11 @@ public class PortalChainOracle {
             var box = boxes.get(0);
             System.out.printf("SHAPE %s %s %.4f %.4f %.4f %.4f %.4f %.4f%n", axis.getSerializedName(), wet,
                 box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ);
+            System.out.printf("LIGHT %s %s %d %d %s %s %s %s%n", axis.getSerializedName(), wet,
+                state.getLightDampening(), state.getLightEmission(), state.useShapeForLightOcclusion(),
+                LightEngine.hasDifferentLightProperties(state, Blocks.AIR.defaultBlockState()),
+                LightEngine.hasDifferentLightProperties(state, Blocks.WATER.defaultBlockState()),
+                LightEngine.hasDifferentLightProperties(state, Blocks.IRON_BARS.defaultBlockState()));
             for (var direction : Direction.values()) {
                 ticks.clear();
                 var result = state.updateShape(world, world, BlockPos.ZERO, direction, BlockPos.ZERO.relative(direction),

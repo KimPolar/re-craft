@@ -1850,9 +1850,14 @@ impl WorldReader {
 
     pub fn read_chunk(&mut self, x: i32, z: i32) -> Result<Option<LoadedChunk>> {
         let directory = self.dimension.region_dir(&self.root);
-        read_region_document(&directory, x, z, &mut self.regions, &mut self.region_usage)?
-            .map(|document| decode_chunk(document, ChunkPos { x, z }))
-            .transpose()
+        read_validated_region_document(
+            &directory,
+            x,
+            z,
+            &mut self.regions,
+            &mut self.region_usage,
+            |document| decode_chunk(document, ChunkPos { x, z }),
+        )
     }
 
     /// A missing entity-region entry represents an empty entity chunk in 26.3.
@@ -1860,30 +1865,28 @@ impl WorldReader {
     /// that an unreadable chunk is empty.
     pub fn read_entity_chunk(&mut self, x: i32, z: i32) -> Result<Option<SavedEntityChunk>> {
         let directory = self.dimension.entity_region_dir(&self.root);
-        read_region_document(
+        read_validated_region_document(
             &directory,
             x,
             z,
             &mut self.entity_regions,
             &mut self.entity_region_usage,
-        )?
-        .map(|document| decode_entity_chunk(document, ChunkPos { x, z }))
-        .transpose()
+            |document| decode_entity_chunk(document, ChunkPos { x, z }),
+        )
     }
 
     /// Missing POI storage is distinct from a decoded empty entry: Java can
     /// populate or rebuild it when loading the corresponding terrain sections.
     pub fn read_poi_chunk(&mut self, x: i32, z: i32) -> Result<Option<SavedPoiChunk>> {
         let directory = self.dimension.poi_region_dir(&self.root);
-        read_region_document(
+        read_validated_region_document(
             &directory,
             x,
             z,
             &mut self.poi_regions,
             &mut self.poi_region_usage,
-        )?
-        .map(|document| decode_poi_chunk(document, ChunkPos { x, z }))
-        .transpose()
+            |document| decode_poi_chunk(document, ChunkPos { x, z }),
+        )
     }
 
     pub fn read_area(&mut self, center: ChunkPos, radius: u32) -> Result<ChunkArea> {
@@ -1928,6 +1931,24 @@ impl WorldReader {
             missing,
         })
     }
+}
+
+fn read_validated_region_document<T>(
+    directory: &Path,
+    x: i32,
+    z: i32,
+    regions: &mut BTreeMap<(i32, i32), RegionReader>,
+    usage: &mut VecDeque<(i32, i32)>,
+    decode: impl FnOnce(NamedTag) -> Result<T>,
+) -> Result<Option<T>> {
+    let result = read_region_document(directory, x, z, regions, usage)
+        .and_then(|document| document.map(decode).transpose());
+    if result.is_err() {
+        let pos = (x.div_euclid(REGION_SIDE), z.div_euclid(REGION_SIDE));
+        regions.remove(&pos);
+        usage.retain(|cached| *cached != pos);
+    }
+    result
 }
 
 fn read_region_document(
@@ -3113,6 +3134,69 @@ mod tests {
         )
         .unwrap();
         assert!(reader.saved_chunk_positions(RegionStore::Terrain).is_err());
+    }
+
+    #[test]
+    fn failed_region_reads_release_cached_handles_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let write = |directory: &Path, fields: Vec<(JavaString, Tag)>, version: i32| {
+            std::fs::create_dir_all(directory).unwrap();
+            let mut fields = fields;
+            fields.push(("DataVersion".into(), Tag::Int(version)));
+            let nbt = nbt::write(&NamedTag {
+                name: "".into(),
+                value: Tag::Compound(fields),
+            })
+            .unwrap();
+            let mut bytes = vec![0u8; 3 * 4096];
+            bytes[..4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+            bytes[8192..8196].copy_from_slice(&((nbt.len() + 1) as u32).to_be_bytes());
+            bytes[8196] = 3;
+            bytes[8197..8197 + nbt.len()].copy_from_slice(&nbt);
+            std::fs::write(directory.join("r.0.0.mca"), bytes).unwrap();
+        };
+        let terrain = vec![("xPos".into(), Tag::Int(0)), ("zPos".into(), Tag::Int(0))];
+        let entities = vec![
+            ("Position".into(), Tag::IntArray(vec![0, 0])),
+            (
+                "Entities".into(),
+                Tag::List {
+                    element_type: TagType::End,
+                    values: vec![],
+                },
+            ),
+        ];
+        let poi = vec![("Sections".into(), Tag::Compound(vec![]))];
+        let directories = [
+            dimension.region_dir(dir.path()),
+            dimension.entity_region_dir(dir.path()),
+            dimension.poi_region_dir(dir.path()),
+        ];
+        for (path, fields) in directories.iter().zip([&terrain, &entities, &poi]) {
+            write(path, fields.clone(), TARGET_DATA_VERSION - 1);
+        }
+        let mut reader = WorldReader::open(dir.path(), dimension).unwrap();
+        assert!(reader.read_chunk(0, 0).is_err());
+        assert!(reader.read_entity_chunk(0, 0).is_err());
+        assert!(reader.read_poi_chunk(0, 0).is_err());
+        assert!(
+            reader.regions.is_empty()
+                && reader.entity_regions.is_empty()
+                && reader.poi_regions.is_empty()
+        );
+        assert!(
+            reader.region_usage.is_empty()
+                && reader.entity_region_usage.is_empty()
+                && reader.poi_region_usage.is_empty()
+        );
+        for (path, fields) in directories.iter().zip([terrain, entities, poi]) {
+            write(path, fields, TARGET_DATA_VERSION);
+        }
+        assert!(reader.read_chunk(0, 0).unwrap().is_some());
+        assert!(reader.read_entity_chunk(0, 0).unwrap().is_some());
+        assert!(reader.read_poi_chunk(0, 0).unwrap().is_some());
     }
 
     #[test]

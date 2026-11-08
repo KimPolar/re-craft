@@ -89,6 +89,15 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
         json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_sword","modifier":
             {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"include_additional_cost_component":true}
         }]}]}),
+        json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:potion","modifier":[
+            {"type":"minecraft:set_potion","id":"minecraft:water_breathing"},
+            {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"only_compatible":false}
+        ]}]}]}),
+        json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:tipped_arrow","modifier":[
+            {"type":"minecraft:enchant_randomly","options":["minecraft:unbreaking"],"only_compatible":false},
+            {"type":"minecraft:set_potion","id":"minecraft:swiftness"},
+            {"type":"minecraft:set_count","count":3}
+        ]}]}]}),
     ];
     std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let oracle = run(Command::new(java.join("java.exe"))
@@ -113,6 +122,7 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
         let max = match item.id.path.as_str() {
             "enchanted_book"
             | "diamond_sword"
+            | "potion"
             | "music_disc_otherside"
             | "music_disc_13"
             | "music_disc_cat"
@@ -122,6 +132,7 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
             | "diamond_horse_armor" => 1,
             "book"
             | "stone"
+            | "tipped_arrow"
             | "leather"
             | "golden_apple"
             | "enchanted_golden_apple"
@@ -204,8 +215,13 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
                         entries.join(",")
                     };
                     let level = item.enchantments.len();
+                    let potion = item
+                        .potion
+                        .as_ref()
+                        .map(|value| format!("{}:{}", value.namespace, value.path))
+                        .unwrap_or_else(|| "-".into());
                     format!(
-                        "P {slot} {}:{} {} {id} {level}",
+                        "P {slot} {}:{} {} {id} {level} {potion}",
                         item.id.namespace, item.id.path, item.count
                     )
                 })

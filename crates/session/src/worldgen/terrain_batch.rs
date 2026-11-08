@@ -5734,6 +5734,8 @@ mod session_block_support_tests {
                     Ok(vec![
                         ResourceId::parse("example:chests/sword")?,
                         ResourceId::parse("example:chests/stone")?,
+                        ResourceId::parse("example:chests/potion")?,
+                        ResourceId::parse("example:chests/arrow")?,
                     ])
                 } else {
                     self.0.list_data(folder)
@@ -5741,14 +5743,27 @@ mod session_block_support_tests {
             }
             fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
                 let item = match path {
-                    "data/example/loot_table/chests/sword.json" => Some("minecraft:diamond_sword"),
-                    "data/example/loot_table/chests/stone.json" => Some("minecraft:stone"),
+                    "data/example/loot_table/chests/sword.json" => {
+                        Some(("minecraft:diamond_sword", None))
+                    }
+                    "data/example/loot_table/chests/stone.json" => Some(("minecraft:stone", None)),
+                    "data/example/loot_table/chests/potion.json" => {
+                        Some(("minecraft:potion", Some("minecraft:water_breathing")))
+                    }
+                    "data/example/loot_table/chests/arrow.json" => {
+                        Some(("minecraft:tipped_arrow", Some("minecraft:swiftness")))
+                    }
                     _ => None,
                 };
-                if let Some(item) = item {
+                if let Some((item, potion)) = item {
+                    let mut modifiers = Vec::new();
+                    if let Some(potion) = potion {
+                        modifiers.push(json!({"type":"minecraft:set_potion","id":potion}));
+                    }
+                    modifiers.push(json!({"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"only_compatible":false}));
                     Ok(Some(serde_json::to_vec(
                         &json!({"type":"minecraft:chest", "random_sequence":"example:items", "pools":[{"rolls":1,"entries":[{
-                            "type":"minecraft:item", "name":item, "modifier":{"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"only_compatible":false}
+                            "type":"minecraft:item", "name":item, "modifier":modifiers
                         }]}]}),
                     )?))
                 } else {
@@ -5759,9 +5774,50 @@ mod session_block_support_tests {
         let item_loot = Arc::new(native_resources::chest_loot::ChestLootTables::load(
             &mut EnchantedLoot(&mut resources),
         )?);
+        let oracle_dir = tempfile::tempdir()?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), oracle_dir.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = oracle_dir
+            .path()
+            .join("EnchantedPotionRoundTripOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../../tests/java/EnchantedPotionRoundTripOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java item oracle did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
         for (table, item_id) in [
             ("example:chests/sword", "minecraft:diamond_sword"),
             ("example:chests/stone", "minecraft:stone"),
+            ("example:chests/potion", "minecraft:potion"),
+            ("example:chests/arrow", "minecraft:tipped_arrow"),
         ] {
             let mut item_session = fresh_player_session_with_loot_chest(Some(table));
             item_session.set_player_inventory(PlayerInventory::default());
@@ -5791,6 +5847,11 @@ mod session_block_support_tests {
                 .get("minecraft:enchantments")
                 .context("enchantment component missing")?
                 .clone();
+            let potion = item.components().get("minecraft:potion_contents").cloned();
+            assert_eq!(
+                potion.is_some(),
+                matches!(item_id, "minecraft:potion" | "minecraft:tipped_arrow")
+            );
             assert!(item.has_glint());
             item_session.submit_command(PlayerCommand::ToggleInventory);
             item_session.update(Duration::from_millis(50));
@@ -5808,6 +5869,63 @@ mod session_block_support_tests {
                     .and_then(|value| value.get("minecraft:enchantments")),
                 Some(&expected)
             );
+            assert_eq!(
+                saved
+                    .get("components")
+                    .and_then(|value| value.get("minecraft:potion_contents")),
+                potion.as_ref()
+            );
+            if let Some(potion_id) = match item_id {
+                "minecraft:potion" => Some("minecraft:water_breathing"),
+                "minecraft:tipped_arrow" => Some("minecraft:swiftness"),
+                _ => None,
+            } {
+                let Tag::Compound(fields) = saved else {
+                    anyhow::bail!("saved item is not a compound")
+                };
+                let item = Tag::Compound(
+                    fields
+                        .iter()
+                        .filter(|(name, _)| !name.matches("Slot"))
+                        .cloned()
+                        .collect(),
+                );
+                let input = oracle_dir.path().join("item-in.nbt");
+                let output = oracle_dir.path().join("item-out.nbt");
+                std::fs::write(
+                    &input,
+                    native_persistence::nbt::write(&native_persistence::nbt::NamedTag {
+                        name: "".into(),
+                        value: item,
+                    })?,
+                )?;
+                let result = std::process::Command::new(java.join("java.exe"))
+                    .arg("-classpath")
+                    .arg(&classpath)
+                    .arg("EnchantedPotionRoundTripOracle")
+                    .arg(&input)
+                    .arg(&output)
+                    .arg(item_id)
+                    .arg(potion_id)
+                    .output()?;
+                ensure!(
+                    result.status.success(),
+                    "Java item round trip failed: {} {}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let reloaded = native_persistence::nbt::read(&std::fs::read(output)?)?;
+                let components = reloaded
+                    .value
+                    .get("components")
+                    .context("round-tripped components missing")?;
+                assert_eq!(components.get("minecraft:enchantments"), Some(&expected));
+                let max = if item_id == "minecraft:potion" { 1 } else { 64 };
+                assert_eq!(
+                    crate::equippable::saved_inventory_max(item_id, components),
+                    Some(max)
+                );
+            }
         }
         let registry = resources.vanilla_block_ids()?;
         let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);

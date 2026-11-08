@@ -69,6 +69,35 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
     if let Some(max) = saved_item_max(id, components) {
         return Some(max);
     }
+    if let Tag::Compound(entries) = components
+        && entries.iter().any(|(name, _)| {
+            name.matches("minecraft:enchantments") || name.matches("minecraft:stored_enchantments")
+        })
+    {
+        let mut ordinary = Vec::with_capacity(entries.len());
+        let mut enchantments = false;
+        let mut stored = false;
+        for (name, value) in entries {
+            if name.matches("minecraft:enchantments") {
+                if enchantments || !valid_enchantments(value) {
+                    return None;
+                }
+                enchantments = true;
+            } else if name.matches("minecraft:stored_enchantments") {
+                if stored || id != "minecraft:enchanted_book" || !valid_enchantments(value) {
+                    return None;
+                }
+                stored = true;
+            } else {
+                ordinary.push((name.clone(), value.clone()));
+            }
+        }
+        if (enchantments || stored)
+            && let Some(max) = saved_item_max(id, &Tag::Compound(ordinary))
+        {
+            return Some(max);
+        }
+    }
     let default = vanilla_equipment(id)
         .map(|entry| entry.1)
         .or_else(|| ordinary_item_default_max(id))?;
@@ -249,5 +278,45 @@ mod tests {
             Some(1)
         );
         assert_eq!(saved_inventory_max("example:unknown", &components), None);
+    }
+
+    #[test]
+    fn enchantments_compose_with_valid_potion_components() {
+        let enchantment = (
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(2))]),
+        );
+        let potion = (
+            "minecraft:potion_contents".into(),
+            Tag::Compound(vec![(
+                "potion".into(),
+                Tag::String("minecraft:water_breathing".into()),
+            )]),
+        );
+        let components = Tag::Compound(vec![potion.clone(), enchantment.clone()]);
+        assert_eq!(
+            saved_inventory_max("minecraft:potion", &components),
+            Some(1)
+        );
+        assert_eq!(
+            saved_inventory_max("minecraft:tipped_arrow", &components),
+            Some(64)
+        );
+        assert_eq!(saved_inventory_max("minecraft:stone", &components), None);
+        assert_eq!(
+            saved_inventory_max(
+                "minecraft:potion",
+                &Tag::Compound(vec![potion.clone(), enchantment.clone(), enchantment])
+            ),
+            None
+        );
+        let unknown = Tag::Compound(vec![
+            potion,
+            (
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(0))]),
+            ),
+        ]);
+        assert_eq!(saved_inventory_max("minecraft:potion", &unknown), None);
     }
 }

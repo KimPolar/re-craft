@@ -91,7 +91,8 @@ public class ChestLootOracle {
        boolean book=stack.is(Items.ENCHANTED_BOOK);var enchantments=stack.get(book?DataComponents.STORED_ENCHANTMENTS:DataComponents.ENCHANTMENTS);String id="-";int level=0;
        if(enchantments!=null&&!enchantments.isEmpty()){var values=new ArrayList<String>();for(var e:enchantments.entrySet())values.add(e.getKey().unwrapKey().orElseThrow().identifier().toString()+"="+e.getIntValue());Collections.sort(values);id=String.join(",",values);level=enchantments.size();}
        if(!id.equals("-")){String encoded=ItemStack.CODEC.encodeStart(nbtops,stack).getOrThrow().toString();if(!encoded.contains(book?"minecraft:stored_enchantments":"minecraft:enchantments"))throw new AssertionError(encoded);}
-       out.printf("P %d %s %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount(),id,level);
+       var contents=stack.get(DataComponents.POTION_CONTENTS);String potion=contents==null?"-":contents.potion().flatMap(Holder::unwrapKey).map(k->k.identifier().toString()).orElse("-");
+       out.printf("P %d %s %d %s %d %s%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount(),id,level,potion);
       }
       else if(args.length>1&&args[1].equals("potion")){
        var contents=stack.get(DataComponents.POTION_CONTENTS);

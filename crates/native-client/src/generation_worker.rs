@@ -894,8 +894,9 @@ impl GenerationReady {
                 .is_some_and(|stage| stage >= GenerationStage::Spawn)
             {
                 if let Some(records) = self.batch.complete_generated_entity_records(pos)? {
-                    session
-                        .set_initial_entity_chunk(pos, generated_session_entities(pos, records))?;
+                    let data =
+                        native_session::loaded::SavedEntityData::from_generated(pos, records)?;
+                    session.set_initial_entity_chunk(pos, data)?;
                 }
             }
         }
@@ -962,36 +963,6 @@ impl GenerationReady {
         }
         Ok(session)
     }
-}
-
-/// Build a transient session input; this is not a complete entity-region
-/// document and must not be used to save a Java world.
-fn generated_session_entities(
-    pos: ChunkPos,
-    records: &[native_persistence::nbt::Tag],
-) -> native_session::loaded::SavedEntityData {
-    use native_persistence::{
-        nbt::{NamedTag, Tag, TagType},
-        world::{ChunkPos as SavedChunkPos, SavedEntityChunk},
-    };
-    use native_session::loaded::SavedEntityData;
-
-    if records.is_empty() {
-        return SavedEntityData::Empty;
-    }
-    SavedEntityData::Present(Arc::new(SavedEntityChunk {
-        position: SavedChunkPos { x: pos.x, z: pos.z },
-        document: Arc::new(NamedTag {
-            name: "".into(),
-            value: Tag::Compound(vec![(
-                "Entities".into(),
-                Tag::List {
-                    element_type: TagType::Compound,
-                    values: records.to_vec(),
-                },
-            )]),
-        }),
-    }))
 }
 
 /// A lit protochunk may still change during generation. Only publish block

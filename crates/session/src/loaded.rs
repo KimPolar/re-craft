@@ -116,6 +116,26 @@ pub enum SavedEntityData {
     Unavailable,
 }
 
+impl SavedEntityData {
+    /// Create the same initial entity document as a freshly staged region.
+    /// The caller must establish that all entity sources and ownership are complete.
+    pub fn from_generated(
+        pos: ChunkPos,
+        records: &[native_persistence::nbt::Tag],
+    ) -> anyhow::Result<Self> {
+        if records.is_empty() {
+            return Ok(Self::Empty);
+        }
+        let document = native_persistence::generated_chunk::assemble_entity_chunk(pos, records)?;
+        Ok(Self::Present(Arc::new(
+            native_persistence::world::SavedEntityChunk {
+                position: native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                document: Arc::new(document),
+            },
+        )))
+    }
+}
+
 /// A generated player-spawn search must not skip a candidate when its
 /// terrain or entity data is not yet available.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60663,6 +60683,43 @@ pub(crate) mod tests {
                 .is_err(),
             "discontinuous history must be rejected"
         );
+    }
+
+    #[test]
+    fn generated_entity_data_matches_the_staged_region_document() {
+        use native_persistence::nbt::Tag;
+        let pos = ChunkPos { x: -2, z: 3 };
+        assert!(matches!(
+            SavedEntityData::from_generated(pos, &[]).unwrap(),
+            SavedEntityData::Empty
+        ));
+        let records = vec![Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:pig".into())),
+            ("future".into(), Tag::Int(42)),
+        ])];
+        let SavedEntityData::Present(chunk) =
+            SavedEntityData::from_generated(pos, &records).unwrap()
+        else {
+            panic!("generated entity data missing")
+        };
+        assert_eq!(
+            chunk.position,
+            native_persistence::world::ChunkPos { x: -2, z: 3 }
+        );
+        assert_eq!(
+            *chunk.document,
+            native_persistence::generated_chunk::assemble_entity_chunk(pos, &records).unwrap()
+        );
+        assert_eq!(
+            chunk.document.value.get("DataVersion"),
+            Some(&Tag::Int(5023))
+        );
+        assert_eq!(
+            chunk.document.value.get("Position"),
+            Some(&Tag::IntArray(vec![-2, 3]))
+        );
+        assert_eq!(chunk.entities(), records);
+        assert!(SavedEntityData::from_generated(pos, &[Tag::Int(1)]).is_err());
     }
 
     #[test]

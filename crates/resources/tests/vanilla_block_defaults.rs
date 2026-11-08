@@ -514,7 +514,10 @@ fn generated_block_defaults_match_java() {
         assert!(registry.contains(id), "missing block entity state {id}");
     }
     println!("verified {} generated block defaults", registry.len());
+    let defaults = registry.default_states();
+    assert_eq!(defaults.len(), registry.len());
     for id in registry.ids() {
+        assert_eq!(defaults.get(id), registry.default_properties(id).as_ref());
         assert_eq!(
             registry.has_block_entity(id),
             Some(entity_expected[id]),

@@ -1155,6 +1155,14 @@ impl GeneratedBlockRegistry {
             .map(|schema| schema.default_properties())
     }
 
+    /// Default properties for the state schemas verified from the client.
+    pub fn default_states(&self) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.states
+            .iter()
+            .map(|(id, schema)| (id.clone(), schema.default_properties()))
+            .collect()
+    }
+
     /// Strict property lookup for command block states. Unlike the NBT codec,
     /// command parsing rejects unknown names and invalid values.
     pub fn command_property(&self, id: &str, name: &str, value: &str) -> Option<String> {

@@ -436,18 +436,13 @@ impl ChunkArea {
                         for state in &palette.states {
                             let name = String::from_utf16(&state.name.0)
                                 .context("block identifier contains invalid UTF-16")?;
-                            let mut properties = BTreeMap::new();
+                            let mut properties = defaults.get(&name).cloned().unwrap_or_default();
                             for (key, value) in &state.properties {
                                 let key = String::from_utf16(&key.0)
                                     .context("block property name contains invalid UTF-16")?;
                                 let value = String::from_utf16(&value.0)
                                     .context("block property value contains invalid UTF-16")?;
                                 properties.insert(key, value);
-                            }
-                            if properties.is_empty()
-                                && let Some(default) = defaults.get(&name)
-                            {
-                                properties.clone_from(default);
                             }
                             ids.push(world.intern_state(loaded::BlockState { name, properties }));
                         }
@@ -3673,6 +3668,69 @@ mod tests {
         assert!(without.block(0, 0, 0).unwrap().properties.is_empty());
         assert_eq!(with.block(0, 0, 0).unwrap().properties["snowy"], "false");
         assert_eq!(*area.chunks[&pos].document, root);
+    }
+
+    #[test]
+    fn materialization_merges_partial_properties_without_losing_unknown_blocks() {
+        use crate::palette::{BlockPalette, BlockState, ChunkSection};
+        let pos = ChunkPos { x: 0, z: 0 };
+        let document = Arc::new(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![]),
+        });
+        let chunk = LoadedChunk {
+            position: pos,
+            data_version: TARGET_DATA_VERSION,
+            status: Some("minecraft:full".into()),
+            document: Arc::clone(&document),
+            sections: vec![ChunkSection {
+                y: 0,
+                blocks: Some(BlockPalette {
+                    states: vec![
+                        BlockState {
+                            name: "minecraft:oak_stairs".into(),
+                            properties: vec![("facing".into(), "east".into())],
+                        },
+                        BlockState {
+                            name: "example:unknown".into(),
+                            properties: vec![("custom".into(), "value".into())],
+                        },
+                    ],
+                    indices: (0..4096).map(|index| index % 2).collect(),
+                }),
+                biomes: None,
+                block_light: None,
+                sky_light: None,
+            }],
+        };
+        let area = ChunkArea {
+            center: pos,
+            radius: 0,
+            chunks: BTreeMap::from([(pos, Arc::new(chunk))]),
+            missing: vec![],
+        };
+        let defaults = BTreeMap::from([(
+            "minecraft:oak_stairs".to_owned(),
+            BTreeMap::from([
+                ("facing".to_owned(), "north".to_owned()),
+                ("half".to_owned(), "bottom".to_owned()),
+                ("shape".to_owned(), "straight".to_owned()),
+                ("waterlogged".to_owned(), "false".to_owned()),
+            ]),
+        )]);
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let world = area
+            .materialize_with_defaults(&dimension, &defaults)
+            .unwrap();
+        let stairs = world.block(0, 0, 0).unwrap();
+        assert_eq!(stairs.properties["facing"], "east");
+        assert_eq!(stairs.properties["half"], "bottom");
+        assert_eq!(stairs.properties["shape"], "straight");
+        assert_eq!(stairs.properties["waterlogged"], "false");
+        let unknown = world.block(1, 0, 0).unwrap();
+        assert_eq!(unknown.name, "example:unknown");
+        assert_eq!(unknown.properties["custom"], "value");
+        assert_eq!(area.chunks[&pos].document, document);
     }
 
     #[test]

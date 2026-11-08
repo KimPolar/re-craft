@@ -725,6 +725,15 @@ fn initial_spawn_chunk_positions(
     Ok(chunks)
 }
 
+fn vanilla_world_block_defaults(
+    resources: &mut ResourceStack,
+) -> Result<native_resources::block_registry::DefaultProperties> {
+    Ok(resources
+        .vanilla_generated_block_registry()
+        .context("cannot load vanilla block state defaults")?
+        .default_states())
+}
+
 /// All disk reads and CPU scene preparation are independent of the window
 /// event loop; GUI launches run this on a background thread.
 fn prepare_existing_world(
@@ -838,13 +847,14 @@ fn prepare_existing_world(
     if area.chunks.is_empty() && initial_spawn.is_none() {
         bail!("no saved chunks found in the selected area");
     }
+    let mut resources = ResourceStack::open(minecraft_dir)?;
     let defaults = if let Some(directory) = block_report {
         let defaults = native_resources::block_registry::load(minecraft_dir, directory)
             .context("cannot load block registry report")?;
         println!("Loaded default states for {} blocks", defaults.len());
         defaults
     } else {
-        BTreeMap::new()
+        vanilla_world_block_defaults(&mut resources)?
     };
     let mut world = area.materialize_with_defaults(reader.dimension(), &defaults)?;
     let world_seed = match reader.saved_world_seed() {
@@ -915,7 +925,6 @@ fn prepare_existing_world(
             pitch: -0.65,
         }
     };
-    let mut resources = ResourceStack::open(minecraft_dir)?;
     for pack in packs {
         resources.push_pack(pack)?;
     }

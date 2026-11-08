@@ -102,6 +102,25 @@ pub fn load_farmland_maintainers(
     .context("cannot resolve farmland maintenance tag")
 }
 
+/// Resolve the active tag used to calculate crop growth speed.
+pub fn load_crop_soils(
+    provider: &mut impl ResourceProvider,
+    registry: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let id = ResourceId::parse("minecraft:grows_crops")?;
+    let mut raw = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    read_block_tag(provider, &id, &mut raw, &mut failed, 0)?;
+    resolve(
+        &id,
+        &raw,
+        registry,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )
+    .context("cannot resolve crop growth soil tag")
+}
+
 /// Resolve the active tag used by snowy grass, podzol and mycelium.
 pub fn load_snow_tag(
     provider: &mut impl ResourceProvider,
@@ -344,6 +363,22 @@ mod tests {
         assert_eq!(
             load_climbable_tag(&mut provider, &registry).unwrap(),
             BTreeSet::from(["minecraft:stone".into()])
+        );
+    }
+
+    #[test]
+    fn crop_soil_tag_respects_data_pack_replacement() {
+        let mut provider = Provider(BTreeMap::from([(
+            "data/minecraft/tags/block/grows_crops.json".into(),
+            vec![
+                br#"{"values":["minecraft:farmland"]}"#.to_vec(),
+                br#"{"replace":true,"values":["minecraft:dirt"]}"#.to_vec(),
+            ],
+        )]));
+        let registry = BTreeSet::from(["minecraft:farmland".into(), "minecraft:dirt".into()]);
+        assert_eq!(
+            load_crop_soils(&mut provider, &registry).unwrap(),
+            BTreeSet::from(["minecraft:dirt".into()])
         );
     }
 

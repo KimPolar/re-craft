@@ -1571,6 +1571,10 @@ fn prepare_existing_world(
                     Ok(tag) => session.set_farmland_maintainers(Arc::new(tag)),
                     Err(error) => eprintln!("Farmland maintenance tag is unavailable: {error:#}"),
                 }
+                match native_resources::respawn_tags::load_crop_soils(&mut resources, &registry) {
+                    Ok(tag) => session.set_crop_soils(Arc::new(tag)),
+                    Err(error) => eprintln!("Crop soil tag is unavailable: {error:#}"),
+                }
                 match native_resources::respawn_tags::SnowSupportTags::load(
                     &mut resources,
                     &registry,

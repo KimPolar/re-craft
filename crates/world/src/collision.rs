@@ -577,6 +577,29 @@ mod face_tests {
     use super::*;
 
     #[test]
+    fn crop_shapes_follow_age_and_reject_invalid_states() {
+        for (id, age, height) in [
+            ("wheat", "7", 16.0),
+            ("carrots", "7", 9.0),
+            ("potatoes", "0", 2.0),
+            ("beetroots", "3", 8.0),
+        ] {
+            let mut state = BlockState {
+                name: format!("minecraft:{id}"),
+                properties: [("age".into(), age.into())].into(),
+            };
+            assert_eq!(block_shape(&state), Some(Vec::new()));
+            assert_eq!(
+                block_outline(&state),
+                Some(vec![pixel_box(0.0, 0.0, 0.0, 16.0, height, 16.0)])
+            );
+            state.properties.insert("age".into(), "8".into());
+            assert!(block_shape(&state).is_none());
+            assert!(block_outline(&state).is_none());
+        }
+    }
+
+    #[test]
     fn iron_chain_collision_follows_axis_and_rejects_invalid_states() {
         for (axis, min, max) in [
             ("x", [0.0, 6.5, 6.5], [16.0, 9.5, 9.5]),
@@ -851,8 +874,29 @@ pub(crate) fn valid_leaf_litter(state: &BlockState) -> bool {
         )
 }
 
+fn crop_outline_height(state: &BlockState) -> Option<f32> {
+    let (max, step) = match state.name.as_str() {
+        "minecraft:wheat" => (7, 2),
+        "minecraft:carrots" | "minecraft:potatoes" => (7, 1),
+        "minecraft:beetroots" => (3, 2),
+        _ => return None,
+    };
+    if state.properties.len() != 1 {
+        return None;
+    }
+    let value = state.properties.get("age")?;
+    let age: u8 = value.parse().ok()?;
+    if age > max || age.to_string() != *value {
+        return None;
+    }
+    Some(f32::from(2 + step * age) / 16.0)
+}
+
 /// `None` means that this state's physical shape is not implemented.
 pub fn block_shape(state: &BlockState) -> Option<Vec<Aabb>> {
+    if crop_outline_height(state).is_some() {
+        return Some(EMPTY.to_vec());
+    }
     let id = state.name.strip_prefix("minecraft:")?;
     if id == "iron_chain" {
         if state.properties.len() != 2
@@ -1305,6 +1349,9 @@ pub fn spawn_collision_shape(state: &BlockState) -> Option<Vec<Aabb>> {
 
 /// Shape used for block targeting. `None` leaves unsupported outlines explicit.
 pub fn block_outline(state: &BlockState) -> Option<Vec<Aabb>> {
+    if let Some(height) = crop_outline_height(state) {
+        return Some(vec![cuboid(0.0, 0.0, 0.0, 1.0, height, 1.0)]);
+    }
     let id = state.name.strip_prefix("minecraft:")?;
     if id.ends_with("_wall") {
         return Some(wall_boxes(crate::wall::Wall::from_state(state)?, false));

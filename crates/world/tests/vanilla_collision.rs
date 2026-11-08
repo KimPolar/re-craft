@@ -374,6 +374,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     let mut sturdy_checked = 0usize;
     let mut fire_checked = 0usize;
     let mut plant_checked = 0usize;
+    let mut crop_checked = 0usize;
     let mut liquid_checked = 0usize;
     let mut soil_cover_checked = 0usize;
     let mut partial_support_checked = 0usize;
@@ -425,6 +426,17 @@ fn implemented_collision_shapes_match_vanilla_states() {
             name: id.to_owned(),
             properties,
         };
+        if matches!(
+            id,
+            "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots"
+        ) {
+            assert!(
+                block_shape(&state).is_some() && block_outline(&state).is_some(),
+                "{state:?}"
+            );
+            assert_eq!(entry["dynamic"].as_bool(), Some(false), "{state:?}");
+            crop_checked += 1;
+        }
         if id == "minecraft:snow" {
             let layers = native_world::collision::snow_layers(&state).unwrap();
             assert_eq!(entry["fallingFree"].as_bool(), Some(true), "{state:?}");
@@ -636,6 +648,7 @@ fn implemented_collision_shapes_match_vanilla_states() {
     }
     assert!(checked > 1000, "only {checked} states were checked");
     assert_eq!(snow_checked, 8);
+    assert_eq!(crop_checked, 28, "crop states missing from Java oracle");
     assert!(
         soil_cover_checked > 1000,
         "only {soil_cover_checked} slab and stair states"

@@ -622,6 +622,7 @@ pub struct LoadedSession {
     soil_deferred_revision: Option<u64>,
     soil_pending: BTreeSet<(i32, i32, i32, SoilKind)>,
     farmland_maintainers: Option<Arc<BTreeSet<String>>>,
+    crop_soils: Option<Arc<BTreeSet<String>>>,
     farmland_water_tag: Option<u8>,
     washed_away_blocks: Option<Arc<BTreeSet<String>>>,
     weather: Option<crate::weather::Weather>,
@@ -848,6 +849,7 @@ pub struct LoadedSession {
     unresolved_leaf_shape: bool,
     unresolved_fence_shape: bool,
     unresolved_leaf_decay: bool,
+    unresolved_crop_tick: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -1491,6 +1493,8 @@ struct RandomTickCounts {
     farmland: Arc<[usize]>,
     has_farmland: bool,
     leaves: Arc<[usize]>,
+    crops: usize,
+    crop_positions: Arc<[usize]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4128,6 +4132,10 @@ impl LoadedSession {
             "a leaf decay could not be resolved for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_crop_tick,
+            "a crop random tick could not be resolved for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
         );
@@ -5815,6 +5823,10 @@ impl LoadedSession {
         self.soil_deferred_revision = None;
     }
 
+    pub fn set_crop_soils(&mut self, tag: Arc<BTreeSet<String>>) {
+        self.crop_soils = Some(tag);
+    }
+
     pub fn set_farmland_water_tag(&mut self, tag: Arc<BTreeSet<String>>) {
         let bits = [
             "minecraft:empty",
@@ -6789,6 +6801,7 @@ impl LoadedSession {
             soil_deferred_revision: None,
             soil_pending: BTreeSet::new(),
             farmland_maintainers: None,
+            crop_soils: None,
             farmland_water_tag: None,
             washed_away_blocks: None,
             weather: None,
@@ -6998,6 +7011,7 @@ impl LoadedSession {
             unresolved_leaf_shape: false,
             unresolved_fence_shape: false,
             unresolved_leaf_decay: false,
+            unresolved_crop_tick: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -9801,6 +9815,10 @@ impl LoadedSession {
         ensure!(
             !self.unresolved_leaf_decay,
             "a leaf decay could not be resolved for saving"
+        );
+        ensure!(
+            !self.unresolved_crop_tick,
+            "a crop random tick could not be resolved for saving"
         );
         ensure!(
             self.commands.is_empty(),
@@ -13666,6 +13684,8 @@ impl LoadedSession {
                     4
                 } else if leaf_randomly_ticks(state) {
                     5
+                } else if crop_state(state).is_some_and(|(crop, age)| age < crop.max_age()) {
+                    6
                 } else {
                     0
                 }
@@ -13697,6 +13717,7 @@ impl LoadedSession {
                 let mut snow = Vec::new();
                 let mut farmland = Vec::new();
                 let mut leaves = Vec::new();
+                let mut crop_positions = Vec::new();
                 if let Some(blocks) = &section.blocks {
                     for (index, id) in blocks.iter().enumerate() {
                         match kinds.get(id.0 as usize) {
@@ -13707,6 +13728,10 @@ impl LoadedSession {
                                 farmland.push(index);
                             }
                             Some(5) => leaves.push(index),
+                            Some(6) => {
+                                active.crops += 1;
+                                crop_positions.push(index);
+                            }
                             _ => {}
                         }
                     }
@@ -13714,6 +13739,7 @@ impl LoadedSession {
                 active.snow = snow.into();
                 active.farmland = farmland.into();
                 active.leaves = leaves.into();
+                active.crop_positions = crop_positions.into();
                 self.random_tick_sections
                     .insert(key, (Arc::downgrade(section), active));
             }
@@ -13727,6 +13753,7 @@ impl LoadedSession {
                 (active.lit_ores > 0
                     || !active.snow.is_empty()
                     || active.has_farmland
+                    || active.crops > 0
                     || !active.leaves.is_empty())
                 .then_some((chunk, section, active.clone()))
             })
@@ -13755,6 +13782,9 @@ impl LoadedSession {
                 && (self.random_tick_speed <= 64
                     || self.farmland_can_change_in_section(chunk, section, &active.farmland));
             let mut leaves_active = !active.leaves.is_empty();
+            let mut crops_active = active.crops > 0
+                && (self.random_tick_speed <= 64
+                    || self.crop_random_effect_in_section(chunk, section, &active.crop_positions));
             if leaves_active && self.random_tick_speed > 64 {
                 leaves_active = self.leaf_can_decay_in_section(chunk, section, &active.leaves);
                 if !leaves_active {
@@ -13762,7 +13792,12 @@ impl LoadedSession {
                 }
             }
             for index in 0..self.random_tick_speed {
-                if active.lit_ores == 0 && !snow_active && !farmland_active && !leaves_active {
+                if active.lit_ores == 0
+                    && !snow_active
+                    && !farmland_active
+                    && !leaves_active
+                    && !crops_active
+                {
                     self.random_block_position
                         .skip(self.random_tick_speed - index);
                     break;
@@ -13795,11 +13830,38 @@ impl LoadedSession {
                                 self.leaf_can_decay_in_section(chunk, section, &active.leaves);
                         }
                         decayed
+                    } else if let Some(grew) = self.random_tick_crop_at(relative) {
+                        if grew
+                            && self
+                                .world
+                                .block(absolute.x, absolute.y, absolute.z)
+                                .and_then(crop_state)
+                                .is_some_and(|(crop, age)| age == crop.max_age())
+                        {
+                            active.crops = active.crops.saturating_sub(1);
+                        }
+                        if self.random_tick_speed > 64 {
+                            crops_active = self.crop_random_effect_in_section(
+                                chunk,
+                                section,
+                                &active.crop_positions,
+                            );
+                        } else {
+                            crops_active = active.crops > 0;
+                        }
+                        grew
                     } else {
                         false
                     };
                     if changed {
                         snow_active = self.snow_can_melt_in_section(chunk, section, &active.snow);
+                        if self.random_tick_speed > 64 && !crops_active && active.crops > 0 {
+                            crops_active = self.crop_random_effect_in_section(
+                                chunk,
+                                section,
+                                &active.crop_positions,
+                            );
+                        }
                         if self.random_tick_speed > 64
                             && !leaves_active
                             && !active.leaves.is_empty()
@@ -13900,6 +13962,170 @@ impl LoadedSession {
             &mut self.level_random,
         );
         assert!(self.apply_block_set(relative, replacement, true, checked));
+        Some(true)
+    }
+
+    /// A dark non-beet crop consumes no level randomness and cannot change.
+    fn crop_random_effect_in_section(&self, chunk: ChunkPos, section: i8, crops: &[usize]) -> bool {
+        let Some(x) = chunk.x.checked_mul(16) else {
+            return false;
+        };
+        let Some(z) = chunk.z.checked_mul(16) else {
+            return false;
+        };
+        crops.iter().any(|&index| {
+            let absolute = IVec3::new(
+                x + (index % 16) as i32,
+                i32::from(section) * 16 + (index / 256) as i32,
+                z + ((index / 16) % 16) as i32,
+            );
+            let Some((crop, age)) = self
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .and_then(crop_state)
+            else {
+                return false;
+            };
+            if age >= crop.max_age() {
+                return false;
+            }
+            if crop == crate::crop::Crop::Beetroots {
+                return true;
+            }
+            subtract(absolute, self.origin)
+                .and_then(|relative| self.crop_brightness(relative))
+                .is_none_or(|brightness| brightness >= 9)
+        })
+    }
+
+    fn crop_brightness(&self, relative: IVec3) -> Option<u8> {
+        if !self.pending_light.is_empty() || !self.sky_lighting.settled() {
+            return None;
+        }
+        let absolute = add(self.origin, relative)?;
+        let chunk = self.world.chunks.get(&ChunkPos {
+            x: absolute.x.div_euclid(16),
+            z: absolute.z.div_euclid(16),
+        })?;
+        if !chunk.block_light_correct {
+            return None;
+        }
+        let block = self
+            .world
+            .light(absolute.x, absolute.y, absolute.z, false)?;
+        if block >= 9 {
+            return Some(block);
+        }
+        if self.world.dimension == "minecraft:the_end"
+            || self.sky_lighting.capability() == Some(false)
+        {
+            return Some(block);
+        }
+        self.world
+            .light(absolute.x, absolute.y, absolute.z, true)
+            .map(|sky| sky.max(block))
+    }
+
+    fn crop_growth_speed(&self, relative: IVec3, crop: &str) -> Option<f32> {
+        use crate::crop::Soil;
+        let tags = self.crop_soils.as_ref()?;
+        let registered = self.vanilla_block_ids.as_ref()?;
+        let mut soils = [Soil::Other; 9];
+        for x in -1..=1 {
+            for z in -1..=1 {
+                let position = add(relative, IVec3::new(x, -1, z))?;
+                let Cell::State(id) = cell(
+                    &self.world,
+                    self.origin,
+                    self.bounds,
+                    position,
+                    self.states[0],
+                ) else {
+                    return None;
+                };
+                let state = self.world.state(id)?;
+                if !registered.contains(&state.name) {
+                    return None;
+                }
+                if tags.contains(&state.name) {
+                    soils[((x + 1) * 3 + z + 1) as usize] = if state.name == "minecraft:farmland" {
+                        if farmland_moisture(state)? > 0 {
+                            Soil::Wet
+                        } else {
+                            Soil::Dry
+                        }
+                    } else if state.properties.contains_key("moisture") {
+                        return None;
+                    } else {
+                        Soil::Dry
+                    };
+                }
+            }
+        }
+        let offsets = [
+            IVec3::NEG_Z,
+            IVec3::Z,
+            IVec3::NEG_X,
+            IVec3::X,
+            IVec3::NEG_X + IVec3::NEG_Z,
+            IVec3::X + IVec3::NEG_Z,
+            IVec3::X + IVec3::Z,
+            IVec3::NEG_X + IVec3::Z,
+        ];
+        let mut neighbors = [false; 8];
+        for (index, offset) in offsets.into_iter().enumerate() {
+            let position = add(relative, offset)?;
+            let Cell::State(id) = cell(
+                &self.world,
+                self.origin,
+                self.bounds,
+                position,
+                self.states[0],
+            ) else {
+                return None;
+            };
+            neighbors[index] = self.world.state(id)?.name == crop;
+        }
+        Some(crate::crop::growth_speed(soils, neighbors))
+    }
+
+    /// Returns `None` when this is not an immature crop.
+    fn random_tick_crop_at(&mut self, relative: IVec3) -> Option<bool> {
+        let absolute = add(self.origin, relative)?;
+        let state = self
+            .world
+            .block(absolute.x, absolute.y, absolute.z)?
+            .clone();
+        let (crop, age) = crop_state(&state)?;
+        if age >= crop.max_age() {
+            return None;
+        }
+        let brightness = self.crop_brightness(relative);
+        let mut random = self.level_random.clone();
+        let next = crate::crop::random_tick_checked(
+            crop,
+            age,
+            brightness,
+            || self.crop_growth_speed(relative, &state.name),
+            &mut random,
+        );
+        self.level_random = random;
+        let Some(next) = next else {
+            self.unresolved_crop_tick = true;
+            return Some(false);
+        };
+        if next == age {
+            return Some(false);
+        }
+        let mut replacement = state;
+        replacement
+            .properties
+            .insert("age".into(), next.to_string());
+        let replacement = self.intern_block(replacement);
+        if !self.set_with_notify(relative, replacement, false) {
+            self.unresolved_crop_tick = true;
+            return Some(false);
+        }
         Some(true)
     }
 
@@ -22889,6 +23115,23 @@ fn redstone_ore_lit(state: &BlockState) -> Option<bool> {
     }
 }
 
+fn crop_state(state: &BlockState) -> Option<(crate::crop::Crop, u8)> {
+    use crate::crop::Crop;
+    let crop = match state.name.as_str() {
+        "minecraft:wheat" => Crop::Wheat,
+        "minecraft:carrots" => Crop::Carrots,
+        "minecraft:potatoes" => Crop::Potatoes,
+        "minecraft:beetroots" => Crop::Beetroots,
+        _ => return None,
+    };
+    if state.properties.len() != 1 {
+        return None;
+    }
+    let value = state.properties.get("age")?;
+    let age: u8 = value.parse().ok()?;
+    (age <= crop.max_age() && age.to_string() == *value).then_some((crop, age))
+}
+
 fn farmland_moisture(state: &BlockState) -> Option<u8> {
     if state.name != "minecraft:farmland" || state.properties.len() != 1 {
         return None;
@@ -25335,6 +25578,135 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {
+        let (mut world, origin, player) = fixture();
+        let crop = world.intern_state(state(crop, &[("age", &age.to_string())]));
+        let soil = world.intern_state(state("minecraft:farmland", &[("moisture", "7")]));
+        let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+        chunk.block_light_correct = true;
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        let blocks = section.blocks.as_mut().unwrap();
+        let index = |p: IVec3| (p.x + p.z * 16 + p.y * 256) as usize;
+        blocks[index(position)] = crop;
+        blocks[index(position - IVec3::Y)] = soil;
+        if light {
+            section.block_light = Some(Box::new([0; LIGHT_BYTES]));
+            section.sky_light = Some(Box::new([0xff; LIGHT_BYTES]));
+        }
+        let mut session = LoadedSession::new(
+            world,
+            origin,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        session.set_has_skylight(true).unwrap();
+        session.set_crop_soils(Arc::new(BTreeSet::from(["minecraft:farmland".into()])));
+        session.set_vanilla_block_ids(Arc::new(
+            [
+                "minecraft:air",
+                "minecraft:stone",
+                "minecraft:farmland",
+                "minecraft:wheat",
+                "minecraft:beetroots",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ));
+        session
+    }
+
+    #[test]
+    fn crop_random_tick_uses_section_sampling_and_growth_soil() {
+        let seed = (0..10000)
+            .find(|seed| {
+                let [x, y, z] =
+                    native_core::random::BlockRandomPosition::new(*seed).next_section_offset();
+                (1..15).contains(&x) && (1..15).contains(&z) && (1..15).contains(&y)
+            })
+            .unwrap();
+        let [x, y, z] = native_core::random::BlockRandomPosition::new(seed).next_section_offset();
+        let position = IVec3::new(x, y, z);
+        let mut session = crop_test_session(position, "minecraft:wheat", 6, true);
+        assert_eq!(
+            session.crop_growth_speed(position, "minecraft:wheat"),
+            Some(4.0)
+        );
+        let random_seed = (0..10000)
+            .find(|seed| native_core::random::LegacyRandom::new(*seed).next_int_bound(7) == Some(0))
+            .unwrap();
+        session.level_random = native_core::random::LegacyRandom::new(random_seed);
+        let mut expected_random = session.level_random.clone();
+        expected_random.next_int_bound(7);
+        session.random_block_position = native_core::random::BlockRandomPosition::new(seed);
+        session.set_random_tick_speed(1);
+        session.advance_random_block_ticks();
+        let absolute = add(session.origin, position).unwrap();
+        assert_eq!(
+            crop_state(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+            ),
+            Some((crate::crop::Crop::Wheat, 7))
+        );
+        assert_eq!(session.level_random.next_int(), expected_random.next_int());
+        assert!(!session.unresolved_crop_tick);
+        session.refresh_random_tick_sections();
+        assert!(
+            session
+                .active_random_tick_sections
+                .iter()
+                .all(|(_, _, counts)| counts.crops == 0)
+        );
+    }
+
+    #[test]
+    fn crop_tick_preserves_unknown_inputs_and_beetroot_gate_order() {
+        let position = IVec3::new(8, 2, 8);
+        let mut missing = crop_test_session(position, "minecraft:wheat", 0, true);
+        missing.crop_soils = None;
+        let before = missing.level_random.clone().next_int();
+        assert_eq!(missing.random_tick_crop_at(position), Some(false));
+        assert!(missing.unresolved_crop_tick);
+        assert_eq!(missing.level_random.next_int(), before);
+
+        let mut beet = crop_test_session(position, "minecraft:beetroots", 0, false);
+        beet.crop_soils = None;
+        let seed = (0..10000)
+            .find(|seed| native_core::random::LegacyRandom::new(*seed).next_int_bound(3) == Some(0))
+            .unwrap();
+        beet.level_random = native_core::random::LegacyRandom::new(seed);
+        let mut expected = beet.level_random.clone();
+        expected.next_int_bound(3);
+        assert_eq!(beet.random_tick_crop_at(position), Some(false));
+        assert!(!beet.unresolved_crop_tick);
+        assert_eq!(beet.level_random.next_int(), expected.next_int());
+    }
+
+    #[test]
+    fn dark_wheat_fast_forwards_large_random_tick_speed_without_changing_randomness() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        session.set_has_skylight(false).unwrap();
+        session.set_random_tick_speed(i32::MAX as u32);
+        let mut expected_position = session.random_block_position;
+        expected_position.skip(i32::MAX as u32);
+        let mut expected_random = session.level_random.clone();
+        session.advance_random_block_ticks();
+        assert_eq!(
+            session.random_block_position.next_section_offset(),
+            expected_position.next_section_offset()
+        );
+        assert_eq!(session.level_random.next_int(), expected_random.next_int());
+        assert!(!session.unresolved_crop_tick);
     }
 
     #[test]

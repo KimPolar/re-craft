@@ -16,49 +16,132 @@ pub struct PoiBlockChange {
     pub replacement: BlockState,
 }
 
-/// `PoiSection` packs the values of a fastutil Short2ObjectOpenHashMap.
-/// Its key is the section-relative X/Z/Y position; zero has a special slot.
+fn section_key(pos: [i32; 3]) -> u16 {
+    ((pos[0] & 15) << 8 | (pos[2] & 15) << 4 | (pos[1] & 15)) as u16
+}
+
+/// POI packing streams the values of a default fastutil short-key map.
+struct JavaPoiOrder {
+    slots: Vec<Option<u16>>,
+    zero: bool,
+    size: usize,
+}
+
+impl JavaPoiOrder {
+    fn new() -> Self {
+        Self {
+            slots: vec![None; 32],
+            zero: false,
+            size: 0,
+        }
+    }
+
+    fn home(key: u16, mask: usize) -> usize {
+        let hash = u32::from(key).wrapping_mul(0x9e37_79b9);
+        ((hash ^ (hash >> 16)) as usize) & mask
+    }
+
+    fn place(slots: &mut [Option<u16>], key: u16) {
+        let mask = slots.len() - 1;
+        let mut slot = Self::home(key, mask);
+        while slots[slot].is_some() {
+            slot = (slot + 1) & mask;
+        }
+        slots[slot] = Some(key);
+    }
+
+    fn rehash(&mut self, capacity: usize) {
+        let mut slots = vec![None; capacity];
+        for key in self.slots.iter().rev().flatten().copied() {
+            Self::place(&mut slots, key);
+        }
+        self.slots = slots;
+    }
+
+    fn insert(&mut self, key: u16) {
+        if key == 0 {
+            assert!(!self.zero);
+            self.zero = true;
+        } else {
+            Self::place(&mut self.slots, key);
+        }
+        self.size += 1;
+        if self.size > self.slots.len() * 3 / 4 {
+            self.rehash(self.slots.len() * 2);
+        }
+    }
+
+    fn remove(&mut self, key: u16) -> bool {
+        if key == 0 {
+            if !self.zero {
+                return false;
+            }
+            self.zero = false;
+        } else {
+            let mask = self.slots.len() - 1;
+            let mut slot = Self::home(key, mask);
+            while self.slots[slot] != Some(key) {
+                if self.slots[slot].is_none() {
+                    return false;
+                }
+                slot = (slot + 1) & mask;
+            }
+            let mut empty = slot;
+            loop {
+                slot = (slot + 1) & mask;
+                let Some(current) = self.slots[slot] else {
+                    self.slots[empty] = None;
+                    break;
+                };
+                let home = Self::home(current, mask);
+                if if empty <= slot {
+                    empty >= home || home > slot
+                } else {
+                    empty >= home && home > slot
+                } {
+                    self.slots[empty] = Some(current);
+                    empty = slot;
+                }
+            }
+        }
+        self.size -= 1;
+        if self.slots.len() > 32 && self.size < (self.slots.len() * 3 / 4) / 4 {
+            self.rehash(self.slots.len() / 2);
+        }
+        true
+    }
+
+    fn keys(&self) -> impl Iterator<Item = u16> + '_ {
+        self.zero
+            .then_some(0)
+            .into_iter()
+            .chain(self.slots.iter().flatten().copied())
+    }
+}
+
+/// `PoiSection` refresh clears the loaded map without shrinking it and then
+/// visits blocks in SectionPos.blocksInside() order: X, then Y, then Z.
 fn java_section_record_order<T>(
     mut entries: Vec<([i32; 3], T)>,
     previous_count: usize,
 ) -> Vec<([i32; 3], T)> {
-    // SectionPos.blocksInside() visits X first, then Y, then Z.
     entries.sort_by_key(|(pos, _)| (pos[2], pos[1], pos[0]));
-    let mut capacity = 32usize;
-    while previous_count > capacity * 3 / 4 {
-        capacity *= 2;
+    let mut order = JavaPoiOrder::new();
+    while previous_count > order.slots.len() * 3 / 4 {
+        order.rehash(order.slots.len() * 2);
     }
-    let mut slots = vec![None::<(u16, usize)>; capacity];
-    let mut zero = None;
-    let mut size = 0usize;
-    fn insert(slots: &mut [Option<(u16, usize)>], key: u16, index: usize) {
-        let hash = u32::from(key).wrapping_mul(0x9e37_79b9);
-        let mut slot = ((hash ^ (hash >> 16)) as usize) & (slots.len() - 1);
-        while slots[slot].is_some() {
-            slot = (slot + 1) & (slots.len() - 1);
-        }
-        slots[slot] = Some((key, index));
+    let mut values = BTreeMap::new();
+    for (pos, value) in entries {
+        let key = section_key(pos);
+        order.insert(key);
+        assert!(
+            values.insert(key, (pos, value)).is_none(),
+            "duplicate POI position"
+        );
     }
-    for (index, (pos, _)) in entries.iter().enumerate() {
-        let key = ((pos[0] & 15) << 8 | (pos[2] & 15) << 4 | (pos[1] & 15)) as u16;
-        if key == 0 {
-            zero = Some(index);
-        } else {
-            insert(&mut slots, key, index);
-        }
-        size += 1;
-        if size > slots.len() * 3 / 4 {
-            let mut grown = vec![None; slots.len() * 2];
-            for (key, old_index) in slots.into_iter().rev().flatten() {
-                insert(&mut grown, key, old_index);
-            }
-            slots = grown;
-        }
-    }
-    let mut values: Vec<_> = entries.into_iter().map(Some).collect();
-    zero.into_iter()
-        .chain(slots.into_iter().flatten().map(|(_, index)| index))
-        .map(|index| values[index].take().expect("unique POI slot"))
+    order
+        .keys()
+        .map(|key| values.remove(&key).expect("unique POI slot"))
         .collect()
 }
 
@@ -522,6 +605,7 @@ fn draft_changes(
     let mut document = original.clone();
     let mut visited = BTreeMap::<[i32; 3], &BlockState>::new();
     let mut changed_positions = BTreeSet::new();
+    let mut orders = BTreeMap::<i32, JavaPoiOrder>::new();
     for change in changes {
         let [x, y, z] = change.position;
         ensure!(
@@ -566,6 +650,13 @@ fn draft_changes(
                 _ => bail!("existing POI does not match the expected block state"),
             }
         }
+        let order = orders.entry(section_y).or_insert_with(|| {
+            let mut order = JavaPoiOrder::new();
+            for record in &section.records {
+                order.insert(section_key(record.position));
+            }
+            order
+        });
         let Tag::Compound(root) = &mut document.value else {
             unreachable!()
         };
@@ -598,10 +689,15 @@ fn draft_changes(
             unreachable!()
         };
         if let Some(index) = index {
+            ensure!(
+                order.remove(section_key(change.position)),
+                "POI ordering is inconsistent"
+            );
             values.remove(index);
             section.records.remove(index);
         }
         if let Some(kind) = after {
+            order.insert(section_key(change.position));
             *element_type = TagType::Compound;
             values.push(Tag::Compound(vec![
                 ("pos".into(), Tag::IntArray(change.position.to_vec())),
@@ -615,6 +711,48 @@ fn draft_changes(
             });
         }
         changed_positions.insert(change.position);
+    }
+    for (section_y, order) in orders {
+        let records = &decoded.sections[&section_y].records;
+        let Tag::Compound(root) = &mut document.value else {
+            unreachable!()
+        };
+        let Tag::Compound(sections) = &mut root
+            .iter_mut()
+            .find(|(key, _)| key.matches("Sections"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut sections
+            .iter_mut()
+            .find(|(key, _)| key.matches(&section_y.to_string()))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut section
+            .iter_mut()
+            .find(|(key, _)| key.matches("Records"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        ensure!(values.len() == records.len(), "POI record count differs");
+        let mut keyed = BTreeMap::new();
+        for (record, value) in records.iter().zip(values.drain(..)) {
+            ensure!(
+                keyed.insert(section_key(record.position), value).is_none(),
+                "duplicate POI position"
+            );
+        }
+        for key in order.keys() {
+            values.push(keyed.remove(&key).context("POI ordering lost a record")?);
+        }
+        ensure!(keyed.is_empty(), "POI ordering omitted a record");
     }
     // Revalidate the assembled document before exposing it to callers.
     decode_poi_chunk(document.clone(), source.position)?;
@@ -844,6 +982,22 @@ mod tests {
             .map(|(pos, _)| pos)
             .collect();
         assert_eq!(positions, [[0, 0, 0], [1, 7, 4], [0, 10, 13], [0, 13, 6]]);
+    }
+
+    #[test]
+    fn poi_order_preserves_zero_and_reinserts_removed_keys() {
+        let mut order = JavaPoiOrder::new();
+        for key in [0, 109, 218, 327] {
+            order.insert(key);
+        }
+        assert_eq!(order.keys().collect::<Vec<_>>(), [0, 327, 218, 109]);
+        assert!(order.remove(109));
+        assert!(order.remove(0));
+        assert!(!order.remove(109));
+        assert_eq!(order.keys().collect::<Vec<_>>(), [327, 218]);
+        order.insert(109);
+        order.insert(0);
+        assert_eq!(order.keys().collect::<Vec<_>>(), [0, 327, 218, 109]);
     }
 
     #[test]

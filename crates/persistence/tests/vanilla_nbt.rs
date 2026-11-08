@@ -769,6 +769,158 @@ public class FreshPoiOrderOracle {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn poi_edits_preserve_java_map_order() {
+    use native_persistence::poi::{PoiBlockChange, draft_ordered_block_changes};
+    use native_world::loaded::BlockState;
+    use std::collections::BTreeMap;
+    let game = minecraft_dir();
+    let java = java_bin();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("PoiEditOrderOracle.java");
+    std::fs::write(&source, r#"
+import com.google.gson.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.*;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.ai.village.poi.*;
+public class PoiEditOrderOracle {
+  static BlockPos position(int i) { int k = (i * 109) & 4095; return new BlockPos(k >> 8, k & 15, (k >> 4) & 15); }
+  public static void main(String[] args) {
+    var out = System.out; SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var type = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.MEETING);
+    var rows = new JsonArray();
+    for (int count : new int[]{0,1,4,16,24,25,49,100,256,1024}) for (int mode = 0; mode < 3; mode++) {
+      var records = new ArrayList<PoiRecord.Packed>();
+      for (int i = 0; i < count; i++) records.add(new PoiRecord.Packed(position(i), type, 0));
+      var section = new PoiSection.Packed(true, records).unpack(() -> {});
+      for (int i = 0; i < count; i += (mode == 2 ? 1 : 2)) section.remove(position(i));
+      for (int i = 0; i < count; i += 4) section.add(position(i), type);
+      for (int i = count; i < count + (mode == 0 ? 1 : 80); i++) section.add(position(i), type);
+      var row = new JsonArray();
+      for (var record : section.pack().records()) {
+        var p = record.pos(); var v = new JsonArray(); v.add(p.getX()); v.add(p.getY()); v.add(p.getZ()); v.add(record.freeTickets()); row.add(v);
+      }
+      rows.add(row);
+    }
+    out.println(rows);
+  }
+}
+"#).unwrap();
+    let cp = classpath(&game, Some(temp.path()));
+    run_checked(
+        Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source),
+    );
+    let output = run_checked(
+        Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("PoiEditOrderOracle"),
+    );
+    let expected: Vec<Vec<[i32; 4]>> =
+        serde_json::from_str(output.lines().last().unwrap()).unwrap();
+    let state = |name: &str| BlockState {
+        name: format!("minecraft:{name}"),
+        properties: BTreeMap::new(),
+    };
+    let position = |i: usize| {
+        let key = (i * 109) & 4095;
+        [
+            (key >> 8) as i32,
+            (key & 15) as i32,
+            ((key >> 4) & 15) as i32,
+        ]
+    };
+    let bell = state("bell");
+    let air = state("air");
+    let mut case = 0;
+    for count in [0usize, 1, 4, 16, 24, 25, 49, 100, 256, 1024] {
+        for mode in 0..3 {
+            let records = (0..count)
+                .map(|i| {
+                    Tag::Compound(vec![
+                        ("pos".into(), Tag::IntArray(position(i).to_vec())),
+                        ("type".into(), Tag::String("minecraft:meeting".into())),
+                        ("free_tickets".into(), Tag::Int(0)),
+                    ])
+                })
+                .collect();
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "Sections".into(),
+                        Tag::Compound(vec![(
+                            "0".into(),
+                            Tag::Compound(vec![
+                                ("Valid".into(), Tag::Byte(1)),
+                                (
+                                    "Records".into(),
+                                    Tag::List {
+                                        element_type: if count == 0 {
+                                            nbt::TagType::End
+                                        } else {
+                                            nbt::TagType::Compound
+                                        },
+                                        values: records,
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            };
+            let source = native_persistence::world::SavedPoiChunk::from_document(
+                document,
+                ChunkPos { x: 0, z: 0 },
+            )
+            .unwrap();
+            let mut changes = Vec::new();
+            for i in (0..count).step_by(if mode == 2 { 1 } else { 2 }) {
+                changes.push(PoiBlockChange {
+                    position: position(i),
+                    expected: bell.clone(),
+                    replacement: air.clone(),
+                });
+            }
+            for i in (0..count).step_by(4) {
+                changes.push(PoiBlockChange {
+                    position: position(i),
+                    expected: air.clone(),
+                    replacement: bell.clone(),
+                });
+            }
+            for i in count..count + if mode == 0 { 1 } else { 80 } {
+                changes.push(PoiBlockChange {
+                    position: position(i),
+                    expected: air.clone(),
+                    replacement: bell.clone(),
+                });
+            }
+            let draft = draft_ordered_block_changes(&source, &changes, |_| Ok(())).unwrap();
+            let actual: Vec<_> = native_persistence::world::SavedPoiChunk::from_document(
+                draft.document().clone(),
+                source.position,
+            )
+            .unwrap()
+            .sections[&0]
+                .records
+                .iter()
+                .map(|r| [r.position[0], r.position[1], r.position[2], r.free_tickets])
+                .collect();
+            assert_eq!(actual, expected[case], "count {count} mode {mode}");
+            case += 1;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_poi_sections_are_decoded_from_dimension_region() {
     let game = minecraft_dir();
     let java = java_bin();

@@ -1726,7 +1726,7 @@ impl<'p, 's> PreparedDecoration<'p, 's> {
                 .biomes
                 .chunks
                 .values()
-                .flat_map(|chunk| chunk.values.iter())
+                .flat_map(|chunk| chunk.palette.iter())
                 .collect::<BTreeSet<_>>();
             let mut climates = BTreeMap::new();
             for id in ids {

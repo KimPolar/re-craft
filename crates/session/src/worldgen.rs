@@ -3,7 +3,7 @@
 //! integration are not yet implemented.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -175,12 +175,15 @@ fn stage_generated_entity(
 }
 
 /// A complete BIOMES-stage chunk in Z, X, Y order, independent of rendering.
+/// Cells share a palette; the expanded public view is materialized on demand.
 pub struct QuartBiomeChunk {
     chunk: [i32; 2],
     seed: i64,
     min_y: i32,
     height: i32,
-    values: Vec<ResourceId>,
+    palette: Vec<ResourceId>,
+    indices: Vec<usize>,
+    expanded: OnceLock<Vec<ResourceId>>,
 }
 
 /// A terrain-stage result ready for the remaining generation stages. The
@@ -2080,7 +2083,7 @@ pub fn materialize_carved_terrain(
         "invalid terrain volume length"
     );
     ensure!(
-        biomes.values.len() == height / 4 * 16,
+        biomes.indices.len() == height / 4 * 16,
         "invalid biome volume length"
     );
 
@@ -2091,7 +2094,7 @@ pub fn materialize_carved_terrain(
     let mut world = World::new(format!("{}:{}", dimension.namespace, dimension.path));
     world.set_biome_world_seed(Some(biomes.seed));
     let mut state_cache: HashMap<*const Value, BlockStateId> = HashMap::new();
-    let mut biome_cache: BTreeMap<&ResourceId, BiomeId> = BTreeMap::new();
+    let mut biome_cache: Vec<Option<BiomeId>> = vec![None; biomes.palette.len()];
     let mut sections = BTreeMap::new();
     for section_y in first_section..end_section {
         let offset = usize::try_from(section_y * 16 - terrain.min_y)?;
@@ -2117,12 +2120,16 @@ pub fn materialize_carved_terrain(
         for y in 0..4usize {
             for z in 0..4usize {
                 for x in 0..4usize {
-                    let biome = &biomes.values[(z * 4 + x) * (height / 4) + offset / 4 + y];
-                    let id = if let Some(id) = biome_cache.get(biome) {
-                        *id
+                    let palette_index = biomes.indices[(z * 4 + x) * (height / 4) + offset / 4 + y];
+                    let cache = biome_cache
+                        .get_mut(palette_index)
+                        .context("invalid biome palette index")?;
+                    let id = if let Some(id) = *cache {
+                        id
                     } else {
+                        let biome = &biomes.palette[palette_index];
                         let id = world.intern_biome(format!("{}:{}", biome.namespace, biome.path));
-                        biome_cache.insert(biome, id);
+                        *cache = Some(id);
                         id
                     };
                     biome_values[x + z * 4 + y * 16] = id;
@@ -2184,12 +2191,52 @@ impl QuartBiomeChunk {
             .checked_mul(16)
             .context("biome volume size overflow")?;
         ensure!(values.len() == expected, "invalid biome volume length");
+        let mut palette = Vec::new();
+        let mut palette_index = BTreeMap::new();
+        let mut indices = Vec::with_capacity(values.len());
+        for biome in values {
+            let index = if let Some(&index) = palette_index.get(&biome) {
+                index
+            } else {
+                let index = palette.len();
+                palette_index.insert(biome.clone(), index);
+                palette.push(biome);
+                index
+            };
+            indices.push(index);
+        }
+        Self::from_palette(chunk, seed, min_y, height, palette, indices)
+    }
+    fn from_palette(
+        chunk: [i32; 2],
+        seed: i64,
+        min_y: i32,
+        height: i32,
+        palette: Vec<ResourceId>,
+        indices: Vec<usize>,
+    ) -> Result<Self> {
+        ensure!(
+            height > 0
+                && min_y % 16 == 0
+                && height % 16 == 0
+                && min_y.checked_add(height).is_some(),
+            "invalid biome height range"
+        );
+        let expected = usize::try_from(height / 4)?
+            .checked_mul(16)
+            .context("biome volume size overflow")?;
+        ensure!(
+            indices.len() == expected && indices.iter().all(|&index| index < palette.len()),
+            "invalid biome palette volume"
+        );
         Ok(Self {
             chunk,
             seed,
             min_y,
             height,
-            values,
+            palette,
+            indices,
+            expanded: OnceLock::new(),
         })
     }
     pub fn chunk_position(&self) -> [i32; 2] {
@@ -2201,8 +2248,17 @@ impl QuartBiomeChunk {
     pub fn height(&self) -> i32 {
         self.height
     }
+    /// Return the complete Z, X, Y view, expanding it on first use.
     pub fn values(&self) -> &[ResourceId] {
-        &self.values
+        self.expanded.get_or_init(|| {
+            self.indices
+                .iter()
+                .map(|&index| self.palette[index].clone())
+                .collect()
+        })
+    }
+    fn value_at_index(&self, index: usize) -> Option<&ResourceId> {
+        self.palette.get(*self.indices.get(index)?)
     }
     fn at(&self, quart: IVec3) -> Option<&ResourceId> {
         if quart.x.div_euclid(4) != self.chunk[0] || quart.z.div_euclid(4) != self.chunk[1] {
@@ -2213,7 +2269,7 @@ impl QuartBiomeChunk {
         let y = quart.y.clamp(min, min + height - 1) - min;
         let x = quart.x.rem_euclid(4) as usize;
         let z = quart.z.rem_euclid(4) as usize;
-        self.values.get((z * 4 + x) * height as usize + y as usize)
+        self.value_at_index((z * 4 + x) * height as usize + y as usize)
     }
 }
 
@@ -2855,7 +2911,7 @@ impl TerrainGenerator {
                     target[0].checked_add(dx).context("neighbor X overflow")?,
                     target[1].checked_add(dz).context("neighbor Z overflow")?,
                 ];
-                present.extend(neighborhood.chunks[&key].values.iter());
+                present.extend(neighborhood.chunks[&key].palette.iter());
             }
         }
         let origin = [
@@ -3495,7 +3551,9 @@ impl TerrainGenerator {
         } else {
             Vec::new()
         };
-        let mut values = vec![None; 16 * sy];
+        let mut palette: Vec<ResourceId> = Vec::new();
+        let mut palette_lookup = BTreeMap::new();
+        let mut indices = vec![usize::MAX; 16 * sy];
         // ChunkAccess walks sections bottom-up, then local X, Y, Z.
         for section in 0..height / 16 {
             for lx in 0..4 {
@@ -3507,7 +3565,6 @@ impl TerrainGenerator {
                             climate
                                 .select(&mut self.source, point)
                                 .context("climate sample is absent")?
-                                .clone()
                         } else if end {
                             let index = if end_y_independent { 0 } else { y as usize };
                             if end_cache[index].is_none() {
@@ -3517,23 +3574,27 @@ impl TerrainGenerator {
                                         .clone(),
                                 );
                             }
-                            end_cache[index].as_ref().unwrap().clone()
+                            end_cache[index].as_ref().unwrap()
                         } else {
                             self.source
                                 .sample_quart(self.noise.router(), evaluator, point)
-                                .clone()
+                        };
+                        let palette_index = match palette_lookup.get(biome) {
+                            Some(&index) => index,
+                            None => {
+                                let index = palette.len();
+                                palette_lookup.insert(biome.clone(), index);
+                                palette.push(biome.clone());
+                                index
+                            }
                         };
                         let index = (lz as usize * 4 + lx as usize) * sy + y as usize;
-                        values[index] = Some(biome);
+                        indices[index] = palette_index;
                     }
                 }
             }
         }
-        let values = values
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .context("incomplete biome volume")?;
-        QuartBiomeChunk::from_values(chunk, self.seed, min_y, height, values)
+        QuartBiomeChunk::from_palette(chunk, self.seed, min_y, height, palette, indices)
     }
     /// Generate the intermediate noise volume before surface rules or carvers.
     pub fn generate_noise(
@@ -3945,7 +4006,7 @@ mod tests {
                 }
             }
         }
-        let biome_values: Vec<_> = (0..16 * height / 4)
+        let mut biome_values: Vec<_> = (0..16 * height / 4)
             .map(|i| {
                 ResourceId::parse(if i % 2 == 0 {
                     "minecraft:plains"
@@ -3955,6 +4016,9 @@ mod tests {
                 .unwrap()
             })
             .collect();
+        // The palette is discovered in Z/X/Y order, but sections intern in
+        // Y/Z/X order. The world registry must keep the latter order.
+        biome_values[8] = ResourceId::parse("minecraft:forest").unwrap();
         let biomes =
             QuartBiomeChunk::from_values(position, 123, -16, height as i32, biome_values.clone())
                 .unwrap();
@@ -3997,6 +4061,10 @@ mod tests {
         assert_eq!(generated.fluid_postprocessing_at(0, -17, 0), None);
         assert_eq!(generated.fluid_postprocessing_at(0, 16, 0), None);
         let world = generated.world();
+        assert_eq!(
+            world.biomes().collect::<Vec<_>>(),
+            ["minecraft:plains", "minecraft:forest", "minecraft:desert"]
+        );
         assert_eq!(world.biome_zoom_seed(), Some(obfuscate_seed(123)));
         let chunk = &world.chunks[&native_world::loaded::ChunkPos { x: -2, z: 3 }];
         assert_eq!(chunk.status.as_deref(), Some("minecraft:terrain"));
@@ -7488,6 +7556,42 @@ mod tests {
             }
         }
         assert!(different, "fixture must cross a zoomed biome boundary");
+    }
+
+    #[test]
+    fn biome_palette_preserves_indices_and_expands_only_on_request() {
+        let plains = ResourceId::parse("minecraft:plains").unwrap();
+        let forest = ResourceId::parse("minecraft:forest").unwrap();
+        let input: Vec<_> = (0..1536)
+            .map(|i| {
+                if i % 7 == 0 {
+                    forest.clone()
+                } else {
+                    plains.clone()
+                }
+            })
+            .collect();
+        let chunk = QuartBiomeChunk::from_values([-2, 3], 42, -64, 384, input.clone()).unwrap();
+        assert_eq!(chunk.palette.len(), 2);
+        assert_eq!(chunk.indices.len(), input.len());
+        assert!(chunk.expanded.get().is_none());
+        for z in 0..4 {
+            for x in 0..4 {
+                for y in 0..96 {
+                    let index = (z * 4 + x) * 96 + y;
+                    assert_eq!(
+                        chunk.at(IVec3::new(-8 + x as i32, -16 + y as i32, 12 + z as i32)),
+                        Some(&input[index])
+                    );
+                }
+            }
+        }
+        assert!(chunk.expanded.get().is_none());
+        assert_eq!(chunk.values(), input);
+        assert!(chunk.expanded.get().is_some());
+        assert!(
+            QuartBiomeChunk::from_palette([0, 0], 0, 0, 16, vec![plains], vec![1; 64]).is_err()
+        );
     }
 
     #[test]

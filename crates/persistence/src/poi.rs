@@ -16,6 +16,52 @@ pub struct PoiBlockChange {
     pub replacement: BlockState,
 }
 
+/// `PoiSection` packs the values of a fastutil Short2ObjectOpenHashMap.
+/// Its key is the section-relative X/Z/Y position; zero has a special slot.
+fn java_section_record_order<T>(
+    mut entries: Vec<([i32; 3], T)>,
+    previous_count: usize,
+) -> Vec<([i32; 3], T)> {
+    // SectionPos.blocksInside() visits X first, then Y, then Z.
+    entries.sort_by_key(|(pos, _)| (pos[2], pos[1], pos[0]));
+    let mut capacity = 32usize;
+    while previous_count > capacity * 3 / 4 {
+        capacity *= 2;
+    }
+    let mut slots = vec![None::<(u16, usize)>; capacity];
+    let mut zero = None;
+    let mut size = 0usize;
+    fn insert(slots: &mut [Option<(u16, usize)>], key: u16, index: usize) {
+        let hash = u32::from(key).wrapping_mul(0x9e37_79b9);
+        let mut slot = ((hash ^ (hash >> 16)) as usize) & (slots.len() - 1);
+        while slots[slot].is_some() {
+            slot = (slot + 1) & (slots.len() - 1);
+        }
+        slots[slot] = Some((key, index));
+    }
+    for (index, (pos, _)) in entries.iter().enumerate() {
+        let key = ((pos[0] & 15) << 8 | (pos[2] & 15) << 4 | (pos[1] & 15)) as u16;
+        if key == 0 {
+            zero = Some(index);
+        } else {
+            insert(&mut slots, key, index);
+        }
+        size += 1;
+        if size > slots.len() * 3 / 4 {
+            let mut grown = vec![None; slots.len() * 2];
+            for (key, old_index) in slots.into_iter().rev().flatten() {
+                insert(&mut grown, key, old_index);
+            }
+            slots = grown;
+        }
+    }
+    let mut values: Vec<_> = entries.into_iter().map(Some).collect();
+    zero.into_iter()
+        .chain(slots.into_iter().flatten().map(|(_, index)| index))
+        .map(|index| values[index].take().expect("unique POI slot"))
+        .collect()
+}
+
 /// A section reconciliation result. It cannot be written as a world save.
 pub struct PoiRefreshDraft {
     pub source: Option<NamedTag>,
@@ -304,6 +350,10 @@ pub fn refresh_section(
             old.insert(record.position, raw.clone());
         }
     }
+    let discovered = java_section_record_order(
+        discovered,
+        previous.map_or(0, |section| section.records.len()),
+    );
     let mut records = Vec::with_capacity(discovered.len());
     for (position, kind) in discovered {
         records.push(old.remove(&position).unwrap_or_else(|| {
@@ -781,6 +831,22 @@ mod tests {
     }
 
     #[test]
+    fn fresh_poi_packing_uses_java_hash_iteration_order() {
+        let entries: Vec<_> = (0..4)
+            .map(|i| {
+                let key = i * 109;
+                let position = [key >> 8, key & 15, (key >> 4) & 15];
+                (position, i)
+            })
+            .collect();
+        let positions: Vec<_> = java_section_record_order(entries, 0)
+            .into_iter()
+            .map(|(pos, _)| pos)
+            .collect();
+        assert_eq!(positions, [[0, 0, 0], [1, 7, 4], [0, 10, 13], [0, 13, 6]]);
+    }
+
+    #[test]
     fn refresh_matches_java_position_retention_and_validity_rules() {
         let original = source(false);
         let original_document = (*original.document).clone();
@@ -806,13 +872,23 @@ mod tests {
         let section = &decoded.sections[&0];
         assert!(section.valid);
         assert_eq!(section.records.len(), 2);
+        let retained = section
+            .records
+            .iter()
+            .find(|record| record.position == [0, 4, 0])
+            .unwrap();
+        let added = section
+            .records
+            .iter()
+            .find(|record| record.position == [2, 4, 0])
+            .unwrap();
         assert!(
-            section.records[0].type_id.matches("minecraft:home"),
+            retained.type_id.matches("minecraft:home"),
             "Java retains the old type at this position"
         );
-        assert_eq!(section.records[0].free_tickets, 0);
-        assert!(section.records[1].type_id.matches("minecraft:meeting"));
-        assert_eq!(section.records[1].free_tickets, 32);
+        assert_eq!(retained.free_tickets, 0);
+        assert!(added.type_id.matches("minecraft:meeting"));
+        assert_eq!(added.free_tickets, 32);
         let valid = source(true);
         let draft = refresh_section(
             Some(&valid),

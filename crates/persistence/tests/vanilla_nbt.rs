@@ -501,6 +501,274 @@ public class NewWorldClocksOracle {
 
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn poi_refresh_record_order_matches_java_section() {
+    use native_persistence::poi::refresh_missing_chunk;
+    use native_world::loaded::{self, BLOCK_COUNT, BlockState};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
+    let game = minecraft_dir();
+    let java = java_bin();
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("FreshPoiOrderOracle.java");
+    std::fs::write(&source, r#"
+import com.google.gson.*;
+import java.util.*;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.core.*;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.ai.village.poi.*;
+public class FreshPoiOrderOracle {
+  public static void main(String[] args) {
+    var output = System.out;
+    SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+    var result = new JsonArray();
+    var type = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.MEETING);
+    int[] counts = {0,1,2,4,16,24,25,26,48,49,100,200,256,1024,4096};
+    for (int variant = 0; variant < 2; variant++) for (int count : counts) {
+      var selected = new HashSet<Long>();
+      for (int i = 0; i < count; i++) {
+        int key = (i * 109 + variant * 571) & 4095;
+        selected.add(new BlockPos(key >> 8, key & 15, (key >> 4) & 15).asLong());
+      }
+      var section = new PoiSection(() -> {});
+      SectionPos.of(0, 0, 0).blocksInside().forEach(p -> {
+        if (selected.contains(p.asLong())) section.add(p.immutable(), type);
+      });
+      var row = new JsonArray();
+      for (var record : section.pack().records()) {
+        var p = record.pos(); var coordinates = new JsonArray();
+        coordinates.add(p.getX()); coordinates.add(p.getY()); coordinates.add(p.getZ()); row.add(coordinates);
+      }
+      result.add(row);
+    }
+    var home = BuiltInRegistries.POINT_OF_INTEREST_TYPE.getOrThrow(PoiTypes.HOME);
+    for (int oldCount : new int[]{0,1,24,25,49,100,1024}) for (int count : new int[]{0,4,25,50}) {
+      var old = new ArrayList<PoiRecord.Packed>();
+      for (int i = 0; i < oldCount; i++) {
+        int key = (i * 109 + 571) & 4095;
+        old.add(new PoiRecord.Packed(new BlockPos(key >> 8, key & 15, (key >> 4) & 15), home, 0));
+      }
+      var selected = new HashSet<Long>();
+      for (int i = 0; i < count; i++) {
+        int key = (i * 109 + 571) & 4095;
+        selected.add(new BlockPos(key >> 8, key & 15, (key >> 4) & 15).asLong());
+      }
+      var section = new PoiSection.Packed(false, old).unpack(() -> {});
+      section.refresh(add -> SectionPos.of(0, 0, 0).blocksInside().forEach(p -> {
+        if (selected.contains(p.asLong())) add.accept(p.immutable(), type);
+      }));
+      var row = new JsonArray();
+      for (var record : section.pack().records()) {
+        var p = record.pos(); var coordinates = new JsonArray();
+        coordinates.add(p.getX()); coordinates.add(p.getY()); coordinates.add(p.getZ()); row.add(coordinates);
+      }
+      result.add(row);
+    }
+    output.println(result);
+  }
+}
+"#).unwrap();
+    let cp = classpath(&game, Some(temp.path()));
+    run_checked(
+        Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source),
+    );
+    let output = run_checked(
+        Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("FreshPoiOrderOracle"),
+    );
+    let expected: Vec<Vec<[i32; 3]>> =
+        serde_json::from_str(output.lines().last().unwrap()).unwrap();
+    let counts = [
+        0usize, 1, 2, 4, 16, 24, 25, 26, 48, 49, 100, 200, 256, 1024, 4096,
+    ];
+    for variant in 0..2usize {
+        for (case, &count) in counts.iter().enumerate() {
+            let mut world = loaded::World::new("minecraft:overworld");
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let bell = world.intern_state(BlockState {
+                name: "minecraft:bell".into(),
+                properties: BTreeMap::new(),
+            });
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            for i in 0..count {
+                let key = (i * 109 + variant * 571) & 4095;
+                let x = key >> 8;
+                let y = key & 15;
+                let z = (key >> 4) & 15;
+                blocks[x + z * 16 + y * 256] = bell;
+            }
+            let pos = loaded::ChunkPos { x: 0, z: 0 };
+            world.chunks.insert(
+                pos,
+                Arc::new(loaded::Chunk {
+                    position: pos,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(loaded::Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+            let draft =
+                refresh_missing_chunk(ChunkPos { x: 0, z: 0 }, &world, 0, 16, |_| Ok(())).unwrap();
+            let actual: Vec<[i32; 3]> = match draft {
+                Some(doc) => native_persistence::world::SavedPoiChunk::from_document(
+                    doc,
+                    ChunkPos { x: 0, z: 0 },
+                )
+                .unwrap()
+                .sections[&0]
+                    .records
+                    .iter()
+                    .map(|r| r.position)
+                    .collect(),
+                None => Vec::new(),
+            };
+            assert_eq!(
+                actual.iter().copied().collect::<BTreeSet<_>>(),
+                expected[variant * counts.len() + case]
+                    .iter()
+                    .copied()
+                    .collect(),
+                "membership variant {variant} count {count}"
+            );
+            assert_eq!(
+                actual,
+                expected[variant * counts.len() + case],
+                "order variant {variant} count {count}"
+            );
+        }
+    }
+    let mut index = counts.len() * 2;
+    for old_count in [0usize, 1, 24, 25, 49, 100, 1024] {
+        for count in [0usize, 4, 25, 50] {
+            let mut world = loaded::World::new("minecraft:overworld");
+            let air = world.intern_state(BlockState {
+                name: "minecraft:air".into(),
+                properties: BTreeMap::new(),
+            });
+            let bell = world.intern_state(BlockState {
+                name: "minecraft:bell".into(),
+                properties: BTreeMap::new(),
+            });
+            let mut blocks = Box::new([air; BLOCK_COUNT]);
+            for i in 0..count {
+                let key = (i * 109 + 571) & 4095;
+                blocks[(key >> 8) + ((key >> 4) & 15) * 16 + (key & 15) * 256] = bell;
+            }
+            let pos = loaded::ChunkPos { x: 0, z: 0 };
+            world.chunks.insert(
+                pos,
+                Arc::new(loaded::Chunk {
+                    position: pos,
+                    status: Some("minecraft:full".into()),
+                    block_light_correct: false,
+                    sections: BTreeMap::from([(
+                        0,
+                        Arc::new(loaded::Section {
+                            blocks: Some(blocks),
+                            biomes: None,
+                            block_light: None,
+                            sky_light: None,
+                        }),
+                    )]),
+                }),
+            );
+            let records = (0..old_count)
+                .map(|i| {
+                    let key = (i * 109 + 571) & 4095;
+                    Tag::Compound(vec![
+                        (
+                            "pos".into(),
+                            Tag::IntArray(vec![
+                                (key >> 8) as i32,
+                                (key & 15) as i32,
+                                ((key >> 4) & 15) as i32,
+                            ]),
+                        ),
+                        ("type".into(), Tag::String("minecraft:home".into())),
+                        ("free_tickets".into(), Tag::Int(0)),
+                    ])
+                })
+                .collect();
+            let document = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    (
+                        "Sections".into(),
+                        Tag::Compound(vec![(
+                            "0".into(),
+                            Tag::Compound(vec![
+                                ("Valid".into(), Tag::Byte(0)),
+                                (
+                                    "Records".into(),
+                                    Tag::List {
+                                        element_type: if old_count == 0 {
+                                            nbt::TagType::End
+                                        } else {
+                                            nbt::TagType::Compound
+                                        },
+                                        values: records,
+                                    },
+                                ),
+                            ]),
+                        )]),
+                    ),
+                ]),
+            };
+            let source = native_persistence::world::SavedPoiChunk::from_document(
+                document,
+                ChunkPos { x: 0, z: 0 },
+            )
+            .unwrap();
+            let draft = native_persistence::poi::refresh_section(
+                Some(&source),
+                source.position,
+                0,
+                &world,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .document
+            .unwrap();
+            let actual: Vec<_> =
+                native_persistence::world::SavedPoiChunk::from_document(draft, source.position)
+                    .unwrap()
+                    .sections[&0]
+                    .records
+                    .iter()
+                    .map(|r| r.position)
+                    .collect();
+            assert_eq!(
+                actual, expected[index],
+                "invalid section old {old_count}, new {count}"
+            );
+            index += 1;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_poi_sections_are_decoded_from_dimension_region() {
     let game = minecraft_dir();
     let java = java_bin();

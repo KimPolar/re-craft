@@ -103,6 +103,8 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
             "!minecraft:attribute_modifiers" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
                 {}
             "minecraft:enchantments" if valid_enchantments(value) => {}
+            "minecraft:stored_enchantments"
+                if id == "minecraft:enchanted_book" && valid_enchantments(value) => {}
             "minecraft:break_sound"
                 if crate::consume_particles::break_sound_id(value).is_some() => {}
             "!minecraft:break_sound" if matches!(value, Tag::Compound(fields) if fields.is_empty()) =>
@@ -144,6 +146,9 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
     if vanilla_equipment(id).is_none()
         && ordinary_item_default_durability(id).is_none()
         && !has_equippable_patch
+        && !(id == "minecraft:enchanted_book"
+            && seen.len() == 1
+            && seen.contains("minecraft:stored_enchantments"))
     {
         return None;
     }
@@ -200,5 +205,31 @@ pub fn player_can_equip(item: &ItemStack, slot: EquipmentSlot) -> bool {
         Tag::String(_) => player(allowed),
         Tag::List { values, .. } => values.iter().any(player),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_book_enchantments_are_validated_without_accepting_other_items() {
+        let components = Tag::Compound(vec![(
+            "minecraft:stored_enchantments".into(),
+            Tag::Compound(vec![("minecraft:unbreaking".into(), Tag::Int(3))]),
+        )]);
+        assert_eq!(
+            saved_inventory_max("minecraft:enchanted_book", &components),
+            Some(1)
+        );
+        assert_eq!(saved_inventory_max("minecraft:book", &components), None);
+        let invalid = Tag::Compound(vec![(
+            "minecraft:stored_enchantments".into(),
+            Tag::Compound(vec![("minecraft:unbreaking".into(), Tag::Int(0))]),
+        )]);
+        assert_eq!(
+            saved_inventory_max("minecraft:enchanted_book", &invalid),
+            None
+        );
     }
 }

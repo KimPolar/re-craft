@@ -5659,6 +5659,60 @@ mod session_block_support_tests {
                 .slot(PlayerSlot::Chest(slot))
                 .is_some_and(|item| item.id() == "minecraft:stone")
         }));
+        let mut tested_book = false;
+        for seed in 0..64 {
+            let mut dungeon =
+                fresh_player_session_with_loot_chest(Some("minecraft:chests/simple_dungeon"));
+            dungeon.set_player_inventory(PlayerInventory::default());
+            assert!(batch.apply_session_content(&mut dungeon)?);
+            dungeon.set_world_seed(Some(seed));
+            dungeon.set_random_sequences(
+                seed,
+                native_persistence::random_sequences::RandomSequences::read(None)?,
+            )?;
+            dungeon.submit_command(PlayerCommand::Place);
+            dungeon.update(Duration::from_millis(50));
+            let snapshot = dungeon.snapshot();
+            assert!(
+                snapshot.inventory.is_open(),
+                "dungeon chest did not open for seed {seed}"
+            );
+            let Some(book) = (0..27).find_map(|slot| {
+                snapshot
+                    .inventory
+                    .slot(PlayerSlot::Chest(slot))
+                    .filter(|item| item.id() == "minecraft:enchanted_book")
+            }) else {
+                continue;
+            };
+            let expected = book
+                .components()
+                .get("minecraft:stored_enchantments")
+                .context("enchanted book has no stored enchantments")?
+                .clone();
+            dungeon.submit_command(PlayerCommand::ToggleInventory);
+            dungeon.update(Duration::from_millis(50));
+            let chest = dungeon
+                .saved_chest(glam::IVec3::new(8, 2, 7))?
+                .context("opened chest missing")?;
+            let draft = chest.draft_inventory(&chest.slots)?;
+            let saved_book = match draft.get("Items") {
+                Some(Tag::List { values, .. }) => values.iter().find(|item| matches!(item.get("id"), Some(Tag::String(id)) if id.matches("minecraft:enchanted_book"))).context("saved enchanted book missing")?,
+                _ => anyhow::bail!("saved chest items missing"),
+            };
+            assert_eq!(
+                saved_book
+                    .get("components")
+                    .and_then(|value| value.get("minecraft:stored_enchantments")),
+                Some(&expected)
+            );
+            tested_book = true;
+            break;
+        }
+        assert!(
+            tested_book,
+            "the dungeon seeds did not generate an enchanted book"
+        );
         let registry = resources.vanilla_block_ids()?;
         let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);
         ensure!(tags.climbable.is_some(), "climbable tag unavailable");

@@ -6,7 +6,10 @@ use crate::packs::{ResourceId, ResourceProvider};
 use anyhow::{Context, Result, bail, ensure};
 use native_core::random::{LegacyRandom, XoroshiroRandom};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub trait ChestLootRandom: Clone {
     fn next_int(&mut self, bound: i32) -> Option<i32>;
@@ -44,6 +47,8 @@ pub struct ChestLootItem {
     pub potion: Option<ResourceId>,
     /// The generated damage component, when changed by a loot function.
     pub damage: Option<u32>,
+    /// Enchantments produced by an active data-pack loot function.
+    pub enchantments: Vec<crate::enchantment_selection::Selected>,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum ChestLootDurability {
@@ -79,6 +84,11 @@ enum Modifier {
     SetCount(IntProvider),
     SetPotion(ResourceId),
     SetDamage(FloatProvider, bool),
+    EnchantRandomly {
+        options: Option<Value>,
+        only_compatible: bool,
+        selector: Option<Arc<crate::random_enchantment::RandomEnchantment>>,
+    },
 }
 #[derive(Clone, Debug)]
 struct Entry {
@@ -110,6 +120,8 @@ pub struct ChestLootTables {
 impl ChestLootTables {
     pub fn load(provider: &mut impl ResourceProvider) -> Result<Self> {
         let mut tables = BTreeMap::new();
+        let mut items: Option<Arc<BTreeSet<ResourceId>>> = None;
+        let mut selectors = BTreeMap::new();
         for id in provider.list_data("loot_table")? {
             let path = format!("data/{}/loot_table/{}.json", id.namespace, id.path);
             let Some(bytes) = provider.read_data(&path)? else {
@@ -121,7 +133,11 @@ impl ChestLootTables {
             let Ok(value) = serde_json::from_slice(&bytes) else {
                 continue;
             };
-            if let Ok(table) = ChestLootTable::decode(&value) {
+            if let Ok(mut table) = ChestLootTable::decode(&value)
+                && table
+                    .prepare_random_enchantments(provider, &mut items, &mut selectors)
+                    .is_ok()
+            {
                 tables.insert(id, table);
             }
         }
@@ -308,6 +324,31 @@ fn modifiers(value: Option<&Value>) -> Result<Vec<Modifier>> {
                         add,
                     ))
                 }
+                "enchant_randomly" => {
+                    allowed_fields(
+                        entry,
+                        &[
+                            "type",
+                            "options",
+                            "only_compatible",
+                            "include_additional_cost_component",
+                        ],
+                    )?;
+                    let only_compatible = entry
+                        .get("only_compatible")
+                        .map(|v| v.as_bool().context("invalid compatibility flag"))
+                        .transpose()?
+                        .unwrap_or(true);
+                    // Chest loot contexts do not contain the trade-cost parameter.
+                    if let Some(value) = entry.get("include_additional_cost_component") {
+                        value.as_bool().context("invalid additional cost flag")?;
+                    }
+                    Ok(Modifier::EnchantRandomly {
+                        options: entry.get("options").cloned(),
+                        only_compatible,
+                        selector: None,
+                    })
+                }
                 _ => bail!("unsupported chest loot modifier {}", kind.path),
             }
         })
@@ -334,14 +375,90 @@ impl IntProvider {
     }
 }
 impl ChestLootTable {
+    /// Resolve enchantment holders from the same immutable stack as this table.
+    pub fn resolve_random_enchantments(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+    ) -> Result<()> {
+        let mut prepared = self.clone();
+        prepared.prepare_random_enchantments(provider, &mut None, &mut BTreeMap::new())?;
+        *self = prepared;
+        Ok(())
+    }
+
+    fn prepare_random_enchantments(
+        &mut self,
+        provider: &mut impl ResourceProvider,
+        items: &mut Option<Arc<BTreeSet<ResourceId>>>,
+        selectors: &mut BTreeMap<
+            (Option<String>, bool),
+            Arc<crate::random_enchantment::RandomEnchantment>,
+        >,
+    ) -> Result<()> {
+        let modifiers = self
+            .modifiers
+            .iter_mut()
+            .chain(self.pools.iter_mut().flat_map(|pool| {
+                pool.modifiers.iter_mut().chain(
+                    pool.entries
+                        .iter_mut()
+                        .flat_map(|entry| entry.modifiers.iter_mut()),
+                )
+            }));
+        for modifier in modifiers {
+            let Modifier::EnchantRandomly {
+                options,
+                only_compatible,
+                selector,
+            } = modifier
+            else {
+                continue;
+            };
+            let key = (options.as_ref().map(Value::to_string), *only_compatible);
+            let prepared = if let Some(prepared) = selectors.get(&key) {
+                Arc::clone(prepared)
+            } else {
+                let registry = if let Some(items) = items.as_ref() {
+                    Arc::clone(items)
+                } else {
+                    let registry = provider
+                        .builtin_item_registry()?
+                        .context("verified item registry unavailable for random enchantment")?;
+                    let ids = registry
+                        .iter()
+                        .map(|(id, _)| ResourceId::parse(id))
+                        .collect::<Result<BTreeSet<_>>>()?;
+                    let ids = Arc::new(ids);
+                    *items = Some(Arc::clone(&ids));
+                    ids
+                };
+                let prepared = Arc::new(crate::random_enchantment::RandomEnchantment::load(
+                    provider,
+                    registry,
+                    options.as_ref(),
+                    *only_compatible,
+                )?);
+                selectors.insert(key, Arc::clone(&prepared));
+                prepared
+            };
+            *selector = Some(prepared);
+        }
+        Ok(())
+    }
+
     pub fn load(provider: &mut impl ResourceProvider, id: &ResourceId) -> Result<Self> {
         let path = format!("data/{}/loot_table/{}.json", id.namespace, id.path);
         let bytes = provider
             .read_data(&path)?
             .with_context(|| format!("missing loot table {path}"))?;
         ensure!(bytes.len() <= 16 * 1024 * 1024, "loot table too large");
-        Self::decode(&serde_json::from_slice(&bytes).context("invalid loot table JSON")?)
-            .with_context(|| format!("in loot table {path}"))
+        let mut table =
+            Self::decode(&serde_json::from_slice(&bytes).context("invalid loot table JSON")?)
+                .with_context(|| format!("in loot table {path}"))?;
+        table
+            .resolve_random_enchantments(provider)
+            .with_context(|| format!("in loot table {path}"))?;
+        Ok(table)
     }
     pub fn decode(value: &Value) -> Result<Self> {
         allowed_fields(value, &["type", "random_sequence", "pools", "modifier"])?;
@@ -541,6 +658,7 @@ impl ChestLootTable {
                         count: 1,
                         potion: None,
                         damage: None,
+                        enchantments: Vec::new(),
                     };
                     for modifier in entry
                         .modifiers
@@ -582,10 +700,37 @@ impl ChestLootTable {
                         durability: ChestLootDurability::Unknown,
                     }
                 };
+                let enchanted_book = if entry
+                    .item
+                    .as_ref()
+                    .is_some_and(|id| id.namespace == "minecraft" && id.path == "book")
+                    && entry
+                        .modifiers
+                        .iter()
+                        .chain(pool.modifiers.iter())
+                        .chain(self.modifiers.iter())
+                        .any(|m| matches!(m, Modifier::EnchantRandomly { .. }))
+                {
+                    let prototype = ChestLootItem {
+                        id: ResourceId::parse("minecraft:enchanted_book")?,
+                        count: 1,
+                        potion: None,
+                        damage: None,
+                        enchantments: Vec::new(),
+                    };
+                    let info: ChestLootPrototype = max_stack(&prototype)?.into();
+                    ensure!(
+                        (1..=99).contains(&info.max_stack),
+                        "invalid enchanted book stack limit"
+                    );
+                    Some(info)
+                } else {
+                    None
+                };
                 let weight =
                     java_floor((entry.weight as f32) + (entry.quality as f32) * luck).max(0);
                 if weight > 0 {
-                    entries.push((entry, maximum, weight));
+                    entries.push((entry, maximum, enchanted_book, weight));
                 }
             }
             prepared.push(entries);
@@ -595,7 +740,7 @@ impl ChestLootTable {
         for (pool, candidates) in self.pools.iter().zip(prepared) {
             let total = candidates
                 .iter()
-                .try_fold(0i32, |sum, (_, _, weight)| sum.checked_add(*weight))
+                .try_fold(0i32, |sum, (_, _, _, weight)| sum.checked_add(*weight))
                 .context("loot weight overflow")?;
             let rolls = pool.rolls.sample(&mut rng)?;
             let bonus = pool.bonus_rolls.sample(&mut rng);
@@ -608,15 +753,15 @@ impl ChestLootTable {
                 if candidates.is_empty() {
                     continue;
                 }
-                let (selected, info, _) = if candidates.len() == 1 {
+                let (selected, mut info, enchanted_book, _) = if candidates.len() == 1 {
                     candidates[0]
                 } else {
                     let mut n = bounded(&mut rng, total)?;
                     let mut selected = candidates[0];
-                    for &(entry, maximum, weight) in &candidates {
+                    for &(entry, maximum, enchanted_book, weight) in &candidates {
                         n -= weight;
                         if n < 0 {
-                            selected = (entry, maximum, weight);
+                            selected = (entry, maximum, enchanted_book, weight);
                             break;
                         }
                     }
@@ -630,6 +775,7 @@ impl ChestLootTable {
                     count: 1,
                     potion: None,
                     damage: None,
+                    enchantments: Vec::new(),
                 };
                 for modifier in selected
                     .modifiers
@@ -658,6 +804,30 @@ impl ChestLootTable {
                                 item.damage = Some(
                                     (((1.0 - remaining) * max as f32).floor() as u32).min(max),
                                 );
+                            }
+                        }
+                        Modifier::EnchantRandomly { selector, .. } => {
+                            ensure!(
+                                item.count > 0,
+                                "randomly enchanting an empty stack is unsupported"
+                            );
+                            let selector = selector
+                                .as_ref()
+                                .context("random enchantment registry is unavailable")?;
+                            let selected = selector.select(&item.id, &mut rng)?;
+                            if let Some(enchantment) = selected {
+                                ensure!(
+                                    item.id.namespace == "minecraft" && item.id.path == "book",
+                                    "random enchantment on non-book loot is not yet supported"
+                                );
+                                info = enchanted_book
+                                    .context("enchanted book prototype is unavailable")?;
+                                item.id = ResourceId::parse("minecraft:enchanted_book")?;
+                                item.count = 1;
+                                item.potion = None;
+                                item.damage = None;
+                                item.enchantments.clear();
+                                item.enchantments.push(enchantment);
                             }
                         }
                     }

@@ -675,6 +675,34 @@ impl SavedChest {
                 .find(|(id, potion, _)| *id == item.id && *potion == item.potion)
                 .context("missing generated item prototype")?;
             let mut components = prototype.2.components().clone();
+            if !item.enchantments.is_empty() {
+                ensure!(
+                    item.id.namespace == "minecraft" && item.id.path == "enchanted_book",
+                    "unsupported loot enchantment target"
+                );
+                let Tag::Compound(fields) = &mut components else {
+                    bail!("invalid item components")
+                };
+                ensure!(
+                    !fields
+                        .iter()
+                        .any(|(name, _)| name.matches("minecraft:stored_enchantments")),
+                    "stored enchantments already present"
+                );
+                let mut levels = Vec::with_capacity(item.enchantments.len());
+                for enchantment in &item.enchantments {
+                    levels.push((
+                        format!("{}:{}", enchantment.id.namespace, enchantment.id.path)
+                            .as_str()
+                            .into(),
+                        Tag::Int(enchantment.level),
+                    ));
+                }
+                fields.push((
+                    "minecraft:stored_enchantments".into(),
+                    Tag::Compound(levels),
+                ));
+            }
             if let Some(damage) = item.damage.filter(|damage| *damage != 0) {
                 let Tag::Compound(fields) = &mut components else {
                     bail!("invalid item components")

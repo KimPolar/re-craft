@@ -3108,6 +3108,14 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
             | "minecraft:milk_bucket"
             | "minecraft:potion"
             | "minecraft:leather_horse_armor"
+            | "minecraft:golden_horse_armor"
+            | "minecraft:copper_horse_armor"
+            | "minecraft:iron_horse_armor"
+            | "minecraft:diamond_horse_armor"
+            | "minecraft:enchanted_book"
+            | "minecraft:music_disc_otherside"
+            | "minecraft:music_disc_13"
+            | "minecraft:music_disc_cat"
             | "minecraft:wolf_armor"
             | "minecraft:iron_spear"
             | "minecraft:copper_nautilus_armor"
@@ -3138,6 +3146,9 @@ pub fn ordinary_item_default_max(id: &str) -> Option<u32> {
         return Some(max);
     }
     let name = id.strip_prefix("minecraft:")?;
+    if matches!(name, "book" | "name_tag") {
+        return Some(64);
+    }
     if matches!(name, "ender_pearl" | "snowball" | "honey_bottle" | "bucket") {
         return Some(16);
     }

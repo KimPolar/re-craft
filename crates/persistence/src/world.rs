@@ -264,6 +264,14 @@ pub struct ChunkPos {
     pub z: i32,
 }
 
+/// The independent region stores belonging to the selected dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionStore {
+    Terrain,
+    Entities,
+    PointsOfInterest,
+}
+
 /// A complete entity-region document. Unknown entity and passenger data are
 /// kept in their original form; this does not yet instantiate game entities.
 #[derive(Clone)]
@@ -1806,6 +1814,40 @@ impl WorldReader {
         })?))
     }
 
+    /// Enumerate actual saved entries without decoding chunk payloads. Missing
+    /// stores are empty, while malformed region headers are reported as errors.
+    pub fn saved_chunk_positions(&self, store: RegionStore) -> Result<BTreeSet<ChunkPos>> {
+        let directory = match store {
+            RegionStore::Terrain => self.dimension.region_dir(&self.root),
+            RegionStore::Entities => self.dimension.entity_region_dir(&self.root),
+            RegionStore::PointsOfInterest => self.dimension.poi_region_dir(&self.root),
+        };
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeSet::new());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot list {}", directory.display()));
+            }
+        };
+        let mut positions = BTreeSet::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "mca") {
+                continue;
+            }
+            let mut region = RegionReader::open(&path)?;
+            for (x, z) in region.chunk_positions()? {
+                ensure!(
+                    positions.insert(ChunkPos { x, z }),
+                    "duplicate saved chunk ({x}, {z})"
+                );
+            }
+        }
+        Ok(positions)
+    }
+
     pub fn read_chunk(&mut self, x: i32, z: i32) -> Result<Option<LoadedChunk>> {
         let directory = self.dimension.region_dir(&self.root);
         read_region_document(&directory, x, z, &mut self.regions, &mut self.region_usage)?
@@ -3013,6 +3055,64 @@ mod tests {
         assert_eq!(reader.regions.len(), MAX_OPEN_REGIONS);
         assert!(reader.regions.contains_key(&(0, 0)));
         assert!(!reader.regions.contains_key(&(1, 0)));
+    }
+
+    #[test]
+    fn saved_chunk_enumeration_covers_each_dimension_store_and_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gzip(&dir.path().join("level.dat"), &level(TARGET_DATA_VERSION));
+        let overworld = DimensionId::parse("overworld").unwrap();
+        let nether = DimensionId::parse("the_nether").unwrap();
+        let create = |directory: &Path, name: &str, index: usize| {
+            std::fs::create_dir_all(directory).unwrap();
+            let mut bytes = vec![0u8; 3 * 4096];
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&((2u32 << 8) | 1).to_be_bytes());
+            std::fs::write(directory.join(name), bytes).unwrap();
+        };
+        create(&overworld.region_dir(dir.path()), "r.-1.0.mca", 31);
+        create(
+            &overworld.entity_region_dir(dir.path()),
+            "r.0.-1.mca",
+            31 * 32,
+        );
+        create(&overworld.poi_region_dir(dir.path()), "r.0.0.mca", 33);
+        create(&nether.region_dir(dir.path()), "r.0.0.mca", 0);
+        let mut reader = WorldReader::open(dir.path(), overworld.clone()).unwrap();
+        assert_eq!(
+            reader.saved_chunk_positions(RegionStore::Terrain).unwrap(),
+            BTreeSet::from([ChunkPos { x: -1, z: 0 }])
+        );
+        assert_eq!(
+            reader.saved_chunk_positions(RegionStore::Entities).unwrap(),
+            BTreeSet::from([ChunkPos { x: 0, z: -1 }])
+        );
+        assert_eq!(
+            reader
+                .saved_chunk_positions(RegionStore::PointsOfInterest)
+                .unwrap(),
+            BTreeSet::from([ChunkPos { x: 1, z: 1 }])
+        );
+        reader.set_dimension(nether);
+        assert_eq!(
+            reader.saved_chunk_positions(RegionStore::Terrain).unwrap(),
+            BTreeSet::from([ChunkPos { x: 0, z: 0 }])
+        );
+        assert!(
+            reader
+                .saved_chunk_positions(RegionStore::Entities)
+                .unwrap()
+                .is_empty()
+        );
+        reader.set_dimension(overworld.clone());
+        create(&overworld.region_dir(dir.path()), "r.-01.0.mca", 31);
+        assert!(reader.saved_chunk_positions(RegionStore::Terrain).is_err());
+        std::fs::remove_file(overworld.region_dir(dir.path()).join("r.-01.0.mca")).unwrap();
+        std::fs::write(
+            overworld.region_dir(dir.path()).join("r.1.0.mca"),
+            [0u8; 12],
+        )
+        .unwrap();
+        assert!(reader.saved_chunk_positions(RegionStore::Terrain).is_err());
     }
 
     #[test]

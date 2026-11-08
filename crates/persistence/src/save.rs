@@ -995,6 +995,7 @@ pub struct RewriteResult {
 #[derive(Default)]
 pub struct WorldSavePlan {
     chunks: Vec<PlannedChunk>,
+    generated_chunks: Vec<PlannedGeneratedChunk>,
     entity_chunks: Vec<PlannedEntityChunk>,
     poi_chunks: Vec<PlannedEntityChunk>,
     players: Vec<PlannedPlayerData>,
@@ -1007,6 +1008,13 @@ pub struct WorldSavePlan {
 struct PlannedChunk {
     dimension: DimensionId,
     draft: crate::edit::ChunkDraft,
+    region_timestamp_seconds: u32,
+}
+
+struct PlannedGeneratedChunk {
+    dimension: DimensionId,
+    position: crate::world::ChunkPos,
+    document: Vec<u8>,
     region_timestamp_seconds: u32,
 }
 
@@ -1063,7 +1071,10 @@ impl WorldSavePlan {
         ensure!(
             !self.chunks.iter().any(|entry| {
                 entry.dimension == dimension && entry.draft.position() == position
-            }),
+            }) && !self
+                .generated_chunks
+                .iter()
+                .any(|entry| { entry.dimension == dimension && entry.position == position }),
             "world save plan contains a duplicate chunk"
         );
         self.chunks.push(PlannedChunk {
@@ -1075,7 +1086,87 @@ impl WorldSavePlan {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.chunks.len() + self.generated_chunks.len()
+    }
+
+    /// Stage a newly generated FULL chunk and its complete entity and POI
+    /// storage actions. `None` means the corresponding region entry must be
+    /// absent, not that it may be ignored. All three entries are checked for
+    /// absence again at commit, including when their region files do not exist.
+    /// The caller must prove generation and all cross-chunk effects complete;
+    /// this method alone does not authorize saving an active game session.
+    pub fn add_generated_chunk(
+        &mut self,
+        dimension: DimensionId,
+        position: crate::world::ChunkPos,
+        terrain: &nbt::NamedTag,
+        entities: Option<&nbt::NamedTag>,
+        poi: Option<&nbt::NamedTag>,
+        region_timestamp_seconds: u32,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .chunks
+                .iter()
+                .any(|entry| entry.dimension == dimension && entry.draft.position() == position)
+                && !self
+                    .generated_chunks
+                    .iter()
+                    .any(|entry| entry.dimension == dimension && entry.position == position),
+            "world save plan contains a duplicate chunk"
+        );
+        ensure!(
+            !self
+                .entity_chunks
+                .iter()
+                .any(|entry| entry.dimension == dimension && entry.position == position)
+                && !self
+                    .poi_chunks
+                    .iter()
+                    .any(|entry| entry.dimension == dimension && entry.position == position),
+            "world save plan contains duplicate chunk sidecars"
+        );
+        validate_chunk(&terrain.value, position.x, position.z)?;
+        if let Some(document) = entities {
+            validate_entity_document(document, position)?;
+        }
+        if let Some(document) = poi {
+            crate::world::decode_poi_chunk(document.clone(), position)?;
+        }
+        let encode = |document: &nbt::NamedTag| -> Result<Vec<u8>> {
+            let bytes = nbt::write(document)?;
+            ensure!(
+                bytes.len() <= nbt::MAX_NBT_BYTES,
+                "generated chunk exceeds NBT limit"
+            );
+            Ok(bytes)
+        };
+        // Encode all documents before modifying the plan, so any error leaves
+        // it unchanged and a caller can correct the complete batch.
+        let terrain = encode(terrain)?;
+        let entities = entities.map(encode).transpose()?;
+        let poi = poi.map(encode).transpose()?;
+        self.generated_chunks.push(PlannedGeneratedChunk {
+            dimension: dimension.clone(),
+            position,
+            document: terrain,
+            region_timestamp_seconds,
+        });
+        self.entity_chunks.push(PlannedEntityChunk {
+            dimension: dimension.clone(),
+            position,
+            source_nbt: None,
+            replacement: entities,
+            region_timestamp_seconds,
+        });
+        self.poi_chunks.push(PlannedEntityChunk {
+            dimension,
+            position,
+            source_nbt: None,
+            replacement: poi,
+            region_timestamp_seconds,
+        });
+        Ok(())
     }
 
     pub fn poi_chunk_count(&self) -> usize {
@@ -1790,6 +1881,7 @@ impl WorldWriteGuard {
     ) -> Result<WorldSaveResult> {
         ensure!(
             !plan.chunks.is_empty()
+                || !plan.generated_chunks.is_empty()
                 || !plan.entity_chunks.is_empty()
                 || !plan.poi_chunks.is_empty()
                 || !plan.players.is_empty()
@@ -1848,6 +1940,23 @@ impl WorldWriteGuard {
                     position,
                     source_nbt: Some(chunk.draft.source_nbt().to_vec()),
                     replacement: Some(replacement),
+                    timestamp: chunk.region_timestamp_seconds,
+                });
+        }
+        for chunk in &plan.generated_chunks {
+            let position = chunk.position;
+            groups
+                .entry((
+                    RegionKind::Blocks,
+                    chunk.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default()
+                .push(RegionChange {
+                    position,
+                    source_nbt: None,
+                    replacement: Some(chunk.document.clone()),
                     timestamp: chunk.region_timestamp_seconds,
                 });
         }
@@ -1964,7 +2073,7 @@ impl WorldWriteGuard {
         let mut extra_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
         for ((kind, dimension, _, _), chunks) in &groups {
             let directory = match kind {
-                RegionKind::Blocks => continue,
+                RegionKind::Blocks => dimension.region_dir(&self.root),
                 RegionKind::Entities => dimension.entity_region_dir(&self.root),
                 RegionKind::Poi => dimension.poi_region_dir(&self.root),
             };
@@ -2015,9 +2124,7 @@ impl WorldWriteGuard {
                 RegionKind::Entities => dimension.entity_region_dir(&self.root),
                 RegionKind::Poi => dimension.poi_region_dir(&self.root),
             };
-            if kind != RegionKind::Blocks
-                && extra_directories.get(&directory) == Some(&(false, false))
-            {
+            if extra_directories.get(&directory) == Some(&(false, false)) {
                 continue;
             }
             let region_dir = directory
@@ -2042,12 +2149,7 @@ impl WorldWriteGuard {
                     );
                     Some(canonical)
                 }
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && kind != RegionKind::Blocks =>
-                {
-                    None
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => {
                     return Err(error).with_context(|| {
                         format!("cannot inspect region {}", region_path.display())
@@ -2531,7 +2633,7 @@ impl WorldWriteGuard {
             note,
             "Minecraft Native coordinated save backup\nregions={}\nchunks={}\nentity_regions={}\nentity_chunks={}\npoi_regions={}\npoi_chunks={}\nabsent_regions={}\nplayers={}\nworld_clocks={}\nweather={}\nrandom_sequences={}\nlevel={}",
             region_paths.len(),
-            plan.chunks.len(),
+            plan.chunk_count(),
             entity_region_paths.len(),
             plan.entity_chunks.len(),
             poi_region_paths.len(),
@@ -7215,6 +7317,152 @@ mod tests {
             player_replacement
         );
         assert!(!world.path().join(".minecraft-native-pending").exists());
+    }
+
+    #[test]
+    fn generated_chunks_are_added_with_sidecars_across_regions() {
+        let world = test_world();
+        let (region, original, external) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let first = ChunkPos { x: 3, z: 0 };
+        let second = ChunkPos { x: 32, z: 0 };
+        let terrain = editable_chunk(first.x);
+        let far_terrain = editable_chunk(second.x);
+        let entities = entity_chunk(
+            first.x,
+            vec![Tag::Compound(vec![(
+                "id".into(),
+                Tag::String("minecraft:pig".into()),
+            )])],
+        );
+        let mut poi = poi_document();
+        let Tag::Compound(record) = &mut poi_records_mut(&mut poi)[0] else {
+            panic!()
+        };
+        record
+            .iter_mut()
+            .find(|(key, _)| key.matches("pos"))
+            .unwrap()
+            .1 = Tag::IntArray(vec![48, 0, 0]);
+        let mut plan = WorldSavePlan::new();
+        assert!(
+            plan.add_generated_chunk(
+                dimension.clone(),
+                first,
+                &terrain,
+                Some(&entity_chunk(4, vec![])),
+                Some(&poi),
+                10,
+            )
+            .is_err()
+        );
+        assert_eq!(plan.chunk_count(), 0);
+        assert_eq!(plan.poi_chunk_count(), 0);
+        plan.add_generated_chunk(
+            dimension.clone(),
+            first,
+            &terrain,
+            Some(&entities),
+            Some(&poi),
+            10,
+        )
+        .unwrap();
+        plan.add_generated_chunk(dimension.clone(), second, &far_terrain, None, None, 11)
+            .unwrap();
+        assert_eq!(plan.chunk_count(), 2);
+        assert!(
+            plan.add_generated_chunk(dimension.clone(), first, &terrain, None, None, 12)
+                .is_err()
+        );
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let result = guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert_eq!(result.region_paths.len(), 2);
+        assert_eq!(result.entity_region_paths.len(), 1);
+        assert_eq!(result.poi_region_paths.len(), 1);
+        assert_eq!(
+            fs::read(result.backup_directory.join("region-0/r.0.0.mca")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read(region.parent().unwrap().join("c.2.0.mcc")).unwrap(),
+            external
+        );
+        let mut reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
+        assert_eq!(*reader.read_chunk(3, 0).unwrap().unwrap().document, terrain);
+        assert_eq!(
+            *reader.read_chunk(32, 0).unwrap().unwrap().document,
+            far_terrain
+        );
+        assert_eq!(
+            *reader.read_entity_chunk(3, 0).unwrap().unwrap().document,
+            entities
+        );
+        assert_eq!(*reader.read_poi_chunk(3, 0).unwrap().unwrap().document, poi);
+        assert!(reader.read_entity_chunk(32, 0).unwrap().is_none());
+        assert!(reader.read_poi_chunk(32, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn generated_chunk_conflicts_abort_the_whole_save() {
+        let world = test_world();
+        let (region, original, external) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let sidecar_dir = world.path().join("dimensions/minecraft/overworld/entities");
+        fs::create_dir(&sidecar_dir).unwrap();
+        let sidecar_path = sidecar_dir.join("r.0.0.mca");
+        let mut sidecar = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut sidecar, 3, 2, &entity_chunk(3, vec![]), 1);
+        fs::write(&sidecar_path, &sidecar).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        for conflict in [ChunkPos { x: 0, z: 0 }, ChunkPos { x: 3, z: 0 }] {
+            let mut plan = WorldSavePlan::new();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 32, z: 0 },
+                &editable_chunk(32),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                conflict,
+                &editable_chunk(conflict.x),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+            assert_eq!(fs::read(&region).unwrap(), original);
+            assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar);
+            assert_eq!(
+                fs::read(region.parent().unwrap().join("c.2.0.mcc")).unwrap(),
+                external
+            );
+            assert!(!region.parent().unwrap().join("r.1.0.mca").exists());
+        }
+    }
+
+    #[test]
+    fn generated_chunk_creates_a_missing_terrain_directory() {
+        let world = test_world();
+        let (region, _, _) = fixture(world.path());
+        let directory = region.parent().unwrap();
+        fs::remove_file(directory.join("c.2.0.mcc")).unwrap();
+        fs::remove_file(&region).unwrap();
+        fs::remove_dir(directory).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let position = ChunkPos { x: 0, z: 0 };
+        let terrain = editable_chunk(0);
+        let mut plan = WorldSavePlan::new();
+        plan.add_generated_chunk(dimension.clone(), position, &terrain, None, None, 123)
+            .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        let mut reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
+        assert_eq!(*reader.read_chunk(0, 0).unwrap().unwrap().document, terrain);
     }
 
     #[test]

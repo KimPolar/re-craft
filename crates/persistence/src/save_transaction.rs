@@ -311,6 +311,10 @@ fn valid_created_poi_region(value: &str) -> bool {
     valid_created_region(value, "poi")
 }
 
+fn valid_created_terrain_region(value: &str) -> bool {
+    valid_created_region(value, "region")
+}
+
 /// A new external chunk is only recoverable as part of its owning region's
 /// transaction. Keep the canonical spelling to avoid aliases during recovery.
 fn external_chunk_region(value: &str) -> Option<String> {
@@ -364,6 +368,7 @@ fn valid_created_target(value: &str, version: u32) -> bool {
         || (version >= 8 && external_chunk_region(value).is_some())
         || (version >= 10 && valid_created_player(value))
         || (version >= 11 && valid_created_world_clocks(value))
+        || (version >= 12 && valid_created_terrain_region(value))
 }
 
 fn valid_created_world_clocks(value: &str) -> bool {
@@ -436,7 +441,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
         matches!(
             manifest.version,
-            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11
+            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12
         ),
         "unsupported transaction version"
     );
@@ -750,63 +755,67 @@ fn prepare_with_deletions(
             original,
         });
     }
-    let manifest = Manifest {
-        version: if records
-            .iter()
-            .any(|record| record.original.is_none() && valid_created_world_clocks(&record.target))
-        {
-            11
-        } else if records
-            .iter()
-            .any(|record| record.original.is_none() && valid_created_player(&record.target))
-        {
-            10
-        } else if !deleted_records.is_empty() {
-            9
-        } else if records.iter().any(|record| {
-            record.original.is_none() && external_chunk_region(&record.target).is_some()
-        }) {
-            8
-        } else if records.iter().any(|record| {
-            record.original.is_none() && valid_created_random_sequences(&record.target)
-        }) {
-            7
-        } else if records
-            .iter()
-            .any(|record| record.original.is_none() && record.target == "level.dat_old")
-        {
-            6
-        } else if records
-            .iter()
-            .any(|record| record.original.is_none() && valid_created_weather(&record.target))
-        {
-            5
-        } else if records
-            .iter()
-            .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
-            || absent_dependencies
+    let manifest =
+        Manifest {
+            version: if records.iter().any(|record| {
+                record.original.is_none() && valid_created_terrain_region(&record.target)
+            }) {
+                12
+            } else if records.iter().any(|record| {
+                record.original.is_none() && valid_created_world_clocks(&record.target)
+            }) {
+                11
+            } else if records
                 .iter()
-                .any(|target| valid_created_poi_region(target))
-            || absent_directories
+                .any(|record| record.original.is_none() && valid_created_player(&record.target))
+            {
+                10
+            } else if !deleted_records.is_empty() {
+                9
+            } else if records.iter().any(|record| {
+                record.original.is_none() && external_chunk_region(&record.target).is_some()
+            }) {
+                8
+            } else if records.iter().any(|record| {
+                record.original.is_none() && valid_created_random_sequences(&record.target)
+            }) {
+                7
+            } else if records
                 .iter()
-                .any(|target| valid_poi_directory(target))
-        {
-            4
-        } else if !absent_directories.is_empty() {
-            3
-        } else if !absent_dependencies.is_empty()
-            || records.iter().any(|record| record.original.is_none())
-        {
-            2
-        } else {
-            1
-        },
-        files: records,
-        dependencies: dependency_records,
-        absent_dependencies,
-        absent_directories,
-        deletions: deleted_records,
-    };
+                .any(|record| record.original.is_none() && record.target == "level.dat_old")
+            {
+                6
+            } else if records
+                .iter()
+                .any(|record| record.original.is_none() && valid_created_weather(&record.target))
+            {
+                5
+            } else if records
+                .iter()
+                .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
+                || absent_dependencies
+                    .iter()
+                    .any(|target| valid_created_poi_region(target))
+                || absent_directories
+                    .iter()
+                    .any(|target| valid_poi_directory(target))
+            {
+                4
+            } else if !absent_directories.is_empty() {
+                3
+            } else if !absent_dependencies.is_empty()
+                || records.iter().any(|record| record.original.is_none())
+            {
+                2
+            } else {
+                1
+            },
+            files: records,
+            dependencies: dependency_records,
+            absent_dependencies,
+            absent_directories,
+            deletions: deleted_records,
+        };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(
@@ -1349,6 +1358,43 @@ mod tests {
         assert!(prepare(&root, &backup, files, dependencies).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"outside writer");
         assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
+    fn created_terrain_region_has_versioned_paths_and_recovers_after_interruption() {
+        let region = "dimensions/minecraft/overworld/region/r.-1.2.mca";
+        assert!(!valid_created_target(region, 11));
+        assert!(valid_created_target(region, 12));
+        for invalid in [
+            "dimensions/minecraft/overworld/region/r.01.0.mca",
+            "dimensions/minecraft/../region/r.0.0.mca",
+            "dimensions/minecraft/overworld/region/session.lock",
+            "players/data/r.0.0.mca",
+        ] {
+            assert!(!valid_created_target(invalid, 12), "{invalid}");
+        }
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let target = root.join(region);
+        let mut stage = tempfile::Builder::new()
+            .prefix(".native-region-")
+            .tempfile_in(target.parent().unwrap())
+            .unwrap();
+        stage.write_all(b"generated terrain").unwrap();
+        let file = Replacement {
+            target: target.clone(),
+            backup: None,
+            stage,
+            original_hash: None,
+        };
+        let mut prepared = prepare(&root, &backup, vec![file], vec![]).unwrap();
+        assert_eq!(prepared.manifest.version, 12);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        assert_eq!(fs::read(&target).unwrap(), b"generated terrain");
+        assert!(recover(&root).unwrap());
+        assert!(!target.exists());
     }
 
     #[test]

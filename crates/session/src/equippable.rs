@@ -63,9 +63,8 @@ fn parse_slot(tag: &Tag) -> Option<EquipmentSlot> {
     })
 }
 
-/// Infer a stack limit only when the item's ordinary inventory click behavior
-/// and all of its saved component shapes are understood.
-pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
+/// Resolve ordinary item behavior with optional validated enchantment patches.
+pub(crate) fn saved_ordinary_max_with_enchantments(id: &str, components: &Tag) -> Option<u32> {
     if let Some(max) = saved_item_max(id, components) {
         return Some(max);
     }
@@ -97,6 +96,15 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
         {
             return Some(max);
         }
+    }
+    None
+}
+
+/// Infer a stack limit only when the item's ordinary inventory click behavior
+/// and all of its saved component shapes are understood.
+pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
+    if let Some(max) = saved_ordinary_max_with_enchantments(id, components) {
+        return Some(max);
     }
     let default = vanilla_equipment(id)
         .map(|entry| entry.1)

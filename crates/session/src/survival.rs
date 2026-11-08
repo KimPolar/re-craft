@@ -1013,7 +1013,8 @@ impl FoodUse {
         let Some(food) = food_properties(item) else {
             return false;
         };
-        if saved_item_max(item.id(), item.components()) != item.max_count()
+        if crate::equippable::saved_ordinary_max_with_enchantments(item.id(), item.components())
+            != item.max_count()
             || item.max_count().is_none()
         {
             return false;
@@ -1815,6 +1816,64 @@ mod tests {
     use crate::{GameMode, GameSession, LocalSession, PlayerCommand};
 
     #[test]
+    fn enchanted_potion_can_be_used_and_rejects_invalid_components() {
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            let components = Tag::Compound(vec![
+                (
+                    "minecraft:potion_contents".into(),
+                    Tag::String("minecraft:water_breathing".into()),
+                ),
+                (
+                    "minecraft:enchantments".into(),
+                    Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(2))]),
+                ),
+            ]);
+            let mut inventory = PlayerInventory::default();
+            inventory.set_slot(
+                PlayerSlot::Storage(0),
+                ItemStack::new("minecraft:potion".into(), 1, 1, components.clone()),
+            );
+            let mut inventory = Arc::new(inventory);
+            let mut vitals = PlayerVitals::default();
+            let mut usage = FoodUse::default();
+            assert!(usage.start_hand(&mut inventory, PlayerSlot::Storage(0), &mut vitals, mode));
+            for _ in 0..32 {
+                usage.tick(&mut inventory, &mut vitals, mode);
+            }
+            let item = inventory.slot(PlayerSlot::Storage(0)).unwrap();
+            if mode == GameMode::Creative {
+                assert_eq!(item.id(), "minecraft:potion");
+                assert_eq!(item.components(), &components);
+            } else {
+                assert_eq!(item.id(), "minecraft:glass_bottle");
+            }
+            assert!(usage.take_events().iter().any(|event| matches!(event, FoodRandomEvent::PotionEffects(effects) if effects.iter().any(|effect| effect.kind == FoodStatusKind::WaterBreathing))));
+        }
+        let invalid = Tag::Compound(vec![
+            (
+                "minecraft:potion_contents".into(),
+                Tag::String("minecraft:water_breathing".into()),
+            ),
+            (
+                "minecraft:enchantments".into(),
+                Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(0))]),
+            ),
+        ]);
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new("minecraft:potion".into(), 1, 1, invalid),
+        );
+        let mut inventory = Arc::new(inventory);
+        assert!(!FoodUse::default().start_hand(
+            &mut inventory,
+            PlayerSlot::Storage(0),
+            &mut PlayerVitals::default(),
+            GameMode::Survival
+        ));
+    }
+
+    #[test]
     fn interrupted_milk_use_does_not_consume_or_clear_effects() {
         let mut inventory = PlayerInventory::default();
         inventory.set_slot(
@@ -2319,11 +2378,11 @@ mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 540);
+        assert_eq!(rows.len(), 1080);
         for row in rows {
             for variant in 0..4 {
                 let name = row["potion"].as_str().unwrap();
-                let components = Tag::Compound(vec![(
+                let mut components = vec![(
                     "minecraft:potion_contents".into(),
                     match variant {
                         0 => Tag::Compound(vec![("potion".into(), Tag::String(name.into()))]),
@@ -2346,7 +2405,14 @@ mod tests {
                             ),
                         ]),
                     },
-                )]);
+                )];
+                if row["enchanted"].as_bool().unwrap() {
+                    components.push((
+                        "minecraft:enchantments".into(),
+                        Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(2))]),
+                    ));
+                }
+                let components = Tag::Compound(components);
                 let item = ItemStack::new("minecraft:potion".into(), 1, 1, components).unwrap();
                 assert_eq!(
                     potion_color(item.components()).unwrap_or(0x385dc6),

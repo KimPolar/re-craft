@@ -59,6 +59,15 @@ public class RandomEnchantmentOracle {
         var swordTags = new ArrayList<net.minecraft.tags.TagKey<Item>>();
         for (var tag : itemTags) if (tagEntries("item", tag.location(), new HashSet<>()).contains("minecraft:diamond_sword")) swordTags.add(tag);
         bindTags.invoke(Items.DIAMOND_SWORD.builtInRegistryHolder(), swordTags);
+        int total = 0, missing = 0;
+        for (var item : BuiltInRegistries.ITEM) {
+            var stack = new ItemStack(item);
+            if (!stack.isEmpty()) {
+                total++;
+                if (!stack.has(DataComponents.ENCHANTMENTS)) missing++;
+            }
+        }
+        System.out.printf("A %d %d%n", total, missing);
         var ops = RegistryOps.create(JsonOps.INSTANCE, registries);
         Constructor<?> ctor = LootContext.class.getDeclaredConstructors()[0];
         ctor.setAccessible(true);

@@ -54,6 +54,17 @@ fn random_enchantment_selection_matches_java() {
         .arg("-classpath")
         .arg(&cp)
         .arg("RandomEnchantmentOracle"));
+    let prototypes: Vec<_> = oracle
+        .lines()
+        .find(|line| line.starts_with("A "))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert!(prototypes[1].parse::<usize>().unwrap() > 0);
+    assert_eq!(
+        prototypes[2], "0",
+        "an item lacks the standard enchantment component"
+    );
 
     let mut resources = ResourceStack::open(&game).unwrap();
     let items: BTreeSet<_> = resources

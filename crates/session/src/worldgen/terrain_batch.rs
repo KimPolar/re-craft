@@ -5713,6 +5713,102 @@ mod session_block_support_tests {
             tested_book,
             "the dungeon seeds did not generate an enchanted book"
         );
+        struct EnchantedLoot<'a>(&'a mut native_resources::packs::ResourceStack);
+        impl ResourceProvider for EnchantedLoot<'_> {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0.read_asset(path)
+            }
+            fn read_builtin_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0.read_builtin_data(path)
+            }
+            fn builtin_item_registry(
+                &mut self,
+            ) -> Result<Option<native_resources::item_registry::ItemRegistry>> {
+                self.0.builtin_item_registry()
+            }
+            fn read_data_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                self.0.read_data_stack(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "loot_table" {
+                    Ok(vec![
+                        ResourceId::parse("example:chests/sword")?,
+                        ResourceId::parse("example:chests/stone")?,
+                    ])
+                } else {
+                    self.0.list_data(folder)
+                }
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                let item = match path {
+                    "data/example/loot_table/chests/sword.json" => Some("minecraft:diamond_sword"),
+                    "data/example/loot_table/chests/stone.json" => Some("minecraft:stone"),
+                    _ => None,
+                };
+                if let Some(item) = item {
+                    Ok(Some(serde_json::to_vec(
+                        &json!({"type":"minecraft:chest", "random_sequence":"example:items", "pools":[{"rolls":1,"entries":[{
+                            "type":"minecraft:item", "name":item, "modifier":{"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"only_compatible":false}
+                        }]}]}),
+                    )?))
+                } else {
+                    self.0.read_data(path)
+                }
+            }
+        }
+        let item_loot = Arc::new(native_resources::chest_loot::ChestLootTables::load(
+            &mut EnchantedLoot(&mut resources),
+        )?);
+        for (table, item_id) in [
+            ("example:chests/sword", "minecraft:diamond_sword"),
+            ("example:chests/stone", "minecraft:stone"),
+        ] {
+            let mut item_session = fresh_player_session_with_loot_chest(Some(table));
+            item_session.set_player_inventory(PlayerInventory::default());
+            assert!(batch.apply_session_content(&mut item_session)?);
+            item_session.set_chest_loot(Arc::clone(&item_loot));
+            item_session.set_random_sequences(
+                42,
+                native_persistence::random_sequences::RandomSequences::read(None)?,
+            )?;
+            item_session.submit_command(PlayerCommand::Place);
+            item_session.update(Duration::from_millis(50));
+            let snapshot = item_session.snapshot();
+            assert!(
+                snapshot.inventory.is_open(),
+                "enchanted {item_id} chest did not open"
+            );
+            let item = (0..27)
+                .find_map(|slot| {
+                    snapshot
+                        .inventory
+                        .slot(PlayerSlot::Chest(slot))
+                        .filter(|item| item.id() == item_id)
+                })
+                .context("enchanted item missing")?;
+            let expected = item
+                .components()
+                .get("minecraft:enchantments")
+                .context("enchantment component missing")?
+                .clone();
+            assert!(item.has_glint());
+            item_session.submit_command(PlayerCommand::ToggleInventory);
+            item_session.update(Duration::from_millis(50));
+            let chest = item_session
+                .saved_chest(glam::IVec3::new(8, 2, 7))?
+                .context("opened chest missing")?;
+            let draft = chest.draft_inventory(&chest.slots)?;
+            let saved = match draft.get("Items") {
+                Some(Tag::List { values, .. }) => values.iter().find(|item| matches!(item.get("id"), Some(Tag::String(id)) if id.matches(item_id))).context("saved enchanted item missing")?,
+                _ => anyhow::bail!("saved chest items missing"),
+            };
+            assert_eq!(
+                saved
+                    .get("components")
+                    .and_then(|value| value.get("minecraft:enchantments")),
+                Some(&expected)
+            );
+        }
         let registry = resources.vanilla_block_ids()?;
         let tags = GeneratedSessionBlockTags::load(&mut resources, &registry);
         ensure!(tags.climbable.is_some(), "climbable tag unavailable");

@@ -149,6 +149,7 @@ pub fn saved_inventory_max(id: &str, components: &Tag) -> Option<u32> {
         && !(id == "minecraft:enchanted_book"
             && seen.len() == 1
             && seen.contains("minecraft:stored_enchantments"))
+        && !(seen.len() == 1 && seen.contains("minecraft:enchantments"))
     {
         return None;
     }
@@ -231,5 +232,22 @@ mod tests {
             saved_inventory_max("minecraft:enchanted_book", &invalid),
             None
         );
+    }
+
+    #[test]
+    fn normal_enchantments_preserve_stack_limits_for_ordinary_items() {
+        let components = Tag::Compound(vec![(
+            "minecraft:enchantments".into(),
+            Tag::Compound(vec![("minecraft:sharpness".into(), Tag::Int(2))]),
+        )]);
+        assert_eq!(
+            saved_inventory_max("minecraft:stone", &components),
+            Some(64)
+        );
+        assert_eq!(
+            saved_inventory_max("minecraft:diamond_sword", &components),
+            Some(1)
+        );
+        assert_eq!(saved_inventory_max("example:unknown", &components), None);
     }
 }

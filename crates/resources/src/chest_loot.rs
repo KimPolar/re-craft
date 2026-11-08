@@ -816,18 +816,24 @@ impl ChestLootTable {
                                 .context("random enchantment registry is unavailable")?;
                             let selected = selector.select(&item.id, &mut rng)?;
                             if let Some(enchantment) = selected {
-                                ensure!(
-                                    item.id.namespace == "minecraft" && item.id.path == "book",
-                                    "random enchantment on non-book loot is not yet supported"
-                                );
-                                info = enchanted_book
-                                    .context("enchanted book prototype is unavailable")?;
-                                item.id = ResourceId::parse("minecraft:enchanted_book")?;
-                                item.count = 1;
-                                item.potion = None;
-                                item.damage = None;
-                                item.enchantments.clear();
-                                item.enchantments.push(enchantment);
+                                if item.id.namespace == "minecraft" && item.id.path == "book" {
+                                    info = enchanted_book
+                                        .context("enchanted book prototype is unavailable")?;
+                                    item.id = ResourceId::parse("minecraft:enchanted_book")?;
+                                    item.count = 1;
+                                    item.potion = None;
+                                    item.damage = None;
+                                    item.enchantments.clear();
+                                }
+                                if let Some(existing) = item
+                                    .enchantments
+                                    .iter_mut()
+                                    .find(|entry| entry.id == enchantment.id)
+                                {
+                                    existing.level = existing.level.max(enchantment.level);
+                                } else {
+                                    item.enchantments.push(enchantment);
+                                }
                             }
                         }
                     }

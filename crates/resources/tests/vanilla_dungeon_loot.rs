@@ -55,21 +55,64 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
         .unwrap();
     let input = temp.path().join("loot.json");
     let definition: Value = serde_json::from_slice(&raw).unwrap();
-    std::fs::write(&input, serde_json::to_vec(&json!([definition])).unwrap()).unwrap();
+    let random = |id: &str, options: Value, compatible: bool| {
+        json!({
+            "type":"minecraft:chest", "pools":[{"rolls":1,"entries":[{
+                "type":"minecraft:item", "name":id,
+                "modifier":{"type":"minecraft:enchant_randomly","options":options,"only_compatible":compatible}
+            }]}]
+        })
+    };
+    let fixtures = vec![
+        definition,
+        random(
+            "minecraft:diamond_sword",
+            json!(["minecraft:sharpness", "minecraft:unbreaking"]),
+            true,
+        ),
+        random("minecraft:stone", json!(["minecraft:sharpness"]), false),
+        random("minecraft:stone", json!(["minecraft:sharpness"]), true),
+        random(
+            "minecraft:enchanted_book",
+            json!(["minecraft:sharpness"]),
+            false,
+        ),
+        json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_sword","modifier":[
+            {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"]},
+            {"type":"minecraft:enchant_randomly","options":["minecraft:unbreaking"]},
+            {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"]}
+        ]}]}]}),
+        json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:book","modifier":[
+            {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"]},
+            {"type":"minecraft:enchant_randomly","options":["minecraft:unbreaking"],"only_compatible":false}
+        ]}]}]}),
+        json!({"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond_sword","modifier":
+            {"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"],"include_additional_cost_component":true}
+        }]}]}),
+    ];
+    std::fs::write(&input, serde_json::to_vec(&fixtures).unwrap()).unwrap();
     let oracle = run(Command::new(java.join("java.exe"))
         .arg("-classpath")
         .arg(&cp)
         .arg("ChestLootOracle")
         .arg(&input)
         .arg("enchant"));
-    let table = ChestLootTable::load(
-        &mut resources,
-        &ResourceId::parse("minecraft:chests/simple_dungeon").unwrap(),
-    )
-    .unwrap();
+    let mut tables = vec![
+        ChestLootTable::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:chests/simple_dungeon").unwrap(),
+        )
+        .unwrap(),
+    ];
+    for fixture in fixtures.iter().skip(1) {
+        let mut table = ChestLootTable::decode(fixture).unwrap();
+        table.resolve_random_enchantments(&mut resources).unwrap();
+        tables.push(table);
+    }
     let max = |item: &ChestLootItem| -> anyhow::Result<u32> {
         let max = match item.id.path.as_str() {
             "enchanted_book"
+            | "diamond_sword"
             | "music_disc_otherside"
             | "music_disc_13"
             | "music_disc_cat"
@@ -78,6 +121,7 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
             | "iron_horse_armor"
             | "diamond_horse_armor" => 1,
             "book"
+            | "stone"
             | "leather"
             | "golden_apple"
             | "enchanted_golden_apple"
@@ -109,6 +153,8 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
     while let Some(header) = lines.next() {
         let fields: Vec<_> = header.split_whitespace().collect();
         assert_eq!(fields[0], "S");
+        let index: usize = fields[1].parse().unwrap();
+        let table = &tables[index];
         let luck: f32 = fields[2].parse().unwrap();
         let mode: u8 = fields[3].parse().unwrap();
         let seed: i64 = fields[4].parse().unwrap();
@@ -141,14 +187,23 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
             .enumerate()
             .filter_map(|(slot, item)| {
                 item.map(|item| {
-                    let enchantment = item.enchantments.first();
-                    if enchantment.is_some() {
+                    if !item.enchantments.is_empty() {
                         enchanted += 1;
                     }
-                    let id = enchantment
-                        .map(|value| format!("{}:{}", value.id.namespace, value.id.path))
-                        .unwrap_or_else(|| "-".into());
-                    let level = enchantment.map_or(0, |value| value.level);
+                    let mut entries: Vec<_> = item
+                        .enchantments
+                        .iter()
+                        .map(|value| {
+                            format!("{}:{}={}", value.id.namespace, value.id.path, value.level)
+                        })
+                        .collect();
+                    entries.sort();
+                    let id = if entries.is_empty() {
+                        "-".into()
+                    } else {
+                        entries.join(",")
+                    };
+                    let level = item.enchantments.len();
                     format!(
                         "P {slot} {}:{} {} {id} {level}",
                         item.id.namespace, item.id.path, item.count
@@ -160,11 +215,11 @@ fn dungeon_loot_matches_java_including_enchanted_books() {
         assert_eq!(next, expected_next, "{header}");
         cases += 1;
     }
-    assert_eq!(cases, 32);
+    assert_eq!(cases, fixtures.len() * 32);
     assert!(enchanted > 0, "the oracle did not exercise enchanted books");
     let mut unsupported = ChestLootTable::decode(&json!({
         "type":"minecraft:chest", "pools":[{"rolls":1,"entries":[{
-            "type":"minecraft:item", "name":"minecraft:diamond_sword",
+            "type":"minecraft:item", "name":"example:unknown",
             "modifier":{"type":"minecraft:enchant_randomly","options":["minecraft:sharpness"]}
         }]}]
     }))

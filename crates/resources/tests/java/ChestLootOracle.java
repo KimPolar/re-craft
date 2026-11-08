@@ -23,22 +23,22 @@ import net.minecraft.world.level.levelgen.*;
 import net.minecraft.world.level.storage.loot.*;
 
 public class ChestLootOracle {
- static Set<String> enchantmentTag(String name,Set<String> visiting)throws Exception{
+ static Set<String> readTag(String kind,String name,Set<String> visiting)throws Exception{
   if(!visiting.add(name))throw new IllegalStateException("cyclic tag");
-  var id=Identifier.parse(name);String path="data/"+id.getNamespace()+"/tags/enchantment/"+id.getPath()+".json";
+  var id=Identifier.parse(name);String path="data/"+id.getNamespace()+"/tags/"+kind+"/"+id.getPath()+".json";
   var result=new LinkedHashSet<String>();
   try(var stream=ChestLootOracle.class.getClassLoader().getResourceAsStream(path)){
    if(stream==null)throw new IllegalStateException("missing tag "+path);
    var values=JsonParser.parseString(new String(stream.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject().getAsJsonArray("values");
    for(var value:values){String entry=value.isJsonObject()?value.getAsJsonObject().get("id").getAsString():value.getAsString();
-    if(entry.startsWith("#"))result.addAll(enchantmentTag(entry.substring(1),visiting));else result.add(Identifier.parse(entry).toString());}
+    if(entry.startsWith("#"))result.addAll(readTag(kind,entry.substring(1),visiting));else result.add(Identifier.parse(entry).toString());}
   }visiting.remove(name);return result;
  }
  static void expandEnchantmentOptions(com.google.gson.JsonElement value)throws Exception{
   if(value.isJsonArray()){for(var child:value.getAsJsonArray())expandEnchantmentOptions(child);return;}
   if(!value.isJsonObject())return;var object=value.getAsJsonObject();
   if(object.has("type")&&object.get("type").getAsString().equals("minecraft:enchant_randomly")&&object.has("options")&&object.get("options").isJsonPrimitive()&&object.get("options").getAsString().startsWith("#")){
-   var list=new com.google.gson.JsonArray();for(var id:enchantmentTag(object.get("options").getAsString().substring(1),new HashSet<>()))list.add(id);object.add("options",list);
+   var list=new com.google.gson.JsonArray();for(var id:readTag("enchantment",object.get("options").getAsString().substring(1),new HashSet<>()))list.add(id);object.add("options",list);
   }
   for(var child:object.entrySet())expandEnchantmentOptions(child.getValue());
  }
@@ -47,7 +47,15 @@ public class ChestLootOracle {
   var lookup=VanillaRegistries.createWorldLookup();var registries=VanillaRegistries.createReloadableLookup(lookup);
   for(var pending:BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(registries))pending.apply();
   var json=JsonParser.parseString(Files.readString(Path.of(args[0])));var ops=RegistryOps.create(JsonOps.INSTANCE,registries);var nbtops=RegistryOps.create(NbtOps.INSTANCE,registries);
-  if(args.length>1&&args[1].equals("enchant"))expandEnchantmentOptions(json);
+  if(args.length>1&&args[1].equals("enchant")){
+   expandEnchantmentOptions(json);
+   var holders=lookup.lookupOrThrow(Registries.ENCHANTMENT).listElements().toList();
+   var tags=holders.stream().map(h->h.value().definition().supportedItems().unwrapKey()).flatMap(Optional::stream).distinct().toList();
+   var membership=new HashMap<String,List<net.minecraft.tags.TagKey<net.minecraft.world.item.Item>>>();
+   for(var tag:tags)for(var id:readTag("item",tag.location().toString(),new HashSet<>()))membership.computeIfAbsent(id,k->new ArrayList<>()).add(tag);
+   var bind=net.minecraft.core.Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class);bind.setAccessible(true);
+   for(var item:BuiltInRegistries.ITEM){var id=BuiltInRegistries.ITEM.getKey(item).toString();bind.invoke(item.builtInRegistryHolder(),membership.getOrDefault(id,List.of()));}
+  }
   var ctor=LootContext.class.getDeclaredConstructors()[0];ctor.setAccessible(true);
   var slots=LootTable.class.getDeclaredMethod("getAvailableSlots",net.minecraft.world.Container.class,RandomSource.class);slots.setAccessible(true);
   var split=LootTable.class.getDeclaredMethod("shuffleAndSplitItems",ObjectArrayList.class,int.class,RandomSource.class);split.setAccessible(true);
@@ -80,9 +88,9 @@ public class ChestLootOracle {
        if(stack.getDamageValue()>0&&!encoded.contains(component+stack.getDamageValue()))throw new AssertionError(encoded);
       }
       else if(args.length>1&&args[1].equals("enchant")){
-       var enchantments=stack.get(DataComponents.STORED_ENCHANTMENTS);String id="-";int level=0;
-       if(enchantments!=null&&!enchantments.isEmpty()){if(enchantments.size()!=1)throw new AssertionError();var e=enchantments.entrySet().iterator().next();id=e.getKey().unwrapKey().orElseThrow().identifier().toString();level=e.getIntValue();}
-       if(!id.equals("-")){String encoded=ItemStack.CODEC.encodeStart(nbtops,stack).getOrThrow().toString();if(!encoded.contains("minecraft:stored_enchantments")||!encoded.contains(id))throw new AssertionError(encoded);}
+       boolean book=stack.is(Items.ENCHANTED_BOOK);var enchantments=stack.get(book?DataComponents.STORED_ENCHANTMENTS:DataComponents.ENCHANTMENTS);String id="-";int level=0;
+       if(enchantments!=null&&!enchantments.isEmpty()){var values=new ArrayList<String>();for(var e:enchantments.entrySet())values.add(e.getKey().unwrapKey().orElseThrow().identifier().toString()+"="+e.getIntValue());Collections.sort(values);id=String.join(",",values);level=enchantments.size();}
+       if(!id.equals("-")){String encoded=ItemStack.CODEC.encodeStart(nbtops,stack).getOrThrow().toString();if(!encoded.contains(book?"minecraft:stored_enchantments":"minecraft:enchantments"))throw new AssertionError(encoded);}
        out.printf("P %d %s %d %s %d%n",slot,BuiltInRegistries.ITEM.getKey(stack.getItem()),stack.getCount(),id,level);
       }
       else if(args.length>1&&args[1].equals("potion")){

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 57] = [
+const BASIC_BLOCKS: [&str; 61] = [
     "grass_block",
     "dirt",
     "sand",
@@ -25,6 +25,10 @@ const BASIC_BLOCKS: [&str; 57] = [
     "mycelium",
     "dirt_path",
     "farmland",
+    "wheat",
+    "carrots",
+    "potatoes",
+    "beetroots",
     "redstone_block",
     "lodestone",
     "redstone_lamp",
@@ -317,6 +321,7 @@ enum ModifierKind {
     UniformCount(i32, i32, bool),
     OreDrops(ResourceId),
     UniformBonus(ResourceId, i32),
+    BinomialBonus(ResourceId, i32, f32),
     ExplosionDecay,
     CopyBlockEntityCustomName,
     CopyBlockEntityComponents(ComponentFilter),
@@ -409,6 +414,29 @@ impl Modifier {
                     .next_int(bound)
                     .context("loot random source does not support bounded integers")?;
                 drop.count = drop.count.saturating_add(bonus as u32);
+            }
+            ModifierKind::BinomialBonus(enchantment, extra, probability) => {
+                let level = tool
+                    .enchantments
+                    .iter()
+                    .find(|(id, _)| id == enchantment)
+                    .map_or(0, |(_, level)| *level);
+                let rounds = i32::try_from(level)?
+                    .checked_add(*extra)
+                    .context("binomial bonus level overflow")?;
+                if rounds > 0 {
+                    let random = random
+                        .as_mut()
+                        .context("random loot requires a random source")?;
+                    for _ in 0..rounds {
+                        if random.next_float() < *probability {
+                            drop.count = drop
+                                .count
+                                .checked_add(1)
+                                .context("binomial loot count overflow")?;
+                        }
+                    }
+                }
             }
             // Normal player mining does not have an explosion radius.
             ModifierKind::ExplosionDecay => {}
@@ -655,6 +683,17 @@ impl BlockLootTables {
                         .and_then(|level| multiplier.checked_mul(level))
                         .and_then(|value| value.checked_add(1))
                         .is_some_and(|bound| bound > 0)
+                }
+                ModifierKind::BinomialBonus(enchantment, extra, _) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|level| level.checked_add(*extra))
+                        .is_some()
                 }
                 ModifierKind::OreDrops(enchantment) => {
                     let level = tool
@@ -938,6 +977,17 @@ impl BlockLootTables {
                         .and_then(|v| multiplier.checked_mul(v))
                         .and_then(|v| v.checked_add(1))
                         .is_some_and(|v| v > 0)
+                }
+                ModifierKind::BinomialBonus(enchantment, extra, _) => {
+                    let level = tool
+                        .enchantments
+                        .iter()
+                        .find(|(id, _)| id == enchantment)
+                        .map_or(0, |(_, level)| *level);
+                    i32::try_from(level)
+                        .ok()
+                        .and_then(|level| level.checked_add(*extra))
+                        .is_some()
                 }
                 ModifierKind::OreDrops(enchantment) => {
                     let level = tool
@@ -1390,6 +1440,25 @@ fn parse_modifiers(
                                 .context("missing bonus multiplier")?;
                             ModifierKind::UniformBonus(id, i32::try_from(multiplier)?)
                         }
+                        Some("minecraft:binomial_with_bonus_count") => {
+                            let parameters = modifier
+                                .get("parameters")
+                                .context("missing binomial bonus parameters")?;
+                            let extra = parameters
+                                .get("extra")
+                                .and_then(Value::as_i64)
+                                .context("missing binomial bonus rounds")?;
+                            let probability = parameters
+                                .get("probability")
+                                .and_then(Value::as_f64)
+                                .context("missing binomial bonus probability")?
+                                as f32;
+                            ensure!(
+                                probability.is_finite(),
+                                "invalid binomial bonus probability"
+                            );
+                            ModifierKind::BinomialBonus(id, i32::try_from(extra)?, probability)
+                        }
                         _ => ModifierKind::Unsupported("unsupported apply_bonus formula".into()),
                     }
                 }
@@ -1792,6 +1861,30 @@ mod tests {
     }
 
     #[test]
+    fn binomial_bonus_uses_extra_and_fortune_draws() {
+        let mut source = Memory::default();
+        source.put("data/minecraft/loot_table/blocks/wheat.json", r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds","modifier":{"type":"minecraft:apply_bonus","enchantment":"minecraft:fortune","formula":"minecraft:binomial_with_bonus_count","parameters":{"extra":3,"probability":0.5}}}]}]}"#);
+        let tables = BlockLootTables::load(&mut source).unwrap();
+        let enchantments = [(ResourceId::parse("minecraft:fortune").unwrap(), 2)];
+        let tool = BasicTool {
+            item: Some("minecraft:diamond_hoe"),
+            count: 1,
+            enchantments: &enchantments,
+        };
+        assert!(tables.fully_supported_player_block_for_tool("minecraft:wheat", tool));
+        let mut values = [0.0, 0.5, 0.1, 0.8, 0.499].into_iter();
+        let drops = tables
+            .drops_with_random(
+                "minecraft:wheat",
+                tool,
+                Some(&mut || values.next().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(drops[0].count, 4);
+        assert!(values.next().is_none());
+    }
+
+    #[test]
     fn random_chance_uses_one_float_even_at_extreme_probabilities() {
         for (chance, draw, expected) in [
             (-1.0, 0.0, false),
@@ -1883,7 +1976,7 @@ mod tests {
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn weighted_block_loot_matches_java_26_3() {
         use std::{path::PathBuf, process::Command};
-        const TABLES: [&str; 7] = [
+        const TABLES: [&str; 8] = [
             r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:set_count","count":{"type":"minecraft:uniform","min":1,"max":3}}},{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":0.5}},{"type":"minecraft:empty","weight":2}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:alternatives","children":[{"type":"minecraft:item","name":"minecraft:stone","weight":4,"condition":{"type":"minecraft:random_chance","chance":0.3}},{"type":"minecraft:item","name":"minecraft:stick","weight":2}]},{"type":"minecraft:item","name":"minecraft:diamond","weight":3},{"type":"minecraft:empty","weight":2}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":5,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":0},{"type":"minecraft:item","name":"minecraft:stick"}]}]}"#,
@@ -1891,6 +1984,7 @@ mod tests {
             r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":16777217,"quality":2147483647},{"type":"minecraft:item","name":"minecraft:stick","weight":16777219,"quality":-2147483648}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":-17,"quality":13},{"type":"minecraft:item","name":"minecraft:stick","weight":2,"quality":-11}]}]}"#,
             r#"{"type":"minecraft:block","pools":[{"rolls":3,"entries":[{"type":"minecraft:item","name":"minecraft:stone","weight":2147483647,"quality":1},{"type":"minecraft:item","name":"minecraft:stick","weight":0,"quality":-1}]}]}"#,
+            r#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stone","modifier":{"type":"minecraft:apply_bonus","enchantment":"minecraft:fortune","formula":"minecraft:binomial_with_bonus_count","parameters":{"extra":3,"probability":0.5714286}}}]}]}"#,
         ];
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)

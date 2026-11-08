@@ -627,6 +627,13 @@ fn java_reads_generated_region_batch_in_existing_world() {
     entities.add(first, &entity, 10).unwrap();
     pois.add(first, &poi, 10).unwrap();
     let mut plan = WorldSavePlan::new();
+    plan.add_generation_dependency(
+        DimensionId::parse("overworld").unwrap(),
+        FreshRegionKind::Terrain,
+        ChunkPos { x: 1, z: 0 },
+        Some(&original),
+    )
+    .unwrap();
     plan.add_generated_regions(
         DimensionId::parse("overworld").unwrap(),
         [terrain_a, terrain_b, entities, pois],

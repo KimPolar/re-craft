@@ -359,6 +359,10 @@ fn valid_poi_directory(value: &str) -> bool {
     valid_created_poi_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
 }
 
+fn valid_terrain_directory(value: &str) -> bool {
+    valid_created_terrain_region(&format!("{value}{}r.0.0.mca", std::path::MAIN_SEPARATOR))
+}
+
 fn valid_created_target(value: &str, version: u32) -> bool {
     valid_created_entity_region(value)
         || (version >= 4 && valid_created_poi_region(value))
@@ -434,14 +438,16 @@ fn valid_created_weather(value: &str) -> bool {
 }
 
 fn valid_absent_directory(value: &str, version: u32) -> bool {
-    valid_entity_directory(value) || (version >= 4 && valid_poi_directory(value))
+    valid_entity_directory(value)
+        || (version >= 4 && valid_poi_directory(value))
+        || (version >= 13 && valid_terrain_directory(value))
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
         matches!(
             manifest.version,
-            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12
+            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13
         ),
         "unsupported transaction version"
     );
@@ -717,7 +723,9 @@ fn prepare_with_deletions(
             Dependency::Absent { target } => {
                 let target = relative(root, target)?;
                 ensure!(
-                    valid_created_target(&target, 4),
+                    valid_created_entity_region(&target)
+                        || valid_created_poi_region(&target)
+                        || valid_created_terrain_region(&target),
                     "invalid absent region path"
                 );
                 ensure!(
@@ -729,7 +737,7 @@ fn prepare_with_deletions(
             Dependency::AbsentDirectory { target } => {
                 let target_relative = relative(root, target)?;
                 ensure!(
-                    valid_absent_directory(&target_relative, 4),
+                    valid_absent_directory(&target_relative, 13),
                     "invalid absent region directory path"
                 );
                 ensure!(
@@ -755,67 +763,76 @@ fn prepare_with_deletions(
             original,
         });
     }
-    let manifest =
-        Manifest {
-            version: if records.iter().any(|record| {
+    let manifest = Manifest {
+        version: if absent_directories
+            .iter()
+            .any(|target| valid_terrain_directory(target))
+        {
+            13
+        } else if absent_dependencies
+            .iter()
+            .any(|target| valid_created_terrain_region(target))
+            || records.iter().any(|record| {
                 record.original.is_none() && valid_created_terrain_region(&record.target)
-            }) {
-                12
-            } else if records.iter().any(|record| {
-                record.original.is_none() && valid_created_world_clocks(&record.target)
-            }) {
-                11
-            } else if records
+            })
+        {
+            12
+        } else if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_world_clocks(&record.target))
+        {
+            11
+        } else if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_player(&record.target))
+        {
+            10
+        } else if !deleted_records.is_empty() {
+            9
+        } else if records.iter().any(|record| {
+            record.original.is_none() && external_chunk_region(&record.target).is_some()
+        }) {
+            8
+        } else if records.iter().any(|record| {
+            record.original.is_none() && valid_created_random_sequences(&record.target)
+        }) {
+            7
+        } else if records
+            .iter()
+            .any(|record| record.original.is_none() && record.target == "level.dat_old")
+        {
+            6
+        } else if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_weather(&record.target))
+        {
+            5
+        } else if records
+            .iter()
+            .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
+            || absent_dependencies
                 .iter()
-                .any(|record| record.original.is_none() && valid_created_player(&record.target))
-            {
-                10
-            } else if !deleted_records.is_empty() {
-                9
-            } else if records.iter().any(|record| {
-                record.original.is_none() && external_chunk_region(&record.target).is_some()
-            }) {
-                8
-            } else if records.iter().any(|record| {
-                record.original.is_none() && valid_created_random_sequences(&record.target)
-            }) {
-                7
-            } else if records
+                .any(|target| valid_created_poi_region(target))
+            || absent_directories
                 .iter()
-                .any(|record| record.original.is_none() && record.target == "level.dat_old")
-            {
-                6
-            } else if records
-                .iter()
-                .any(|record| record.original.is_none() && valid_created_weather(&record.target))
-            {
-                5
-            } else if records
-                .iter()
-                .any(|record| record.original.is_none() && valid_created_poi_region(&record.target))
-                || absent_dependencies
-                    .iter()
-                    .any(|target| valid_created_poi_region(target))
-                || absent_directories
-                    .iter()
-                    .any(|target| valid_poi_directory(target))
-            {
-                4
-            } else if !absent_directories.is_empty() {
-                3
-            } else if !absent_dependencies.is_empty()
-                || records.iter().any(|record| record.original.is_none())
-            {
-                2
-            } else {
-                1
-            },
-            files: records,
-            dependencies: dependency_records,
-            absent_dependencies,
-            absent_directories,
-            deletions: deleted_records,
-        };
+                .any(|target| valid_poi_directory(target))
+        {
+            4
+        } else if !absent_directories.is_empty() {
+            3
+        } else if !absent_dependencies.is_empty()
+            || records.iter().any(|record| record.original.is_none())
+        {
+            2
+        } else {
+            1
+        },
+        files: records,
+        dependencies: dependency_records,
+        absent_dependencies,
+        absent_directories,
+        deletions: deleted_records,
+    };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(
@@ -2017,6 +2034,38 @@ mod tests {
         });
         let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
         assert_eq!(prepared.manifest.version, 4);
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        drop(prepared);
+        fs::create_dir(&missing).unwrap();
+        assert!(recover(&root).is_err());
+        fs::remove_dir(&missing).unwrap();
+        assert!(recover(&root).unwrap());
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
+    }
+
+    #[test]
+    fn absent_terrain_directory_is_versioned_and_checked_during_recovery() {
+        let path = "dimensions/minecraft/the_nether/region";
+        assert!(!valid_absent_directory(path, 12));
+        assert!(valid_absent_directory(path, 13));
+        assert!(!valid_absent_directory(
+            "dimensions/minecraft/../region",
+            13
+        ));
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        fs::create_dir_all(root.join("dimensions/minecraft/the_nether")).unwrap();
+        let missing = root.join(path);
+        let (files, mut dependencies) = replacements(&root);
+        dependencies.push(Dependency::AbsentDirectory {
+            target: missing.clone(),
+        });
+        let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
+        assert_eq!(prepared.manifest.version, 13);
         replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
         drop(prepared);
         fs::create_dir(&missing).unwrap();

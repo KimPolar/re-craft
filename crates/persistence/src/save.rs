@@ -998,6 +998,7 @@ pub struct WorldSavePlan {
     generated_chunks: Vec<PlannedGeneratedChunk>,
     entity_chunks: Vec<PlannedEntityChunk>,
     poi_chunks: Vec<PlannedEntityChunk>,
+    generation_dependencies: Vec<PlannedGenerationDependency>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedSharedData>,
     weather: Option<PlannedSharedData>,
@@ -1026,6 +1027,13 @@ struct PlannedEntityChunk {
     region_timestamp_seconds: u32,
 }
 
+struct PlannedGenerationDependency {
+    dimension: DimensionId,
+    kind: RegionKind,
+    position: crate::world::ChunkPos,
+    source_nbt: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum RegionKind {
     Blocks,
@@ -1038,6 +1046,7 @@ struct RegionChange {
     source_nbt: Option<Vec<u8>>,
     replacement: Option<Vec<u8>>,
     timestamp: u32,
+    check_only: bool,
 }
 
 struct PlannedPlayerData {
@@ -1087,6 +1096,56 @@ impl WorldSavePlan {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len() + self.generated_chunks.len()
+    }
+
+    /// Require an observed region entry to remain unchanged until commit.
+    /// `None` means the entry was absent. Callers must capture every terrain,
+    /// entity and POI input that generation actually observed, and separately
+    /// protect unsaved in-memory edits and other world-generation inputs.
+    pub fn add_generation_dependency(
+        &mut self,
+        dimension: DimensionId,
+        kind: FreshRegionKind,
+        position: crate::world::ChunkPos,
+        source: Option<&nbt::NamedTag>,
+    ) -> Result<()> {
+        let kind = match kind {
+            FreshRegionKind::Terrain => RegionKind::Blocks,
+            FreshRegionKind::Entities => RegionKind::Entities,
+            FreshRegionKind::Poi => RegionKind::Poi,
+        };
+        ensure!(
+            !self.generation_dependencies.iter().any(|entry| {
+                entry.dimension == dimension && entry.kind == kind && entry.position == position
+            }),
+            "duplicate generation dependency"
+        );
+        if let Some(document) = source {
+            match kind {
+                RegionKind::Blocks => validate_chunk(&document.value, position.x, position.z)?,
+                RegionKind::Entities => {
+                    validate_entity_document(document, position)?;
+                }
+                RegionKind::Poi => {
+                    crate::world::decode_poi_chunk(document.clone(), position)?;
+                }
+            }
+        }
+        let source_nbt = source.map(nbt::write).transpose()?;
+        ensure!(
+            source_nbt
+                .as_ref()
+                .is_none_or(|bytes| bytes.len() <= nbt::MAX_NBT_BYTES),
+            "generation dependency exceeds NBT limit"
+        );
+        self.generation_dependencies
+            .push(PlannedGenerationDependency {
+                dimension,
+                kind,
+                position,
+                source_nbt,
+            });
+        Ok(())
     }
 
     /// Stage a newly generated FULL chunk and its complete entity and POI
@@ -2038,6 +2097,7 @@ impl WorldWriteGuard {
                     source_nbt: Some(chunk.draft.source_nbt().to_vec()),
                     replacement: Some(replacement),
                     timestamp: chunk.region_timestamp_seconds,
+                    check_only: false,
                 });
         }
         for chunk in &plan.generated_chunks {
@@ -2055,6 +2115,7 @@ impl WorldWriteGuard {
                     source_nbt: None,
                     replacement: Some(chunk.document.clone()),
                     timestamp: chunk.region_timestamp_seconds,
+                    check_only: false,
                 });
         }
         for chunk in &plan.entity_chunks {
@@ -2072,6 +2133,7 @@ impl WorldWriteGuard {
                     source_nbt: chunk.source_nbt.clone(),
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
+                    check_only: false,
                 });
         }
         for chunk in &plan.poi_chunks {
@@ -2089,7 +2151,33 @@ impl WorldWriteGuard {
                     source_nbt: chunk.source_nbt.clone(),
                     replacement: chunk.replacement.clone(),
                     timestamp: chunk.region_timestamp_seconds,
+                    check_only: false,
                 });
+        }
+        for observed in &plan.generation_dependencies {
+            let position = observed.position;
+            let group = groups
+                .entry((
+                    observed.kind,
+                    observed.dimension.clone(),
+                    position.x.div_euclid(REGION_SIDE),
+                    position.z.div_euclid(REGION_SIDE),
+                ))
+                .or_default();
+            if let Some(change) = group.iter().find(|change| change.position == position) {
+                ensure!(
+                    change.source_nbt == observed.source_nbt,
+                    "generation dependency conflicts with a planned chunk change"
+                );
+            } else {
+                group.push(RegionChange {
+                    position,
+                    source_nbt: observed.source_nbt.clone(),
+                    replacement: None,
+                    timestamp: 0,
+                    check_only: true,
+                });
+            }
         }
 
         let backup_root = self.root.join(".minecraft-native-backups");
@@ -2263,6 +2351,7 @@ impl WorldWriteGuard {
                 });
                 continue;
             }
+            let read_only = chunks.iter().all(|chunk| chunk.check_only);
             let target = existing.clone().unwrap_or_else(|| region_path.clone());
 
             let mut stage = tempfile::Builder::new()
@@ -2325,6 +2414,9 @@ impl WorldWriteGuard {
                         }
                     }
                 }
+                if planned.check_only {
+                    continue;
+                }
                 let mut external_replacement = false;
                 if let Some(replacement) = &planned.replacement {
                     let draft = nbt::read(replacement).context("invalid chunk draft NBT")?;
@@ -2386,6 +2478,16 @@ impl WorldWriteGuard {
                     )?;
                 }
                 expected_chunks.push((position, planned.replacement, external_replacement));
+            }
+            if read_only {
+                let backup_path = group_backup.join(&name);
+                let expected = original_hash.context("generation dependency region is missing")?;
+                ensure!(
+                    hash_file(&backup_path)? == expected,
+                    "generation dependency region changed during staging"
+                );
+                dependencies.insert(target, backup_path);
+                continue;
             }
             stage.as_file_mut().flush()?;
             stage.as_file().sync_all()?;
@@ -7637,6 +7739,274 @@ mod tests {
         );
         assert!(reader.read_entity_chunk(32, 0).unwrap().is_none());
         assert!(reader.read_poi_chunk(32, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn generation_dependencies_preserve_existing_neighbors_and_reject_stale_inputs() {
+        let world = test_world();
+        let (region, original, external) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let generated = ChunkPos { x: 32, z: 0 };
+        let source = chunk(1, "neighbor");
+        let make_plan = || {
+            let mut plan = WorldSavePlan::new();
+            plan.add_generation_dependency(
+                dimension.clone(),
+                FreshRegionKind::Terrain,
+                neighbor,
+                Some(&source),
+            )
+            .unwrap();
+            plan.add_generation_dependency(
+                dimension.clone(),
+                FreshRegionKind::Entities,
+                neighbor,
+                None,
+            )
+            .unwrap();
+            plan.add_generation_dependency(dimension.clone(), FreshRegionKind::Poi, neighbor, None)
+                .unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                generated,
+                &editable_chunk(32),
+                None,
+                None,
+                5,
+            )
+            .unwrap();
+            plan
+        };
+        let stale = make_plan();
+        let mut changed = original.clone();
+        store_record(&mut changed, 1, 3, &chunk(1, "changed"), 77);
+        fs::write(&region, &changed).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(stale, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region).unwrap(), changed);
+        assert!(!region.parent().unwrap().join("r.1.0.mca").exists());
+        fs::write(&region, &original).unwrap();
+        let result = guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
+        assert_eq!(result.region_paths.len(), 1);
+        assert_eq!(fs::read(&region).unwrap(), original);
+        assert_eq!(
+            fs::read(region.parent().unwrap().join("c.2.0.mcc")).unwrap(),
+            external
+        );
+        let mut reader = crate::world::WorldReader::open(world.path(), dimension).unwrap();
+        assert_eq!(*reader.read_chunk(1, 0).unwrap().unwrap().document, source);
+        assert_eq!(
+            *reader.read_chunk(32, 0).unwrap().unwrap().document,
+            editable_chunk(32)
+        );
+    }
+
+    #[test]
+    fn generation_dependencies_work_in_modified_and_missing_regions() {
+        let world = test_world();
+        let (region, _, _) = fixture(world.path());
+        let overworld = DimensionId::parse("overworld").unwrap();
+        let nether = DimensionId::parse("the_nether").unwrap();
+        fs::create_dir_all(world.path().join("dimensions/minecraft/the_nether")).unwrap();
+        let source = chunk(1, "neighbor");
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_dependency(
+            overworld.clone(),
+            FreshRegionKind::Terrain,
+            ChunkPos { x: 1, z: 0 },
+            Some(&source),
+        )
+        .unwrap();
+        plan.add_generation_dependency(
+            nether,
+            FreshRegionKind::Terrain,
+            ChunkPos { x: 0, z: 0 },
+            None,
+        )
+        .unwrap();
+        plan.add_generation_dependency(
+            overworld.clone(),
+            FreshRegionKind::Terrain,
+            ChunkPos { x: 96, z: 0 },
+            None,
+        )
+        .unwrap();
+        plan.add_generated_chunk(
+            overworld.clone(),
+            ChunkPos { x: 3, z: 0 },
+            &editable_chunk(3),
+            None,
+            None,
+            8,
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        guard.write_plan(plan, |_, _| Ok(())).unwrap();
+        assert!(
+            !world
+                .path()
+                .join("dimensions/minecraft/the_nether/region")
+                .exists()
+        );
+        assert!(!region.parent().unwrap().join("r.3.0.mca").exists());
+        let mut reader = crate::world::WorldReader::open(world.path(), overworld).unwrap();
+        assert_eq!(*reader.read_chunk(1, 0).unwrap().unwrap().document, source);
+        assert!(reader.read_chunk(3, 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn generation_dependency_conflicting_with_a_planned_change_is_rejected() {
+        let world = test_world();
+        let (region, original, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_dependency(
+            dimension.clone(),
+            FreshRegionKind::Terrain,
+            ChunkPos { x: 3, z: 0 },
+            Some(&chunk(3, "other")),
+        )
+        .unwrap();
+        plan.add_generated_chunk(
+            dimension,
+            ChunkPos { x: 3, z: 0 },
+            &editable_chunk(3),
+            None,
+            None,
+            8,
+        )
+        .unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(region).unwrap(), original);
+    }
+
+    #[test]
+    fn generation_dependency_rejects_a_previously_absent_chunk() {
+        let world = test_world();
+        let (region, original, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_dependency(
+            dimension.clone(),
+            FreshRegionKind::Terrain,
+            ChunkPos { x: 96, z: 0 },
+            None,
+        )
+        .unwrap();
+        plan.add_generated_chunk(
+            dimension,
+            ChunkPos { x: 3, z: 0 },
+            &editable_chunk(3),
+            None,
+            None,
+            8,
+        )
+        .unwrap();
+        let mut appeared = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut appeared, 0, 2, &chunk(96, "new"), 7);
+        let new_region = region.parent().unwrap().join("r.3.0.mca");
+        fs::write(&new_region, &appeared).unwrap();
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        assert!(guard.write_plan(plan, |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(region).unwrap(), original);
+        assert_eq!(fs::read(new_region).unwrap(), appeared);
+    }
+
+    #[test]
+    fn generation_dependencies_detect_changed_entity_and_poi_sources() {
+        let world = test_world();
+        let (terrain, original, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let position = ChunkPos { x: 1, z: 0 };
+        let entities_dir = world.path().join("dimensions/minecraft/overworld/entities");
+        let poi_dir = world.path().join("dimensions/minecraft/overworld/poi");
+        fs::create_dir(&entities_dir).unwrap();
+        fs::create_dir(&poi_dir).unwrap();
+        let entity = entity_chunk(1, vec![]);
+        let mut poi = poi_document();
+        let Tag::Compound(record) = &mut poi_records_mut(&mut poi)[0] else {
+            panic!()
+        };
+        record
+            .iter_mut()
+            .find(|(name, _)| name.matches("pos"))
+            .unwrap()
+            .1 = Tag::IntArray(vec![16, 0, 0]);
+        let mut entity_region = vec![0; 3 * SECTOR_SIZE as usize];
+        let mut poi_region = vec![0; 3 * SECTOR_SIZE as usize];
+        store_record(&mut entity_region, 1, 2, &entity, 1);
+        store_record(&mut poi_region, 1, 2, &poi, 1);
+        let entity_path = entities_dir.join("r.0.0.mca");
+        let poi_path = poi_dir.join("r.0.0.mca");
+        fs::write(&entity_path, &entity_region).unwrap();
+        fs::write(&poi_path, &poi_region).unwrap();
+        let make_plan = || {
+            let mut plan = WorldSavePlan::new();
+            plan.add_generation_dependency(
+                dimension.clone(),
+                FreshRegionKind::Entities,
+                position,
+                Some(&entity),
+            )
+            .unwrap();
+            plan.add_generation_dependency(
+                dimension.clone(),
+                FreshRegionKind::Poi,
+                position,
+                Some(&poi),
+            )
+            .unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 32, z: 0 },
+                &editable_chunk(32),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            plan
+        };
+        let mut guard = WorldWriteGuard::acquire(world.path()).unwrap();
+        let mut changed_entity = entity_region.clone();
+        store_record(
+            &mut changed_entity,
+            1,
+            2,
+            &entity_chunk(
+                1,
+                vec![Tag::Compound(vec![(
+                    "id".into(),
+                    Tag::String("minecraft:pig".into()),
+                )])],
+            ),
+            2,
+        );
+        fs::write(&entity_path, &changed_entity).unwrap();
+        assert!(guard.write_plan(make_plan(), |_, _| Ok(())).is_err());
+        assert!(!terrain.parent().unwrap().join("r.1.0.mca").exists());
+        fs::write(&entity_path, &entity_region).unwrap();
+        let mut changed_poi_doc = poi.clone();
+        let Tag::Compound(record) = &mut poi_records_mut(&mut changed_poi_doc)[0] else {
+            panic!()
+        };
+        record
+            .iter_mut()
+            .find(|(name, _)| name.matches("free_tickets"))
+            .unwrap()
+            .1 = Tag::Int(0);
+        let mut changed_poi = poi_region.clone();
+        store_record(&mut changed_poi, 1, 2, &changed_poi_doc, 2);
+        fs::write(&poi_path, &changed_poi).unwrap();
+        assert!(guard.write_plan(make_plan(), |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&terrain).unwrap(), original);
+        assert!(!terrain.parent().unwrap().join("r.1.0.mca").exists());
+        fs::write(&poi_path, &poi_region).unwrap();
+        guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(entity_path).unwrap(), entity_region);
+        assert_eq!(fs::read(poi_path).unwrap(), poi_region);
     }
 
     #[test]

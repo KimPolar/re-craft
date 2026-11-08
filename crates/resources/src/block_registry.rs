@@ -36,6 +36,8 @@ enum StateSchema {
     Axis,
     DoublePlant,
     BerryBush,
+    Age7,
+    Farmland,
     Age15,
     Age25,
     Sapling,
@@ -257,7 +259,8 @@ impl StateSchema {
             Self::HangingRoots => ("waterlogged", "false"),
             Self::DoublePlant => ("half", "lower"),
             Self::BerryBush => ("age", "0"),
-            Self::Age15 | Self::Age25 => ("age", "0"),
+            Self::Age7 | Self::Age15 | Self::Age25 => ("age", "0"),
+            Self::Farmland => ("moisture", "0"),
             Self::Sapling => ("stage", "0"),
         };
         BTreeMap::from([(value.0.to_owned(), value.1.to_owned())])
@@ -486,6 +489,12 @@ impl StateSchema {
             }
             Self::BerryBush if name == "age" => java_decimal(value)
                 .filter(|n| (0..=3).contains(n))
+                .map(|n| n.to_string()),
+            Self::Age7 if name == "age" => java_decimal(value)
+                .filter(|n| (0..=7).contains(n))
+                .map(|n| n.to_string()),
+            Self::Farmland if name == "moisture" => java_decimal(value)
+                .filter(|n| (0..=7).contains(n))
                 .map(|n| n.to_string()),
             Self::Age15 if name == "age" => java_decimal(value)
                 .filter(|n| (0..=15).contains(n))
@@ -922,6 +931,11 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/SweetBerryBushBlock" => {
                     Some(StateSchema::BerryBush)
                 }
+                "net/minecraft/world/level/block/BeetrootBlock" => Some(StateSchema::BerryBush),
+                "net/minecraft/world/level/block/CropBlock"
+                | "net/minecraft/world/level/block/CarrotBlock"
+                | "net/minecraft/world/level/block/PotatoBlock" => Some(StateSchema::Age7),
+                "net/minecraft/world/level/block/FarmlandBlock" => Some(StateSchema::Farmland),
                 "net/minecraft/world/level/block/SugarCaneBlock"
                 | "net/minecraft/world/level/block/CactusBlock" => Some(StateSchema::Age15),
                 "net/minecraft/world/level/block/SaplingBlock" => Some(StateSchema::Sapling),
@@ -1019,6 +1033,9 @@ impl GeneratedBlockRegistry {
         if matches!(
             schema,
             StateSchema::Stateless
+                | StateSchema::BerryBush
+                | StateSchema::Age7
+                | StateSchema::Farmland
                 | StateSchema::Dusted
                 | StateSchema::Slab
                 | StateSchema::Waterlogged
@@ -1418,6 +1435,36 @@ mod tests {
         assert_eq!(registry.has_block_entity("minecraft:unimplemented"), None);
         assert!(!registry.is_canonical_state("minecraft:unimplemented", &BTreeMap::new()));
         assert!(!registry.is_registered("example:unknown"));
+    }
+
+    #[test]
+    fn crops_and_farmland_resolve_and_validate_state_boundaries() {
+        let registry = GeneratedBlockRegistry {
+            states: BTreeMap::from([
+                ("minecraft:wheat".into(), StateSchema::Age7),
+                ("minecraft:beetroots".into(), StateSchema::BerryBush),
+                ("minecraft:farmland".into(), StateSchema::Farmland),
+            ]),
+            block_entities: BTreeMap::new(),
+        };
+        for (id, property, max) in [
+            ("minecraft:wheat", "age", 7),
+            ("minecraft:beetroots", "age", 3),
+            ("minecraft:farmland", "moisture", 7),
+        ] {
+            let input = serde_json::json!({"id":id, "properties":{(property):max.to_string()}});
+            let (_, state) = registry.resolve(&input).unwrap();
+            assert_eq!(state[property], max.to_string());
+            assert!(registry.is_canonical_state(id, &state));
+            let invalid =
+                serde_json::json!({"id":id, "properties":{(property):(max + 1).to_string()}});
+            let (_, fallback) = registry.resolve(&invalid).unwrap();
+            assert_eq!(fallback[property], "0");
+            assert!(!registry.is_canonical_state(
+                id,
+                &BTreeMap::from([(property.into(), (max + 1).to_string())]),
+            ));
+        }
     }
 
     #[test]

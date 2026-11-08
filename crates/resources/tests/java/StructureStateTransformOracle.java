@@ -37,6 +37,9 @@ public class StructureStateTransformOracle {
         }
         for (var block : List.of(Blocks.POTENT_SULFUR, Blocks.SULFUR_SPIKE))
             states.addAll(block.getStateDefinition().getPossibleStates());
+        for (var block : List.of(Blocks.WHEAT, Blocks.CARROTS, Blocks.POTATOES,
+                Blocks.BEETROOTS, Blocks.FARMLAND, Blocks.SWEET_BERRY_BUSH))
+            states.addAll(block.getStateDefinition().getPossibleStates());
         states.addAll(Blocks.DARK_OAK_TRAPDOOR.getStateDefinition().getPossibleStates());
         for (var block : List.of(Blocks.STONE_BRICK_WALL, Blocks.MOSSY_STONE_BRICK_WALL,
                 Blocks.COBBLESTONE_WALL, Blocks.MOSSY_COBBLESTONE_WALL,

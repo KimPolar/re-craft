@@ -375,6 +375,25 @@ fn generated_block_defaults_match_java() {
         }
     }
     for id in [
+        "minecraft:wheat",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:beetroots",
+        "minecraft:farmland",
+    ] {
+        cases.push(serde_json::json!(id));
+        let property = if id == "minecraft:farmland" {
+            "moisture"
+        } else {
+            "age"
+        };
+        for value in [
+            "-1", "0", "1", "2", "3", "4", "5", "6", "7", "8", "+3", "03", "invalid",
+        ] {
+            cases.push(serde_json::json!({"id":id,"properties":{(property):value}}));
+        }
+    }
+    for id in [
         "minecraft:oak_sapling",
         "minecraft:spruce_sapling",
         "minecraft:birch_sapling",
@@ -504,6 +523,18 @@ fn generated_block_defaults_match_java() {
         );
     }
     assert!(registry.contains("minecraft:deepslate"));
+    for id in [
+        "minecraft:wheat",
+        "minecraft:carrots",
+        "minecraft:potatoes",
+        "minecraft:beetroots",
+        "minecraft:farmland",
+    ] {
+        assert!(
+            registry.contains(id),
+            "missing crop or farmland state schema: {id}"
+        );
+    }
     for id in [
         "minecraft:bee_nest",
         "minecraft:beehive",

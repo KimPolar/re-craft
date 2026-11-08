@@ -7852,6 +7852,42 @@ impl LoadedSession {
         Ok(())
     }
 
+    /// Install the POI snapshot produced for a fresh world's postprocessed
+    /// chunks. The caller must establish that no earlier POI storage or ticket
+    /// activity exists. Validate the complete batch before changing the session.
+    pub fn install_generated_poi_snapshot(
+        &mut self,
+        snapshot: BTreeMap<ChunkPos, Option<native_persistence::nbt::NamedTag>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.tick == 0 && self.accumulated == Duration::ZERO,
+            "POI chunks must be set before the first tick"
+        );
+        let mut prepared = BTreeMap::new();
+        for (pos, document) in snapshot {
+            anyhow::ensure!(
+                self.world.chunks.contains_key(&pos),
+                "POI chunk has no loaded block chunk"
+            );
+            anyhow::ensure!(
+                !self.poi_chunks.contains_key(&pos) && !self.block_edits.contains_key(&pos),
+                "POI source was already captured or edited"
+            );
+            let poi = match document {
+                Some(document) => SavedPoiData::Present(Arc::new(
+                    native_persistence::world::SavedPoiChunk::from_document(
+                        document,
+                        native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+                    )?,
+                )),
+                None => SavedPoiData::Missing,
+            };
+            prepared.insert(pos, poi);
+        }
+        self.poi_chunks.extend(prepared);
+        Ok(())
+    }
+
     pub fn saved_poi_chunk(&self, pos: ChunkPos) -> Option<&SavedPoiData> {
         self.poi_chunks.get(&pos)
     }
@@ -60626,6 +60662,94 @@ pub(crate) mod tests {
                 .draft_poi_chunk(position, &terrain, &poi_source, |_| Ok(()))
                 .is_err(),
             "discontinuous history must be rejected"
+        );
+    }
+
+    #[test]
+    fn generated_poi_snapshot_is_atomic_and_preserves_present_and_missing_entries() {
+        use native_persistence::nbt::{NamedTag, Tag, TagType};
+        let mut current = session();
+        let pos = current.player_chunk().unwrap();
+        let missing_terrain = ChunkPos {
+            x: pos.x + 1,
+            z: pos.z,
+        };
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                (
+                    "Sections".into(),
+                    Tag::Compound(vec![(
+                        "0".into(),
+                        Tag::Compound(vec![
+                            ("Valid".into(), Tag::Byte(1)),
+                            (
+                                "Records".into(),
+                                Tag::List {
+                                    element_type: TagType::Compound,
+                                    values: vec![Tag::Compound(vec![
+                                        (
+                                            "pos".into(),
+                                            Tag::IntArray(vec![pos.x * 16 + 1, 4, pos.z * 16 + 1]),
+                                        ),
+                                        ("type".into(), Tag::String("minecraft:meeting".into())),
+                                        ("free_tickets".into(), Tag::Int(32)),
+                                    ])],
+                                },
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        };
+        assert!(
+            current
+                .install_generated_poi_snapshot(BTreeMap::from([
+                    (pos, Some(document.clone())),
+                    (missing_terrain, None),
+                ]))
+                .is_err()
+        );
+        assert!(current.saved_poi_chunk(pos).is_none());
+        let mut malformed = document.clone();
+        let Tag::Compound(fields) = &mut malformed.value else {
+            unreachable!()
+        };
+        fields[0].1 = Tag::Int(5022);
+        assert!(
+            current
+                .install_generated_poi_snapshot(BTreeMap::from([(pos, Some(malformed))]))
+                .is_err()
+        );
+        assert!(current.saved_poi_chunk(pos).is_none());
+        current
+            .install_generated_poi_snapshot(BTreeMap::from([(pos, Some(document.clone()))]))
+            .unwrap();
+        let Some(SavedPoiData::Present(saved)) = current.saved_poi_chunk(pos) else {
+            panic!("present POI missing")
+        };
+        assert_eq!(*saved.document, document);
+        assert_eq!(saved.sections[&0].records[0].free_tickets, 32);
+        assert!(
+            current
+                .install_generated_poi_snapshot(BTreeMap::from([(pos, None)]))
+                .is_err()
+        );
+
+        let mut empty = session();
+        empty
+            .install_generated_poi_snapshot(BTreeMap::from([(pos, None)]))
+            .unwrap();
+        assert!(matches!(
+            empty.saved_poi_chunk(pos),
+            Some(SavedPoiData::Missing)
+        ));
+        let mut late = session();
+        late.update(TICK);
+        assert!(
+            late.install_generated_poi_snapshot(BTreeMap::from([(pos, None)]))
+                .is_err()
         );
     }
 

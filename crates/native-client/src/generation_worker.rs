@@ -391,6 +391,13 @@ impl GenerationReady {
             session.generated_spawn_clear(spawn, targets)?,
             "initial player spawn is obstructed"
         );
+        if let Some(processed) = &self.postprocessed {
+            let poi = self.batch.postprocessed_missing_poi_snapshot(
+                &processed.region,
+                targets.iter().copied(),
+            )?;
+            session.install_generated_poi_snapshot(poi)?;
+        }
         let uuid = session.initialize_new_player()?;
         let level_data = self.draft_initial_level_data(last_played_ms, Some(uuid), true)?;
         Ok(GeneratedInitialPlayer {

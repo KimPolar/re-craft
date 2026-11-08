@@ -29,11 +29,13 @@ public class CropUseOracle {
         var bind=Holder.Reference.class.getDeclaredMethod("bindTags",Collection.class); bind.setAccessible(true);
         var field=sun.misc.Unsafe.class.getDeclaredField("theUnsafe"); field.setAccessible(true);
         var world=(World)((sun.misc.Unsafe)field.get(null)).allocateInstance(World.class);
-        var result=new JsonObject(); var survival=new JsonArray(); var bonemeal=new JsonArray();
+        var result=new JsonObject(); var survival=new JsonArray(); var bonemeal=new JsonArray(); var shape=new JsonArray(); var mining=new JsonArray();
         var crops=List.of(Blocks.WHEAT, Blocks.CARROTS, Blocks.POTATOES, Blocks.BEETROOTS);
         for (int kind=0;kind<4;kind++) {
             var block=(BonemealableBlock)crops.get(kind); int max=kind==3 ? 3 : 7;
             var property=kind==3 ? BeetrootBlock.AGE : CropBlock.AGE;
+            var mineRow=new JsonArray(); mineRow.add(kind); mineRow.add(crops.get(kind).defaultBlockState().getDestroySpeed(world,BlockPos.ZERO));
+            mineRow.add(crops.get(kind).defaultBlockState().requiresCorrectToolForDrops()); mining.add(mineRow);
             for (boolean tagged:new boolean[]{false,true}) {
                 bind.invoke(Blocks.DIRT.builtInRegistryHolder(),tagged ? List.of(BlockTags.SUPPORTS_CROPS) : List.of());
                 world.soil=Blocks.DIRT.defaultBlockState();
@@ -41,6 +43,12 @@ public class CropUseOracle {
                     world.light=light;
                     var row=new JsonArray(); row.add(kind); row.add(tagged); row.add(light);
                     row.add(crops.get(kind).defaultBlockState().canSurvive(world,BlockPos.ZERO)); survival.add(row);
+                    for (var direction:Direction.values()) {
+                        var state=crops.get(kind).defaultBlockState();
+                        var updated=state.updateShape(world,world,BlockPos.ZERO,direction,BlockPos.ZERO.relative(direction),world.soil,RandomSource.create(17));
+                        var shapeRow=new JsonArray(); shapeRow.add(kind); shapeRow.add(tagged); shapeRow.add(light);
+                        shapeRow.add(direction.ordinal()); shapeRow.add(updated.isAir()); shape.add(shapeRow);
+                    }
                 }
             }
             for (int age=0;age<=max;age++) for (long seed:new long[]{-1,0,1,42,1234567,Long.MIN_VALUE}) {
@@ -53,7 +61,7 @@ public class CropUseOracle {
                 row.add(world.written==null ? age : world.written.getValue(property)); row.add(world.random.nextInt()); bonemeal.add(row);
             }
         }
-        result.add("survival",survival); result.add("bonemeal",bonemeal);
+        result.add("survival",survival); result.add("bonemeal",bonemeal); result.add("shape",shape); result.add("mining",mining);
         Files.writeString(Path.of(args[0]),result.toString());
     }
 }

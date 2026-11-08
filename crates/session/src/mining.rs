@@ -91,6 +91,7 @@ pub enum Material {
     Gravel,
     Snow,
     SnowBlock,
+    Crop,
     HoneyBlock,
     DirtPath,
     Stone,
@@ -150,6 +151,10 @@ impl Material {
             "minecraft:gravel" => Some(Self::Gravel),
             "minecraft:snow" => Some(Self::Snow),
             "minecraft:snow_block" => Some(Self::SnowBlock),
+            "minecraft:wheat"
+            | "minecraft:carrots"
+            | "minecraft:potatoes"
+            | "minecraft:beetroots" => Some(Self::Crop),
             "minecraft:honey_block" => Some(Self::HoneyBlock),
             "minecraft:stone" => Some(Self::Stone),
             "minecraft:stone_bricks" => Some(Self::StoneBricks),
@@ -235,7 +240,7 @@ impl Material {
             Self::DirtPath => 0.65,
             Self::Snow => 0.1,
             Self::SnowBlock => 0.2,
-            Self::HoneyBlock => 0.0,
+            Self::HoneyBlock | Self::Crop => 0.0,
             Self::RedstoneLamp => 0.3,
             Self::Banner => 1.0,
             Self::RedstoneBlock => 5.0,

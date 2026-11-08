@@ -202,6 +202,17 @@ impl SkyLighting {
         self.pending.is_empty() && self.worker.is_none()
     }
 
+    /// Existing light remains valid when every pending edit has identical
+    /// verified sky behavior. Unknown states or any changed behavior do not qualify.
+    pub(crate) fn light_unchanged(&self, world: &World) -> bool {
+        self.pending.iter().all(|edit| {
+            let Some(new) = world.state(edit.new) else {
+                return false;
+            };
+            !sky_change_for_edit(edit.old.and_then(|old| world.state(old)), new)
+        })
+    }
+
     pub(crate) fn take_applied_originals(&mut self) -> BTreeMap<ChunkPos, Arc<Chunk>> {
         std::mem::take(&mut self.applied_originals)
     }
@@ -430,6 +441,19 @@ mod tests {
         }
         sky.wait_for_worker();
         sky.advance(world, Some(bounds))
+    }
+    #[test]
+    fn pending_sky_light_is_reusable_only_for_equivalent_edits() {
+        let mut world = fixture();
+        let mut sky = SkyLighting::default();
+        sky.set_enabled(true);
+        let first = BlockPosition { x: 1, y: 5, z: 1 };
+        edit(&mut sky, &mut world, first, state("wheat", &[("age", "0")]));
+        assert!(!sky.settled());
+        assert!(sky.light_unchanged(&world));
+        let second = BlockPosition { x: 2, y: 5, z: 1 };
+        edit(&mut sky, &mut world, second, state("stone", &[]));
+        assert!(!sky.light_unchanged(&world));
     }
     #[test]
     fn worker_applies_sky_to_current_world_and_preserves_snapshot() {

@@ -151,6 +151,30 @@ fn crop_survival_and_bonemeal_match_java() {
             "{row}"
         );
     }
+    let shapes = output["shape"].as_array().unwrap();
+    assert_eq!(shapes.len(), 240);
+    for row in shapes {
+        let survives = can_survive(
+            Some(row[2].as_u64().unwrap() as u8),
+            Some(row[1].as_bool().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(!survives, row[4].as_bool().unwrap(), "{row}");
+    }
+    let mining = output["mining"].as_array().unwrap();
+    assert_eq!(mining.len(), 4);
+    for row in mining {
+        assert_eq!(
+            f64::from(native_session::mining::Material::Crop.hardness()),
+            row[1].as_f64().unwrap(),
+            "{row}"
+        );
+        assert_eq!(
+            native_session::mining::Material::Crop.needs_tool(),
+            row[2].as_bool().unwrap(),
+            "{row}"
+        );
+    }
     let rows = output["bonemeal"].as_array().unwrap();
     assert_eq!(rows.len(), 168);
     for row in rows {
@@ -173,4 +197,5 @@ fn crop_survival_and_bonemeal_match_java() {
     }
     assert_eq!(can_survive(Some(7), None), Some(false));
     assert_eq!(can_survive(Some(8), None), None);
+    assert_eq!(can_survive(None, Some(false)), Some(false));
 }

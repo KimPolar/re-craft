@@ -851,6 +851,7 @@ pub struct LoadedSession {
     unresolved_fence_shape: bool,
     unresolved_leaf_decay: bool,
     unresolved_crop_tick: bool,
+    unresolved_crop_shape: bool,
     // Java's level counter is shared by block and fluid schedule calls.
     next_sub_tick: i64,
     fluid_chunks_seen: BTreeSet<ChunkPos>,
@@ -4137,6 +4138,10 @@ impl LoadedSession {
             "a crop random tick could not be resolved for saving"
         );
         anyhow::ensure!(
+            !self.unresolved_crop_shape,
+            "a crop neighbor update could not be resolved for saving"
+        );
+        anyhow::ensure!(
             !self.unresolved_player_damage,
             "player damage could not be resolved during this session"
         );
@@ -4356,6 +4361,10 @@ impl LoadedSession {
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<native_persistence::edit::ChunkDraft> {
         use anyhow::Context;
+        anyhow::ensure!(
+            !self.unresolved_crop_shape,
+            "a crop neighbor update could not be resolved for saving"
+        );
         anyhow::ensure!(
             !self.unresolved_fence_shape && self.pending_fence_updates.is_empty(),
             "fence shape updates are not yet fully tracked for saving"
@@ -7018,6 +7027,7 @@ impl LoadedSession {
             unresolved_fence_shape: false,
             unresolved_leaf_decay: false,
             unresolved_crop_tick: false,
+            unresolved_crop_shape: false,
             next_sub_tick: 0,
             fluid_chunks_seen,
             sand_ticks: BTreeMap::new(),
@@ -9825,6 +9835,10 @@ impl LoadedSession {
         ensure!(
             !self.unresolved_crop_tick,
             "a crop random tick could not be resolved for saving"
+        );
+        ensure!(
+            !self.unresolved_crop_shape,
+            "a crop neighbor update could not be resolved for saving"
         );
         ensure!(
             self.commands.is_empty(),
@@ -14005,7 +14019,9 @@ impl LoadedSession {
     }
 
     fn crop_brightness(&self, relative: IVec3, minimum: u8) -> Option<u8> {
-        if !self.pending_light.is_empty() || !self.sky_lighting.settled() {
+        if !self.pending_light.is_empty()
+            || !(self.sky_lighting.settled() || self.sky_lighting.light_unchanged(&self.world))
+        {
             return None;
         }
         let absolute = add(self.origin, relative)?;
@@ -14027,29 +14043,30 @@ impl LoadedSession {
         {
             return Some(block);
         }
+        if self.sky_lighting.capability() != Some(true) {
+            return None;
+        }
         self.world
             .light(absolute.x, absolute.y, absolute.z, true)
             .map(|sky| sky.max(block))
     }
 
     fn crop_can_survive(&self, relative: IVec3) -> Option<bool> {
-        let light = self.crop_brightness(relative, 8)?;
-        if light < 8 {
-            return Some(false);
-        }
-        let below = add(relative, IVec3::NEG_Y)?;
-        let Cell::State(id) = cell(&self.world, self.origin, self.bounds, below, self.states[0])
-        else {
-            return None;
-        };
-        let state = self.world.state(id)?;
-        if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
-            return None;
-        }
-        crate::crop::can_survive(
-            Some(light),
-            Some(self.crop_supports.as_ref()?.contains(&state.name)),
-        )
+        let light = self.crop_brightness(relative, 8);
+        let supported = (|| {
+            let below = add(relative, IVec3::NEG_Y)?;
+            let Cell::State(id) =
+                cell(&self.world, self.origin, self.bounds, below, self.states[0])
+            else {
+                return None;
+            };
+            let state = self.world.state(id)?;
+            if !self.vanilla_block_ids.as_ref()?.contains(&state.name) {
+                return None;
+            }
+            Some(self.crop_supports.as_ref()?.contains(&state.name))
+        })();
+        crate::crop::can_survive(light, supported)
     }
 
     /// Apply a seed item or bonemeal to a supported crop using the selected hand.
@@ -14666,6 +14683,13 @@ impl LoadedSession {
         let slab = crate::slab_mining::material(&name).is_some();
         let lodestone = name == "minecraft:lodestone";
         let honey = name == "minecraft:honey_block";
+        let crop = matches!(
+            name.as_str(),
+            "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots"
+        );
+        if crop && self.world.state(id).and_then(crop_state).is_none() {
+            return;
+        }
         if honey
             && !self
                 .world
@@ -14698,7 +14722,7 @@ impl LoadedSession {
         {
             return;
         }
-        if (snow || stair || slab || lodestone || honey)
+        if (snow || stair || slab || lodestone || honey || crop)
             && self.game_mode != GameMode::Creative
             && properties.is_none()
         {
@@ -14709,6 +14733,7 @@ impl LoadedSession {
             || slab
             || lodestone
             || honey
+            || crop
             || (self.loot.is_some() && properties.is_some());
         let player_loot = checked
             && self.game_mode != GameMode::Creative
@@ -18649,6 +18674,60 @@ impl LoadedSession {
         }
     }
 
+    /// Apply VegetationBlock's shape update for a crop. Unknown light, support,
+    /// or loot cannot be guessed without risking an incorrect world save.
+    fn update_crop_neighbor(&mut self, position: IVec3, id: BlockStateId) -> bool {
+        let Some(block) = self.world.state(id).cloned() else {
+            return false;
+        };
+        if !matches!(
+            block.name.as_str(),
+            "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots"
+        ) {
+            return false;
+        }
+        if crop_state(&block).is_none() {
+            self.unresolved_crop_shape = true;
+            return true;
+        }
+        match self.crop_can_survive(position) {
+            Some(true) => return true,
+            None => {
+                self.unresolved_crop_shape = true;
+                return true;
+            }
+            Some(false) => {}
+        }
+        let Some(absolute) = add(self.origin, position) else {
+            self.unresolved_crop_shape = true;
+            return true;
+        };
+        let Some(checked) = self.check_block_set(position, self.states[0], true, false) else {
+            self.unresolved_crop_shape = true;
+            return true;
+        };
+        let Ok((drops, _)) = self.stage_block_loot_without_entity(&block) else {
+            self.unresolved_crop_shape = true;
+            return true;
+        };
+        self.dropped_items.drop_block_resources(
+            absolute,
+            drops,
+            None,
+            self.block_drops,
+            &mut self.level_random,
+        );
+        assert!(self.apply_block_set(position, self.states[0], true, checked));
+        self.dispatch_vibration(
+            "minecraft:block_destroy",
+            absolute.as_dvec3() + DVec3::splat(0.5),
+            None,
+            None,
+            Some(&block.name),
+        );
+        true
+    }
+
     fn notify_one_block(&mut self, position: IVec3, old: BlockStateId, new: BlockStateId) {
         let settings = self.fluid_settings();
         let old_name = self.world.state(old).map(|state| state.name.as_str());
@@ -18747,6 +18826,9 @@ impl LoadedSession {
                 if self.update_fence_neighbor(neighbor, id, -direction, current) {
                     continue;
                 }
+            }
+            if self.update_crop_neighbor(neighbor, id) {
+                continue;
             }
             if self
                 .world
@@ -25832,6 +25914,258 @@ pub(crate) mod tests {
         assert_eq!(beet.random_tick_crop_at(position), Some(false));
         assert!(!beet.unresolved_crop_tick);
         assert_eq!(beet.level_random.next_int(), expected.next_int());
+    }
+
+    fn test_crop_neighbor_loot() -> Arc<BlockLootTables> {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(["wheat", "carrots", "potatoes", "beetroots"].iter().any(|name| path.ends_with(&format!("/blocks/{name}.json"))).then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:wheat_seeds"}]}]}"#.to_vec()))
+            }
+        }
+        Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
+    #[test]
+    fn crop_neighbor_update_removes_unsupported_crop_and_drops_resources() {
+        let position = IVec3::new(8, 2, 8);
+        let loot = test_crop_neighbor_loot();
+        for name in [
+            "minecraft:wheat",
+            "minecraft:carrots",
+            "minecraft:potatoes",
+            "minecraft:beetroots",
+        ] {
+            for drops in [false, true] {
+                let mut session = crop_test_session(position, name, 0, true);
+                session.set_block_loot(Arc::clone(&loot));
+                session.set_block_drops(drops);
+                let stone = session.intern_block(state("minecraft:stone", &[]));
+                assert!(session.set(position - IVec3::Y, stone));
+                let absolute = add(session.origin, position).unwrap();
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:air",
+                    "{name}"
+                );
+                let items = session.dropped_items.snapshot();
+                assert_eq!(items.len(), usize::from(drops), "{name}");
+                if drops {
+                    assert_eq!(items[0].stack.id(), "minecraft:wheat_seeds");
+                }
+                assert!(!session.unresolved_crop_shape);
+            }
+        }
+    }
+
+    #[test]
+    fn crop_player_break_uses_original_state_and_requires_loot() {
+        let position = IVec3::new(8, 2, 8);
+        let loot = test_crop_neighbor_loot();
+        for name in [
+            "minecraft:wheat",
+            "minecraft:carrots",
+            "minecraft:potatoes",
+            "minecraft:beetroots",
+        ] {
+            for mode in [GameMode::Survival, GameMode::Creative] {
+                let mut session = crop_test_session(position, name, 0, true);
+                session.set_game_mode(mode);
+                session.set_block_loot(Arc::clone(&loot));
+                let absolute = add(session.origin, position).unwrap();
+                session.finish_breaking(absolute);
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:air",
+                    "{name} {mode:?}"
+                );
+                let items = session.dropped_items.snapshot();
+                assert_eq!(items.len(), usize::from(mode == GameMode::Survival));
+                if mode == GameMode::Survival {
+                    assert_eq!(items[0].stack.id(), "minecraft:wheat_seeds");
+                }
+            }
+        }
+        let mut missing = crop_test_session(position, "minecraft:wheat", 0, true);
+        let absolute = add(missing.origin, position).unwrap();
+        missing.finish_breaking(absolute);
+        assert_eq!(
+            missing
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:wheat"
+        );
+
+        let position = IVec3::new(8, 2, 7);
+        let mut session = crop_test_session(position, "minecraft:wheat", 7, true);
+        session.set_block_loot(loot);
+        assert_eq!(session.ray_hit().unwrap().position, position);
+        session.submit_command(PlayerCommand::Break);
+        session.update(TICK);
+        let absolute = add(session.origin, position).unwrap();
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:air"
+        );
+        assert_eq!(
+            session.dropped_items.snapshot()[0].stack.id(),
+            "minecraft:wheat_seeds"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3 block loot"]
+    fn installed_crop_loot_supports_all_neighbor_removals() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let loot = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        let position = IVec3::new(8, 2, 8);
+        for (name, max) in [
+            ("minecraft:wheat", 7),
+            ("minecraft:carrots", 7),
+            ("minecraft:potatoes", 7),
+            ("minecraft:beetroots", 3),
+        ] {
+            for age in 0..=max {
+                let mut session = crop_test_session(position, name, age, true);
+                session.set_block_loot(Arc::clone(&loot));
+                session
+                    .set_random_sequences(
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                let stone = session.intern_block(state("minecraft:stone", &[]));
+                assert!(session.set(position - IVec3::Y, stone));
+                let absolute = add(session.origin, position).unwrap();
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:air",
+                    "{name} age={age}"
+                );
+                assert!(!session.unresolved_crop_shape, "{name} age={age}");
+                assert!(
+                    !session.dropped_items.snapshot().is_empty(),
+                    "{name} age={age}"
+                );
+
+                let mut harvest = crop_test_session(position, name, age, true);
+                harvest.set_block_loot(Arc::clone(&loot));
+                harvest
+                    .set_random_sequences(
+                        42,
+                        native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    )
+                    .unwrap();
+                let absolute = add(harvest.origin, position).unwrap();
+                harvest.finish_breaking(absolute);
+                assert_eq!(
+                    harvest
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    "minecraft:air",
+                    "player harvest {name} age={age}"
+                );
+                assert!(
+                    !harvest.dropped_items.snapshot().is_empty(),
+                    "player harvest {name} age={age}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crop_neighbor_update_rejects_unknown_inputs_without_partial_changes() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let position = IVec3::new(8, 2, 8);
+        for missing_loot in [false, true] {
+            let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+            if missing_loot {
+                session.crop_supports = Some(Arc::new(BTreeSet::new()));
+            } else {
+                session.crop_supports = None;
+            }
+            let absolute = add(session.origin, position).unwrap();
+            let id = session
+                .world
+                .block_id(absolute.x, absolute.y, absolute.z)
+                .unwrap();
+            let mut before = session.level_random.clone();
+            assert!(session.update_crop_neighbor(position, id));
+            assert!(session.unresolved_crop_shape);
+            assert_eq!(
+                session.world.block_id(absolute.x, absolute.y, absolute.z),
+                Some(id)
+            );
+            assert_eq!(session.level_random.next_int(), before.next_int());
+            let original = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            };
+            let chunk = ChunkPos {
+                x: absolute.x.div_euclid(16),
+                z: absolute.z.div_euclid(16),
+            };
+            assert!(session.draft_changed_chunk(chunk, &original).is_err());
+        }
+    }
+
+    #[test]
+    fn crop_neighbor_check_keeps_crops_after_light_equivalent_planting() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        let neighbor = session.intern_block(state("minecraft:carrots", &[("age", "0")]));
+        assert!(session.set(position + IVec3::X, neighbor));
+        assert!(session.sky_lighting.light_unchanged(&session.world));
+        assert!(!session.unresolved_crop_shape);
+        let absolute = add(session.origin, position).unwrap();
+        assert_eq!(
+            session
+                .world
+                .block(absolute.x, absolute.y, absolute.z)
+                .unwrap()
+                .name,
+            "minecraft:wheat"
+        );
+    }
+
+    #[test]
+    fn crop_light_requires_known_sky_capability_unless_block_light_is_sufficient() {
+        let position = IVec3::new(8, 2, 8);
+        let mut session = crop_test_session(position, "minecraft:wheat", 0, true);
+        session.sky_lighting = crate::sky_lighting::SkyLighting::default();
+        assert_eq!(session.crop_brightness(position, 8), None);
+        let world = Arc::make_mut(&mut session.world);
+        let chunk = Arc::make_mut(world.chunks.values_mut().next().unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.block_light = Some(Box::new([0x88; LIGHT_BYTES]));
+        assert_eq!(session.crop_brightness(position, 8), Some(8));
     }
 
     #[test]

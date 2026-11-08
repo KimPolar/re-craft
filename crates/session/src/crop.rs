@@ -25,10 +25,13 @@ impl Crop {
 
 /// A crop survives only with enough raw light and a tagged supporting block.
 pub fn can_survive(brightness: Option<u8>, supported: Option<bool>) -> Option<bool> {
-    if brightness? < 8 {
+    if brightness.is_some_and(|value| value < 8) || supported == Some(false) {
         return Some(false);
     }
-    supported
+    match (brightness, supported) {
+        (Some(_), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// Apply the crop's bonemeal increase, or return None for a mature crop.

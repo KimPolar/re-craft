@@ -10238,6 +10238,17 @@ impl LoadedSession {
                 .any(|pending| pending.pos == pos && pending.world.is_some())
     }
 
+    /// Positions whose streamed data still awaits a simulation tick boundary.
+    pub fn pending_stream_data_positions(&self) -> BTreeSet<ChunkPos> {
+        self.incoming
+            .iter()
+            .filter(|pending| {
+                pending.world.is_some() || pending.entities.is_some() || pending.poi.is_some()
+            })
+            .map(|pending| pending.pos)
+            .collect()
+    }
+
     /// A committed chunk cannot disappear without a chunk-window change.
     pub fn has_resident_or_parked_chunk(&self, pos: ChunkPos) -> bool {
         self.world.chunks.contains_key(&pos) || self.parked_chunks.contains_key(&pos)

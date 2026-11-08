@@ -71,6 +71,7 @@ pub struct ChunkStreamer {
     #[cfg(test)]
     skipped_target_checks: u64,
     pending: BTreeSet<ChunkPos>,
+    awaiting_attachment: BTreeSet<ChunkPos>,
     missing: BTreeSet<ChunkPos>,
     failed: BTreeMap<ChunkPos, (Instant, u32)>,
     entity_retry: BTreeMap<ChunkPos, (Instant, u32)>,
@@ -217,6 +218,7 @@ impl ChunkStreamer {
             #[cfg(test)]
             skipped_target_checks: 0,
             pending: BTreeSet::new(),
+            awaiting_attachment: BTreeSet::new(),
             missing,
             failed: BTreeMap::new(),
             entity_retry: BTreeMap::new(),
@@ -305,15 +307,6 @@ impl ChunkStreamer {
                             poi,
                             heightmaps,
                         })) => {
-                            self.failed.remove(&response.pos);
-                            if matches!(entities, SavedEntityData::Unavailable)
-                                || (session.can_retry_poi_chunk(response.pos)
-                                    && matches!(poi, SavedPoiData::Unavailable))
-                            {
-                                schedule_retry(&mut self.entity_retry, response.pos);
-                            } else {
-                                self.entity_retry.remove(&response.pos);
-                            }
                             if let Some(world) = world {
                                 session.queue_loaded_chunk_with_poi(
                                     response.pos,
@@ -326,6 +319,7 @@ impl ChunkStreamer {
                                 session.queue_entity_chunk(response.pos, entities);
                                 session.queue_poi_chunk(response.pos, poi);
                             }
+                            self.awaiting_attachment.insert(response.pos);
                         }
                         Ok(None) if response.entities_only => {
                             schedule_retry(&mut self.entity_retry, response.pos);
@@ -358,6 +352,42 @@ impl ChunkStreamer {
                 }
             }
         }
+        // Reads are only applied by the session at a tick boundary. A valid
+        // region record can still fail position or data validation there, so
+        // do not treat a successful read as a successful attachment.
+        let attached: Vec<_> = if self.awaiting_attachment.is_empty() {
+            Vec::new()
+        } else {
+            let pending = session.pending_stream_data_positions();
+            self.awaiting_attachment
+                .difference(&pending)
+                .copied()
+                .collect()
+        };
+        for pos in attached {
+            self.awaiting_attachment.remove(&pos);
+            if !windows.contains(pos) {
+                continue;
+            }
+            if !session.has_resident_or_parked_chunk(pos) {
+                schedule_retry(&mut self.failed, pos);
+                continue;
+            }
+            self.failed.remove(&pos);
+            if matches!(
+                session.saved_entity_chunk(pos),
+                None | Some(SavedEntityData::Unavailable)
+            ) || (session.can_retry_poi_chunk(pos)
+                && matches!(
+                    session.saved_poi_chunk(pos),
+                    None | Some(SavedPoiData::Unavailable)
+                ))
+            {
+                schedule_retry(&mut self.entity_retry, pos);
+            } else {
+                self.entity_retry.remove(&pos);
+            }
+        }
         // Another path may have attached the chunk while its failed read was
         // waiting. A stale terrain error must not block entity-only retries.
         self.failed
@@ -366,12 +396,14 @@ impl ChunkStreamer {
         let entity_retry_due = self.entity_retry.iter().any(|(pos, (at, _))| {
             *at <= now
                 && !self.pending.contains(pos)
+                && !self.awaiting_attachment.contains(pos)
                 && !self.failed.contains_key(pos)
                 && !self.missing.contains(pos)
         });
         let terrain_retry_due = self.failed.iter().any(|(pos, (at, _))| {
             *at <= now
                 && !self.pending.contains(pos)
+                && !self.awaiting_attachment.contains(pos)
                 && !self.missing.contains(pos)
                 && !session.has_chunk_or_pending(*pos)
         });
@@ -402,6 +434,7 @@ impl ChunkStreamer {
                 if self.missing.contains(&pos)
                     || (self.failed.contains_key(&pos) && !terrain_retry)
                     || self.pending.contains(&pos)
+                    || self.awaiting_attachment.contains(&pos)
                     || (session.has_chunk_or_pending(pos) && !retry)
                 {
                     continue;
@@ -722,6 +755,7 @@ mod tests {
                 assert!(Instant::now() < deadline, "entity retry did not complete");
                 thread::sleep(Duration::from_millis(2));
             }
+            streamer.service(&mut session).unwrap();
             assert!(!streamer.entity_retry.contains_key(&home));
         }
     }
@@ -795,7 +829,187 @@ mod tests {
             assert!(Instant::now() < deadline, "terrain retry did not recover");
             thread::sleep(Duration::from_millis(2));
         }
+        streamer.service(&mut session).unwrap();
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert!(!streamer.failed.contains_key(&target));
+        assert!(!streamer.missing.contains(&target));
+    }
+
+    #[test]
+    fn rejected_entity_and_poi_attachments_retry_after_the_tick() {
+        use native_persistence::{
+            nbt::{NamedTag, Tag},
+            world::{SavedEntityChunk, SavedPoiChunk},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let missing = targets(home, 1)
+            .into_iter()
+            .filter(|&pos| pos != home && pos != target)
+            .collect();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let mut streamer =
+            ChunkStreamer::with_entity_source(1, missing, move |pos, entities_only| {
+                assert_eq!(pos, target);
+                let attempt = worker_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                if attempt == 0 {
+                    assert!(!entities_only);
+                    let document = Arc::new(NamedTag {
+                        name: "".into(),
+                        value: Tag::Compound(vec![]),
+                    });
+                    let wrong = SavedChunkPos { x: 9, z: 9 };
+                    Ok(Some(ChunkPayload {
+                        world: Some(chunk_world(target)),
+                        entities: SavedEntityData::Present(Arc::new(SavedEntityChunk {
+                            position: wrong,
+                            document: Arc::clone(&document),
+                        })),
+                        poi: SavedPoiData::Present(Arc::new(SavedPoiChunk {
+                            position: wrong,
+                            document,
+                            sections: BTreeMap::new(),
+                        })),
+                        heightmaps: None,
+                    }))
+                } else {
+                    assert!(entities_only);
+                    Ok(Some(ChunkPayload {
+                        world: None,
+                        entities: SavedEntityData::Empty,
+                        poi: SavedPoiData::Missing,
+                        heightmaps: None,
+                    }))
+                }
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !streamer.awaiting_attachment.contains(&target) {
+            streamer.service(&mut session).unwrap();
+            assert!(Instant::now() < deadline, "initial read did not finish");
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Repeated render frames must not start another read before the tick.
+        for _ in 0..5 {
+            streamer.service(&mut session).unwrap();
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        session.update(Duration::from_millis(50));
+        streamer.service(&mut session).unwrap();
+        assert!(session.has_resident_or_parked_chunk(target));
+        assert!(matches!(
+            session.saved_entity_chunk(target),
+            Some(SavedEntityData::Unavailable)
+        ));
+        assert!(streamer.entity_retry.contains_key(&target));
+        streamer.entity_retry.get_mut(&target).unwrap().0 = Instant::now();
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if matches!(
+                session.saved_entity_chunk(target),
+                Some(SavedEntityData::Empty)
+            ) && matches!(session.saved_poi_chunk(target), Some(SavedPoiData::Missing))
+            {
+                streamer.service(&mut session).unwrap();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attachment retry did not recover"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        assert!(!streamer.entity_retry.contains_key(&target));
+    }
+
+    #[test]
+    fn rejected_terrain_attachment_retries_without_marking_the_chunk_missing() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 1, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let missing = targets(home, 1)
+            .into_iter()
+            .filter(|&pos| pos != home && pos != target)
+            .collect();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let mut streamer = ChunkStreamer::with_source(1, missing, move |pos| {
+            assert_eq!(pos, target);
+            if worker_attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                Ok(Some(World::new("minecraft:the_nether")))
+            } else {
+                Ok(Some(chunk_world(target)))
+            }
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !streamer.failed.contains_key(&target) {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "terrain rejection was not recorded"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!streamer.missing.contains(&target));
+        assert!(!session.has_resident_or_parked_chunk(target));
+        streamer.failed.get_mut(&target).unwrap().0 = Instant::now();
+        loop {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            if session.has_resident_or_parked_chunk(target) {
+                streamer.service(&mut session).unwrap();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "terrain attachment did not recover"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
         assert!(!streamer.failed.contains_key(&target));
         assert!(!streamer.missing.contains(&target));
     }
@@ -891,6 +1105,7 @@ mod tests {
             assert!(Instant::now() < deadline, "entity retry did not recover");
             thread::sleep(Duration::from_millis(2));
         }
+        streamer.service(&mut session).unwrap();
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
         assert!(!streamer.entity_retry.contains_key(&home));
     }

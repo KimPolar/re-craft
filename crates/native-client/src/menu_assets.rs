@@ -715,19 +715,10 @@ impl MenuAssets {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
             })
             .unwrap_or_else(|| "en_us".to_owned());
-        let name = format!("minecraft/lang/{locale}.json");
-        let language_bytes = stack
-            .read_pack_asset(&format!("assets/{name}"))?
-            .or_else(|| index.read(minecraft_dir, &name).ok())
-            .or_else(|| {
-                stack
-                    .read_asset("assets/minecraft/lang/en_us.json")
-                    .ok()
-                    .flatten()
-            });
-        let language = language_bytes
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let namespaces = stack.asset_namespaces()?;
+        let language = load_language_layers(&mut stack, &namespaces, &locale, |name| {
+            index.read(minecraft_dir, name).ok()
+        })?;
         let player_skin = Arc::new(crate::player_skin::PlayerSkin::load(&mut stack, None)?);
         let trim_registry = Arc::new(
             crate::equipment_visual::TrimRegistry::load(&mut stack).unwrap_or_else(|error| {
@@ -811,6 +802,37 @@ impl MenuAssets {
     }
 }
 
+/// Java loads English first, then the selected locale; each resource stack is
+/// applied from the built-in assets to the highest-priority resource pack.
+fn load_language_layers(
+    provider: &mut impl ResourceProvider,
+    namespaces: &std::collections::BTreeSet<String>,
+    locale: &str,
+    mut indexed_asset: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> Result<HashMap<String, String>> {
+    let mut language = HashMap::new();
+    for code in [Some("en_us"), (locale != "en_us").then_some(locale)]
+        .into_iter()
+        .flatten()
+    {
+        for namespace in namespaces {
+            let name = format!("{namespace}/lang/{code}.json");
+            let mut layers = provider.read_asset_stack(&format!("assets/{name}"))?;
+            if namespace == "minecraft" {
+                if let Some(bytes) = indexed_asset(&name) {
+                    layers.insert(0, bytes);
+                }
+            }
+            for bytes in layers {
+                if let Ok(entries) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+                    language.extend(entries);
+                }
+            }
+        }
+    }
+    Ok(language)
+}
+
 fn native_translation(locale: &str, key: &str) -> Option<&'static str> {
     if locale != "ko_kr" {
         return None;
@@ -878,6 +900,225 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn languages_merge_english_locale_and_pack_layers() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        struct Layers(BTreeMap<String, Vec<Vec<u8>>>);
+        impl ResourceProvider for Layers {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                unreachable!("language loading must use every asset layer")
+            }
+
+            fn read_asset_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(self.0.get(path).cloned().unwrap_or_default())
+            }
+        }
+        let bytes = |value: &str| value.as_bytes().to_vec();
+        let mut provider = Layers(BTreeMap::from([
+            (
+                "assets/minecraft/lang/en_us.json".into(),
+                vec![
+                    bytes(r#"{"english":"English","shared":"base","fallback":"original"}"#),
+                    bytes(r#"{"shared":"english pack","pack_only":"present"}"#),
+                ],
+            ),
+            (
+                "assets/minecraft/lang/ko_kr.json".into(),
+                vec![
+                    bytes(r#"{"shared":"lower pack","lower_only":"kept"}"#),
+                    bytes(r#"{"shared":"higher pack"}"#),
+                ],
+            ),
+            (
+                "assets/example/lang/ko_kr.json".into(),
+                vec![bytes(r#"{"example.key":"custom namespace"}"#)],
+            ),
+        ]));
+        let namespaces = BTreeSet::from(["example".into(), "minecraft".into()]);
+        let language = load_language_layers(&mut provider, &namespaces, "ko_kr", |name| {
+            (name == "minecraft/lang/ko_kr.json")
+                .then(|| bytes(r#"{"shared":"한국어","korean_only":"유지"}"#))
+        })
+        .unwrap();
+        for (key, value) in [
+            ("english", "English"),
+            ("fallback", "original"),
+            ("pack_only", "present"),
+            ("korean_only", "유지"),
+            ("lower_only", "kept"),
+            ("shared", "higher pack"),
+            ("example.key", "custom namespace"),
+        ] {
+            assert_eq!(language.get(key).map(String::as_str), Some(value));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn installed_languages_merge_partial_resource_packs() -> Result<()> {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let index = AssetIndex::load(&game)?;
+        let korean: HashMap<String, String> =
+            serde_json::from_slice(&index.read(&game, "minecraft/lang/ko_kr.json")?)?;
+        let temp = tempfile::tempdir()?;
+        let low = temp.path().join("low");
+        let high = temp.path().join("high");
+        for (pack, locale, data) in [
+            (
+                &low,
+                "en_us",
+                r#"{"recraft.test.shared":"english","recraft.test.fallback":"retained"}"#,
+            ),
+            (
+                &low,
+                "ko_kr",
+                r#"{"recraft.test.shared":"lower","recraft.test.lower":"retained"}"#,
+            ),
+            (&high, "ko_kr", r#"{"recraft.test.shared":"higher"}"#),
+        ] {
+            let path = pack
+                .join("assets/minecraft/lang")
+                .join(format!("{locale}.json"));
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, data)?;
+        }
+        let custom = high.join("assets/example/lang/ko_kr.json");
+        fs::create_dir_all(custom.parent().unwrap())?;
+        fs::write(custom, r#"{"recraft.test.custom":"present"}"#)?;
+        let mut stack = ResourceStack::open(&game)?;
+        stack.push_pack(&low)?;
+        stack.push_pack(&high)?;
+        let namespaces = stack.asset_namespaces()?;
+        let language = load_language_layers(&mut stack, &namespaces, "ko_kr", |name| {
+            index.read(&game, name).ok()
+        })?;
+        for (key, value) in [
+            ("recraft.test.shared", "higher"),
+            ("recraft.test.fallback", "retained"),
+            ("recraft.test.lower", "retained"),
+            ("recraft.test.custom", "present"),
+        ] {
+            assert_eq!(language.get(key).map(String::as_str), Some(value));
+        }
+        assert_eq!(
+            language.get("menu.singleplayer"),
+            korean.get("menu.singleplayer")
+        );
+        assert!(language.contains_key("menu.singleplayer"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and a Java 25 JDK"]
+    fn language_layer_order_matches_java() -> Result<()> {
+        use std::{
+            collections::{BTreeMap, BTreeSet},
+            process::Command,
+        };
+
+        struct Layers(BTreeMap<String, Vec<Vec<u8>>>);
+        impl ResourceProvider for Layers {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                unreachable!()
+            }
+            fn read_asset_stack(&mut self, path: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(self.0.get(path).cloned().unwrap_or_default())
+            }
+        }
+        let bytes = |s: &str| s.as_bytes().to_vec();
+        let mut provider = Layers(BTreeMap::from([
+            (
+                "assets/minecraft/lang/en_us.json".into(),
+                vec![
+                    bytes(r#"{"english":"English","shared":"base","fallback":"original"}"#),
+                    bytes(r#"{"shared":"english pack","pack_only":"present"}"#),
+                ],
+            ),
+            (
+                "assets/minecraft/lang/ko_kr.json".into(),
+                vec![
+                    bytes(r#"{"shared":"lower pack","lower_only":"kept"}"#),
+                    bytes(r#"{"shared":"higher pack"}"#),
+                ],
+            ),
+            (
+                "assets/example/lang/ko_kr.json".into(),
+                vec![bytes(r#"{"example.key":"custom namespace"}"#)],
+            ),
+        ]));
+        let actual = load_language_layers(
+            &mut provider,
+            &BTreeSet::from(["example".into(), "minecraft".into()]),
+            "ko_kr",
+            |name| {
+                (name == "minecraft/lang/ko_kr.json")
+                    .then(|| bytes(r#"{"shared":"Korean","korean_only":"retained"}"#))
+            },
+        )?;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("LanguageLayersOracle.java");
+        fs::write(
+            &source,
+            include_str!("../tests/java/LanguageLayersOracle.java"),
+        )?;
+        let mut classpath = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    classpath.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(classpath)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java language oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("LanguageLayersOracle")
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java language oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout)?;
+        let lines: Vec<_> = output
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .collect();
+        assert_eq!(lines.len(), 7);
+        for (key, expected) in lines {
+            assert_eq!(actual.get(key).map(String::as_str), Some(expected), "{key}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn parses_nonlatin_bitmap_grid_and_rejects_inconsistent_rows() {

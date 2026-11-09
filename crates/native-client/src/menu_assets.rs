@@ -327,6 +327,8 @@ impl GuiSpriteScaling {
 pub struct UnicodeGlyph {
     pub rows: [u32; 16],
     pub bits: u32,
+    pub left: u32,
+    pub right: u32,
 }
 
 /// The default non-Latin bitmap provider precedes unifont in vanilla's font stack.
@@ -712,10 +714,7 @@ impl MenuAssets {
             panorama_overlay.width() > 0 && panorama_overlay.height() > 0,
             "Empty Minecraft panorama overlay"
         );
-        let unicode = index
-            .read(minecraft_dir, "minecraft/font/unifont.zip")
-            .and_then(|bytes| parse_unicode_font(&bytes))
-            .unwrap_or_default();
+        let unicode = load_unicode_fonts(&mut stack, &index, minecraft_dir).unwrap_or_default();
         let options = fs::read_to_string(minecraft_dir.join("options.txt")).unwrap_or_default();
         let chat = crate::chat_hud::ChatSettings::from_options(&options);
         let main_hand_left = options
@@ -953,7 +952,93 @@ fn native_translation(locale: &str, key: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
+#[derive(Debug)]
+struct UnicodeSizeOverride {
+    from: u32,
+    to: u32,
+    left: u32,
+    right: u32,
+}
+
+fn unicode_overrides(provider: &Value) -> Vec<UnicodeSizeOverride> {
+    provider
+        .get("size_overrides")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let code = |key: &str| {
+                let mut chars = value.get(key)?.as_str()?.chars();
+                let ch = chars.next()?;
+                chars.next().is_none().then_some(ch as u32)
+            };
+            let (from, to) = (code("from")?, code("to")?);
+            let left = u32::try_from(value.get("left")?.as_u64()?).ok()?;
+            let right = u32::try_from(value.get("right")?.as_u64()?).ok()?;
+            (from <= to && left <= right && right < 32).then_some(UnicodeSizeOverride {
+                from,
+                to,
+                left,
+                right,
+            })
+        })
+        .collect()
+}
+
+fn load_unicode_fonts(
+    stack: &mut ResourceStack,
+    index: &AssetIndex,
+    root: &Path,
+) -> Result<HashMap<char, UnicodeGlyph>> {
+    let definition = match stack.read_pack_asset("assets/minecraft/font/include/unifont.json")? {
+        Some(bytes) => bytes,
+        None => index.read(root, "minecraft/font/include/unifont.json")?,
+    };
+    let definition: Value =
+        serde_json::from_slice(&definition).context("Invalid unicode font definition")?;
+    let providers = definition
+        .get("providers")
+        .and_then(Value::as_array)
+        .context("Missing unicode font providers")?;
+    let mut result = HashMap::new();
+    for provider in providers {
+        let kind = provider.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind.strip_prefix("minecraft:").unwrap_or(kind) != "unihex"
+            || provider
+                .get("filter")
+                .and_then(|f| f.get("jp"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            || provider
+                .get("filter")
+                .and_then(|f| f.get("uniform"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            continue;
+        }
+        let id = native_resources::packs::ResourceId::parse(
+            provider
+                .get("hex_file")
+                .and_then(Value::as_str)
+                .context("Missing unicode font file")?,
+        )?;
+        let name = format!("{}/{}", id.namespace, id.path);
+        let bytes = match stack.read_asset(&format!("assets/{name}"))? {
+            Some(bytes) => bytes,
+            None => index.read(root, &name)?,
+        };
+        for (code, glyph) in parse_unicode_font(&bytes, &unicode_overrides(provider))? {
+            result.entry(code).or_insert(glyph);
+        }
+    }
+    Ok(result)
+}
+
+fn parse_unicode_font(
+    bytes: &[u8],
+    overrides: &[UnicodeSizeOverride],
+) -> Result<HashMap<char, UnicodeGlyph>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let mut data = String::new();
     for i in 0..zip.len() {
@@ -974,7 +1059,7 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
         let Some(ch) = u32::from_str_radix(code, 16).ok().and_then(char::from_u32) else {
             continue;
         };
-        if ch.is_ascii() || bitmap.len() % 16 != 0 {
+        if bitmap.len() % 16 != 0 {
             continue;
         }
         let digits = bitmap.len() / 16;
@@ -992,11 +1077,29 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
             }
         }
         if valid {
+            let bits = (digits * 4) as u32;
+            let mask = rows.iter().fold(0, |mask, row| mask | row);
+            let (left, right) = overrides
+                .iter()
+                .find(|range| range.from <= ch as u32 && ch as u32 <= range.to)
+                .map(|range| (range.left, range.right))
+                .unwrap_or_else(|| {
+                    if mask == 0 {
+                        (0, bits)
+                    } else {
+                        (
+                            mask.leading_zeros() - (32 - bits),
+                            bits - 1 - mask.trailing_zeros(),
+                        )
+                    }
+                });
             glyphs.insert(
                 ch,
                 UnicodeGlyph {
                     rows,
-                    bits: (digits * 4) as u32,
+                    bits,
+                    left,
+                    right,
                 },
             );
         }
@@ -1723,9 +1826,163 @@ mod tests {
         )
         .unwrap();
         let bytes = zip.finish().unwrap().into_inner();
-        let font = parse_unicode_font(&bytes).unwrap();
+        let font = parse_unicode_font(&bytes, &[]).unwrap();
         assert_eq!(font[&'\u{ac00}'].bits, 16);
         assert_eq!(font[&'\u{ac00}'].rows[2], 4);
         assert_eq!(font[&'\u{ac00}'].rows[3], 0x3f84);
+    }
+
+    #[test]
+    fn unicode_glyph_bounds_use_visible_columns_and_overrides() {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("font.hex", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        write!(
+            zip,
+            "0041:{}\n0042:{}\nAC00:{}\n",
+            "18".repeat(16),
+            "00".repeat(16),
+            "0001".repeat(16)
+        )
+        .unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let overrides = unicode_overrides(
+            &serde_json::json!({"size_overrides": [{"from":"가","to":"힣","left":1,"right":15}]}),
+        );
+        let font = parse_unicode_font(&bytes, &overrides).unwrap();
+        assert_eq!((font[&'A'].left, font[&'A'].right), (3, 4));
+        assert_eq!((font[&'B'].left, font[&'B'].right), (0, 8));
+        assert_eq!((font[&'가'].left, font[&'가'].right), (1, 15));
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn unicode_provider_uses_resource_pack_definitions_and_order() -> Result<()> {
+        use std::io::Write;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let folder = root.join("assets/minecraft/font");
+        fs::create_dir_all(folder.join("include"))?;
+        fs::write(
+            root.join("pack.mcmeta"),
+            br#"{"pack":{"description":"font test","min_format":1,"max_format":9999}}"#,
+        )?;
+        fs::write(folder.join("include/unifont.json"), br#"{"providers":[{"type":"minecraft:unihex","hex_file":"minecraft:font/first.zip","size_overrides":[{"from":"\uAC00","to":"\uD7AF","left":1,"right":15}],"filter":{"jp":false}},{"type":"unihex","hex_file":"minecraft:font/second.zip"}]}"#)?;
+        for (name, row) in [("first.zip", "0004"), ("second.zip", "FFFF")] {
+            let mut zip = zip::ZipWriter::new(fs::File::create(folder.join(name))?);
+            zip.start_file("font.hex", zip::write::SimpleFileOptions::default())?;
+            writeln!(zip, "D55C:{}", row.repeat(16))?;
+            writeln!(zip, "0041:{}", "18".repeat(16))?;
+            zip.finish()?;
+        }
+        let assets = MenuAssets::load(&game, &[root.to_path_buf()])?;
+        let glyph = &assets.unicode[&'한'];
+        assert_eq!(glyph.rows[0], 4);
+        assert_eq!((glyph.left, glyph.right), (1, 15));
+        assert!(assets.unicode.contains_key(&'A'));
+        let mut canvas = crate::menu_draw::Canvas::new(16, 10);
+        assert_eq!(canvas.text_width(Some(&assets), "한"), 8);
+        canvas.text_without_shadow(Some(&assets), 0, 0, "한", [255, 255, 255]);
+        assert!(canvas.pixels.iter().any(|pixel| *pixel != 0));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and a Java 25 JDK"]
+    fn unicode_glyph_metrics_match_installed_java() -> Result<()> {
+        use std::process::Command;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let index = AssetIndex::load(&game)?;
+        let definition = index.read(&game, "minecraft/font/include/unifont.json")?;
+        let json: Value = serde_json::from_slice(&definition)?;
+        let bytes = index.read(&game, "minecraft/font/unifont.zip")?;
+        let font = parse_unicode_font(&bytes, &unicode_overrides(&json["providers"][1]))?;
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("UnihexMetricsOracle.java");
+        fs::write(
+            &source,
+            include_str!("../tests/java/UnihexMetricsOracle.java"),
+        )?;
+        let definition_path = temp.path().join("definition.json");
+        let zip_path = temp.path().join("font.zip");
+        fs::write(&definition_path, definition)?;
+        fs::write(&zip_path, bytes)?;
+        let mut classpath = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    classpath.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(classpath)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("UnihexMetricsOracle")
+            .arg(definition_path)
+            .arg(zip_path)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output = String::from_utf8(result.stdout)?;
+        let mut checked = 0;
+        for line in output.lines() {
+            let values: Vec<_> = line.split('\t').collect();
+            if values.len() != 4 {
+                continue;
+            }
+            let ch =
+                char::from_u32(u32::from_str_radix(values[0], 16)?).context("invalid codepoint")?;
+            let glyph = font.get(&ch).with_context(|| format!("missing {ch:?}"))?;
+            let expected = (
+                values[1].parse::<u32>()?,
+                values[2].parse::<u32>()?,
+                values[3].parse::<u32>()?,
+            );
+            assert_eq!(
+                (
+                    glyph.left,
+                    glyph.right,
+                    (glyph.right - glyph.left + 1) / 2 + 1
+                ),
+                expected,
+                "{ch:?}"
+            );
+            checked += 1;
+        }
+        ensure!(checked > 60_000, "Java font oracle returned too few glyphs");
+        assert_eq!(checked, font.len());
+        Ok(())
     }
 }

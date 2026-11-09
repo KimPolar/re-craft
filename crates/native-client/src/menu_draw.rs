@@ -880,12 +880,13 @@ impl Canvas {
                         }
                     } else if let Some(glyph) = assets.unicode.get(&ch) {
                         for gy in 0..8 {
-                            for gx in 0..glyph.bits.div_ceil(2) {
+                            for gx in 0..(glyph.right - glyph.left + 1).div_ceil(2) {
                                 let mut on = false;
                                 for dy in 0..2 {
                                     for dx in 0..2 {
-                                        let bit = gx * 2 + dx;
-                                        if bit < glyph.bits
+                                        let bit = glyph.left + gx * 2 + dx;
+                                        if bit <= glyph.right
+                                            && bit < glyph.bits
                                             && glyph.rows[gy * 2 + dy]
                                                 & (1 << (glyph.bits - 1 - bit))
                                                 != 0
@@ -1075,7 +1076,7 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
                 }
             }
         } else if let Some(glyph) = assets.unicode.get(&ch) {
-            return glyph.bits.div_ceil(2) as i32 + 1;
+            return ((glyph.right - glyph.left + 1) / 2) as i32 + 1;
         } else {
             return glyph_width(Some(assets), '?');
         }
@@ -1179,6 +1180,8 @@ mod tests {
             crate::menu_assets::UnicodeGlyph {
                 rows: [u32::MAX; 16],
                 bits: 16,
+                left: 0,
+                right: 15,
             },
         );
         let mut canvas = Canvas::new(16, 10);

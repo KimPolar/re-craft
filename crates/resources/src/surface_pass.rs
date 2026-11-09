@@ -198,6 +198,28 @@ fn scan_column(
     Ok(())
 }
 
+// Each slot is bound to one immutable noise material for this surface pass.
+#[inline]
+fn cached_noise_kind(
+    slot: &mut Option<SurfaceBlockKind>,
+    state: &Value,
+    cache: &mut HashMap<Value, SurfaceBlockKind>,
+    classify: &mut impl FnMut(&Value) -> Result<SurfaceBlockKind>,
+) -> Result<SurfaceBlockKind> {
+    if let Some(kind) = *slot {
+        return Ok(kind);
+    }
+    let kind = if let Some(kind) = cache.get(state) {
+        *kind
+    } else {
+        let kind = classify(state)?;
+        cache.insert(state.clone(), kind);
+        kind
+    };
+    *slot = Some(kind);
+    Ok(kind)
+}
+
 /// Apply a rule to noise-stage blocks using already sampled biome identities.
 /// `preliminary` is the chunk surface-level density in Z, X order; its volume
 /// sampling must match the noise generator. Unknown block classifications fail.
@@ -227,23 +249,18 @@ pub fn apply_surface<P: ResourceProvider>(
     let air = Arc::new(json!("minecraft:air"));
     let lava = Arc::new(json!("minecraft:lava"));
     let mut cache = HashMap::<Value, SurfaceBlockKind>::new();
+    let mut material_kinds = [None; 4];
     let mut kinds = Vec::with_capacity(chunk.materials().len());
     let mut states = Vec::with_capacity(chunk.materials().len());
     let mut fluid_updates = chunk.fluid_updates().to_vec();
     for (index, material) in chunk.materials().iter().enumerate() {
-        let state = match material {
-            NoiseMaterial::DefaultBlock => &default_block,
-            NoiseMaterial::DefaultFluid => &default_fluid,
-            NoiseMaterial::Air => &air,
-            NoiseMaterial::Lava => &lava,
+        let (state, slot) = match material {
+            NoiseMaterial::DefaultBlock => (&default_block, &mut material_kinds[0]),
+            NoiseMaterial::DefaultFluid => (&default_fluid, &mut material_kinds[1]),
+            NoiseMaterial::Air => (&air, &mut material_kinds[2]),
+            NoiseMaterial::Lava => (&lava, &mut material_kinds[3]),
         };
-        let kind = if let Some(kind) = cache.get(state.as_ref()) {
-            *kind
-        } else {
-            let kind = classify(state)?;
-            cache.insert((**state).clone(), kind);
-            kind
-        };
+        let kind = cached_noise_kind(slot, state, &mut cache, &mut classify)?;
         // Aquifer scheduling is only recorded by Java when the selected state
         // actually contains fluid; an air result may still carry its raw flag.
         fluid_updates[index] &= kind == SurfaceBlockKind::Fluid;
@@ -461,6 +478,48 @@ mod tests {
         std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin")
     }
+    #[test]
+    fn noise_classification_preserves_aliases_and_failures() {
+        let air = json!("minecraft:air");
+        let stone = json!("minecraft:stone");
+        let mut cache = HashMap::new();
+        let mut slots = [None; 4];
+        let mut calls = Vec::new();
+        let mut fail = true;
+        let mut classify = |state: &Value| {
+            calls.push(state.clone());
+            if fail {
+                fail = false;
+                anyhow::bail!("unavailable state");
+            }
+            Ok(if *state == air {
+                SurfaceBlockKind::Air
+            } else {
+                SurfaceBlockKind::Solid
+            })
+        };
+        assert!(cached_noise_kind(&mut slots[0], &air, &mut cache, &mut classify).is_err());
+        assert_eq!(slots[0], None);
+        assert!(cache.is_empty());
+        assert_eq!(
+            cached_noise_kind(&mut slots[0], &air, &mut cache, &mut classify).unwrap(),
+            SurfaceBlockKind::Air
+        );
+        assert_eq!(
+            cached_noise_kind(&mut slots[1], &air, &mut cache, &mut classify).unwrap(),
+            SurfaceBlockKind::Air
+        );
+        assert_eq!(
+            cached_noise_kind(&mut slots[2], &stone, &mut cache, &mut classify).unwrap(),
+            SurfaceBlockKind::Solid
+        );
+        assert_eq!(
+            cached_noise_kind(&mut slots[0], &air, &mut cache, &mut classify).unwrap(),
+            SurfaceBlockKind::Air
+        );
+        assert_eq!(calls, [air.clone(), air, stone]);
+    }
+
     #[test]
     fn column_depths_and_water_reset_across_air_and_caves() {
         use SurfaceBlockKind::{Air as A, Fluid as F, Solid as S};

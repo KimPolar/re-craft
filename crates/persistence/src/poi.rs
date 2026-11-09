@@ -498,10 +498,10 @@ pub fn refresh_missing_chunk(
         first >= i32::from(i8::MIN) && end - 1 <= i32::from(i8::MAX),
         "POI refresh section out of range"
     );
-    let mut current: Option<SavedPoiChunk> = None;
+    let mut sections = Vec::new();
     for section_y in first..end {
         let refreshed = refresh_section(
-            current.as_ref(),
+            None,
             position,
             i8::try_from(section_y)?,
             world,
@@ -513,15 +513,43 @@ pub fn refresh_missing_chunk(
             "missing POI refresh discarded records"
         );
         if refreshed.changed {
-            current = Some(SavedPoiChunk::from_document(
-                refreshed
-                    .document
-                    .context("refreshed POI data is missing")?,
-                position,
-            )?);
+            let document = refreshed
+                .document
+                .context("refreshed POI data is missing")?;
+            let Tag::Compound(root) = document.value else {
+                bail!("refreshed POI root is invalid");
+            };
+            let (_, Tag::Compound(mut refreshed_sections)) = root
+                .into_iter()
+                .find(|(name, _)| name.matches("Sections"))
+                .context("refreshed POI sections are missing")?
+            else {
+                bail!("refreshed POI sections are invalid");
+            };
+            ensure!(
+                refreshed_sections.len() == 1,
+                "refreshed POI section count differs"
+            );
+            let entry = refreshed_sections.pop().expect("one section was checked");
+            ensure!(
+                entry.0.matches(&section_y.to_string()),
+                "refreshed POI section differs"
+            );
+            sections.push(entry);
         }
     }
-    Ok(current.map(|chunk| (*chunk.document).clone()))
+    if sections.is_empty() {
+        return Ok(None);
+    }
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![
+            ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+            ("Sections".into(), Tag::Compound(sections)),
+        ]),
+    };
+    decode_poi_chunk(document.clone(), position)?;
+    Ok(Some(document))
 }
 
 /// This document is an incomplete draft; it is not a write authorization.
@@ -1155,6 +1183,35 @@ mod tests {
         let draft = refresh_missing_chunk(pos, &world, -16, 48, |_| Ok(()))
             .unwrap()
             .unwrap();
+        let mut previous: Option<SavedPoiChunk> = None;
+        let mut reference_validation = Vec::new();
+        for section_y in -1..2 {
+            let refreshed = refresh_section(
+                previous.as_ref(),
+                pos,
+                section_y,
+                &world,
+                |state| {
+                    reference_validation.push(state.clone());
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            if refreshed.changed {
+                previous =
+                    Some(SavedPoiChunk::from_document(refreshed.document.unwrap(), pos).unwrap());
+            }
+        }
+        let mut actual_validation = Vec::new();
+        let actual = refresh_missing_chunk(pos, &world, -16, 48, |state| {
+            actual_validation.push(state.clone());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, *previous.unwrap().document);
+        assert_eq!(actual_validation, reference_validation);
         let decoded = decode_poi_chunk(draft, pos).unwrap();
         assert_eq!(decoded.sections.len(), 2);
         assert_eq!(decoded.sections[&-1].records.len(), 1);
@@ -1175,6 +1232,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "manual POI refresh timing"]
+    fn measure_missing_chunk_refresh_with_many_poi_sections() {
+        use std::{hint::black_box, time::Instant};
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut world = terrain(&[(2, "bell")]);
+        let chunk = Arc::make_mut(
+            world
+                .chunks
+                .get_mut(&loaded::ChunkPos { x: 0, z: 0 })
+                .unwrap(),
+        );
+        let section = Arc::clone(&chunk.sections[&0]);
+        for y in 1..24 {
+            chunk.sections.insert(y, Arc::clone(&section));
+        }
+        for sections in [3, 24] {
+            let run = || refresh_missing_chunk(pos, &world, 0, sections * 16, |_| Ok(())).unwrap();
+            assert_eq!(
+                decode_poi_chunk(run().unwrap(), pos)
+                    .unwrap()
+                    .sections
+                    .len(),
+                sections as usize
+            );
+            let start = Instant::now();
+            for _ in 0..20 {
+                black_box(run());
+            }
+            eprintln!(
+                "POI refresh: {sections} sections, 20 iterations, {:?}",
+                start.elapsed()
+            );
+        }
     }
 
     #[test]

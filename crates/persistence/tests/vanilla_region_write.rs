@@ -349,6 +349,18 @@ public class RegionWriteOracle {
         } else if (args[0].equals("verifyPoi")) {
             net.minecraft.server.Bootstrap.bootStrap();
             var ops = net.minecraft.core.RegistryAccess.fromRegistryOfRegistries(net.minecraft.core.registries.BuiltInRegistries.REGISTRY).createSerializationContext(NbtOps.INSTANCE);
+            try (var region = open(dir); var in = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
+                var root = NbtIo.read((DataInput)in);
+                var states = root.getListOrEmpty("sections").getCompoundOrEmpty(0).getCompoundOrEmpty("block_states");
+                var palette = states.getListOrEmpty("palette");
+                var words = states.getLongArray("data").orElseThrow();
+                int blockIndex = 1 + 16 + 256;
+                int paletteIndex = (int)((words[blockIndex / 16] >>> ((blockIndex % 16) * 4)) & 15L);
+                var raw = palette.get(paletteIndex);
+                if (raw instanceof CompoundTag wrapper && wrapper.contains("")) raw = wrapper.get("");
+                String id = raw instanceof StringTag text ? text.value() : ((CompoundTag)raw).getStringOr("id", "");
+                if (!id.equals("minecraft:bell")) throw new AssertionError("POI terrain block differs: " + id);
+            }
             Path poi = world.resolve("dimensions/minecraft/overworld/poi");
             try (var region = open(poi); var in = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
                 if (in == null) throw new AssertionError("missing POI chunk");
@@ -418,7 +430,8 @@ fn state(name: &str) -> BlockState {
 #[test]
 #[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
 fn java_reads_poi_region_created_in_coordinated_save() {
-    use native_persistence::nbt::{NamedTag, Tag, TagType};
+    use native_world::loaded::{self, BLOCK_COUNT, BlockState as RuntimeBlockState};
+    use std::{collections::BTreeMap, sync::Arc};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/region-test-temp");
     std::fs::create_dir_all(&root).unwrap();
     let temp = tempfile::Builder::new()
@@ -462,7 +475,15 @@ fn java_reads_poi_region_created_in_coordinated_save() {
         expected: state("minecraft:stone"),
         replacement: state("minecraft:dirt"),
     };
-    let mut draft = draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[change]).unwrap();
+    let bell_change = BlockChange {
+        x: 1,
+        y: 1,
+        z: 1,
+        expected: state("minecraft:stone"),
+        replacement: state("minecraft:bell"),
+    };
+    let mut draft =
+        draft_chunk_blocks(&original, ChunkPos { x: 0, z: 0 }, &[change, bell_change]).unwrap();
     draft
         .rebuild_heightmaps(
             HeightBounds {
@@ -480,32 +501,49 @@ fn java_reads_poi_region_created_in_coordinated_save() {
             },
         )
         .unwrap();
-    let poi = NamedTag {
-        name: "".into(),
-        value: Tag::Compound(vec![
-            ("DataVersion".into(), Tag::Int(5023)),
-            (
-                "Sections".into(),
-                Tag::Compound(vec![(
-                    "0".into(),
-                    Tag::Compound(vec![
-                        ("Valid".into(), Tag::Byte(1)),
-                        (
-                            "Records".into(),
-                            Tag::List {
-                                element_type: TagType::Compound,
-                                values: vec![Tag::Compound(vec![
-                                    ("pos".into(), Tag::IntArray(vec![1, 1, 1])),
-                                    ("type".into(), Tag::String("minecraft:meeting".into())),
-                                    ("free_tickets".into(), Tag::Int(32)),
-                                ])],
-                            },
-                        ),
-                    ]),
-                )]),
-            ),
-        ]),
-    };
+    let mut generated = loaded::World::new("minecraft:overworld");
+    let stone = generated.intern_state(RuntimeBlockState {
+        name: "minecraft:stone".into(),
+        properties: BTreeMap::new(),
+    });
+    let dirt = generated.intern_state(RuntimeBlockState {
+        name: "minecraft:dirt".into(),
+        properties: BTreeMap::new(),
+    });
+    let bell = generated.intern_state(RuntimeBlockState {
+        name: "minecraft:bell".into(),
+        properties: BTreeMap::new(),
+    });
+    let mut blocks = Box::new([stone; BLOCK_COUNT]);
+    blocks[0] = dirt;
+    blocks[1 + 16 + 256] = bell;
+    let position = loaded::ChunkPos { x: 0, z: 0 };
+    generated.chunks.insert(
+        position,
+        Arc::new(loaded::Chunk {
+            position,
+            status: Some("minecraft:full".into()),
+            block_light_correct: false,
+            sections: BTreeMap::from([(
+                0,
+                Arc::new(loaded::Section {
+                    blocks: Some(blocks),
+                    biomes: None,
+                    block_light: None,
+                    sky_light: None,
+                }),
+            )]),
+        }),
+    );
+    let poi = native_persistence::poi::refresh_missing_chunk(
+        ChunkPos { x: 0, z: 0 },
+        &generated,
+        0,
+        16,
+        |_| Ok(()),
+    )
+    .unwrap()
+    .expect("bell POI should be generated");
     let dimension = DimensionId::parse("overworld").unwrap();
     let mut plan = WorldSavePlan::new();
     plan.add_chunk(dimension.clone(), draft, 2).unwrap();

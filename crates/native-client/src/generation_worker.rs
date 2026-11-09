@@ -317,21 +317,14 @@ impl GenerationReady {
             .region
             .water_source_conversion()
             .context("postprocessed water conversion rule is missing")?;
-        let targets = self
-            .mesh
-            .targets
-            .as_ref()
-            .context("generated targets are missing")?;
+        ensure!(self.mesh.targets.is_some(), "generated targets are missing");
         let regions = if structures {
             self.batch
                 .prepare_converted_structure_region_drafts(&processed.region, region_timestamp)?
                 .regions
         } else {
-            self.batch.postprocessed_region_drafts(
-                &processed.region,
-                targets.iter().copied(),
-                region_timestamp,
-            )?
+            self.batch
+                .converted_region_drafts(&processed.region, region_timestamp)?
         };
         progress(InitialWorldStageProgress::Preparing)?;
         // Reject incomplete regions before constructing the initial session.
@@ -1734,20 +1727,20 @@ impl GenerationWorker {
                     };
                     ready = result;
                 } else {
-                    let next_revision = ready
-                        .mesh
-                        .revision
-                        .checked_add(1)
-                        .context("mesh revision overflow")?;
-                    let postprocessor = Self::postprocess(
+                    let Some(result) = complete_initial_postprocessing(
                         ready,
-                        targets.iter().copied().collect(),
-                        0,
-                        0,
+                        &mut resources,
+                        &mut classify,
+                        &mut resolve,
+                        None::<&mut crate::fresh_generation::HeightClassifier>,
+                        &mut build,
+                        &mut construct,
+                        spawn_mobs,
                         water_source_conversion,
-                        next_revision,
-                    )?;
-                    let Some(result) = wait_nested_generation(postprocessor, cancelled, progress)?
+                        biome_blend,
+                        cancelled,
+                        progress,
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -2053,20 +2046,20 @@ impl GenerationWorker {
                 };
                 result
             } else {
-                let next_revision = ready
-                    .mesh
-                    .revision
-                    .checked_add(1)
-                    .context("mesh revision overflow")?;
-                let postprocessor = Self::postprocess(
+                let Some(result) = complete_initial_postprocessing(
                     ready,
-                    targets.iter().copied().collect(),
-                    0,
-                    0,
+                    &mut provider,
+                    &mut classify,
+                    &mut resolve,
+                    Some(&mut classify_height),
+                    &mut build,
+                    &mut construct,
+                    spawn_mobs,
                     water_source_conversion,
-                    next_revision,
-                )?;
-                let Some(result) = wait_nested_generation(postprocessor, cancelled, progress)?
+                    biome_blend,
+                    cancelled,
+                    progress,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -2834,9 +2827,202 @@ where
     Ok(true)
 }
 
-/// Complete an initial bonus attempt without committing a partial placement.
-/// Only a neighbor actually requested by the feature is generated and added.
+/// Retry initial postprocessing after preparing a requested neighboring chunk.
+/// Each failed attempt is discarded before its partial edits can be committed.
 #[allow(clippy::too_many_arguments)]
+fn complete_initial_postprocessing<P, C, R, H, M, K>(
+    mut ready: GenerationReady,
+    provider: &mut P,
+    classify: &mut C,
+    resolve: &mut R,
+    mut structure_height: Option<&mut H>,
+    build_spawner: &mut M,
+    construct: &mut K,
+    spawn_mobs: bool,
+    water_source_conversion: bool,
+    biome_blend: u8,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+) -> Result<Option<GenerationReady>>
+where
+    P: ResourceProvider,
+    C: FnMut(&Value) -> Result<CarverBlockState>,
+    R: FnMut(&Value) -> Result<BlockState>,
+    H: FnMut(&Value) -> Result<native_persistence::heightmap::BlockHeightFlags>,
+    M: FnMut(
+        &FreshTerrainBatch,
+        &mut P,
+        ChunkPos,
+    ) -> Result<native_session::worldgen::GeneratedSheepSpawner>,
+    K: FnMut(
+        &native_resources::packs::ResourceId,
+    ) -> Result<native_session::worldgen::FreshCreatureConstruction>,
+{
+    use native_session::worldgen::PostprocessingAttempt;
+    ensure!(
+        ready.postprocessed.is_none(),
+        "generation was already postprocessed"
+    );
+    ensure!(
+        ready.batch.supports_structure_expansion() == structure_height.is_some(),
+        "postprocessing structure inputs do not match the batch"
+    );
+    let suggestion = ready
+        .suggested_spawn
+        .context("initial world spawn is missing")?;
+    let targets = checked_spawn_targets(&mut ready)?;
+    let mut converted_order: Vec<_> = targets.iter().copied().collect();
+    let required_neighbors = initialized_neighbors(&targets)?;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let converted = checked_spawn_targets(&mut ready)?;
+        ensure!(
+            converted.iter().copied().collect::<BTreeSet<_>>()
+                == converted_order.iter().copied().collect(),
+            "converted chunk registration order is inconsistent"
+        );
+        let mut missing = required_neighbors.difference(&converted).next().copied();
+        let mut completed_stage = None;
+        if missing.is_none() {
+            let mut stage = ready.batch.begin_generated_postprocessing_with_neighbors(
+                targets.iter().copied(),
+                converted_order.iter().copied(),
+                0,
+                0,
+            )?;
+            stage.set_water_source_conversion(water_source_conversion)?;
+            set_phase(progress, GenerationPhase::Postprocessing);
+            'chunks: for &pos in &targets {
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    match stage.try_poll(pos, 256).with_context(|| {
+                        format!(
+                            "initial postprocessing failed for chunk {}, {}",
+                            pos.x, pos.z
+                        )
+                    })? {
+                        PostprocessingAttempt::Progress { complete: true } => break,
+                        PostprocessingAttempt::Progress { complete: false } => {}
+                        PostprocessingAttempt::NeedsChunk(pos) => {
+                            missing = Some(pos);
+                            break 'chunks;
+                        }
+                    }
+                }
+                let mut state = progress.lock().unwrap_or_else(|error| error.into_inner());
+                state.completed_steps = state.completed_steps.saturating_add(1);
+            }
+            if missing.is_none() {
+                completed_stage = Some(stage);
+            }
+        }
+        if let Some(needed) = missing {
+            ensure!(
+                !converted.contains(&needed),
+                "postprocessing requested an already converted chunk"
+            );
+            // Discard the isolated attempt and replay the chosen chunk order
+            // after expansion, without exposing its partial edits or ticks.
+            let revision = ready
+                .mesh
+                .revision
+                .checked_add(1)
+                .context("mesh revision overflow")?;
+            if let Some(classify_height) = &mut structure_height {
+                if !prepare_structure_expansion(
+                    &mut ready.batch,
+                    needed,
+                    provider,
+                    *classify_height,
+                    cancelled,
+                    progress,
+                )? {
+                    return Ok(None);
+                }
+            }
+            let Some(mut expanded) = expand_with_inputs(
+                ready,
+                needed,
+                provider,
+                classify,
+                resolve,
+                revision,
+                biome_blend,
+                cancelled,
+                progress,
+            )?
+            else {
+                return Ok(None);
+            };
+            expanded.suggested_spawn = Some(suggestion);
+            let targets = checked_spawn_targets(&mut expanded)?;
+            if !complete_creature_spawning_with_inputs(
+                &mut expanded,
+                &targets,
+                provider,
+                classify,
+                resolve,
+                build_spawner,
+                construct,
+                spawn_mobs,
+                cancelled,
+                progress,
+            )? {
+                return Ok(None);
+            }
+            converted_order.push(needed);
+            ready = expanded;
+            continue;
+        }
+        let stage = completed_stage.context("initial postprocessing did not complete")?;
+        let mut draft_stage = stage.clone();
+        let chunks = ready
+            .batch
+            .converted_chunk_drafts(&mut draft_stage, converted_order.iter().copied())?;
+        let region = stage.finish()?;
+        let revision = ready
+            .mesh
+            .revision
+            .checked_add(1)
+            .context("postprocessed mesh revision overflow")?;
+        ready.mesh = MeshJob::for_generated(
+            &mut ready.batch,
+            targets.clone(),
+            revision,
+            ready.mesh.biome_blend,
+            ready.mesh.origin,
+        )?;
+        let revision = revision
+            .checked_add(1)
+            .context("postprocessed mesh revision overflow")?;
+        let mesh = MeshJob::for_postprocessed(
+            &ready.batch,
+            &region,
+            targets.clone(),
+            revision,
+            ready.mesh.biome_blend,
+            ready.mesh.origin,
+        )?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        ready.postprocessed = Some(PostprocessedGeneration {
+            activated_ticks: region.ticks().activated_snapshot(),
+            sealed_world: Arc::clone(&region.world),
+            sealed_mesh: Some(mesh.clone()),
+            mesh: Some(mesh),
+            region,
+            chunks,
+            initial_bonus_chest: None,
+        });
+        return Ok(Some(ready));
+    }
+}
+
 fn complete_bonus_postprocessing<C, R, H, M, K>(
     mut ready: GenerationReady,
     feature: Option<native_resources::bonus_chest::BonusChestFeature>,
@@ -3101,6 +3287,7 @@ where
             .targets
             .as_deref()
             .context("generated targets are missing")?;
+        let mut structure_source_expansion = false;
         let needed = if adjusted && !targets.contains(&center_chunk) {
             previous_search = None;
             checkpoint = None;
@@ -3151,6 +3338,30 @@ where
                 match ready.poll_player_spawn(&session, &mut search, ceiling_spawn_height, 256)? {
                     SpawnProgress::Pending => continue,
                     SpawnProgress::Found(pos) => {
+                        let missing = if structure_height.is_some() {
+                            if let Some(processed) = &ready.postprocessed {
+                                let converted = processed
+                                    .region
+                                    .ticks()
+                                    .registration_order()
+                                    .iter()
+                                    .copied()
+                                    .collect();
+                                ready
+                                    .batch
+                                    .missing_structure_reference_sources(&converted)?
+                                    .into_iter()
+                                    .next()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(source) = missing {
+                            structure_source_expansion = true;
+                            break source;
+                        }
                         ready.player_spawn = Some(pos);
                         return Ok(Some(ready));
                     }
@@ -3192,7 +3403,7 @@ where
                 return Ok(None);
             }
         }
-        let Some(mut expanded) = expand_with_inputs(
+        let Some(mut expanded) = expand_with_inputs_inner(
             ready,
             needed,
             provider,
@@ -3202,12 +3413,17 @@ where
             biome_blend,
             cancelled,
             progress,
+            !structure_source_expansion,
         )?
         else {
             return Ok(None);
         };
         expanded.suggested_spawn = Some(suggestion);
-        let targets = checked_spawn_targets(&mut expanded)?;
+        let targets = if structure_source_expansion {
+            BTreeSet::from([needed])
+        } else {
+            checked_spawn_targets(&mut expanded)?
+        };
         if !complete_creature_spawning_with_inputs(
             &mut expanded,
             &targets,
@@ -3223,24 +3439,130 @@ where
             return Ok(None);
         }
         if let Some((mut processed, checkpoint)) = postprocessed {
+            use native_session::worldgen::PostprocessingAttempt;
             expanded
                 .batch
                 .rebase_postprocessing_after_expansion(&mut processed.region, &checkpoint)?;
-            let mut stage = expanded
-                .batch
-                .resume_generated_postprocessing(&processed.region)?;
-            expanded
-                .batch
-                .register_generated_postprocessing_chunk(&mut stage, needed)?;
-            set_phase(progress, GenerationPhase::Postprocessing);
-            loop {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                if stage.poll(needed, 256)? {
-                    break;
-                }
+            if structure_source_expansion {
+                let mut baseline = expanded
+                    .batch
+                    .resume_generated_postprocessing(&processed.region)?;
+                expanded
+                    .batch
+                    .register_generated_postprocessing_neighbor(&mut baseline, needed)?;
+                processed.region = baseline.finish()?;
             }
+            let mut register =
+                (!processed.region.deferred_chunks().any(|pos| pos == needed)).then_some(needed);
+            let stage = if structure_source_expansion {
+                expanded
+                    .batch
+                    .resume_generated_postprocessing(&processed.region)?
+            } else {
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if let Some(pos) = register.take() {
+                        let mut baseline = expanded
+                            .batch
+                            .resume_generated_postprocessing(&processed.region)?;
+                        expanded
+                            .batch
+                            .register_generated_postprocessing_neighbor(&mut baseline, pos)?;
+                        processed.region = baseline.finish()?;
+                    }
+                    let mut attempt = expanded
+                        .batch
+                        .resume_generated_postprocessing(&processed.region)?;
+                    attempt.request_converted_chunk(needed)?;
+                    set_phase(progress, GenerationPhase::Postprocessing);
+                    let missing = loop {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                        match attempt.try_poll(needed, 256)? {
+                            PostprocessingAttempt::Progress { complete: true } => break None,
+                            PostprocessingAttempt::Progress { complete: false } => {}
+                            PostprocessingAttempt::NeedsChunk(pos) => break Some(pos),
+                        }
+                    };
+                    let Some(missing) = missing else {
+                        break attempt;
+                    };
+                    ensure!(
+                        !processed
+                            .region
+                            .ticks()
+                            .registration_order()
+                            .contains(&missing),
+                        "postprocessing requested an already converted chunk"
+                    );
+                    // Discard the incomplete target pass. Expand only its missing
+                    // neighbor and retry against the same completed-chunk history.
+                    let checkpoint = expanded
+                        .batch
+                        .checkpoint_postprocessing_expansion(&processed.region)?;
+                    let revision = expanded
+                        .mesh
+                        .revision
+                        .checked_add(1)
+                        .context("mesh revision overflow")?;
+                    if let Some(classify_height) = &mut structure_height {
+                        if !prepare_structure_expansion(
+                            &mut expanded.batch,
+                            missing,
+                            provider,
+                            classify_height,
+                            cancelled,
+                            progress,
+                        )? {
+                            return Ok(None);
+                        }
+                    }
+                    let Some(mut next) = expand_with_inputs_inner(
+                        expanded,
+                        missing,
+                        provider,
+                        classify,
+                        resolve,
+                        revision,
+                        biome_blend,
+                        cancelled,
+                        progress,
+                        false,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    next.suggested_spawn = Some(suggestion);
+                    if !complete_creature_spawning_with_inputs(
+                        &mut next,
+                        &BTreeSet::from([missing]),
+                        provider,
+                        classify,
+                        resolve,
+                        build_spawner,
+                        construct,
+                        spawn_mobs,
+                        cancelled,
+                        progress,
+                    )? {
+                        return Ok(None);
+                    }
+                    next.batch.rebase_postprocessing_after_expansion(
+                        &mut processed.region,
+                        &checkpoint,
+                    )?;
+                    expanded = next;
+                    register = Some(missing);
+                }
+            };
+            let converted = processed.region.ticks().registration_order().to_vec();
+            let mut draft_stage = stage.clone();
+            let chunks = expanded
+                .batch
+                .converted_chunk_drafts(&mut draft_stage, converted)?;
             let region = stage.finish()?;
             let targets = expanded
                 .mesh
@@ -3264,9 +3586,7 @@ where
                 expanded.mesh.biome_blend,
                 expanded.mesh.origin,
             )?;
-            processed.chunks = expanded
-                .batch
-                .postprocessed_chunk_drafts(&region, region.chunks.iter().copied())?;
+            processed.chunks = chunks;
             processed.activated_ticks = region.ticks().activated_snapshot();
             processed.sealed_world = Arc::clone(&region.world);
             processed.sealed_mesh = Some(mesh.clone());
@@ -3763,6 +4083,33 @@ fn expand_with_inputs(
     cancelled: &AtomicBool,
     progress: &Mutex<GenerationProgress>,
 ) -> Result<Option<GenerationReady>> {
+    expand_with_inputs_inner(
+        ready,
+        target,
+        provider,
+        classify,
+        resolve,
+        revision,
+        biome_blend,
+        cancelled,
+        progress,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_with_inputs_inner(
+    ready: GenerationReady,
+    target: ChunkPos,
+    provider: &mut impl ResourceProvider,
+    classify: &mut impl FnMut(&Value) -> Result<CarverBlockState>,
+    resolve: &mut impl FnMut(&Value) -> Result<BlockState>,
+    revision: u64,
+    biome_blend: u8,
+    cancelled: &AtomicBool,
+    progress: &Mutex<GenerationProgress>,
+    publish_target: bool,
+) -> Result<Option<GenerationReady>> {
     let GenerationReady {
         mut batch,
         mesh,
@@ -3798,7 +4145,13 @@ fn expand_with_inputs(
         Arc::ptr_eq(&previous, &mesh.world),
         "generated mesh snapshot is stale"
     );
-    ensure!(targets.insert(target), "generation target is already ready");
+    ensure!(
+        !targets.contains(&target),
+        "generation target is already ready"
+    );
+    if publish_target {
+        targets.insert(target);
+    }
     let initialized = initialized_neighbors(&BTreeSet::from([target]))?;
     if cancelled.load(Ordering::Relaxed) {
         return Ok(None);
@@ -8248,6 +8601,157 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3; initial overworld generation is incomplete"]
+    fn installed_overworld_prepares_initial_player_and_stage() -> Result<()> {
+        use crate::fresh_generation::prepare;
+        use std::time::Duration;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let saved_border = native_persistence::world::SavedWorldBorder::default();
+        let border = native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?;
+        let worker = GenerationWorker::start_initial_world_with_player(
+            move || {
+                let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
+                settings.seed = crate::chat_input::ChatInput::field("42");
+                settings.generate_structures = false;
+                let frozen = settings.freeze(game, None);
+                let mut inputs =
+                    prepare(frozen.generation)?.into_new_world_inputs(border, true, true)?;
+                inputs.set_level_settings(frozen.level)?;
+                Ok(inputs)
+            },
+            1,
+            0,
+            None,
+            InitialPlayerSpawnOptions {
+                radius: 10,
+                adventure: false,
+                random_seed: 1234,
+                saved_border: Some(saved_border),
+            },
+        )?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(900);
+        let mut ready = loop {
+            match worker.result.recv_timeout(Duration::from_secs(20)) {
+                Ok(GenerationResult::Ready(ready)) => break ready,
+                Ok(GenerationResult::Failed(error)) => {
+                    return Err(
+                        error.context(format!("generation progress: {:?}", worker.progress()))
+                    );
+                }
+                Ok(GenerationResult::Cancelled) => {
+                    anyhow::bail!("initial world generation was cancelled")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {
+                    eprintln!("initial generation: {:?}", worker.progress())
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let spawn = ready.player_spawn.context("initial player spawn missing")?;
+        let targets = ready
+            .mesh
+            .targets
+            .as_ref()
+            .context("generated targets missing")?;
+        assert!(targets.contains(&ChunkPos {
+            x: spawn.x.div_euclid(16),
+            z: spawn.z.div_euclid(16)
+        }));
+        let temp = tempfile::tempdir()?;
+        let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
+        let mut reader = native_persistence::world::WorldReader::open(
+            staged.stage.path(),
+            native_persistence::world::DimensionId::parse("overworld")?,
+        )?;
+        assert_eq!(reader.saved_world_seed()?, Some(42));
+        assert!(
+            reader
+                .read_chunk(spawn.x.div_euclid(16), spawn.z.div_euclid(16))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3 and structure-aware initial generation"]
+    fn installed_structured_overworld_seed_zero_prepares_initial_player_and_stage() -> Result<()> {
+        check_structured_overworld_seed(0)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft 26.3 and structure-aware initial generation"]
+    fn installed_structured_overworld_negative_seed_prepares_initial_player_and_stage() -> Result<()>
+    {
+        check_structured_overworld_seed(-1)
+    }
+
+    fn check_structured_overworld_seed(seed: i64) -> Result<()> {
+        use std::time::Duration;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let saved_border = native_persistence::world::SavedWorldBorder::default();
+        let border = native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?;
+        let mut settings = crate::world_creation::WorldCreationSettings::new("Test".into());
+        settings.seed = crate::chat_input::ChatInput::field(&seed.to_string());
+        settings.generate_structures = true;
+        let worker = GenerationWorker::start_structured_initial_world(
+            settings.freeze(game, None),
+            StructuredInitialOptions {
+                border,
+                spawn_mobs: true,
+                advance_time: true,
+                water_source_conversion: true,
+                player: InitialPlayerSpawnOptions {
+                    radius: 10,
+                    adventure: false,
+                    random_seed: 1234,
+                    saved_border: Some(saved_border),
+                },
+                ceiling_spawn_height: None,
+                initial_bonus_seed: None,
+            },
+            1,
+            0,
+        )?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(900);
+        let mut ready = loop {
+            match worker.result.recv_timeout(Duration::from_secs(20)) {
+                Ok(GenerationResult::Ready(ready)) => break ready,
+                Ok(GenerationResult::Failed(error)) => {
+                    return Err(error.context(format!(
+                        "seed {seed} generation progress: {:?}",
+                        worker.progress()
+                    )));
+                }
+                Ok(GenerationResult::Cancelled) => {
+                    anyhow::bail!("seed {seed} generation cancelled")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {
+                    eprintln!("seed {seed} generation: {:?}", worker.progress());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let spawn = ready.player_spawn.context("initial player spawn missing")?;
+        let temp = tempfile::tempdir()?;
+        let staged = ready.stage_structure_initial_world(temp.path(), 123, 1)?;
+        let mut reader = native_persistence::world::WorldReader::open(
+            staged.path(),
+            native_persistence::world::DimensionId::parse("overworld")?,
+        )?;
+        assert_eq!(reader.saved_world_seed()?, Some(seed));
+        assert!(
+            reader
+                .read_chunk(spawn.x.div_euclid(16), spawn.z.div_euclid(16))?
+                .is_some()
+        );
         Ok(())
     }
 

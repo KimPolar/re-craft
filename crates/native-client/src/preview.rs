@@ -3636,6 +3636,7 @@ mod tests {
                 name: "World".into(),
                 session: session_settings,
                 packs: None,
+                game_rules: Default::default(),
             }),
             initial_respawn: None,
             postprocessed: None,
@@ -3901,6 +3902,12 @@ mod tests {
             ceiling_spawn_height: None,
             height_tags: Arc::clone(&spawn_tags),
         });
+        expanded
+            .level_settings
+            .as_mut()
+            .unwrap()
+            .game_rules
+            .respawn_radius = 0;
         let draft = expanded.draft_initial_level_data(123, None, false).unwrap();
         assert_eq!(
             draft
@@ -3985,10 +3992,22 @@ mod tests {
             command_data: Default::default(),
             fluid_environment: Default::default(),
         }));
+        expanded
+            .level_settings
+            .as_mut()
+            .unwrap()
+            .game_rules
+            .advance_time = false;
         let mut stopped = expanded.start_session(player).unwrap();
         stopped.update(std::time::Duration::from_millis(150));
         assert_eq!(stopped.world_clock(&clock_id).unwrap().total_ticks, 0);
         expanded.initial_clocks = Some(Arc::clone(&initial_clocks));
+        expanded
+            .level_settings
+            .as_mut()
+            .unwrap()
+            .game_rules
+            .advance_time = true;
         assert_eq!(
             session
                 .generated_spawn_column_candidate(16, 8, None, &expanded_targets)

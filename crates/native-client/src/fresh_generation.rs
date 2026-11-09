@@ -124,6 +124,13 @@ impl PreparedInitialWorld {
         &mut self,
         settings: crate::world_creation::FrozenLevelSettings,
     ) -> Result<()> {
+        settings.game_rules.new_world_document()?;
+        ensure!(
+            settings.game_rules.spawn_mobs == self.spawn_mobs
+                && settings.game_rules.spawn_mobs == self.initial_clocks.spawn_mobs
+                && settings.game_rules.advance_time == self.initial_clocks.advance_time,
+            "game rules differ from the prepared generation inputs"
+        );
         ensure!(
             self.worldgen_settings
                 .value

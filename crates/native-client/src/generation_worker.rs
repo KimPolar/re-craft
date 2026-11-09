@@ -319,17 +319,20 @@ impl GenerationReady {
             settings.session.seed,
             clocks,
         )?;
-        draft.set_game_rules(native_persistence::world::FluidGameRules {
-            spawn_mobs: clock_data.spawn_mobs,
-            advance_time: clock_data.advance_time,
-            water_source_conversion,
-            respawn_radius: self
-                .initial_respawn
-                .as_ref()
-                .context("initial respawn settings are missing")?
-                .radius,
-            ..Default::default()
-        })?;
+        let rules = settings.game_rules;
+        ensure!(
+            rules.spawn_mobs == clock_data.spawn_mobs
+                && rules.advance_time == clock_data.advance_time
+                && rules.water_source_conversion == water_source_conversion
+                && rules.respawn_radius
+                    == self
+                        .initial_respawn
+                        .as_ref()
+                        .context("initial respawn settings are missing")?
+                        .radius,
+            "game rules differ from the initial generation state"
+        );
+        draft.set_game_rules(rules)?;
         let dimension = DimensionId::parse(&self.mesh.world.dimension)?;
         for ((_, _, _), region) in regions {
             draft.add_region(dimension.clone(), region)?;
@@ -920,6 +923,28 @@ impl GenerationReady {
         }
         if let Some(level) = &self.level_settings {
             let settings = level.session;
+            let rules = level.game_rules;
+            rules.new_world_document()?;
+            if let Some(initial) = &self.initial_clocks {
+                ensure!(
+                    initial.spawn_mobs == rules.spawn_mobs
+                        && initial.advance_time == rules.advance_time,
+                    "game rules differ from the initial clock and mob settings"
+                );
+            }
+            if let Some(respawn) = &self.initial_respawn {
+                ensure!(
+                    respawn.radius == rules.respawn_radius,
+                    "respawn radius differs from frozen game rules"
+                );
+            }
+            if let Some(processed) = &self.postprocessed {
+                ensure!(
+                    processed.region.water_source_conversion()
+                        == Some(rules.water_source_conversion),
+                    "water conversion rule differs from postprocessing"
+                );
+            }
             session.set_game_mode(settings.mode);
             session.set_game_master_permission(settings.allow_commands);
             session.set_world_seed(Some(settings.seed));
@@ -929,8 +954,22 @@ impl GenerationReady {
             )?;
             session.set_survival_rules(native_session::survival::SurvivalRules {
                 difficulty: settings.difficulty,
-                ..Default::default()
+                natural_health_regeneration: rules.natural_health_regeneration,
+                fall_damage: rules.fall_damage,
             });
+            session.set_random_tick_speed(rules.random_tick_speed as u32);
+            session.set_death_rules(native_session::DeathRules {
+                keep_inventory: rules.keep_inventory,
+                immediate_respawn: rules.immediate_respawn,
+                show_death_messages: rules.show_death_messages,
+            });
+            session.set_block_drops(rules.block_drops);
+            session.set_entity_drops(rules.entity_drops);
+            session.set_source_conversion(
+                rules.water_source_conversion,
+                rules.lava_source_conversion,
+            );
+            session.set_weather(None, None, rules.advance_weather);
             session.set_player_vitals(native_session::survival::PlayerVitals {
                 hardcore: settings.hardcore,
                 ..Default::default()
@@ -1073,6 +1112,14 @@ impl GenerationWorker {
         biome_blend: u8,
     ) -> Result<Self> {
         frozen.validate()?;
+        let rules = frozen.level.game_rules;
+        ensure!(
+            options.spawn_mobs == rules.spawn_mobs
+                && options.advance_time == rules.advance_time
+                && options.water_source_conversion == rules.water_source_conversion
+                && options.player.radius == rules.respawn_radius,
+            "initial generation options differ from frozen game rules"
+        );
         ensure!(
             frozen.generation.structures_enabled,
             "structures must be enabled"
@@ -1453,6 +1500,16 @@ impl GenerationWorker {
                 initial_clocks.spawn_mobs == spawn_mobs,
                 "mob spawning rule differs from initial generation inputs"
             );
+            let water_source_conversion = if let Some(level) = &level_settings {
+                ensure!(
+                    level.game_rules.spawn_mobs == spawn_mobs
+                        && level.game_rules.advance_time == initial_clocks.advance_time,
+                    "game rules differ from initial generation inputs"
+                );
+                level.game_rules.water_source_conversion
+            } else {
+                true
+            };
             let pack_snapshot = resources.data_pack_snapshot();
             let Some(mut ready) = generate_spawn_origin(
                 batch,
@@ -1530,7 +1587,7 @@ impl GenerationWorker {
                         &mut build,
                         &mut construct,
                         spawn_mobs,
-                        true,
+                        water_source_conversion,
                         biome_blend,
                         cancelled,
                         progress,
@@ -1550,7 +1607,7 @@ impl GenerationWorker {
                         targets.iter().copied().collect(),
                         0,
                         0,
-                        true,
+                        water_source_conversion,
                         next_revision,
                     )?;
                     let Some(result) = wait_nested_generation(postprocessor, cancelled, progress)?
@@ -1567,6 +1624,10 @@ impl GenerationWorker {
                         player.adventure
                             == (level.session.mode == native_session::GameMode::Adventure),
                         "player spawn game mode differs from the frozen world settings"
+                    );
+                    ensure!(
+                        player.radius == level.game_rules.respawn_radius,
+                        "player spawn radius differs from frozen game rules"
                     );
                 }
                 let initial_respawn =
@@ -1738,6 +1799,12 @@ impl GenerationWorker {
                 ensure!(
                     player.adventure == (level.session.mode == native_session::GameMode::Adventure),
                     "player spawn game mode differs from the frozen world settings"
+                );
+                ensure!(
+                    player.radius == level.game_rules.respawn_radius
+                        && spawn_mobs == level.game_rules.spawn_mobs
+                        && water_source_conversion == level.game_rules.water_source_conversion,
+                    "initial generation options differ from frozen game rules"
                 );
             }
             let bonus_enabled = match ready
@@ -4111,7 +4178,8 @@ mod tests {
 
     #[test]
     fn structured_initial_world_rejects_inconsistent_settings_before_start() {
-        let creation = crate::world_creation::WorldCreationSettings::new("World".into());
+        let mut creation = crate::world_creation::WorldCreationSettings::new("World".into());
+        creation.game_rules.respawn_radius = 0;
         let options = || StructuredInitialOptions {
             border: native_session::respawn::RespawnBorder {
                 min_x: -100.0,
@@ -4140,6 +4208,12 @@ mod tests {
         let frozen = creation.freeze(std::path::PathBuf::new(), None);
         let mut mismatched = options();
         mismatched.player.adventure = true;
+        assert!(
+            GenerationWorker::start_structured_initial_world(frozen, mismatched, 1, 0).is_err()
+        );
+        let frozen = creation.freeze(std::path::PathBuf::new(), None);
+        let mut mismatched = options();
+        mismatched.water_source_conversion = false;
         assert!(
             GenerationWorker::start_structured_initial_world(frozen, mismatched, 1, 0).is_err()
         );
@@ -4390,6 +4464,10 @@ mod tests {
         creation.mode = crate::world_creation::GameMode::Creative;
         creation.difficulty = crate::world_creation::Difficulty::Hard;
         creation.bonus_chest = true;
+        creation.game_rules.advance_time = false;
+        creation.game_rules.respawn_radius = 0;
+        creation.game_rules.keep_inventory = true;
+        creation.game_rules.random_tick_speed = 0;
         let frozen = creation.freeze(game.clone(), Some((world.clone(), selection)));
         let saved_border = native_persistence::world::SavedWorldBorder::default();
         let initial_worker = GenerationWorker::start_structured_initial_world(
@@ -4536,6 +4614,8 @@ mod tests {
         assert!(!staged_rules.advance_time);
         assert!(staged_rules.water_source_conversion);
         assert_eq!(staged_rules.respawn_radius, 0);
+        assert!(staged_rules.keep_inventory);
+        assert_eq!(staged_rules.random_tick_speed, 0);
         drop(staged_reader);
         assert!(initial_ready.hut_generation.is_none());
         let initial = initial_ready.start_initial_player_session(123)?;
@@ -6538,6 +6618,10 @@ mod tests {
                         allow_commands: false,
                     },
                     packs: Some(packs),
+                    game_rules: native_persistence::world::FluidGameRules {
+                        spawn_mobs: false,
+                        ..Default::default()
+                    },
                 })?;
                 Ok(inputs)
             },
@@ -6939,6 +7023,9 @@ mod tests {
                 move || {
                     let mut settings =
                         crate::world_creation::WorldCreationSettings::new("Test".into());
+                    settings.game_rules.spawn_mobs = spawn_mobs;
+                    settings.game_rules.water_source_conversion = spawn_mobs;
+                    settings.game_rules.keep_inventory = !spawn_mobs;
                     settings.seed = crate::chat_input::ChatInput::field("42");
                     settings.mode = crate::world_creation::GameMode::Creative;
                     settings.difficulty = crate::world_creation::Difficulty::Easy;
@@ -7398,6 +7485,8 @@ mod tests {
                 let rules = reader.fluid_game_rules()?;
                 assert!(!rules.spawn_mobs);
                 assert!(rules.advance_time);
+                assert!(!rules.water_source_conversion);
+                assert!(rules.keep_inventory);
                 assert_eq!(rules.respawn_radius, 10);
                 drop(reader);
                 drop(staged);
@@ -7485,7 +7574,7 @@ mod tests {
                     positions,
                     0,
                     0,
-                    true,
+                    false,
                     next_revision,
                     InitialBonusChestRequest {
                         feature: None,

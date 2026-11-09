@@ -132,6 +132,7 @@ pub struct FrozenWorldCreation {
 impl FrozenWorldCreation {
     /// Reject settings mixed from different create-world selections.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.level.game_rules.new_world_document()?;
         anyhow::ensure!(
             self.generation.seed == self.level.session.seed,
             "session seed differs from the generation seed"
@@ -159,6 +160,7 @@ pub struct FrozenLevelSettings {
     pub name: String,
     pub session: InitialSessionSettings,
     pub packs: Option<native_resources::datapacks::DataPackSettings>,
+    pub game_rules: native_persistence::world::FluidGameRules,
 }
 
 impl FrozenLevelSettings {
@@ -218,6 +220,7 @@ pub struct WorldCreationSettings {
     pub allow_commands: Option<bool>,
     pub generate_structures: bool,
     pub bonus_chest: bool,
+    pub game_rules: native_persistence::world::FluidGameRules,
     pub preset: native_resources::packs::ResourceId,
     preset_index: usize,
 }
@@ -232,6 +235,7 @@ impl WorldCreationSettings {
             allow_commands: None,
             generate_structures: true,
             bonus_chest: false,
+            game_rules: Default::default(),
             preset: native_resources::packs::ResourceId::parse("minecraft:normal")
                 .expect("built-in preset"),
             preset_index: 0,
@@ -371,6 +375,7 @@ impl WorldCreationSettings {
                 name: self.name.value().to_owned(),
                 session,
                 packs,
+                game_rules: self.game_rules,
             },
         }
     }
@@ -400,6 +405,24 @@ mod tests {
         frozen.level.packs.as_mut().unwrap().enabled.reverse();
         assert!(frozen.validate().is_err());
         frozen.level.packs = None;
+        assert!(frozen.validate().is_err());
+    }
+
+    #[test]
+    fn frozen_game_rules_remain_stable_and_reject_invalid_values() {
+        let mut settings = WorldCreationSettings::new("World".into());
+        settings.game_rules.spawn_mobs = false;
+        settings.game_rules.advance_time = false;
+        settings.game_rules.keep_inventory = true;
+        settings.game_rules.respawn_radius = 4;
+        let mut frozen = settings.freeze(PathBuf::from("game"), None);
+        settings.game_rules = Default::default();
+        assert!(!frozen.level.game_rules.spawn_mobs);
+        assert!(!frozen.level.game_rules.advance_time);
+        assert!(frozen.level.game_rules.keep_inventory);
+        assert_eq!(frozen.level.game_rules.respawn_radius, 4);
+        frozen.validate().unwrap();
+        frozen.level.game_rules.random_tick_speed = -1;
         assert!(frozen.validate().is_err());
     }
 

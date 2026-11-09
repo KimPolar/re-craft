@@ -270,6 +270,17 @@ impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedPortalPlacemen
             .place(region, start, &mut clip, random)?;
         Ok(())
     }
+
+    fn place_shipwreck(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::shipwreck::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place_shipwreck(region, key, start, clip, random)
+    }
 }
 
 /// Adds preflighted jigsaw starts to another mixed decoration context.
@@ -568,6 +579,17 @@ where
     ) -> Result<()> {
         self.other
             .place_ruined_portal(region, key, start, clip, random)
+    }
+
+    fn place_shipwreck(
+        &mut self,
+        region: &mut DecorationRegion<'_>,
+        key: &super::structure_batch::TerrainStartKey,
+        start: &mut super::shipwreck::PreparedStart,
+        clip: native_core::beardifier::BoundingBox,
+        random: &mut DecorationRandom,
+    ) -> Result<()> {
+        self.other.place_shipwreck(region, key, start, clip, random)
     }
 }
 
@@ -24792,6 +24814,22 @@ mod tests {
                 Ok(())
             }
         }
+        struct Biomes;
+        impl ResourceProvider for Biomes {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                Ok(
+                    (path == "data/minecraft/tags/worldgen/biome/mineshaft_blocking.json")
+                        .then(|| br#"{"values":[]}"#.to_vec()),
+                )
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                ensure!(folder == "worldgen/biome", "unexpected registry");
+                Ok(vec![ResourceId::parse("minecraft:plains")?])
+            }
+        }
         let (mut data, schedule, neighborhood) = scheduled_fixture(None);
         let plan = fixture_plan(&schedule, &neighborhood);
         let registry = batch_registry();
@@ -24851,6 +24889,33 @@ mod tests {
             &updated[0][0],
             PreparedStructureStart::Shipwreck(_)
         ));
+        let blocking = native_resources::mineshaft::MineshaftBlockingBiomes::load(&mut Biomes)?;
+        for fail in [false, true] {
+            let (mut terrain, _, _, _) = fixture();
+            let before = terrain.snapshot();
+            let portal = MixedPortalPlacementContext {
+                other: Runner {
+                    fail,
+                    ..Default::default()
+                },
+                starts: Arc::new(BTreeMap::new()),
+            };
+            let mut context = MixedMineshaftPlacementContext {
+                other: portal,
+                blocking_biomes: &blocking,
+                uuid_factory: |_: [f64; 3]| Ok(None),
+            };
+            let result =
+                prepared.execute_with_mixed_structure_plan(&mut terrain, &structures, &mut context);
+            if fail {
+                assert!(result.is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(context.other.other.draws.is_empty());
+            } else {
+                result?;
+                assert_eq!(context.other.other.draws, draws);
+            }
+        }
         for (fail, corrupt) in [(true, false), (false, true)] {
             let (mut terrain, _, _, _) = fixture();
             let before = terrain.snapshot();

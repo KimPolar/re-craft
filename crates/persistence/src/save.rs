@@ -46,6 +46,32 @@ pub enum FreshRegionKind {
     Poi,
 }
 
+/// A checkpoint reached while creating an isolated new-world staging tree.
+/// The corresponding operation has not started yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FreshWorldStageProgress<'a> {
+    Validating,
+    WritingMetadata,
+    WritingChunk {
+        dimension: &'a DimensionId,
+        kind: FreshRegionKind,
+        position: crate::world::ChunkPos,
+    },
+    WritingExternalChunk {
+        dimension: &'a DimensionId,
+        kind: FreshRegionKind,
+        position: crate::world::ChunkPos,
+    },
+    VerifyingChunk {
+        dimension: &'a DimensionId,
+        kind: FreshRegionKind,
+        position: crate::world::ChunkPos,
+    },
+    VerifyingMetadata,
+    Sealing,
+    Finished,
+}
+
 /// Complete region data prepared in memory; this does not publish a world.
 /// The caller must separately prove generation, lighting, entities, POIs,
 /// and world metadata are complete before committing the staged files.
@@ -114,6 +140,14 @@ impl FreshRegionDraft {
     /// Write to an empty read/write staging file. On any error the caller must discard
     /// it; returned external payloads belong to the same eventual transaction.
     pub fn write_staged(&self, file: &mut File) -> Result<Vec<FreshExternalChunk>> {
+        self.write_staged_with(file, &mut |_| Ok(()))
+    }
+
+    fn write_staged_with(
+        &self,
+        file: &mut File,
+        checkpoint: &mut impl FnMut(crate::world::ChunkPos) -> Result<()>,
+    ) -> Result<Vec<FreshExternalChunk>> {
         ensure!(
             !self.chunks.is_empty(),
             "cannot stage an empty generated region"
@@ -125,6 +159,7 @@ impl FreshRegionDraft {
         file.set_len(HEADER_SIZE)?;
         let mut external = Vec::new();
         for (position, (bytes, timestamp)) in &self.chunks {
+            checkpoint(*position)?;
             if let Some(compressed) =
                 write_staged_chunk(file, position.x, position.z, bytes, Some(*timestamp), false)
                     .with_context(|| {
@@ -319,6 +354,14 @@ fn staged_world_manifest(
     root: &Path,
     ignore_session_lock: bool,
 ) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>> {
+    staged_world_manifest_with(root, ignore_session_lock, &mut || Ok(()))
+}
+
+fn staged_world_manifest_with(
+    root: &Path,
+    ignore_session_lock: bool,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>> {
     let metadata = fs::symlink_metadata(root)?;
     ensure!(
         ordinary(&metadata) && metadata.is_dir(),
@@ -329,6 +372,7 @@ fn staged_world_manifest(
     let mut output = BTreeMap::new();
     while let Some(parent) = pending.pop() {
         for entry in fs::read_dir(root.join(&parent))? {
+            checkpoint()?;
             let entry = entry?;
             let relative = parent.join(entry.file_name());
             let path = root.join(&relative);
@@ -737,6 +781,20 @@ impl FreshWorldDraft {
     /// Create and re-read an isolated tree. No existing world is touched and
     /// dropping the result removes the tree; this does not authorize publishing.
     pub fn stage(&self, parent: &Path) -> Result<FreshWorldStage> {
+        self.stage_with_progress(parent, |_| Ok(()))
+    }
+
+    /// Stage a world while reporting checkpoints. Returning an error from
+    /// `progress` aborts the operation and removes its private staging tree.
+    /// Checks occur between chunks and file operations, not during a single
+    /// compression, sync, metadata validation, or filesystem call. Installing
+    /// data packs and publishing are separate operations.
+    pub fn stage_with_progress(
+        &self,
+        parent: &Path,
+        mut progress: impl FnMut(FreshWorldStageProgress<'_>) -> Result<()>,
+    ) -> Result<FreshWorldStage> {
+        progress(FreshWorldStageProgress::Validating)?;
         ensure!(
             self.regions
                 .keys()
@@ -750,6 +808,7 @@ impl FreshWorldDraft {
         for ((dimension, kind, _, _), region) in &self.regions {
             if *kind != FreshRegionKind::Terrain {
                 for position in region.chunks.keys() {
+                    progress(FreshWorldStageProgress::Validating)?;
                     ensure!(
                         self.has_terrain_chunk(dimension, *position),
                         "staged {kind:?} chunk ({}, {}) has no matching terrain chunk in {}:{}",
@@ -761,7 +820,8 @@ impl FreshWorldDraft {
                 }
             }
         }
-        self.validate_entity_identities()?;
+        self.validate_entity_identities(&mut progress)?;
+        progress(FreshWorldStageProgress::WritingMetadata)?;
         let directory = tempfile::Builder::new()
             .prefix(".re-craft-world-")
             .tempdir_in(parent)
@@ -774,21 +834,25 @@ impl FreshWorldDraft {
         fs::create_dir_all(root.join("data/minecraft"))?;
         fs::create_dir_all(root.join("players/data"))?;
         write_new_gzip(&root.join("level.dat"), &self.level)?;
+        progress(FreshWorldStageProgress::WritingMetadata)?;
         write_new_gzip(
             &root.join("data/minecraft/world_gen_settings.dat"),
             &self.worldgen,
         )?;
         let clock_document = crate::world::WorldReader::create_world_clock_document(&self.clocks)?;
+        progress(FreshWorldStageProgress::WritingMetadata)?;
         write_new_gzip(
             &root.join("data/minecraft/world_clocks.dat"),
             &clock_document,
         )?;
         if let Some(rules) = self.game_rules {
+            progress(FreshWorldStageProgress::WritingMetadata)?;
             write_new_gzip(
                 &root.join("data/minecraft/game_rules.dat"),
                 &rules.new_world_document()?,
             )?;
         }
+        progress(FreshWorldStageProgress::WritingMetadata)?;
         write_new_gzip(
             &root
                 .join("players/data")
@@ -808,7 +872,19 @@ impl FreshWorldDraft {
                 .write(true)
                 .create_new(true)
                 .open(&path)?;
-            for external in region.write_staged(&mut file)? {
+            let external_chunks = region.write_staged_with(&mut file, &mut |position| {
+                progress(FreshWorldStageProgress::WritingChunk {
+                    dimension,
+                    kind: *kind,
+                    position,
+                })
+            })?;
+            for external in external_chunks {
+                progress(FreshWorldStageProgress::WritingExternalChunk {
+                    dimension,
+                    kind: *kind,
+                    position: external.position,
+                })?;
                 let path = region_dir.join(format!(
                     "c.{}.{}.mcc",
                     external.position.x, external.position.z
@@ -821,6 +897,11 @@ impl FreshWorldDraft {
             drop(file);
             let mut reader = RegionReader::open(&path)?;
             for (position, (expected, _)) in &region.chunks {
+                progress(FreshWorldStageProgress::VerifyingChunk {
+                    dimension,
+                    kind: *kind,
+                    position: *position,
+                })?;
                 ensure!(
                     reader
                         .read_chunk_nbt_bytes(position.x, position.z)?
@@ -830,6 +911,7 @@ impl FreshWorldDraft {
                 );
             }
         }
+        progress(FreshWorldStageProgress::VerifyingMetadata)?;
         let reader =
             crate::world::WorldReader::open(root, DimensionId::parse("minecraft:overworld")?)?;
         ensure!(
@@ -894,7 +976,11 @@ impl FreshWorldDraft {
             "staged spawn chunk cannot be read"
         );
         drop(reader);
-        let manifest = staged_world_manifest(&world_path, false)?;
+        progress(FreshWorldStageProgress::Sealing)?;
+        let manifest = staged_world_manifest_with(&world_path, false, &mut || {
+            progress(FreshWorldStageProgress::Sealing)
+        })?;
+        progress(FreshWorldStageProgress::Finished)?;
         Ok(FreshWorldStage {
             _directory: directory,
             root: world_path,
@@ -905,7 +991,10 @@ impl FreshWorldDraft {
 
     /// Java indexes loaded entities by UUID within each dimension. Check the
     /// generated passenger trees and the player before creating any files.
-    fn validate_entity_identities(&self) -> Result<()> {
+    fn validate_entity_identities(
+        &self,
+        progress: &mut impl FnMut(FreshWorldStageProgress<'_>) -> Result<()>,
+    ) -> Result<()> {
         let mut seen: BTreeMap<&DimensionId, BTreeSet<[i32; 4]>> = BTreeMap::new();
         seen.entry(&self.player_dimension)
             .or_default()
@@ -916,6 +1005,7 @@ impl FreshWorldDraft {
             }
             let identities = seen.entry(dimension).or_default();
             for (position, (bytes, _)) in &region.chunks {
+                progress(FreshWorldStageProgress::Validating)?;
                 let document = nbt::read(bytes).context("cannot decode generated entity chunk")?;
                 collect_fresh_entity_identities(&document, identities).with_context(|| {
                     format!(
@@ -4940,6 +5030,154 @@ mod tests {
     }
 
     #[test]
+    fn fresh_world_staging_reports_progress_and_cleans_up_on_cancellation() {
+        let parent = tempfile::tempdir().unwrap();
+        let sentinel = parent.path().join("existing-world");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut region = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        for x in 0..2 {
+            region
+                .add(crate::world::ChunkPos { x, z: 0 }, &chunk(x, "stage"), 1)
+                .unwrap();
+        }
+        draft.add_region(dimension.clone(), region).unwrap();
+
+        for cancel_at in [
+            "validate",
+            "metadata",
+            "metadata_partial",
+            "write",
+            "verify",
+            "verify_metadata",
+            "seal",
+            "seal_partial",
+            "finish",
+        ] {
+            let mut reached = false;
+            let mut metadata_calls = 0;
+            let mut seal_calls = 0;
+            let result = draft.stage_with_progress(parent.path(), |event| {
+                let cancel = match event {
+                    FreshWorldStageProgress::Validating => cancel_at == "validate",
+                    FreshWorldStageProgress::WritingMetadata => {
+                        metadata_calls += 1;
+                        cancel_at == "metadata"
+                            || (cancel_at == "metadata_partial" && metadata_calls == 2)
+                    }
+                    FreshWorldStageProgress::WritingChunk { position, .. } => {
+                        cancel_at == "write" && position.x == 1
+                    }
+                    FreshWorldStageProgress::VerifyingChunk { position, .. } => {
+                        cancel_at == "verify" && position.x == 0
+                    }
+                    FreshWorldStageProgress::VerifyingMetadata => cancel_at == "verify_metadata",
+                    FreshWorldStageProgress::Sealing => {
+                        seal_calls += 1;
+                        cancel_at == "seal" || (cancel_at == "seal_partial" && seal_calls == 2)
+                    }
+                    FreshWorldStageProgress::Finished => cancel_at == "finish",
+                    FreshWorldStageProgress::WritingExternalChunk { .. } => false,
+                };
+                if cancel {
+                    reached = true;
+                    anyhow::bail!("cancelled at {cancel_at}");
+                }
+                Ok(())
+            });
+            assert!(reached, "checkpoint {cancel_at} was not reached");
+            assert!(format!("{:#}", result.err().expect("cancelled stage")).contains("cancelled"));
+            assert_eq!(
+                fs::read_dir(parent.path()).unwrap().count(),
+                1,
+                "{cancel_at}"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        }
+
+        let mut written = Vec::new();
+        let mut verified = Vec::new();
+        let mut finished = false;
+        let stage = draft
+            .stage_with_progress(parent.path(), |event| {
+                match event {
+                    FreshWorldStageProgress::WritingChunk {
+                        dimension: actual,
+                        kind,
+                        position,
+                    } => {
+                        assert_eq!(actual, &dimension);
+                        assert_eq!(kind, FreshRegionKind::Terrain);
+                        written.push(position);
+                    }
+                    FreshWorldStageProgress::VerifyingChunk { position, .. } => {
+                        verified.push(position)
+                    }
+                    FreshWorldStageProgress::Finished => finished = true,
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        let expected = vec![
+            crate::world::ChunkPos { x: 0, z: 0 },
+            crate::world::ChunkPos { x: 1, z: 0 },
+        ];
+        assert_eq!(written, expected);
+        assert_eq!(verified, expected);
+        assert!(finished);
+        let mut reader = crate::world::WorldReader::open(stage.path(), dimension).unwrap();
+        assert!(reader.read_chunk(0, 0).unwrap().is_some());
+        assert!(reader.read_chunk(1, 0).unwrap().is_some());
+        drop(reader);
+        drop(stage);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn fresh_world_cancellation_before_external_chunk_write_removes_stage() {
+        let parent = tempfile::tempdir().unwrap();
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut document = chunk(0, "large");
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        let mut state = 0x1234_5678_u32;
+        let bytes = (0..1_200_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        fields.push(("large_test_data".into(), Tag::ByteArray(bytes)));
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(crate::world::ChunkPos { x: 0, z: 0 }, &document, 1)
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        let mut reached = false;
+        let result = draft.stage_with_progress(parent.path(), |event| {
+            if matches!(event, FreshWorldStageProgress::WritingExternalChunk { .. }) {
+                reached = true;
+                anyhow::bail!("cancelled external chunk");
+            }
+            Ok(())
+        });
+        assert!(reached, "fixture must produce an external chunk");
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn fresh_world_stage_rejects_mismatches_and_missing_spawn_without_leaking_files() {
         let parent = tempfile::tempdir().unwrap();
         let (level, worldgen, player, uuid) = fresh_world_metadata();
@@ -5134,7 +5372,7 @@ mod tests {
         draft
             .add_region(DimensionId::parse("minecraft:the_nether").unwrap(), nether)
             .unwrap();
-        assert!(draft.validate_entity_identities().is_ok());
+        assert!(draft.validate_entity_identities(&mut |_| Ok(())).is_ok());
 
         let ambiguous = [
             Tag::Compound(vec![("UUID".into(), Tag::IntArray(vec![1, 2, 3]))]),

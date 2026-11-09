@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use native_persistence::save::{FreshRegionKind, FreshWorldStageProgress};
 use native_persistence::world::{ChunkPos, DimensionId};
 
@@ -56,6 +56,35 @@ pub enum StagingResult {
         generation: GenerationReady,
         error: anyhow::Error,
     },
+}
+
+/// Failure to start staging leaves the generated world available for retry.
+pub struct StagingStartError {
+    pub generation: GenerationReady,
+    pub error: anyhow::Error,
+}
+
+/// Keep ownership on the caller until a worker has actually started.
+fn spawn_with_payload<T: Send + 'static>(
+    payload: T,
+    task: impl FnOnce(T) + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> std::result::Result<(), (T, std::io::Error)> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = Box::new(move || {
+        if let Ok(payload) = receiver.recv() {
+            task(payload);
+        }
+    });
+    if let Err(error) = spawn(worker) {
+        return Err((payload, error));
+    }
+    sender.send(payload).map_err(|error| {
+        (
+            error.0,
+            std::io::Error::other("staging worker stopped before accepting generation"),
+        )
+    })
 }
 
 pub struct InitialWorldStagingWorker {
@@ -138,6 +167,24 @@ impl InitialWorldStagingWorker {
         last_played_ms: i64,
         region_timestamp: u32,
     ) -> Result<Self> {
+        Self::start_recoverable(
+            generation,
+            parent,
+            structures,
+            last_played_ms,
+            region_timestamp,
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    /// Return the generation result if the worker cannot be started.
+    pub fn start_recoverable(
+        generation: GenerationReady,
+        parent: PathBuf,
+        structures: bool,
+        last_played_ms: i64,
+        region_timestamp: u32,
+    ) -> std::result::Result<Self, StagingStartError> {
         Self::start_inner(
             generation,
             parent,
@@ -166,10 +213,11 @@ impl InitialWorldStagingWorker {
             region_timestamp,
             Some(Box::new(observer)),
         )
+        .map_err(|failure| failure.error)
     }
 
     fn start_inner(
-        mut generation: GenerationReady,
+        generation: GenerationReady,
         parent: PathBuf,
         structures: bool,
         last_played_ms: i64,
@@ -177,7 +225,7 @@ impl InitialWorldStagingWorker {
         #[cfg(test)] mut observer: Option<
             Box<dyn for<'a> FnMut(InitialWorldStageProgress<'a>) -> Result<()> + Send>,
         >,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, StagingStartError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(StagingProgress {
             phase: StagingPhase::Preparing,
@@ -187,9 +235,9 @@ impl InitialWorldStagingWorker {
         let (sender, result) = mpsc::channel();
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_progress = Arc::clone(&progress);
-        thread::Builder::new()
-            .name("world-staging".into())
-            .spawn(move || {
+        spawn_with_payload(
+            generation,
+            move |mut generation| {
                 let mut report = |event: InitialWorldStageProgress<'_>| {
                     checkpoint(&worker_cancelled, &worker_progress, event)?;
                     #[cfg(test)]
@@ -234,8 +282,18 @@ impl InitialWorldStagingWorker {
                     StagingResult::Failed { .. } => StagingPhase::Failed,
                 };
                 let _ = sender.send(outcome);
-            })
-            .context("cannot start world staging worker")?;
+            },
+            |task| {
+                thread::Builder::new()
+                    .name("world-staging".into())
+                    .spawn(task)
+                    .map(|_| ())
+            },
+        )
+        .map_err(|(generation, error)| StagingStartError {
+            generation,
+            error: anyhow::Error::new(error).context("cannot start world staging worker"),
+        })?;
         Ok(Self {
             cancelled,
             progress,
@@ -275,6 +333,46 @@ impl Drop for InitialWorldStagingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_worker_launch_returns_payload_and_success_transfers_it_once() {
+        let (payload, error) = spawn_with_payload(
+            String::from("generated world"),
+            |_| panic!("failed worker must not run"),
+            |_| Err(std::io::Error::other("thread unavailable")),
+        )
+        .unwrap_err();
+        assert_eq!(payload, "generated world");
+        assert_eq!(error.to_string(), "thread unavailable");
+
+        let (payload, error) = spawn_with_payload(
+            payload,
+            |_| {},
+            |task| {
+                drop(task);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(payload, "generated world");
+        assert!(error.to_string().contains("before accepting generation"));
+
+        let (sender, receiver) = mpsc::channel();
+        spawn_with_payload(
+            payload,
+            move |value| sender.send(value).unwrap(),
+            |task| thread::Builder::new().spawn(task).map(|_| ()),
+        )
+        .unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "generated world"
+        );
+        assert!(receiver.recv().is_err());
+    }
+
     #[test]
     fn checkpoints_report_chunks_and_stop_only_for_requested_cancellation() {
         let cancelled = AtomicBool::new(false);

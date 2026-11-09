@@ -5,7 +5,9 @@ use anyhow::Result;
 use native_persistence::world::SavedWorldBorder;
 
 use crate::{
-    generation_staging::{InitialWorldStagingWorker, StagedWorld, StagingProgress, StagingResult},
+    generation_staging::{
+        InitialWorldStagingWorker, StagedWorld, StagingProgress, StagingResult, StagingStartError,
+    },
     generation_worker::{GenerationProgress, GenerationReady, GenerationResult, GenerationWorker},
     world_creation::FrozenWorldCreation,
 };
@@ -97,13 +99,39 @@ impl InitialWorldPipeline {
         }
     }
 
+    /// Retry a cancelled or failed staging operation with its original settings.
+    /// A new parent can be supplied after a directory or permissions error.
+    pub fn retry_staging(
+        &mut self,
+        generation: GenerationReady,
+        parent: PathBuf,
+    ) -> std::result::Result<(), StagingStartError> {
+        if !matches!(self.state, State::Finished) {
+            return Err(StagingStartError {
+                generation,
+                error: anyhow::anyhow!("initial world pipeline is still running"),
+            });
+        }
+        let worker = InitialWorldStagingWorker::start_recoverable(
+            generation,
+            parent.clone(),
+            self.structures,
+            self.options.last_played_ms,
+            self.options.region_timestamp,
+        )?;
+        self.options.staging_parent = parent;
+        self.cancelled = false;
+        self.state = State::Staging(worker);
+        Ok(())
+    }
+
     /// Poll once without waiting. A terminal result is returned at most once.
     pub fn poll(&mut self) -> Option<InitialWorldResult> {
         match &self.state {
             State::Generating(worker) => match worker.try_result() {
                 Ok(None) => None,
                 Ok(Some(GenerationResult::Ready(generation))) if !self.cancelled => {
-                    match InitialWorldStagingWorker::start(
+                    match InitialWorldStagingWorker::start_recoverable(
                         generation,
                         self.options.staging_parent.clone(),
                         self.structures,
@@ -114,11 +142,11 @@ impl InitialWorldPipeline {
                             self.state = State::Staging(worker);
                             None
                         }
-                        Err(error) => {
+                        Err(failure) => {
                             self.state = State::Finished;
                             Some(InitialWorldResult::Failed {
-                                error: error.context("cannot start initial world staging"),
-                                generation: None,
+                                error: failure.error.context("cannot start initial world staging"),
+                                generation: Some(failure.generation),
                             })
                         }
                     }
@@ -259,20 +287,10 @@ mod tests {
         assert!(pipeline.poll().is_none());
         assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
 
-        let worker = InitialWorldStagingWorker::start(
-            generation,
-            parent.path().to_path_buf(),
-            true,
-            123,
-            1,
-        )?;
-        let mut retry = InitialWorldPipeline {
-            state: State::Staging(worker),
-            options: options(parent.path().to_path_buf()),
-            structures: true,
-            cancelled: false,
-        };
-        let (generation, world) = match wait(&mut retry) {
+        pipeline
+            .retry_staging(generation, parent.path().to_path_buf())
+            .map_err(|failure| failure.error)?;
+        let (generation, world) = match wait(&mut pipeline) {
             InitialWorldResult::Ready { generation, world } => (generation, world),
             InitialWorldResult::Failed { error, .. } => return Err(error),
             _ => anyhow::bail!("staging retry was cancelled"),
@@ -284,25 +302,33 @@ mod tests {
         assert!(stage_path.join("level.dat").is_file());
         drop(world);
         assert!(!stage_path.exists());
-        assert!(matches!(retry.progress(), InitialWorldProgress::Finished));
-        assert!(retry.poll().is_none());
+        assert!(matches!(
+            pipeline.progress(),
+            InitialWorldProgress::Finished
+        ));
+        assert!(pipeline.poll().is_none());
 
         let missing = parent.path().join("missing");
-        let worker = InitialWorldStagingWorker::start(generation, missing.clone(), true, 123, 1)?;
-        let mut failed = InitialWorldPipeline {
-            state: State::Staging(worker),
-            options: options(missing),
-            structures: true,
-            cancelled: false,
-        };
-        assert!(matches!(
-            wait(&mut failed),
+        pipeline
+            .retry_staging(generation, missing)
+            .map_err(|failure| failure.error)?;
+        let generation = match wait(&mut pipeline) {
             InitialWorldResult::Failed {
-                generation: Some(_),
+                generation: Some(generation),
                 ..
-            }
-        ));
-        assert!(failed.poll().is_none());
+            } => generation,
+            _ => anyhow::bail!("staging failure did not retain generation"),
+        };
+        assert!(pipeline.poll().is_none());
+        pipeline
+            .retry_staging(generation, parent.path().to_path_buf())
+            .map_err(|failure| failure.error)?;
+        match wait(&mut pipeline) {
+            InitialWorldResult::Ready { world, .. } => drop(world),
+            InitialWorldResult::Failed { error, .. } => return Err(error),
+            _ => anyhow::bail!("staging retry after failure was cancelled"),
+        }
+        assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
         Ok(())
     }
 }

@@ -86,6 +86,15 @@ impl GeneratedDimensionLighting {
             .as_ref()
             .or(stem)
             .context("dimension is missing from world preset and active data packs")?;
+        Self::from_stem(provider, dimension, stem)
+    }
+
+    /// Resolve a previously selected dimension stem with the same pack stack.
+    pub fn from_stem(
+        provider: &mut impl ResourceProvider,
+        dimension: ResourceId,
+        stem: &Value,
+    ) -> Result<(Self, Value, Value)> {
         let generator = stem
             .get("generator")
             .filter(|v| v.is_object())

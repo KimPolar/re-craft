@@ -19,6 +19,8 @@ use native_session::worldgen::{
 use native_world::{fluid::FluidState, loaded::BlockState};
 use serde_json::Value;
 
+pub(crate) mod existing;
+
 pub struct FreshGenerationSettings {
     pub minecraft_dir: PathBuf,
     pub preset: String,

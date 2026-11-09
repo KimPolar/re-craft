@@ -257,6 +257,10 @@ impl GenerationReady {
             .as_ref()
             .context("initial world has not been postprocessed")?;
         let game_time = processed.region.ticks().game_time();
+        let water_source_conversion = processed
+            .region
+            .water_source_conversion()
+            .context("postprocessed water conversion rule is missing")?;
         let targets = self
             .mesh
             .targets
@@ -315,6 +319,17 @@ impl GenerationReady {
             settings.session.seed,
             clocks,
         )?;
+        draft.set_game_rules(native_persistence::world::FluidGameRules {
+            spawn_mobs: clock_data.spawn_mobs,
+            advance_time: clock_data.advance_time,
+            water_source_conversion,
+            respawn_radius: self
+                .initial_respawn
+                .as_ref()
+                .context("initial respawn settings are missing")?
+                .radius,
+            ..Default::default()
+        })?;
         let dimension = DimensionId::parse(&self.mesh.world.dimension)?;
         for ((_, _, _), region) in regions {
             draft.add_region(dimension.clone(), region)?;
@@ -1434,6 +1449,10 @@ impl GenerationWorker {
                 level_settings,
                 ..
             } = prepare()?;
+            ensure!(
+                initial_clocks.spawn_mobs == spawn_mobs,
+                "mob spawning rule differs from initial generation inputs"
+            );
             let pack_snapshot = resources.data_pack_snapshot();
             let Some(mut ready) = generate_spawn_origin(
                 batch,
@@ -1704,6 +1723,12 @@ impl GenerationWorker {
                 ready.batch.supports_structure_expansion(),
                 "structure expansion is unavailable"
             );
+            if let Some(initial) = &ready.initial_clocks {
+                ensure!(
+                    initial.spawn_mobs == spawn_mobs,
+                    "mob spawning rule differs from initial generation inputs"
+                );
+            }
             ensure!(
                 ready.player_spawn.is_none(),
                 "player spawn was already selected"
@@ -4159,9 +4184,25 @@ mod tests {
             .postprocessed
             .as_ref()
             .context("postprocessing missing")?;
-        let draft = ready
-            .batch
-            .postprocessed_chunk_drafts(&processed.region, [pos])?
+        let mut drafts = if processed.region.deferred_chunks().next().is_some() {
+            let mut stage = ready
+                .batch
+                .resume_generated_postprocessing(&processed.region)?;
+            ready.batch.converted_chunk_drafts(
+                &mut stage,
+                processed
+                    .region
+                    .ticks()
+                    .registration_order()
+                    .iter()
+                    .copied(),
+            )?
+        } else {
+            ready
+                .batch
+                .postprocessed_chunk_drafts(&processed.region, [pos])?
+        };
+        let draft = drafts
             .remove(&pos)
             .context("generated treasure chunk missing")?;
         let directory = parent.join("structure-region-verification");
@@ -4486,6 +4527,16 @@ mod tests {
             &generation
         ));
         let staged = initial_ready.stage_structure_initial_world(temp.path(), 123, 1)?;
+        let staged_reader = native_persistence::world::WorldReader::open(
+            staged.path(),
+            native_persistence::world::DimensionId::parse("overworld")?,
+        )?;
+        let staged_rules = staged_reader.fluid_game_rules()?;
+        assert!(staged_rules.spawn_mobs);
+        assert!(!staged_rules.advance_time);
+        assert!(staged_rules.water_source_conversion);
+        assert_eq!(staged_rules.respawn_radius, 0);
+        drop(staged_reader);
         assert!(initial_ready.hut_generation.is_none());
         let initial = initial_ready.start_initial_player_session(123)?;
         assert_eq!(
@@ -4726,41 +4777,73 @@ mod tests {
         assert!(player_ready.pack_snapshot.as_ref().is_some());
         let processed = player_ready.postprocessed.as_ref().unwrap();
         let selected = player_ready.mesh.targets.as_deref().unwrap();
-        let preview = player_ready.batch.preview_structure_regions(
-            &processed.region,
-            selected.iter().copied(),
-            1,
-        )?;
-        assert_eq!(preview.chunk_count, selected.len());
-        assert!(preview.terrain_regions > 0);
-        assert!(!preview.referenced_start_chunks.is_empty());
-        assert!(preview.referenced_start_chunks.is_subset(selected));
-        if verify_java {
-            assert_eq!(
-                preview,
-                player_ready.batch.preview_structure_regions(
-                    &processed.region,
-                    selected.iter().rev().copied(),
-                    1,
-                )?
-            );
-            let duplicate = selected
-                .iter()
-                .copied()
-                .chain(selected.iter().next().copied());
+        if processed.region.deferred_chunks().next().is_some() {
             assert!(
                 player_ready
                     .batch
-                    .preview_structure_regions(&processed.region, duplicate, 1,)
+                    .preview_structure_regions(&processed.region, selected.iter().copied(), 1,)
                     .is_err()
             );
-            verify_generated_structure_region_with_java(
-                &game,
-                temp.path(),
-                &player_ready,
-                &preview.referenced_start_chunks,
+            let converted = player_ready
+                .batch
+                .prepare_converted_structure_region_drafts(&processed.region, 1)?;
+            let positions: BTreeSet<_> = processed
+                .region
+                .ticks()
+                .registration_order()
+                .iter()
+                .copied()
+                .collect();
+            assert!(selected.is_subset(&positions));
+            assert_eq!(converted.chunk_count, positions.len());
+            assert!(!converted.referenced_start_chunks.is_empty());
+            assert!(converted.referenced_start_chunks.is_subset(&positions));
+            if verify_java {
+                verify_generated_structure_region_with_java(
+                    &game,
+                    temp.path(),
+                    &player_ready,
+                    &converted.referenced_start_chunks,
+                )?;
+                return Ok(());
+            }
+        } else {
+            let preview = player_ready.batch.preview_structure_regions(
+                &processed.region,
+                selected.iter().copied(),
+                1,
             )?;
-            return Ok(());
+            assert_eq!(preview.chunk_count, selected.len());
+            assert!(preview.terrain_regions > 0);
+            assert!(!preview.referenced_start_chunks.is_empty());
+            assert!(preview.referenced_start_chunks.is_subset(selected));
+            if verify_java {
+                assert_eq!(
+                    preview,
+                    player_ready.batch.preview_structure_regions(
+                        &processed.region,
+                        selected.iter().rev().copied(),
+                        1,
+                    )?
+                );
+                let duplicate = selected
+                    .iter()
+                    .copied()
+                    .chain(selected.iter().next().copied());
+                assert!(
+                    player_ready
+                        .batch
+                        .preview_structure_regions(&processed.region, duplicate, 1,)
+                        .is_err()
+                );
+                verify_generated_structure_region_with_java(
+                    &game,
+                    temp.path(),
+                    &player_ready,
+                    &preview.referenced_start_chunks,
+                )?;
+                return Ok(());
+            }
         }
         assert!(
             player_ready
@@ -7308,6 +7391,15 @@ mod tests {
                 assert!(format!("{error:#}").contains("structure generation is disabled"));
                 let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
                 assert!(staged.stage.path().join("level.dat").is_file());
+                let reader = native_persistence::world::WorldReader::open(
+                    staged.stage.path(),
+                    native_persistence::world::DimensionId::parse("overworld")?,
+                )?;
+                let rules = reader.fluid_game_rules()?;
+                assert!(!rules.spawn_mobs);
+                assert!(rules.advance_time);
+                assert_eq!(rules.respawn_radius, 10);
+                drop(reader);
                 drop(staged);
                 // The remaining checks exercise an independent, manually
                 // assembled pass against the original protochunk batch.

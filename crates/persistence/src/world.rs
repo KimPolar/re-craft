@@ -776,6 +776,7 @@ pub struct DataPackSettings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FluidGameRules {
     pub random_tick_speed: i32,
+    pub spawn_mobs: bool,
     pub advance_time: bool,
     pub advance_weather: bool,
     pub water_source_conversion: bool,
@@ -794,6 +795,7 @@ impl Default for FluidGameRules {
     fn default() -> Self {
         Self {
             random_tick_speed: 3,
+            spawn_mobs: true,
             advance_time: true,
             advance_weather: true,
             water_source_conversion: true,
@@ -807,6 +809,59 @@ impl Default for FluidGameRules {
             show_death_messages: true,
             respawn_radius: 10,
         }
+    }
+}
+
+impl FluidGameRules {
+    /// Encode the supported initial rules for a new 26.3 world. Other rules
+    /// are absent and retain Java's defaults; this is not an existing-world edit.
+    pub fn new_world_document(self) -> Result<NamedTag> {
+        ensure!(
+            self.random_tick_speed >= 0,
+            "random_tick_speed must not be negative"
+        );
+        ensure!(
+            self.respawn_radius >= 0,
+            "respawn_radius must not be negative"
+        );
+        let mut values = Vec::new();
+        for (name, value) in [
+            ("spawn_mobs", self.spawn_mobs),
+            ("advance_time", self.advance_time),
+            ("advance_weather", self.advance_weather),
+            ("water_source_conversion", self.water_source_conversion),
+            ("lava_source_conversion", self.lava_source_conversion),
+            ("block_drops", self.block_drops),
+            ("entity_drops", self.entity_drops),
+            (
+                "natural_health_regeneration",
+                self.natural_health_regeneration,
+            ),
+            ("fall_damage", self.fall_damage),
+            ("keep_inventory", self.keep_inventory),
+            ("immediate_respawn", self.immediate_respawn),
+            ("show_death_messages", self.show_death_messages),
+        ] {
+            values.push((
+                format!("minecraft:{name}").as_str().into(),
+                Tag::Byte(i8::from(value)),
+            ));
+        }
+        values.push((
+            "minecraft:random_tick_speed".into(),
+            Tag::Int(self.random_tick_speed),
+        ));
+        values.push((
+            "minecraft:respawn_radius".into(),
+            Tag::Int(self.respawn_radius),
+        ));
+        Ok(NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("data".into(), Tag::Compound(values)),
+            ]),
+        })
     }
 }
 
@@ -1881,6 +1936,7 @@ impl WorldReader {
         };
         Ok(FluidGameRules {
             random_tick_speed,
+            spawn_mobs: read("spawn_mobs", true)?,
             advance_time: read("advance_time", true)?,
             advance_weather: read("advance_weather", true)?,
             water_source_conversion: read("water_source_conversion", true)?,
@@ -3192,6 +3248,7 @@ mod tests {
                 (
                     "data".into(),
                     Tag::Compound(vec![
+                        ("minecraft:spawn_mobs".into(), Tag::Byte(0)),
                         ("minecraft:water_source_conversion".into(), Tag::Byte(0)),
                         ("minecraft:lava_source_conversion".into(), Tag::Byte(1)),
                         ("minecraft:block_drops".into(), Tag::Byte(0)),
@@ -3219,6 +3276,7 @@ mod tests {
                 reader.fluid_game_rules().unwrap(),
                 FluidGameRules {
                     random_tick_speed: 9,
+                    spawn_mobs: false,
                     advance_time: false,
                     advance_weather: false,
                     water_source_conversion: false,

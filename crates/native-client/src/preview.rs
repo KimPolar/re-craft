@@ -3610,6 +3610,7 @@ mod tests {
         let initial_clocks = Arc::new(crate::fresh_generation::InitialWorldClocks {
             ticks: BTreeMap::from([(ResourceId::parse("example:clock").unwrap(), 0_i64)]),
             advance_time: true,
+            spawn_mobs: true,
             command_data: Default::default(),
             fluid_environment: Default::default(),
         });
@@ -3980,6 +3981,7 @@ mod tests {
         expanded.initial_clocks = Some(Arc::new(crate::fresh_generation::InitialWorldClocks {
             ticks: initial_clocks.ticks.clone(),
             advance_time: false,
+            spawn_mobs: initial_clocks.spawn_mobs,
             command_data: Default::default(),
             fluid_environment: Default::default(),
         }));

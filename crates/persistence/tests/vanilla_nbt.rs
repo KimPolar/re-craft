@@ -193,6 +193,7 @@ public class NbtOracle {
             Files.createDirectories(borderDir);
             NbtIo.writeCompressed(borderFile, borderDir.resolve("world_border.dat"));
             GameRuleMap rules=GameRuleMap.of();
+            rules.set(GameRules.SPAWN_MOBS,false);
             rules.set(GameRules.ADVANCE_TIME,false);
             rules.set(GameRules.WATER_SOURCE_CONVERSION,false);
             rules.set(GameRules.LAVA_SOURCE_CONVERSION,true);
@@ -395,6 +396,88 @@ fn run_checked(command: &mut Command) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+#[ignore = "requires the user's Minecraft Java Edition 26.3 installation and Java 25 JDK"]
+fn new_world_game_rules_are_read_by_java_codec() {
+    use flate2::{Compression, write::GzEncoder};
+    use native_persistence::world::FluidGameRules;
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let game = minecraft_dir();
+    let cp = classpath(&game, Some(temp.path()));
+    let source = temp.path().join("FreshGameRulesOracle.java");
+    std::fs::write(
+        &source,
+        r#"
+import java.nio.file.Path;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.nbt.*;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.level.gamerules.*;
+public class FreshGameRulesOracle {
+    public static void main(String[] args) throws Exception {
+        SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
+        var root=NbtIo.readCompressed(Path.of(args[0]), NbtAccounter.unlimitedHeap());
+        if(root.getIntOr("DataVersion", 0)!=5023) throw new AssertionError("version");
+        var map=GameRuleMap.CODEC.parse(NbtOps.INSTANCE, root.get("data")).getOrThrow();
+        var rules=new GameRules(FeatureFlags.DEFAULT_FLAGS, map);
+        if(rules.get(GameRules.SPAWN_MOBS) || rules.get(GameRules.ADVANCE_TIME)
+            || rules.get(GameRules.ADVANCE_WEATHER) || rules.get(GameRules.WATER_SOURCE_CONVERSION)
+            || !rules.get(GameRules.LAVA_SOURCE_CONVERSION) || rules.get(GameRules.BLOCK_DROPS)
+            || rules.get(GameRules.ENTITY_DROPS) || rules.get(GameRules.NATURAL_HEALTH_REGENERATION)
+            || rules.get(GameRules.FALL_DAMAGE) || !rules.get(GameRules.KEEP_INVENTORY)
+            || !rules.get(GameRules.IMMEDIATE_RESPAWN) || rules.get(GameRules.SHOW_DEATH_MESSAGES)
+            || rules.get(GameRules.RANDOM_TICK_SPEED)!=9 || rules.get(GameRules.RESPAWN_RADIUS)!=7
+            || !rules.get(GameRules.MOB_GRIEFING)) throw new AssertionError("rules differ");
+        System.out.println("RE_CRAFT_FRESH_GAMERULES_OK");
+    }
+}
+"#,
+    )
+    .unwrap();
+    run_checked(
+        Command::new(java_bin().join("javac.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg(&source),
+    );
+    let rules = FluidGameRules {
+        random_tick_speed: 9,
+        spawn_mobs: false,
+        advance_time: false,
+        advance_weather: false,
+        water_source_conversion: false,
+        lava_source_conversion: true,
+        block_drops: false,
+        entity_drops: false,
+        natural_health_regeneration: false,
+        fall_damage: false,
+        keep_inventory: true,
+        immediate_respawn: true,
+        show_death_messages: false,
+        respawn_radius: 7,
+    };
+    let path = temp.path().join("game_rules.dat");
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(&nbt::write(&rules.new_world_document().unwrap()).unwrap())
+        .unwrap();
+    std::fs::write(&path, gzip.finish().unwrap()).unwrap();
+    let output = run_checked(
+        Command::new(java_bin().join("java.exe"))
+            .arg("-classpath")
+            .arg(&cp)
+            .arg("FreshGameRulesOracle")
+            .arg(&path),
+    );
+    assert!(
+        output
+            .lines()
+            .any(|line| line.ends_with("RE_CRAFT_FRESH_GAMERULES_OK")),
+        "{output}"
+    );
 }
 
 #[test]
@@ -1632,6 +1715,7 @@ fn java_and_rust_read_each_others_nbt() {
         }
     );
     let rules = reader.fluid_game_rules().unwrap();
+    assert!(!rules.spawn_mobs);
     assert!(!rules.advance_time);
     assert!(!rules.water_source_conversion);
     assert!(rules.lava_source_conversion);

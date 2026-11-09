@@ -156,6 +156,7 @@ pub struct FreshWorldDraft {
     player_dimension: DimensionId,
     player_chunk: crate::world::ChunkPos,
     clocks: BTreeMap<DimensionId, crate::world::SavedClock>,
+    game_rules: Option<crate::world::FluidGameRules>,
     regions: BTreeMap<(DimensionId, FreshRegionKind, i32, i32), FreshRegionDraft>,
 }
 
@@ -708,6 +709,7 @@ impl FreshWorldDraft {
             player_dimension,
             player_chunk,
             clocks,
+            game_rules: None,
             regions: BTreeMap::new(),
         })
     }
@@ -722,6 +724,13 @@ impl FreshWorldDraft {
             "duplicate generated region"
         );
         self.regions.insert(key, region);
+        Ok(())
+    }
+
+    /// Set supported new-world rules without modifying existing-world data.
+    pub fn set_game_rules(&mut self, rules: crate::world::FluidGameRules) -> Result<()> {
+        rules.new_world_document()?;
+        self.game_rules = Some(rules);
         Ok(())
     }
 
@@ -774,6 +783,12 @@ impl FreshWorldDraft {
             &root.join("data/minecraft/world_clocks.dat"),
             &clock_document,
         )?;
+        if let Some(rules) = self.game_rules {
+            write_new_gzip(
+                &root.join("data/minecraft/game_rules.dat"),
+                &rules.new_world_document()?,
+            )?;
+        }
         write_new_gzip(
             &root
                 .join("players/data")
@@ -833,6 +848,12 @@ impl FreshWorldDraft {
             reader.world_clocks()? == self.clocks,
             "staged clocks did not round-trip"
         );
+        if let Some(rules) = self.game_rules {
+            ensure!(
+                reader.fluid_game_rules()? == rules,
+                "staged game rules did not round-trip"
+            );
+        }
         let enabled_file_packs = reader
             .data_pack_settings()?
             .enabled
@@ -4616,6 +4637,23 @@ mod tests {
             clocks.clone(),
         )
         .unwrap();
+        let rules = crate::world::FluidGameRules {
+            spawn_mobs: false,
+            advance_time: false,
+            water_source_conversion: false,
+            respawn_radius: 7,
+            random_tick_speed: 9,
+            ..Default::default()
+        };
+        draft.set_game_rules(rules).unwrap();
+        assert!(
+            draft
+                .set_game_rules(crate::world::FluidGameRules {
+                    random_tick_speed: -1,
+                    ..rules
+                })
+                .is_err()
+        );
         let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
         terrain
             .add(
@@ -4637,6 +4675,7 @@ mod tests {
         assert_eq!(reader.saved_world_seed().unwrap(), Some(42));
         assert_eq!(reader.read_player().unwrap(), Some(player));
         assert_eq!(reader.world_clocks().unwrap(), clocks);
+        assert_eq!(reader.fluid_game_rules().unwrap(), rules);
         assert!(reader.read_chunk(0, 0).unwrap().is_some());
         assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
         drop(reader);

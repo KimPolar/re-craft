@@ -155,6 +155,8 @@ impl PreparedInitialWorld {
 pub struct InitialWorldClocks {
     pub ticks: BTreeMap<ResourceId, i64>,
     pub advance_time: bool,
+    /// Frozen separately from whether this dimension's generator permits mobs.
+    pub spawn_mobs: bool,
     pub command_data: InitialClockCommandData,
     /// Dimension attributes evaluated against these same world clocks.
     pub fluid_environment: InitialFluidEnvironment,
@@ -586,6 +588,7 @@ pub(crate) fn structured_initial_context(
     let clocks = Arc::new(InitialWorldClocks {
         ticks: ticks.clone(),
         advance_time,
+        spawn_mobs,
         command_data: InitialClockCommandData::load(resources, &lighting, &definition),
         fluid_environment: InitialFluidEnvironment::load(resources, &definition),
     });
@@ -642,6 +645,7 @@ impl PreparedFreshGeneration {
         let initial_clocks = Arc::new(InitialWorldClocks {
             ticks: clocks.clone(),
             advance_time,
+            spawn_mobs,
             command_data: InitialClockCommandData::load(
                 &mut self.resources,
                 &self.lighting,

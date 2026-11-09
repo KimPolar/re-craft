@@ -17,6 +17,15 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::{menu_assets::MenuAssets, menu_draw::Canvas, menu_gpu_worker::SurfaceRequester};
 
+#[cfg(test)]
+pub(crate) static TEST_HOLD_BLUR_PIPELINES: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static TEST_PENDING_BLUR_FRAMES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static TEST_BLURRED_FRAMES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // Kept out of release builds; separates GPU queueing from surface pacing.
 #[cfg(any(debug_assertions, test))]
 #[derive(Default)]
@@ -497,6 +506,10 @@ impl MenuRenderer {
         std::thread::Builder::new()
             .name("menu-blur-pipelines".into())
             .spawn(move || {
+                #[cfg(test)]
+                while TEST_HOLD_BLUR_PIPELINES.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                         label: Some("menu blur shader"),
@@ -629,11 +642,11 @@ impl MenuRenderer {
         if size.width == 0 || size.height == 0 {
             return Ok(false);
         }
-        let blurred = blurred && radius > 0;
+        let wants_blur = blurred && radius > 0;
+        // Keep presenting the new screen while the shader compiles. The
+        // ordinary animation requests will enable blur as soon as it is ready.
+        let blurred = wants_blur && self.blur_pipelines_ready()?;
         if blurred {
-            if !self.blur_pipelines_ready()? {
-                return Ok(false);
-            }
             let radius = radius.min(10);
             if radius != self.blur_radius {
                 self.queue.write_buffer(
@@ -873,6 +886,14 @@ impl MenuRenderer {
         #[cfg(any(debug_assertions, test))]
         let submitted = started.map(|start| start.elapsed());
         self.queue.present(frame);
+        #[cfg(test)]
+        if wants_blur {
+            if blurred {
+                TEST_BLURRED_FRAMES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                TEST_PENDING_BLUR_FRAMES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // The title does not need blur. Start compilation only after its first
         // frame is submitted so the driver cannot delay initial display.
         if !blurred {

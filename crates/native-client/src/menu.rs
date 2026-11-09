@@ -5277,6 +5277,98 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "requires Minecraft 26.3 assets and a Windows GPU window"]
+    fn options_render_while_blur_pipelines_are_compiling() {
+        if !crate::window_test::isolated(
+            "menu::tests::options_render_while_blur_pipelines_are_compiling",
+        ) {
+            return;
+        }
+        use crate::menu_renderer::{
+            TEST_BLURRED_FRAMES, TEST_HOLD_BLUR_PIPELINES, TEST_PENDING_BLUR_FRAMES,
+        };
+        use std::sync::atomic::Ordering;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        struct Gate;
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                TEST_HOLD_BLUR_PIPELINES.store(false, Ordering::Relaxed);
+            }
+        }
+        struct Harness<'a> {
+            menu: Menu<'a>,
+            started: Instant,
+            first_fallback: Option<Duration>,
+            first_blur: Option<Duration>,
+        }
+        impl ApplicationHandler for Harness<'_> {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.menu.resumed(event_loop);
+                self.started = Instant::now();
+            }
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                self.menu.window_event(event_loop, id, event);
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.menu.about_to_wait(event_loop);
+                if TEST_PENDING_BLUR_FRAMES.load(Ordering::Relaxed) >= 3
+                    && self.first_fallback.is_none()
+                {
+                    self.first_fallback = Some(self.started.elapsed());
+                    TEST_HOLD_BLUR_PIPELINES.store(false, Ordering::Relaxed);
+                }
+                if TEST_BLURRED_FRAMES.load(Ordering::Relaxed) > 0 {
+                    self.first_blur = Some(self.started.elapsed());
+                    event_loop.exit();
+                } else if self.started.elapsed() > Duration::from_secs(8) {
+                    event_loop.exit();
+                }
+            }
+        }
+        let _gate = Gate;
+        TEST_PENDING_BLUR_FRAMES.store(0, Ordering::Relaxed);
+        TEST_BLURRED_FRAMES.store(0, Ordering::Relaxed);
+        TEST_HOLD_BLUR_PIPELINES.store(true, Ordering::Relaxed);
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let assets = Arc::new(MenuAssets::load(&game, &[]).unwrap());
+        let mut state = State::new(game, Vec::new());
+        state.asset_load = None;
+        state.assets = Some(assets);
+        state.screen = Screen::Options;
+        state.video.menu_blur = 5;
+        let mut harness = Harness {
+            menu: Menu::new(&mut state),
+            started: Instant::now(),
+            first_fallback: None,
+            first_blur: None,
+        };
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        builder.build().unwrap().run_app(&mut harness).unwrap();
+        assert!(
+            harness.first_fallback.is_some(),
+            "no frame was presented while blur was pending"
+        );
+        assert!(
+            harness.first_blur.is_some(),
+            "blur did not appear after compilation"
+        );
+        println!(
+            "Options first three fallback frames: {:?}; first blurred frame: {:?}; CPU observations, not display scanout",
+            harness.first_fallback, harness.first_blur
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     #[ignore = "performance measurement requiring Minecraft 26.3 assets and a Windows GPU window"]
     fn measure_title_window_pacing() {
         if !crate::window_test::isolated("menu::tests::measure_title_window_pacing") {

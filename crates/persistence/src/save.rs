@@ -752,6 +752,7 @@ impl FreshWorldDraft {
                 }
             }
         }
+        self.validate_entity_identities()?;
         let directory = tempfile::Builder::new()
             .prefix(".re-craft-world-")
             .tempdir_in(parent)
@@ -879,6 +880,31 @@ impl FreshWorldDraft {
             manifest,
             enabled_file_packs,
         })
+    }
+
+    /// Java indexes loaded entities by UUID within each dimension. Check the
+    /// generated passenger trees and the player before creating any files.
+    fn validate_entity_identities(&self) -> Result<()> {
+        let mut seen: BTreeMap<&DimensionId, BTreeSet<[i32; 4]>> = BTreeMap::new();
+        seen.entry(&self.player_dimension)
+            .or_default()
+            .insert(self.uuid);
+        for ((dimension, kind, _, _), region) in &self.regions {
+            if *kind != FreshRegionKind::Entities {
+                continue;
+            }
+            let identities = seen.entry(dimension).or_default();
+            for (position, (bytes, _)) in &region.chunks {
+                let document = nbt::read(bytes).context("cannot decode generated entity chunk")?;
+                collect_fresh_entity_identities(&document, identities).with_context(|| {
+                    format!(
+                        "generated entity chunk ({}, {}) in {}:{}",
+                        position.x, position.z, dimension.namespace, dimension.path
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn has_terrain_chunk(&self, dimension: &DimensionId, pos: crate::world::ChunkPos) -> bool {
@@ -1872,6 +1898,56 @@ fn validate_poi_preservation(
                     old_extra == empty,
                     "removing POI record would discard unrecognized fields"
                 ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Explicit UUIDs are checked across the loaded entities of one dimension.
+/// Missing UUIDs are left to Java's entity decoder and are not proof of identity.
+fn collect_fresh_entity_identities(
+    document: &nbt::NamedTag,
+    seen: &mut BTreeSet<[i32; 4]>,
+) -> Result<()> {
+    use nbt::TagType;
+    let mut pending: Vec<&Tag> = match document.value.get("Entities") {
+        None => Vec::new(),
+        Some(Tag::List { values, .. }) => values.iter().collect(),
+        _ => anyhow::bail!("generated entity list is invalid"),
+    };
+    while let Some(entity) = pending.pop() {
+        let Tag::Compound(fields) = entity else {
+            anyhow::bail!("generated entity must be a compound");
+        };
+        let mut uuids = fields.iter().filter(|(name, _)| name.matches("UUID"));
+        if let Some((_, value)) = uuids.next() {
+            ensure!(uuids.next().is_none(), "duplicate entity UUID field");
+            let Tag::IntArray(words) = value else {
+                anyhow::bail!("generated entity UUID must be an int array");
+            };
+            let uuid: [i32; 4] = words
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("generated entity UUID must contain four integers"))?;
+            ensure!(
+                seen.insert(uuid),
+                "duplicate generated entity UUID {uuid:?}"
+            );
+        }
+        let mut passengers = fields.iter().filter(|(name, _)| name.matches("Passengers"));
+        if let Some((_, value)) = passengers.next() {
+            ensure!(passengers.next().is_none(), "duplicate Passengers field");
+            match value {
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values,
+                } => pending.extend(values),
+                Tag::List {
+                    element_type: TagType::End,
+                    values,
+                } if values.is_empty() => {}
+                _ => anyhow::bail!("generated entity Passengers must be a compound list"),
             }
         }
     }
@@ -4675,6 +4751,109 @@ mod tests {
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
         add_terrain(&mut draft, -65);
         drop(draft.stage(parent.path()).unwrap());
+    }
+
+    #[test]
+    fn fresh_world_rejects_duplicate_entity_and_passenger_uuids_before_staging() {
+        fn entity(uuid: Option<[i32; 4]>, passengers: Vec<Tag>) -> Tag {
+            let mut fields = vec![("id".into(), Tag::String("minecraft:pig".into()))];
+            if let Some(uuid) = uuid {
+                fields.push(("UUID".into(), Tag::IntArray(uuid.to_vec())));
+            }
+            if !passengers.is_empty() {
+                fields.push((
+                    "Passengers".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: passengers,
+                    },
+                ));
+            }
+            Tag::Compound(fields)
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let (level, worldgen, player, player_uuid) = fresh_world_metadata();
+        let a = [41, 42, 43, 44];
+        let b = [51, 52, 53, 54];
+        let cases = [
+            (
+                vec![entity(Some(a), vec![])],
+                vec![entity(Some(a), vec![])],
+                true,
+            ),
+            (
+                vec![entity(Some(a), vec![entity(Some(b), vec![])])],
+                vec![entity(Some(b), vec![])],
+                true,
+            ),
+            (vec![entity(Some(player_uuid), vec![])], vec![], true),
+            (
+                vec![entity(Some(a), vec![entity(Some(b), vec![])])],
+                vec![entity(None, vec![])],
+                false,
+            ),
+        ];
+        for (first, second, duplicate) in cases {
+            let mut draft = FreshWorldDraft::new(
+                level.clone(),
+                worldgen.clone(),
+                player.clone(),
+                player_uuid,
+                42,
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let dimension = DimensionId::parse("overworld").unwrap();
+            let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+            let mut entities = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+            for (x, records) in [(0, first), (1, second)] {
+                let pos = crate::world::ChunkPos { x, z: 0 };
+                terrain.add(pos, &chunk(x, "stage"), 1).unwrap();
+                entities.add(pos, &entity_chunk(x, records), 1).unwrap();
+            }
+            draft.add_region(dimension.clone(), terrain).unwrap();
+            draft.add_region(dimension, entities).unwrap();
+            if duplicate {
+                let error = draft.stage(parent.path()).err().unwrap();
+                assert!(format!("{error:#}").contains("duplicate generated entity UUID"));
+            } else {
+                drop(draft.stage(parent.path()).unwrap());
+            }
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn fresh_entity_identity_checks_are_dimension_scoped_and_reject_ambiguity() {
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mob = Tag::Compound(vec![("UUID".into(), Tag::IntArray(uuid.to_vec()))]);
+        let mut nether = FreshRegionDraft::new(FreshRegionKind::Entities, 0, 0);
+        nether
+            .add(
+                crate::world::ChunkPos { x: 0, z: 0 },
+                &entity_chunk(0, vec![mob]),
+                1,
+            )
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("minecraft:the_nether").unwrap(), nether)
+            .unwrap();
+        assert!(draft.validate_entity_identities().is_ok());
+
+        let ambiguous = [
+            Tag::Compound(vec![("UUID".into(), Tag::IntArray(vec![1, 2, 3]))]),
+            Tag::Compound(vec![
+                ("UUID".into(), Tag::IntArray(vec![1; 4])),
+                ("UUID".into(), Tag::IntArray(vec![2; 4])),
+            ]),
+            Tag::Compound(vec![("Passengers".into(), Tag::Int(1))]),
+        ];
+        for invalid in ambiguous {
+            let document = entity_chunk(0, vec![invalid]);
+            assert!(collect_fresh_entity_identities(&document, &mut BTreeSet::new()).is_err());
+        }
     }
 
     #[test]

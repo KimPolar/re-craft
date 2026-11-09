@@ -1397,7 +1397,11 @@ impl GenerationSchedule {
     pub(super) fn revision(&self) -> u64 {
         self.revision
     }
-    pub(super) fn requirements(&self) -> impl Iterator<Item = (ChunkPos, GenerationStage)> + '_ {
+    /// The complete, deduplicated set of currently requested stage inputs,
+    /// including prerequisites added for neighboring chunks. Adding another
+    /// request can extend this set, so consumers must capture it again after
+    /// any change to the schedule.
+    pub fn requirements(&self) -> impl Iterator<Item = (ChunkPos, GenerationStage)> + '_ {
         self.required.iter().map(|(&pos, &stage)| (pos, stage))
     }
     pub fn required(&self, pos: ChunkPos) -> Option<GenerationStage> {

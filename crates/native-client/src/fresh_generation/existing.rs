@@ -3,12 +3,13 @@ use super::*;
 use anyhow::{Context, bail};
 use native_persistence::{
     nbt::{NamedTag, Tag},
-    world::{DimensionId, GenerationContextSnapshot, GenerationInputSnapshot},
+    world::{DimensionId, GenerationContextSnapshot, GenerationInputSnapshot, WorldReader},
 };
+use native_session::worldgen::schedule::GenerationSchedule;
 
 /// A generator bound to the exact captured inputs from which it was prepared.
-/// Live state, data-pack changes and generation completeness still need their
-/// own checks before any generated data may be saved.
+/// Bind the captured inputs with `add_save_dependencies` when saving.
+/// Live state and generation completeness still need independent checks.
 pub(crate) struct PreparedExistingGenerator {
     pub generator: TerrainGenerator,
     pub lighting: GeneratedDimensionLighting,
@@ -180,7 +181,7 @@ fn resolve_stem(
 }
 
 /// Compile using the saved generator and the pack selection captured from the
-/// same world. The pack source still needs protection before a later save.
+/// same world. A later save must bind these inputs as transaction dependencies.
 pub(crate) fn prepare_existing_generator(
     context: GenerationContextSnapshot,
     minecraft_dir: &std::path::Path,
@@ -236,6 +237,31 @@ pub(crate) fn prepare_existing_generator(
     })
 }
 
+/// Capture the scheduler's complete current neighborhood before preparing the
+/// generator. If the schedule is expanded, callers must capture and prepare
+/// again; dynamic inputs outside this schedule and unsaved session changes
+/// still need independent tracking.
+pub(crate) fn prepare_existing_generator_for_schedule(
+    reader: &mut WorldReader,
+    schedule: &GenerationSchedule,
+    minecraft_dir: &std::path::Path,
+) -> Result<PreparedExistingGenerator> {
+    let context = capture_scheduled_context(reader, schedule)?;
+    prepare_existing_generator(context, minecraft_dir)
+}
+
+fn capture_scheduled_context(
+    reader: &mut WorldReader,
+    schedule: &GenerationSchedule,
+) -> Result<GenerationContextSnapshot> {
+    ensure!(schedule.requested_chunks() != 0, "no generation requests");
+    reader.capture_generation_context(
+        schedule
+            .requirements()
+            .map(|(pos, _)| native_persistence::world::ChunkPos { x: pos.x, z: pos.z }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +296,74 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn scheduled_capture_tracks_every_required_neighbor_and_expansion() -> Result<()> {
+        use flate2::{Compression, write::GzEncoder};
+        use native_session::worldgen::schedule::GenerationStage;
+        use native_world::loaded::ChunkPos;
+        use std::io::Write;
+
+        let world = tempfile::tempdir()?;
+        let root = world.path();
+        std::fs::create_dir_all(root.join("data/minecraft"))?;
+        std::fs::create_dir_all(root.join("dimensions/minecraft/overworld/region"))?;
+        std::fs::write(
+            root.join("data/minecraft/world_gen_settings.dat"),
+            native_persistence::nbt::write(&settings(Tag::Compound(vec![])))?,
+        )?;
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![("DataVersion".into(), Tag::Int(5023))]),
+            )]),
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&native_persistence::nbt::write(&level)?)?;
+        std::fs::write(root.join("level.dat"), gzip.finish()?)?;
+        let mut reader = WorldReader::open_for_session(root, DimensionId::parse("overworld")?)?;
+        let mut schedule = GenerationSchedule::new();
+        assert!(capture_scheduled_context(&mut reader, &schedule).is_err());
+        let target = ChunkPos { x: -3, z: 4 };
+        schedule.request_many([
+            (target, GenerationStage::Full),
+            (ChunkPos { x: -2, z: 4 }, GenerationStage::Terrain),
+        ])?;
+        let expected: BTreeSet<_> = schedule
+            .requirements()
+            .map(|(pos, _)| (pos.x, pos.z))
+            .collect();
+        let captured = capture_scheduled_context(&mut reader, &schedule)?;
+        let sources = captured.inputs().sources().chunks();
+        assert_eq!(
+            sources
+                .keys()
+                .map(|pos| (pos.x, pos.z))
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        assert!(sources.values().all(|source| {
+            source.terrain.is_none() && source.entities.is_none() && source.poi.is_none()
+        }));
+        assert!(expected.len() > 1);
+
+        let before = schedule.requested_chunks();
+        assert!(
+            schedule
+                .request(ChunkPos { x: i32::MAX, z: 0 }, GenerationStage::Full)
+                .is_err()
+        );
+        assert_eq!(schedule.requested_chunks(), before);
+        schedule.request(ChunkPos { x: 50, z: 50 }, GenerationStage::Full)?;
+        let expanded = capture_scheduled_context(&mut reader, &schedule)?;
+        assert!(expanded.inputs().sources().chunks().len() > sources.len());
+        assert_eq!(
+            expanded.inputs().sources().chunks().len(),
+            schedule.requested_chunks()
+        );
+        Ok(())
     }
 
     #[test]
@@ -390,8 +484,17 @@ mod tests {
             std::fs::create_dir_all(root.join(format!("dimensions/minecraft/{name}/region")))?;
             let dimension = DimensionId::parse(name)?;
             let mut reader = WorldReader::open_for_session(root, dimension)?;
-            let context = reader.capture_generation_context([ChunkPos { x: 0, z: 0 }])?;
-            let mut actual = prepare_existing_generator(context, &game)?;
+            let mut schedule = GenerationSchedule::new();
+            schedule.request(
+                native_world::loaded::ChunkPos { x: 0, z: 0 },
+                native_session::worldgen::schedule::GenerationStage::Full,
+            )?;
+            let mut actual =
+                prepare_existing_generator_for_schedule(&mut reader, &schedule, &game)?;
+            assert_eq!(
+                actual.inputs().sources().chunks().len(),
+                schedule.requested_chunks()
+            );
             assert!(actual.generate_structures);
             assert_eq!(actual.inputs().settings().seed(), -42);
             let mut plan = WorldSavePlan::new();

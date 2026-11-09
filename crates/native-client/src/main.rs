@@ -33,6 +33,7 @@ mod frame_pacer;
 mod fresh_generation;
 mod game_ui;
 mod generated_item;
+mod generation_pipeline;
 mod generation_staging;
 mod generation_worker;
 mod ground_items;

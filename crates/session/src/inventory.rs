@@ -3375,9 +3375,14 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
             }
             8192
         } else if name.matches("minecraft:use_remainder") {
-            // Generic block and tool uses do not yet apply use-remainder side
-            // effects, so only resolve items whose ordinary use is handled as food.
-            crate::survival::ordinary_food(id)?;
+            // BlockItem.place uses ItemStack.consume, which does not apply
+            // USE_REMAINDER. Food applies it separately when eating completes.
+            // Other item use paths still need their own verification.
+            if crate::survival::ordinary_food(id).is_none()
+                && native_world::Block::from_item_id(id).is_none()
+            {
+                return None;
+            }
             crate::survival::parse_use_remainder(value)?;
             16384
         } else if name.matches("!minecraft:use_remainder") {

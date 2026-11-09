@@ -30032,6 +30032,170 @@ pub(crate) mod tests {
         }
     }
 
+    fn place_stone_with_use_remainder(
+        creative: bool,
+        hand: crate::inventory::PlayerSlot,
+        count: u32,
+    ) -> (u32, bool) {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let components = Tag::Compound(vec![(
+            "minecraft:use_remainder".into(),
+            Tag::String("minecraft:diamond".into()),
+        )]);
+        let saved = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:stone".into())),
+            ("count".into(), Tag::Int(count as i32)),
+            ("components".into(), components.clone()),
+        ]);
+        let item = crate::player_data::read_stack(&saved).unwrap();
+        assert_eq!(item.max_count(), Some(64));
+        let mut session = session();
+        session.set_game_mode(if creative {
+            GameMode::Creative
+        } else {
+            GameMode::Survival
+        });
+        let pos = IVec3::new(8, 2, 7);
+        let water = session.intern_block(state("minecraft:water", &[("level", "0")]));
+        assert!(session.set_with_notify(pos, water, false));
+        let mut inventory = PlayerInventory::default();
+        assert!(inventory.set_slot(hand, Some(item)));
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Place);
+        session.update(TICK);
+        let Cell::State(id) = cell(
+            &session.world,
+            session.origin,
+            session.bounds,
+            pos,
+            session.states[0],
+        ) else {
+            panic!("missing target")
+        };
+        assert_eq!(session.world.state(id).unwrap().name, "minecraft:stone");
+        for slot in (0..36)
+            .map(PlayerSlot::Storage)
+            .chain([PlayerSlot::Offhand])
+        {
+            assert!(
+                session
+                    .inventory
+                    .slot(slot)
+                    .is_none_or(|item| item.id() != "minecraft:diamond")
+            );
+        }
+        assert!(session.dropped_items.snapshot().is_empty());
+        let remaining = session.inventory.slot(hand);
+        (
+            remaining.map_or(0, ItemStack::count),
+            remaining.is_some_and(|item| item.components() == &components),
+        )
+    }
+
+    #[test]
+    fn block_use_remainder_is_preserved_without_creating_an_item() {
+        use crate::inventory::PlayerSlot;
+        use native_persistence::nbt::Tag;
+        for creative in [false, true] {
+            for count in [1, 2, 64] {
+                for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                    let expected = count - u32::from(!creative);
+                    assert_eq!(
+                        place_stone_with_use_remainder(creative, hand, count),
+                        (expected, expected != 0)
+                    );
+                }
+            }
+        }
+        let malformed = Tag::Compound(vec![("minecraft:use_remainder".into(), Tag::Int(2))]);
+        assert!(crate::inventory::saved_item_max("minecraft:stone", &malformed).is_none());
+        let unsupported = Tag::Compound(vec![(
+            "minecraft:use_remainder".into(),
+            Tag::String("minecraft:diamond".into()),
+        )]);
+        assert!(crate::inventory::saved_item_max("minecraft:iron_pickaxe", &unsupported).is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn block_use_remainder_placement_matches_java() {
+        use crate::inventory::PlayerSlot;
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        native_resources::packs::ResourceStack::open(&game).unwrap();
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME")).map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let vibration = temp.path().join("VibrationOracle.java");
+        let source = temp.path().join("BlockUseRemainderOracle.java");
+        let output = temp.path().join("result.json");
+        std::fs::write(
+            &vibration,
+            include_str!("../tests/java/VibrationOracle.java"),
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/BlockUseRemainderOracle.java"),
+        )
+        .unwrap();
+        for command in [
+            Command::new(java.join("javac.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg(&vibration)
+                .arg(&source),
+            Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&cp)
+                .arg("BlockUseRemainderOracle")
+                .arg(&output),
+        ] {
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "oracle failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 6);
+        for row in rows {
+            let creative = row["creative"].as_bool().unwrap();
+            let before = row["before"].as_u64().unwrap() as u32;
+            let expected = (
+                row["after"].as_u64().unwrap() as u32,
+                row["has_remainder"].as_bool().unwrap(),
+            );
+            for hand in [PlayerSlot::Storage(0), PlayerSlot::Offhand] {
+                assert_eq!(
+                    place_stone_with_use_remainder(creative, hand, before),
+                    expected,
+                    "{row} {hand:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_os = "windows")]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]

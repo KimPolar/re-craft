@@ -179,6 +179,16 @@ impl ResourceStack {
         Ok(None)
     }
 
+    /// Root metadata of each user pack, in increasing pack priority.
+    /// Failures are returned separately so callers can ignore one broken
+    /// metadata section without discarding the other packs.
+    pub fn pack_metadata(&mut self) -> Vec<Result<Option<Vec<u8>>>> {
+        self.packs
+            .iter_mut()
+            .map(|pack| pack.read("pack.mcmeta"))
+            .collect()
+    }
+
     /// Namespaces exposed by the client and selected resource packs. The
     /// callers still read each asset through the normal priority stack.
     pub fn asset_namespaces(&self) -> Result<BTreeSet<String>> {

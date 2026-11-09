@@ -1,7 +1,7 @@
 //! Vanilla menu textures are read from the user's verified installation at runtime.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::Read,
     path::Path,
@@ -75,6 +75,13 @@ pub struct MenuAssets {
     pub unicode: HashMap<char, UnicodeGlyph>,
     pub language: HashMap<String, String>,
     locale: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageInfo {
+    pub name: String,
+    pub region: String,
+    pub bidirectional: bool,
 }
 
 pub struct HudSprites {
@@ -706,15 +713,14 @@ impl MenuAssets {
             .find_map(|line| line.strip_prefix("mainHand:"))
             .and_then(|value| serde_json::from_str::<String>(value).ok())
             .is_some_and(|value| value == "left");
-        let locale = options
-            .lines()
-            .find_map(|line| line.strip_prefix("lang:").map(str::to_owned))
-            .filter(|value| {
-                value
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            })
-            .unwrap_or_else(|| "en_us".to_owned());
+        let mut languages = BTreeMap::new();
+        if let Ok(metadata) = index.read(minecraft_dir, "pack.mcmeta") {
+            merge_language_metadata(&mut languages, &metadata);
+        }
+        for metadata in stack.pack_metadata().into_iter().flatten().flatten() {
+            merge_language_metadata(&mut languages, &metadata);
+        }
+        let locale = selected_language(&options, &languages).to_owned();
         let namespaces = stack.asset_namespaces()?;
         let language = load_language_layers(&mut stack, &namespaces, &locale, |name| {
             index.read(minecraft_dir, name).ok()
@@ -799,6 +805,64 @@ impl MenuAssets {
             .map(String::as_str)
             .or_else(|| native_translation(&self.locale, key))
             .unwrap_or(fallback)
+    }
+}
+
+fn selected_language<'a>(options: &'a str, languages: &BTreeMap<String, LanguageInfo>) -> &'a str {
+    // Java loads a selected locale only when a pack declares it. English
+    // remains the fallback even when its metadata cannot be read.
+    options
+        .lines()
+        .find_map(|line| line.strip_prefix("lang:"))
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-/".contains(&b))
+                && value
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..")
+        })
+        .filter(|value| *value == "en_us" || languages.contains_key(*value))
+        .unwrap_or("en_us")
+}
+
+/// LanguageManager keeps the first declaration of each language as packs are
+/// visited from the built-in pack through the user packs.
+fn merge_language_metadata(languages: &mut BTreeMap<String, LanguageInfo>, bytes: &[u8]) {
+    fn parse(bytes: &[u8]) -> Option<Vec<(String, LanguageInfo)>> {
+        let root: Value = serde_json::from_slice(bytes).ok()?;
+        let entries = root.get("language")?.as_object()?;
+        entries
+            .iter()
+            .map(|(code, value)| {
+                if !(1..=16).contains(&code.encode_utf16().count()) {
+                    return None;
+                }
+                let name = value.get("name")?.as_str()?.to_owned();
+                let region = value.get("region")?.as_str()?.to_owned();
+                if name.is_empty() || region.is_empty() {
+                    return None;
+                }
+                let bidirectional = match value.get("bidirectional") {
+                    None => false,
+                    Some(value) => value.as_bool()?,
+                };
+                Some((
+                    code.clone(),
+                    LanguageInfo {
+                        name,
+                        region,
+                        bidirectional,
+                    },
+                ))
+            })
+            .collect()
+    }
+    if let Some(entries) = parse(bytes) {
+        for (code, info) in entries {
+            languages.entry(code).or_insert(info);
+        }
     }
 }
 
@@ -929,6 +993,129 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_metadata_uses_first_pack_declaration_and_rejects_invalid_sections() {
+        let mut languages = BTreeMap::new();
+        merge_language_metadata(&mut languages, br#"{"language":{"en_us":{"name":"English","region":"US"},"ko_kr":{"name":"Korean","region":"Korea","bidirectional":false}}}"#);
+        merge_language_metadata(&mut languages, br#"{"language":{"en_us":{"name":"Override","region":"Other"},"custom":{"name":"Custom","region":"World","bidirectional":true}}}"#);
+        merge_language_metadata(&mut languages, br#"{"language":{"ignored":{"name":"Valid","region":"Here"},"invalid":{"name":"","region":"Here"}}}"#);
+        assert_eq!(languages.len(), 3);
+        assert_eq!(languages["en_us"].name, "English");
+        assert_eq!(languages["ko_kr"].region, "Korea");
+        assert!(languages["custom"].bidirectional);
+        assert!(!languages.contains_key("ignored"));
+        for invalid in [
+            br#"{"language":{"":{"name":"x","region":"x"}}}"#.as_slice(),
+            br#"{"language":{"12345678901234567":{"name":"x","region":"x"}}}"#,
+            br#"{"language":{"invalid":{"name":"x","region":"x","bidirectional":"yes"}}}"#,
+        ] {
+            merge_language_metadata(&mut languages, invalid);
+            assert_eq!(languages.len(), 3);
+        }
+        assert_eq!(selected_language("lang:ko_kr\n", &languages), "ko_kr");
+        assert_eq!(selected_language("lang:unknown\n", &languages), "en_us");
+        assert_eq!(selected_language("lang:../custom\n", &languages), "en_us");
+        assert_eq!(selected_language("other:value\n", &languages), "en_us");
+    }
+
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and a Java 25 JDK"]
+    fn language_metadata_matches_java() -> Result<()> {
+        use std::{io::Write, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let index = AssetIndex::load(&game)?;
+        let layers = [
+            index.read(&game, "pack.mcmeta")?,
+            br#"{"language":{"en_us":{"name":"Override","region":"Other"},"custom":{"name":"Custom","region":"World","bidirectional":true}}}"#.to_vec(),
+            br#"{"language":{"ignored":{"name":"Valid","region":"Here"},"invalid":{"name":"","region":"Here"}}}"#.to_vec(),
+        ];
+        let version = game.join("versions/26.3");
+        let manifest: Value = serde_json::from_slice(&fs::read(version.join("26.3.json"))?)?;
+        let temp = tempfile::tempdir()?;
+        let directory_pack = temp.path().join("directory-pack");
+        fs::create_dir(&directory_pack)?;
+        fs::write(directory_pack.join("pack.mcmeta"), &layers[1])?;
+        let archive_pack = temp.path().join("archive-pack.zip");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&archive_pack)?);
+        archive.start_file("pack.mcmeta", zip::write::SimpleFileOptions::default())?;
+        archive.write_all(&layers[2])?;
+        archive.finish()?;
+        let mut stack = ResourceStack::open(&game)?;
+        stack.push_pack(&directory_pack)?;
+        stack.push_pack(&archive_pack)?;
+        let mut actual = BTreeMap::new();
+        merge_language_metadata(&mut actual, &layers[0]);
+        for layer in stack.pack_metadata() {
+            if let Some(layer) = layer? {
+                merge_language_metadata(&mut actual, &layer);
+            }
+        }
+        assert_eq!(selected_language("lang:custom", &actual), "custom");
+        assert_eq!(selected_language("lang:unknown", &actual), "en_us");
+        let source = temp.path().join("LanguageMetadataOracle.java");
+        fs::write(
+            &source,
+            include_str!("../tests/java/LanguageMetadataOracle.java"),
+        )?;
+        let mut classpath = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("libraries missing")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    classpath.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(classpath)?;
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut command = Command::new(java.join("java.exe"));
+        command
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("LanguageMetadataOracle");
+        for (number, layer) in layers.iter().enumerate() {
+            let path = temp.path().join(format!("layer-{number}.json"));
+            fs::write(&path, layer)?;
+            command.arg(path);
+        }
+        let result = command.output()?;
+        ensure!(
+            result.status.success(),
+            "Java oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let expected: Value = serde_json::from_slice(&result.stdout).with_context(|| {
+            format!(
+                "invalid Java output: {}",
+                String::from_utf8_lossy(&result.stdout)
+            )
+        })?;
+        let actual: BTreeMap<_, _> = actual.into_iter().map(|(code, info)| (code, serde_json::json!({
+            "name": info.name, "region": info.region, "bidirectional": info.bidirectional
+        }))).collect();
+        assert_eq!(serde_json::to_value(actual)?, expected);
+        Ok(())
+    }
 
     #[test]
     fn language_entries_accept_primitives_and_normalize_numeric_formats() {

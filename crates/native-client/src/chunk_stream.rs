@@ -296,6 +296,10 @@ impl ChunkStreamer {
                 .chain(targets(center, self.radius))
                 .filter(|pos| seen.insert(*pos))
                 .collect();
+            // Missing entries are only useful in an active window. Keeping
+            // every absent chunk ever visited grows without bound and can
+            // suppress a fresh disk read when a distant area is revisited.
+            self.missing.retain(|pos| windows.contains(*pos));
             self.entity_retry.retain(|pos, _| windows.contains(*pos));
             self.failed.retain(|pos, _| windows.contains(*pos));
             for &pos in &self.targets {
@@ -1442,6 +1446,99 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn missing_cache_expires_outside_window_and_rechecks_on_return() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let home = ChunkPos { x: 0, z: 0 };
+        let target = ChunkPos { x: 2, z: 0 };
+        let player = PlayerState {
+            position: Vec3::new(8.5, 1.0, 8.5),
+            yaw: 0.0,
+            pitch: 0.0,
+            vertical_velocity: 0.0,
+            on_ground: false,
+            pose: native_session::PlayerPose::Standing,
+        };
+        let mut session = LoadedSession::new(
+            chunk_world(home),
+            IVec3::ZERO,
+            BuildBounds {
+                min_y: 0,
+                max_y: 32,
+            },
+            player,
+        )
+        .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let worker_reads = Arc::clone(&reads);
+        let mut streamer = ChunkStreamer::with_source(2, BTreeSet::new(), move |pos| {
+            if pos == target && worker_reads.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
+                Ok(Some(chunk_world(pos)))
+            } else {
+                Ok(None)
+            }
+        })
+        .unwrap();
+        // Simulate negative cache entries accumulated during a long journey.
+        streamer
+            .missing
+            .extend((-10_000..=10_000).map(|x| ChunkPos { x, z: 100 }));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !streamer.missing.contains(&target) {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(Instant::now() < deadline, "first read did not finish");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(streamer.missing.len() <= 25);
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .missing_chunks
+                .contains(&target)
+        );
+
+        streamer.set_radius(1);
+        streamer.service(&mut session).unwrap();
+        session.update(Duration::from_millis(50));
+        assert!(!streamer.missing.contains(&target));
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .missing_chunks
+                .contains(&target)
+        );
+
+        streamer.set_radius(2);
+        while !session.has_resident_or_parked_chunk(target) {
+            streamer.service(&mut session).unwrap();
+            session.update(Duration::from_millis(50));
+            assert!(
+                Instant::now() < deadline,
+                "returned chunk was not rechecked"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 2);
+        assert!(
+            !session
+                .snapshot()
+                .world
+                .loaded()
+                .unwrap()
+                .missing_chunks
+                .contains(&target)
+        );
     }
 
     #[test]

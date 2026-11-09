@@ -382,12 +382,23 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
     }
     fn place_template_entities(
         &mut self,
-        _: &[Tag],
-        _: [i32; 3],
-        _: native_resources::structure_transform::Rotation,
-        _: BoundingBox,
+        entities: &[Tag],
+        origin: [i32; 3],
+        rotation: native_resources::structure_transform::Rotation,
+        clip: BoundingBox,
     ) -> Result<()> {
-        bail!("jigsaw template entity placement is not yet supported")
+        ensure!(
+            !super::super::template_entities::template_entities_intersect(
+                entities,
+                origin,
+                native_resources::structure_transform::Mirror::None,
+                rotation,
+                [0, 0, 0],
+                clip,
+            )?,
+            "jigsaw template entity placement is not yet supported"
+        );
+        Ok(())
     }
 }
 
@@ -483,6 +494,13 @@ mod tests {
         }
     }
     fn template(with_unsupported_nbt: bool) -> Result<TemplateData> {
+        template_with_entities(with_unsupported_nbt, Vec::new())
+    }
+
+    fn template_with_entities(
+        with_unsupported_nbt: bool,
+        entities: Vec<Tag>,
+    ) -> Result<TemplateData> {
         let mut second = vec![
             ("pos".into(), ints(&[1, 0, 0])),
             ("state".into(), Tag::Int(0)),
@@ -521,8 +539,12 @@ mod tests {
                 (
                     "entities".into(),
                     Tag::List {
-                        element_type: TagType::End,
-                        values: vec![],
+                        element_type: if entities.is_empty() {
+                            TagType::End
+                        } else {
+                            TagType::Compound
+                        },
+                        values: entities,
                     },
                 ),
             ]),
@@ -2548,6 +2570,94 @@ mod tests {
         assert!(region.finish().is_err());
         assert_eq!(terrain.snapshot().block(1, 8, 1), before.block(1, 8, 1));
         assert_eq!(terrain.snapshot().block(2, 8, 1), before.block(2, 8, 1));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_entities_outside_clip_do_not_block_placement() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[]}));
+        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+        ));
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let piece = Piece {
+            element: PoolElement::Single {
+                legacy: false,
+                location: ResourceId::parse("example:test")?,
+                processors: holder,
+                projection: Projection::Rigid,
+                override_liquid_settings: None,
+            },
+            origin: [1, 8, 1],
+            rotation: Rotation::None,
+            bounds: clip,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        for (anchor, expected) in [
+            (Some([15, 0, 0]), true),
+            (Some([1, 0, 0]), false),
+            (None, false),
+        ] {
+            let mut entity = vec![
+                (
+                    "pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: vec![Tag::Double(1.5), Tag::Double(0.0), Tag::Double(0.5)],
+                    },
+                ),
+                (
+                    "nbt".into(),
+                    Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]),
+                ),
+            ];
+            if let Some(anchor) = anchor {
+                entity.push(("blockPos".into(), ints(&anchor)));
+            }
+            let prepared = PreparedTemplatePiece::load(
+                &piece,
+                &processors,
+                &mut template_with_entities(false, vec![Tag::Compound(entity)])?,
+            )?;
+            let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            let mut initial_random = random.clone();
+            let result = region.place_rigid_jigsaw_piece(
+                &prepared,
+                &registry,
+                clip,
+                LiquidSettings::IgnoreWaterlogging,
+                &mut random,
+            );
+            if expected {
+                assert!(result?);
+                region.finish()?;
+                assert_eq!(
+                    terrain.snapshot().block(1, 8, 1).unwrap().name,
+                    "minecraft:stone"
+                );
+            } else {
+                let error = result.err().context("entity was not rejected")?;
+                if anchor.is_some() {
+                    assert!(format!("{error:#}").contains("entity placement is not yet supported"));
+                } else {
+                    assert!(format!("{error:#}").contains("blockPos missing"));
+                }
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+            }
+            assert_eq!(random.next_long(), initial_random.next_long());
+        }
         Ok(())
     }
 

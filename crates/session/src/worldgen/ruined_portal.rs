@@ -13,6 +13,8 @@ use native_resources::{
 };
 use std::sync::Arc;
 
+use super::template_entities::template_entities_intersect;
+
 /// Access to the selected generation biome's temperature at the portal origin.
 pub trait PortalStartEnvironment: PortalEnvironment {
     fn cold_enough_to_snow(
@@ -38,55 +40,6 @@ pub struct PortalJigsawMarker {
     pub source_index: usize,
     pub position: [i32; 3],
     pub final_state: native_world::loaded::BlockState,
-}
-
-// Java clips template entities using their transformed integer blockPos,
-// independently of their floating-point Pos. Reject records whose location
-// cannot be established instead of silently omitting a possible entity.
-fn template_entities_intersect(
-    entities: &[Tag],
-    origin: [i32; 3],
-    mirror: Mirror,
-    rotation: Rotation,
-    pivot: [i32; 3],
-    clip: BoundingBox,
-) -> Result<bool> {
-    ensure!(
-        (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
-        "invalid portal clipping box"
-    );
-    for entity in entities {
-        let Tag::Compound(fields) = entity else {
-            anyhow::bail!("invalid portal template entity");
-        };
-        let mut positions = fields.iter().filter(|(name, _)| name.matches("blockPos"));
-        let (_, position) = positions.next().context("portal entity blockPos missing")?;
-        ensure!(
-            positions.next().is_none(),
-            "duplicate portal entity blockPos"
-        );
-        let local = match position {
-            Tag::IntArray(values) => match values.as_slice() {
-                [x, y, z] => [*x, *y, *z],
-                _ => anyhow::bail!("invalid portal entity blockPos length"),
-            },
-            Tag::List {
-                element_type: TagType::Int,
-                values,
-            } => match values.as_slice() {
-                [Tag::Int(x), Tag::Int(y), Tag::Int(z)] => [*x, *y, *z],
-                _ => anyhow::bail!("invalid portal entity blockPos"),
-            },
-            _ => anyhow::bail!("invalid portal entity blockPos"),
-        };
-        let world = native_resources::structure_transform::block_world_position(
-            local, origin, mirror, rotation, pivot,
-        );
-        if (0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&world[axis])) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 impl PreparedStart {
@@ -721,75 +674,5 @@ impl SavedRuinedPortalPiece {
         };
         piece.validate()?;
         Ok(piece)
-    }
-}
-
-#[cfg(test)]
-mod entity_clip_tests {
-    use super::*;
-
-    fn entity(position: Tag) -> Tag {
-        Tag::Compound(vec![("blockPos".into(), position)])
-    }
-
-    #[test]
-    fn template_entity_clipping_uses_transformed_integer_anchor() -> Result<()> {
-        let list = Tag::List {
-            element_type: TagType::Int,
-            values: vec![Tag::Int(3), Tag::Int(4), Tag::Int(-2)],
-        };
-        let args = (
-            [-32, 60, 48],
-            Mirror::FrontBack,
-            Rotation::Clockwise90,
-            [2, 0, 3],
-        );
-        let point = BoundingBox::new([-25, 64, 46], [-25, 64, 46]).unwrap();
-        let outside = BoundingBox::new([-24, 64, 46], [-24, 64, 46]).unwrap();
-        for position in [list, Tag::IntArray(vec![3, 4, -2])] {
-            let entities = [entity(position)];
-            assert!(template_entities_intersect(
-                &entities, args.0, args.1, args.2, args.3, point
-            )?);
-            assert!(!template_entities_intersect(
-                &entities, args.0, args.1, args.2, args.3, outside
-            )?);
-        }
-        assert!(!template_entities_intersect(
-            &[],
-            args.0,
-            args.1,
-            args.2,
-            args.3,
-            point
-        )?);
-        Ok(())
-    }
-
-    #[test]
-    fn template_entity_clipping_rejects_unknown_anchors() {
-        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).unwrap();
-        let cases = [
-            Tag::Compound(vec![]),
-            entity(Tag::IntArray(vec![1, 2])),
-            entity(Tag::String("1 2 3".into())),
-            Tag::Compound(vec![
-                ("blockPos".into(), Tag::IntArray(vec![1, 2, 3])),
-                ("blockPos".into(), Tag::IntArray(vec![30, 2, 3])),
-            ]),
-        ];
-        for value in cases {
-            assert!(
-                template_entities_intersect(
-                    &[value],
-                    [0, 0, 0],
-                    Mirror::None,
-                    Rotation::None,
-                    [0, 0, 0],
-                    clip
-                )
-                .is_err()
-            );
-        }
     }
 }

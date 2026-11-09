@@ -1047,6 +1047,7 @@ pub struct WorldSavePlan {
     poi_chunks: Vec<PlannedEntityChunk>,
     generation_dependencies: Vec<PlannedGenerationDependency>,
     generation_source_session: Option<WorldSessionGuard>,
+    generation_settings: Option<GenerationSettingsSnapshot>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedSharedData>,
     weather: Option<PlannedSharedData>,
@@ -1178,6 +1179,28 @@ impl WorldSavePlan {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len() + self.generated_chunks.len()
+    }
+
+    /// Require the exact generator settings used for generation to remain on
+    /// disk until this plan commits. Other inputs, including packs and unsaved
+    /// session changes, still require their own protection.
+    pub fn require_generation_settings(
+        &mut self,
+        snapshot: &GenerationSettingsSnapshot,
+    ) -> Result<()> {
+        ensure!(
+            self.generation_settings.is_none(),
+            "generation settings already bound"
+        );
+        if let Some(session) = &self.generation_source_session {
+            ensure!(
+                Arc::ptr_eq(&session.shared, &snapshot.session.shared),
+                "generation captures belong to different world sessions"
+            );
+        }
+        self.generation_source_session = Some(snapshot.session.clone());
+        self.generation_settings = Some(snapshot.clone());
+        Ok(())
     }
 
     /// Require an observed region entry to remain unchanged until commit.
@@ -2064,6 +2087,26 @@ pub struct WorldSessionGuard {
     shared: Arc<SessionLock>,
 }
 
+/// Immutable generator settings captured under the world's session lock.
+/// This does not capture data packs or unsaved simulation state.
+#[derive(Clone)]
+pub struct GenerationSettingsSnapshot {
+    session: WorldSessionGuard,
+    raw: Arc<[u8]>,
+    document: Arc<nbt::NamedTag>,
+    seed: i64,
+}
+
+impl GenerationSettingsSnapshot {
+    pub fn document(&self) -> &nbt::NamedTag {
+        &self.document
+    }
+
+    pub fn seed(&self) -> i64 {
+        self.seed
+    }
+}
+
 /// Identity of the world state used for one asynchronous read request.
 #[derive(Clone)]
 pub struct WorldReadStamp {
@@ -2106,6 +2149,38 @@ struct SessionLock {
     write_epoch: AtomicU64,
     attachment_gate: Mutex<()>,
     region_caches: Mutex<Vec<Weak<Mutex<crate::world::WorldRegionCache>>>>,
+}
+
+fn read_generation_settings(root: &Path) -> Result<(PathBuf, Vec<u8>, nbt::NamedTag, i64)> {
+    let directory = root.join("data/minecraft");
+    ensure!(
+        crate::save_transaction::checked_directory(root, &directory)?.1,
+        "world generation directory is missing"
+    );
+    let directory = directory.canonicalize()?;
+    ensure!(
+        directory.starts_with(root),
+        "world generation directory is outside the world"
+    );
+    let path = directory.join("world_gen_settings.dat");
+    let metadata = fs::symlink_metadata(&path).context("world generation settings are missing")?;
+    ensure!(
+        metadata.is_file() && ordinary(&metadata),
+        "world generation settings must be an ordinary file"
+    );
+    let path = path.canonicalize()?;
+    ensure!(
+        path.parent() == Some(directory.as_path()),
+        "world generation settings resolve outside the world"
+    );
+    let bytes = nbt::decompress_limited(File::open(&path)?)?;
+    let document = if bytes.starts_with(&[0x1f, 0x8b]) {
+        nbt::read_gzip(bytes.as_slice())?
+    } else {
+        nbt::read(&bytes)?
+    };
+    let seed = crate::world::WorldReader::world_seed_from_document(&document)?;
+    Ok((path, bytes, document, seed))
 }
 
 impl WorldSessionGuard {
@@ -2166,6 +2241,20 @@ impl WorldSessionGuard {
     pub(crate) fn acquire_capture(&self) -> Result<WorldCaptureGuard> {
         Ok(WorldCaptureGuard {
             _guard: self.acquire_exclusive(false)?,
+        })
+    }
+
+    /// Capture the complete saved generator document and its exact source
+    /// bytes while native writers are excluded. Generation must use this
+    /// document rather than independently reopening the file.
+    pub fn capture_generation_settings(&self) -> Result<GenerationSettingsSnapshot> {
+        let _lease = self.acquire_capture()?;
+        let (_, raw, document, seed) = read_generation_settings(&self.shared.root)?;
+        Ok(GenerationSettingsSnapshot {
+            session: self.clone(),
+            raw: raw.into(),
+            document: Arc::new(document),
+            seed,
         })
     }
 
@@ -2495,39 +2584,20 @@ impl WorldWriteGuard {
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
         let mut deletions = Vec::new();
         let mut absent_dependencies = Vec::new();
-        if let Some(expected_seed) = named_loot_seed {
-            let directory = self.root.join("data/minecraft");
-            ensure!(
-                crate::save_transaction::checked_directory(&self.root, &directory)?.1,
-                "world generation directory is missing"
-            );
-            let directory = directory.canonicalize()?;
-            ensure!(
-                directory.starts_with(&self.root),
-                "world generation directory is outside the world"
-            );
-            let path = directory.join("world_gen_settings.dat");
-            let metadata =
-                fs::symlink_metadata(&path).context("world generation settings are missing")?;
-            ensure!(
-                metadata.is_file() && ordinary(&metadata),
-                "world generation settings must be an ordinary file"
-            );
-            let path = path.canonicalize()?;
-            ensure!(
-                path.parent() == Some(directory.as_path()),
-                "world generation settings resolve outside the world"
-            );
-            let bytes = nbt::decompress_limited(File::open(&path)?)?;
-            let document = if bytes.starts_with(&[0x1f, 0x8b]) {
-                nbt::read_gzip(bytes.as_slice())?
-            } else {
-                nbt::read(&bytes)?
-            };
-            ensure!(
-                crate::world::WorldReader::world_seed_from_document(&document)? == expected_seed,
-                "world seed differs from chest loot proof"
-            );
+        if named_loot_seed.is_some() || plan.generation_settings.is_some() {
+            let (path, bytes, _, seed) = read_generation_settings(&self.root)?;
+            if let Some(expected_seed) = named_loot_seed {
+                ensure!(
+                    seed == expected_seed,
+                    "world seed differs from chest loot proof"
+                );
+            }
+            if let Some(snapshot) = &plan.generation_settings {
+                ensure!(
+                    bytes.as_slice() == snapshot.raw.as_ref(),
+                    "world generation settings changed after capture"
+                );
+            }
             let backup_dir = backup.path().join("world-data");
             fs::create_dir_all(&backup_dir)?;
             let backup_path = backup_dir.join("world_gen_settings.dat");
@@ -8466,6 +8536,129 @@ mod tests {
         guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
         assert_eq!(fs::read(entity_path).unwrap(), entity_region);
         assert_eq!(fs::read(poi_path).unwrap(), poi_region);
+    }
+
+    #[test]
+    fn generation_settings_capture_protects_generated_chunk_transaction() {
+        let world = test_world();
+        let (region_path, original_region, _) = fixture(world.path());
+        let directory = world.path().join("data/minecraft");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("world_gen_settings.dat");
+        let settings = |structures: bool| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![
+                        ("seed".into(), Tag::Long(42)),
+                        ("generate_features".into(), Tag::Byte(i8::from(structures))),
+                    ]),
+                ),
+            ]),
+        };
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&nbt::write(&settings(true)).unwrap())
+            .unwrap();
+        let original = gzip.finish().unwrap();
+        fs::write(&path, &original).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
+        let session = reader.session_guard().unwrap();
+        let captured = session.capture_generation_settings().unwrap();
+        assert_eq!(captured.seed(), 42);
+        assert_eq!(captured.document(), &settings(true));
+        let sources = reader
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        let make_plan = || {
+            let mut plan = WorldSavePlan::new();
+            plan.require_generation_settings(&captured).unwrap();
+            plan.add_generation_sources(&sources).unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 3, z: 0 },
+                &editable_chunk(3),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            plan
+        };
+        let mut duplicate = WorldSavePlan::new();
+        duplicate.require_generation_settings(&captured).unwrap();
+        assert!(duplicate.require_generation_settings(&captured).is_err());
+        fs::write(&path, nbt::write(&settings(false)).unwrap()).unwrap();
+        let mut writer = session.acquire_write().unwrap();
+        assert!(session.capture_generation_settings().is_err());
+        let error = writer.write_plan(make_plan(), |_, _| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("settings changed after capture"));
+        assert_eq!(fs::read(&region_path).unwrap(), original_region);
+        fs::write(&path, &original).unwrap();
+        let result = writer.write_plan(make_plan(), |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(
+                result
+                    .backup_directory
+                    .join("world-data/world_gen_settings.dat")
+            )
+            .unwrap(),
+            original
+        );
+        drop(writer);
+        assert!(reader.read_chunk(3, 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn generation_settings_reject_invalid_documents_and_other_sessions() {
+        let first = test_world();
+        fixture(first.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut reader =
+            crate::world::WorldReader::open_for_session(first.path(), dimension.clone()).unwrap();
+        let session = reader.session_guard().unwrap();
+        assert!(session.capture_generation_settings().is_err());
+        let directory = first.path().join("data/minecraft");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("world_gen_settings.dat");
+        fs::write(&path, b"bad nbt").unwrap();
+        assert!(session.capture_generation_settings().is_err());
+        let settings = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                ),
+            ]),
+        };
+        fs::write(&path, nbt::write(&settings).unwrap()).unwrap();
+        let captured = session.capture_generation_settings().unwrap();
+        let other = test_world();
+        fixture(other.path());
+        let mut other_reader =
+            crate::world::WorldReader::open_for_session(other.path(), dimension).unwrap();
+        let other_sources = other_reader
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        let mut plan = WorldSavePlan::new();
+        plan.require_generation_settings(&captured).unwrap();
+        assert!(plan.add_generation_sources(&other_sources).is_err());
+        assert!(plan.generation_dependencies.is_empty());
+        let mut plan = WorldSavePlan::new();
+        plan.add_generation_sources(&other_sources).unwrap();
+        assert!(plan.require_generation_settings(&captured).is_err());
+        assert!(plan.generation_settings.is_none());
+        assert!(
+            reader
+                .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+                .is_ok()
+        );
     }
 
     #[test]

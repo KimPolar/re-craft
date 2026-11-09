@@ -27,6 +27,7 @@ mod fire_overlay;
 mod first_person;
 mod fluid_mesh;
 mod focus_pause;
+mod font_ui;
 mod fov_ui;
 mod frame_pacer;
 mod fresh_generation;

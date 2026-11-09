@@ -1066,7 +1066,9 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
         return 4;
     }
     if let Some(assets) = assets {
-        if let Some(glyph) = assets.nonlatin_font.cells.get(&ch) {
+        if !assets.font_options.uniform
+            && let Some(glyph) = assets.nonlatin_font.cells.get(&ch)
+        {
             return glyph.advance;
         }
         if let Some((image, sx, sy)) = bitmap_glyph(assets, ch) {
@@ -1078,6 +1080,9 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
         } else if let Some(glyph) = assets.unicode.get(&ch) {
             return ((glyph.right - glyph.left + 1) / 2) as i32 + 1;
         } else {
+            if ch == '?' {
+                return 6;
+            }
             return glyph_width(Some(assets), '?');
         }
     }
@@ -1085,6 +1090,9 @@ fn glyph_width(assets: Option<&MenuAssets>, ch: char) -> i32 {
 }
 
 fn bitmap_glyph(assets: &MenuAssets, ch: char) -> Option<(&RgbaImage, u32, u32)> {
+    if assets.font_options.uniform {
+        return None;
+    }
     if let Some(glyph) = assets.nonlatin_font.cells.get(&ch) {
         return Some((&assets.nonlatin_font.image, glyph.x, glyph.y));
     }

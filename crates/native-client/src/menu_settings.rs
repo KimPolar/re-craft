@@ -226,6 +226,8 @@ impl SoundSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VideoSettings {
+    pub force_unicode_font: bool,
+    pub japanese_glyph_variants: bool,
     /// Render distance in chunks; Java's default is 12.
     pub render_distance: u8,
     /// Radius of the square biome-color average, in blocks.
@@ -285,6 +287,8 @@ impl InactivityFpsLimit {
 impl Default for VideoSettings {
     fn default() -> Self {
         Self {
+            force_unicode_font: false,
+            japanese_glyph_variants: japanese_glyph_variants_default(),
             render_distance: 12,
             biome_blend: 2,
             weather_radius: 10,
@@ -313,6 +317,41 @@ impl Default for VideoSettings {
             inactivity_fps_limit: InactivityFpsLimit::Afk,
         }
     }
+}
+
+fn is_japanese_locale(name: &str) -> bool {
+    name.split(['-', '_', '.'])
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("ja"))
+}
+
+fn japanese_glyph_variants_default() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let mut name = [0u16; 85];
+            // SAFETY: the writable buffer has 85 UTF-16 elements and remains
+            // valid for the duration of the call; the API writes at most that many.
+            let len = unsafe {
+                windows_sys::Win32::Globalization::GetUserDefaultLocaleName(
+                    name.as_mut_ptr(),
+                    name.len() as i32,
+                )
+            };
+            if len <= 0 || len as usize > name.len() {
+                return false;
+            }
+            is_japanese_locale(&String::from_utf16_lossy(&name[..len as usize - 1]))
+        }
+        #[cfg(not(windows))]
+        {
+            ["LC_ALL", "LC_CTYPE", "LANG"]
+                .into_iter()
+                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                .is_some_and(|name| is_japanese_locale(&name))
+        }
+    })
 }
 
 impl VideoSettings {
@@ -418,7 +457,7 @@ fn save_sound_to(path: &Path, sound: SoundSettings) -> Result<()> {
     update_settings(path, serde_json::json!({ "sound": sound }))
 }
 
-fn save_video_to(path: &Path, video: VideoSettings) -> Result<()> {
+pub(crate) fn save_video_to(path: &Path, video: VideoSettings) -> Result<()> {
     update_settings(path, serde_json::json!({ "video": video }))
 }
 
@@ -466,6 +505,16 @@ pub(crate) fn save_to(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japanese_glyph_default_uses_locale_language() {
+        for locale in ["ja", "ja-JP", "JA_jp.UTF-8"] {
+            assert!(is_japanese_locale(locale));
+        }
+        for locale in ["", "en-US", "ko_KR.UTF-8", "japanese"] {
+            assert!(!is_japanese_locale(locale));
+        }
+    }
 
     #[test]
     fn focus_pause_defaults_on_and_survives_unrelated_saves() {
@@ -588,6 +637,8 @@ mod tests {
             video: VideoSettings {
                 render_distance: 24,
                 biome_blend: 7,
+                force_unicode_font: true,
+                japanese_glyph_variants: true,
                 vsync: false,
                 max_fps: 260,
                 fov: 95,

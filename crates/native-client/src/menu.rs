@@ -50,6 +50,7 @@ enum Screen {
     CreateWorld,
     Options,
     Language,
+    Font,
     Controls,
     Mouse,
     Sound,
@@ -69,6 +70,9 @@ enum ButtonId {
     Options,
     Language,
     LanguageSearch,
+    FontSettings,
+    ForceUnicodeFont,
+    JapaneseGlyphVariants,
     Controls,
     MouseSettings,
     SprintWindow,
@@ -279,6 +283,7 @@ enum AssetLoadKind {
     ChooseDirectory,
     ChangePacks(Option<usize>),
     ChangeLanguage(String),
+    ChangeFont(crate::menu_assets::FontOptions),
 }
 
 struct PendingAssetLoad {
@@ -390,8 +395,7 @@ fn java_folder_name(path: &Path) -> impl Iterator<Item = u16> {
 impl State {
     fn from_settings(settings: Settings, options: crate::launch_options::LaunchOptions) -> Self {
         let (directory, packs) = options.resolve(&settings);
-        let mut state = Self::new_with_language(directory, packs, settings.language);
-        state.video = settings.video;
+        let mut state = Self::new_with_options(directory, packs, settings.language, settings.video);
         state.sound = settings.sound;
         state
     }
@@ -401,16 +405,26 @@ impl State {
         Self::new_with_language(minecraft_dir, packs, None)
     }
 
+    #[cfg(test)]
     fn new_with_language(
         minecraft_dir: PathBuf,
         packs: Vec<PathBuf>,
         language: Option<String>,
     ) -> Self {
+        Self::new_with_options(minecraft_dir, packs, language, VideoSettings::default())
+    }
+
+    fn new_with_options(
+        minecraft_dir: PathBuf,
+        packs: Vec<PathBuf>,
+        language: Option<String>,
+        video: VideoSettings,
+    ) -> Self {
         let mut state = Self {
             minecraft_dir,
             menu_screenshots: None,
             audio: None,
-            video: VideoSettings::default(),
+            video,
             panorama_seconds: 0.0,
             hud_hidden: false,
             sound: SoundSettings::default(),
@@ -455,6 +469,16 @@ impl State {
         state
     }
 
+    fn persist_settings(&self, settings: &Settings) -> Result<()> {
+        #[cfg(test)]
+        return self.settings_path.as_ref().map_or_else(
+            || menu_settings::save(settings),
+            |path| menu_settings::save_to(path, settings),
+        );
+        #[cfg(not(test))]
+        menu_settings::save(settings)
+    }
+
     fn save_settings(&mut self) {
         let settings = Settings {
             minecraft_dir: Some(self.minecraft_dir.clone()),
@@ -463,13 +487,7 @@ impl State {
             video: self.video,
             sound: self.sound,
         };
-        #[cfg(test)]
-        let saved = self.settings_path.as_ref().map_or_else(
-            || menu_settings::save(&settings),
-            |path| menu_settings::save_to(path, &settings),
-        );
-        #[cfg(not(test))]
-        let saved = menu_settings::save(&settings);
+        let saved = self.persist_settings(&settings);
         if let Err(error) = saved {
             self.error = Some(format!("{error:#}"));
         } else {
@@ -485,15 +503,20 @@ impl State {
             AssetLoadKind::ChangeLanguage(language) => Some(language.clone()),
             _ => self.language.clone(),
         };
+        let font_options = match &kind {
+            AssetLoadKind::ChangeFont(options) => *options,
+            _ => self.video.into(),
+        };
         std::thread::spawn(move || {
             let loaded = load_packs
                 .iter()
                 .try_for_each(|path| validate_pack(path))
                 .and_then(|()| {
-                    MenuAssets::load_with_language(
+                    MenuAssets::load_with_font(
                         &load_directory,
                         &load_packs,
                         language.as_deref(),
+                        font_options,
                     )
                 });
             let _ = sender.send(loaded);
@@ -518,6 +541,24 @@ impl State {
         let load = self.asset_load.take().expect("completed asset load");
         match result {
             Ok(assets) => {
+                if let AssetLoadKind::ChangeFont(font) = &load.kind {
+                    let mut video = self.video;
+                    video.force_unicode_font = font.uniform;
+                    video.japanese_glyph_variants = font.japanese;
+                    let settings = Settings {
+                        minecraft_dir: Some(load.directory.clone()),
+                        resource_packs: load.packs.clone(),
+                        language: self.language.clone(),
+                        video,
+                        sound: self.sound,
+                    };
+                    if let Err(error) = self.persist_settings(&settings) {
+                        self.error = Some(format!("{error:#}"));
+                        return true;
+                    }
+                    self.video = video;
+                    self.video_dirty = false;
+                }
                 self.minecraft_dir = load.directory;
                 self.packs = load.packs;
                 self.assets = Some(Arc::new(assets));
@@ -1135,7 +1176,12 @@ impl<'a> Menu<'a> {
     }
 
     fn update_gui_scale(&mut self) {
-        self.scale = gui_scale_for(self.size.0, self.size.1, self.state.video.gui_scale);
+        self.scale = gui_scale_for_font(
+            self.size.0,
+            self.size.1,
+            self.state.video.gui_scale,
+            self.state.video.force_unicode_font,
+        );
         if let Some((x, y)) = self.cursor_raw {
             self.cursor = gui_cursor(self.size, self.scale, (x, y));
         }
@@ -1907,12 +1953,12 @@ impl<'a> Menu<'a> {
                 );
                 let font = crate::language_ui::LanguageUi::font_rect(w, h);
                 add(
-                    ButtonId::Unavailable,
+                    ButtonId::FontSettings,
                     font.x,
                     font.y,
                     font.w,
                     tr("options.font", "Font Settings..."),
-                    false,
+                    true,
                 );
                 let done = crate::language_ui::LanguageUi::done_rect(w, h);
                 add(
@@ -1923,6 +1969,31 @@ impl<'a> Menu<'a> {
                     tr("gui.done", "Done"),
                     true,
                 );
+            }
+            Screen::Font => {
+                for (id, control, enabled) in [
+                    (
+                        ButtonId::ForceUnicodeFont,
+                        crate::font_ui::FontControl::Unicode,
+                        self.state.video.force_unicode_font,
+                    ),
+                    (
+                        ButtonId::JapaneseGlyphVariants,
+                        crate::font_ui::FontControl::Japanese,
+                        self.state.video.japanese_glyph_variants,
+                    ),
+                ] {
+                    let rect = crate::font_ui::rect(w, control);
+                    add(
+                        id,
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        crate::font_ui::label(self.state.assets.as_deref(), control, enabled),
+                        true,
+                    );
+                }
+                add(ButtonId::Done, x, h - 27, 200, tr("gui.done", "Done"), true);
             }
             Screen::Controls => {
                 let rect = mouse_ui::controls_mouse_button(w);
@@ -2164,6 +2235,7 @@ impl<'a> Menu<'a> {
     }
 
     fn do_button(&mut self, id: ButtonId, event_loop: &ActiveEventLoop) {
+        let returning_to_language = id == ButtonId::Done && self.state.screen == Screen::Font;
         self.state.error = None;
         if self.focused != Some(id)
             && let Some(field) = self.creation_field()
@@ -2192,6 +2264,20 @@ impl<'a> Menu<'a> {
                 }
             }
             ButtonId::LanguageSearch => self.focused = Some(ButtonId::LanguageSearch),
+            ButtonId::FontSettings => self.state.screen = Screen::Font,
+            ButtonId::ForceUnicodeFont | ButtonId::JapaneseGlyphVariants => {
+                let mut font: crate::menu_assets::FontOptions = self.state.video.into();
+                if id == ButtonId::ForceUnicodeFont {
+                    font.uniform = !font.uniform;
+                } else {
+                    font.japanese = !font.japanese;
+                }
+                self.state.begin_asset_load(
+                    self.state.minecraft_dir.clone(),
+                    self.state.packs.clone(),
+                    AssetLoadKind::ChangeFont(font),
+                );
+            }
             ButtonId::CreateWorld => {
                 let name = self.state.assets.as_ref().map_or_else(
                     || "New World".to_owned(),
@@ -2523,6 +2609,7 @@ impl<'a> Menu<'a> {
                         self.recovery_return_screen
                     }
                     Screen::Mouse => Screen::Controls,
+                    Screen::Font => Screen::Language,
                     Screen::Packs
                     | Screen::Language
                     | Screen::Video
@@ -2639,6 +2726,9 @@ impl<'a> Menu<'a> {
             )
         {
             self.focused = None;
+        }
+        if returning_to_language {
+            self.focused = Some(ButtonId::LanguageSearch);
         }
         if let Some(window) = &self.window {
             window.set_ime_allowed(
@@ -2964,6 +3054,17 @@ impl<'a> Menu<'a> {
                         self.focused == Some(ButtonId::LanguageSearch),
                     );
                 }
+            }
+            Screen::Font => {
+                canvas.text_centered(
+                    assets,
+                    lw / 2,
+                    15,
+                    assets.map_or("Font Settings", |a| {
+                        a.translate("options.font.title", "Font Settings")
+                    }),
+                    [255, 255, 255],
+                );
             }
             Screen::Worlds => {
                 let title = assets.map_or("Select World", |a| {
@@ -4594,8 +4695,12 @@ impl ApplicationHandler for Menu<'_> {
             }
         }
         self.receive_dialog();
+        let old_unicode = self.state.video.force_unicode_font;
         if self.state.poll_asset_load() | self.state.poll_world_load() | self.state.poll_pack_load()
         {
+            if old_unicode != self.state.video.force_unicode_font {
+                self.update_gui_scale();
+            }
             self.invalidate();
         }
         if self.state.screen == Screen::CreateWorld
@@ -4697,6 +4802,15 @@ pub(crate) fn gui_scale_for(width: u32, height: u32, requested: u32) -> u32 {
         scale += 1;
     }
     scale
+}
+
+pub(crate) fn gui_scale_for_font(width: u32, height: u32, requested: u32, unicode: bool) -> u32 {
+    let scale = gui_scale_for(width, height, requested);
+    if unicode && scale % 2 != 0 {
+        scale + 1
+    } else {
+        scale
+    }
 }
 
 pub(crate) fn next_gui_scale(width: u32, height: u32, current: u32) -> u32 {
@@ -6215,6 +6329,9 @@ mod tests {
         assert_eq!(gui_scale_for(1920, 1080, 1), 1);
         assert_eq!(gui_scale_for(1920, 1080, 3), 3);
         assert_eq!(gui_scale_for(1920, 1080, 20), 4);
+        assert_eq!(gui_scale_for_font(1280, 720, 0, true), 4);
+        assert_eq!(gui_scale_for_font(320, 240, 0, true), 2);
+        assert_eq!(gui_scale_for_font(1920, 1080, 2, true), 2);
         assert_eq!(
             (0..=4)
                 .map(|value| next_gui_scale(1920, 1080, value))
@@ -6643,9 +6760,46 @@ public class GuiScaleOracle {
         }
         assert!(state.asset_load.is_none());
         assert_eq!(state.assets.as_ref().unwrap().locale, "ko_kr");
+        let font = crate::menu_assets::FontOptions {
+            uniform: true,
+            japanese: true,
+        };
+        state.begin_asset_load(game.clone(), Vec::new(), AssetLoadKind::ChangeFont(font));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while state.asset_load.is_some() && Instant::now() < deadline {
+            state.poll_asset_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.asset_load.is_none());
+        assert_eq!(state.assets.as_ref().unwrap().font_options, font);
+        assert_eq!(state.assets.as_ref().unwrap().locale, "ko_kr");
         let loaded: Settings =
-            serde_json::from_slice(&std::fs::read(state.settings_path.unwrap()).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(state.settings_path.as_ref().unwrap()).unwrap())
+                .unwrap();
         assert_eq!(loaded.language.as_deref(), Some("ko_kr"));
+        assert!(loaded.video.force_unicode_font && loaded.video.japanese_glyph_variants);
+        let old_assets = state.assets.as_ref().unwrap().clone();
+        std::fs::write(state.settings_path.as_ref().unwrap(), b"{broken").unwrap();
+        state.begin_asset_load(
+            game.clone(),
+            Vec::new(),
+            AssetLoadKind::ChangeFont(crate::menu_assets::FontOptions {
+                uniform: false,
+                japanese: false,
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while state.asset_load.is_some() && Instant::now() < deadline {
+            state.poll_asset_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.video.force_unicode_font && state.video.japanese_glyph_variants);
+        assert!(Arc::ptr_eq(state.assets.as_ref().unwrap(), &old_assets));
+        assert_eq!(
+            std::fs::read(state.settings_path.as_ref().unwrap()).unwrap(),
+            b"{broken"
+        );
+        assert!(state.error.is_some());
         assert_eq!(std::fs::read(game.join("options.txt")).ok(), options);
     }
 

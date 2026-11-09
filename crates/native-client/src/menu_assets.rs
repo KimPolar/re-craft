@@ -74,9 +74,31 @@ pub struct MenuAssets {
     pub panorama: Vec<RgbaImage>,
     pub panorama_overlay: RgbaImage,
     pub unicode: HashMap<char, UnicodeGlyph>,
+    pub font_options: FontOptions,
     pub language: HashMap<String, String>,
     pub languages: BTreeMap<String, LanguageInfo>,
     pub locale: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontOptions {
+    pub uniform: bool,
+    pub japanese: bool,
+}
+
+impl Default for FontOptions {
+    fn default() -> Self {
+        crate::menu_settings::VideoSettings::default().into()
+    }
+}
+
+impl From<crate::menu_settings::VideoSettings> for FontOptions {
+    fn from(settings: crate::menu_settings::VideoSettings) -> Self {
+        Self {
+            uniform: settings.force_unicode_font,
+            japanese: settings.japanese_glyph_variants,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,6 +456,15 @@ impl MenuAssets {
         packs: &[std::path::PathBuf],
         language: Option<&str>,
     ) -> Result<Self> {
+        Self::load_with_font(minecraft_dir, packs, language, FontOptions::default())
+    }
+
+    pub fn load_with_font(
+        minecraft_dir: &Path,
+        packs: &[std::path::PathBuf],
+        language: Option<&str>,
+        font_options: FontOptions,
+    ) -> Result<Self> {
         let mut stack = ResourceStack::open(minecraft_dir)?;
         for pack in packs {
             stack.push_pack(pack)?;
@@ -714,7 +745,14 @@ impl MenuAssets {
             panorama_overlay.width() > 0 && panorama_overlay.height() > 0,
             "Empty Minecraft panorama overlay"
         );
-        let unicode = load_unicode_fonts(&mut stack, &index, minecraft_dir).unwrap_or_default();
+        let unicode = load_unicode_fonts(&mut stack, &index, minecraft_dir, font_options);
+        let unicode = if font_options.uniform || font_options.japanese {
+            let glyphs = unicode?;
+            ensure!(!glyphs.is_empty(), "The selected font has no glyphs");
+            glyphs
+        } else {
+            unicode.unwrap_or_default()
+        };
         let options = fs::read_to_string(minecraft_dir.join("options.txt")).unwrap_or_default();
         let chat = crate::chat_hud::ChatSettings::from_options(&options);
         let main_hand_left = options
@@ -806,6 +844,7 @@ impl MenuAssets {
             panorama,
             panorama_overlay,
             unicode,
+            font_options,
             language,
             languages,
             locale,
@@ -989,6 +1028,7 @@ fn load_unicode_fonts(
     stack: &mut ResourceStack,
     index: &AssetIndex,
     root: &Path,
+    options: FontOptions,
 ) -> Result<HashMap<char, UnicodeGlyph>> {
     let definition = match stack.read_pack_asset("assets/minecraft/font/include/unifont.json")? {
         Some(bytes) => bytes,
@@ -1008,12 +1048,12 @@ fn load_unicode_fonts(
                 .get("filter")
                 .and_then(|f| f.get("jp"))
                 .and_then(Value::as_bool)
-                == Some(true)
+                .is_some_and(|required| required != options.japanese)
             || provider
                 .get("filter")
                 .and_then(|f| f.get("uniform"))
                 .and_then(Value::as_bool)
-                == Some(true)
+                .is_some_and(|required| required != options.uniform)
         {
             continue;
         }
@@ -1879,7 +1919,15 @@ mod tests {
             writeln!(zip, "0041:{}", "18".repeat(16))?;
             zip.finish()?;
         }
-        let assets = MenuAssets::load(&game, &[root.to_path_buf()])?;
+        let assets = MenuAssets::load_with_font(
+            &game,
+            &[root.to_path_buf()],
+            None,
+            FontOptions {
+                uniform: false,
+                japanese: false,
+            },
+        )?;
         let glyph = &assets.unicode[&'한'];
         assert_eq!(glyph.rows[0], 4);
         assert_eq!((glyph.left, glyph.right), (1, 15));
@@ -1947,8 +1995,9 @@ mod tests {
             .arg("-classpath")
             .arg(&classpath)
             .arg("UnihexMetricsOracle")
-            .arg(definition_path)
-            .arg(zip_path)
+            .arg(&definition_path)
+            .arg(&zip_path)
+            .arg("1")
             .output()?;
         ensure!(
             result.status.success(),
@@ -1983,6 +2032,68 @@ mod tests {
         }
         ensure!(checked > 60_000, "Java font oracle returned too few glyphs");
         assert_eq!(checked, font.len());
+        let jp_bytes = index.read(&game, "minecraft/font/unifont_jp.zip")?;
+        let jp_font = parse_unicode_font(&jp_bytes, &unicode_overrides(&json["providers"][0]))?;
+        let jp_path = temp.path().join("jp.zip");
+        fs::write(&jp_path, jp_bytes)?;
+        let result = Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("UnihexMetricsOracle")
+            .arg(&definition_path)
+            .arg(&jp_path)
+            .arg("0")
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "Java Japanese font oracle failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut stack = ResourceStack::open(&game)?;
+        let combined = load_unicode_fonts(
+            &mut stack,
+            &index,
+            &game,
+            FontOptions {
+                uniform: false,
+                japanese: true,
+            },
+        )?;
+        let mut checked_jp = 0;
+        let mut changed = 0;
+        for line in String::from_utf8(result.stdout)?.lines() {
+            let values: Vec<_> = line.split('\t').collect();
+            if values.len() != 4 {
+                continue;
+            }
+            let ch =
+                char::from_u32(u32::from_str_radix(values[0], 16)?).context("invalid codepoint")?;
+            let glyph = combined
+                .get(&ch)
+                .with_context(|| format!("missing Japanese glyph {ch:?}"))?;
+            let jp = jp_font
+                .get(&ch)
+                .with_context(|| format!("missing Japanese source glyph {ch:?}"))?;
+            assert_eq!(
+                (
+                    glyph.left,
+                    glyph.right,
+                    (glyph.right - glyph.left + 1) / 2 + 1
+                ),
+                (values[1].parse()?, values[2].parse()?, values[3].parse()?),
+                "{ch:?}"
+            );
+            assert_eq!(glyph.rows, jp.rows, "Japanese provider priority for {ch:?}");
+            if font.get(&ch).is_some_and(|base| base.rows != jp.rows) {
+                changed += 1;
+            }
+            checked_jp += 1;
+        }
+        ensure!(
+            checked_jp > 1000 && changed > 1000,
+            "Japanese provider comparison was incomplete"
+        );
+        assert_eq!(checked_jp, jp_font.len());
         Ok(())
     }
 }

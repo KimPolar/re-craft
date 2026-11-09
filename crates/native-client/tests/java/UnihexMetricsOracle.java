@@ -7,7 +7,7 @@ import net.minecraft.client.gui.font.providers.UnihexProvider;
 public class UnihexMetricsOracle {
     public static void main(String[] args) throws Exception {
         var json = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
-        var provider = json.getAsJsonArray("providers").get(1);
+        var provider = json.getAsJsonArray("providers").get(Integer.parseInt(args[2]));
         var definition = UnihexProvider.Definition.CODEC.codec().parse(JsonOps.INSTANCE, provider).getOrThrow();
         var load = UnihexProvider.Definition.class.getDeclaredMethod("loadData", java.io.InputStream.class);
         load.setAccessible(true);

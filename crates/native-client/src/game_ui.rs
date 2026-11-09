@@ -15,7 +15,7 @@ use crate::{
     first_person::{FirstPersonInput, ItemUseAnimation},
     fov_ui::FovSlider,
     held_items::ItemModelCache,
-    menu::{gui_cursor, gui_scale_for, gui_size},
+    menu::{gui_cursor, gui_scale_for_font, gui_size},
     menu_assets::MenuAssets,
     menu_draw::{Canvas, Rect},
     menu_settings::{SoundCategory, SoundSettings, VideoSettings},
@@ -28,7 +28,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::menu::gui_scale;
+use crate::menu::{gui_scale, gui_scale_for};
 
 // Reserve enough tick history to age messages created before the world starts.
 const CHAT_AGE_OFFSET: u64 = 200;
@@ -47,6 +47,7 @@ enum PausePage {
     Game,
     Options,
     Language,
+    Font,
     Controls,
     Mouse,
     Sound,
@@ -60,6 +61,9 @@ enum PauseButton {
     Options,
     Language,
     LanguageSearch,
+    FontSettings,
+    ForceUnicodeFont,
+    JapaneseGlyphVariants,
     Controls,
     MouseSettings,
     SprintWindow,
@@ -154,6 +158,7 @@ struct DrawKey {
 
 struct PendingLanguage {
     code: String,
+    font: Option<crate::menu_assets::FontOptions>,
     result: std::sync::mpsc::Receiver<Result<MenuAssets>>,
 }
 
@@ -649,7 +654,12 @@ impl GameUi {
     }
 
     fn gui_scale(&self) -> u32 {
-        gui_scale_for(self.size.0, self.size.1, self.video.gui_scale)
+        gui_scale_for_font(
+            self.size.0,
+            self.size.1,
+            self.video.gui_scale,
+            self.video.force_unicode_font,
+        )
     }
 
     fn update_cursor_scale(&mut self) {
@@ -1102,19 +1112,50 @@ impl GameUi {
         };
         let directory = self.assets.minecraft_dir.clone();
         let packs = self.assets.resource_packs.clone();
+        let font = self.video.into();
         let requested = code.clone();
         let (sender, result) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
             .name("language-reload".into())
             .spawn(move || {
-                let loaded = MenuAssets::load_with_language(&directory, &packs, Some(&requested));
+                let loaded = MenuAssets::load_with_font(&directory, &packs, Some(&requested), font);
                 let _ = sender.send(loaded);
             }) {
             Ok(_) => {
-                self.language_load = Some(PendingLanguage { code, result });
+                self.language_load = Some(PendingLanguage {
+                    code,
+                    font: None,
+                    result,
+                });
                 self.video_error = None;
             }
             Err(error) => self.video_error = Some(format!("Cannot reload language: {error}")),
+        }
+        self.last_draw = None;
+    }
+
+    fn apply_font(&mut self, options: crate::menu_assets::FontOptions) {
+        let directory = self.assets.minecraft_dir.clone();
+        let packs = self.assets.resource_packs.clone();
+        let code = self.assets.locale.clone();
+        let requested = code.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("font-reload".into())
+            .spawn(move || {
+                let loaded =
+                    MenuAssets::load_with_font(&directory, &packs, Some(&requested), options);
+                let _ = sender.send(loaded);
+            }) {
+            Ok(_) => {
+                self.language_load = Some(PendingLanguage {
+                    code,
+                    font: Some(options),
+                    result,
+                });
+                self.video_error = None;
+            }
+            Err(error) => self.video_error = Some(format!("Cannot reload font: {error}")),
         }
         self.last_draw = None;
     }
@@ -1132,23 +1173,50 @@ impl GameUi {
             }
         };
         let pending = self.language_load.take().expect("completed language load");
+        let mut video = self.video;
         let result = result.and_then(|assets| {
             anyhow::ensure!(
                 assets.locale == pending.code,
                 "Selected language is unavailable"
             );
-            #[cfg(test)]
-            let saved = self.language_settings_path.as_ref().map_or_else(
-                || crate::menu_settings::save_language(&pending.code),
-                |path| crate::menu_settings::save_language_to(path, &pending.code),
-            );
-            #[cfg(not(test))]
-            let saved = crate::menu_settings::save_language(&pending.code);
+            let saved = if let Some(font) = pending.font {
+                anyhow::ensure!(assets.font_options == font, "Selected font is unavailable");
+                video.force_unicode_font = font.uniform;
+                video.japanese_glyph_variants = font.japanese;
+                #[cfg(test)]
+                {
+                    self.language_settings_path.as_ref().map_or_else(
+                        || crate::menu_settings::save_video(video),
+                        |path| crate::menu_settings::save_video_to(path, video),
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    crate::menu_settings::save_video(video)
+                }
+            } else {
+                #[cfg(test)]
+                {
+                    self.language_settings_path.as_ref().map_or_else(
+                        || crate::menu_settings::save_language(&pending.code),
+                        |path| crate::menu_settings::save_language_to(path, &pending.code),
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    crate::menu_settings::save_language(&pending.code)
+                }
+            };
             saved?;
             Ok(assets)
         });
         match result {
             Ok(assets) => {
+                if pending.font.is_some() {
+                    self.video = video;
+                    self.video_dirty = false;
+                    self.update_cursor_scale();
+                }
                 self.assets = Arc::new(assets);
                 self.video_error = None;
             }
@@ -1396,6 +1464,30 @@ impl GameUi {
                     Some(PauseButton::LanguageSearch)
                 } else if hit(crate::language_ui::LanguageUi::done_rect(w, h)) {
                     Some(PauseButton::Done)
+                } else if hit(crate::language_ui::LanguageUi::font_rect(w, h)) {
+                    Some(PauseButton::FontSettings)
+                } else {
+                    None
+                }
+            }
+            PausePage::Font => {
+                if hit(crate::font_ui::rect(
+                    w,
+                    crate::font_ui::FontControl::Unicode,
+                )) {
+                    Some(PauseButton::ForceUnicodeFont)
+                } else if hit(crate::font_ui::rect(
+                    w,
+                    crate::font_ui::FontControl::Japanese,
+                )) {
+                    Some(PauseButton::JapaneseGlyphVariants)
+                } else if hit(Rect {
+                    x,
+                    y: h - 27,
+                    w: 200,
+                    h: 20,
+                }) {
+                    Some(PauseButton::Done)
                 } else {
                     None
                 }
@@ -1529,6 +1621,21 @@ impl GameUi {
                     ui.search
                         .click(&self.assets, width.w, self.cursor.0 - width.x, false);
                 }
+                PauseAction::None
+            }
+            PauseButton::FontSettings => {
+                self.pause_page = PausePage::Font;
+                self.pause_focus = None;
+                PauseAction::None
+            }
+            PauseButton::ForceUnicodeFont | PauseButton::JapaneseGlyphVariants => {
+                let mut font: crate::menu_assets::FontOptions = self.video.into();
+                if button == PauseButton::ForceUnicodeFont {
+                    font.uniform = !font.uniform;
+                } else {
+                    font.japanese = !font.japanese;
+                }
+                self.apply_font(font);
                 PauseAction::None
             }
             PauseButton::Controls => {
@@ -1948,6 +2055,11 @@ impl GameUi {
                 self.pause_page = PausePage::Options;
                 PauseAction::None
             }
+            PausePage::Font => {
+                self.pause_page = PausePage::Language;
+                self.pause_focus = Some(PauseButton::LanguageSearch);
+                PauseAction::None
+            }
             PausePage::Controls => {
                 self.pause_page = PausePage::Options;
                 PauseAction::None
@@ -2030,6 +2142,11 @@ impl GameUi {
                     PauseButton::Done,
                 ],
                 PausePage::Language => vec![PauseButton::LanguageSearch, PauseButton::Done],
+                PausePage::Font => vec![
+                    PauseButton::ForceUnicodeFont,
+                    PauseButton::JapaneseGlyphVariants,
+                    PauseButton::Done,
+                ],
                 PausePage::Controls => vec![
                     PauseButton::MouseSettings,
                     PauseButton::ToggleSneak,
@@ -3610,13 +3727,54 @@ impl GameUi {
                 canvas.button(
                     Some(assets),
                     crate::language_ui::LanguageUi::font_rect(w, h),
-                    false,
-                    false,
+                    true,
+                    hover == Some(PauseButton::FontSettings)
+                        || self.pause_focus == Some(PauseButton::FontSettings),
                     assets.translate("options.font", "Font Settings..."),
                 );
                 canvas.button(
                     Some(assets),
                     crate::language_ui::LanguageUi::done_rect(w, h),
+                    true,
+                    hover == Some(PauseButton::Done) || self.pause_focus == Some(PauseButton::Done),
+                    assets.translate("gui.done", "Done"),
+                );
+            } else if self.pause_page == PausePage::Font {
+                canvas.text_centered(
+                    Some(assets),
+                    w / 2,
+                    15,
+                    assets.translate("options.font.title", "Font Settings"),
+                    [255, 255, 255],
+                );
+                for (control, button, enabled) in [
+                    (
+                        crate::font_ui::FontControl::Unicode,
+                        PauseButton::ForceUnicodeFont,
+                        self.video.force_unicode_font,
+                    ),
+                    (
+                        crate::font_ui::FontControl::Japanese,
+                        PauseButton::JapaneseGlyphVariants,
+                        self.video.japanese_glyph_variants,
+                    ),
+                ] {
+                    canvas.button(
+                        Some(assets),
+                        crate::font_ui::rect(w, control),
+                        true,
+                        hover == Some(button) || self.pause_focus == Some(button),
+                        &crate::font_ui::label(Some(assets), control, enabled),
+                    );
+                }
+                canvas.button(
+                    Some(assets),
+                    Rect {
+                        x: w / 2 - 100,
+                        y: h - 27,
+                        w: 200,
+                        h: 20,
+                    },
                     true,
                     hover == Some(PauseButton::Done) || self.pause_focus == Some(PauseButton::Done),
                     assets.translate("gui.done", "Done"),
@@ -4338,12 +4496,20 @@ mod inventory_tests {
             pack.join("assets/minecraft/lang/ko_kr.json"),
             r#"{"menu.singleplayer":"팩 번역"}"#,
         )?;
-        let assets = Arc::new(MenuAssets::load_with_language(
+        let assets = Arc::new(MenuAssets::load_with_font(
             &game,
             std::slice::from_ref(&pack),
             Some("en_us"),
+            crate::menu_assets::FontOptions {
+                uniform: false,
+                japanese: false,
+            },
         )?);
         let mut ui = GameUi::new(Arc::clone(&assets));
+        ui.set_video_settings(VideoSettings {
+            japanese_glyph_variants: false,
+            ..VideoSettings::default()
+        });
         ui.language_settings_path = Some(temp.path().join("options.json"));
         std::fs::write(
             ui.language_settings_path.as_ref().unwrap(),
@@ -4412,9 +4578,44 @@ mod inventory_tests {
         let saved: crate::menu_settings::Settings = serde_json::from_slice(&saved_bytes)?;
         assert_eq!(saved.language.as_deref(), Some("ko_kr"));
         assert!(Arc::ptr_eq(&ui.menu_assets(), &ui.assets));
+        ui.activate(PauseButton::Language, false);
+        ui.activate(PauseButton::FontSettings, false);
+        assert_eq!(ui.pause_page, PausePage::Font);
+        ui.activate(PauseButton::ForceUnicodeFont, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ui.language_load.is_some() && std::time::Instant::now() < deadline {
+            ui.poll_language_load();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ui.video.force_unicode_font, "{:?}", ui.video_error);
+        assert!(ui.assets.font_options.uniform);
+        assert_eq!(ui.gui_scale(), 4);
+        let glyph = &ui.assets.unicode[&'A'];
+        let canvas = Canvas::new(10, 10);
+        assert_eq!(
+            canvas.text_width(Some(&ui.assets), "A"),
+            ((glyph.right - glyph.left + 1) / 2 + 1) as i32
+        );
+        ui.activate(PauseButton::JapaneseGlyphVariants, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ui.language_load.is_some() && std::time::Instant::now() < deadline {
+            ui.poll_language_load();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ui.video.japanese_glyph_variants, "{:?}", ui.video_error);
+        assert!(ui.assets.font_options.japanese);
+        let saved: crate::menu_settings::Settings =
+            serde_json::from_slice(&std::fs::read(ui.language_settings_path.as_ref().unwrap())?)?;
+        assert!(saved.video.force_unicode_font && saved.video.japanese_glyph_variants);
+        assert_eq!(saved.language.as_deref(), Some("ko_kr"));
+        ui.pause_key(KeyCode::Escape, false);
+        assert_eq!(ui.pause_page, PausePage::Language);
+        ui.pause_key(KeyCode::Escape, false);
+        assert_eq!(ui.pause_page, PausePage::Options);
         let (sender, result) = std::sync::mpsc::channel();
         ui.language_load = Some(PendingLanguage {
             code: "en_us".into(),
+            font: None,
             result,
         });
         assert!(
@@ -4436,6 +4637,7 @@ mod inventory_tests {
         let (sender, result) = std::sync::mpsc::channel();
         ui.language_load = Some(PendingLanguage {
             code: "en_us".into(),
+            font: None,
             result,
         });
         assert!(sender.send(Ok(replacement)).is_ok());

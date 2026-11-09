@@ -3,7 +3,7 @@
 //! Unsupported functions are errors rather than substitutes that silently
 //! produce a different world.
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -44,13 +44,15 @@ struct BlockVolume {
 
 #[derive(Default)]
 struct SampleMemo {
-    values: HashMap<(usize, i32, i32, i32, bool), f32>,
+    // Keys contain only graph addresses and sample coordinates; map order is
+    // never observed, and datapack strings are not hashed here.
+    values: rustc_hash::FxHashMap<(usize, i32, i32, i32, bool), f32>,
     volume: Option<BlockVolume>,
     structure: Option<Arc<Beardifier>>,
     structure_volume: Option<Vec<f32>>,
 }
 impl Deref for SampleMemo {
-    type Target = HashMap<(usize, i32, i32, i32, bool), f32>;
+    type Target = rustc_hash::FxHashMap<(usize, i32, i32, i32, bool), f32>;
     fn deref(&self) -> &Self::Target {
         &self.values
     }

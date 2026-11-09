@@ -1985,9 +1985,9 @@ impl WorldReadStamp {
     }
 
     pub fn is_current(&self) -> bool {
-        self.session
-            .read_stamp()
-            .is_ok_and(|stamp| stamp.epoch == self.epoch)
+        // Captures reserve disk I/O but do not modify it or advance the epoch.
+        // Attachment still takes the gate before relying on this observation.
+        self.session.shared.write_epoch.load(Ordering::Acquire) == self.epoch
     }
 
     pub fn lock_current(&self) -> Result<WorldReadLease<'_>> {
@@ -7115,6 +7115,9 @@ mod tests {
         let stamp = session.read_stamp().unwrap();
         let capture = session.acquire_capture().unwrap();
         assert!(session.read_stamp().is_err());
+        assert!(stamp.is_current());
+        assert!(stamp.lock_current().is_ok());
+        assert!(session.acquire_write().is_err());
         drop(capture);
         assert!(
             stamp.is_current(),

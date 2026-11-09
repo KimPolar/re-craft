@@ -17,7 +17,7 @@ public class LanguageLayersOracle {
         Map<String, List<Resource>> layers = Map.of(
             "minecraft:lang/en_us.json", List.of(
                 resource("{\"english\":\"English\",\"shared\":\"base\",\"fallback\":\"original\"}"),
-                resource("{\"shared\":\"english pack\",\"pack_only\":\"present\"}")),
+                resource("{\"shared\":\"english pack\",\"pack_only\":\"present\",\"number\":1e+02,\"negative_zero\":-0.00,\"flag\":true,\"format\":\"%2$04d / %.2f / %s / %%d\"}")),
             "minecraft:lang/ko_kr.json", List.of(
                 resource("{\"shared\":\"Korean\",\"korean_only\":\"retained\"}"),
                 resource("{\"shared\":\"lower pack\",\"lower_only\":\"kept\"}"),
@@ -32,7 +32,7 @@ public class LanguageLayersOracle {
                 default -> throw new UnsupportedOperationException(method.getName());
             });
         ClientLanguage language = ClientLanguage.loadFrom(manager, List.of("en_us", "ko_kr"), false);
-        for (String key : List.of("english", "fallback", "pack_only", "korean_only", "lower_only", "shared", "example.key")) {
+        for (String key : List.of("english", "fallback", "pack_only", "korean_only", "lower_only", "shared", "example.key", "number", "negative_zero", "flag", "format")) {
             System.out.println(key + "\t" + language.getOrDefault(key));
         }
     }

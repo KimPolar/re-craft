@@ -824,13 +824,42 @@ fn load_language_layers(
                 }
             }
             for bytes in layers {
-                if let Ok(entries) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+                if let Some(entries) = parse_language_entries(&bytes) {
                     language.extend(entries);
                 }
             }
         }
     }
     Ok(language)
+}
+
+/// Java's language parser accepts JSON primitives and keeps the original
+/// spelling of numbers when converting them to strings.
+fn parse_language_entries(bytes: &[u8]) -> Option<HashMap<String, String>> {
+    use serde_json::value::RawValue;
+    use std::sync::OnceLock;
+
+    static UNSUPPORTED_FORMAT: OnceLock<regex::Regex> = OnceLock::new();
+    let entries = serde_json::from_slice::<HashMap<String, Box<RawValue>>>(bytes).ok()?;
+    let mut out = HashMap::with_capacity(entries.len());
+    for (key, raw) in entries {
+        let text = raw.get();
+        let value = match text.as_bytes().first().copied()? {
+            b'"' => serde_json::from_str::<String>(text).ok()?,
+            b't' | b'f' | b'-' | b'0'..=b'9' => text.to_owned(),
+            _ => return None,
+        };
+        let value = if value.contains('%') {
+            UNSUPPORTED_FORMAT
+                .get_or_init(|| regex::Regex::new(r"%([0-9]+\$)?[0-9.]*[df]").unwrap())
+                .replace_all(&value, "%${1}s")
+                .into_owned()
+        } else {
+            value
+        };
+        out.insert(key, value);
+    }
+    Some(out)
 }
 
 fn native_translation(locale: &str, key: &str) -> Option<&'static str> {
@@ -900,6 +929,21 @@ fn parse_unicode_font(bytes: &[u8]) -> Result<HashMap<char, UnicodeGlyph>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_entries_accept_primitives_and_normalize_numeric_formats() {
+        let entries = parse_language_entries(
+            br#"{"integer":42,"scientific":1e+02,"negative_zero":-0.00,"flag":true,"text":"%2$04d / %.2f / %s / %%d"}"#,
+        )
+        .unwrap();
+        assert_eq!(entries["integer"], "42");
+        assert_eq!(entries["scientific"], "1e+02");
+        assert_eq!(entries["negative_zero"], "-0.00");
+        assert_eq!(entries["flag"], "true");
+        assert_eq!(entries["text"], "%2$s / %s / %s / %%s");
+        assert!(parse_language_entries(br#"{"value":null}"#).is_none());
+        assert!(parse_language_entries(br#"{"value":[1]}"#).is_none());
+    }
 
     #[test]
     fn languages_merge_english_locale_and_pack_layers() {
@@ -1035,7 +1079,9 @@ mod tests {
                 "assets/minecraft/lang/en_us.json".into(),
                 vec![
                     bytes(r#"{"english":"English","shared":"base","fallback":"original"}"#),
-                    bytes(r#"{"shared":"english pack","pack_only":"present"}"#),
+                    bytes(
+                        r#"{"shared":"english pack","pack_only":"present","number":1e+02,"negative_zero":-0.00,"flag":true,"format":"%2$04d / %.2f / %s / %%d"}"#,
+                    ),
                 ],
             ),
             (
@@ -1113,7 +1159,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.split_once('\t'))
             .collect();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 11);
         for (key, expected) in lines {
             assert_eq!(actual.get(key).map(String::as_str), Some(expected), "{key}");
         }

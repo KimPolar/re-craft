@@ -74,7 +74,8 @@ pub struct MenuAssets {
     pub panorama_overlay: RgbaImage,
     pub unicode: HashMap<char, UnicodeGlyph>,
     pub language: HashMap<String, String>,
-    locale: String,
+    pub languages: BTreeMap<String, LanguageInfo>,
+    pub locale: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,6 +423,14 @@ fn nonlatin_bitmap_font(definition: &[u8], image: RgbaImage) -> Result<BitmapFon
 
 impl MenuAssets {
     pub fn load(minecraft_dir: &Path, packs: &[std::path::PathBuf]) -> Result<Self> {
+        Self::load_with_language(minecraft_dir, packs, None)
+    }
+
+    pub fn load_with_language(
+        minecraft_dir: &Path,
+        packs: &[std::path::PathBuf],
+        language: Option<&str>,
+    ) -> Result<Self> {
         let mut stack = ResourceStack::open(minecraft_dir)?;
         for pack in packs {
             stack.push_pack(pack)?;
@@ -720,7 +729,9 @@ impl MenuAssets {
         for metadata in stack.pack_metadata().into_iter().flatten().flatten() {
             merge_language_metadata(&mut languages, &metadata);
         }
-        let locale = selected_language(&options, &languages).to_owned();
+        let selection = language.map(|value| format!("lang:{value}"));
+        let locale =
+            selected_language(selection.as_deref().unwrap_or(&options), &languages).to_owned();
         let namespaces = stack.asset_namespaces()?;
         let language = load_language_layers(&mut stack, &namespaces, &locale, |name| {
             index.read(minecraft_dir, name).ok()
@@ -795,6 +806,7 @@ impl MenuAssets {
             panorama_overlay,
             unicode,
             language,
+            languages,
             locale,
         })
     }

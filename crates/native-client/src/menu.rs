@@ -49,6 +49,7 @@ enum Screen {
     Worlds,
     CreateWorld,
     Options,
+    Language,
     Controls,
     Mouse,
     Sound,
@@ -66,6 +67,8 @@ enum ButtonId {
     Multiplayer,
     Realms,
     Options,
+    Language,
+    LanguageSearch,
     Controls,
     MouseSettings,
     SprintWindow,
@@ -234,6 +237,7 @@ struct State {
     settings_path: Option<PathBuf>,
     assets: Option<Arc<MenuAssets>>,
     packs: Vec<PathBuf>,
+    language: Option<String>,
     available_packs: Vec<PathBuf>,
     selected_pack: Option<usize>,
     available_pack_scroll: usize,
@@ -274,6 +278,7 @@ enum AssetLoadKind {
     StartupWithoutPacks(String),
     ChooseDirectory,
     ChangePacks(Option<usize>),
+    ChangeLanguage(String),
 }
 
 struct PendingAssetLoad {
@@ -385,13 +390,22 @@ fn java_folder_name(path: &Path) -> impl Iterator<Item = u16> {
 impl State {
     fn from_settings(settings: Settings, options: crate::launch_options::LaunchOptions) -> Self {
         let (directory, packs) = options.resolve(&settings);
-        let mut state = Self::new(directory, packs);
+        let mut state = Self::new_with_language(directory, packs, settings.language);
         state.video = settings.video;
         state.sound = settings.sound;
         state
     }
 
+    #[cfg(test)]
     fn new(minecraft_dir: PathBuf, packs: Vec<PathBuf>) -> Self {
+        Self::new_with_language(minecraft_dir, packs, None)
+    }
+
+    fn new_with_language(
+        minecraft_dir: PathBuf,
+        packs: Vec<PathBuf>,
+        language: Option<String>,
+    ) -> Self {
         let mut state = Self {
             minecraft_dir,
             menu_screenshots: None,
@@ -405,6 +419,7 @@ impl State {
             settings_path: None,
             assets: None,
             packs,
+            language,
             available_packs: Vec::new(),
             selected_pack: None,
             available_pack_scroll: 0,
@@ -444,6 +459,7 @@ impl State {
         let settings = Settings {
             minecraft_dir: Some(self.minecraft_dir.clone()),
             resource_packs: self.packs.clone(),
+            language: self.language.clone(),
             video: self.video,
             sound: self.sound,
         };
@@ -465,11 +481,21 @@ impl State {
         let (sender, result) = mpsc::channel();
         let load_directory = directory.clone();
         let load_packs = packs.clone();
+        let language = match &kind {
+            AssetLoadKind::ChangeLanguage(language) => Some(language.clone()),
+            _ => self.language.clone(),
+        };
         std::thread::spawn(move || {
             let loaded = load_packs
                 .iter()
                 .try_for_each(|path| validate_pack(path))
-                .and_then(|()| MenuAssets::load(&load_directory, &load_packs));
+                .and_then(|()| {
+                    MenuAssets::load_with_language(
+                        &load_directory,
+                        &load_packs,
+                        language.as_deref(),
+                    )
+                });
             let _ = sender.send(loaded);
         });
         self.error = None;
@@ -518,6 +544,9 @@ impl State {
                 } else if matches!(load.kind, AssetLoadKind::ChooseDirectory) {
                     self.selected_pack = None;
                     self.refresh_packs();
+                    self.save_settings();
+                } else if let AssetLoadKind::ChangeLanguage(language) = load.kind {
+                    self.language = Some(language);
                     self.save_settings();
                 }
             }
@@ -977,6 +1006,8 @@ struct Menu<'a> {
     frame_timings: Option<MenuFrameTimings>,
     dialog: Option<mpsc::Receiver<(ButtonId, Option<PathBuf>)>>,
     last_world_click: Option<(usize, Instant)>,
+    last_language_click: Option<(String, Instant)>,
+    language_ui: Option<crate::language_ui::LanguageUi>,
     size: (u32, u32),
     scale: u32,
     video_ui: VideoUi,
@@ -993,6 +1024,15 @@ struct Menu<'a> {
 }
 
 impl<'a> Menu<'a> {
+    fn cancel_language(&mut self) {
+        self.language_ui = None;
+        self.state.screen = Screen::Options;
+        self.focused = None;
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+        }
+    }
+
     fn request_screenshot(&mut self) {
         if self.screenshots.is_none() {
             self.state.error = Some("Screenshot writer unavailable".into());
@@ -1044,6 +1084,8 @@ impl<'a> Menu<'a> {
                 .map(|_| MenuFrameTimings::default()),
             dialog: None,
             last_world_click: None,
+            last_language_click: None,
+            language_ui: None,
             size: (0, 0),
             scale: 1,
             video_ui,
@@ -1812,6 +1854,7 @@ impl<'a> Menu<'a> {
                         "options.fov" => ButtonId::OptionsFov,
                         "options.resourcepack" => ButtonId::Packs,
                         "options.video" => ButtonId::VideoSettings,
+                        "options.language" => ButtonId::Language,
                         _ => ButtonId::Unavailable,
                     };
                     add(
@@ -1846,6 +1889,35 @@ impl<'a> Menu<'a> {
                     true,
                 );
                 add(ButtonId::Done, x, h - 28, 200, tr("gui.done", "Done"), true);
+            }
+            Screen::Language => {
+                let search = crate::language_ui::LanguageUi::search_rect(w);
+                add(
+                    ButtonId::LanguageSearch,
+                    search.x,
+                    search.y,
+                    search.w,
+                    String::new(),
+                    true,
+                );
+                let font = crate::language_ui::LanguageUi::font_rect(w, h);
+                add(
+                    ButtonId::Unavailable,
+                    font.x,
+                    font.y,
+                    font.w,
+                    tr("options.font", "Font Settings..."),
+                    false,
+                );
+                let done = crate::language_ui::LanguageUi::done_rect(w, h);
+                add(
+                    ButtonId::Done,
+                    done.x,
+                    done.y,
+                    done.w,
+                    tr("gui.done", "Done"),
+                    true,
+                );
             }
             Screen::Controls => {
                 let rect = mouse_ui::controls_mouse_button(w);
@@ -2070,6 +2142,12 @@ impl<'a> Menu<'a> {
                 add(ButtonId::Done, x, h - 28, 200, tr("gui.done", "Done"), true);
             }
         }
+        if let Some(search) = result
+            .iter_mut()
+            .find(|button| button.id == ButtonId::LanguageSearch)
+        {
+            search.rect.h = 15;
+        }
         if self.state.asset_load.is_some() {
             for button in &mut result {
                 if button.id != ButtonId::Quit {
@@ -2097,6 +2175,18 @@ impl<'a> Menu<'a> {
                 self.state.refresh_worlds();
                 self.state.screen = Screen::Worlds;
             }
+            ButtonId::Language => {
+                if let Some(assets) = &self.state.assets {
+                    self.language_ui = Some(crate::language_ui::LanguageUi::new(
+                        assets,
+                        self.logical_size().1,
+                    ));
+                    self.state.screen = Screen::Language;
+                    self.focused = Some(ButtonId::LanguageSearch);
+                    self.last_language_click = None;
+                }
+            }
+            ButtonId::LanguageSearch => self.focused = Some(ButtonId::LanguageSearch),
             ButtonId::CreateWorld => {
                 let name = self.state.assets.as_ref().map_or_else(
                     || "New World".to_owned(),
@@ -2371,6 +2461,27 @@ impl<'a> Menu<'a> {
             #[cfg(debug_assertions)]
             ButtonId::WorldSettings => self.state.screen = Screen::WorldSettings,
             ButtonId::Done => {
+                if self.state.screen == Screen::Language {
+                    let selected = self
+                        .language_ui
+                        .as_ref()
+                        .and_then(|ui| ui.selected())
+                        .map(str::to_owned);
+                    if let Some(language) = selected
+                        && self
+                            .state
+                            .assets
+                            .as_ref()
+                            .is_some_and(|assets| assets.locale != language)
+                    {
+                        self.state.begin_asset_load(
+                            self.state.minecraft_dir.clone(),
+                            self.state.packs.clone(),
+                            AssetLoadKind::ChangeLanguage(language),
+                        );
+                    }
+                    self.language_ui = None;
+                }
                 if self.state.screen == Screen::Video {
                     self.state.video_dirty |= self.video_ui.apply_pending_distance(
                         &mut self.state.video,
@@ -2408,6 +2519,7 @@ impl<'a> Menu<'a> {
                     }
                     Screen::Mouse => Screen::Controls,
                     Screen::Packs
+                    | Screen::Language
                     | Screen::Video
                     | Screen::Accessibility
                     | Screen::Sound
@@ -2488,9 +2600,17 @@ impl<'a> Menu<'a> {
                 | ButtonId::Radius
                 | ButtonId::CreationName
                 | ButtonId::CreationSeed
+                | ButtonId::Language
+                | ButtonId::LanguageSearch
         );
         #[cfg(not(debug_assertions))]
-        let keep_focus = matches!(id, ButtonId::CreationName | ButtonId::CreationSeed);
+        let keep_focus = matches!(
+            id,
+            ButtonId::CreationName
+                | ButtonId::CreationSeed
+                | ButtonId::Language
+                | ButtonId::LanguageSearch
+        );
         if !keep_focus
             && id.accessibility_control().is_none()
             && !matches!(
@@ -2517,11 +2637,13 @@ impl<'a> Menu<'a> {
         }
         if let Some(window) = &self.window {
             window.set_ime_allowed(
-                self.state.screen == Screen::CreateWorld
-                    && matches!(
-                        self.focused,
-                        Some(ButtonId::CreationName | ButtonId::CreationSeed)
-                    ),
+                (self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch))
+                    || self.state.screen == Screen::CreateWorld
+                        && matches!(
+                            self.focused,
+                            Some(ButtonId::CreationName | ButtonId::CreationSeed)
+                        ),
             );
         }
         self.invalidate();
@@ -2828,6 +2950,15 @@ impl<'a> Menu<'a> {
                     "Choose your Minecraft game folder",
                     [255, 255, 255],
                 );
+            }
+            Screen::Language => {
+                if let (Some(assets), Some(ui)) = (assets, &self.language_ui) {
+                    ui.draw(
+                        &mut canvas,
+                        assets,
+                        self.focused == Some(ButtonId::LanguageSearch),
+                    );
+                }
             }
             Screen::Worlds => {
                 let title = assets.map_or("Select World", |a| {
@@ -3191,6 +3322,9 @@ impl<'a> Menu<'a> {
             }
         }
         for button in self.buttons() {
+            if button.id == ButtonId::LanguageSearch {
+                continue;
+            }
             if matches!(button.id, ButtonId::CreationName | ButtonId::CreationSeed) {
                 let focused = self.focused == Some(button.id);
                 if let Some(assets) = assets {
@@ -3465,7 +3599,15 @@ impl ApplicationHandler for Menu<'_> {
                 let previous = self.hover_target(&buttons, self.cursor);
                 self.cursor_raw = Some((position.x, position.y));
                 self.cursor = gui_cursor(self.size, self.scale, (position.x, position.y));
-                let (dragged, changed) = if self.state.screen == Screen::Controls {
+                let (dragged, changed) = if self.state.screen == Screen::Language {
+                    let (w, h) = self.logical_size();
+                    (
+                        self.language_ui
+                            .as_mut()
+                            .is_some_and(|ui| ui.drag_scrollbar(w, h, self.cursor.1)),
+                        false,
+                    )
+                } else if self.state.screen == Screen::Controls {
                     let (w, _) = self.logical_size();
                     self.sprint_window_ui
                         .pointer_move(w, self.cursor.0, &mut self.state.video)
@@ -3552,9 +3694,15 @@ impl ApplicationHandler for Menu<'_> {
                     self.cursor_raw = Some(raw);
                 }
                 let (w, h) = self.logical_size();
-                let scrollbar = self.state.screen == Screen::Video
+                let scrollbar = self.state.screen == Screen::Language
                     && self.state.asset_load.is_none()
-                    && self.video_ui.start_scrollbar(w, h, self.cursor)
+                    && self
+                        .language_ui
+                        .as_mut()
+                        .is_some_and(|ui| ui.start_scrollbar(w, h, self.cursor))
+                    || self.state.screen == Screen::Video
+                        && self.state.asset_load.is_none()
+                        && self.video_ui.start_scrollbar(w, h, self.cursor)
                     || self.state.screen == Screen::Accessibility
                         && self.state.asset_load.is_none()
                         && self.accessibility_ui.start_scrollbar(w, h, self.cursor)
@@ -3586,7 +3734,7 @@ impl ApplicationHandler for Menu<'_> {
                                 | ButtonId::PanoramaSpeed
                                 | ButtonId::MenuBlur
                         );
-                    if !self.slider_mouse_pressed {
+                    if !self.slider_mouse_pressed && button.id != ButtonId::LanguageSearch {
                         self.play_button_sound();
                     }
                     if matches!(button.id, ButtonId::SoundSlider(_))
@@ -3618,6 +3766,17 @@ impl ApplicationHandler for Menu<'_> {
                         self.focused = Some(button.id);
                     }
                     self.do_button(button.id, event_loop);
+                    if button.id == ButtonId::LanguageSearch
+                        && let (Some(assets), Some(ui)) =
+                            (self.state.assets.as_deref(), &mut self.language_ui)
+                    {
+                        ui.search.click(
+                            assets,
+                            button.rect.w,
+                            self.cursor.0 - button.rect.x,
+                            self.modifiers.shift_key(),
+                        );
+                    }
                     if matches!(button.id, ButtonId::CreationName | ButtonId::CreationSeed)
                         && let Some(assets) = self.state.assets.clone()
                     {
@@ -3629,7 +3788,28 @@ impl ApplicationHandler for Menu<'_> {
                     }
                 } else if self.state.asset_load.is_none() {
                     let (w, h) = self.logical_size();
-                    if self.state.screen == Screen::Worlds
+                    if self.state.screen == Screen::Language {
+                        if let Some(ui) = &mut self.language_ui
+                            && ui.click(w, h, self.cursor)
+                        {
+                            self.focused = None;
+                            if let Some(window) = &self.window {
+                                window.set_ime_allowed(false);
+                            }
+                            let code = ui.selected().unwrap_or_default().to_owned();
+                            let now = Instant::now();
+                            let double =
+                                self.last_language_click.as_ref().is_some_and(|(old, at)| {
+                                    old == &code
+                                        && now.saturating_duration_since(*at)
+                                            < Duration::from_millis(250)
+                                });
+                            self.last_language_click = Some((code, now));
+                            if double {
+                                self.do_button(ButtonId::Done, event_loop);
+                            }
+                        }
+                    } else if self.state.screen == Screen::Worlds
                         && self.state.world_load.is_none()
                         && self.cursor.0 >= w / 2 - 154
                         && self.cursor.0 < w / 2 + 154
@@ -3689,6 +3869,9 @@ impl ApplicationHandler for Menu<'_> {
                 button: MouseButton::Left,
                 ..
             } => {
+                if let Some(ui) = &mut self.language_ui {
+                    ui.release();
+                }
                 if let Some(field) = self.creation_field() {
                     field.end_drag();
                 }
@@ -3740,6 +3923,16 @@ impl ApplicationHandler for Menu<'_> {
                             amount > 0.0,
                         );
                     }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. }
+                if self.state.screen == Screen::Language && self.state.asset_load.is_none() =>
+            {
+                let amount =
+                    crate::mouse_scroll::scaled_delta(crate::scroll_lines(delta), self.state.video);
+                let (_, h) = self.logical_size();
+                if let Some(ui) = &mut self.language_ui {
+                    ui.scroll_by(amount, h);
                 }
             }
             WindowEvent::MouseWheel { delta, .. }
@@ -3816,6 +4009,25 @@ impl ApplicationHandler for Menu<'_> {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::Ime(winit::event::Ime::Preedit(text, _))
+                if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch) =>
+            {
+                if let Some(ui) = &mut self.language_ui {
+                    ui.search.set_preedit(text);
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(text))
+                if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch) =>
+            {
+                let (_, h) = self.logical_size();
+                if let Some(ui) = &mut self.language_ui {
+                    ui.search.insert_limited(&text, 32);
+                    ui.search.set_preedit(String::new());
+                    ui.changed_search(h);
+                }
+            }
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, _))
                 if self.state.screen == Screen::CreateWorld && self.creation_field().is_some() =>
             {
                 if let Some(field) = self.creation_field() {
@@ -3831,6 +4043,9 @@ impl ApplicationHandler for Menu<'_> {
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Disabled) => {
+                if let Some(ui) = &mut self.language_ui {
+                    ui.search.set_preedit(String::new());
+                }
                 if let Some(field) = self.creation_field() {
                     field.set_preedit(String::new());
                 }
@@ -3853,7 +4068,92 @@ impl ApplicationHandler for Menu<'_> {
                     PhysicalKey::Code(code) => Some(code),
                     _ => None,
                 };
-                if self.state.screen == Screen::CreateWorld
+                if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch)
+                    && self
+                        .language_ui
+                        .as_ref()
+                        .is_some_and(|ui| ui.search.composing())
+                {
+                    // IME composition is handled by the preedit and commit events.
+                } else if self.state.screen == Screen::Language && code == Some(KeyCode::Escape) {
+                    self.cancel_language();
+                } else if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch)
+                    && self.modifiers.control_key()
+                    && matches!(code, Some(KeyCode::KeyC | KeyCode::KeyX | KeyCode::KeyV))
+                {
+                    use crate::clipboard::Clipboard;
+                    let (_, h) = self.logical_size();
+                    if let Some(ui) = &mut self.language_ui {
+                        let previous = ui.search.value().to_owned();
+                        let mut clipboard =
+                            crate::clipboard::SystemClipboard::new(self.window.as_deref());
+                        if code == Some(KeyCode::KeyV) {
+                            if let Ok(text) = clipboard.read() {
+                                ui.search.insert_limited(&text, 32);
+                            }
+                        } else if clipboard.write(ui.search.selected_text()).is_ok()
+                            && code == Some(KeyCode::KeyX)
+                        {
+                            ui.search.delete_selection();
+                        }
+                        if ui.search.value() != previous {
+                            ui.changed_search(h);
+                        }
+                    }
+                } else if self.state.screen == Screen::Language
+                    && matches!(code, Some(KeyCode::ArrowUp | KeyCode::ArrowDown))
+                {
+                    let (_, h) = self.logical_size();
+                    if let Some(ui) = &mut self.language_ui {
+                        ui.move_selection(code == Some(KeyCode::ArrowDown), h);
+                    }
+                    self.focused = None;
+                    if let Some(window) = &self.window {
+                        window.set_ime_allowed(false);
+                    }
+                } else if self.state.screen == Screen::Language
+                    && self.focused.is_none()
+                    && matches!(code, Some(KeyCode::Enter | KeyCode::NumpadEnter))
+                {
+                    self.do_button(ButtonId::Done, event_loop);
+                } else if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch)
+                    && matches!(code, Some(KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::Home | KeyCode::End | KeyCode::Backspace | KeyCode::Delete) | Some(KeyCode::KeyA) if self.modifiers.control_key() || code != Some(KeyCode::KeyA))
+                {
+                    let (_, h) = self.logical_size();
+                    if let Some(ui) = &mut self.language_ui {
+                        let previous = ui.search.value().to_owned();
+                        ui.search.key(
+                            code.unwrap(),
+                            self.modifiers.control_key(),
+                            self.modifiers.shift_key(),
+                        );
+                        if ui.search.value() != previous {
+                            ui.changed_search(h);
+                        }
+                    }
+                } else if self.state.screen == Screen::Language
+                    && self.focused == Some(ButtonId::LanguageSearch)
+                    && !self.modifiers.control_key()
+                    && !matches!(
+                        code,
+                        Some(
+                            KeyCode::Escape | KeyCode::Tab | KeyCode::Enter | KeyCode::NumpadEnter
+                        )
+                    )
+                    && event
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| crate::chat_input::ChatInput::accepts_text(text))
+                {
+                    let (_, h) = self.logical_size();
+                    if let (Some(ui), Some(text)) = (&mut self.language_ui, event.text.as_ref()) {
+                        ui.search.insert_limited(text, 32);
+                        ui.changed_search(h);
+                    }
+                } else if self.state.screen == Screen::CreateWorld
                     && self.creation_field().is_some()
                     && self.modifiers.control_key()
                     && matches!(code, Some(KeyCode::KeyC | KeyCode::KeyX | KeyCode::KeyV))
@@ -4055,11 +4355,13 @@ impl ApplicationHandler for Menu<'_> {
                         self.focused = Some(buttons[next]);
                         if let Some(window) = &self.window {
                             window.set_ime_allowed(
-                                self.state.screen == Screen::CreateWorld
-                                    && matches!(
-                                        self.focused,
-                                        Some(ButtonId::CreationName | ButtonId::CreationSeed)
-                                    ),
+                                (self.state.screen == Screen::Language
+                                    && self.focused == Some(ButtonId::LanguageSearch))
+                                    || self.state.screen == Screen::CreateWorld
+                                        && matches!(
+                                            self.focused,
+                                            Some(ButtonId::CreationName | ButtonId::CreationSeed)
+                                        ),
                             );
                         }
                         if self.state.screen == Screen::Video
@@ -6266,6 +6568,80 @@ public class GuiScaleOracle {
         assert_eq!(state.packs, vec![old_pack]);
         assert_eq!(state.selected_pack, Some(0));
         assert!(state.error.unwrap().contains("invalid pack"));
+    }
+
+    #[test]
+    fn failed_language_load_keeps_previous_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::new(tmp.path().to_path_buf(), Vec::new());
+        state.language = Some("en_us".into());
+        let (sender, result) = mpsc::channel();
+        state.asset_load = Some(PendingAssetLoad {
+            directory: tmp.path().to_path_buf(),
+            packs: Vec::new(),
+            kind: AssetLoadKind::ChangeLanguage("ko_kr".into()),
+            result,
+        });
+        sender.send(Err(anyhow::anyhow!("failed reload"))).unwrap();
+        assert!(state.poll_asset_load());
+        assert_eq!(state.language.as_deref(), Some("en_us"));
+        assert!(state.error.unwrap().contains("failed reload"));
+    }
+
+    #[test]
+    fn escape_from_language_screen_does_not_start_a_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = State::new(tmp.path().to_path_buf(), Vec::new());
+        state.asset_load = None;
+        state.language = Some("en_us".into());
+        state.screen = Screen::Language;
+        let mut menu = Menu::new(&mut state);
+        menu.cancel_language();
+        assert_eq!(menu.state.screen, Screen::Options);
+        assert_eq!(menu.state.language.as_deref(), Some("en_us"));
+        assert!(menu.state.asset_load.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn language_reload_saves_and_applies_without_changing_minecraft_options() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let options = std::fs::read(game.join("options.txt")).ok();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = State::new_with_language(game.clone(), Vec::new(), Some("en_us".into()));
+        state.settings_path = Some(temp.path().join("options.json"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while state.asset_load.is_some() && Instant::now() < deadline {
+            state.poll_asset_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.assets.as_ref().unwrap().locale, "en_us");
+        let mut ui = crate::language_ui::LanguageUi::new(state.assets.as_ref().unwrap(), 240);
+        ui.search.insert("한국");
+        ui.changed_search(240);
+        assert!(ui.click(320, 240, (160, 40)));
+        assert_eq!(ui.selected(), Some("ko_kr"));
+        let mut canvas = Canvas::new(320, 240);
+        ui.draw(&mut canvas, state.assets.as_ref().unwrap(), true);
+        assert!(canvas.pixels.iter().any(|pixel| *pixel != 0));
+        state.begin_asset_load(
+            game.clone(),
+            Vec::new(),
+            AssetLoadKind::ChangeLanguage("ko_kr".into()),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while state.asset_load.is_some() && Instant::now() < deadline {
+            state.poll_asset_load();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.asset_load.is_none());
+        assert_eq!(state.assets.as_ref().unwrap().locale, "ko_kr");
+        let loaded: Settings =
+            serde_json::from_slice(&std::fs::read(state.settings_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(loaded.language.as_deref(), Some("ko_kr"));
+        assert_eq!(std::fs::read(game.join("options.txt")).ok(), options);
     }
 
     #[test]

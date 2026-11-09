@@ -123,6 +123,7 @@ impl<'de> Deserialize<'de> for UnitInterval {
 pub struct Settings {
     pub minecraft_dir: Option<PathBuf>,
     pub resource_packs: Vec<PathBuf>,
+    pub language: Option<String>,
     pub video: VideoSettings,
     pub sound: SoundSettings,
 }
@@ -574,6 +575,7 @@ mod tests {
         let mut settings = Settings {
             minecraft_dir: Some(PathBuf::from("game-folder")),
             resource_packs: vec![PathBuf::from("pack.zip")],
+            language: Some("ko_kr".into()),
             video: VideoSettings {
                 render_distance: 24,
                 biome_blend: 7,
@@ -592,6 +594,7 @@ mod tests {
         let loaded: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(loaded.minecraft_dir, settings.minecraft_dir);
         assert_eq!(loaded.resource_packs, settings.resource_packs);
+        assert_eq!(loaded.language, settings.language);
         assert_eq!(loaded.video, settings.video);
     }
 

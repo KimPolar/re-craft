@@ -39,6 +39,7 @@ mod held_items;
 mod item_gui;
 mod item_render;
 mod item_tooltip;
+mod language_ui;
 mod launch_options;
 mod menu;
 mod menu_assets;

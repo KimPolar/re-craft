@@ -754,6 +754,44 @@ fn face_masks(state: &BlockState) -> Option<[[u16; 16]; 6]> {
     Some(masks)
 }
 
+/// Whether a verified vanilla slab or stair completely occludes one face.
+/// Unknown block names, malformed states and non-cardinal directions return None.
+pub fn slab_stair_face_full(state: &BlockState, direction: [i32; 3]) -> Option<bool> {
+    if !shape_family(&state.name) {
+        return None;
+    }
+    crate::collision::slab_stair_solid(state)?;
+    if !DIRECTIONS.iter().any(|&(x, y, z)| direction == [x, y, z]) {
+        return None;
+    }
+    let property = |name: &str| state.properties.get(name).map(String::as_str);
+    if let Some(kind) = property("type") {
+        return Some(
+            kind == "double"
+                || (kind == "bottom" && direction == [0, -1, 0])
+                || (kind == "top" && direction == [0, 1, 0]),
+        );
+    }
+    if direction[1] != 0 {
+        return Some((property("half")? == "bottom") == (direction[1] < 0));
+    }
+    let (front, left) = match property("facing")? {
+        "north" => ([0, 0, -1], [-1, 0, 0]),
+        "south" => ([0, 0, 1], [1, 0, 0]),
+        "west" => ([-1, 0, 0], [0, 0, 1]),
+        "east" => ([1, 0, 0], [0, 0, -1]),
+        _ => return None,
+    };
+    let right = [-left[0], 0, -left[2]];
+    Some(match property("shape")? {
+        "straight" => direction == front,
+        "inner_left" => direction == front || direction == left,
+        "inner_right" => direction == front || direction == right,
+        "outer_left" | "outer_right" => false,
+        _ => return None,
+    })
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct LightProperties {
     pub(crate) opacity: u8,

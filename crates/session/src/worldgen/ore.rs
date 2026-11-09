@@ -7562,7 +7562,7 @@ impl SpringWorld for DecorationRegion<'_> {
 }
 
 impl MagmaWorld for DecorationRegion<'_> {
-    fn face_is_full(&mut self, state: &BlockState, _direction: [i32; 3]) -> Result<bool> {
+    fn face_is_full(&mut self, state: &BlockState, direction: [i32; 3]) -> Result<bool> {
         if state.name == "minecraft:potent_sulfur" {
             ensure!(
                 super::generated_potent_sulfur::is_valid_state(state),
@@ -7577,6 +7577,9 @@ impl MagmaWorld for DecorationRegion<'_> {
             ensure!(tree_cave_vines(state)?, "invalid magma neighbor cave vines");
         }
         if let Some(full) = vanilla_full_occlusion(&state.name) {
+            return Ok(full);
+        }
+        if let Some(full) = native_world::block_light::slab_stair_face_full(state, direction) {
             return Ok(full);
         }
         if jigsaw::jigsaw_wood(state) {
@@ -23282,6 +23285,7 @@ mod tests {
             "minecraft:deepslate_coal_ore".into(),
             "minecraft:oak_planks".into(),
             "minecraft:unknown_shape".into(),
+            "minecraft:stone_slab".into(),
         ]);
         let prepared =
             PreparedDecoration::load(&mut MagmaData, &plan, &registry, &mut resolve_test).unwrap();
@@ -23333,6 +23337,36 @@ mod tests {
                     [0x888]
                 );
             }
+        }
+        for (slab_type, expected) in [("bottom", false), ("top", false), ("double", true)] {
+            let (mut terrain, tags, motion, _) = fixture();
+            let center = ChunkPos { x: 0, z: 0 };
+            let mut setup = terrain
+                .decoration_region(&tags, &motion, BTreeSet::from([center]))
+                .unwrap();
+            let mut water = state("water");
+            water.properties.insert("level".into(), "0".into());
+            setup.set_section_block([8, 8, 8], &water).unwrap();
+            let mut slab = state("stone_slab");
+            slab.properties.insert("type".into(), slab_type.into());
+            slab.properties.insert("waterlogged".into(), "false".into());
+            setup.set_section_block([9, 7, 8], &slab).unwrap();
+            setup.finish().unwrap();
+            assert_eq!(
+                prepared.execute(&mut terrain, false).unwrap(),
+                [expected],
+                "{slab_type}"
+            );
+            assert_eq!(
+                terrain.snapshot().block(8, 7, 8).unwrap().name,
+                if expected {
+                    "minecraft:magma_block"
+                } else {
+                    "minecraft:stone"
+                },
+                "{slab_type}"
+            );
+            assert_eq!(terrain.snapshot().block(9, 7, 8).unwrap(), &slab);
         }
         for source in ["coal_ore", "deepslate_coal_ore"] {
             let (mut terrain, tags, motion, _) = fixture();

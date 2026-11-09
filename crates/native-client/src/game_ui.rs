@@ -46,6 +46,7 @@ pub enum PauseAction {
 enum PausePage {
     Game,
     Options,
+    Language,
     Controls,
     Mouse,
     Sound,
@@ -57,6 +58,8 @@ enum PausePage {
 enum PauseButton {
     Resume,
     Options,
+    Language,
+    LanguageSearch,
     Controls,
     MouseSettings,
     SprintWindow,
@@ -149,6 +152,11 @@ struct DrawKey {
     action_bar: Option<(u64, u8)>,
 }
 
+struct PendingLanguage {
+    code: String,
+    result: std::sync::mpsc::Receiver<Result<MenuAssets>>,
+}
+
 pub struct GameUi {
     assets: Arc<MenuAssets>,
     enchantments: Arc<crate::enchantment_tooltip::Registry>,
@@ -204,6 +212,11 @@ pub struct GameUi {
     hud_hidden: bool,
     pause_page: PausePage,
     pause_focus: Option<PauseButton>,
+    language_ui: Option<crate::language_ui::LanguageUi>,
+    language_load: Option<PendingLanguage>,
+    language_last_click: Option<(String, std::time::Instant)>,
+    #[cfg(test)]
+    language_settings_path: Option<std::path::PathBuf>,
     video: VideoSettings,
     sound: SoundSettings,
     sound_ui: SoundUi,
@@ -363,6 +376,11 @@ impl GameUi {
             hud_hidden: false,
             pause_page: PausePage::Game,
             pause_focus: None,
+            language_ui: None,
+            language_load: None,
+            language_last_click: None,
+            #[cfg(test)]
+            language_settings_path: None,
             video: VideoSettings::default(),
             sound: crate::menu_settings::load().sound,
             sound_ui: SoundUi::default(),
@@ -969,6 +987,176 @@ impl GameUi {
         &self.assets.minecraft_dir
     }
 
+    pub fn menu_assets(&self) -> Arc<MenuAssets> {
+        Arc::clone(&self.assets)
+    }
+
+    pub fn language_search_focused(&self) -> bool {
+        self.paused
+            && self.pause_page == PausePage::Language
+            && self.pause_focus == Some(PauseButton::LanguageSearch)
+            && self.language_load.is_none()
+    }
+
+    pub fn language_ime_area(&self) -> Option<(i32, i32, u32)> {
+        let ui = self.language_ui.as_ref()?;
+        let rect = crate::language_ui::LanguageUi::search_rect(self.logical_size().0);
+        let scale = self.gui_scale();
+        Some((
+            (rect.x + ui.search.cursor_x(&self.assets, rect.w)) * scale as i32,
+            rect.y * scale as i32,
+            scale,
+        ))
+    }
+
+    pub fn language_ime(&mut self, event: winit::event::Ime) {
+        if !self.language_search_focused() {
+            return;
+        }
+        let (_, height) = self.logical_size();
+        if let Some(ui) = &mut self.language_ui {
+            match event {
+                winit::event::Ime::Preedit(text, _) => ui.search.set_preedit(text),
+                winit::event::Ime::Commit(text) => {
+                    ui.search.insert_limited(&text, 32);
+                    ui.search.set_preedit(String::new());
+                    ui.changed_search(height);
+                }
+                winit::event::Ime::Disabled => ui.search.set_preedit(String::new()),
+                winit::event::Ime::Enabled => {}
+            }
+            self.last_draw = None;
+        }
+    }
+
+    pub fn language_input_key(
+        &mut self,
+        key: KeyCode,
+        text: Option<&str>,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        clipboard: &mut impl crate::clipboard::Clipboard,
+    ) -> bool {
+        if !self.language_search_focused() {
+            return false;
+        }
+        let (_, height) = self.logical_size();
+        let Some(ui) = &mut self.language_ui else {
+            return false;
+        };
+        if ui.search.composing() {
+            return true;
+        }
+        if matches!(
+            key,
+            KeyCode::Escape | KeyCode::Tab | KeyCode::ArrowUp | KeyCode::ArrowDown
+        ) {
+            return false;
+        }
+        let previous = ui.search.value().to_owned();
+        if control && matches!(key, KeyCode::KeyC | KeyCode::KeyX | KeyCode::KeyV) {
+            if key == KeyCode::KeyV {
+                if let Ok(text) = clipboard.read() {
+                    ui.search.insert_limited(&text, 32);
+                }
+            } else if clipboard.write(ui.search.selected_text()).is_ok() && key == KeyCode::KeyX {
+                ui.search.delete_selection();
+            }
+        } else if matches!(
+            key,
+            KeyCode::ArrowLeft
+                | KeyCode::ArrowRight
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Backspace
+                | KeyCode::Delete
+        ) || control && key == KeyCode::KeyA
+        {
+            ui.search.key(key, control, shift);
+        } else if !control
+            && !alt
+            && !matches!(key, KeyCode::Enter | KeyCode::NumpadEnter)
+            && let Some(text) = text
+        {
+            ui.search.insert_limited(text, 32);
+        }
+        if ui.search.value() != previous {
+            ui.changed_search(height);
+        }
+        self.last_draw = None;
+        true
+    }
+
+    fn apply_language(&mut self) {
+        let selected = self
+            .language_ui
+            .as_ref()
+            .and_then(|ui| ui.selected())
+            .map(str::to_owned);
+        self.language_ui = None;
+        self.pause_page = PausePage::Options;
+        self.pause_focus = None;
+        let Some(code) = selected.filter(|code| code != &self.assets.locale) else {
+            return;
+        };
+        let directory = self.assets.minecraft_dir.clone();
+        let packs = self.assets.resource_packs.clone();
+        let requested = code.clone();
+        let (sender, result) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("language-reload".into())
+            .spawn(move || {
+                let loaded = MenuAssets::load_with_language(&directory, &packs, Some(&requested));
+                let _ = sender.send(loaded);
+            }) {
+            Ok(_) => {
+                self.language_load = Some(PendingLanguage { code, result });
+                self.video_error = None;
+            }
+            Err(error) => self.video_error = Some(format!("Cannot reload language: {error}")),
+        }
+        self.last_draw = None;
+    }
+
+    pub fn poll_language_load(&mut self) {
+        let result = match self
+            .language_load
+            .as_ref()
+            .map(|load| load.result.try_recv())
+        {
+            None | Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return,
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Err(anyhow::anyhow!("Language reload stopped unexpectedly"))
+            }
+        };
+        let pending = self.language_load.take().expect("completed language load");
+        let result = result.and_then(|assets| {
+            anyhow::ensure!(
+                assets.locale == pending.code,
+                "Selected language is unavailable"
+            );
+            #[cfg(test)]
+            let saved = self.language_settings_path.as_ref().map_or_else(
+                || crate::menu_settings::save_language(&pending.code),
+                |path| crate::menu_settings::save_language_to(path, &pending.code),
+            );
+            #[cfg(not(test))]
+            let saved = crate::menu_settings::save_language(&pending.code);
+            saved?;
+            Ok(assets)
+        });
+        match result {
+            Ok(assets) => {
+                self.assets = Arc::new(assets);
+                self.video_error = None;
+            }
+            Err(error) => self.video_error = Some(format!("{error:#}")),
+        }
+        self.last_draw = None;
+    }
+
     pub fn toggle_hud(&mut self) {
         self.hud_hidden = !self.hud_hidden;
         self.last_draw = None;
@@ -1050,7 +1238,16 @@ impl GameUi {
                 self.last_draw = None;
             }
         }
-        if self.paused && self.pause_page == PausePage::Sound {
+        if self.paused && self.pause_page == PausePage::Language {
+            let (w, h) = self.logical_size();
+            if self
+                .language_ui
+                .as_mut()
+                .is_some_and(|ui| ui.drag_scrollbar(w, h, self.cursor.1))
+            {
+                self.last_draw = None;
+            }
+        } else if self.paused && self.pause_page == PausePage::Sound {
             let (w, h) = self.logical_size();
             let (dragged, changed) = self
                 .sound_ui
@@ -1170,6 +1367,13 @@ impl GameUi {
                 }) {
                     Some(PauseButton::Controls)
                 } else if hit(Rect {
+                    x: w / 2 - 155,
+                    y: 107,
+                    w: 150,
+                    h: 20,
+                }) {
+                    Some(PauseButton::Language)
+                } else if hit(Rect {
                     x: w / 2 + 5,
                     y: 131,
                     w: 150,
@@ -1182,6 +1386,15 @@ impl GameUi {
                     w: 200,
                     h: 20,
                 }) {
+                    Some(PauseButton::Done)
+                } else {
+                    None
+                }
+            }
+            PausePage::Language => {
+                if hit(crate::language_ui::LanguageUi::search_rect(w)) {
+                    Some(PauseButton::LanguageSearch)
+                } else if hit(crate::language_ui::LanguageUi::done_rect(w, h)) {
                     Some(PauseButton::Done)
                 } else {
                     None
@@ -1300,6 +1513,22 @@ impl GameUi {
             PauseButton::Options => {
                 self.pause_page = PausePage::Options;
                 self.pause_focus = None;
+                PauseAction::None
+            }
+            PauseButton::Language => {
+                let (_, height) = self.logical_size();
+                self.language_ui = Some(crate::language_ui::LanguageUi::new(&self.assets, height));
+                self.pause_page = PausePage::Language;
+                self.pause_focus = Some(PauseButton::LanguageSearch);
+                self.language_last_click = None;
+                PauseAction::None
+            }
+            PauseButton::LanguageSearch => {
+                let width = crate::language_ui::LanguageUi::search_rect(self.logical_size().0);
+                if mouse && let Some(ui) = &mut self.language_ui {
+                    ui.search
+                        .click(&self.assets, width.w, self.cursor.0 - width.x, false);
+                }
                 PauseAction::None
             }
             PauseButton::Controls => {
@@ -1438,6 +1667,10 @@ impl GameUi {
                 }
                 PauseAction::None
             }
+            PauseButton::Done if self.pause_page == PausePage::Language => {
+                self.apply_language();
+                PauseAction::None
+            }
             PauseButton::Done => self.pause_back(),
             PauseButton::Vsync => {
                 self.video.vsync = !self.video.vsync;
@@ -1541,6 +1774,35 @@ impl GameUi {
     }
 
     pub fn click(&mut self) -> PauseAction {
+        if self.language_load.is_some() {
+            return PauseAction::None;
+        }
+        if self.pause_page == PausePage::Language {
+            let (w, h) = self.logical_size();
+            if let Some(ui) = &mut self.language_ui {
+                if ui.start_scrollbar(w, h, self.cursor) {
+                    self.last_draw = None;
+                    return PauseAction::None;
+                }
+                if ui.click(w, h, self.cursor) {
+                    ui.search.set_preedit(String::new());
+                    self.pause_focus = None;
+                    self.last_draw = None;
+                    let code = ui.selected().unwrap_or_default().to_owned();
+                    let now = std::time::Instant::now();
+                    let double = self.language_last_click.as_ref().is_some_and(|(old, at)| {
+                        old == &code
+                            && now.saturating_duration_since(*at)
+                                < std::time::Duration::from_millis(250)
+                    });
+                    self.language_last_click = Some((code, now));
+                    if double {
+                        self.apply_language();
+                    }
+                    return PauseAction::None;
+                }
+            }
+        }
         if self.pause_page == PausePage::Sound {
             let (w, h) = self.logical_size();
             if self.sound_ui.start_scrollbar(w, h, self.cursor) {
@@ -1580,7 +1842,7 @@ impl GameUi {
                 | PauseButton::MenuBlur
                 | PauseButton::SoundSlider(_)
         );
-        if !self.slider_pressed {
+        if !self.slider_pressed && button != PauseButton::LanguageSearch {
             self.play_click();
         }
         self.activate(button, true)
@@ -1595,7 +1857,12 @@ impl GameUi {
 
     pub fn pause_cancel(&mut self) {
         self.slider_pressed = false;
-        if self.paused && self.pause_page == PausePage::Controls {
+        if self.paused && self.pause_page == PausePage::Language {
+            if let Some(ui) = &mut self.language_ui {
+                ui.release();
+            }
+            self.last_draw = None;
+        } else if self.paused && self.pause_page == PausePage::Controls {
             self.sprint_window_ui.release();
             self.last_draw = None;
         } else if self.paused && self.pause_page == PausePage::Mouse {
@@ -1617,6 +1884,13 @@ impl GameUi {
     }
 
     pub fn pause_scroll(&mut self, delta: f64) {
+        if self.paused && self.pause_page == PausePage::Language {
+            let (_, h) = self.logical_size();
+            if let Some(ui) = &mut self.language_ui {
+                ui.scroll_by(delta, h);
+            }
+            self.last_draw = None;
+        }
         if self.paused && self.pause_page == PausePage::Sound {
             let (_, h) = self.logical_size();
             self.sound_ui.scroll_by(delta, h);
@@ -1669,6 +1943,11 @@ impl GameUi {
         self.last_draw = None;
         match self.pause_page {
             PausePage::Game => PauseAction::Resume,
+            PausePage::Language => {
+                self.language_ui = None;
+                self.pause_page = PausePage::Options;
+                PauseAction::None
+            }
             PausePage::Controls => {
                 self.pause_page = PausePage::Options;
                 PauseAction::None
@@ -1730,6 +2009,9 @@ impl GameUi {
     }
 
     pub fn pause_key(&mut self, key: KeyCode, shift: bool) -> PauseAction {
+        if self.language_load.is_some() {
+            return PauseAction::None;
+        }
         if key == KeyCode::Escape {
             return self.pause_back();
         }
@@ -1743,9 +2025,11 @@ impl GameUi {
                     PauseButton::Sound,
                     PauseButton::Video,
                     PauseButton::Controls,
+                    PauseButton::Language,
                     PauseButton::Accessibility,
                     PauseButton::Done,
                 ],
+                PausePage::Language => vec![PauseButton::LanguageSearch, PauseButton::Done],
                 PausePage::Controls => vec![
                     PauseButton::MouseSettings,
                     PauseButton::ToggleSneak,
@@ -1882,6 +2166,20 @@ impl GameUi {
                 )
             );
             self.last_draw = None;
+        } else if self.pause_page == PausePage::Language
+            && matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown)
+        {
+            let (_, h) = self.logical_size();
+            if let Some(ui) = &mut self.language_ui {
+                ui.move_selection(key == KeyCode::ArrowDown, h);
+            }
+            self.pause_focus = None;
+            self.last_draw = None;
+        } else if self.pause_page == PausePage::Language
+            && self.pause_focus.is_none()
+            && matches!(key, KeyCode::Enter | KeyCode::NumpadEnter)
+        {
+            self.apply_language();
         } else if self.pause_page == PausePage::Controls
             && self.pause_focus == Some(PauseButton::SprintWindow)
             && self.sprint_window_ui.keyboard_adjust
@@ -3240,7 +3538,7 @@ impl GameUi {
                 ];
                 for (row, (left, right)) in rows.into_iter().enumerate() {
                     let y = 35 + row as i32 * 24;
-                    let enabled = row == 2;
+                    let enabled = row == 2 || row == 3;
                     if row == 0 {
                         self.fov_ui.draw(
                             &mut canvas,
@@ -3259,9 +3557,12 @@ impl GameUi {
                                 h: 20,
                             },
                             enabled,
-                            enabled
+                            (row == 2
                                 && (hover == Some(PauseButton::Video)
-                                    || self.pause_focus == Some(PauseButton::Video)),
+                                    || self.pause_focus == Some(PauseButton::Video)))
+                                || (row == 3
+                                    && (hover == Some(PauseButton::Language)
+                                        || self.pause_focus == Some(PauseButton::Language))),
                             assets.translate(left.0, left.1),
                         );
                     }
@@ -3294,6 +3595,28 @@ impl GameUi {
                         w: 200,
                         h: 20,
                     },
+                    true,
+                    hover == Some(PauseButton::Done) || self.pause_focus == Some(PauseButton::Done),
+                    assets.translate("gui.done", "Done"),
+                );
+            } else if self.pause_page == PausePage::Language {
+                if let Some(ui) = &self.language_ui {
+                    ui.draw(
+                        &mut canvas,
+                        assets,
+                        self.pause_focus == Some(PauseButton::LanguageSearch),
+                    );
+                }
+                canvas.button(
+                    Some(assets),
+                    crate::language_ui::LanguageUi::font_rect(w, h),
+                    false,
+                    false,
+                    assets.translate("options.font", "Font Settings..."),
+                );
+                canvas.button(
+                    Some(assets),
+                    crate::language_ui::LanguageUi::done_rect(w, h),
                     true,
                     hover == Some(PauseButton::Done) || self.pause_focus == Some(PauseButton::Done),
                     assets.translate("gui.done", "Done"),
@@ -3474,6 +3797,15 @@ impl GameUi {
                     true,
                     hover == Some(PauseButton::Done) || self.pause_focus == Some(PauseButton::Done),
                     assets.translate("gui.done", "Done"),
+                );
+            }
+            if self.language_load.is_some() {
+                canvas.text_centered(
+                    Some(assets),
+                    w / 2,
+                    4,
+                    "Loading resources...",
+                    [255, 255, 255],
                 );
             }
             if let Some(error) = &self.video_error {
@@ -3978,6 +4310,144 @@ fn cube_icon(canvas: &mut Canvas, x: i32, y: i32, top: &RgbaImage, side: &RgbaIm
 #[cfg(test)]
 mod inventory_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn pause_language_selection_reloads_and_keeps_resource_packs() -> Result<()> {
+        struct TestClipboard(String);
+        impl crate::clipboard::Clipboard for TestClipboard {
+            fn read(&mut self) -> Result<String> {
+                Ok(self.0.clone())
+            }
+            fn write(&mut self, text: &str) -> Result<()> {
+                self.0 = text.to_owned();
+                Ok(())
+            }
+        }
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let temp = tempfile::tempdir()?;
+        let pack = temp.path().join("pack");
+        std::fs::create_dir_all(pack.join("assets/minecraft/lang"))?;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            br#"{"pack":{"description":"test","min_format":1,"max_format":9999}}"#,
+        )?;
+        std::fs::write(
+            pack.join("assets/minecraft/lang/ko_kr.json"),
+            r#"{"menu.singleplayer":"팩 번역"}"#,
+        )?;
+        let assets = Arc::new(MenuAssets::load_with_language(
+            &game,
+            std::slice::from_ref(&pack),
+            Some("en_us"),
+        )?);
+        let mut ui = GameUi::new(Arc::clone(&assets));
+        ui.language_settings_path = Some(temp.path().join("options.json"));
+        std::fs::write(
+            ui.language_settings_path.as_ref().unwrap(),
+            br#"{"future":{"keep":true}}"#,
+        )?;
+        ui.resize((1280, 720));
+        assert!(ui.toggle_pause());
+        ui.activate(PauseButton::Options, false);
+        let (w, _) = ui.logical_size();
+        ui.cursor = (w / 2 - 150, 110);
+        assert_eq!(ui.hover(), Some(PauseButton::Language));
+        ui.click();
+        assert!(ui.language_search_focused());
+        assert!(
+            ui.compose((1280, 720), &PlayerInventory::default(), 0)
+                .is_some()
+        );
+        ui.language_ime(winit::event::Ime::Preedit("한".into(), None));
+        let mut clipboard = TestClipboard(String::new());
+        assert!(ui.language_input_key(
+            KeyCode::KeyA,
+            Some("한"),
+            false,
+            false,
+            false,
+            &mut clipboard
+        ));
+        ui.language_ime(winit::event::Ime::Commit("한국".into()));
+        ui.cursor = (w / 2, 40);
+        ui.click();
+        assert_eq!(ui.language_ui.as_ref().unwrap().selected(), Some("ko_kr"));
+        ui.pause_key(KeyCode::Escape, false);
+        assert_eq!(ui.pause_page, PausePage::Options);
+        assert!(ui.language_load.is_none());
+        assert!(Arc::ptr_eq(&assets, &ui.assets));
+
+        ui.activate(PauseButton::Language, false);
+        assert!(ui.language_input_key(
+            KeyCode::KeyA,
+            Some("한국"),
+            false,
+            false,
+            false,
+            &mut clipboard
+        ));
+        ui.cursor = (w / 2, 40);
+        ui.click();
+        let (_, h) = ui.logical_size();
+        let done = crate::language_ui::LanguageUi::done_rect(w, h);
+        ui.cursor = (done.x + 1, done.y + 1);
+        ui.click();
+        assert!(ui.language_load.is_some());
+        assert_eq!(ui.pause_key(KeyCode::Escape, false), PauseAction::None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ui.language_load.is_some() && std::time::Instant::now() < deadline {
+            ui.poll_language_load();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ui.language_load.is_none());
+        assert_eq!(ui.assets.locale, "ko_kr", "{:?}", ui.video_error);
+        assert_eq!(ui.assets.translate("menu.singleplayer", ""), "팩 번역");
+        assert_eq!(ui.assets.resource_packs, vec![pack]);
+        let saved_bytes = std::fs::read(ui.language_settings_path.as_ref().unwrap())?;
+        let saved_value: serde_json::Value = serde_json::from_slice(&saved_bytes)?;
+        assert_eq!(saved_value["future"]["keep"], true);
+        let saved: crate::menu_settings::Settings = serde_json::from_slice(&saved_bytes)?;
+        assert_eq!(saved.language.as_deref(), Some("ko_kr"));
+        assert!(Arc::ptr_eq(&ui.menu_assets(), &ui.assets));
+        let (sender, result) = std::sync::mpsc::channel();
+        ui.language_load = Some(PendingLanguage {
+            code: "en_us".into(),
+            result,
+        });
+        assert!(
+            sender
+                .send(Err(anyhow::anyhow!("broken language pack")))
+                .is_ok()
+        );
+        ui.poll_language_load();
+        assert_eq!(ui.assets.locale, "ko_kr");
+        assert!(
+            ui.video_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("broken language pack")
+        );
+        std::fs::write(ui.language_settings_path.as_ref().unwrap(), b"{broken")?;
+        let replacement =
+            MenuAssets::load_with_language(&game, &ui.assets.resource_packs, Some("en_us"))?;
+        let (sender, result) = std::sync::mpsc::channel();
+        ui.language_load = Some(PendingLanguage {
+            code: "en_us".into(),
+            result,
+        });
+        assert!(sender.send(Ok(replacement)).is_ok());
+        ui.poll_language_load();
+        assert_eq!(ui.assets.locale, "ko_kr");
+        assert_eq!(
+            std::fs::read(ui.language_settings_path.as_ref().unwrap())?,
+            b"{broken"
+        );
+        assert!(ui.video_error.is_some());
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires the locally installed Minecraft 26.3 assets"]

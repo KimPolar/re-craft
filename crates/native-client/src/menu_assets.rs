@@ -18,6 +18,7 @@ use serde_json::Value;
 
 pub struct MenuAssets {
     pub minecraft_dir: std::path::PathBuf,
+    pub resource_packs: Vec<std::path::PathBuf>,
     pub world_presets: Option<native_resources::world_presets::WorldPresets>,
     pub chat: crate::chat_hud::ChatSettings,
     pub item_models: Arc<Mutex<crate::held_items::Loader>>,
@@ -750,6 +751,7 @@ impl MenuAssets {
         let item_models = Arc::new(Mutex::new(crate::held_items::Loader::from_stack(stack)));
         Ok(Self {
             minecraft_dir: minecraft_dir.to_owned(),
+            resource_packs: packs.to_vec(),
             world_presets,
             chat,
             item_models,

@@ -405,6 +405,15 @@ pub fn save_sound(sound: SoundSettings) -> Result<()> {
     save_sound_to(&path, sound)
 }
 
+pub fn save_language(language: &str) -> Result<()> {
+    let path = path().context("APPDATA is unavailable; cannot save settings")?;
+    save_language_to(&path, language)
+}
+
+pub(crate) fn save_language_to(path: &Path, language: &str) -> Result<()> {
+    update_settings(path, serde_json::json!({ "language": language }))
+}
+
 fn save_sound_to(path: &Path, sound: SoundSettings) -> Result<()> {
     update_settings(path, serde_json::json!({ "sound": sound }))
 }

@@ -804,10 +804,15 @@ pub fn run(options: crate::launch_options::LaunchOptions) -> Result<()> {
                 };
                 match result {
                     Ok(crate::GameExit::Quit) => return Ok(()),
-                    Ok(crate::GameExit::ReturnToTitle(video, hud_hidden)) => {
+                    Ok(crate::GameExit::ReturnToTitle(video, hud_hidden, assets)) => {
                         state.video = video;
                         state.hud_hidden = hud_hidden;
-                        state.sound = menu_settings::load().sound;
+                        let settings = menu_settings::load();
+                        state.sound = settings.sound;
+                        state.language = settings.language;
+                        if let Some(assets) = assets {
+                            state.assets = Some(assets);
+                        }
                         if let Some(audio) = &state.audio {
                             audio.set_gain(state.sound.ui_gain());
                         }

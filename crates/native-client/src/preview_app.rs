@@ -469,7 +469,11 @@ fn run_inner(
     Ok(if app.quit_application {
         crate::GameExit::Quit
     } else {
-        crate::GameExit::ReturnToTitle(app.video, app.ui.as_ref().is_some_and(GameUi::hud_hidden))
+        crate::GameExit::ReturnToTitle(
+            app.video,
+            app.ui.as_ref().is_some_and(GameUi::hud_hidden),
+            app.ui.as_ref().map(GameUi::menu_assets),
+        )
     })
 }
 
@@ -656,6 +660,7 @@ impl Viewer {
             }
             PauseAction::None => {}
         }
+        crate::update_pause_ime(&self.window, &self.ui);
     }
 
     fn death_action(&mut self, action: crate::death_ui::DeathAction, event_loop: &ActiveEventLoop) {
@@ -1752,6 +1757,9 @@ impl ApplicationHandler for Viewer {
                     ui.resize((size.width, size.height));
                 }
                 crate::update_chat_ime_area(&self.window, &self.ui);
+                if let Some(window) = &self.window {
+                    crate::update_language_ime_area(window, self.ui.as_ref());
+                }
             }
             WindowEvent::Occluded(occluded) => self.occluded = occluded,
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -1842,6 +1850,15 @@ impl ApplicationHandler for Viewer {
             }
             WindowEvent::Ime(ime) => {
                 if let Some(ui) = &mut self.ui
+                    && ui.language_search_focused()
+                {
+                    ui.language_ime(ime);
+                    if let Some(window) = &self.window {
+                        crate::update_language_ime_area(window, self.ui.as_ref());
+                    }
+                    return;
+                }
+                if let Some(ui) = &mut self.ui
                     && ui.chat_open()
                 {
                     match ime {
@@ -1865,6 +1882,27 @@ impl ApplicationHandler for Viewer {
                 if crate::fullscreen_shortcut(event.physical_key, event.state, event.repeat) {
                     self.toggle_fullscreen();
                     return;
+                }
+                if event.state == ElementState::Pressed
+                    && let PhysicalKey::Code(code) = event.physical_key
+                    && let Some(ui) = &mut self.ui
+                    && ui.language_search_focused()
+                {
+                    let mut clipboard =
+                        crate::clipboard::SystemClipboard::new(self.window.as_deref());
+                    if ui.language_input_key(
+                        code,
+                        event.text.as_deref(),
+                        self.inventory_control,
+                        self.inventory_shift,
+                        self.inventory_alt,
+                        &mut clipboard,
+                    ) {
+                        if let Some(window) = &self.window {
+                            crate::update_language_ime_area(window, self.ui.as_ref());
+                        }
+                        return;
+                    }
                 }
                 if let Some(ui) = &mut self.ui
                     && ui.chat_open()
@@ -2382,6 +2420,9 @@ impl ApplicationHandler for Viewer {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(ui) = &mut self.ui {
+            ui.poll_language_load();
+        }
         let now = Instant::now();
         if self.ui.is_some()
             && self

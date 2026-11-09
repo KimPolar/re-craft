@@ -191,7 +191,14 @@ pub struct GeneratedInitialPlayer {
 /// The staging tree is temporary and is not yet safe to publish as a world.
 pub struct StagedInitialWorld {
     pub initial: GeneratedInitialPlayer,
-    pub stage: native_persistence::save::FreshWorldStage,
+    stage: native_persistence::save::FreshWorldStage,
+}
+
+impl StagedInitialWorld {
+    /// Inspect the temporary world without exposing the publication handle.
+    pub fn path(&self) -> &std::path::Path {
+        self.stage.path()
+    }
 }
 
 /// A structure-aware staging tree for verification. Publication remains
@@ -7611,9 +7618,9 @@ mod tests {
                     .context("structure staging accepted a structure-free world")?;
                 assert!(format!("{error:#}").contains("structure generation is disabled"));
                 let staged = ready.stage_initial_world(temp.path(), 123, 1)?;
-                assert!(staged.stage.path().join("level.dat").is_file());
+                assert!(staged.path().join("level.dat").is_file());
                 let reader = native_persistence::world::WorldReader::open(
-                    staged.stage.path(),
+                    staged.path(),
                     native_persistence::world::DimensionId::parse("overworld")?,
                 )?;
                 let rules = reader.fluid_game_rules()?;

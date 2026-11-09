@@ -58,6 +58,8 @@ mod double_plant_tests;
 mod jigsaw;
 #[cfg(test)]
 mod kelp_tests;
+#[cfg(test)]
+mod magma_wood_tests;
 mod mineshaft;
 mod ocean_ruin;
 #[cfg(test)]
@@ -7574,8 +7576,13 @@ impl MagmaWorld for DecorationRegion<'_> {
         ) {
             ensure!(tree_cave_vines(state)?, "invalid magma neighbor cave vines");
         }
-        vanilla_full_occlusion(&state.name)
-            .with_context(|| format!("unsupported magma neighbor occlusion for {}", state.name))
+        if let Some(full) = vanilla_full_occlusion(&state.name) {
+            return Ok(full);
+        }
+        if jigsaw::jigsaw_wood(state) {
+            return Ok(true);
+        }
+        bail!("unsupported magma neighbor occlusion for {}", state.name)
     }
     fn set_magma(&mut self, pos: [i32; 3], state: &BlockState) -> Result<bool> {
         let result = (|| {
@@ -23273,10 +23280,17 @@ mod tests {
             "minecraft:magma_block".into(),
             "minecraft:coal_ore".into(),
             "minecraft:deepslate_coal_ore".into(),
+            "minecraft:oak_planks".into(),
+            "minecraft:unknown_shape".into(),
         ]);
         let prepared =
             PreparedDecoration::load(&mut MagmaData, &plan, &registry, &mut resolve_test).unwrap();
-        for neighbor in [None, Some("diamond_ore"), Some("oak_planks")] {
+        for neighbor in [
+            None,
+            Some("diamond_ore"),
+            Some("oak_planks"),
+            Some("unknown_shape"),
+        ] {
             let (mut terrain, tags, motion, _) = fixture();
             let center = ChunkPos { x: 0, z: 0 };
             let mut setup = terrain
@@ -23292,8 +23306,14 @@ mod tests {
             }
             setup.finish().unwrap();
             let before = terrain.snapshot();
-            if neighbor == Some("oak_planks") {
-                assert!(prepared.execute(&mut terrain, false).is_err());
+            if neighbor == Some("unknown_shape") {
+                let error = prepared.execute(&mut terrain, false).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(
+                        "unsupported magma neighbor occlusion for minecraft:unknown_shape"
+                    ),
+                    "{error:#}"
+                );
                 assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
                 assert!(terrain.feature_postprocessing(center).is_none());
             } else {
@@ -23302,10 +23322,10 @@ mod tests {
                     terrain.snapshot().block(8, 7, 8).unwrap().name,
                     "minecraft:magma_block"
                 );
-                if neighbor == Some("diamond_ore") {
+                if let Some(neighbor) = neighbor {
                     assert_eq!(
                         terrain.snapshot().block(9, 7, 8).unwrap().name,
-                        "minecraft:diamond_ore"
+                        format!("minecraft:{neighbor}")
                     );
                 }
                 assert_eq!(

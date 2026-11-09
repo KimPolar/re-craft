@@ -331,6 +331,23 @@ impl GenerationSourceSnapshot {
     }
 }
 
+/// Disk inputs captured under one exclusive native writer lease. The caller
+/// must still capture packs, unsaved session state and every required chunk.
+pub struct GenerationInputSnapshot {
+    pub(crate) settings: crate::save::GenerationSettingsSnapshot,
+    pub(crate) sources: GenerationSourceSnapshot,
+}
+
+impl GenerationInputSnapshot {
+    pub fn settings(&self) -> &crate::save::GenerationSettingsSnapshot {
+        &self.settings
+    }
+
+    pub fn sources(&self) -> &GenerationSourceSnapshot {
+        &self.sources
+    }
+}
+
 impl SavedPoiChunk {
     /// Decode and validate a POI document for its containing chunk.
     pub fn from_document(document: NamedTag, position: ChunkPos) -> Result<Self> {
@@ -1193,7 +1210,36 @@ impl WorldReader {
             .session_guard
             .clone()
             .context("generation capture requires a locked world session")?;
-        let _lease = session.acquire_capture()?;
+        let lease = session.acquire_capture()?;
+        self.capture_generation_sources_in(&lease, positions)
+    }
+
+    /// Capture generator settings and selected chunk sources without allowing
+    /// a native save to run between them. Generation must use both snapshots.
+    pub fn capture_generation_inputs(
+        &mut self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<GenerationInputSnapshot> {
+        let session = self
+            .session_guard
+            .clone()
+            .context("generation capture requires a locked world session")?;
+        let lease = session.acquire_capture()?;
+        let settings = lease.generation_settings()?;
+        let sources = self.capture_generation_sources_in(&lease, positions)?;
+        Ok(GenerationInputSnapshot { settings, sources })
+    }
+
+    fn capture_generation_sources_in(
+        &mut self,
+        lease: &crate::save::WorldCaptureGuard,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<GenerationSourceSnapshot> {
+        let session = lease.session();
+        ensure!(
+            session.matches_root(&self.root),
+            "generation capture belongs to another world"
+        );
         let mut cache = self.region_cache.lock().unwrap_or_else(|e| e.into_inner());
         let terrain_dir = self.dimension.region_dir(&self.root);
         let entity_dir = self.dimension.entity_region_dir(&self.root);

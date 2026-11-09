@@ -1203,6 +1203,47 @@ impl WorldSavePlan {
         Ok(())
     }
 
+    /// Add a single-lease capture as one operation. Conflicts leave the plan
+    /// unchanged; callers must separately protect packs and live session edits.
+    pub fn add_generation_inputs(
+        &mut self,
+        inputs: &crate::world::GenerationInputSnapshot,
+    ) -> Result<()> {
+        let mut pending = WorldSavePlan::new();
+        pending.require_generation_settings(inputs.settings())?;
+        pending.add_generation_sources(inputs.sources())?;
+        ensure!(
+            self.generation_settings.is_none(),
+            "generation settings already bound"
+        );
+        if let Some(session) = &self.generation_source_session {
+            let incoming = pending
+                .generation_source_session
+                .as_ref()
+                .context("generation capture session is missing")?;
+            ensure!(
+                Arc::ptr_eq(&session.shared, &incoming.shared),
+                "generation captures belong to different world sessions"
+            );
+        }
+        let existing: BTreeSet<_> = self
+            .generation_dependencies
+            .iter()
+            .map(|entry| (entry.dimension.clone(), entry.kind, entry.position))
+            .collect();
+        for entry in &pending.generation_dependencies {
+            ensure!(
+                !existing.contains(&(entry.dimension.clone(), entry.kind, entry.position)),
+                "duplicate generation dependency"
+            );
+        }
+        self.generation_source_session = pending.generation_source_session;
+        self.generation_settings = pending.generation_settings;
+        self.generation_dependencies
+            .extend(pending.generation_dependencies);
+        Ok(())
+    }
+
     /// Require an observed region entry to remain unchanged until commit.
     /// `None` means the entry was absent. Callers must capture every terrain,
     /// entity and POI input that generation actually observed, and separately
@@ -2248,14 +2289,7 @@ impl WorldSessionGuard {
     /// bytes while native writers are excluded. Generation must use this
     /// document rather than independently reopening the file.
     pub fn capture_generation_settings(&self) -> Result<GenerationSettingsSnapshot> {
-        let _lease = self.acquire_capture()?;
-        let (_, raw, document, seed) = read_generation_settings(&self.shared.root)?;
-        Ok(GenerationSettingsSnapshot {
-            session: self.clone(),
-            raw: raw.into(),
-            document: Arc::new(document),
-            seed,
-        })
+        self.acquire_capture()?.generation_settings()
     }
 
     fn acquire_exclusive(&self, invalidates_reads: bool) -> Result<WorldWriteGuard> {
@@ -2321,6 +2355,23 @@ pub struct WorldWriteGuard {
 /// A source capture cannot mutate world files through its exclusive lease.
 pub(crate) struct WorldCaptureGuard {
     _guard: WorldWriteGuard,
+}
+
+impl WorldCaptureGuard {
+    pub(crate) fn session(&self) -> WorldSessionGuard {
+        self._guard.session.clone()
+    }
+
+    pub(crate) fn generation_settings(&self) -> Result<GenerationSettingsSnapshot> {
+        let session = self.session();
+        let (_, raw, document, seed) = read_generation_settings(&self._guard.root)?;
+        Ok(GenerationSettingsSnapshot {
+            session,
+            raw: raw.into(),
+            document: Arc::new(document),
+            seed,
+        })
+    }
 }
 
 impl Drop for WorldWriteGuard {
@@ -8659,6 +8710,189 @@ mod tests {
                 .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn generation_inputs_capture_and_save_as_one_coherent_set() {
+        let world = test_world();
+        let (region_path, original_region, _) = fixture(world.path());
+        let directory = world.path().join("data/minecraft");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("world_gen_settings.dat");
+        let settings = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(-42))]),
+                ),
+            ]),
+        };
+        let original_settings = nbt::write(&settings).unwrap();
+        fs::write(&path, &original_settings).unwrap();
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let mut unlocked =
+            crate::world::WorldReader::open(world.path(), dimension.clone()).unwrap();
+        assert!(
+            unlocked
+                .capture_generation_inputs([ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        drop(unlocked);
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
+        let session = reader.session_guard().unwrap();
+        let writer = session.acquire_write().unwrap();
+        assert!(
+            reader
+                .capture_generation_inputs([ChunkPos { x: 1, z: 0 }])
+                .is_err()
+        );
+        drop(writer);
+        assert!(reader.capture_generation_inputs([]).is_err());
+        let positions = [ChunkPos { x: 1, z: 0 }, ChunkPos { x: 4, z: 0 }];
+        let inputs = reader.capture_generation_inputs(positions).unwrap();
+        assert_eq!(inputs.settings().seed(), -42);
+        assert_eq!(inputs.settings().document(), &settings);
+        assert!(inputs.sources().chunks()[&positions[0]].terrain.is_some());
+        assert!(inputs.sources().chunks()[&positions[1]].terrain.is_none());
+        let mut duplicate = WorldSavePlan::new();
+        duplicate.add_generation_sources(inputs.sources()).unwrap();
+        assert!(duplicate.add_generation_inputs(&inputs).is_err());
+        assert_eq!(duplicate.generation_dependencies.len(), 6);
+        assert!(duplicate.generation_settings.is_none());
+        let other = test_world();
+        fixture(other.path());
+        let mut other_reader =
+            crate::world::WorldReader::open_for_session(other.path(), dimension.clone()).unwrap();
+        let other_sources = other_reader
+            .capture_generation_sources([ChunkPos { x: 1, z: 0 }])
+            .unwrap();
+        let mut different_session = WorldSavePlan::new();
+        different_session
+            .add_generation_sources(&other_sources)
+            .unwrap();
+        assert!(different_session.add_generation_inputs(&inputs).is_err());
+        assert_eq!(different_session.generation_dependencies.len(), 3);
+        assert!(different_session.generation_settings.is_none());
+        let make_plan = |inputs: &crate::world::GenerationInputSnapshot| {
+            let mut plan = WorldSavePlan::new();
+            plan.add_generation_inputs(inputs).unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 3, z: 0 },
+                &editable_chunk(3),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            plan
+        };
+        fs::write(&path, b"changed").unwrap();
+        let mut writer = session.acquire_write().unwrap();
+        assert!(
+            writer
+                .write_plan(make_plan(&inputs), |_, _| Ok(()))
+                .is_err()
+        );
+        assert_eq!(fs::read(&region_path).unwrap(), original_region);
+        fs::write(&path, &original_settings).unwrap();
+        let mut intervening = WorldSavePlan::new();
+        intervening
+            .add_generated_chunk(
+                dimension.clone(),
+                positions[1],
+                &editable_chunk(4),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        writer.write_plan(intervening, |_, _| Ok(())).unwrap();
+        assert!(
+            writer
+                .write_plan(make_plan(&inputs), |_, _| Ok(()))
+                .is_err()
+        );
+        drop(writer);
+        assert!(reader.read_chunk(3, 0).unwrap().is_none());
+        let refreshed = reader.capture_generation_inputs(positions).unwrap();
+        assert!(
+            refreshed.sources().chunks()[&positions[1]]
+                .terrain
+                .is_some()
+        );
+        let mut writer = session.acquire_write().unwrap();
+        writer
+            .write_plan(make_plan(&refreshed), |_, _| Ok(()))
+            .unwrap();
+        drop(writer);
+        assert!(reader.read_chunk(3, 0).unwrap().is_some());
+        assert_eq!(fs::read(path).unwrap(), original_settings);
+    }
+
+    #[test]
+    fn generation_inputs_exclude_writers_during_the_entire_capture() {
+        use std::{sync::mpsc, time::Duration};
+        struct PausedPosition {
+            ready: Option<mpsc::SyncSender<()>>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Iterator for PausedPosition {
+            type Item = ChunkPos;
+            fn next(&mut self) -> Option<Self::Item> {
+                let ready = self.ready.take()?;
+                ready.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+                Some(ChunkPos { x: 1, z: 0 })
+            }
+        }
+        let world = test_world();
+        fixture(world.path());
+        let directory = world.path().join("data/minecraft");
+        fs::create_dir_all(&directory).unwrap();
+        let settings = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                ),
+            ]),
+        };
+        fs::write(
+            directory.join("world_gen_settings.dat"),
+            nbt::write(&settings).unwrap(),
+        )
+        .unwrap();
+        let mut reader = crate::world::WorldReader::open_for_session(
+            world.path(),
+            DimensionId::parse("overworld").unwrap(),
+        )
+        .unwrap();
+        let session = reader.session_guard().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            reader.capture_generation_inputs(PausedPosition {
+                ready: Some(ready_tx),
+                resume: resume_rx,
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(session.acquire_write().is_err());
+        resume_tx.send(()).unwrap();
+        let inputs = worker.join().unwrap().unwrap();
+        assert_eq!(inputs.settings().seed(), 42);
+        assert!(
+            inputs.sources().chunks()[&ChunkPos { x: 1, z: 0 }]
+                .terrain
+                .is_some()
+        );
+        assert!(session.acquire_write().is_ok());
     }
 
     #[test]

@@ -214,6 +214,15 @@ impl StagedStructureInitialWorld {
     }
 }
 
+/// Checkpoints for a generated world's isolated staging operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialWorldStageProgress<'a> {
+    Preparing,
+    Saving(native_persistence::save::FreshWorldStageProgress<'a>),
+    InstallingDataPacks,
+    Finished,
+}
+
 impl GenerationReady {
     /// Stage the exact postprocessed targets and a new player together.
     /// Pack files and remaining generation/save dependencies are not yet
@@ -224,7 +233,24 @@ impl GenerationReady {
         last_played_ms: i64,
         region_timestamp: u32,
     ) -> Result<StagedInitialWorld> {
-        self.stage_initial_world_impl(parent, last_played_ms, region_timestamp, false)
+        self.stage_initial_world_with_progress(parent, last_played_ms, region_timestamp, |_| Ok(()))
+    }
+
+    /// Report staging checkpoints; returning an error cancels before publication.
+    pub fn stage_initial_world_with_progress(
+        &mut self,
+        parent: &std::path::Path,
+        last_played_ms: i64,
+        region_timestamp: u32,
+        mut progress: impl FnMut(InitialWorldStageProgress<'_>) -> Result<()>,
+    ) -> Result<StagedInitialWorld> {
+        self.stage_initial_world_impl(
+            parent,
+            last_played_ms,
+            region_timestamp,
+            false,
+            &mut progress,
+        )
     }
 
     /// Stage a structure-aware world only for inspection. The private stage
@@ -235,8 +261,29 @@ impl GenerationReady {
         last_played_ms: i64,
         region_timestamp: u32,
     ) -> Result<StagedStructureInitialWorld> {
-        let staged =
-            self.stage_initial_world_impl(parent, last_played_ms, region_timestamp, true)?;
+        self.stage_structure_initial_world_with_progress(
+            parent,
+            last_played_ms,
+            region_timestamp,
+            |_| Ok(()),
+        )
+    }
+
+    /// The caller may cancel at checkpoints; pack copying is one uninterrupted operation.
+    pub fn stage_structure_initial_world_with_progress(
+        &mut self,
+        parent: &std::path::Path,
+        last_played_ms: i64,
+        region_timestamp: u32,
+        mut progress: impl FnMut(InitialWorldStageProgress<'_>) -> Result<()>,
+    ) -> Result<StagedStructureInitialWorld> {
+        let staged = self.stage_initial_world_impl(
+            parent,
+            last_played_ms,
+            region_timestamp,
+            true,
+            &mut progress,
+        )?;
         Ok(StagedStructureInitialWorld {
             initial: staged.initial,
             stage: staged.stage,
@@ -249,12 +296,14 @@ impl GenerationReady {
         last_played_ms: i64,
         region_timestamp: u32,
         structures: bool,
+        progress: &mut impl FnMut(InitialWorldStageProgress<'_>) -> Result<()>,
     ) -> Result<StagedInitialWorld> {
         use native_persistence::{
             save::FreshWorldDraft,
             world::{DimensionId, SavedClock},
         };
         use native_session::GameSession;
+        progress(InitialWorldStageProgress::Preparing)?;
         ensure!(
             self.postprocessed.is_some(),
             "initial world has not been postprocessed"
@@ -284,6 +333,7 @@ impl GenerationReady {
                 region_timestamp,
             )?
         };
+        progress(InitialWorldStageProgress::Preparing)?;
         // Reject incomplete regions before constructing the initial session.
         let initial = self.prepare_initial_player_session(last_played_ms)?;
         let snapshot = initial.session.snapshot();
@@ -344,12 +394,16 @@ impl GenerationReady {
         for ((_, _, _), region) in regions {
             draft.add_region(dimension.clone(), region)?;
         }
-        let mut stage = draft.stage(parent)?;
+        let mut stage = draft.stage_with_progress(parent, |event| {
+            progress(InitialWorldStageProgress::Saving(event))
+        })?;
+        progress(InitialWorldStageProgress::InstallingDataPacks)?;
         match (&settings.packs, &self.pack_snapshot) {
             (Some(_), Some(snapshot)) => stage.install_data_packs(snapshot)?,
             (None, None) => {}
             _ => anyhow::bail!("generation data pack snapshot does not match level settings"),
         }
+        progress(InitialWorldStageProgress::Finished)?;
         self.hut_generation = None;
         Ok(StagedInitialWorld { initial, stage })
     }
@@ -4703,7 +4757,151 @@ mod tests {
             initial_ready.hut_generation.as_ref().unwrap(),
             &generation
         ));
-        let staged = initial_ready.stage_structure_initial_world(temp.path(), 123, 1)?;
+        for cancel_at_finish in [false, true] {
+            let parent = tempfile::tempdir()?;
+            let mut observed = false;
+            let cancelled = initial_ready.stage_structure_initial_world_with_progress(
+                parent.path(),
+                123,
+                1,
+                |event| {
+                    let cancel =
+                        if cancel_at_finish {
+                            matches!(event, InitialWorldStageProgress::Finished)
+                        } else {
+                            matches!(event, InitialWorldStageProgress::Saving(
+                            native_persistence::save::FreshWorldStageProgress::WritingChunk { .. }
+                        ))
+                        };
+                    if cancel {
+                        observed = true;
+                        anyhow::bail!("test cancellation");
+                    }
+                    Ok(())
+                },
+            );
+            assert!(observed && cancelled.is_err());
+            assert_eq!(std::fs::read_dir(parent.path())?.count(), 0);
+            assert!(Arc::ptr_eq(
+                initial_ready.hut_generation.as_ref().unwrap(),
+                &generation
+            ));
+        }
+        let cancelled_parent = tempfile::tempdir()?;
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (resume, resume_rx) = mpsc::sync_channel(1);
+        let mut gate = Some((entered, resume_rx));
+        let cancelled_worker =
+            crate::generation_staging::InitialWorldStagingWorker::start_observed(
+                initial_ready,
+                cancelled_parent.path().to_path_buf(),
+                true,
+                123,
+                1,
+                move |event| {
+                    if matches!(
+                        event,
+                        InitialWorldStageProgress::Saving(
+                            native_persistence::save::FreshWorldStageProgress::WritingChunk { .. }
+                        )
+                    ) && let Some((entered, resume)) = gate.take()
+                    {
+                        entered.send(())?;
+                        resume.recv_timeout(std::time::Duration::from_secs(30))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        entered_rx.recv_timeout(std::time::Duration::from_secs(30))?;
+        assert_eq!(
+            cancelled_worker.progress().phase,
+            crate::generation_staging::StagingPhase::WritingChunk
+        );
+        cancelled_worker.cancel();
+        resume.send(())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let initial_ready = loop {
+            match cancelled_worker.try_result()? {
+                Some(crate::generation_staging::StagingResult::Cancelled(generation)) => {
+                    break generation;
+                }
+                Some(crate::generation_staging::StagingResult::Failed { error, .. }) => {
+                    return Err(error);
+                }
+                Some(_) => anyhow::bail!("cancelled staging unexpectedly succeeded"),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => anyhow::bail!("cancelled staging worker timed out"),
+            }
+        };
+        assert_eq!(
+            cancelled_worker.progress().phase,
+            crate::generation_staging::StagingPhase::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(cancelled_parent.path())?.count(), 0);
+        assert!(Arc::ptr_eq(
+            initial_ready.hut_generation.as_ref().unwrap(),
+            &generation
+        ));
+        let failed_worker = crate::generation_staging::InitialWorldStagingWorker::start(
+            initial_ready,
+            missing_parent,
+            true,
+            123,
+            1,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let initial_ready = loop {
+            match failed_worker.try_result()? {
+                Some(crate::generation_staging::StagingResult::Failed { generation, error }) => {
+                    assert!(format!("{error:#}").contains("staging directory"));
+                    break generation;
+                }
+                Some(_) => anyhow::bail!("failed staging returned an unexpected outcome"),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => anyhow::bail!("failed staging worker timed out"),
+            }
+        };
+        assert_eq!(
+            failed_worker.progress().phase,
+            crate::generation_staging::StagingPhase::Failed
+        );
+        assert!(Arc::ptr_eq(
+            initial_ready.hut_generation.as_ref().unwrap(),
+            &generation
+        ));
+        let stage_worker = crate::generation_staging::InitialWorldStagingWorker::start(
+            initial_ready,
+            temp.path().to_path_buf(),
+            true,
+            123,
+            1,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let (mut initial_ready, staged) = loop {
+            match stage_worker.try_result()? {
+                Some(crate::generation_staging::StagingResult::Ready {
+                    generation,
+                    world: crate::generation_staging::StagedWorld::Structured(staged),
+                }) => break (generation, staged),
+                Some(crate::generation_staging::StagingResult::Failed { error, .. }) => {
+                    return Err(error);
+                }
+                Some(_) => anyhow::bail!("unexpected staging outcome"),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => anyhow::bail!("staging worker timed out"),
+            }
+        };
+        assert_eq!(
+            stage_worker.progress().phase,
+            crate::generation_staging::StagingPhase::Ready
+        );
+        assert!(stage_worker.progress().chunks_started > 0);
         let staged_reader = native_persistence::world::WorldReader::open(
             staged.path(),
             native_persistence::world::DimensionId::parse("overworld")?,

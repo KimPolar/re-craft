@@ -348,6 +348,29 @@ impl GenerationInputSnapshot {
     }
 }
 
+/// One disk capture of generation inputs and the world's selected data packs.
+/// Unsaved session changes and later changes to the original pack files still
+/// require separate checks before generated chunks can be committed.
+pub struct GenerationContextSnapshot {
+    inputs: GenerationInputSnapshot,
+    packs: Arc<native_resources::datapack_snapshot::DataPackSnapshot>,
+    selection: DataPackSettings,
+}
+
+impl GenerationContextSnapshot {
+    pub fn inputs(&self) -> &GenerationInputSnapshot {
+        &self.inputs
+    }
+
+    pub fn packs(&self) -> &Arc<native_resources::datapack_snapshot::DataPackSnapshot> {
+        &self.packs
+    }
+
+    pub fn selection(&self) -> &DataPackSettings {
+        &self.selection
+    }
+}
+
 impl SavedPoiChunk {
     /// Decode and validate a POI document for its containing chunk.
     pub fn from_document(document: NamedTag, position: ChunkPos) -> Result<Self> {
@@ -1225,8 +1248,43 @@ impl WorldReader {
             .clone()
             .context("generation capture requires a locked world session")?;
         let lease = session.acquire_capture()?;
+        self.capture_generation_inputs_in(&lease, positions)
+    }
+
+    /// Capture the generator, selected region entries, level pack selection
+    /// and a private copy of the same world's packs under one writer lease.
+    pub fn capture_generation_context(
+        &mut self,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<GenerationContextSnapshot> {
+        let session = self
+            .session_guard
+            .clone()
+            .context("generation capture requires a locked world session")?;
+        let lease = session.acquire_capture()?;
+        let selection = lease.data_pack_settings()?;
+        let packs = lease.data_pack_snapshot()?;
+        let inputs = self.capture_generation_inputs_in(&lease, positions)?;
+        packs.verify()?;
+        lease.verify_data_pack_source(&packs)?;
+        ensure!(
+            lease.data_pack_settings()? == selection,
+            "world data pack selection changed during capture"
+        );
+        Ok(GenerationContextSnapshot {
+            inputs,
+            packs,
+            selection,
+        })
+    }
+
+    fn capture_generation_inputs_in(
+        &mut self,
+        lease: &crate::save::WorldCaptureGuard,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Result<GenerationInputSnapshot> {
         let settings = lease.generation_settings()?;
-        let sources = self.capture_generation_sources_in(&lease, positions)?;
+        let sources = self.capture_generation_sources_in(lease, positions)?;
         Ok(GenerationInputSnapshot { settings, sources })
     }
 
@@ -1999,15 +2057,19 @@ impl WorldReader {
     }
 
     pub fn data_pack_settings(&self) -> Result<DataPackSettings> {
-        let Tag::Compound(root) = &self.level.value else {
+        Self::data_pack_settings_from_document(&self.level)
+    }
+
+    /// Decode pack selection from the exact level document used for capture.
+    pub(crate) fn data_pack_settings_from_document(level: &NamedTag) -> Result<DataPackSettings> {
+        let Tag::Compound(root) = &level.value else {
             bail!("level.dat root must be a compound")
         };
         ensure!(
             root.iter().filter(|(name, _)| name.matches("Data")).count() == 1,
             "level.dat must contain exactly one Data compound"
         );
-        let data = self
-            .level
+        let data = level
             .value
             .get("Data")
             .context("level.dat is missing Data")?;

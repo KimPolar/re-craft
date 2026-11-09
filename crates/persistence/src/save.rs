@@ -2372,6 +2372,41 @@ impl WorldCaptureGuard {
             seed,
         })
     }
+
+    pub(crate) fn data_pack_settings(&self) -> Result<crate::world::DataPackSettings> {
+        let root = &self._guard.root;
+        let path = root.join("level.dat");
+        let metadata = fs::symlink_metadata(&path).context("level.dat is missing")?;
+        ensure!(
+            metadata.is_file() && ordinary(&metadata),
+            "level.dat must be an ordinary file"
+        );
+        ensure!(
+            path.canonicalize()?.parent() == Some(root.as_path()),
+            "level.dat is outside the world"
+        );
+        let (info, level) = crate::anvil::read_level_document(root)?;
+        ensure!(
+            info.data_version == TARGET_DATA_VERSION,
+            "unsupported level DataVersion"
+        );
+        crate::world::WorldReader::data_pack_settings_from_document(&level)
+    }
+
+    pub(crate) fn data_pack_snapshot(
+        &self,
+    ) -> Result<Arc<native_resources::datapack_snapshot::DataPackSnapshot>> {
+        Ok(Arc::new(
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(&self._guard.root)?,
+        ))
+    }
+
+    pub(crate) fn verify_data_pack_source(
+        &self,
+        snapshot: &native_resources::datapack_snapshot::DataPackSnapshot,
+    ) -> Result<()> {
+        snapshot.verify_source(&self._guard.root)
+    }
 }
 
 impl Drop for WorldWriteGuard {
@@ -8893,6 +8928,107 @@ mod tests {
                 .is_some()
         );
         assert!(session.acquire_write().is_ok());
+    }
+
+    #[test]
+    fn generation_context_rejects_pack_or_selection_changes_during_capture() {
+        use std::{sync::mpsc, time::Duration};
+        struct PausedPosition {
+            ready: Option<mpsc::SyncSender<()>>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Iterator for PausedPosition {
+            type Item = ChunkPos;
+            fn next(&mut self) -> Option<Self::Item> {
+                self.ready.take()?.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+                Some(ChunkPos { x: 1, z: 0 })
+            }
+        }
+        for change_selection in [false, true] {
+            let world = test_world();
+            fixture(world.path());
+            let dir = world.path().join("data/minecraft");
+            fs::create_dir_all(&dir).unwrap();
+            let settings = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                    ),
+                ]),
+            };
+            fs::write(
+                dir.join("world_gen_settings.dat"),
+                nbt::write(&settings).unwrap(),
+            )
+            .unwrap();
+            let pack = world.path().join("datapacks/test.zip");
+            fs::create_dir_all(pack.parent().unwrap()).unwrap();
+            fs::write(&pack, b"before").unwrap();
+            let mut reader = crate::world::WorldReader::open_for_session(
+                world.path(),
+                DimensionId::parse("overworld").unwrap(),
+            )
+            .unwrap();
+            let session = reader.session_guard().unwrap();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                reader.capture_generation_context(PausedPosition {
+                    ready: Some(ready_tx),
+                    resume: resume_rx,
+                })
+            });
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(session.acquire_write().is_err());
+            if change_selection {
+                let (_, mut level) = crate::anvil::read_level_document(world.path()).unwrap();
+                let Tag::Compound(root) = &mut level.value else {
+                    unreachable!()
+                };
+                let Tag::Compound(data) = &mut root
+                    .iter_mut()
+                    .find(|(key, _)| key.matches("Data"))
+                    .unwrap()
+                    .1
+                else {
+                    unreachable!()
+                };
+                data.push((
+                    "enabled_features".into(),
+                    Tag::List {
+                        element_type: TagType::String,
+                        values: vec![
+                            Tag::String("minecraft:vanilla".into()),
+                            Tag::String("minecraft:trade_rebalance".into()),
+                        ],
+                    },
+                ));
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&nbt::write(&level).unwrap()).unwrap();
+                fs::write(world.path().join("level.dat"), gzip.finish().unwrap()).unwrap();
+            } else {
+                fs::write(&pack, b"after").unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            let result = worker.join().unwrap();
+            let error = match result {
+                Ok(_) => panic!("changed generation context was accepted"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains(if change_selection {
+                    "selection changed"
+                } else {
+                    "source data packs changed"
+                }),
+                "{error}"
+            );
+            assert!(session.acquire_write().is_ok());
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@ use super::*;
 use anyhow::{Context, bail};
 use native_persistence::{
     nbt::{NamedTag, Tag},
-    world::{DimensionId, GenerationInputSnapshot},
+    world::{DimensionId, GenerationContextSnapshot, GenerationInputSnapshot},
 };
 
 /// A generator bound to the exact captured inputs from which it was prepared.
@@ -15,19 +15,21 @@ pub(crate) struct PreparedExistingGenerator {
     pub dimension_definition: Value,
     pub generate_structures: bool,
     pub resources: ResourceStack,
-    inputs: GenerationInputSnapshot,
+    context: GenerationContextSnapshot,
 }
 
 impl PreparedExistingGenerator {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
-        &self.inputs
+        self.context.inputs()
     }
 
-    pub fn add_save_dependencies(
+    /// Bind terrain and generator settings only. Pack source and level pack
+    /// selection must still be protected before the resulting save can run.
+    pub fn add_terrain_and_settings_dependencies(
         &self,
         plan: &mut native_persistence::save::WorldSavePlan,
     ) -> Result<()> {
-        plan.add_generation_inputs(&self.inputs)
+        plan.add_generation_inputs(self.context.inputs())
     }
 }
 
@@ -177,17 +179,28 @@ fn resolve_stem(
     Ok((saved_value(saved, false, 0, &mut 0)?, generate_structures))
 }
 
-/// Compile using the saved generator, or the selected data-pack dimension
-/// override if present. The resource stack must use a frozen world-pack
-/// snapshot; callers still need to protect that snapshot's original files.
+/// Compile using the saved generator and the pack selection captured from the
+/// same world. The pack source still needs protection before a later save.
 pub(crate) fn prepare_existing_generator(
-    inputs: GenerationInputSnapshot,
-    mut resources: ResourceStack,
+    context: GenerationContextSnapshot,
+    minecraft_dir: &std::path::Path,
 ) -> Result<PreparedExistingGenerator> {
-    let packs = resources
-        .data_pack_snapshot()
-        .context("world data packs are not frozen")?;
+    let packs = Arc::clone(context.packs());
     packs.verify()?;
+    let selected = context.selection();
+    let selection = DataPackSettings {
+        enabled: selected.enabled.clone(),
+        disabled: selected.disabled.clone(),
+        enabled_features: selected.enabled_features.clone(),
+    };
+    let mut resources = ResourceStack::open(minecraft_dir)?;
+    let warnings = resources.configure_snapshot_data(Arc::clone(&packs), &selection)?;
+    ensure!(
+        warnings.is_empty(),
+        "data pack selection needs attention: {}",
+        warnings.join("; ")
+    );
+    let inputs = context.inputs();
     let dimension = inputs.sources().dimension();
     let (stem, generate_structures) =
         resolve_stem(&mut resources, inputs.settings().document(), dimension)?;
@@ -219,7 +232,7 @@ pub(crate) fn prepare_existing_generator(
         dimension_definition,
         generate_structures,
         resources,
-        inputs,
+        context,
     })
 }
 
@@ -377,26 +390,17 @@ mod tests {
             std::fs::create_dir_all(root.join(format!("dimensions/minecraft/{name}/region")))?;
             let dimension = DimensionId::parse(name)?;
             let mut reader = WorldReader::open_for_session(root, dimension)?;
-            let inputs = reader.capture_generation_inputs([ChunkPos { x: 0, z: 0 }])?;
-            let mut resources = ResourceStack::open(&game)?;
-            let snapshot =
-                Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(root)?);
-            let packs = DataPackSettings {
-                enabled: vec!["vanilla".into()],
-                disabled: Vec::new(),
-                enabled_features: vec!["minecraft:vanilla".into()],
-            };
-            let warnings = resources.configure_snapshot_data(snapshot, &packs)?;
-            ensure!(
-                warnings.is_empty(),
-                "unexpected data pack warnings: {warnings:?}"
-            );
-            let mut actual = prepare_existing_generator(inputs, resources)?;
+            let context = reader.capture_generation_context([ChunkPos { x: 0, z: 0 }])?;
+            let mut actual = prepare_existing_generator(context, &game)?;
             assert!(actual.generate_structures);
             assert_eq!(actual.inputs().settings().seed(), -42);
             let mut plan = WorldSavePlan::new();
-            actual.add_save_dependencies(&mut plan)?;
-            assert!(actual.add_save_dependencies(&mut plan).is_err());
+            actual.add_terrain_and_settings_dependencies(&mut plan)?;
+            assert!(
+                actual
+                    .add_terrain_and_settings_dependencies(&mut plan)
+                    .is_err()
+            );
             let mut reference_resources = ResourceStack::open(&game)?;
             let (lighting, definition, dimension_definition) =
                 GeneratedDimensionLighting::load_preset_with_definition(
@@ -465,25 +469,50 @@ mod tests {
             serde_json::to_vec(&custom_stem("minecraft:desert"))?,
         )?;
         let mut reader = WorldReader::open_for_session(root, DimensionId::parse("overworld")?)?;
-        let inputs = reader.capture_generation_inputs([ChunkPos { x: 0, z: 0 }])?;
-        let mut resources = ResourceStack::open(&game)?;
-        let snapshot =
-            Arc::new(native_resources::datapack_snapshot::DataPackSnapshot::capture(root)?);
-        let packs = DataPackSettings {
-            enabled: vec!["vanilla".into(), "file/custom".into()],
-            disabled: Vec::new(),
-            enabled_features: vec!["minecraft:vanilla".into()],
+        let mut updated_level = level.clone();
+        let Tag::Compound(root_fields) = &mut updated_level.value else {
+            unreachable!()
         };
-        let warnings = resources.configure_snapshot_data(snapshot, &packs)?;
-        ensure!(
-            warnings.is_empty(),
-            "unexpected data pack warnings: {warnings:?}"
-        );
+        let Tag::Compound(data) = &mut root_fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("Data"))
+            .unwrap()
+            .1
+        else {
+            unreachable!()
+        };
+        data.push((
+            "DataPacks".into(),
+            Tag::Compound(vec![
+                (
+                    "Enabled".into(),
+                    Tag::List {
+                        element_type: TagType::String,
+                        values: vec![
+                            Tag::String("vanilla".into()),
+                            Tag::String("file/custom".into()),
+                        ],
+                    },
+                ),
+                (
+                    "Disabled".into(),
+                    Tag::List {
+                        element_type: TagType::End,
+                        values: vec![],
+                    },
+                ),
+            ]),
+        ));
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+        gzip.write_all(&native_persistence::nbt::write(&updated_level)?)?;
+        std::fs::write(root.join("level.dat"), gzip.finish()?)?;
+        let context = reader.capture_generation_context([ChunkPos { x: 0, z: 0 }])?;
+        assert_eq!(context.selection().enabled, ["vanilla", "file/custom"]);
         std::fs::write(
             &dimension_file,
             serde_json::to_vec(&custom_stem("minecraft:plains"))?,
         )?;
-        let actual = prepare_existing_generator(inputs, resources)?;
+        let actual = prepare_existing_generator(context, &game)?;
         assert!(!actual.generate_structures);
         assert_eq!(
             actual.generator.possible_biomes(),

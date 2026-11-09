@@ -97,6 +97,38 @@ impl DataPackSnapshot {
         Ok(())
     }
 
+    /// Verify that a world's current pack tree still matches this snapshot.
+    /// This does not lock the source against a later external modification.
+    pub fn verify_source(&self, world: &Path) -> Result<()> {
+        let world = world
+            .canonicalize()
+            .context("cannot resolve data pack source world")?;
+        ensure!(world.is_dir(), "data pack source is not a directory");
+        let source = world.join("datapacks");
+        if self.present {
+            let metadata =
+                fs::symlink_metadata(&source).context("source data packs are missing")?;
+            ensure!(
+                ordinary(&metadata) && metadata.is_dir(),
+                "source data packs are not an ordinary directory"
+            );
+            ensure!(
+                source.canonicalize()?.starts_with(&world),
+                "source data packs are outside the world"
+            );
+            ensure!(
+                scan(&source, None)? == self.manifest,
+                "source data packs changed after capture"
+            );
+        } else {
+            ensure!(
+                matches!(fs::symlink_metadata(&source), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "source data packs appeared after capture"
+            );
+        }
+        Ok(())
+    }
+
     /// Copy into a new staged world; on failure the caller must discard it.
     pub fn copy_into(&self, world: &Path) -> Result<()> {
         self.verify()?;
@@ -216,8 +248,14 @@ mod tests {
         fs::write(packs.join("active/data/example/value.json"), b"original").unwrap();
         fs::write(packs.join("disabled.zip"), b"archive bytes").unwrap();
         let snapshot = DataPackSnapshot::capture(source.path()).unwrap();
+        snapshot.verify_source(source.path()).unwrap();
         fs::write(packs.join("active/data/example/value.json"), b"modified").unwrap();
+        assert!(snapshot.verify_source(source.path()).is_err());
+        fs::write(packs.join("active/data/example/value.json"), b"original").unwrap();
+        snapshot.verify_source(source.path()).unwrap();
         fs::write(packs.join("later.zip"), b"new").unwrap();
+        assert!(snapshot.verify_source(source.path()).is_err());
+        fs::write(packs.join("active/data/example/value.json"), b"modified").unwrap();
         let stage = tempfile::tempdir().unwrap();
         snapshot.copy_into(stage.path()).unwrap();
         let staged = stage.path().join("datapacks");
@@ -255,6 +293,9 @@ mod tests {
         assert!(!stage.path().join("datapacks").exists());
         let empty_source = tempfile::tempdir().unwrap();
         let empty = DataPackSnapshot::capture(empty_source.path()).unwrap();
+        empty.verify_source(empty_source.path()).unwrap();
+        fs::create_dir(empty_source.path().join("datapacks")).unwrap();
+        assert!(empty.verify_source(empty_source.path()).is_err());
         empty.copy_into(stage.path()).unwrap();
         assert!(!stage.path().join("datapacks").exists());
     }

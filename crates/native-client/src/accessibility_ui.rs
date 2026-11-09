@@ -397,16 +397,15 @@ impl AccessibilityUi {
                     );
                     let name = assets.translate(key, fallback);
                     let text = if value == 0.0 && control != AccessibilityControl::PanoramaSpeed {
-                        assets
-                            .translate("options.generic_value", "%s: %s")
-                            .replacen("%s", name, 1)
-                            .replacen("%s", assets.translate("options.off", "OFF"), 1)
+                        crate::text_component::format_plain(
+                            assets.translate("options.generic_value", "%s: %s"),
+                            &[name, assets.translate("options.off", "OFF")],
+                        )
                     } else {
-                        assets
-                            .translate("options.percent_value", "%s: %s%%")
-                            .replacen("%s", name, 1)
-                            .replacen("%s", &((value * 100.0) as i32).to_string(), 1)
-                            .replace("%%", "%")
+                        crate::text_component::format_plain(
+                            assets.translate("options.percent_value", "%s: %s%%"),
+                            &[name, &((value * 100.0) as i32).to_string()],
+                        )
                     };
                     list.text_centered(
                         Some(assets),
@@ -424,10 +423,9 @@ impl AccessibilityUi {
                     } else {
                         ("options.off.composed", "%s: OFF")
                     };
-                    assets.translate(key, fallback).replacen(
-                        "%s",
-                        assets.translate("options.viewBobbing", "View Bobbing"),
-                        1,
+                    crate::text_component::format_plain(
+                        assets.translate(key, fallback),
+                        &[assets.translate("options.viewBobbing", "View Bobbing")],
                     )
                 } else {
                     assets.translate(key, fallback).to_owned()

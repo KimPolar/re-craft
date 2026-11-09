@@ -87,11 +87,7 @@ pub fn draw(canvas: &mut Canvas, assets: &MenuAssets, display: Display) {
     if let Some(level) = display.level {
         let template = assets.translate("gui.experience.level", "%s");
         let number = level.to_string();
-        let text = if template.contains("%1$s") {
-            template.replace("%1$s", &number)
-        } else {
-            template.replacen("%s", &number, 1)
-        };
+        let text = crate::text_component::format_plain(template, &[&number]);
         for (x, y, color) in level_text_positions(
             canvas.width,
             canvas.height,

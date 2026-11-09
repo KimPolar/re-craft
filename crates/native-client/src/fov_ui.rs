@@ -133,11 +133,7 @@ impl FovSlider {
             value => value.to_string(),
         };
         let format = assets.translate("options.generic_value", "%s: %s");
-        let caption = if format.contains("%1$s") || format.contains("%2$s") {
-            format.replace("%1$s", label).replace("%2$s", &value)
-        } else {
-            format.replacen("%s", label, 1).replacen("%s", &value, 1)
-        };
+        let caption = crate::text_component::format_plain(format, &[label, &value]);
         canvas.text_centered(
             Some(assets),
             rect.x + rect.w / 2,

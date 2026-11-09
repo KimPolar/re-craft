@@ -46,5 +46,19 @@ public class TitleComponentOracle {
             output.add(chars);
         }
         Files.writeString(Path.of(args[0],"expected.json"),output.toString());
+        String[][] plainCases = {
+            {"%2$s: %1$s %%", "A", "B"},
+            {"%s %2$s %s", "A", "B"},
+            {"%s %s", "%s", "value"},
+            {"%1$s / %1$s", "A"},
+            {"bad %q", "A"},
+            {"%2$s", "A"}
+        };
+        var plain = new JsonArray();
+        for (var row : plainCases) {
+            var values = Arrays.copyOfRange(row, 1, row.length, Object[].class);
+            plain.add(Component.translatableWithFallback("missing.key", row[0], values).getString());
+        }
+        Files.writeString(Path.of(args[0], "plain.json"), plain.toString());
     }
 }

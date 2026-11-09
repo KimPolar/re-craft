@@ -596,10 +596,9 @@ impl VideoUi {
                                 handle.scaling,
                             );
                             let value = if weather {
-                                assets.translate("options.blocks", "%s Blocks").replacen(
-                                    "%s",
-                                    &weather_from_slider(slider).to_string(),
-                                    1,
+                                crate::text_component::format_plain(
+                                    assets.translate("options.blocks", "%s Blocks"),
+                                    &[&weather_from_slider(slider).to_string()],
                                 )
                             } else if blend {
                                 let side = blend_from_slider(slider) * 2 + 1;
@@ -611,20 +610,14 @@ impl VideoUi {
                                 };
                                 assets.translate(&key, &fallback).to_owned()
                             } else {
-                                assets.translate("options.chunks", "%s Chunks").replacen(
-                                    "%s",
-                                    &distance_from_slider(slider).to_string(),
-                                    1,
+                                crate::text_component::format_plain(
+                                    assets.translate("options.chunks", "%s Chunks"),
+                                    &[&distance_from_slider(slider).to_string()],
                                 )
                             };
                             let format = assets.translate("options.generic_value", "%s: %s");
-                            let text = if format.contains("%1$s") || format.contains("%2$s") {
-                                format.replace("%1$s", tr(label)).replace("%2$s", &value)
-                            } else {
-                                format
-                                    .replacen("%s", tr(label), 1)
-                                    .replacen("%s", &value, 1)
-                            };
+                            let text =
+                                crate::text_component::format_plain(format, &[tr(label), &value]);
                             list.text_centered(
                                 Some(assets),
                                 rect.x + rect.w / 2,
@@ -660,17 +653,19 @@ impl VideoUi {
                                     .translate("options.framerateLimit.max", "Unlimited")
                                     .to_owned()
                             } else {
-                                assets.translate("options.framerate", "%s fps").replacen(
-                                    "%s",
-                                    &video.max_fps.to_string(),
-                                    1,
+                                crate::text_component::format_plain(
+                                    assets.translate("options.framerate", "%s fps"),
+                                    &[&video.max_fps.to_string()],
                                 )
                             };
                             list.text_centered(
                                 Some(assets),
                                 rect.x + rect.w / 2,
                                 rect.y + 6,
-                                &format!("{}: {value}", tr(label)),
+                                &crate::text_component::format_plain(
+                                    assets.translate("options.generic_value", "%s: %s"),
+                                    &[tr(label), &value],
+                                ),
                                 [255, 255, 255],
                             );
                         } else if label.key == "options.vsync" || label.key == "options.fullscreen"
@@ -687,8 +682,10 @@ impl VideoUi {
                                 "options.off.composed"
                             };
                             let fallback = if enabled { "%s: ON" } else { "%s: OFF" };
-                            let value =
-                                assets.translate(key, fallback).replacen("%s", tr(label), 1);
+                            let value = crate::text_component::format_plain(
+                                assets.translate(key, fallback),
+                                &[tr(label)],
+                            );
                             list.button(
                                 Some(assets),
                                 rect,
@@ -708,10 +705,10 @@ impl VideoUi {
                             } else {
                                 video.gui_scale.to_string()
                             };
-                            let value = assets
-                                .translate("options.generic_value", "%s: %s")
-                                .replacen("%s", tr(label), 1)
-                                .replacen("%s", &value, 1);
+                            let value = crate::text_component::format_plain(
+                                assets.translate("options.generic_value", "%s: %s"),
+                                &[tr(label), &value],
+                            );
                             list.button(
                                 Some(assets),
                                 rect,
@@ -730,11 +727,8 @@ impl VideoUi {
                             };
                             let value = assets.translate(key, fallback);
                             let format = assets.translate("options.generic_value", "%s: %s");
-                            let value = if format.contains("%1$s") || format.contains("%2$s") {
-                                format.replace("%1$s", tr(label)).replace("%2$s", value)
-                            } else {
-                                format.replacen("%s", tr(label), 1).replacen("%s", value, 1)
-                            };
+                            let value =
+                                crate::text_component::format_plain(format, &[tr(label), value]);
                             list.button(
                                 Some(assets),
                                 rect,

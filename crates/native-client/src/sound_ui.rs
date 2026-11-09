@@ -190,23 +190,14 @@ impl SoundUi {
             let label = assets.translate(&key, category.name());
             let value = settings.get(category);
             let caption = if value == 0.0 {
-                assets
-                    .translate("options.off.composed", "%s: OFF")
-                    .replacen("%s", label, 1)
+                crate::text_component::format_plain(
+                    assets.translate("options.off.composed", "%s: OFF"),
+                    &[label],
+                )
             } else {
                 let format = assets.translate("options.percent_value", "%s: %s%%");
                 let percent = ((value * 100.0) as i32).to_string();
-                if format.contains("%1$s") || format.contains("%2$s") {
-                    format
-                        .replace("%1$s", label)
-                        .replace("%2$s", &percent)
-                        .replace("%%", "%")
-                } else {
-                    format
-                        .replacen("%s", label, 1)
-                        .replacen("%s", &percent, 1)
-                        .replace("%%", "%")
-                }
+                crate::text_component::format_plain(format, &[label, &percent])
             };
             list.text_centered(
                 Some(assets),

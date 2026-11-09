@@ -183,10 +183,10 @@ impl SprintWindowUi {
         let value = if settings.sprint_window == 0 {
             assets.translate("options.off", "OFF").to_owned()
         } else {
-            assets
-                .translate("options.value", "%s")
-                .replace("%1$s", &settings.sprint_window.to_string())
-                .replacen("%s", &settings.sprint_window.to_string(), 1)
+            crate::text_component::format_plain(
+                assets.translate("options.value", "%s"),
+                &[&settings.sprint_window.to_string()],
+            )
         };
         let text = caption(
             assets,
@@ -373,7 +373,6 @@ impl MouseUi {
                 label,
                 &number,
             )
-            .replace("%%", "%")
         };
         canvas.text_centered(
             Some(assets),
@@ -421,8 +420,7 @@ impl MouseUi {
             assets.translate("options.percent_value", "%s: %s%%"),
             wheel_label,
             &wheel_value,
-        )
-        .replace("%%", "%");
+        );
         canvas.text_centered(
             Some(assets),
             wheel_rect.x + wheel_rect.w / 2,
@@ -493,16 +491,20 @@ fn caption(assets: &MenuAssets, label: &str, value: &str) -> String {
 }
 
 fn format_pair(format: &str, label: &str, value: &str) -> String {
-    if format.contains("%1$s") || format.contains("%2$s") {
-        format.replace("%1$s", label).replace("%2$s", value)
-    } else {
-        format.replacen("%s", label, 1).replacen("%s", value, 1)
-    }
+    crate::text_component::format_plain(format, &[label, value])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captions_respect_localized_order_without_replacing_argument_text() {
+        assert_eq!(
+            format_pair("%2$s / %1$s %%", "Mouse %2$s", "20"),
+            "20 / Mouse %2$s %"
+        );
+    }
 
     #[test]
     fn slider_and_hit_testing_follow_the_mouse_settings_layout() {

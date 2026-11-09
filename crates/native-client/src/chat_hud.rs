@@ -310,21 +310,7 @@ fn screenshot_message(template: &str, name: &str) -> (String, Vec<Range<usize>>)
 }
 
 fn format_translation(template: &str, arguments: &[&str]) -> String {
-    use crate::text_component::{Part, format_parts};
-    let Some(parts) = format_parts(template) else {
-        return template.to_owned();
-    };
-    let mut result = String::new();
-    for part in parts {
-        match part {
-            Part::Text(text) => result.push_str(&text),
-            Part::Argument(index) => match arguments.get(index) {
-                Some(argument) => result.push_str(argument),
-                None => return template.to_owned(),
-            },
-        }
-    }
-    result
+    crate::text_component::format_plain(template, arguments)
 }
 
 pub(crate) fn format_clock_rate(rate: f32) -> String {
@@ -704,18 +690,19 @@ fn prepare_lines(
                 None,
             ),
             SystemMessageKind::ScreenshotFailed(reason) => (
-                assets
-                    .translate("screenshot.failure", "Couldn't save screenshot: %s")
-                    .replacen("%s", reason, 1),
+                format_translation(
+                    assets.translate("screenshot.failure", "Couldn't save screenshot: %s"),
+                    &[reason],
+                ),
                 None,
                 Vec::new(),
                 None,
             ),
             SystemMessageKind::LocalChat(text) => (
-                assets
-                    .translate("chat.type.text", "<%s> %s")
-                    .replacen("%s", "Player", 1)
-                    .replacen("%s", text, 1),
+                format_translation(
+                    assets.translate("chat.type.text", "<%s> %s"),
+                    &["Player", text],
+                ),
                 None,
                 Vec::new(),
                 None,

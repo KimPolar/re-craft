@@ -293,23 +293,32 @@ pub(crate) enum Part {
     Text(String),
     Argument(usize),
 }
-pub(crate) fn format_parts(template: &str) -> Option<Vec<Part>> {
+
+enum FormatPart<'a> {
+    Text(&'a str),
+    Percent,
+    Argument(usize),
+}
+
+fn visit_format_parts<'a>(
+    template: &'a str,
+    mut visit: impl FnMut(FormatPart<'a>) -> Option<()>,
+) -> Option<()> {
     let bytes = template.as_bytes();
     let mut at = 0;
     let mut start = 0;
     let mut sequential = 0;
-    let mut parts = Vec::new();
     while at < bytes.len() {
         if bytes[at] != b'%' {
             at += 1;
             continue;
         }
         if start < at {
-            parts.push(Part::Text(template[start..at].into()));
+            visit(FormatPart::Text(&template[start..at]))?;
         }
         at += 1;
         if bytes.get(at) == Some(&b'%') {
-            parts.push(Part::Text("%".into()));
+            visit(FormatPart::Percent)?;
             at += 1;
             start = at;
             continue;
@@ -334,19 +343,60 @@ pub(crate) fn format_parts(template: &str) -> Option<Vec<Part>> {
             return None;
         }
         at += 1;
-        parts.push(Part::Argument(index));
+        visit(FormatPart::Argument(index))?;
         start = at;
     }
     if start < template.len() {
-        parts.push(Part::Text(template[start..].into()));
+        visit(FormatPart::Text(&template[start..]))?;
     }
+    Some(())
+}
+
+pub(crate) fn format_parts(template: &str) -> Option<Vec<Part>> {
+    let mut parts = Vec::new();
+    visit_format_parts(template, |part| {
+        parts.push(match part {
+            FormatPart::Text(text) => Part::Text(text.into()),
+            FormatPart::Percent => Part::Text("%".into()),
+            FormatPart::Argument(index) => Part::Argument(index),
+        });
+        Some(())
+    })?;
     Some(parts)
+}
+
+/// Format plain UI text using the same placeholders as translatable components.
+/// Invalid templates or missing arguments remain visible as the original text.
+pub(crate) fn format_plain(template: &str, arguments: &[&str]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let result = visit_format_parts(template, |part| {
+        match part {
+            FormatPart::Text(text) => out.push_str(text),
+            FormatPart::Percent => out.push('%'),
+            FormatPart::Argument(index) => out.push_str(arguments.get(index)?),
+        }
+        Some(())
+    });
+    if result.is_none() {
+        return template.to_owned();
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use native_persistence::nbt::TagType;
+
+    #[test]
+    fn plain_translation_handles_order_escapes_and_argument_text() {
+        assert_eq!(format_plain("%2$s: %1$s %%", &["A", "B"]), "B: A %");
+        assert_eq!(format_plain("%s %2$s %s", &["A", "B"]), "A B B");
+        assert_eq!(format_plain("%s %s", &["%s", "value"]), "%s value");
+        assert_eq!(format_plain("%1$s / %1$s", &["A"]), "A / A");
+        assert_eq!(format_plain("bad %q", &["A"]), "bad %q");
+        assert_eq!(format_plain("%2$s", &["A"]), "%2$s");
+    }
 
     #[test]
     fn inherited_style_and_translated_arguments_are_preserved() {
@@ -472,6 +522,21 @@ mod tests {
         let rows: Vec<Value> =
             serde_json::from_slice(&std::fs::read(temp.path().join("expected.json")).unwrap())
                 .unwrap();
+        let plain: Vec<String> =
+            serde_json::from_slice(&std::fs::read(temp.path().join("plain.json")).unwrap())
+                .unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            ("%2$s: %1$s %%", &["A", "B"]),
+            ("%s %2$s %s", &["A", "B"]),
+            ("%s %s", &["%s", "value"]),
+            ("%1$s / %1$s", &["A"]),
+            ("bad %q", &["A"]),
+            ("%2$s", &["A"]),
+        ];
+        assert_eq!(plain.len(), cases.len());
+        for ((template, arguments), expected) in cases.iter().zip(&plain) {
+            assert_eq!(&format_plain(template, arguments), expected, "{template}");
+        }
         assert_eq!(rows.len(), 13);
         for (index, expected) in rows.iter().enumerate() {
             let nbt = native_persistence::nbt::read(

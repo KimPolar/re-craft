@@ -273,10 +273,10 @@ impl DeathScreen {
                 if self.info.show_message
                     && let Some((key, fallback)) = cause
                 {
-                    let text = assets
-                        .translate(key, fallback)
-                        .replace("%1$s", "Player")
-                        .replace("%s", "Player");
+                    let text = crate::text_component::format_plain(
+                        assets.translate(key, fallback),
+                        &["Player"],
+                    );
                     canvas.text_centered(Some(assets), width / 2, 85, &text, [255; 3]);
                 }
                 let template = assets.translate("deathScreen.score.value", "Score: %s");

@@ -1103,6 +1103,82 @@ enum GenerationTargets {
 }
 
 impl GenerationWorker {
+    /// Start initial overworld generation from one frozen create-world selection.
+    /// The caller supplies the player-search RNG seed independently of the world seed.
+    pub(crate) fn start_frozen_initial_world(
+        frozen: crate::world_creation::FrozenWorldCreation,
+        saved_border: native_persistence::world::SavedWorldBorder,
+        player_random_seed: i64,
+        ceiling_spawn_height: Option<i32>,
+        revision: u64,
+        biome_blend: u8,
+    ) -> Result<Self> {
+        Self::start_frozen_initial_world_impl(
+            frozen,
+            saved_border,
+            player_random_seed,
+            ceiling_spawn_height,
+            revision,
+            biome_blend,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_frozen_initial_world_impl(
+        frozen: crate::world_creation::FrozenWorldCreation,
+        saved_border: native_persistence::world::SavedWorldBorder,
+        player_random_seed: i64,
+        ceiling_spawn_height: Option<i32>,
+        revision: u64,
+        biome_blend: u8,
+        #[cfg(test)] initial_bonus_seed: Option<i64>,
+    ) -> Result<Self> {
+        frozen.validate()?;
+        ensure!(
+            frozen.generation.dimension == "minecraft:overworld",
+            "initial world spawn requires the overworld"
+        );
+        let border = native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?;
+        let rules = frozen.level.game_rules;
+        let player = InitialPlayerSpawnOptions {
+            radius: rules.respawn_radius,
+            adventure: frozen.level.session.mode == native_session::GameMode::Adventure,
+            random_seed: player_random_seed,
+            saved_border: Some(saved_border),
+        };
+        if frozen.generation.structures_enabled {
+            Self::start_structured_initial_world(
+                frozen,
+                StructuredInitialOptions {
+                    border,
+                    spawn_mobs: rules.spawn_mobs,
+                    advance_time: rules.advance_time,
+                    water_source_conversion: rules.water_source_conversion,
+                    player,
+                    ceiling_spawn_height,
+                    #[cfg(test)]
+                    initial_bonus_seed,
+                },
+                revision,
+                biome_blend,
+            )
+        } else {
+            Self::start_initial_world_with_player(
+                move || {
+                    let mut inputs = crate::fresh_generation::prepare(frozen.generation)?
+                        .into_new_world_inputs(border, rules.spawn_mobs, rules.advance_time)?;
+                    inputs.set_level_settings(frozen.level)?;
+                    Ok(inputs)
+                },
+                revision,
+                biome_blend,
+                ceiling_spawn_height,
+                player,
+            )
+        }
+    }
+
     /// Resolve one frozen create-world selection through structure generation,
     /// initial creatures and player spawn. The result remains unsaveable.
     pub(crate) fn start_structured_initial_world(
@@ -4177,6 +4253,32 @@ mod tests {
     }
 
     #[test]
+    fn frozen_initial_world_rejects_invalid_inputs_before_start() {
+        let settings = crate::world_creation::WorldCreationSettings::new("World".into());
+        let frozen = || settings.freeze(std::path::PathBuf::new(), None);
+        let border = native_persistence::world::SavedWorldBorder::default();
+        let mut mixed = frozen();
+        mixed.level.session.seed ^= 1;
+        assert!(
+            GenerationWorker::start_frozen_initial_world(mixed, border, 0, None, 1, 0).is_err()
+        );
+        let mut other_dimension = frozen();
+        other_dimension.generation.dimension = "minecraft:the_nether".into();
+        assert!(
+            GenerationWorker::start_frozen_initial_world(other_dimension, border, 0, None, 1, 0)
+                .is_err()
+        );
+        let invalid_border = native_persistence::world::SavedWorldBorder {
+            size: f64::NAN,
+            ..border
+        };
+        assert!(
+            GenerationWorker::start_frozen_initial_world(frozen(), invalid_border, 0, None, 1, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn structured_initial_world_rejects_inconsistent_settings_before_start() {
         let mut creation = crate::world_creation::WorldCreationSettings::new("World".into());
         creation.game_rules.respawn_radius = 0;
@@ -4470,24 +4572,14 @@ mod tests {
         creation.game_rules.random_tick_speed = 0;
         let frozen = creation.freeze(game.clone(), Some((world.clone(), selection)));
         let saved_border = native_persistence::world::SavedWorldBorder::default();
-        let initial_worker = GenerationWorker::start_structured_initial_world(
+        let initial_worker = GenerationWorker::start_frozen_initial_world_impl(
             frozen,
-            StructuredInitialOptions {
-                border: native_session::respawn::RespawnBorder::from_saved(saved_border, 0)?,
-                spawn_mobs: true,
-                advance_time: false,
-                water_source_conversion: true,
-                player: InitialPlayerSpawnOptions {
-                    radius: 0,
-                    adventure: false,
-                    random_seed: 3,
-                    saved_border: Some(saved_border),
-                },
-                ceiling_spawn_height: None,
-                initial_bonus_seed: Some(42),
-            },
+            saved_border,
+            3,
+            None,
             50,
             0,
+            Some(42),
         )?;
         let mut initial_ready = match initial_worker
             .result
@@ -7017,6 +7109,35 @@ mod tests {
             } else {
                 None
             };
+            let frozen_for_worker = if !spawn_mobs {
+                let mut settings =
+                    crate::world_creation::WorldCreationSettings::new("Test".into());
+                settings.game_rules.spawn_mobs = false;
+                settings.game_rules.water_source_conversion = false;
+                settings.game_rules.keep_inventory = true;
+                settings.seed = crate::chat_input::ChatInput::field("42");
+                settings.mode = crate::world_creation::GameMode::Creative;
+                settings.difficulty = crate::world_creation::Difficulty::Easy;
+                settings.generate_structures = false;
+                settings.preset = native_resources::packs::ResourceId::parse(if disabled {
+                    "example:compact_disabled"
+                } else {
+                    "example:compact"
+                })?;
+                Some(settings.freeze(
+                    game.clone(),
+                    Some((
+                        world.clone(),
+                        DataPackSettings {
+                            enabled: vec!["vanilla".into(), "file/compact".into()],
+                            disabled: vec![],
+                            enabled_features: vec!["minecraft:vanilla".into()],
+                        },
+                    )),
+                ))
+            } else {
+                None
+            };
             let game = game.clone();
             let world = world.clone();
             let prepare_inputs =
@@ -7072,7 +7193,20 @@ mod tests {
                 };
             let resolve_player = !spawn_mobs
                 || (spawn_mobs && !disabled && species == "minecraft:sheep" && feature_kind == 0);
-            let worker = if resolve_player {
+            let worker = if let Some(frozen) = frozen_for_worker {
+                GenerationWorker::start_frozen_initial_world(
+                    frozen,
+                    native_persistence::world::SavedWorldBorder {
+                        size: 200.0,
+                        lerp_target: 200.0,
+                        ..Default::default()
+                    },
+                    1234,
+                    None,
+                    80,
+                    0,
+                )?
+            } else if resolve_player {
                 GenerationWorker::start_initial_world_with_player(
                     prepare_inputs,
                     80,

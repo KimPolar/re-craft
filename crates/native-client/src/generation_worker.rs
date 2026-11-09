@@ -22,6 +22,10 @@ use serde_json::Value;
 
 use crate::mesh_worker::MeshJob;
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "../tests/java/generated_world_java.rs"]
+mod generated_world_java;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GenerationPhase {
     Planning,

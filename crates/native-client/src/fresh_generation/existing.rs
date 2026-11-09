@@ -23,13 +23,13 @@ impl PreparedExistingGenerator {
         self.context.inputs()
     }
 
-    /// Bind terrain and generator settings only. Pack source and level pack
-    /// selection must still be protected before the resulting save can run.
-    pub fn add_terrain_and_settings_dependencies(
+    /// Bind captured disk and pack inputs; live session state and generation
+    /// completeness still require independent checks before saving.
+    pub fn add_save_dependencies(
         &self,
         plan: &mut native_persistence::save::WorldSavePlan,
     ) -> Result<()> {
-        plan.add_generation_inputs(self.context.inputs())
+        plan.add_generation_context(&self.context)
     }
 }
 
@@ -395,12 +395,8 @@ mod tests {
             assert!(actual.generate_structures);
             assert_eq!(actual.inputs().settings().seed(), -42);
             let mut plan = WorldSavePlan::new();
-            actual.add_terrain_and_settings_dependencies(&mut plan)?;
-            assert!(
-                actual
-                    .add_terrain_and_settings_dependencies(&mut plan)
-                    .is_err()
-            );
+            actual.add_save_dependencies(&mut plan)?;
+            assert!(actual.add_save_dependencies(&mut plan).is_err());
             let mut reference_resources = ResourceStack::open(&game)?;
             let (lighting, definition, dimension_definition) =
                 GeneratedDimensionLighting::load_preset_with_definition(

@@ -129,6 +129,12 @@ impl DataPackSnapshot {
         Ok(())
     }
 
+    /// Stable fingerprint of pack names, kinds, lengths and file contents.
+    /// This is suitable for a durable save-transaction dependency.
+    pub fn fingerprint(&self) -> Result<[u8; 32]> {
+        manifest_fingerprint(self.present, &self.manifest)
+    }
+
     /// Copy into a new staged world; on failure the caller must discard it.
     pub fn copy_into(&self, world: &Path) -> Result<()> {
         self.verify()?;
@@ -148,6 +154,71 @@ impl DataPackSnapshot {
         }
         Ok(())
     }
+}
+
+/// Fingerprint the current tree using the same format as a captured snapshot.
+pub fn source_fingerprint(world: &Path) -> Result<[u8; 32]> {
+    let world = world
+        .canonicalize()
+        .context("cannot resolve data pack source world")?;
+    ensure!(world.is_dir(), "data pack source is not a directory");
+    let source = world.join("datapacks");
+    match fs::symlink_metadata(&source) {
+        Ok(metadata) => {
+            ensure!(
+                ordinary(&metadata) && metadata.is_dir(),
+                "source data packs are not an ordinary directory"
+            );
+            ensure!(
+                source.canonicalize()?.parent() == Some(world.as_path()),
+                "source data packs are outside the world"
+            );
+            manifest_fingerprint(true, &scan(&source, None)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            manifest_fingerprint(false, &BTreeMap::new())
+        }
+        Err(error) => Err(error).context("cannot inspect source data packs"),
+    }
+}
+
+fn manifest_fingerprint(present: bool, manifest: &BTreeMap<PathBuf, Entry>) -> Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    hash.update(b"re-craft-data-pack-tree-v1\0");
+    hash.update([u8::from(present)]);
+    hash.update((manifest.len() as u64).to_le_bytes());
+    for (path, entry) in manifest {
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStrExt;
+            path.as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(any(windows, unix)))]
+        let name = path
+            .to_str()
+            .context("unsupported data pack path encoding")?
+            .as_bytes()
+            .to_vec();
+        hash.update((name.len() as u64).to_le_bytes());
+        hash.update(name);
+        match entry {
+            Entry::Directory => hash.update([0]),
+            Entry::File { len, hash: content } => {
+                hash.update([1]);
+                hash.update(len.to_le_bytes());
+                hash.update(content);
+            }
+        }
+    }
+    Ok(hash.finalize().into())
 }
 
 fn ordinary(metadata: &fs::Metadata) -> bool {
@@ -249,12 +320,16 @@ mod tests {
         fs::write(packs.join("disabled.zip"), b"archive bytes").unwrap();
         let snapshot = DataPackSnapshot::capture(source.path()).unwrap();
         snapshot.verify_source(source.path()).unwrap();
+        let fingerprint = snapshot.fingerprint().unwrap();
+        assert_eq!(source_fingerprint(source.path()).unwrap(), fingerprint);
         fs::write(packs.join("active/data/example/value.json"), b"modified").unwrap();
         assert!(snapshot.verify_source(source.path()).is_err());
+        assert_ne!(source_fingerprint(source.path()).unwrap(), fingerprint);
         fs::write(packs.join("active/data/example/value.json"), b"original").unwrap();
         snapshot.verify_source(source.path()).unwrap();
         fs::write(packs.join("later.zip"), b"new").unwrap();
         assert!(snapshot.verify_source(source.path()).is_err());
+        assert_ne!(source_fingerprint(source.path()).unwrap(), fingerprint);
         fs::write(packs.join("active/data/example/value.json"), b"modified").unwrap();
         let stage = tempfile::tempdir().unwrap();
         snapshot.copy_into(stage.path()).unwrap();
@@ -294,8 +369,16 @@ mod tests {
         let empty_source = tempfile::tempdir().unwrap();
         let empty = DataPackSnapshot::capture(empty_source.path()).unwrap();
         empty.verify_source(empty_source.path()).unwrap();
+        assert_eq!(
+            source_fingerprint(empty_source.path()).unwrap(),
+            empty.fingerprint().unwrap()
+        );
         fs::create_dir(empty_source.path().join("datapacks")).unwrap();
         assert!(empty.verify_source(empty_source.path()).is_err());
+        assert_ne!(
+            source_fingerprint(empty_source.path()).unwrap(),
+            empty.fingerprint().unwrap()
+        );
         empty.copy_into(stage.path()).unwrap();
         assert!(!stage.path().join("datapacks").exists());
     }

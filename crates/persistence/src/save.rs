@@ -1048,6 +1048,7 @@ pub struct WorldSavePlan {
     generation_dependencies: Vec<PlannedGenerationDependency>,
     generation_source_session: Option<WorldSessionGuard>,
     generation_settings: Option<GenerationSettingsSnapshot>,
+    generation_packs: Option<PlannedGenerationPacks>,
     players: Vec<PlannedPlayerData>,
     world_clocks: Option<PlannedSharedData>,
     weather: Option<PlannedSharedData>,
@@ -1081,6 +1082,11 @@ struct PlannedGenerationDependency {
     kind: RegionKind,
     position: crate::world::ChunkPos,
     source_nbt: Option<Vec<u8>>,
+}
+
+struct PlannedGenerationPacks {
+    snapshot: Arc<native_resources::datapack_snapshot::DataPackSnapshot>,
+    selection: crate::world::DataPackSettings,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -1241,6 +1247,24 @@ impl WorldSavePlan {
         self.generation_settings = pending.generation_settings;
         self.generation_dependencies
             .extend(pending.generation_dependencies);
+        Ok(())
+    }
+
+    /// Bind all captured disk inputs, selected pack files and the saved pack
+    /// selection to the same recoverable transaction.
+    pub fn add_generation_context(
+        &mut self,
+        context: &crate::world::GenerationContextSnapshot,
+    ) -> Result<()> {
+        ensure!(
+            self.generation_packs.is_none(),
+            "generation packs already bound"
+        );
+        self.add_generation_inputs(context.inputs())?;
+        self.generation_packs = Some(PlannedGenerationPacks {
+            snapshot: Arc::clone(context.packs()),
+            selection: context.selection().clone(),
+        });
         Ok(())
     }
 
@@ -2224,6 +2248,52 @@ fn read_generation_settings(root: &Path) -> Result<(PathBuf, Vec<u8>, nbt::Named
     Ok((path, bytes, document, seed))
 }
 
+fn read_level_pack_settings(
+    root: &Path,
+) -> Result<(
+    PathBuf,
+    Vec<u8>,
+    nbt::NamedTag,
+    crate::world::DataPackSettings,
+)> {
+    let path = root.join("level.dat");
+    let metadata = fs::symlink_metadata(&path).context("level.dat is missing")?;
+    ensure!(
+        metadata.is_file() && ordinary(&metadata),
+        "level.dat must be an ordinary file"
+    );
+    let path = path.canonicalize()?;
+    ensure!(
+        path.parent() == Some(root),
+        "level.dat is outside the world"
+    );
+    let bytes = nbt::decompress_limited(File::open(&path)?)?;
+    let level = nbt::read_gzip(bytes.as_slice()).context("invalid level.dat")?;
+    let Tag::Compound(data) = level
+        .value
+        .get("Data")
+        .context("level.dat Data is missing")?
+    else {
+        anyhow::bail!("level.dat Data must be a compound");
+    };
+    ensure!(
+        data.iter()
+            .filter(|(key, _)| key.matches("DataVersion"))
+            .count()
+            == 1
+            && matches!(
+                level
+                    .value
+                    .get("Data")
+                    .and_then(|data| data.get("DataVersion")),
+                Some(Tag::Int(TARGET_DATA_VERSION))
+            ),
+        "unsupported or duplicate level DataVersion"
+    );
+    let selection = crate::world::WorldReader::data_pack_settings_from_document(&level)?;
+    Ok((path, bytes, level, selection))
+}
+
 impl WorldSessionGuard {
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         Ok(Self {
@@ -2374,23 +2444,7 @@ impl WorldCaptureGuard {
     }
 
     pub(crate) fn data_pack_settings(&self) -> Result<crate::world::DataPackSettings> {
-        let root = &self._guard.root;
-        let path = root.join("level.dat");
-        let metadata = fs::symlink_metadata(&path).context("level.dat is missing")?;
-        ensure!(
-            metadata.is_file() && ordinary(&metadata),
-            "level.dat must be an ordinary file"
-        );
-        ensure!(
-            path.canonicalize()?.parent() == Some(root.as_path()),
-            "level.dat is outside the world"
-        );
-        let (info, level) = crate::anvil::read_level_document(root)?;
-        ensure!(
-            info.data_version == TARGET_DATA_VERSION,
-            "unsupported level DataVersion"
-        );
-        crate::world::WorldReader::data_pack_settings_from_document(&level)
+        Ok(read_level_pack_settings(&self._guard.root)?.3)
     }
 
     pub(crate) fn data_pack_snapshot(
@@ -2668,6 +2722,7 @@ impl WorldWriteGuard {
                 + 2 * plan.level_time.is_some() as usize,
         );
         let mut dependencies = BTreeMap::<PathBuf, PathBuf>::new();
+        let mut special_dependencies = Vec::new();
         let mut deletions = Vec::new();
         let mut absent_dependencies = Vec::new();
         if named_loot_seed.is_some() || plan.generation_settings.is_some() {
@@ -2695,6 +2750,42 @@ impl WorldWriteGuard {
                 "world generation settings changed during staging"
             );
             dependencies.insert(path, backup_path);
+        }
+        if let Some(packs) = &plan.generation_packs {
+            packs.snapshot.verify()?;
+            let expected = packs.snapshot.fingerprint()?;
+            ensure!(
+                native_resources::datapack_snapshot::source_fingerprint(&self.root)? == expected,
+                "world data packs changed after capture"
+            );
+            let (path, bytes, _, selection) = read_level_pack_settings(&self.root)?;
+            ensure!(
+                selection == packs.selection,
+                "world data pack selection changed after capture"
+            );
+            if let Some(level) = &plan.level_time {
+                ensure!(
+                    crate::world::WorldReader::data_pack_settings_from_document(&level.document)?
+                        == packs.selection,
+                    "planned level data changes the data pack selection"
+                );
+            } else {
+                let backup_dir = backup.path().join("world-data");
+                fs::create_dir_all(&backup_dir)?;
+                let backup_path = backup_dir.join("level.dat");
+                copy_sync(&path, &backup_path)?;
+                ensure!(
+                    hash_file(&backup_path)? == <[u8; 32]>::from(Sha256::digest(&bytes)),
+                    "level data changed during staging"
+                );
+                special_dependencies.push(crate::save_transaction::Dependency::PackLevel {
+                    target: path,
+                    backup: backup_path,
+                });
+            }
+            special_dependencies.push(crate::save_transaction::Dependency::PackTree {
+                fingerprint: expected,
+            });
         }
         let mut extra_directories = BTreeMap::<PathBuf, (bool, bool)>::new();
         for ((kind, dimension, _, _), chunks) in &groups {
@@ -3197,6 +3288,13 @@ impl WorldWriteGuard {
             let current =
                 nbt::read_gzip(original.as_slice()).context("cannot decode level data")?;
             crate::world::WorldReader::validate_level_game_time(&current)?;
+            if let Some(packs) = &plan.generation_packs {
+                ensure!(
+                    crate::world::WorldReader::data_pack_settings_from_document(&current)?
+                        == packs.selection,
+                    "world data pack selection changed during staging"
+                );
+            }
             ensure!(
                 nbt::write(&current)? == planned.source_nbt,
                 "level data changed after its draft was created"
@@ -3292,6 +3390,7 @@ impl WorldWriteGuard {
             .map(|(target, backup)| crate::save_transaction::Dependency::Present { target, backup })
             .collect();
         dependencies.extend(absent_dependencies);
+        dependencies.extend(special_dependencies);
         crate::save_transaction::commit_with_deletions(
             &self.root,
             &backup_directory,
@@ -9028,6 +9127,140 @@ mod tests {
                 "{error}"
             );
             assert!(session.acquire_write().is_ok());
+        }
+    }
+
+    #[test]
+    fn generation_context_guards_pack_files_and_selection_when_saving() {
+        for change in [
+            "edit",
+            "add",
+            "remove",
+            "appear",
+            "folder_remove",
+            "selection",
+            "unrelated_level",
+            "level_time",
+        ] {
+            let world = test_world();
+            let (region_path, original_region, _) = fixture(world.path());
+            let dir = world.path().join("data/minecraft");
+            fs::create_dir_all(&dir).unwrap();
+            let settings = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    (
+                        "data".into(),
+                        Tag::Compound(vec![("seed".into(), Tag::Long(42))]),
+                    ),
+                ]),
+            };
+            fs::write(
+                dir.join("world_gen_settings.dat"),
+                nbt::write(&settings).unwrap(),
+            )
+            .unwrap();
+            let pack_dir = world.path().join("datapacks");
+            let pack = pack_dir.join("test.zip");
+            if change != "appear" {
+                fs::create_dir(&pack_dir).unwrap();
+                fs::write(&pack, b"before").unwrap();
+            }
+            let dimension = DimensionId::parse("overworld").unwrap();
+            let mut reader =
+                crate::world::WorldReader::open_for_session(world.path(), dimension.clone())
+                    .unwrap();
+            let session = reader.session_guard().unwrap();
+            let captured = reader
+                .capture_generation_context([ChunkPos { x: 1, z: 0 }])
+                .unwrap();
+            let mut conflict = WorldSavePlan::new();
+            conflict
+                .add_generation_sources(captured.inputs().sources())
+                .unwrap();
+            assert!(conflict.add_generation_context(&captured).is_err());
+            assert!(conflict.generation_settings.is_none() && conflict.generation_packs.is_none());
+            assert_eq!(conflict.generation_dependencies.len(), 3);
+            let mut plan = WorldSavePlan::new();
+            plan.add_generation_context(&captured).unwrap();
+            assert!(plan.add_generation_context(&captured).is_err());
+            plan.add_generated_chunk(
+                dimension,
+                ChunkPos { x: 3, z: 0 },
+                &editable_chunk(3),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            if change == "level_time" {
+                let (_, source) = crate::anvil::read_level_document(world.path()).unwrap();
+                plan.add_level_time(&source, 57).unwrap();
+            } else if change == "selection" || change == "unrelated_level" {
+                let (_, mut level) = crate::anvil::read_level_document(world.path()).unwrap();
+                let Tag::Compound(root) = &mut level.value else {
+                    unreachable!()
+                };
+                let Tag::Compound(data) = &mut root
+                    .iter_mut()
+                    .find(|(key, _)| key.matches("Data"))
+                    .unwrap()
+                    .1
+                else {
+                    unreachable!()
+                };
+                if change == "selection" {
+                    data.push((
+                        "enabled_features".into(),
+                        Tag::List {
+                            element_type: TagType::String,
+                            values: vec![
+                                Tag::String("minecraft:vanilla".into()),
+                                Tag::String("minecraft:trade_rebalance".into()),
+                            ],
+                        },
+                    ));
+                } else {
+                    data.push(("Time".into(), Tag::Long(9)));
+                }
+                let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+                gzip.write_all(&nbt::write(&level).unwrap()).unwrap();
+                fs::write(world.path().join("level.dat"), gzip.finish().unwrap()).unwrap();
+            } else {
+                match change {
+                    "edit" => fs::write(&pack, b"after!").unwrap(),
+                    "add" => fs::write(pack_dir.join("new.zip"), b"new").unwrap(),
+                    "remove" => fs::remove_file(&pack).unwrap(),
+                    "appear" => fs::create_dir(&pack_dir).unwrap(),
+                    "folder_remove" => {
+                        fs::remove_file(&pack).unwrap();
+                        fs::remove_dir(&pack_dir).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let mut writer = session.acquire_write().unwrap();
+            let result = writer.write_plan(plan, |_, _| Ok(()));
+            if matches!(change, "unrelated_level" | "level_time") {
+                result.unwrap_or_else(|error| panic!("{change}: {error:#}"));
+            } else {
+                assert!(result.is_err(), "{change}");
+                assert_eq!(fs::read(&region_path).unwrap(), original_region, "{change}");
+            }
+            drop(writer);
+            assert_eq!(
+                reader.read_chunk(3, 0).unwrap().is_some(),
+                matches!(change, "unrelated_level" | "level_time"),
+                "{change}"
+            );
+            if change == "level_time" {
+                let (_, saved) = crate::anvil::read_level_document(world.path()).unwrap();
+                assert_eq!(
+                    crate::world::WorldReader::validate_level_game_time(&saved).unwrap(),
+                    57
+                );
+            }
         }
     }
 

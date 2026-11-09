@@ -35,9 +35,26 @@ pub(crate) struct Deletion {
 }
 
 pub(crate) enum Dependency {
-    Present { target: PathBuf, backup: PathBuf },
-    Absent { target: PathBuf },
-    AbsentDirectory { target: PathBuf },
+    Present {
+        target: PathBuf,
+        backup: PathBuf,
+    },
+    Absent {
+        target: PathBuf,
+    },
+    AbsentDirectory {
+        target: PathBuf,
+    },
+    /// The source tree is read-only and must match through commit. Recovery
+    /// does not restore or require it because no transaction file is inside it.
+    PackTree {
+        fingerprint: [u8; 32],
+    },
+    /// Read-only level.dat used for pack selection; never restored by recovery.
+    PackLevel {
+        target: PathBuf,
+        backup: PathBuf,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +69,10 @@ struct Manifest {
     absent_directories: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deletions: Vec<DependencyRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_level: Option<DependencyRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -447,7 +468,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     ensure!(
         matches!(
             manifest.version,
-            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13
+            1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14
         ),
         "unsupported transaction version"
     );
@@ -470,6 +491,28 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         .iter()
         .map(|record| relative_path_key(&record.target))
         .collect::<Result<BTreeSet<_>>>()?;
+    if let Some(fingerprint) = &manifest.pack_tree {
+        ensure!(
+            manifest.version >= 14 && valid_digest(fingerprint),
+            "invalid pack tree dependency"
+        );
+        let prefix = format!("datapacks{}", std::path::MAIN_SEPARATOR);
+        for target in manifest
+            .files
+            .iter()
+            .map(|r| &r.target)
+            .chain(manifest.dependencies.iter().map(|r| &r.target))
+            .chain(manifest.deletions.iter().map(|r| &r.target))
+            .chain(manifest.absent_dependencies.iter())
+            .chain(manifest.absent_directories.iter())
+        {
+            let key = relative_path_key(target)?;
+            ensure!(
+                key != "datapacks" && !key.starts_with(&prefix),
+                "pack tree overlaps a transaction target"
+            );
+        }
+    }
     for record in &manifest.files {
         ensure!(
             targets.insert(relative_path_key(&record.target)?),
@@ -521,6 +564,18 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             "duplicate transaction backup"
         );
         ensure!(valid_digest(&record.original), "invalid transaction hash");
+    }
+    if let Some(record) = &manifest.pack_level {
+        ensure!(
+            manifest.version >= 14 && manifest.pack_tree.is_some() && record.target == "level.dat",
+            "invalid pack selection dependency"
+        );
+        ensure!(
+            targets.insert(relative_path_key(&record.target)?)
+                && backups.insert(relative_path_key(&record.backup)?)
+                && valid_digest(&record.original),
+            "duplicate or invalid pack selection dependency"
+        );
     }
     ensure!(
         manifest.version >= 9 || manifest.deletions.is_empty(),
@@ -704,6 +759,8 @@ fn prepare_with_deletions(
     let mut dependency_records = Vec::with_capacity(dependencies.len());
     let mut absent_dependencies = Vec::new();
     let mut absent_directories = Vec::new();
+    let mut pack_tree = None;
+    let mut pack_level = None;
     for dependency in &dependencies {
         match dependency {
             Dependency::Present { target, backup } => {
@@ -746,6 +803,33 @@ fn prepare_with_deletions(
                 );
                 absent_directories.push(target_relative);
             }
+            Dependency::PackTree { fingerprint } => {
+                ensure!(pack_tree.is_none(), "duplicate pack tree dependency");
+                ensure!(
+                    native_resources::datapack_snapshot::source_fingerprint(root)? == *fingerprint,
+                    "world data packs changed during staging"
+                );
+                pack_tree = Some(format!(
+                    "{:x}",
+                    sha2::digest::Output::<sha2::Sha256>::from(*fingerprint)
+                ));
+            }
+            Dependency::PackLevel { target, backup } => {
+                ensure!(pack_level.is_none(), "duplicate pack selection dependency");
+                let target = relative(root, target)?;
+                ensure!(target == "level.dat", "invalid pack selection target");
+                let backup = relative(&backup_dir, backup)?;
+                let original = digest(&checked_file(&backup_dir, &backup, false)?)?;
+                ensure!(
+                    digest(&checked_file(root, &target, true)?)? == original,
+                    "pack selection changed during staging"
+                );
+                pack_level = Some(DependencyRecord {
+                    target,
+                    backup,
+                    original,
+                });
+            }
         }
     }
     let mut deleted_records = Vec::with_capacity(deletions.len());
@@ -764,7 +848,9 @@ fn prepare_with_deletions(
         });
     }
     let manifest = Manifest {
-        version: if absent_directories
+        version: if pack_tree.is_some() {
+            14
+        } else if absent_directories
             .iter()
             .any(|target| valid_terrain_directory(target))
         {
@@ -832,6 +918,8 @@ fn prepare_with_deletions(
         absent_dependencies,
         absent_directories,
         deletions: deleted_records,
+        pack_tree,
+        pack_level,
     };
     validate_manifest(&manifest)?;
     let bytes = serde_json::to_vec(&manifest)?;
@@ -889,6 +977,25 @@ fn check_dependencies(root: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn check_pack_tree(root: &Path, manifest: &Manifest) -> Result<()> {
+    if let Some(expected) = &manifest.pack_tree {
+        let actual = native_resources::datapack_snapshot::source_fingerprint(root)?;
+        let actual = format!("{:x}", sha2::digest::Output::<sha2::Sha256>::from(actual));
+        ensure!(
+            actual == *expected,
+            "world data packs changed during transaction"
+        );
+    }
+    if let Some(level) = &manifest.pack_level {
+        let path = checked_file(root, &level.target, true)?;
+        ensure!(
+            digest(&path)? == level.original,
+            "world data pack selection changed during transaction"
+        );
+    }
+    Ok(())
+}
+
 fn replace_one(root: &Path, record: &FileRecord, file: Replacement) -> Result<()> {
     let (target, exists) = checked_target(root, &record.target)?;
     match &record.original {
@@ -937,6 +1044,7 @@ pub(crate) fn commit_with_deletions(
     let prepared = prepare_with_deletions(root, backup_dir, files, dependencies, deletions)?;
     let result = (|| -> Result<()> {
         check_dependencies(root, &prepared.manifest)?;
+        check_pack_tree(root, &prepared.manifest)?;
         for (record, file) in prepared.manifest.files.iter().zip(prepared.files) {
             replace_one(root, record, file)?;
         }
@@ -963,6 +1071,7 @@ pub(crate) fn commit_with_deletions(
             );
         }
         check_dependencies(root, &prepared.manifest)?;
+        check_pack_tree(root, &prepared.manifest)?;
         write_new(&prepared.backup_dir.join(COMPLETED), b"committed\n")?;
         fs::remove_file(root.join(PENDING)).context("cannot clear completed transaction record")?;
         Ok(())
@@ -1375,6 +1484,55 @@ mod tests {
         assert!(prepare(&root, &backup, files, dependencies).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"outside writer");
         assert!(!root.join(PENDING).exists());
+    }
+
+    #[test]
+    fn pack_tree_change_is_checked_and_recovery_preserves_the_new_pack() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let backup = root.join(".minecraft-native-backups/transaction-fixture");
+        let pack = root.join("datapacks/test.zip");
+        fs::create_dir(root.join("datapacks")).unwrap();
+        fs::write(&pack, b"original pack").unwrap();
+        let level = root.join("level.dat");
+        let level_backup = backup.join("pack-level-original");
+        fs::write(&level, b"original selection").unwrap();
+        fs::copy(&level, &level_backup).unwrap();
+        let fingerprint = native_resources::datapack_snapshot::source_fingerprint(&root).unwrap();
+        let (files, mut dependencies) = replacements(&root);
+        dependencies.push(Dependency::PackTree { fingerprint });
+        dependencies.push(Dependency::PackLevel {
+            target: level.clone(),
+            backup: level_backup,
+        });
+        let mut prepared = prepare(&root, &backup, files, dependencies).unwrap();
+        assert_eq!(prepared.manifest.version, 14);
+        assert!(check_pack_tree(&root, &prepared.manifest).is_ok());
+        fs::write(&level, b"changed selection").unwrap();
+        assert!(check_pack_tree(&root, &prepared.manifest).is_err());
+        fs::write(&level, b"original selection").unwrap();
+        prepared.manifest.version = 13;
+        assert!(validate_manifest(&prepared.manifest).is_err());
+        prepared.manifest.version = 14;
+        let original_target = prepared.manifest.files[0].target.clone();
+        prepared.manifest.files[0].target = "datapacks/test.zip".into();
+        assert!(
+            format!("{:#}", validate_manifest(&prepared.manifest).unwrap_err())
+                .contains("pack tree overlaps")
+        );
+        prepared.manifest.files[0].target = original_target;
+        replace_one(&root, &prepared.manifest.files[0], prepared.files.remove(0)).unwrap();
+        fs::write(&pack, b"changed pack").unwrap();
+        fs::write(&level, b"changed selection").unwrap();
+        assert!(check_pack_tree(&root, &prepared.manifest).is_err());
+        drop(prepared);
+        assert!(recover(&root).unwrap());
+        assert_eq!(
+            fs::read(root.join("dimensions/minecraft/overworld/region/r.0.0.mca")).unwrap(),
+            OLD_REGION
+        );
+        assert_eq!(fs::read(&pack).unwrap(), b"changed pack");
+        assert_eq!(fs::read(&level).unwrap(), b"changed selection");
     }
 
     #[test]
@@ -2016,6 +2174,8 @@ mod tests {
             absent_dependencies: vec![],
             absent_directories: vec![],
             deletions: vec![],
+            pack_tree: None,
+            pack_level: None,
         };
         assert!(validate_manifest(&manifest).is_err());
         manifest.version = 4;

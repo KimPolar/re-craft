@@ -25,6 +25,7 @@ pub(crate) struct PreparedExistingGenerator {
 
 struct SavedTerrainAssets {
     tags: CarverBlockTags,
+    block_ids: BTreeSet<String>,
     blocks: native_resources::block_registry::GeneratedBlockRegistry,
     carvers: native_resources::carver::schedule::CarverCache,
 }
@@ -195,6 +196,45 @@ impl RestoredSavedTerrain {
 impl PreparedExistingGenerator {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         self.context.inputs()
+    }
+
+    fn ensure_terrain_assets(&mut self) -> Result<()> {
+        if self.terrain_assets.is_none() {
+            let block_ids = self.resources.vanilla_block_ids()?;
+            let tags = CarverBlockTags::load(&mut self.resources, &block_ids)?;
+            let blocks = self.resources.vanilla_generated_block_registry()?;
+            self.terrain_assets = Some(SavedTerrainAssets {
+                tags,
+                block_ids,
+                blocks,
+                carvers: native_resources::carver::schedule::CarverCache::default(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve every selected feature against the captured pack and registry
+    /// before passing it to the caller. This does not establish structure,
+    /// terrain, light or scheduler readiness and does not write the world.
+    pub fn with_saved_prepared_decoration<T>(
+        &mut self,
+        context: &SavedDecorationContext,
+        action: impl FnOnce(&native_session::worldgen::PreparedDecoration<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let plan = context.plan(self)?;
+        self.ensure_terrain_assets()?;
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .expect("terrain assets initialized");
+        let mut resolve = |value: &Value| resolve_generated_terrain_state(value, &assets.blocks);
+        let prepared = native_session::worldgen::PreparedDecoration::load(
+            &mut self.resources,
+            &plan,
+            &assets.block_ids,
+            &mut resolve,
+        )?;
+        action(&prepared)
     }
 
     /// Restore Java's biome-dependent decoration plan for a captured chunk.
@@ -827,16 +867,7 @@ impl PreparedExistingGenerator {
             ensure!(structure_order.is_empty(), "structures are disabled");
             None
         };
-        if self.terrain_assets.is_none() {
-            let blocks = self.resources.vanilla_block_ids()?;
-            let tags = CarverBlockTags::load(&mut self.resources, &blocks)?;
-            let blocks = self.resources.vanilla_generated_block_registry()?;
-            self.terrain_assets = Some(SavedTerrainAssets {
-                tags,
-                blocks,
-                carvers: native_resources::carver::schedule::CarverCache::default(),
-            });
-        }
+        self.ensure_terrain_assets()?;
         let assets = self
             .terrain_assets
             .as_mut()
@@ -2302,6 +2333,12 @@ mod tests {
             if name == "overworld" {
                 assert!(!plan.features().is_empty());
             }
+            let mut called = false;
+            actual.with_saved_prepared_decoration(&decoration, |_| {
+                called = true;
+                Ok(())
+            })?;
+            assert!(called, "{name}: prepared feature callback was not called");
             let second_plan = actual.prepare_saved_decoration(ChunkPos { x: 2, z: 3 })?;
             assert!(Arc::ptr_eq(&decoration.schedule, &second_plan.schedule));
             assert!(
@@ -2565,6 +2602,16 @@ mod tests {
                 let context = reader.capture_generation_context(positions)?;
                 let mut other = prepare_existing_generator(context, &game)?;
                 assert!(decoration.plan(&other).is_err());
+                let mut called = false;
+                assert!(
+                    other
+                        .with_saved_prepared_decoration(&decoration, |_| {
+                            called = true;
+                            Ok(())
+                        })
+                        .is_err()
+                );
+                assert!(!called);
                 let alien = other.resume_saved_terrain(
                     ChunkPos { x: 4, z: 3 },
                     &[],
@@ -2759,6 +2806,18 @@ mod tests {
         let pack = root.join("datapacks/custom");
         let dimensions = pack.join("data/minecraft/dimension");
         std::fs::create_dir_all(&dimensions)?;
+        let biome_file = pack.join("data/minecraft/worldgen/biome/plains.json");
+        std::fs::create_dir_all(biome_file.parent().unwrap())?;
+        let mut custom_biome: Value = serde_json::from_slice(
+            &source
+                .read_data("data/minecraft/worldgen/biome/plains.json")?
+                .context("vanilla plains biome missing")?,
+        )?;
+        custom_biome["features"] = json!([[{
+            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+            "placement": []
+        }]]);
+        std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
         std::fs::write(
             pack.join("pack.mcmeta"),
             br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
@@ -2773,7 +2832,7 @@ mod tests {
         };
         std::fs::write(
             &dimension_file,
-            serde_json::to_vec(&custom_stem("minecraft:desert"))?,
+            serde_json::to_vec(&custom_stem("minecraft:plains"))?,
         )?;
         let mut reader = WorldReader::open_for_session(root, DimensionId::parse("overworld")?)?;
         let mut updated_level = level.clone();
@@ -2818,14 +2877,27 @@ mod tests {
         assert_eq!(context.selection().enabled, ["vanilla", "file/custom"]);
         std::fs::write(
             &dimension_file,
-            serde_json::to_vec(&custom_stem("minecraft:plains"))?,
+            serde_json::to_vec(&custom_stem("minecraft:desert"))?,
         )?;
+        custom_biome["features"] = json!([[{
+            "feature": {"type":"example:unsupported"}, "placement": []
+        }]]);
+        std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
         let mut actual = prepare_existing_generator(context, &game)?;
         assert!(!actual.generate_structures);
         assert_eq!(
             actual.generator.possible_biomes(),
-            &BTreeSet::from([ResourceId::parse("minecraft:desert")?])
+            &BTreeSet::from([ResourceId::parse("minecraft:plains")?])
         );
+        let custom_decoration = actual.prepare_saved_decoration(ChunkPos { x: 3, z: 3 })?;
+        let plan = custom_decoration.plan(&actual)?;
+        assert_eq!(plan.features().len(), 1);
+        let mut prepared = false;
+        actual.with_saved_prepared_decoration(&custom_decoration, |_| {
+            prepared = true;
+            Ok(())
+        })?;
+        assert!(prepared, "captured data-pack feature was not prepared");
         let previous = Arc::new(native_core::beardifier::Beardifier::new(
             vec![],
             vec![],
@@ -2849,6 +2921,29 @@ mod tests {
                     &mut evaluator
                 )
                 .is_err()
+        );
+        std::fs::write(
+            &dimension_file,
+            serde_json::to_vec(&custom_stem("minecraft:plains"))?,
+        )?;
+        let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
+        let context = reader.capture_generation_context(positions)?;
+        let mut unsupported = prepare_existing_generator(context, &game)?;
+        let decoration = unsupported.prepare_saved_decoration(ChunkPos { x: 3, z: 3 })?;
+        let mut called = false;
+        let error = unsupported
+            .with_saved_prepared_decoration(&decoration, |_| {
+                called = true;
+                Ok(())
+            })
+            .expect_err("unsupported feature unexpectedly prepared");
+        assert!(
+            format!("{error:#}").contains("example:unsupported"),
+            "{error:#}"
+        );
+        assert!(
+            !called,
+            "unsupported feature reached the placement callback"
         );
         Ok(())
     }

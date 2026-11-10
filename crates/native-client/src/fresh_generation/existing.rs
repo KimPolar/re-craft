@@ -53,6 +53,22 @@ pub(crate) struct ResumedSavedTerrain {
     terrain: native_session::worldgen::MaterializedTerrain,
 }
 
+/// A partial player-independent NBT draft. Its status and remaining metadata
+/// are unchanged, so it is not a completed or writable terrain chunk.
+pub(crate) struct ResumedSectionDraft {
+    source_nbt: Vec<u8>,
+    document: NamedTag,
+}
+
+impl ResumedSectionDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        Ok(native_persistence::nbt::write(source)? == self.source_nbt)
+    }
+}
+
 /// Intermediate chunks prepared from one generation capture. Their original
 /// protochunk documents remain available for the eventual coordinated update.
 pub(crate) struct ResumedTerrainWorld {
@@ -477,6 +493,71 @@ impl PreparedExistingGenerator {
             position: target,
             source: Arc::clone(&source.document),
             terrain,
+        })
+    }
+
+    /// Merge only regenerated blocks into their exact captured protochunk.
+    /// Status, heightmaps, ticks, structures and other fields remain untouched.
+    pub fn draft_resumed_sections(
+        &mut self,
+        chunk: &ResumedSavedTerrain,
+    ) -> Result<ResumedSectionDraft> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &chunk.identity),
+            "terrain belongs to another generation capture"
+        );
+        let captured = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&chunk.position)
+            .and_then(|source| source.terrain.as_ref())
+            .context("captured terrain target missing")?;
+        ensure!(
+            Arc::ptr_eq(&captured.document, &chunk.source),
+            "captured terrain source differs"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let biome_ids: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        let sections = native_persistence::generated_section::encode_generated_sections(
+            chunk.terrain.world(),
+            native_world::loaded::ChunkPos {
+                x: chunk.position.x,
+                z: chunk.position.z,
+            },
+            self.lighting.min_y,
+            self.lighting.height,
+            self.lighting.has_skylight,
+            |state| registry.is_canonical_state(&state.name, &state.properties),
+            |name| {
+                ResourceId::parse(name)
+                    .ok()
+                    .is_some_and(|id| biome_ids.contains(&id))
+            },
+        )?;
+        let mut document = (*chunk.source).clone();
+        let Tag::Compound(fields) = &mut document.value else {
+            bail!("saved chunk is not a compound")
+        };
+        let mut sources = fields.iter_mut().filter(|(key, _)| key.matches("sections"));
+        let (_, original) = sources.next().context("saved sections are missing")?;
+        *original =
+            native_persistence::generated_section::merge_biome_stage_blocks(original, &sections)?;
+        ensure!(sources.next().is_none(), "duplicate saved sections");
+        let source_nbt = native_persistence::nbt::write(&chunk.source)?;
+        native_persistence::nbt::write(&document)?;
+        Ok(ResumedSectionDraft {
+            source_nbt,
+            document,
         })
     }
 
@@ -1712,7 +1793,7 @@ mod tests {
                                 let Tag::Compound(section) = section else {
                                     unreachable!()
                                 };
-                                for (key, value) in section {
+                                for (key, value) in section.iter_mut() {
                                     if key.matches("block_states") {
                                         *value = Tag::Compound(vec![(
                                             "palette".into(),
@@ -1723,12 +1804,14 @@ mod tests {
                                         )]);
                                     }
                                 }
+                                section.push(("custom_section".into(), Tag::Int(91)));
                             }
                         }
                     }
                     fields.retain(|(key, _)| {
                         !key.matches("Heightmaps") && !key.matches("PostProcessing")
                     });
+                    fields.push(("custom_chunk".into(), Tag::Int(42)));
                     let bytes = native_persistence::nbt::write(&biome_chunk)?;
                     let offset = file.seek(SeekFrom::End(0))?;
                     let sectors = (bytes.len() + 5).div_ceil(4096);
@@ -1915,6 +1998,63 @@ mod tests {
                     .unwrap()
                     .document,
             );
+            let draft = actual.draft_resumed_sections(&first)?;
+            assert!(draft.matches_source(&captured_source)?);
+            assert_eq!(
+                draft.document().value.get("Status"),
+                Some(&Tag::String("minecraft:biomes".into()))
+            );
+            assert_eq!(
+                draft.document().value.get("structures"),
+                captured_source.value.get("structures")
+            );
+            assert_eq!(
+                draft.document().value.get("custom_chunk"),
+                Some(&Tag::Int(42))
+            );
+            let Tag::List {
+                values: source_sections,
+                ..
+            } = captured_source.value.get("sections").unwrap()
+            else {
+                panic!()
+            };
+            let Tag::List {
+                values: draft_sections,
+                ..
+            } = draft.document().value.get("sections").unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(source_sections.len(), draft_sections.len());
+            for (old, new) in source_sections.iter().zip(draft_sections) {
+                assert_eq!(old.get("biomes"), new.get("biomes"));
+                assert_eq!(new.get("custom_section"), Some(&Tag::Int(91)));
+            }
+            let decoded = native_persistence::palette::decode_sections(&draft.document().value)?;
+            let bottom = decoded
+                .iter()
+                .find(|section| i32::from(section.y) == lighting.min_y / 16)
+                .unwrap();
+            let expected = materialized
+                .block(target.x * 16, lighting.min_y, target.z * 16)
+                .unwrap();
+            assert!(
+                bottom
+                    .blocks
+                    .as_ref()
+                    .unwrap()
+                    .block(0, 0, 0)
+                    .unwrap()
+                    .name
+                    .matches(&expected.name)
+            );
+            let mut stale = (*captured_source).clone();
+            let Tag::Compound(fields) = &mut stale.value else {
+                unreachable!()
+            };
+            fields.push(("changed".into(), Tag::Byte(1)));
+            assert!(!draft.matches_source(&stale)?);
             let mut resumed_world = first.into_world();
             assert!(Arc::ptr_eq(
                 &captured_source,
@@ -1936,6 +2076,7 @@ mod tests {
                     &[],
                     &mut restored_evaluator,
                 )?;
+                assert!(actual.draft_resumed_sections(&alien).is_err());
                 assert!(resumed_world.insert(&alien).is_err());
                 assert_eq!(resumed_world.sources().len(), 2);
             }

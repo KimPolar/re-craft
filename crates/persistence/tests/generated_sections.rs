@@ -258,5 +258,40 @@ fn generated_section_palettes_decode_in_java() {
         .arg("-cp")
         .arg(&cp)
         .arg("GeneratedSectionOracle")
-        .arg(input));
+        .arg(&input));
+
+    let generated = root.value.get("sections").unwrap();
+    let mut saved = generated.clone();
+    let Tag::List { values, .. } = &mut saved else {
+        panic!()
+    };
+    for section in values {
+        let Tag::Compound(fields) = section else {
+            panic!()
+        };
+        let (_, blocks) = fields
+            .iter_mut()
+            .find(|(name, _)| name.matches("block_states"))
+            .unwrap();
+        *blocks = Tag::Compound(vec![(
+            "palette".into(),
+            Tag::List {
+                element_type: nbt::TagType::String,
+                values: vec![Tag::String("minecraft:air".into())],
+            },
+        )]);
+        fields.push(("custom_section".into(), Tag::Int(42)));
+    }
+    let merged =
+        native_persistence::generated_section::merge_biome_stage_blocks(&saved, generated).unwrap();
+    let merged_root = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![("sections".into(), merged)]),
+    };
+    std::fs::write(&input, nbt::write(&merged_root).unwrap()).unwrap();
+    run(Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(&cp)
+        .arg("GeneratedSectionOracle")
+        .arg(&input));
 }

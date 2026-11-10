@@ -537,8 +537,14 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         .find_map(|line| line.strip_prefix("ENTITIES "))
         .context("Java entity count missing")?
         .parse()?;
+    if seed == 42 {
+        ensure!(
+            entity_count > 0,
+            "seed 42 did not exercise Java entity loading"
+        );
+    }
     eprintln!(
-        "Java decoded {} entity headers from {} entity chunks and {} POI chunks",
+        "Java loaded and saved {} entities from {} entity chunks and {} POI chunks",
         entity_count,
         entity_positions.len(),
         poi_positions.len()
@@ -643,7 +649,7 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         }
     }
     eprintln!(
-        "Java round-tripped {} terrain, {} entity and {} POI chunks; decoded {} entity headers",
+        "Java round-tripped {} terrain, {} entity and {} POI chunks; loaded and saved {} entities",
         positions.len(),
         entity_positions.len(),
         poi_positions.len(),

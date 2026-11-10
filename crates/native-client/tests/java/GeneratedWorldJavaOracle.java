@@ -30,11 +30,15 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityProcessor;
 import net.minecraft.world.level.storage.TagValueInput;
 import net.minecraft.world.level.storage.TagValueOutput;
 
 /** Validate a disposable generated world and rewrite all listed chunks with Java. */
 public class GeneratedWorldJavaOracle {
+    private static RegistryAccess entityAccess;
     private static final class TestLevel extends ClientLevel {
         TestLevel() { super(null, null, null, null, 0, 0, null, false, 0L, 0); }
         @Override public int getNextEntityId() { return 1; }
@@ -42,6 +46,27 @@ public class GeneratedWorldJavaOracle {
     private static final class TestPlayer extends Player {
         TestPlayer(Level level, UUID uuid) { super(level, new GameProfile(uuid, "Oracle")); }
         @Override public GameType gameMode() { return GameType.SURVIVAL; }
+    }
+    private static final class TestEntityLevel extends ClientLevel {
+        TestEntityLevel() { super(null, null, null, null, 0, 0, null, false, 0L, 0); }
+        @Override public int getNextEntityId() { return 1; }
+        @Override public RegistryAccess registryAccess() { return entityAccess; }
+        @Override public net.minecraft.world.flag.FeatureFlagSet enabledFeatures() {
+            return net.minecraft.world.flag.FeatureFlags.VANILLA_SET;
+        }
+    }
+
+    private static TestEntityLevel entityLevel() throws Exception {
+        var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        field.setAccessible(true);
+        return (TestEntityLevel) ((sun.misc.Unsafe) field.get(null)).allocateInstance(TestEntityLevel.class);
+    }
+
+    private static <T> Registry<T> copyRegistry(HolderLookup.Provider lookup, ResourceKey<? extends Registry<T>> key) {
+        var registry = new MappedRegistry<T>(key, Lifecycle.stable());
+        lookup.lookupOrThrow(key).listElements().forEach(holder ->
+                registry.register(holder.key(), holder.value(), RegistrationInfo.BUILT_IN));
+        return registry.freeze();
     }
 
     private static void verifyPlayerRoundTrip(CompoundTag saved) throws Exception {
@@ -73,6 +98,16 @@ public class GeneratedWorldJavaOracle {
         var poiOps = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY)
                 .createSerializationContext(NbtOps.INSTANCE);
         int entityCount = 0;
+        var entityRegistry = VanillaRegistries.createWorldLookup();
+        entityAccess = new RegistryAccess.ImmutableRegistryAccess(java.util.List.of(
+                copyRegistry(entityRegistry, Registries.PIG_VARIANT),
+                copyRegistry(entityRegistry, Registries.COW_VARIANT),
+                copyRegistry(entityRegistry, Registries.CHICKEN_VARIANT),
+                copyRegistry(entityRegistry, Registries.PIG_SOUND_VARIANT),
+                copyRegistry(entityRegistry, Registries.COW_SOUND_VARIANT),
+                copyRegistry(entityRegistry, Registries.CHICKEN_SOUND_VARIANT),
+                copyRegistry(entityRegistry, Registries.ZOMBIE_NAUTILUS_VARIANT)));
+        var entityLevel = kind.equals("entities") ? entityLevel() : null;
         for (var position : positions) {
             var coordinates = position.split(" ");
             if (coordinates.length != 2) throw new AssertionError("invalid " + kind + " position " + position);
@@ -93,6 +128,16 @@ public class GeneratedWorldJavaOracle {
                         var id = Identifier.parse(entity.getStringOr("id", ""));
                         if (!BuiltInRegistries.ENTITY_TYPE.containsKey(id) || entity.read("Pos", Vec3.CODEC).isEmpty())
                             throw new AssertionError("unreadable entity " + id + " in " + pos);
+                        var problems = new ProblemReporter.Collector();
+                        var loaded = EntityType.loadEntityRecursive(TagValueInput.create(problems, entityRegistry, entity),
+                                entityLevel, EntitySpawnReason.LOAD, EntityProcessor.NOP);
+                        if (loaded == null) throw new AssertionError("cannot load entity " + id + " in " + pos);
+                        var output = TagValueOutput.createWithContext(problems, entityRegistry);
+                        if (!loaded.save(output) || !problems.isEmpty())
+                            throw new AssertionError("cannot save entity " + id + " in " + pos + ": " + problems.getReport());
+                        var rewritten = output.buildResult();
+                        if (!entity.equals(rewritten))
+                            throw new AssertionError("entity " + id + " changed on Java load/save in " + pos + ": " + entity + " != " + rewritten);
                         entityCount++;
                     }
                 } else {

@@ -387,17 +387,20 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         rotation: native_resources::structure_transform::Rotation,
         clip: BoundingBox,
     ) -> Result<()> {
-        ensure!(
-            !super::super::template_entities::template_entities_intersect(
-                entities,
+        for entity in entities {
+            if let Some((position, data)) = super::super::generated_cushion::draft_template_cushion(
+                entity,
                 origin,
-                native_resources::structure_transform::Mirror::None,
                 rotation,
-                [0, 0, 0],
                 clip,
-            )?,
-            "jigsaw template entity placement is not yet supported"
-        );
+                super::super::fresh_entity_uuid_from_entropy,
+            )? {
+                self.region.record_generated_entity(
+                    position,
+                    super::super::GeneratedEntityRecord::Saved(data),
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -2657,6 +2660,114 @@ mod tests {
                 assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
             }
             assert_eq!(random.next_long(), initial_random.next_long());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_records_vanilla_cushion_and_rolls_back_unsupported_entity() -> Result<()> {
+        use native_persistence::structure_template::StructureTemplate;
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let source = StructureTemplate::load(
+            &mut resources,
+            &ResourceId::parse(
+                "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1",
+            )?,
+        )?
+        .context("cushion template missing")?;
+        let cushion = source
+            .entities
+            .first()
+            .context("cushion entity missing")?
+            .clone();
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[]}));
+        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+        ));
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let piece = Piece {
+            element: PoolElement::Single {
+                legacy: false,
+                location: ResourceId::parse("example:test")?,
+                processors: holder,
+                projection: Projection::Rigid,
+                override_liquid_settings: None,
+            },
+            origin: [1, 8, 1],
+            rotation: Rotation::None,
+            bounds: clip,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        for reject in [false, true] {
+            let mut entities = vec![cushion.clone()];
+            if reject {
+                entities.push(Tag::Compound(vec![
+                    ("blockPos".into(), ints(&[1, 0, 0])),
+                    (
+                        "pos".into(),
+                        Tag::List {
+                            element_type: TagType::Double,
+                            values: vec![Tag::Double(1.5), Tag::Double(0.0), Tag::Double(0.5)],
+                        },
+                    ),
+                    (
+                        "nbt".into(),
+                        Tag::Compound(vec![("id".into(), Tag::String("minecraft:pig".into()))]),
+                    ),
+                ]));
+            }
+            let prepared = PreparedTemplatePiece::load(
+                &piece,
+                &processors,
+                &mut template_with_entities(false, entities)?,
+            )?;
+            let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            let mut unchanged = random.clone();
+            let result = region.place_rigid_jigsaw_piece(
+                &prepared,
+                &registry,
+                clip,
+                LiquidSettings::IgnoreWaterlogging,
+                &mut random,
+            );
+            if reject {
+                assert!(result.is_err());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(
+                    terrain
+                        .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                        .is_empty()
+                );
+            } else {
+                assert!(result?);
+                region.finish()?;
+                let recorded = terrain.recorded_generated_entities(ChunkPos { x: 0, z: 0 })?;
+                assert_eq!(recorded.len(), 1);
+                assert_eq!(
+                    recorded[0].get("id"),
+                    Some(&Tag::String("minecraft:cushion".into()))
+                );
+                assert_eq!(
+                    recorded[0].get("block_pos"),
+                    Some(&Tag::IntArray(vec![5, 8, 7]))
+                );
+                assert_ne!(
+                    recorded[0].get("UUID"),
+                    cushion.get("nbt").and_then(|nbt| nbt.get("UUID"))
+                );
+            }
+            assert_eq!(random.next_long(), unchanged.next_long());
         }
         Ok(())
     }

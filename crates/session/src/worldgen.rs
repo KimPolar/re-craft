@@ -34,6 +34,7 @@ mod generated_beehive;
 mod generated_brushable;
 mod generated_chest;
 mod generated_creature_random;
+mod generated_cushion;
 mod generated_donkey;
 mod generated_drowned;
 mod generated_farm_animal;
@@ -8296,6 +8297,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_records_vanilla_jigsaw_cushion() -> Result<()> {
+        run_fresh_template_batch(32, None)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_ruined_portal() -> Result<()> {
         run_fresh_template_batch(9, None)
     }
@@ -8579,6 +8586,7 @@ mod tests {
             (false, false, "minecraft:oak_planks", 30),
             (true, false, "minecraft:oak_planks", 30),
             (false, false, "minecraft:oak_planks", 31),
+            (false, false, "minecraft:stone_bricks", 32),
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
@@ -8586,7 +8594,7 @@ mod tests {
             if entity_anchor.is_some() && *unsupported {
                 false
             } else if portal_kind == 0 {
-                !(9..=29).contains(kind)
+                !(9..=29).contains(kind) && *kind != 32
             } else if portal_kind == 10 {
                 (10..=29).contains(kind)
             } else {
@@ -8615,6 +8623,67 @@ mod tests {
                     ]),
                 ));
             }
+            let template_entities = if feature_kind == 32 {
+                let game = native_resources::default_minecraft_dir()
+                    .context("Minecraft directory missing")?;
+                let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+                let source = native_persistence::structure_template::StructureTemplate::load(
+                    &mut resources,
+                    &ResourceId::parse(
+                        "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1",
+                    )?,
+                )?
+                .context("vanilla cushion template missing")?;
+                let mut entity = source
+                    .entities
+                    .first()
+                    .context("cushion missing")?
+                    .clone();
+                let Tag::Compound(fields) = &mut entity else {
+                    anyhow::bail!("cushion template entity is not a compound");
+                };
+                for (name, value) in fields {
+                    if name.matches("blockPos") {
+                        *value = list(TagType::Int, vec![Tag::Int(0), Tag::Int(0), Tag::Int(0)]);
+                    } else if name.matches("pos") {
+                        *value = list(
+                            TagType::Double,
+                            vec![Tag::Double(0.5), Tag::Double(0.9375), Tag::Double(0.5)],
+                        );
+                    }
+                }
+                vec![entity]
+            } else {
+                entity_anchor
+                    .map(|x| {
+                        Tag::Compound(vec![
+                            (
+                                "blockPos".into(),
+                                list(TagType::Int, vec![Tag::Int(x), Tag::Int(0), Tag::Int(0)]),
+                            ),
+                            (
+                                "pos".into(),
+                                list(
+                                    TagType::Double,
+                                        vec![
+                                            Tag::Double(f64::from(x) + 0.5),
+                                            Tag::Double(0.5),
+                                            Tag::Double(0.5),
+                                        ],
+                                ),
+                            ),
+                            (
+                                "nbt".into(),
+                                Tag::Compound(vec![(
+                                    "id".into(),
+                                    Tag::String("minecraft:pig".into()),
+                                )]),
+                            ),
+                        ])
+                    })
+                    .into_iter()
+                    .collect()
+            };
             let document = NamedTag {
                 name: "".into(),
                 value: Tag::Compound(vec![
@@ -8639,41 +8708,7 @@ mod tests {
                     ),
                     (
                         "entities".into(),
-                        list(
-                            TagType::Compound,
-                            entity_anchor
-                                .map(|x| {
-                                    Tag::Compound(vec![
-                                        (
-                                            "blockPos".into(),
-                                            list(
-                                                TagType::Int,
-                                                vec![Tag::Int(x), Tag::Int(0), Tag::Int(0)],
-                                            ),
-                                        ),
-                                        (
-                                            "pos".into(),
-                                            list(
-                                                TagType::Double,
-                                                vec![
-                                                    Tag::Double(f64::from(x) + 0.5),
-                                                    Tag::Double(0.5),
-                                                    Tag::Double(0.5),
-                                                ],
-                                            ),
-                                        ),
-                                        (
-                                            "nbt".into(),
-                                            Tag::Compound(vec![(
-                                                "id".into(),
-                                                Tag::String("minecraft:pig".into()),
-                                            )]),
-                                        ),
-                                    ])
-                                })
-                                .into_iter()
-                                .collect(),
-                        ),
+                        list(TagType::Compound, template_entities),
                     ),
                 ]),
             };
@@ -9021,8 +9056,19 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=31).contains(&feature_kind)
+                    feature_kind == 0 || feature_kind == 2 || (4..=32).contains(&feature_kind)
                 );
+                if feature_kind == 32 {
+                    let entities = batch.recorded_generated_entities(target)?;
+                    assert_eq!(entities.len(), 1);
+                    assert!(
+                        matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion"))
+                    );
+                    assert_eq!(
+                        entities[0].get("block_pos"),
+                        Some(&Tag::IntArray(origin.to_vec()))
+                    );
+                }
                 if (30..=31).contains(&feature_kind) {
                     let structure_data = batch.structure_data(target)?;
                     assert!(batch.structure_reference_sources(target)?.contains(&source));

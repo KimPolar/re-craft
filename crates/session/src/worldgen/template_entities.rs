@@ -20,39 +20,49 @@ pub(super) fn template_entities_intersect(
         "invalid template entity clipping box"
     );
     for entity in entities {
-        let Tag::Compound(fields) = entity else {
-            anyhow::bail!("invalid template entity");
-        };
-        let mut positions = fields.iter().filter(|(name, _)| name.matches("blockPos"));
-        let (_, position) = positions
-            .next()
-            .context("template entity blockPos missing")?;
-        ensure!(
-            positions.next().is_none(),
-            "duplicate template entity blockPos"
-        );
-        let local = match position {
-            Tag::IntArray(values) => match values.as_slice() {
-                [x, y, z] => [*x, *y, *z],
-                _ => anyhow::bail!("invalid template entity blockPos length"),
-            },
-            Tag::List {
-                element_type: TagType::Int,
-                values,
-            } => match values.as_slice() {
-                [Tag::Int(x), Tag::Int(y), Tag::Int(z)] => [*x, *y, *z],
-                _ => anyhow::bail!("invalid template entity blockPos"),
-            },
-            _ => anyhow::bail!("invalid template entity blockPos"),
-        };
-        let world = native_resources::structure_transform::block_world_position(
-            local, origin, mirror, rotation, pivot,
-        );
+        let world = template_entity_anchor(entity, origin, mirror, rotation, pivot)?;
         if (0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&world[axis])) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+pub(super) fn template_entity_anchor(
+    entity: &Tag,
+    origin: [i32; 3],
+    mirror: Mirror,
+    rotation: Rotation,
+    pivot: [i32; 3],
+) -> Result<[i32; 3]> {
+    let Tag::Compound(fields) = entity else {
+        anyhow::bail!("invalid template entity");
+    };
+    let mut positions = fields.iter().filter(|(name, _)| name.matches("blockPos"));
+    let (_, position) = positions
+        .next()
+        .context("template entity blockPos missing")?;
+    ensure!(
+        positions.next().is_none(),
+        "duplicate template entity blockPos"
+    );
+    let local = match position {
+        Tag::IntArray(values) => match values.as_slice() {
+            [x, y, z] => [*x, *y, *z],
+            _ => anyhow::bail!("invalid template entity blockPos length"),
+        },
+        Tag::List {
+            element_type: TagType::Int,
+            values,
+        } => match values.as_slice() {
+            [Tag::Int(x), Tag::Int(y), Tag::Int(z)] => [*x, *y, *z],
+            _ => anyhow::bail!("invalid template entity blockPos"),
+        },
+        _ => anyhow::bail!("invalid template entity blockPos"),
+    };
+    Ok(native_resources::structure_transform::block_world_position(
+        local, origin, mirror, rotation, pivot,
+    ))
 }
 
 #[cfg(test)]

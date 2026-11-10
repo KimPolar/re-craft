@@ -35,6 +35,7 @@ struct SavedMobPlacementAssets {
     prevent_inside: BTreeSet<String>,
     height_tags: native_resources::heightmap_tags::HeightmapTags,
     ground_tags: native_resources::worldgen_mob_rules::GroundSpawnTags,
+    sheep_tags: native_resources::worldgen_region_random::SheepBiomeTags,
 }
 
 struct SavedTerrainAssets {
@@ -211,6 +212,17 @@ pub(crate) struct ResumedCreaturePlan {
     construction: Option<native_resources::worldgen_mob_geometry::CreatureSpawnGeometry>,
     border: Option<native_session::respawn::RespawnBorder>,
     rule_light: Option<native_world::generation_light::VisibleLightSnapshot>,
+    random: native_resources::worldgen_region_random::RegionRandom,
+    group_id: Option<u64>,
+    sheep_group: native_resources::worldgen_region_random::AnimalGroupData,
+    horse_group: native_resources::worldgen_region_random::HorseGroupData,
+    donkey_group: native_resources::worldgen_region_random::DonkeyGroupData,
+    constructed: Option<native_session::worldgen::FreshCreatureConstruction>,
+    pose: Option<native_session::worldgen::GeneratedCreaturePose>,
+    instance_passed: bool,
+    finalizable: bool,
+    additions: Vec<native_session::worldgen::GeneratedEntityAddition>,
+    used_uuids: BTreeSet<[i32; 4]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -218,6 +230,12 @@ pub(crate) enum ResumedCreatureCheck {
     Pending,
     Rejected,
     NeedsConstruction(native_resources::worldgen_mob_geometry::CreatureSpawnGeometry),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ResumedCreatureInstance {
+    Rejected,
+    NeedsFinalization(native_session::worldgen::GeneratedCreaturePose),
 }
 
 pub(crate) struct ResumedPlannedSpawn {
@@ -249,6 +267,15 @@ impl ResumedPlannedSpawn {
 }
 
 impl ResumedCreaturePlan {
+    fn clear_candidate(&mut self) {
+        self.probe = None;
+        self.construction = None;
+        self.constructed = None;
+        self.pose = None;
+        self.instance_passed = false;
+        self.finalizable = false;
+    }
+
     fn matches_state(
         &self,
         world: &ResumedTerrainWorld,
@@ -277,6 +304,21 @@ impl ResumedCreaturePlan {
             "creature plan is stale"
         );
         let progress = self.planner.next(1)?;
+        if matches!(
+            progress,
+            native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_)
+        ) {
+            let id = self
+                .planner
+                .group_id()
+                .context("creature group is missing")?;
+            if self.group_id != Some(id) {
+                self.group_id = Some(id);
+                self.sheep_group = Default::default();
+                self.horse_group = Default::default();
+                self.donkey_group = Default::default();
+            }
+        }
         self.finished = matches!(
             progress,
             native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished
@@ -877,12 +919,23 @@ impl PreparedExistingGenerator {
             construction: None,
             border: None,
             rule_light: None,
+            random: self.generator.region_random(position),
+            group_id: None,
+            sheep_group: Default::default(),
+            horse_group: Default::default(),
+            donkey_group: Default::default(),
+            constructed: None,
+            pose: None,
+            instance_passed: false,
+            finalizable: false,
+            additions: Vec::new(),
+            used_uuids: BTreeSet::new(),
         })
     }
 
-    /// A finished plan with only rejected candidates has no entity additions.
+    /// Publish the completed plan's staged entities to an intermediate draft.
     /// Plans with an unresolved candidate cannot complete the scheduler.
-    pub fn finish_resumed_creatures_without_additions(
+    pub fn finish_resumed_creatures(
         &mut self,
         world: &ResumedTerrainWorld,
         schedule: &mut GenerationSchedule,
@@ -904,7 +957,29 @@ impl PreparedExistingGenerator {
             x: plan.position.x,
             z: plan.position.z,
         };
-        let lit = self.draft_resumed_lit_chunk(world, light, position)?;
+        let mut lit = self.draft_resumed_lit_chunk(world, light, position)?;
+        let records = plan
+            .additions
+            .iter()
+            .map(|addition| {
+                ensure!(
+                    addition.block_position[0].div_euclid(16) == position.x
+                        && addition.block_position[2].div_euclid(16) == position.z,
+                    "generated creature is outside its source chunk"
+                );
+                match &addition.record {
+                    native_session::worldgen::GeneratedEntityRecord::Saved(tag) => Ok(tag.clone()),
+                    _ => bail!("unsupported generated creature record"),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let original = unique_root_field(&lit.feature.document, "entities")?;
+        if let Some(entities) =
+            native_persistence::generated_chunk::append_proto_entity_records(original, &records)?
+        {
+            replace_unique_root_field(&mut lit.feature.document, "entities", entities)?;
+        }
+        native_persistence::nbt::write(&lit.feature.document)?;
         schedule.complete(plan.position, GenerationStage::Spawn)?;
         Ok(ResumedPlannedSpawn {
             lit,
@@ -974,10 +1049,14 @@ impl PreparedExistingGenerator {
                 &mut self.resources,
                 &blocks,
             )?;
+            let sheep_tags = native_resources::worldgen_region_random::SheepBiomeTags::load(
+                &mut self.resources,
+            )?;
             self.mob_placement_assets = Some(SavedMobPlacementAssets {
                 prevent_inside,
                 height_tags,
                 ground_tags,
+                sheep_tags,
             });
         }
         let assets = self
@@ -1060,6 +1139,229 @@ impl PreparedExistingGenerator {
                 }
             }
         }
+    }
+
+    /// Mark the externally constructed entity at Java's constructor point.
+    /// The caller supplies a unique UUID from the entity's independent RNG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn construct_resumed_creature(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &GenerationSchedule,
+        light: &ResumedStagedLight,
+        plan: &mut ResumedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+        construction: native_session::worldgen::FreshCreatureConstruction,
+    ) -> Result<native_session::worldgen::GeneratedCreaturePose> {
+        use native_resources::worldgen_mob_spawner::CreatureSpawnProgress;
+        ensure!(
+            plan.matches_state(world, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        ensure!(plan.border == Some(border), "creature spawn border differs");
+        ensure!(
+            plan.construction.is_some() && plan.constructed.is_none(),
+            "creature is not ready for construction"
+        );
+        let CreatureSpawnProgress::Attempt(attempt) = plan.planner.next(0)? else {
+            bail!("creature candidate is missing")
+        };
+        ensure!(
+            attempt.entity.namespace == "minecraft"
+                && matches!(attempt.entity.path.as_str(), "sheep" | "horse" | "donkey"),
+            "creature finalization is not supported"
+        );
+        ensure!(
+            construction.chicken_egg_time.is_none(),
+            "egg timer belongs only to a chicken"
+        );
+        ensure!(
+            !plan.used_uuids.contains(&construction.uuid),
+            "duplicate generated creature UUID"
+        );
+        let pose = plan
+            .probe
+            .as_mut()
+            .context("creature probe missing")?
+            .mark_constructed(&mut plan.planner)?;
+        plan.used_uuids.insert(construction.uuid);
+        plan.constructed = Some(construction);
+        plan.pose = Some(pose);
+        Ok(pose)
+    }
+
+    /// Check the constructed entity's own spawn rule and obstruction in order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_resumed_creature_instance(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &GenerationSchedule,
+        light: &ResumedStagedLight,
+        plan: &mut ResumedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+    ) -> Result<ResumedCreatureInstance> {
+        use native_session::worldgen::{
+            GeneratedCreatureInstanceRuleProgress, GeneratedCreatureObstructionProgress,
+        };
+        ensure!(
+            plan.matches_state(world, light, spawn_mobs, clocks),
+            "creature plan is stale"
+        );
+        self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        ensure!(plan.border == Some(border), "creature spawn border differs");
+        let pose = plan.pose.context("constructed creature is missing")?;
+        if plan.finalizable {
+            return Ok(ResumedCreatureInstance::NeedsFinalization(pose));
+        }
+        let assets = self
+            .mob_placement_assets
+            .as_ref()
+            .context("mob placement assets are missing")?;
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let visible = plan
+            .rule_light
+            .as_ref()
+            .context("candidate light missing")?;
+        let ambient = self
+            .lighting
+            .ambient_light
+            .context("dimension ambient light is missing")?;
+        let mut view = native_session::worldgen::GeneratedMobPlacementView::from_captured_terrain(
+            &world.terrain,
+            visible,
+            registry,
+            ambient,
+            self.lighting.min_y,
+            self.lighting.height,
+            native_resources::mob_spawn_placement::MobSpawnHeightmap::MotionBlockingNoLeaves,
+            border,
+            &assets.prevent_inside,
+            &assets.height_tags,
+        )?;
+        let probe = plan.probe.as_mut().context("creature probe missing")?;
+        if !plan.instance_passed {
+            match probe.check_instance_rules(&mut plan.planner, &mut view)? {
+                GeneratedCreatureInstanceRuleProgress::Rejected => {
+                    plan.clear_candidate();
+                    return Ok(ResumedCreatureInstance::Rejected);
+                }
+                GeneratedCreatureInstanceRuleProgress::NeedsObstruction(_) => {
+                    plan.instance_passed = true
+                }
+            }
+        }
+        let bounds = native_world::movement::BoundingBox {
+            min: glam::DVec3::from_array(pose.geometry.min),
+            max: glam::DVec3::from_array(pose.geometry.max),
+        };
+        match probe.check_obstruction(&mut plan.planner, &mut view, bounds)? {
+            GeneratedCreatureObstructionProgress::Rejected => {
+                plan.clear_candidate();
+                Ok(ResumedCreatureInstance::Rejected)
+            }
+            GeneratedCreatureObstructionProgress::NeedsFinalization(_) => {
+                plan.finalizable = true;
+                Ok(ResumedCreatureInstance::NeedsFinalization(pose))
+            }
+        }
+    }
+
+    /// Finalize a supported animal into the plan, leaving disk and live state untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_resumed_creature(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &GenerationSchedule,
+        light: &ResumedStagedLight,
+        context: &SavedDecorationContext,
+        plan: &mut ResumedCreaturePlan,
+        spawn_mobs: bool,
+        clocks: &BTreeMap<ResourceId, i64>,
+        border: native_session::respawn::RespawnBorder,
+    ) -> Result<()> {
+        ensure!(
+            plan.matches_state(world, light, spawn_mobs, clocks)
+                && Arc::ptr_eq(&self.identity, &context.identity),
+            "creature plan is stale"
+        );
+        self.validate_resumed_spawn(world, schedule, light, plan.position)?;
+        ensure!(
+            plan.border == Some(border) && plan.finalizable,
+            "creature is not ready for finalization"
+        );
+        ensure!(
+            context.position.x == plan.position.x && context.position.z == plan.position.z,
+            "creature biome context differs"
+        );
+        let construction = plan.constructed.context("constructed creature missing")?;
+        let pose = plan.pose.context("creature pose missing")?;
+        let coords = pose.geometry.position;
+        ensure!(
+            coords.iter().all(|v| v.is_finite()
+                && v.floor() >= f64::from(i32::MIN)
+                && v.floor() <= f64::from(i32::MAX)),
+            "invalid creature coordinates"
+        );
+        let position = [
+            coords[0].floor() as i32,
+            coords[1].floor() as i32,
+            coords[2].floor() as i32,
+        ];
+        ensure!(
+            position[0].div_euclid(16) == plan.position.x
+                && position[2].div_euclid(16) == plan.position.z,
+            "creature moved outside its source chunk"
+        );
+        let attempt = plan
+            .planner
+            .created_attempt()
+            .context("constructed creature attempt missing")?;
+        let probe = plan.probe.as_mut().context("creature probe missing")?;
+        let addition = match attempt.entity.path.as_str() {
+            "sheep" => {
+                let biome = context
+                    .biomes
+                    .biome_at_block(position[0], position[1], position[2])?;
+                let tags = &self
+                    .mob_placement_assets
+                    .as_ref()
+                    .context("mob placement assets missing")?
+                    .sheep_tags;
+                probe.prepare_sheep_with_biome(
+                    &mut plan.planner,
+                    biome,
+                    tags,
+                    &mut plan.random,
+                    &mut plan.sheep_group,
+                    construction.uuid,
+                )?
+            }
+            "horse" => probe.prepare_fresh_horse(
+                &mut plan.planner,
+                &mut plan.random,
+                &mut plan.horse_group,
+                construction.uuid,
+            )?,
+            "donkey" => probe.prepare_fresh_donkey(
+                &mut plan.planner,
+                &mut plan.random,
+                &mut plan.donkey_group,
+                construction.uuid,
+            )?,
+            _ => bail!("creature finalization is not supported"),
+        };
+        plan.additions.push(addition);
+        plan.clear_candidate();
+        Ok(())
     }
 
     /// Retain the recorded proto entities and light without claiming FULL or
@@ -4478,6 +4780,21 @@ mod tests {
         std::fs::create_dir_all(&dimensions)?;
         let biome_file = pack.join("data/minecraft/worldgen/biome/plains.json");
         std::fs::create_dir_all(biome_file.parent().unwrap())?;
+        // Keep the synthetic fixed-plains fixture above its sea level so the
+        // creature checks exercise real spawnable ground rather than ocean.
+        let noise_file = pack.join("data/minecraft/worldgen/noise_settings/overworld.json");
+        std::fs::create_dir_all(noise_file.parent().unwrap())?;
+        let mut noise: Value = serde_json::from_slice(
+            &source
+                .read_data("data/minecraft/worldgen/noise_settings/overworld.json")?
+                .context("vanilla noise settings missing")?,
+        )?;
+        noise["sea_level"] = json!(-64);
+        noise
+            .as_object_mut()
+            .context("noise settings are not an object")?
+            .remove("aquifers");
+        std::fs::write(&noise_file, serde_json::to_vec(&noise)?)?;
         let mut custom_biome: Value = serde_json::from_slice(
             &source
                 .read_data("data/minecraft/worldgen/biome/plains.json")?
@@ -4958,7 +5275,7 @@ mod tests {
             }
         }
         assert!(finished, "rejected candidates did not finish");
-        let rejected_draft = actual.finish_resumed_creatures_without_additions(
+        let rejected_draft = actual.finish_resumed_creatures(
             &terrain,
             &mut rejected_schedule,
             &staged,
@@ -4973,6 +5290,179 @@ mod tests {
             rejected_schedule.completed(center),
             Some(GenerationStage::Spawn)
         );
+        let mut animal_schedule = GenerationSchedule::new();
+        animal_schedule.request(center, GenerationStage::Spawn)?;
+        let imported = animal_schedule
+            .requirements()
+            .map(|(pos, _)| {
+                (
+                    pos,
+                    planned_schedule
+                        .completed(pos)
+                        .unwrap_or(GenerationStage::Empty),
+                )
+            })
+            .collect::<Vec<_>>();
+        animal_schedule.restore_imported(imported)?;
+        let mut animal = actual.plan_resumed_creatures(
+            &terrain,
+            &animal_schedule,
+            &staged,
+            &custom_decoration,
+            true,
+            &clocks,
+        )?;
+        let attrs = json!({"gameplay/natural_mob_spawns":{"spawns_by_category":{"creature":[{"type":"minecraft:sheep","weight":1,"count":1}]},"spawn_costs":{}}});
+        let sheep = native_resources::mob_spawns::resolve_creature_spawns(
+            &json!({}),
+            &attrs,
+            &json!({}),
+            &[],
+            |_| Some(false),
+        )?;
+        animal.planner = native_resources::worldgen_mob_spawner::ChunkCreatureSpawner::new(
+            -42,
+            center.x,
+            center.z,
+            true,
+            0.8,
+            sheep.spawns,
+        )?;
+        let border = native_session::respawn::RespawnBorder {
+            min_x: -1000.0,
+            max_x: 1000.0,
+            min_z: -1000.0,
+            max_z: 1000.0,
+        };
+        let mut generated = 0i32;
+        let mut finished = false;
+        for _ in 0..512 {
+            match animal.advance(&terrain, &staged, true, &clocks)? {
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished => {
+                    finished = true;
+                    break;
+                }
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Pending => {}
+                native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Attempt(_) => {
+                    for _ in 0..16 {
+                        match actual.check_resumed_creature_candidate(
+                            &terrain,
+                            &animal_schedule,
+                            &staged,
+                            &mut animal,
+                            true,
+                            &clocks,
+                            border,
+                            64,
+                        )? {
+                            ResumedCreatureCheck::Pending => {}
+                            ResumedCreatureCheck::Rejected => break,
+                            ResumedCreatureCheck::NeedsConstruction(_) => {
+                                generated += 1;
+                                let construction =
+                                    native_session::worldgen::FreshCreatureConstruction {
+                                        uuid: [1, 2, 3, generated],
+                                        chicken_egg_time: None,
+                                    };
+                                actual.construct_resumed_creature(
+                                    &terrain,
+                                    &animal_schedule,
+                                    &staged,
+                                    &mut animal,
+                                    true,
+                                    &clocks,
+                                    border,
+                                    construction,
+                                )?;
+                                match actual.check_resumed_creature_instance(
+                                    &terrain,
+                                    &animal_schedule,
+                                    &staged,
+                                    &mut animal,
+                                    true,
+                                    &clocks,
+                                    border,
+                                )? {
+                                    ResumedCreatureInstance::Rejected => {}
+                                    ResumedCreatureInstance::NeedsFinalization(_) => actual
+                                        .finalize_resumed_creature(
+                                            &terrain,
+                                            &animal_schedule,
+                                            &staged,
+                                            &custom_decoration,
+                                            &mut animal,
+                                            true,
+                                            &clocks,
+                                            border,
+                                        )?,
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(finished, "animal spawning did not finish");
+        if animal.additions.is_empty() {
+            let snapshot = terrain.terrain().snapshot();
+            for (x, z) in [(48, 48), (56, 56), (63, 63)] {
+                let top = (actual.lighting.min_y..actual.lighting.min_y + actual.lighting.height)
+                    .rev()
+                    .find_map(|y| {
+                        let state = snapshot.block(x, y, z)?;
+                        (!matches!(
+                            state.name.as_str(),
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        ))
+                        .then(|| (y, state.name.clone()))
+                    });
+                eprintln!("mob test top {x},{z}: {top:?}");
+            }
+            eprintln!("constructed candidates: {generated}");
+        }
+        assert!(
+            !animal.additions.is_empty(),
+            "no animal passed the generated terrain checks"
+        );
+        let count = animal.additions.len();
+        let animal_draft = actual.finish_resumed_creatures(
+            &terrain,
+            &mut animal_schedule,
+            &staged,
+            animal,
+            true,
+            &clocks,
+            Some(border),
+        )?;
+        let Some(Tag::List {
+            values: entities, ..
+        }) = animal_draft.document().value.get("entities")
+        else {
+            bail!("generated animal records missing")
+        };
+        assert_eq!(entities.len(), count);
+        assert!(entities.iter().all(|entity| matches!(entity.get("id"), Some(Tag::String(id)) if id.matches("minecraft:sheep"))));
+        let animal_file = root.join("resumed-animals.nbt");
+        std::fs::write(
+            &animal_file,
+            native_persistence::nbt::write(animal_draft.document())?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedLightOracle")
+            .arg(&animal_file)
+            .arg(actual.lighting.min_y.to_string())
+            .arg(actual.lighting.height.to_string())
+            .arg("entities")
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java animal validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
         let forced = actual.plan_resumed_creatures(
             &terrain,
             &planned_schedule,
@@ -4983,7 +5473,7 @@ mod tests {
         )?;
         assert!(
             actual
-                .finish_resumed_creatures_without_additions(
+                .finish_resumed_creatures(
                     &terrain,
                     &mut planned_schedule,
                     &staged,
@@ -5016,7 +5506,7 @@ mod tests {
             plan.advance(&terrain, &staged, true, &clocks)?,
             native_resources::worldgen_mob_spawner::CreatureSpawnProgress::Finished
         );
-        let planned = actual.finish_resumed_creatures_without_additions(
+        let planned = actual.finish_resumed_creatures(
             &terrain,
             &mut planned_schedule,
             &staged,

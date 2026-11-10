@@ -1568,6 +1568,25 @@ impl FreshTerrainBatch {
         ))
     }
 
+    pub(super) fn creature_biome_at(&self, position: [i32; 3]) -> Result<ResourceId> {
+        ensure!(
+            self.is_complete(),
+            "finish generation requests before initializing a creature"
+        );
+        let [x, y, z] = position;
+        let chunk = ChunkPos {
+            x: x.div_euclid(16),
+            z: z.div_euclid(16),
+        };
+        ensure!(
+            self.schedule
+                .completed(chunk)
+                .is_some_and(|stage| stage >= GenerationStage::Light),
+            "creature initialization requires a light-complete chunk"
+        );
+        Ok(self.biomes.biome_at_block(x, y, z)?.clone())
+    }
+
     /// Finalize a farm animal using its actual full-resolution biome. The
     /// caller must still create, serialize and publish the entity itself.
     pub fn initialize_farm_animal(

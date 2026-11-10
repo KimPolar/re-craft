@@ -401,6 +401,24 @@ impl GeneratedCreatureProbe {
         group: &mut native_resources::worldgen_region_random::AnimalGroupData,
         uuid: [i32; 4],
     ) -> Result<super::GeneratedEntityAddition> {
+        let geometry =
+            self.collision_geometry(self.top.context("creature position is missing")?)?;
+        let position = geometry_block_position(geometry)?;
+        let biome = batch.creature_biome_at(position.to_array())?;
+        self.prepare_sheep_with_biome(planner, &biome, tags, random, group, uuid)
+    }
+
+    /// Prepare the same sheep record against an independently captured biome.
+    /// The caller must use the actual entity position and matching pack tags.
+    pub fn prepare_sheep_with_biome(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        biome: &native_resources::packs::ResourceId,
+        tags: &native_resources::worldgen_region_random::SheepBiomeTags,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+    ) -> Result<super::GeneratedEntityAddition> {
         ensure!(
             self.attempt.entity.namespace == "minecraft" && self.attempt.entity.path == "sheep",
             "pending creature is not a sheep"
@@ -421,8 +439,14 @@ impl GeneratedCreatureProbe {
         let position = geometry_block_position(geometry)?.to_array();
         let mut next_random = random.clone();
         let mut next_group = *group;
-        let initialized =
-            batch.initialize_sheep(position, tags, &mut next_random, &mut next_group, false)?;
+        let (warm, cold) = tags.membership(biome)?;
+        let initialized = native_resources::worldgen_region_random::finalize_sheep(
+            &mut next_random,
+            &mut next_group,
+            false,
+            warm,
+            cold,
+        );
         let tag = super::draft_fresh_sheep(uuid, geometry.position, yaw, initialized)?;
         let mut next_planner = planner.clone();
         next_planner.finish_entity(true)?;
@@ -438,7 +462,7 @@ impl GeneratedCreatureProbe {
 
     /// Prepare a horse without publishing the spawn stage. Random and group
     /// state are committed only when serialization and the planner both pass.
-    pub(super) fn prepare_fresh_horse(
+    pub fn prepare_fresh_horse(
         &mut self,
         planner: &mut ChunkCreatureSpawner,
         random: &mut native_resources::worldgen_region_random::RegionRandom,
@@ -484,7 +508,7 @@ impl GeneratedCreatureProbe {
     }
 
     /// Prepare a donkey while retaining atomic planner and RNG updates.
-    pub(super) fn prepare_fresh_donkey(
+    pub fn prepare_fresh_donkey(
         &mut self,
         planner: &mut ChunkCreatureSpawner,
         random: &mut native_resources::worldgen_region_random::RegionRandom,

@@ -1208,7 +1208,9 @@ impl PlannedGenerationDependency {
     ) -> Result<Self> {
         if let Some(document) = source {
             match kind {
-                RegionKind::Blocks => validate_chunk(&document.value, position.x, position.z)?,
+                RegionKind::Blocks => {
+                    validate_generation_chunk(&document.value, position.x, position.z)?
+                }
                 RegionKind::Entities => {
                     validate_entity_document(document, position)?;
                 }
@@ -3038,6 +3040,9 @@ impl WorldWriteGuard {
                 if let Some(original) = &original_nbt {
                     let source = nbt::read(original)?;
                     match kind {
+                        RegionKind::Blocks if planned.check_only => {
+                            validate_generation_chunk(&source.value, position.x, position.z)?
+                        }
                         RegionKind::Blocks => {
                             validate_chunk(&source.value, position.x, position.z)?
                         }
@@ -3840,6 +3845,17 @@ fn clear_staged_chunk(file: &mut File, x: i32, z: i32, timestamp: u32) -> Result
 }
 
 pub(crate) fn validate_chunk(chunk: &Tag, x: i32, z: i32) -> Result<()> {
+    validate_generation_chunk(chunk, x, z)?;
+    ensure!(
+        matches!(chunk.get("Status"), Some(Tag::String(value)) if value.matches("minecraft:full")),
+        "only full chunks can be rewritten"
+    );
+    Ok(())
+}
+
+/// Validate a saved generation input without assuming it is a full chunk.
+/// This does not establish that its stage-specific data can be imported.
+pub(crate) fn validate_generation_chunk(chunk: &Tag, x: i32, z: i32) -> Result<()> {
     let Tag::Compound(fields) = chunk else {
         anyhow::bail!("chunk NBT root is not a compound");
     };
@@ -3861,9 +3877,21 @@ pub(crate) fn validate_chunk(chunk: &Tag, x: i32, z: i32) -> Result<()> {
         matches!(chunk.get("zPos"), Some(Tag::Int(value)) if *value == z),
         "chunk Z coordinate does not match its region entry"
     );
+    const STATUSES: [&str; 10] = [
+        "minecraft:empty",
+        "minecraft:structure_starts",
+        "minecraft:structure_references",
+        "minecraft:biomes",
+        "minecraft:terrain",
+        "minecraft:features",
+        "minecraft:initialize_light",
+        "minecraft:light",
+        "minecraft:spawn",
+        "minecraft:full",
+    ];
     ensure!(
-        matches!(chunk.get("Status"), Some(Tag::String(value)) if value.matches("minecraft:full")),
-        "only full chunks can be rewritten"
+        matches!(chunk.get("Status"), Some(Tag::String(value)) if STATUSES.iter().any(|status| value.matches(status))),
+        "unknown or missing chunk generation status"
     );
     palette::decode_sections(chunk).context("unsupported or invalid chunk section")?;
     palette::validate_26_3_block_states(chunk).context("unsupported 26.3 block-state format")?;
@@ -8807,6 +8835,95 @@ mod tests {
             *reader.read_chunk(32, 0).unwrap().unwrap().document,
             editable_chunk(32)
         );
+    }
+
+    #[test]
+    fn partial_generation_neighbors_are_preserved_and_guarded() {
+        let world = test_world();
+        let (region, mut bytes, _) = fixture(world.path());
+        let dimension = DimensionId::parse("overworld").unwrap();
+        let neighbor = ChunkPos { x: 1, z: 0 };
+        let mut source = chunk(1, "partial");
+        for name in [
+            "empty",
+            "structure_starts",
+            "structure_references",
+            "biomes",
+            "terrain",
+            "features",
+            "initialize_light",
+            "light",
+            "spawn",
+        ] {
+            let Tag::Compound(fields) = &mut source.value else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("Status"))
+                .unwrap()
+                .1 = Tag::String(format!("minecraft:{name}").as_str().into());
+            assert!(
+                validate_generation_chunk(&source.value, 1, 0).is_ok(),
+                "{name}"
+            );
+            assert!(validate_chunk(&source.value, 1, 0).is_err(), "{name}");
+        }
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Status"))
+            .unwrap()
+            .1 = Tag::String("example:unknown".into());
+        assert!(validate_generation_chunk(&source.value, 1, 0).is_err());
+        let Tag::Compound(fields) = &mut source.value else {
+            unreachable!()
+        };
+        fields
+            .iter_mut()
+            .find(|(key, _)| key.matches("Status"))
+            .unwrap()
+            .1 = Tag::String("minecraft:features".into());
+        store_record(&mut bytes, 1, 3, &source, 77);
+        fs::write(&region, &bytes).unwrap();
+        let mut reader =
+            crate::world::WorldReader::open_for_session(world.path(), dimension.clone()).unwrap();
+        let captured = reader.capture_generation_sources([neighbor]).unwrap();
+        assert_eq!(
+            *captured.chunks()[&neighbor]
+                .terrain
+                .as_ref()
+                .unwrap()
+                .document,
+            source
+        );
+        let make_plan = || {
+            let mut plan = WorldSavePlan::new();
+            plan.add_generation_sources(&captured).unwrap();
+            plan.add_generated_chunk(
+                dimension.clone(),
+                ChunkPos { x: 3, z: 0 },
+                &editable_chunk(3),
+                None,
+                None,
+                8,
+            )
+            .unwrap();
+            plan
+        };
+        let mut changed = bytes.clone();
+        store_record(&mut changed, 1, 3, &chunk(1, "changed"), 77);
+        fs::write(&region, &changed).unwrap();
+        let mut guard = captured.session_guard().acquire_write().unwrap();
+        assert!(guard.write_plan(make_plan(), |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&region).unwrap(), changed);
+        fs::write(&region, &bytes).unwrap();
+        guard.write_plan(make_plan(), |_, _| Ok(())).unwrap();
+        drop(guard);
+        assert_eq!(*reader.read_chunk(1, 0).unwrap().unwrap().document, source);
+        assert!(reader.read_chunk(3, 0).unwrap().is_some());
     }
 
     #[test]

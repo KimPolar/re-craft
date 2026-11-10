@@ -1310,10 +1310,14 @@ impl WorldReader {
             );
             let terrain = cache.read_terrain(&terrain_dir, position.x, position.z)?;
             if let Some(chunk) = &terrain {
-                crate::save::validate_chunk(&chunk.document.value, position.x, position.z)
-                    .with_context(|| {
-                        format!("invalid generation terrain {}, {}", position.x, position.z)
-                    })?;
+                crate::save::validate_generation_chunk(
+                    &chunk.document.value,
+                    position.x,
+                    position.z,
+                )
+                .with_context(|| {
+                    format!("invalid generation terrain {}, {}", position.x, position.z)
+                })?;
             }
             let entities = cache.read_entities(&entity_dir, position.x, position.z)?;
             let poi = cache.read_poi(&poi_dir, position.x, position.z)?;

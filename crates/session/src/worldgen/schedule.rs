@@ -1165,6 +1165,10 @@ impl GenerationStage {
             Full => "minecraft:full",
         }
     }
+    /// Parse an exact 26.3 saved status; unknown statuses must not be guessed.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|stage| stage.id() == id)
+    }
     pub fn next(self) -> Option<Self> {
         Self::ALL.get(self as usize + 1).copied()
     }
@@ -1480,6 +1484,72 @@ impl GenerationSchedule {
         } else {
             self.ready.remove(&pos);
         }
+    }
+
+    /// Record stages already restored from saved chunks, as one transaction.
+    /// The caller must first restore and validate every piece of data required
+    /// by each stage; a saved status alone is not evidence of usable inputs.
+    /// This only updates the plan and does not import terrain or sidecars.
+    pub fn restore_imported(
+        &mut self,
+        imported: impl IntoIterator<Item = (ChunkPos, GenerationStage)>,
+    ) -> Result<()> {
+        let mut changes = BTreeMap::new();
+        for (pos, stage) in imported {
+            let current = self
+                .completed(pos)
+                .context("imported chunk is not requested")?;
+            ensure!(stage >= current, "imported chunk would regress its stage");
+            ensure!(
+                changes.insert(pos, (current, stage)).is_none(),
+                "duplicate imported chunk"
+            );
+        }
+        changes.retain(|_, (old, new)| old != new);
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        for (&pos, &(_, stage)) in &changes {
+            self.completed.insert(pos, stage);
+        }
+        let radius = GenerationStage::ALL
+            .iter()
+            .map(|stage| stage.direct().len().saturating_sub(1))
+            .max()
+            .unwrap_or(0) as i32;
+        let mut affected = BTreeSet::new();
+        for (&pos, &(old, new)) in &changes {
+            affected.insert(pos);
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let (Some(x), Some(z)) = (pos.x.checked_add(dx), pos.z.checked_add(dz)) else {
+                        continue;
+                    };
+                    let neighbor = ChunkPos { x, z };
+                    let Some(next) = self.completed(neighbor).and_then(GenerationStage::next)
+                    else {
+                        continue;
+                    };
+                    let distance = dx.abs().max(dz.abs()) as usize;
+                    if next
+                        .direct()
+                        .get(distance)
+                        .is_some_and(|&needed| old < needed && needed <= new)
+                    {
+                        affected.insert(neighbor);
+                    }
+                }
+            }
+        }
+        for pos in affected {
+            self.refresh_ready(pos);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
     }
     /// Call only after the corresponding operation succeeded. A failed or
     /// cancelled operation must not be recorded as complete.
@@ -2209,6 +2279,66 @@ mod tests {
             let next = plan.completed(pos)?.next()?;
             (next <= required && plan.ready(pos, next)).then_some((pos, next))
         })
+    }
+
+    #[test]
+    fn imported_stages_refresh_ready_index_and_reject_partial_updates() {
+        let mut plan = GenerationSchedule::new();
+        plan.request(ChunkPos { x: 0, z: 0 }, Full).unwrap();
+        let positions: Vec<_> = plan.required.keys().copied().collect();
+        for batch in positions.chunks(11) {
+            let imported = batch
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, pos)| (pos, if i % 3 == 0 { Full } else { StructureStarts }));
+            plan.restore_imported(imported).unwrap();
+            let expected: BTreeSet<_> = plan
+                .required
+                .keys()
+                .copied()
+                .filter(|&pos| {
+                    plan.completed(pos)
+                        .and_then(GenerationStage::next)
+                        .is_some_and(|stage| plan.ready(pos, stage))
+                })
+                .collect();
+            assert_eq!(plan.ready, expected);
+            assert_eq!(plan.next_ready(), scan_next(&plan));
+        }
+        let before_completed = plan.completed.clone();
+        let before_ready = plan.ready.clone();
+        let before_revision = plan.revision;
+        let pos = positions[0];
+        assert!(plan.restore_imported([(pos, Full), (pos, Full)]).is_err());
+        assert!(
+            plan.restore_imported([(pos, Full), (ChunkPos { x: 1000, z: 1000 }, Full)])
+                .is_err()
+        );
+        assert!(plan.restore_imported([(pos, Empty)]).is_err());
+        assert_eq!(plan.completed, before_completed);
+        assert_eq!(plan.ready, before_ready);
+        assert_eq!(plan.revision, before_revision);
+        while let Some((pos, stage)) = scan_next(&plan) {
+            assert_eq!(plan.next_ready(), Some((pos, stage)));
+            plan.complete(pos, stage).unwrap();
+        }
+        assert!(plan.is_complete());
+        for stage in GenerationStage::ALL {
+            assert_eq!(GenerationStage::from_id(stage.id()), Some(stage));
+        }
+        assert_eq!(GenerationStage::from_id("other:full"), None);
+        assert_eq!(GenerationStage::from_id("minecraft:unknown"), None);
+
+        let edge = ChunkPos {
+            x: i32::MAX,
+            z: i32::MIN,
+        };
+        let mut edge_plan = GenerationSchedule::new();
+        edge_plan.request(edge, StructureStarts).unwrap();
+        edge_plan.restore_imported([(edge, Full)]).unwrap();
+        assert!(edge_plan.is_complete());
+        assert_eq!(edge_plan.next_ready(), None);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub(crate) struct PreparedExistingGenerator {
     context: GenerationContextSnapshot,
     identity: Arc<()>,
     terrain_assets: Option<SavedTerrainAssets>,
+    heightmap_tags: Option<native_resources::heightmap_tags::HeightmapTags>,
 }
 
 struct SavedTerrainAssets {
@@ -56,8 +57,26 @@ pub(crate) struct ResumedSavedTerrain {
 /// A partial player-independent NBT draft. Its status and remaining metadata
 /// are unchanged, so it is not a completed or writable terrain chunk.
 pub(crate) struct ResumedSectionDraft {
+    identity: Arc<()>,
+    position: native_persistence::world::ChunkPos,
     source_nbt: Vec<u8>,
     document: NamedTag,
+}
+
+/// Sections, world-generation heightmaps and ordered fluid marks staged from
+/// one capture. Remaining generation data and the status are not finalized.
+pub(crate) struct ResumedMetadataDraft {
+    source_nbt: Vec<u8>,
+    document: NamedTag,
+}
+
+impl ResumedMetadataDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        Ok(native_persistence::nbt::write(source)? == self.source_nbt)
+    }
 }
 
 impl ResumedSectionDraft {
@@ -556,7 +575,97 @@ impl PreparedExistingGenerator {
         let source_nbt = native_persistence::nbt::write(&chunk.source)?;
         native_persistence::nbt::write(&document)?;
         Ok(ResumedSectionDraft {
+            identity: Arc::clone(&self.identity),
+            position: chunk.position,
             source_nbt,
+            document,
+        })
+    }
+
+    /// Add generated heightmaps and ordered marks to a section draft. No
+    /// status change or world write is authorized by this partial snapshot.
+    pub fn draft_resumed_metadata(
+        &mut self,
+        world: &mut ResumedTerrainWorld,
+        draft: &ResumedSectionDraft,
+    ) -> Result<ResumedMetadataDraft> {
+        use native_persistence::heightmap::{
+            GeneratedHeightmaps, HeightBounds, encode_generated_heightmaps,
+        };
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && Arc::ptr_eq(&self.identity, &draft.identity),
+            "terrain belongs to another generation capture"
+        );
+        let source = world
+            .sources
+            .get(&draft.position)
+            .context("terrain source is missing")?;
+        ensure!(
+            draft.matches_source(source)?,
+            "terrain draft source differs"
+        );
+        let original_maps = preserved_heightmap_fields(source)?;
+        validate_empty_saved_postprocessing(source, self.lighting.min_y, self.lighting.height)?;
+        let position = native_world::loaded::ChunkPos {
+            x: draft.position.x,
+            z: draft.position.z,
+        };
+        let marks = world
+            .terrain
+            .carver_postprocessing(position)
+            .context("ordered terrain postprocessing is missing")?;
+        let marks = native_persistence::postprocessing::encode(marks);
+        native_persistence::postprocessing::decode(
+            &marks,
+            self.lighting.min_y,
+            self.lighting.height,
+        )?;
+        if self.heightmap_tags.is_none() {
+            let blocks = self.resources.vanilla_block_ids()?;
+            self.heightmap_tags = Some(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut self.resources,
+                &blocks,
+            )?);
+        }
+        if world.terrain.worldgen_heightmaps(position).is_none() {
+            world.terrain.initialize_worldgen_heightmaps(
+                position,
+                self.heightmap_tags
+                    .as_ref()
+                    .expect("heightmap tags initialized"),
+            )?;
+        }
+        let (surface, ocean) = world
+            .terrain
+            .worldgen_heightmaps(position)
+            .context("world-generation heightmaps are missing")?;
+        let maps = encode_generated_heightmaps(
+            HeightBounds {
+                min_y: self.lighting.min_y,
+                max_y: self
+                    .lighting
+                    .min_y
+                    .checked_add(self.lighting.height)
+                    .context("height overflow")?,
+            },
+            &GeneratedHeightmaps {
+                world_surface_wg: Some(surface),
+                ocean_floor_wg: Some(ocean),
+                ..Default::default()
+            },
+        )?;
+        let Tag::Compound(generated) = maps else {
+            unreachable!()
+        };
+        let mut combined = original_maps;
+        combined.extend(generated);
+        let mut document = draft.document.clone();
+        replace_unique_root_field(&mut document, "Heightmaps", Tag::Compound(combined))?;
+        replace_unique_root_field(&mut document, "PostProcessing", marks)?;
+        native_persistence::nbt::write(&document)?;
+        Ok(ResumedMetadataDraft {
+            source_nbt: draft.source_nbt.clone(),
             document,
         })
     }
@@ -845,6 +954,74 @@ fn reject_saved_blending(document: &NamedTag) -> Result<()> {
     Ok(())
 }
 
+fn unique_root_field<'a>(document: &'a NamedTag, name: &str) -> Result<Option<&'a Tag>> {
+    let Tag::Compound(fields) = &document.value else {
+        bail!("saved chunk is not a compound")
+    };
+    let mut matches = fields.iter().filter(|(key, _)| key.matches(name));
+    let first = matches.next().map(|(_, value)| value);
+    ensure!(matches.next().is_none(), "duplicate saved {name}");
+    Ok(first)
+}
+
+fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) -> Result<()> {
+    unique_root_field(document, name)?;
+    let Tag::Compound(fields) = &mut document.value else {
+        unreachable!()
+    };
+    if let Some((_, old)) = fields.iter_mut().find(|(key, _)| key.matches(name)) {
+        *old = value;
+    } else {
+        fields.push((name.into(), value));
+    }
+    Ok(())
+}
+
+fn preserved_heightmap_fields(
+    document: &NamedTag,
+) -> Result<Vec<(native_persistence::nbt::JavaString, Tag)>> {
+    let Some(value) = unique_root_field(document, "Heightmaps")? else {
+        return Ok(Vec::new());
+    };
+    let Tag::Compound(fields) = value else {
+        bail!("saved heightmaps are not a compound")
+    };
+    let mut names = BTreeSet::new();
+    for (name, _) in fields {
+        ensure!(names.insert(name.0.clone()), "duplicate saved heightmap");
+        ensure!(
+            ![
+                "WORLD_SURFACE",
+                "OCEAN_FLOOR",
+                "MOTION_BLOCKING",
+                "MOTION_BLOCKING_NO_LEAVES",
+                "WORLD_SURFACE_WG",
+                "OCEAN_FLOOR_WG"
+            ]
+            .iter()
+            .any(|key| name.matches(key)),
+            "existing heightmap needs incremental tracking"
+        );
+    }
+    Ok(fields.clone())
+}
+
+fn validate_empty_saved_postprocessing(document: &NamedTag, min_y: i32, height: i32) -> Result<()> {
+    let Some(value) = unique_root_field(document, "PostProcessing")? else {
+        return Ok(());
+    };
+    if matches!(value, Tag::List { element_type: native_persistence::nbt::TagType::End | native_persistence::nbt::TagType::List, values } if values.is_empty())
+    {
+        return Ok(());
+    }
+    let marks = native_persistence::postprocessing::decode(value, min_y, height)?;
+    ensure!(
+        marks.sections().iter().all(Vec::is_empty),
+        "existing postprocessing marks need incremental tracking"
+    );
+    Ok(())
+}
+
 fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) -> Result<()> {
     use native_session::worldgen::schedule::GenerationStage;
     ensure!(
@@ -1111,6 +1288,7 @@ pub(crate) fn prepare_existing_generator(
         context,
         identity: Arc::new(()),
         terrain_assets: None,
+        heightmap_tags: None,
     })
 }
 
@@ -1280,6 +1458,53 @@ mod tests {
         };
         values[0] = Tag::String("minecraft:stone".into());
         assert!(validate_empty_biomes_target(&loaded(&document)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_metadata_rejects_untracked_heightmaps_and_marks() -> Result<()> {
+        let make = |fields| NamedTag {
+            name: "".into(),
+            value: Tag::Compound(fields),
+        };
+        let custom = make(vec![(
+            "Heightmaps".into(),
+            Tag::Compound(vec![("example:opaque".into(), Tag::Int(9))]),
+        )]);
+        assert_eq!(preserved_heightmap_fields(&custom)?.len(), 1);
+        for name in [
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+            "WORLD_SURFACE_WG",
+            "OCEAN_FLOOR_WG",
+        ] {
+            let source = make(vec![(
+                "Heightmaps".into(),
+                Tag::Compound(vec![(name.into(), Tag::LongArray(vec![]))]),
+            )]);
+            assert!(preserved_heightmap_fields(&source).is_err(), "{name}");
+        }
+        let duplicate = make(vec![
+            ("Heightmaps".into(), Tag::Compound(vec![])),
+            ("Heightmaps".into(), Tag::Compound(vec![])),
+        ]);
+        assert!(preserved_heightmap_fields(&duplicate).is_err());
+        assert!(validate_empty_saved_postprocessing(&make(vec![]), 0, 16).is_ok());
+        let mut marks = native_core::postprocessing::PostProcessing::new(0, 16).unwrap();
+        let empty = make(vec![(
+            "PostProcessing".into(),
+            native_persistence::postprocessing::encode(&marks),
+        )]);
+        assert!(validate_empty_saved_postprocessing(&empty, 0, 16).is_ok());
+        assert!(validate_empty_saved_postprocessing(&empty, 0, 32).is_err());
+        marks.mark(0, 0, 0);
+        let nonempty = make(vec![(
+            "PostProcessing".into(),
+            native_persistence::postprocessing::encode(&marks),
+        )]);
+        assert!(validate_empty_saved_postprocessing(&nonempty, 0, 16).is_err());
         Ok(())
     }
 
@@ -1811,6 +2036,19 @@ mod tests {
                     fields.retain(|(key, _)| {
                         !key.matches("Heightmaps") && !key.matches("PostProcessing")
                     });
+                    fields.push((
+                        "Heightmaps".into(),
+                        Tag::Compound(vec![("example:opaque".into(), Tag::Int(73))]),
+                    ));
+                    let empty_marks = native_core::postprocessing::PostProcessing::new(
+                        lighting.min_y,
+                        lighting.height,
+                    )
+                    .unwrap();
+                    fields.push((
+                        "PostProcessing".into(),
+                        native_persistence::postprocessing::encode(&empty_marks),
+                    ));
                     fields.push(("custom_chunk".into(), Tag::Int(42)));
                     let bytes = native_persistence::nbt::write(&biome_chunk)?;
                     let offset = file.seek(SeekFrom::End(0))?;
@@ -2067,6 +2305,43 @@ mod tests {
             assert!(resumed_world.insert(&second).is_err());
             assert_eq!(resumed_world.sources().len(), 2);
             assert_eq!(resumed_world.terrain().snapshot().chunks.len(), 2);
+            let metadata = actual.draft_resumed_metadata(&mut resumed_world, &draft)?;
+            assert!(metadata.matches_source(&captured_source)?);
+            assert!(!metadata.matches_source(&stale)?);
+            assert_eq!(
+                metadata.document().value.get("Status"),
+                Some(&Tag::String("minecraft:biomes".into()))
+            );
+            assert_eq!(
+                metadata.document().value.get("structures"),
+                captured_source.value.get("structures")
+            );
+            let heightmap_tag = metadata.document().value.get("Heightmaps").unwrap();
+            assert_eq!(heightmap_tag.get("example:opaque"), Some(&Tag::Int(73)));
+            assert!(heightmap_tag.get("WORLD_SURFACE").is_none());
+            let heightmaps = native_persistence::heightmap::SavedGenerationHeightmaps::read(
+                metadata.document(),
+                native_persistence::heightmap::HeightBounds {
+                    min_y: lighting.min_y,
+                    max_y: lighting.min_y + lighting.height,
+                },
+            )?;
+            let (surface, ocean) = resumed_world.terrain().worldgen_heightmaps(key).unwrap();
+            for z in 0..16 {
+                for x in 0..16 {
+                    let index = (x + z * 16) as usize;
+                    assert_eq!(heightmaps.first_available(native_persistence::heightmap::SavedGenerationHeightmapKind::WorldSurfaceWorldgen, x, z), Some(surface[index]));
+                    assert_eq!(heightmaps.first_available(native_persistence::heightmap::SavedGenerationHeightmapKind::OceanFloorWorldgen, x, z), Some(ocean[index]));
+                }
+            }
+            assert_eq!(
+                metadata.document().value.get("PostProcessing"),
+                Some(&native_persistence::postprocessing::encode(
+                    resumed.carver_postprocessing.as_ref().unwrap()
+                ))
+            );
+            let repeated = actual.draft_resumed_metadata(&mut resumed_world, &draft)?;
+            assert_eq!(metadata.document(), repeated.document());
             if name == "overworld" {
                 let positions = (2..=4).flat_map(|z| (3..=5).map(move |x| ChunkPos { x, z }));
                 let context = reader.capture_generation_context(positions)?;
@@ -2077,6 +2352,12 @@ mod tests {
                     &mut restored_evaluator,
                 )?;
                 assert!(actual.draft_resumed_sections(&alien).is_err());
+                let alien_draft = other.draft_resumed_sections(&alien)?;
+                assert!(
+                    actual
+                        .draft_resumed_metadata(&mut resumed_world, &alien_draft)
+                        .is_err()
+                );
                 assert!(resumed_world.insert(&alien).is_err());
                 assert_eq!(resumed_world.sources().len(), 2);
             }

@@ -122,6 +122,7 @@ pub(crate) struct ResumedTerrainWorld {
     identity: Arc<()>,
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
+    feature_touched: BTreeSet<native_world::loaded::ChunkPos>,
 }
 
 impl ResumedSavedTerrain {
@@ -134,6 +135,7 @@ impl ResumedSavedTerrain {
             identity: self.identity,
             terrain: native_session::worldgen::CarvedTerrainWorld::new(self.terrain),
             sources: BTreeMap::from([(self.position, self.source)]),
+            feature_touched: BTreeSet::new(),
         }
     }
 }
@@ -235,6 +237,95 @@ impl PreparedExistingGenerator {
             &mut resolve,
         )?;
         action(&prepared)
+    }
+
+    /// Run a ready FEATURES step on captured intermediate terrain. The caller
+    /// must restore the scheduler from the same verified generation inputs.
+    /// Structure decoration and previously published light are not supported.
+    /// This does not authorize publishing or saving the resulting chunks.
+    pub fn run_saved_features(
+        &mut self,
+        world: &mut ResumedTerrainWorld,
+        context: &SavedDecorationContext,
+        schedule: &mut GenerationSchedule,
+    ) -> Result<Vec<bool>> {
+        use native_session::worldgen::schedule::GenerationStage;
+        use native_world::loaded::ChunkPos;
+        ensure!(
+            !self.generate_structures,
+            "saved structure decoration is not available"
+        );
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && Arc::ptr_eq(&self.identity, &context.identity),
+            "decoration belongs to another generation capture"
+        );
+        let center = ChunkPos {
+            x: context.position.x,
+            z: context.position.z,
+        };
+        ensure!(
+            schedule.ready(center, GenerationStage::Features),
+            "features dependencies are incomplete"
+        );
+        let mut positions = Vec::with_capacity(9);
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let saved_pos = native_persistence::world::ChunkPos {
+                    x: center
+                        .x
+                        .checked_add(dx)
+                        .context("neighbor chunk X overflow")?,
+                    z: center
+                        .z
+                        .checked_add(dz)
+                        .context("neighbor chunk Z overflow")?,
+                };
+                let captured = self
+                    .context
+                    .inputs()
+                    .sources()
+                    .chunks()
+                    .get(&saved_pos)
+                    .and_then(|source| source.terrain.as_ref())
+                    .context("saved terrain neighbor was not captured")?;
+                let source = world
+                    .sources
+                    .get(&saved_pos)
+                    .context("resumed terrain neighbor is missing")?;
+                ensure!(
+                    Arc::ptr_eq(source, &captured.document),
+                    "resumed terrain source differs"
+                );
+                positions.push(ChunkPos {
+                    x: saved_pos.x,
+                    z: saved_pos.z,
+                });
+            }
+        }
+        if self.heightmap_tags.is_none() {
+            let blocks = self.resources.vanilla_block_ids()?;
+            self.heightmap_tags = Some(native_resources::heightmap_tags::HeightmapTags::load(
+                &mut self.resources,
+                &blocks,
+            )?);
+        }
+        let tags = self
+            .heightmap_tags
+            .as_ref()
+            .expect("heightmap tags initialized");
+        for &position in &positions {
+            if world.terrain.worldgen_heightmaps(position).is_none() {
+                world
+                    .terrain
+                    .initialize_worldgen_heightmaps(position, tags)?;
+            }
+        }
+        let result = self.with_saved_prepared_decoration(context, |prepared| {
+            schedule.run_features(&mut world.terrain, prepared, false, None)
+        })?;
+        world.feature_touched.extend(positions);
+        Ok(result)
     }
 
     /// Restore Java's biome-dependent decoration plan for a captured chunk.
@@ -724,6 +815,15 @@ impl PreparedExistingGenerator {
             Arc::ptr_eq(&self.identity, &world.identity)
                 && Arc::ptr_eq(&self.identity, &draft.identity),
             "terrain belongs to another generation capture"
+        );
+        ensure!(
+            !world
+                .feature_touched
+                .contains(&native_world::loaded::ChunkPos {
+                    x: draft.position.x,
+                    z: draft.position.z,
+                }),
+            "terrain draft predates feature placement"
         );
         let source = world
             .sources
@@ -2495,6 +2595,18 @@ mod tests {
             assert!(resumed_world.insert(&second).is_err());
             assert_eq!(resumed_world.sources().len(), 2);
             assert_eq!(resumed_world.terrain().snapshot().chunks.len(), 2);
+            if name == "overworld" {
+                let before = resumed_world.terrain().snapshot();
+                let error = actual
+                    .run_saved_features(
+                        &mut resumed_world,
+                        &decoration,
+                        &mut GenerationSchedule::new(),
+                    )
+                    .expect_err("structure-enabled world must not skip structure placement");
+                assert!(format!("{error:#}").contains("structure decoration"));
+                assert!(Arc::ptr_eq(&before, &resumed_world.terrain().snapshot()));
+            }
             let metadata = actual.draft_resumed_metadata(&mut resumed_world, &draft)?;
             let input = root.join("resumed-terrain.nbt");
             let output = root.join("java-resumed-terrain.nbt");
@@ -2815,7 +2927,7 @@ mod tests {
         )?;
         custom_biome["features"] = json!([[{
             "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
-            "placement": []
+            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
         std::fs::write(
@@ -2872,7 +2984,7 @@ mod tests {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
         gzip.write_all(&native_persistence::nbt::write(&updated_level)?)?;
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
-        let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
+        let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
         let context = reader.capture_generation_context(positions)?;
         assert_eq!(context.selection().enabled, ["vanilla", "file/custom"]);
         std::fs::write(
@@ -2898,6 +3010,92 @@ mod tests {
             Ok(())
         })?;
         assert!(prepared, "captured data-pack feature was not prepared");
+        let saved_center = ChunkPos { x: 3, z: 3 };
+        let center = native_world::loaded::ChunkPos { x: 3, z: 3 };
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(
+            center,
+            native_session::worldgen::schedule::GenerationStage::Features,
+        )?;
+        let first = actual.resume_saved_terrain(
+            saved_center,
+            &[],
+            &mut native_resources::density::DensityEvaluator::default(),
+        )?;
+        let draft = actual.draft_resumed_sections(&first)?;
+        let mut terrain = first.into_world();
+        assert!(
+            actual
+                .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
+                .is_err()
+        );
+        let restored = schedule
+            .requirements()
+            .map(|(position, _)| {
+                let stage =
+                    if (position.x - center.x).abs() <= 1 && (position.z - center.z).abs() <= 1 {
+                        native_session::worldgen::schedule::GenerationStage::Terrain
+                    } else {
+                        native_session::worldgen::schedule::GenerationStage::StructureStarts
+                    };
+                (position, stage)
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(restored)?;
+        let before = terrain.terrain().snapshot();
+        assert!(
+            actual
+                .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before, &terrain.terrain().snapshot()));
+        assert_eq!(
+            schedule.completed(center),
+            Some(native_session::worldgen::schedule::GenerationStage::Terrain)
+        );
+        let mut terrain_evaluator = native_resources::density::DensityEvaluator::default();
+        for z in 2..=4 {
+            for x in 2..=4 {
+                if x == 3 && z == 3 {
+                    continue;
+                }
+                let next =
+                    actual.resume_saved_terrain(ChunkPos { x, z }, &[], &mut terrain_evaluator)?;
+                terrain.insert(&next)?;
+            }
+        }
+        let y = actual.lighting.min_y + 8;
+        let before_block = terrain
+            .terrain()
+            .snapshot()
+            .block(56, y, 56)
+            .context("feature block missing")?
+            .name
+            .clone();
+        assert_ne!(before_block, "minecraft:melon");
+        assert_eq!(
+            actual.run_saved_features(&mut terrain, &custom_decoration, &mut schedule)?,
+            vec![true]
+        );
+        assert_eq!(
+            terrain
+                .terrain()
+                .snapshot()
+                .block(56, y, 56)
+                .context("feature block missing")?
+                .name,
+            "minecraft:melon"
+        );
+        assert_eq!(
+            schedule.completed(center),
+            Some(native_session::worldgen::schedule::GenerationStage::Features)
+        );
+        assert!(actual.draft_resumed_metadata(&mut terrain, &draft).is_err());
+        assert!(
+            actual
+                .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
+                .is_err()
+        );
         let previous = Arc::new(native_core::beardifier::Beardifier::new(
             vec![],
             vec![],

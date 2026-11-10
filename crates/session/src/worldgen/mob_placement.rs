@@ -656,8 +656,18 @@ fn geometry_block_position(
     ))
 }
 
+enum PlacementSource<'a> {
+    Fresh(&'a FreshTerrainBatch),
+    Captured {
+        terrain: &'a super::CarvedTerrainWorld,
+        light: &'a native_world::generation_light::VisibleLightSnapshot,
+        registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+        ambient_light: f32,
+    },
+}
+
 pub struct GeneratedMobPlacementView<'a> {
-    batch: &'a FreshTerrainBatch,
+    source: PlacementSource<'a>,
     world: Arc<World>,
     heightmap: MobSpawnHeightmap,
     border: RespawnBorder,
@@ -689,8 +699,61 @@ impl<'a> GeneratedMobPlacementView<'a> {
         let world = batch.snapshot().context("generated terrain is missing")?;
         let (min_y, max_y) = batch.build_bounds()?;
         Ok(Self {
-            batch,
+            source: PlacementSource::Fresh(batch),
             world,
+            heightmap,
+            border,
+            prevent_inside,
+            height_tags,
+            min_y,
+            max_y,
+            void_air: BlockState {
+                name: "minecraft:void_air".into(),
+                properties: Default::default(),
+            },
+            last_facts: None,
+            computed_heights: BTreeMap::new(),
+            rule_light: BTreeMap::new(),
+            fluid_states: BTreeMap::new(),
+        })
+    }
+
+    /// Read a frozen, already-lit intermediate terrain and a complete visible
+    /// light revision. The caller must verify all inputs belong to one pack,
+    /// world revision and dimension, and that the light remains current.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_captured_terrain(
+        terrain: &'a super::CarvedTerrainWorld,
+        light: &'a native_world::generation_light::VisibleLightSnapshot,
+        registry: &'a native_resources::block_registry::GeneratedBlockRegistry,
+        ambient_light: f32,
+        min_y: i32,
+        height: i32,
+        heightmap: MobSpawnHeightmap,
+        border: RespawnBorder,
+        prevent_inside: &'a BTreeSet<String>,
+        height_tags: &'a native_resources::heightmap_tags::HeightmapTags,
+    ) -> Result<Self> {
+        ensure!(border.is_valid(), "invalid mob spawn border");
+        ensure!(
+            height > 0
+                && ambient_light.is_finite()
+                && min_y == terrain.min_y
+                && height == terrain.height,
+            "invalid captured dimension"
+        );
+        let max_y = min_y
+            .checked_add(height)
+            .context("mob placement height overflow")?;
+        ensure!(light.has_block_channel(), "captured block light is missing");
+        Ok(Self {
+            source: PlacementSource::Captured {
+                terrain,
+                light,
+                registry,
+                ambient_light,
+            },
+            world: terrain.snapshot(),
             heightmap,
             border,
             prevent_inside,
@@ -742,7 +805,10 @@ impl<'a> GeneratedMobPlacementView<'a> {
             z: position.z.div_euclid(16),
         };
         if !self.rule_light.contains_key(&chunk) {
-            let snapshot = self.batch.light_snapshot([chunk])?;
+            let snapshot = match &self.source {
+                PlacementSource::Fresh(batch) => batch.light_snapshot([chunk])?,
+                PlacementSource::Captured { light, .. } => (*light).clone(),
+            };
             self.rule_light.insert(chunk, snapshot);
         }
         self.rule_light[&chunk]
@@ -781,9 +847,13 @@ impl super::mob_obstruction::FluidScanWorld for GeneratedMobPlacementView<'_> {
             .state(id)
             .context("creature obstruction block state is missing")?;
         ensure!(
-            self.batch
-                .generated_block_registry()?
-                .is_canonical_state(&state.name, &state.properties),
+            match &self.source {
+                PlacementSource::Fresh(batch) => batch
+                    .generated_block_registry()?
+                    .is_canonical_state(&state.name, &state.properties),
+                PlacementSource::Captured { registry, .. } =>
+                    registry.is_canonical_state(&state.name, &state.properties),
+            },
             "unverified creature obstruction block state {state:?}"
         );
         let fluid = native_world::fluid::FluidState::from_block(state)
@@ -824,13 +894,22 @@ impl native_resources::worldgen_mob_rules::AnimalInstanceSpawnWorld
         self.rule_raw_brightness(position)
     }
     fn ambient_light(&mut self) -> Result<f32> {
-        self.batch.ambient_light()
+        match &self.source {
+            PlacementSource::Fresh(batch) => batch.ambient_light(),
+            PlacementSource::Captured { ambient_light, .. } => Ok(*ambient_light),
+        }
     }
 }
 
 impl MobPlacementWorld for GeneratedMobPlacementView<'_> {
     fn height(&mut self, x: i32, z: i32) -> Result<i32> {
-        if let Some(height) = self.batch.primed_mob_spawn_height(x, z, self.heightmap)? {
+        let primed = match &self.source {
+            PlacementSource::Fresh(batch) => batch.primed_mob_spawn_height(x, z, self.heightmap)?,
+            PlacementSource::Captured { terrain, .. } => {
+                terrain.primed_mob_spawn_height(x, z, self.heightmap)?
+            }
+        };
+        if let Some(height) = primed {
             return Ok(height);
         }
         if let Some(&height) = self.computed_heights.get(&(x, z)) {

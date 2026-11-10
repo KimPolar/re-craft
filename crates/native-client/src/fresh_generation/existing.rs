@@ -11,11 +11,11 @@ use native_session::worldgen::schedule::GenerationSchedule;
 /// Bind the captured inputs with `add_save_dependencies` when saving.
 /// Live state and generation completeness still need independent checks.
 pub(crate) struct PreparedExistingGenerator {
-    pub generator: TerrainGenerator,
-    pub lighting: GeneratedDimensionLighting,
-    pub dimension_definition: Value,
-    pub generate_structures: bool,
-    pub resources: ResourceStack,
+    generator: TerrainGenerator,
+    lighting: GeneratedDimensionLighting,
+    dimension_definition: Value,
+    generate_structures: bool,
+    resources: ResourceStack,
     context: GenerationContextSnapshot,
     identity: Arc<()>,
     terrain_assets: Option<SavedTerrainAssets>,
@@ -42,6 +42,64 @@ pub(crate) struct RestoredSavedTerrain {
         native_world::loaded::ChunkPos,
         Option<native_core::postprocessing::PostProcessing>,
     >,
+}
+
+/// One regenerated TERRAIN-stage chunk, tied to the captured source and packs.
+/// It is not a FULL chunk and cannot be installed into a running session yet.
+pub(crate) struct ResumedSavedTerrain {
+    identity: Arc<()>,
+    position: native_persistence::world::ChunkPos,
+    source: Arc<NamedTag>,
+    terrain: native_session::worldgen::MaterializedTerrain,
+}
+
+/// Intermediate chunks prepared from one generation capture. Their original
+/// protochunk documents remain available for the eventual coordinated update.
+pub(crate) struct ResumedTerrainWorld {
+    identity: Arc<()>,
+    terrain: native_session::worldgen::CarvedTerrainWorld,
+    sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
+}
+
+impl ResumedSavedTerrain {
+    pub fn materialized(&self) -> &native_session::worldgen::MaterializedTerrain {
+        &self.terrain
+    }
+
+    pub fn into_world(self) -> ResumedTerrainWorld {
+        ResumedTerrainWorld {
+            identity: self.identity,
+            terrain: native_session::worldgen::CarvedTerrainWorld::new(self.terrain),
+            sources: BTreeMap::from([(self.position, self.source)]),
+        }
+    }
+}
+
+impl ResumedTerrainWorld {
+    pub fn terrain(&self) -> &native_session::worldgen::CarvedTerrainWorld {
+        &self.terrain
+    }
+
+    pub fn sources(&self) -> &BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>> {
+        &self.sources
+    }
+
+    /// Do not mix results from separate disk/pack captures, even if their
+    /// dimensions and seeds happen to match.
+    pub fn insert(&mut self, chunk: &ResumedSavedTerrain) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &chunk.identity),
+            "terrain belongs to another generation capture"
+        );
+        ensure!(
+            !self.sources.contains_key(&chunk.position),
+            "terrain chunk already exists"
+        );
+        self.terrain.insert(&chunk.terrain)?;
+        self.sources
+            .insert(chunk.position, Arc::clone(&chunk.source));
+        Ok(())
+    }
 }
 
 impl RestoredSavedTerrain {
@@ -379,6 +437,58 @@ impl PreparedExistingGenerator {
         structure_order: &[ResourceId],
         evaluator: &mut native_resources::density::DensityEvaluator,
     ) -> Result<native_resources::surface_pass::SurfaceStageChunk> {
+        self.generate_saved_terrain_parts(target, structure_order, evaluator)
+            .map(|(terrain, _)| terrain)
+    }
+
+    /// Materialize the computed terrain with the exact saved biome palette and
+    /// retain the untouched source document for later generation stages.
+    pub fn resume_saved_terrain(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+        evaluator: &mut native_resources::density::DensityEvaluator,
+    ) -> Result<ResumedSavedTerrain> {
+        let (terrain, biome) =
+            self.generate_saved_terrain_parts(target, structure_order, evaluator)?;
+        let dimension = self.context.inputs().sources().dimension();
+        let dimension = format!("{}:{}", dimension.namespace, dimension.path);
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .expect("terrain assets initialized")
+            .blocks;
+        let terrain = native_session::worldgen::materialize_carved_terrain(
+            terrain,
+            &biome,
+            &dimension,
+            |value| resolve_generated_terrain_state(value, registry),
+        )?;
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .and_then(|source| source.terrain.as_ref())
+            .context("captured terrain target disappeared")?;
+        Ok(ResumedSavedTerrain {
+            identity: Arc::clone(&self.identity),
+            position: target,
+            source: Arc::clone(&source.document),
+            terrain,
+        })
+    }
+
+    fn generate_saved_terrain_parts(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+        evaluator: &mut native_resources::density::DensityEvaluator,
+    ) -> Result<(
+        native_resources::surface_pass::SurfaceStageChunk,
+        Arc<native_session::worldgen::QuartBiomeChunk>,
+    )> {
         let source = self
             .context
             .inputs()
@@ -419,6 +529,14 @@ impl PreparedExistingGenerator {
             }
         }
         let biomes = self.restore_saved_biomes(positions)?;
+        let biome = Arc::clone(
+            biomes
+                .get(&native_world::loaded::ChunkPos {
+                    x: target.x,
+                    z: target.z,
+                })
+                .context("target biome is missing")?,
+        );
         let mut neighborhood = self.generator.biome_neighborhood()?;
         for biome in biomes.into_values() {
             neighborhood.insert(biome)?;
@@ -457,7 +575,7 @@ impl PreparedExistingGenerator {
                     .is_some(),
             })
         };
-        if let Some(structure) = structure {
+        let terrain = if let Some(structure) = structure {
             self.generator
                 .generate_carved_surface_with_structure_context(
                     &mut self.resources,
@@ -482,7 +600,8 @@ impl PreparedExistingGenerator {
             );
             evaluator.replace_structure_terrain_context(previous);
             result
-        }
+        }?;
+        Ok((terrain, biome))
     }
 
     /// Restore captured terrain and recorded generation metadata without
@@ -1561,10 +1680,10 @@ mod tests {
             file.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
             file.seek(SeekFrom::Start(3 * 4))?;
             file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
-            // Nine real BIOMES-stage region entries exercise resuming terrain
-            // from captured neighbors, including saved biome identities.
-            for z in 2..=4 {
-                for x in 2..=4 {
+            // BIOMES-stage entries cover two neighboring terrain results and
+            // their captured biome neighborhoods.
+            for z in 1..=5 {
+                for x in 1..=5 {
                     let mut biome_chunk = saved.clone();
                     let Tag::Compound(fields) = &mut biome_chunk.value else {
                         unreachable!()
@@ -1747,6 +1866,79 @@ mod tests {
                     .generate_saved_terrain(clean_target, &[], &mut restored_evaluator)
                     .is_err()
             );
+            let first = actual.resume_saved_terrain(target, &[], &mut restored_evaluator)?;
+            assert_eq!(
+                first.materialized().fluid_postprocessing(),
+                resumed.fluid_updates
+            );
+            assert_eq!(
+                first.materialized().carver_postprocessing(),
+                resumed.carver_postprocessing.as_ref()
+            );
+            let key = native_world::loaded::ChunkPos {
+                x: target.x,
+                z: target.z,
+            };
+            let materialized = first.materialized().world();
+            assert_eq!(
+                materialized.chunks[&key].status.as_deref(),
+                Some("minecraft:terrain")
+            );
+            assert_eq!(
+                materialized.biome(target.x * 16, lighting.min_y, target.z * 16),
+                Some("minecraft:plains")
+            );
+            assert_eq!(
+                materialized.biome(target.x * 16, lighting.min_y + 16, target.z * 16),
+                Some("minecraft:forest")
+            );
+            let registry = actual.resources.vanilla_generated_block_registry()?;
+            for [x, z] in [[0, 0], [7, 9], [15, 15]] {
+                for y in [
+                    lighting.min_y,
+                    lighting.min_y + lighting.height / 2,
+                    lighting.min_y + lighting.height - 1,
+                ] {
+                    let state = &resumed.states
+                        [((z * 16 + x) * lighting.height + y - lighting.min_y) as usize];
+                    let expected = resolve_generated_terrain_state(state, &registry)?;
+                    assert_eq!(
+                        materialized.block(target.x * 16 + x, y, target.z * 16 + z),
+                        Some(&expected)
+                    );
+                }
+            }
+            let captured_source = Arc::clone(
+                &actual.inputs().sources().chunks()[&target]
+                    .terrain
+                    .as_ref()
+                    .unwrap()
+                    .document,
+            );
+            let mut resumed_world = first.into_world();
+            assert!(Arc::ptr_eq(
+                &captured_source,
+                &resumed_world.sources()[&target]
+            ));
+            let second_target = ChunkPos { x: 2, z: 3 };
+            let second =
+                actual.resume_saved_terrain(second_target, &[], &mut restored_evaluator)?;
+            resumed_world.insert(&second)?;
+            assert!(resumed_world.insert(&second).is_err());
+            assert_eq!(resumed_world.sources().len(), 2);
+            assert_eq!(resumed_world.terrain().snapshot().chunks.len(), 2);
+            if name == "overworld" {
+                let positions = (2..=4).flat_map(|z| (3..=5).map(move |x| ChunkPos { x, z }));
+                let context = reader.capture_generation_context(positions)?;
+                let mut other = prepare_existing_generator(context, &game)?;
+                let alien = other.resume_saved_terrain(
+                    ChunkPos { x: 4, z: 3 },
+                    &[],
+                    &mut restored_evaluator,
+                )?;
+                assert!(resumed_world.insert(&alien).is_err());
+                assert_eq!(resumed_world.sources().len(), 2);
+            }
             let restored = actual.restore_saved_biomes([position])?;
             let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
             let mut neighborhood = actual.generator.biome_neighborhood()?;

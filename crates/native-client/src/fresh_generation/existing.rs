@@ -31,6 +31,51 @@ pub(crate) struct PreparedExistingGenerator {
     mob_placement_assets: Option<SavedMobPlacementAssets>,
     farm_variants: [Option<native_resources::animal_variants::FarmAnimalSpawnVariants>; 3],
     farm_moon: Option<native_resources::moon_phase::Environment>,
+    captured_entity_ids: Option<KnownEntityIds>,
+    generated_entity_ids: Option<(Arc<()>, KnownEntityIds)>,
+}
+
+/// Definite identities in observed records, not proof of global uniqueness.
+/// Unknown, absent or malformed identities remain the caller's responsibility.
+#[derive(Default)]
+struct KnownEntityIds(BTreeSet<[i32; 4]>);
+
+impl KnownEntityIds {
+    fn observe_document(&mut self, document: &NamedTag, list_name: &str) {
+        if let Tag::Compound(fields) = &document.value {
+            for (_, list) in fields.iter().filter(|(name, _)| name.matches(list_name)) {
+                self.observe_list(list);
+            }
+        }
+    }
+
+    fn observe_list(&mut self, list: &Tag) {
+        if let Tag::List { values, .. } = list {
+            self.observe_records(values);
+        }
+    }
+
+    fn observe_records(&mut self, records: &[Tag]) {
+        let mut pending: Vec<&Tag> = records.iter().collect();
+        while let Some(entity) = pending.pop() {
+            let Tag::Compound(fields) = entity else {
+                continue;
+            };
+            for (name, value) in fields {
+                if name.matches("UUID") {
+                    if let Tag::IntArray(words) = value {
+                        if let Ok(uuid) = <[i32; 4]>::try_from(words.as_slice()) {
+                            self.0.insert(uuid);
+                        }
+                    }
+                } else if name.matches("Passengers") {
+                    if let Tag::List { values, .. } = value {
+                        pending.extend(values);
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct ResumedFarmEnvironment<'a> {
@@ -1174,10 +1219,11 @@ impl PreparedExistingGenerator {
     }
 
     /// Mark the externally constructed entity at Java's constructor point.
-    /// The caller supplies a unique UUID from the entity's independent RNG.
+    /// The caller supplies a UUID from the entity's independent RNG and must
+    /// still verify identities outside this capture and in other spawn plans.
     #[allow(clippy::too_many_arguments)]
     pub fn construct_resumed_creature(
-        &self,
+        &mut self,
         world: &ResumedTerrainWorld,
         schedule: &GenerationSchedule,
         light: &ResumedStagedLight,
@@ -1226,6 +1272,7 @@ impl PreparedExistingGenerator {
             !plan.used_uuids.contains(&construction.uuid),
             "duplicate generated creature UUID"
         );
+        self.check_known_entity_id(world, construction.uuid)?;
         let pose = plan
             .probe
             .as_mut()
@@ -1235,6 +1282,48 @@ impl PreparedExistingGenerator {
         plan.constructed = Some(construction);
         plan.pose = Some(pose);
         Ok(pose)
+    }
+
+    fn check_known_entity_id(&mut self, world: &ResumedTerrainWorld, uuid: [i32; 4]) -> Result<()> {
+        let captured = self.captured_entity_ids.get_or_insert_with(|| {
+            let mut ids = KnownEntityIds::default();
+            for chunk in self.context.inputs().sources().chunks().values() {
+                if let Some(terrain) = &chunk.terrain {
+                    ids.observe_document(&terrain.document, "entities");
+                }
+                if let Some(entities) = &chunk.entities {
+                    ids.observe_document(&entities.document, "Entities");
+                }
+            }
+            ids
+        });
+        ensure!(
+            !captured.0.contains(&uuid),
+            "generated creature UUID conflicts with a captured entity"
+        );
+        if !self
+            .generated_entity_ids
+            .as_ref()
+            .is_some_and(|(revision, _)| Arc::ptr_eq(revision, &world.revision))
+        {
+            let mut ids = KnownEntityIds::default();
+            for pos in world.sources.keys() {
+                let pos = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
+                ids.observe_records(world.terrain.recorded_generated_entities(pos)?);
+            }
+            self.generated_entity_ids = Some((Arc::clone(&world.revision), ids));
+        }
+        ensure!(
+            !self
+                .generated_entity_ids
+                .as_ref()
+                .context("generated entity identity index missing")?
+                .1
+                .0
+                .contains(&uuid),
+            "generated creature UUID conflicts with a generated feature entity"
+        );
+        Ok(())
     }
 
     /// Check the constructed entity's own spawn rule and obstruction in order.
@@ -3416,6 +3505,8 @@ pub(crate) fn prepare_existing_generator(
         mob_placement_assets: None,
         farm_variants: [None, None, None],
         farm_moon: None,
+        captured_entity_ids: None,
+        generated_entity_ids: None,
     })
 }
 
@@ -3449,6 +3540,52 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn known_entity_ids_include_proto_sidecar_and_nested_passengers() {
+        let entity = |uuid| Tag::Compound(vec![("UUID".into(), Tag::IntArray(uuid))]);
+        let list = |values| Tag::List {
+            element_type: TagType::Compound,
+            values,
+        };
+        let proto = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "entities".into(),
+                list(vec![Tag::Compound(vec![
+                    ("UUID".into(), Tag::IntArray(vec![1, 2, 3, 4])),
+                    (
+                        "Passengers".into(),
+                        list(vec![entity(vec![5, 6, 7, 8]), Tag::Int(99)]),
+                    ),
+                ])]),
+            )]),
+        };
+        let sidecar = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Entities".into(),
+                list(vec![
+                    entity(vec![9, 10, 11, 12]),
+                    entity(vec![1, 2]),
+                    Tag::Compound(vec![]),
+                ]),
+            )]),
+        };
+        let mut ids = KnownEntityIds::default();
+        ids.observe_document(&proto, "entities");
+        ids.observe_document(&sidecar, "Entities");
+        ids.observe_records(&[entity(vec![13, 14, 15, 16])]);
+        assert_eq!(
+            ids.0,
+            BTreeSet::from([
+                [1, 2, 3, 4],
+                [5, 6, 7, 8],
+                [9, 10, 11, 12],
+                [13, 14, 15, 16],
+            ])
+        );
+    }
 
     #[test]
     fn resumed_light_neighborhood_requires_all_columns_and_checked_coordinates() {
@@ -4339,6 +4476,25 @@ mod tests {
                         native_persistence::postprocessing::encode(&empty_marks),
                     ));
                     fields.push(("custom_chunk".into(), Tag::Int(42)));
+                    if x == 0 && z == 6 {
+                        fields.retain(|(key, _)| !key.matches("entities"));
+                        fields.push((
+                            "entities".into(),
+                            Tag::List {
+                                element_type: TagType::Compound,
+                                values: vec![Tag::Compound(vec![(
+                                    "Passengers".into(),
+                                    Tag::List {
+                                        element_type: TagType::Compound,
+                                        values: vec![Tag::Compound(vec![(
+                                            "UUID".into(),
+                                            Tag::IntArray(vec![9, 9, 9, 9]),
+                                        )])],
+                                    },
+                                )])],
+                            },
+                        ));
+                    }
                     let bytes = native_persistence::nbt::write(&biome_chunk)?;
                     let offset = file.seek(SeekFrom::End(0))?;
                     let sectors = (bytes.len() + 5).div_ceil(4096);
@@ -5533,6 +5689,26 @@ mod tests {
                                 ResumedCreatureCheck::Rejected => break,
                                 ResumedCreatureCheck::NeedsConstruction(_) => {
                                     generated += 1;
+                                    let duplicate =
+                                        native_session::worldgen::FreshCreatureConstruction {
+                                            uuid: [9, 9, 9, 9],
+                                            chicken_egg_time: (species == "chicken")
+                                                .then_some(9000),
+                                        };
+                                    assert!(
+                                        actual
+                                            .construct_resumed_creature(
+                                                &terrain,
+                                                &animal_schedule,
+                                                &staged,
+                                                &mut animal,
+                                                true,
+                                                &clocks,
+                                                border,
+                                                duplicate,
+                                            )
+                                            .is_err()
+                                    );
                                     let construction =
                                         native_session::worldgen::FreshCreatureConstruction {
                                             uuid: [1, 2, 3, generated],
@@ -5997,6 +6173,7 @@ mod tests {
                         element_type: TagType::Compound,
                         values: vec![Tag::Compound(vec![
                             ("id".into(), Tag::String("minecraft:pig".into())),
+                            ("UUID".into(), Tag::IntArray(vec![7, 7, 7, 7])),
                             ("opaque".into(), Tag::Int(812)),
                         ])],
                     },
@@ -6038,6 +6215,11 @@ mod tests {
             &mut native_resources::density::DensityEvaluator::default(),
         )?;
         let mut terrain = first.into_world();
+        assert!(
+            restored
+                .check_known_entity_id(&terrain, [7, 7, 7, 7])
+                .is_err()
+        );
         let mut evaluator = native_resources::density::DensityEvaluator::default();
         for z in 2..=4 {
             for x in 2..=4 {
@@ -6221,9 +6403,13 @@ mod tests {
         );
         // Exercise the same entity-recording path used by generation, including
         // passenger suppression and a serializable empty compound.
-        let generated_one = Tag::Compound(vec![("n".into(), Tag::Int(21))]);
+        let generated_one = Tag::Compound(vec![
+            ("n".into(), Tag::Int(21)),
+            ("UUID".into(), Tag::IntArray(vec![8, 8, 8, 8])),
+        ]);
         let generated_empty = Tag::Compound(vec![]);
         let generated_two = Tag::Compound(vec![("n".into(), Tag::Int(22))]);
+        restored.check_known_entity_id(&terrain, [8, 8, 8, 8])?;
         let block_ids = restored
             .terrain_assets
             .as_ref()
@@ -6261,6 +6447,11 @@ mod tests {
         // This fixture invokes the low-level region API directly; production
         // feature passes update this revision in run_saved_features.
         terrain.revision = Arc::new(());
+        assert!(
+            restored
+                .check_known_entity_id(&terrain, [8, 8, 8, 8])
+                .is_err()
+        );
         let feature = restored.draft_resumed_feature_chunk(&terrain, saved_center)?;
         assert!(feature.matches_source(&treasure_source)?);
         assert!(feature.matches_world(&terrain));

@@ -152,9 +152,51 @@ pub(crate) struct ResumedFeatureLight {
     light: native_world::generation_light::VisibleLightSnapshot,
 }
 
+/// A fresh light engine's section registrations for one frozen terrain.
+/// This does not represent restored light from an existing running world.
+pub(crate) struct ResumedInitialLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    tracker: native_session::worldgen::FreshGenerationLightTracker,
+    initialized: BTreeSet<native_world::loaded::ChunkPos>,
+}
+
+/// A frozen resumed terrain whose registered sections can be propagated.
+pub(crate) struct ResumedStagedLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    engine: native_session::worldgen::StagedGenerationLightEngine,
+    initialized: BTreeSet<native_world::loaded::ChunkPos>,
+}
+
+fn matches_resumed_revision(
+    identity: &Arc<()>,
+    revision: &Arc<()>,
+    world: &ResumedTerrainWorld,
+) -> bool {
+    Arc::ptr_eq(identity, &world.identity) && Arc::ptr_eq(revision, &world.revision)
+}
+
+fn initialized_light_neighborhood(
+    initialized: &BTreeSet<native_world::loaded::ChunkPos>,
+    center: native_world::loaded::ChunkPos,
+) -> bool {
+    (-1i32..=1).all(|dz| {
+        (-1i32..=1).all(|dx| {
+            center
+                .x
+                .checked_add(dx)
+                .zip(center.z.checked_add(dz))
+                .is_some_and(|(x, z)| {
+                    initialized.contains(&native_world::loaded::ChunkPos { x, z })
+                })
+        })
+    })
+}
+
 impl ResumedFeatureLight {
     fn matches_world(&self, world: &ResumedTerrainWorld) -> bool {
-        Arc::ptr_eq(&self.identity, &world.identity) && Arc::ptr_eq(&self.revision, &world.revision)
+        matches_resumed_revision(&self.identity, &self.revision, world)
     }
 }
 
@@ -333,6 +375,130 @@ impl RestoredSavedTerrain {
 }
 
 impl PreparedExistingGenerator {
+    /// Start a new empty engine for captured, unlit terrain. The caller must
+    /// independently establish that no saved or live engine state contributes
+    /// to this region. Any later terrain change invalidates this tracker.
+    pub fn begin_resumed_initial_light(
+        &self,
+        world: &ResumedTerrainWorld,
+    ) -> Result<ResumedInitialLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity),
+            "terrain belongs to another generation capture"
+        );
+        for (position, original) in &world.sources {
+            let saved = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(position)
+                .and_then(|chunk| chunk.terrain.as_ref())
+                .context("light terrain source missing")?;
+            ensure!(
+                Arc::ptr_eq(original, &saved.document),
+                "light terrain source differs"
+            );
+            reject_saved_lighting(saved)?;
+        }
+        Ok(ResumedInitialLight {
+            identity: Arc::clone(&world.identity),
+            revision: Arc::clone(&world.revision),
+            tracker: native_session::worldgen::FreshGenerationLightTracker::new(
+                &world.terrain,
+                self.lighting.has_skylight,
+            )?,
+            initialized: BTreeSet::new(),
+        })
+    }
+
+    /// Register a successfully decorated chunk without propagating light.
+    pub fn initialize_resumed_light(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &mut GenerationSchedule,
+        light: &mut ResumedInitialLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && matches_resumed_revision(&light.identity, &light.revision, world),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            world.feature_entity_sources.completed.contains(&position),
+            "light chunk has not completed resumed features"
+        );
+        ensure!(
+            schedule.ready(position, GenerationStage::InitializeLight),
+            "light initialization dependencies are incomplete"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        schedule.run_light_initialization(
+            &world.terrain,
+            position,
+            &mut light.tracker,
+            registry,
+        )?;
+        light.initialized.insert(position);
+        Ok(())
+    }
+
+    /// Freeze registrations before propagation. Terrain mutation invalidates it.
+    pub fn seal_resumed_light(
+        &self,
+        world: &ResumedTerrainWorld,
+        light: ResumedInitialLight,
+    ) -> Result<ResumedStagedLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && matches_resumed_revision(&light.identity, &light.revision, world),
+            "light belongs to another terrain revision"
+        );
+        ensure!(!light.initialized.is_empty(), "no light chunks initialized");
+        Ok(ResumedStagedLight {
+            identity: light.identity,
+            revision: light.revision,
+            engine: native_session::worldgen::StagedGenerationLightEngine::new(light.tracker),
+            initialized: light.initialized,
+        })
+    }
+
+    /// Propagate one chunk only after every adjacent light input was actually
+    /// initialized by this tracker. The result is not a writable saved chunk.
+    pub fn propagate_resumed_light(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &mut GenerationSchedule,
+        light: &mut ResumedStagedLight,
+        position: native_world::loaded::ChunkPos,
+    ) -> Result<native_world::generation_light::VisibleLightSnapshot> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && matches_resumed_revision(&light.identity, &light.revision, world),
+            "light belongs to another terrain revision"
+        );
+        ensure!(
+            initialized_light_neighborhood(&light.initialized, position),
+            "light neighborhood is not initialized"
+        );
+        ensure!(
+            schedule.ready(position, GenerationStage::Light),
+            "light dependencies are incomplete"
+        );
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        schedule.run_light(&world.terrain, position, &mut light.engine, registry)
+    }
     /// Bind an independently captured, fixed initial light-engine revision to
     /// this intermediate terrain. The caller must establish its provenance,
     /// completeness and that no light sections have been registered or
@@ -2223,6 +2389,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn resumed_light_neighborhood_requires_all_columns_and_checked_coordinates() {
+        use native_world::loaded::ChunkPos;
+        let center = ChunkPos { x: -2, z: 3 };
+        let mut initialized = BTreeSet::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if (dx, dz) != (1, 1) {
+                    initialized.insert(ChunkPos {
+                        x: center.x + dx,
+                        z: center.z + dz,
+                    });
+                }
+            }
+        }
+        assert!(!initialized_light_neighborhood(&initialized, center));
+        initialized.insert(ChunkPos { x: -1, z: 4 });
+        assert!(initialized_light_neighborhood(&initialized, center));
+        assert!(!initialized_light_neighborhood(
+            &initialized,
+            ChunkPos { x: i32::MAX, z: 0 }
+        ));
+    }
+
+    #[test]
     fn resumed_feature_entity_coverage_requires_all_neighbors_and_no_unknown_passes() {
         use native_world::loaded::ChunkPos;
         let center = ChunkPos { x: 5, z: -3 };
@@ -3016,8 +3206,11 @@ mod tests {
             file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
             // BIOMES-stage entries cover two neighboring terrain results and
             // their captured biome neighborhoods.
-            for z in 1..=5 {
-                for x in 1..=5 {
+            for z in 0..=6 {
+                for x in 0..=6 {
+                    if z == 0 && matches!(x, 0 | 1 | 3) {
+                        continue;
+                    }
                     let mut biome_chunk = saved.clone();
                     let Tag::Compound(fields) = &mut biome_chunk.value else {
                         unreachable!()
@@ -3535,7 +3728,7 @@ mod tests {
             assert!(actual.restore_saved_biomes([position, position]).is_err());
             assert!(
                 actual
-                    .restore_saved_biomes([ChunkPos { x: 2, z: 0 }])
+                    .restore_saved_biomes([ChunkPos { x: 8, z: 0 }])
                     .is_err()
             );
             assert!(
@@ -3757,7 +3950,7 @@ mod tests {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
         gzip.write_all(&native_persistence::nbt::write(&updated_level)?)?;
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
-        let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
+        let positions = (0..=6).flat_map(|z| (0..=6).map(move |x| ChunkPos { x, z }));
         let context = reader.capture_generation_context(positions)?;
         assert_eq!(context.selection().enabled, ["vanilla", "file/custom"]);
         std::fs::write(
@@ -3933,6 +4126,73 @@ mod tests {
                 .is_err()
         );
         let no_structures_snapshot = terrain.terrain().snapshot();
+        // Complete the 3x3 feature neighborhood before registering its light
+        // inputs; the outer 5x5 terrain and 7x7 biomes are captured above.
+        for z in 1..=5 {
+            for x in 1..=5 {
+                if (2..=4).contains(&x) && (2..=4).contains(&z) {
+                    continue;
+                }
+                let chunk =
+                    actual.resume_saved_terrain(ChunkPos { x, z }, &[], &mut terrain_evaluator)?;
+                terrain.insert(&chunk)?;
+            }
+        }
+        use native_session::worldgen::schedule::GenerationStage;
+        schedule.request(center, GenerationStage::Light)?;
+        let imported = schedule
+            .requirements()
+            .map(|(pos, _)| {
+                let current = schedule.completed(pos).unwrap();
+                let stage = if (1..=5).contains(&pos.x) && (1..=5).contains(&pos.z) {
+                    current.max(GenerationStage::Terrain)
+                } else {
+                    current.max(GenerationStage::StructureStarts)
+                };
+                (pos, stage)
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(imported)?;
+        for z in 2..=4 {
+            for x in 2..=4 {
+                if x == 3 && z == 3 {
+                    continue;
+                }
+                let decoration = actual.prepare_saved_decoration(ChunkPos { x, z })?;
+                let columns = (z - 1..=z + 1).flat_map(|cz| {
+                    (x - 1..=x + 1).map(move |cx| native_world::loaded::ChunkPos { x: cx, z: cz })
+                });
+                let visible = native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(true, true, [], columns).context("light snapshot unavailable")?;
+                let visible = actual.bind_initial_feature_light(&terrain, visible)?;
+                actual.run_saved_features_with_initial_light(
+                    &mut terrain,
+                    &decoration,
+                    &mut schedule,
+                    &visible,
+                )?;
+            }
+        }
+        let mut initial = actual.begin_resumed_initial_light(&terrain)?;
+        for z in 2..=4 {
+            for x in 2..=4 {
+                actual.initialize_resumed_light(
+                    &terrain,
+                    &mut schedule,
+                    &mut initial,
+                    native_world::loaded::ChunkPos { x, z },
+                )?;
+            }
+        }
+        let mut staged = actual.seal_resumed_light(&terrain, initial)?;
+        let visible =
+            actual.propagate_resumed_light(&terrain, &mut schedule, &mut staged, center)?;
+        assert!(visible.raw_brightness([56, y, 56], 0).is_some());
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Light));
+        assert!(
+            actual
+                .propagate_resumed_light(&terrain, &mut schedule, &mut staged, center)
+                .is_err()
+        );
         let previous = Arc::new(native_core::beardifier::Beardifier::new(
             vec![],
             vec![],
@@ -4015,7 +4275,6 @@ mod tests {
             }
         }
         let mut schedule = GenerationSchedule::new();
-        use native_session::worldgen::schedule::GenerationStage;
         schedule.request(center, GenerationStage::Features)?;
         let restored = schedule
             .requirements()

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::structure_hash_order::{Insertion, StructureIdentityMap};
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::{BoundingBox, TerrainAdjustment, structure_start_bounds};
+use native_persistence::nbt::{JavaString, Tag};
 use native_resources::packs::ResourceId;
 use native_resources::structure_start::SimpleStructureStart;
 use native_world::loaded::ChunkPos;
@@ -93,6 +94,104 @@ impl OrderedStructureReferences {
     }
 }
 
+/// Information Java would discard while loading saved structure references.
+/// The original NBT must remain available when deciding whether to save.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscardedSavedReference {
+    InvalidCompound,
+    UnknownStructure(JavaString),
+    InvalidIdentifier(JavaString),
+    InvalidArray(JavaString),
+    OutsideRadius { structure: ResourceId, packed: i64 },
+}
+
+pub struct SavedStructureReferences {
+    pub references: OrderedStructureReferences,
+    pub discarded: Vec<DiscardedSavedReference>,
+}
+
+/// Rebuild Java's LongOpenHashSet from a saved `References` compound. The
+/// supplied registry must be the one used to open this world. A missing or
+/// non-compound field has the same empty view as Java; discarded data is
+/// reported and the caller must retain the original NBT for lossless saves.
+pub fn restore_saved_structure_references(
+    target: ChunkPos,
+    field: Option<&Tag>,
+    mut registered: impl FnMut(&ResourceId) -> Result<bool>,
+) -> Result<SavedStructureReferences> {
+    let mut membership = StructureReferences::new();
+    let mut ordered = BTreeMap::new();
+    let mut discarded = Vec::new();
+    let Some(Tag::Compound(entries)) = field else {
+        if field.is_some() {
+            discarded.push(DiscardedSavedReference::InvalidCompound);
+        }
+        return Ok(SavedStructureReferences {
+            references: OrderedStructureReferences {
+                membership,
+                ordered,
+                structure_order: None,
+            },
+            discarded,
+        });
+    };
+    let mut seen = BTreeSet::new();
+    for (name, value) in entries {
+        let id = match String::from_utf16(&name.0)
+            .ok()
+            .and_then(|name| ResourceId::parse(&name).ok())
+        {
+            Some(id) => id,
+            None => {
+                discarded.push(DiscardedSavedReference::InvalidIdentifier(name.clone()));
+                continue;
+            }
+        };
+        ensure!(
+            seen.insert(id.clone()),
+            "ambiguous duplicate structure reference ID"
+        );
+        if !registered(&id)? {
+            discarded.push(DiscardedSavedReference::UnknownStructure(name.clone()));
+            continue;
+        }
+        let Tag::LongArray(values) = value else {
+            discarded.push(DiscardedSavedReference::InvalidArray(name.clone()));
+            continue;
+        };
+        let mut filtered = Vec::with_capacity(values.len());
+        for &packed in values {
+            let x = packed as u32 as i32;
+            let z = ((packed as u64) >> 32) as u32 as i32;
+            let dx = target.x.wrapping_sub(x).wrapping_abs();
+            let dz = target.z.wrapping_sub(z).wrapping_abs();
+            if dx.max(dz) > 8 {
+                discarded.push(DiscardedSavedReference::OutsideRadius {
+                    structure: id.clone(),
+                    packed,
+                });
+            } else {
+                filtered.push(packed);
+            }
+        }
+        let mut set = ReferenceSet::with_expected(filtered.len())?;
+        for packed in filtered {
+            set.insert(packed);
+        }
+        let values = set.ordered();
+        membership.insert(id.clone(), values.iter().copied().collect());
+        ordered.insert(id, values);
+    }
+    Ok(SavedStructureReferences {
+        references: OrderedStructureReferences {
+            membership,
+            ordered,
+            structure_order: None,
+        },
+        discarded,
+    })
+}
+
 /// Insert-only default fastutil LongOpenHashSet, as used by ChunkAccess.
 struct ReferenceSet {
     slots: Vec<Option<u64>>,
@@ -111,6 +210,23 @@ impl Default for ReferenceSet {
 }
 
 impl ReferenceSet {
+    fn with_expected(expected: usize) -> Result<Self> {
+        let needed = expected
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(2))
+            .context("structure reference capacity overflow")?
+            / 3;
+        let size = needed
+            .max(2)
+            .checked_next_power_of_two()
+            .context("structure reference capacity overflow")?;
+        ensure!(size <= (1 << 30), "too many saved structure references");
+        Ok(Self {
+            slots: vec![None; size],
+            zero: false,
+            len: 0,
+        })
+    }
     fn find(&self, key: u64) -> usize {
         let h = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let h = h ^ (h >> 32);
@@ -264,6 +380,67 @@ fn collect_with_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_references_report_discarded_data_and_rebuild_sets() {
+        let target = ChunkPos { x: 0, z: 0 };
+        let id = ResourceId::parse("minecraft:buried_treasure").unwrap();
+        let data = Tag::Compound(vec![
+            (
+                "minecraft:buried_treasure".into(),
+                Tag::LongArray(vec![0, 1, 1, -1, 9]),
+            ),
+            ("example:unknown".into(), Tag::LongArray(vec![0])),
+            ("minecraft:swamp_hut".into(), Tag::Int(7)),
+        ]);
+        let restored = restore_saved_structure_references(target, Some(&data), |id| {
+            Ok(id.namespace == "minecraft")
+        })
+        .unwrap();
+        assert_eq!(
+            restored.references.membership()[&id],
+            BTreeSet::from([0, 1, -1])
+        );
+        assert_eq!(restored.references.order(&id).unwrap().len(), 3);
+        assert!(restored.references.structure_order().is_none());
+        assert_eq!(restored.discarded.len(), 3);
+        assert!(matches!(
+            restored.discarded[0],
+            DiscardedSavedReference::OutsideRadius { packed: 9, .. }
+        ));
+        assert!(matches!(
+            restored.discarded[1],
+            DiscardedSavedReference::UnknownStructure(_)
+        ));
+        assert!(matches!(
+            restored.discarded[2],
+            DiscardedSavedReference::InvalidArray(_)
+        ));
+        let aliases = Tag::Compound(vec![
+            ("buried_treasure".into(), Tag::LongArray(vec![])),
+            ("minecraft:buried_treasure".into(), Tag::LongArray(vec![])),
+        ]);
+        assert!(restore_saved_structure_references(target, Some(&aliases), |_| Ok(true)).is_err());
+        assert!(
+            restore_saved_structure_references(target, Some(&data), |_| anyhow::bail!(
+                "registry error"
+            ))
+            .is_err()
+        );
+        assert!(
+            restore_saved_structure_references(target, None, |_| Ok(true))
+                .unwrap()
+                .references
+                .membership()
+                .is_empty()
+        );
+        assert_eq!(
+            restore_saved_structure_references(target, Some(&Tag::Int(7)), |_| Ok(true))
+                .unwrap()
+                .discarded,
+            vec![DiscardedSavedReference::InvalidCompound]
+        );
+    }
 
     #[test]
     fn piece_membership_checks_full_piece_bounds_and_validates_every_box() {

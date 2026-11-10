@@ -122,6 +122,64 @@ impl PreparedExistingGenerator {
         Ok(restored)
     }
 
+    /// Restore the effective reference sets from one captured saved chunk.
+    /// The returned report identifies data Java would discard on loading.
+    pub fn restore_saved_structure_references(
+        &mut self,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<native_session::worldgen::structure_references::SavedStructureReferences> {
+        use native_session::worldgen::{
+            schedule::GenerationStage, structure_references::restore_saved_structure_references,
+        };
+        let registry: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/structure")?
+            .into_iter()
+            .collect();
+        let saved = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&position)
+            .context("structure chunk was not captured")?
+            .terrain
+            .as_ref()
+            .context("saved structure chunk is missing")?;
+        let status = saved
+            .status
+            .as_ref()
+            .context("saved chunk status is missing")?;
+        let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+        ensure!(
+            GenerationStage::from_id(&status)
+                .is_some_and(|stage| stage >= GenerationStage::StructureReferences),
+            "saved chunk has not generated structure references"
+        );
+        let Tag::Compound(root) = &saved.document.value else {
+            bail!("saved chunk is not a compound")
+        };
+        let mut structures = root.iter().filter(|(name, _)| name.matches("structures"));
+        let structure = structures.next().map(|(_, tag)| tag);
+        ensure!(structures.next().is_none(), "duplicate structure data");
+        let references = if let Some(Tag::Compound(fields)) = structure {
+            let mut entries = fields.iter().filter(|(name, _)| name.matches("References"));
+            let references = entries.next().map(|(_, tag)| tag);
+            ensure!(entries.next().is_none(), "duplicate structure references");
+            references
+        } else {
+            structure
+        };
+        restore_saved_structure_references(
+            native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            references,
+            |id| Ok(registry.contains(id)),
+        )
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -787,6 +845,19 @@ mod tests {
                         native_persistence::postprocessing::encode(&marks),
                     ),
                     (
+                        "structures".into(),
+                        Tag::Compound(vec![(
+                            "References".into(),
+                            Tag::Compound(vec![
+                                (
+                                    "minecraft:buried_treasure".into(),
+                                    Tag::LongArray(vec![0, 1, 9]),
+                                ),
+                                ("example:unknown".into(), Tag::LongArray(vec![0])),
+                            ]),
+                        )]),
+                    ),
+                    (
                         "sections".into(),
                         Tag::List {
                             element_type: TagType::Compound,
@@ -855,6 +926,13 @@ mod tests {
             assert!(actual.generate_structures);
             assert_eq!(actual.inputs().settings().seed(), -42);
             let position = ChunkPos { x: 0, z: 0 };
+            let references = actual.restore_saved_structure_references(position)?;
+            let treasure = ResourceId::parse("minecraft:buried_treasure")?;
+            assert_eq!(
+                references.references.membership()[&treasure],
+                BTreeSet::from([0, 1])
+            );
+            assert_eq!(references.discarded.len(), 2);
             let restored = actual.restore_saved_biomes([position])?;
             let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
             let mut neighborhood = actual.generator.biome_neighborhood()?;

@@ -8296,7 +8296,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
     fn fresh_batch_records_vanilla_jigsaw_cushion() -> Result<()> {
         run_fresh_template_batch(32, None)
     }
@@ -8381,6 +8381,69 @@ mod tests {
         ensure!(
             output.status.success(),
             "Java shipwreck region: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    fn java_rewrite_generated_cushion_region(
+        game: &std::path::Path,
+        directory: &std::path::Path,
+        pos: native_world::loaded::ChunkPos,
+    ) -> Result<()> {
+        use std::{path::PathBuf, process::Command};
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let classes = tempfile::tempdir()?;
+        let version = game.join("versions/26.3");
+        let metadata: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        ensure!(
+            metadata["id"] == "26.3",
+            "wrong installed Minecraft version"
+        );
+        let mut paths = vec![version.join("26.3.jar"), classes.path().to_path_buf()];
+        for library in metadata["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let source = classes.path().join("GeneratedCushionRegionOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/GeneratedCushionRegionOracle.java"),
+        )?;
+        let compiled = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let output = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(classpath)
+            .arg("GeneratedCushionRegionOracle")
+            .arg(directory)
+            .arg(pos.x.to_string())
+            .arg(pos.z.to_string())
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "Java cushion region: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -8726,7 +8789,7 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if feature_kind == 31 {
+            if matches!(feature_kind, 31 | 32) {
                 terrain_definition["settings"]["disable_mob_generation"] = json!(true);
             }
             if (4..=31).contains(&feature_kind) {
@@ -8806,7 +8869,7 @@ mod tests {
                 source
             };
             let save_targets: BTreeSet<_> = [source, target].into_iter().collect();
-            let light_targets: BTreeSet<_> = if feature_kind == 31 {
+            let light_targets: BTreeSet<_> = if matches!(feature_kind, 31 | 32) {
                 save_targets
                     .iter()
                     .flat_map(|pos| {
@@ -8904,7 +8967,7 @@ mod tests {
             batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
             batch.enable_light_initialization(registry)?;
             batch.request_features(target)?;
-            if feature_kind == 31 {
+            if matches!(feature_kind, 31 | 32) {
                 batch.request_light_initialization_many(light_targets.iter().copied())?;
             }
             let mut failed = false;
@@ -8973,7 +9036,7 @@ mod tests {
             if !failed {
                 assert_eq!(
                     batch.schedule().completed(target),
-                    Some(if feature_kind == 31 {
+                    Some(if matches!(feature_kind, 31 | 32) {
                         schedule::GenerationStage::InitializeLight
                     } else {
                         schedule::GenerationStage::Features
@@ -9067,6 +9130,66 @@ mod tests {
                     assert_eq!(
                         entities[0].get("block_pos"),
                         Some(&Tag::IntArray(origin.to_vec()))
+                    );
+                    let expected = entities.to_vec();
+                    batch.seal_for_light_propagation()?;
+                    batch.request_light(target)?;
+                    while batch
+                        .step(
+                            &mut data,
+                            &mut |_| anyhow::bail!("unexpected terrain"),
+                            &mut |_| anyhow::bail!("unexpected state"),
+                        )?
+                        .is_some()
+                    {}
+                    batch.request_spawn_without_mobs(target, false)?;
+                    while batch
+                        .step(
+                            &mut data,
+                            &mut |_| anyhow::bail!("unexpected terrain"),
+                            &mut |_| anyhow::bail!("unexpected state"),
+                        )?
+                        .is_some()
+                    {}
+                    assert_eq!(
+                        batch.complete_generated_entity_records(target)?,
+                        Some(expected.as_slice())
+                    );
+                    let mut postprocess = batch.begin_generated_postprocessing([target], 0, 0)?;
+                    postprocess.set_water_source_conversion(false)?;
+                    while !postprocess.poll(target, 256)? {}
+                    let processed = postprocess.finish()?;
+                    let prepared = batch.prepare_structure_region_drafts(&processed, [target], 1)?;
+                    let key = (
+                        native_persistence::save::FreshRegionKind::Entities,
+                        target.x.div_euclid(32),
+                        target.z.div_euclid(32),
+                    );
+                    let region = prepared
+                        .regions
+                        .get(&key)
+                        .context("cushion entity region missing")?;
+                    let directory = tempfile::tempdir()?;
+                    let path = directory.path().join(format!("r.{}.{}.mca", key.1, key.2));
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    assert!(region.write_staged(&mut file)?.is_empty());
+                    drop(file);
+                    java_rewrite_generated_cushion_region(&game, directory.path(), target)?;
+                    let saved = native_persistence::anvil::RegionReader::open(&path)?
+                        .read_chunk(target.x, target.z)?
+                        .context("saved cushion chunk missing")?;
+                    assert_eq!(
+                        canonical_nbt(saved.value),
+                        canonical_nbt(
+                            native_persistence::generated_chunk::assemble_entity_chunk(
+                                target, &expected,
+                            )?
+                            .value
+                        )
                     );
                 }
                 if (30..=31).contains(&feature_kind) {

@@ -1651,7 +1651,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "requires Minecraft 26.3 and a temporary world"]
+    #[ignore = "requires Minecraft 26.3, Java 25 JDK and a temporary world"]
     fn captured_vanilla_world_prepares_each_noise_dimension() -> Result<()> {
         use flate2::{Compression, write::GzEncoder};
         use native_persistence::{
@@ -1665,6 +1665,42 @@ mod tests {
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
         let temp = tempfile::tempdir()?;
         let root = temp.path();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME")
+            .or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon"))
+            .join("bin");
+        let version = game.join("versions/26.3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
+        let mut paths = vec![version.join("26.3.jar"), root.to_owned()];
+        for library in manifest["libraries"]
+            .as_array()
+            .context("missing libraries")?
+        {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths)?;
+        let oracle = root.join("ResumedTerrainOracle.java");
+        std::fs::write(
+            &oracle,
+            include_str!("../../tests/java/ResumedTerrainOracle.java"),
+        )?;
+        let compiled = std::process::Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&oracle)
+            .output()?;
+        ensure!(
+            compiled.status.success(),
+            "Java oracle compilation failed: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
         let mut source = ResourceStack::open(&game)?;
         let worldgen = draft_baked_worldgen_settings(
             &mut source,
@@ -2306,6 +2342,71 @@ mod tests {
             assert_eq!(resumed_world.sources().len(), 2);
             assert_eq!(resumed_world.terrain().snapshot().chunks.len(), 2);
             let metadata = actual.draft_resumed_metadata(&mut resumed_world, &draft)?;
+            let input = root.join("resumed-terrain.nbt");
+            let output = root.join("java-resumed-terrain.nbt");
+            std::fs::write(&input, native_persistence::nbt::write(metadata.document())?)?;
+            let checked = std::process::Command::new(java.join("java.exe"))
+                .arg("-cp")
+                .arg(&classpath)
+                .arg("ResumedTerrainOracle")
+                .arg(&input)
+                .arg(lighting.min_y.to_string())
+                .arg(lighting.height.to_string())
+                .arg(&output)
+                .output()?;
+            ensure!(
+                checked.status.success(),
+                "{name} Java terrain validation failed: {}\n{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
+            let java_document = native_persistence::nbt::read(&std::fs::read(output)?)?;
+            let expected =
+                native_persistence::palette::decode_sections(&metadata.document().value)?;
+            let rewritten = native_persistence::palette::decode_sections(&java_document.value)?;
+            assert_eq!(expected.len(), rewritten.len(), "{name}: section count");
+            for source_section in expected {
+                let java_section = rewritten
+                    .iter()
+                    .find(|section| section.y == source_section.y)
+                    .context("Java section missing")?;
+                let source_blocks = source_section.blocks.context("source blocks missing")?;
+                let java_blocks = java_section
+                    .blocks
+                    .as_ref()
+                    .context("Java blocks missing")?;
+                for y in 0..16 {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            // Java may omit properties equal to their default.
+                            // The oracle compares the complete decoded states.
+                            assert_eq!(
+                                source_blocks.block(x, y, z).map(|state| &state.name),
+                                java_blocks.block(x, y, z).map(|state| &state.name),
+                                "{name}: block at section {}, {x}, {y}, {z}",
+                                source_section.y
+                            );
+                        }
+                    }
+                }
+                let source_biomes = source_section.biomes.context("source biomes missing")?;
+                let java_biomes = java_section
+                    .biomes
+                    .as_ref()
+                    .context("Java biomes missing")?;
+                for y in 0..4 {
+                    for z in 0..4 {
+                        for x in 0..4 {
+                            assert_eq!(
+                                source_biomes.biome(x, y, z),
+                                java_biomes.biome(x, y, z),
+                                "{name}: biome at section {}, {x}, {y}, {z}",
+                                source_section.y
+                            );
+                        }
+                    }
+                }
+            }
             assert!(metadata.matches_source(&captured_source)?);
             assert!(!metadata.matches_source(&stale)?);
             assert_eq!(

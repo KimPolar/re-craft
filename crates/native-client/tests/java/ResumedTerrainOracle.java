@@ -41,19 +41,22 @@ public class ResumedTerrainOracle {
             original = NbtIo.read((DataInput) input);
         }
         // This status change is confined to the disposable test input.
-        original.putString("Status", "minecraft:terrain");
+        boolean features = args.length > 4 && args[4].equals("features");
+        var expectedStatus = features ? ChunkStatus.FEATURES : ChunkStatus.TERRAIN;
+        original.putString("Status", features ? "minecraft:features" : "minecraft:terrain");
         var height = LevelHeightAccessor.create(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
         var first = SerializableChunkData.parse(height, factory, original);
-        if (first == null || first.chunkStatus() != ChunkStatus.TERRAIN) throw new AssertionError("terrain status");
+        if (first == null || first.chunkStatus() != expectedStatus) throw new AssertionError("generation status");
         var rewritten = first.write();
         try (var output = new java.io.DataOutputStream(Files.newOutputStream(Path.of(args[3])))) {
             NbtIo.write(rewritten, (java.io.DataOutput) output);
         }
         var second = SerializableChunkData.parse(height, factory, rewritten);
-        if (second == null || second.chunkStatus() != ChunkStatus.TERRAIN || first.sectionData().size() != second.sectionData().size())
-            throw new AssertionError("terrain or sections changed");
-        if (!first.packedTicks().blocks().isEmpty() || !first.packedTicks().fluids().isEmpty()
+        if (second == null || second.chunkStatus() != expectedStatus || first.sectionData().size() != second.sectionData().size())
+            throw new AssertionError("generation status or sections changed");
+        if ((!features && !first.packedTicks().blocks().isEmpty()) || !first.packedTicks().fluids().isEmpty()
                 || !first.packedTicks().equals(second.packedTicks())) throw new AssertionError("ticks changed");
+        if (features && first.packedTicks().blocks().isEmpty()) throw new AssertionError("generated block tick missing");
         if (!Objects.equals(first.entities(), second.entities()) || !Objects.equals(first.blockEntities(), second.blockEntities()))
             throw new AssertionError("entities changed");
         for (var before : first.sectionData()) {
@@ -75,9 +78,20 @@ public class ResumedTerrainOracle {
         }
         for (var key : new String[]{"structures", "PostProcessing"})
             if (!Objects.equals(original.get(key), rewritten.get(key))) throw new AssertionError(key + " changed");
+        if (features) {
+            for (var key : new String[]{"block_entities", "block_ticks", "fluid_ticks"})
+                if (!Objects.equals(original.get(key), rewritten.get(key))) throw new AssertionError(key + " changed");
+            boolean chest = false;
+            var entities = original.getListOrEmpty("block_entities");
+            for (int i = 0; i < entities.size(); i++)
+                if (entities.getCompoundOrEmpty(i).getStringOr("id", "").equals("minecraft:chest")) chest = true;
+            if (!chest) throw new AssertionError("generated chest entity missing");
+        }
         var beforeMaps = original.getCompoundOrEmpty("Heightmaps");
         var afterMaps = rewritten.getCompoundOrEmpty("Heightmaps");
         for (var key : new String[]{"WORLD_SURFACE_WG", "OCEAN_FLOOR_WG"})
             if (beforeMaps.get(key) == null || !Objects.equals(beforeMaps.get(key), afterMaps.get(key))) throw new AssertionError(key + " changed");
+        for (var key : new String[]{"WORLD_SURFACE", "OCEAN_FLOOR", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"})
+            if (beforeMaps.get(key) != null && !Objects.equals(beforeMaps.get(key), afterMaps.get(key))) throw new AssertionError(key + " changed");
     }
 }

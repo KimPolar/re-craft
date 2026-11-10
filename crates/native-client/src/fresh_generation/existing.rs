@@ -133,6 +133,26 @@ pub(crate) struct ResumedStructureDraft {
     document: NamedTag,
 }
 
+/// A source-bound, point-in-time feature snapshot. It is not a writable chunk.
+pub(crate) struct ResumedFeatureDraft {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    source_nbt: Vec<u8>,
+    document: NamedTag,
+}
+
+impl ResumedFeatureDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        Ok(native_persistence::nbt::write(source)? == self.source_nbt)
+    }
+    pub fn matches_world(&self, world: &ResumedTerrainWorld) -> bool {
+        Arc::ptr_eq(&self.identity, &world.identity) && Arc::ptr_eq(&self.revision, &world.revision)
+    }
+}
+
 impl ResumedStructureDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -168,6 +188,7 @@ pub(crate) struct ResumedTerrainWorld {
     sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
     feature_touched: BTreeSet<native_world::loaded::ChunkPos>,
     treasure_starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+    revision: Arc<()>,
 }
 
 impl ResumedSavedTerrain {
@@ -182,6 +203,7 @@ impl ResumedSavedTerrain {
             sources: BTreeMap::from([(self.position, self.source)]),
             feature_touched: BTreeSet::new(),
             treasure_starts: BTreeMap::new(),
+            revision: Arc::new(()),
         }
     }
 }
@@ -209,6 +231,7 @@ impl ResumedTerrainWorld {
         self.terrain.insert(&chunk.terrain)?;
         self.sources
             .insert(chunk.position, Arc::clone(&chunk.source));
+        self.revision = Arc::new(());
         Ok(())
     }
 }
@@ -303,6 +326,146 @@ impl PreparedExistingGenerator {
         }
         native_persistence::nbt::write(&document)?;
         Ok(ResumedStructureDraft {
+            source_nbt,
+            document,
+        })
+    }
+
+    /// Capture the currently generated feature data with its original source.
+    /// Entity sidecars, later neighboring features, lighting, live state and
+    /// save dependencies are not established by this partial draft.
+    pub fn draft_resumed_feature_chunk(
+        &mut self,
+        world: &ResumedTerrainWorld,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<ResumedFeatureDraft> {
+        use native_world::loaded::ChunkPos;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity),
+            "terrain belongs to another generation capture"
+        );
+        let key = ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            world.feature_touched.contains(&key),
+            "chunk has not been reached by a feature pass"
+        );
+        let saved = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&position)
+            .and_then(|source| source.terrain.as_ref())
+            .context("saved terrain source missing")?;
+        validate_empty_biomes_target(saved)?;
+        let source = Arc::clone(&saved.document);
+        ensure!(
+            world
+                .sources
+                .get(&position)
+                .is_some_and(|value| Arc::ptr_eq(value, &source)),
+            "resumed terrain source differs"
+        );
+        reject_saved_lighting(saved)?;
+        let original_maps = preserved_heightmap_fields(&source)?;
+        validate_empty_saved_postprocessing(&source, self.lighting.min_y, self.lighting.height)?;
+        let source_nbt = native_persistence::nbt::write(&source)?;
+        let mut document = if world.treasure_starts.keys().any(|(_, pos)| *pos == key) {
+            self.draft_resumed_structure_starts(world, position)?
+                .document
+        } else {
+            (*source).clone()
+        };
+        let biome_ids: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        let assets = self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?;
+        let snapshot = world.terrain.snapshot();
+        let sections = native_persistence::generated_section::encode_generated_sections(
+            &snapshot,
+            key,
+            self.lighting.min_y,
+            self.lighting.height,
+            self.lighting.has_skylight,
+            |state| {
+                assets
+                    .blocks
+                    .is_canonical_state(&state.name, &state.properties)
+            },
+            |name| {
+                ResourceId::parse(name)
+                    .ok()
+                    .is_some_and(|id| biome_ids.contains(&id))
+            },
+        )?;
+        let original_sections =
+            unique_root_field(&source, "sections")?.context("saved sections missing")?;
+        let sections = native_persistence::generated_section::merge_biome_stage_blocks(
+            original_sections,
+            &sections,
+        )?;
+        let block_entities = world
+            .terrain
+            .generated_block_entity_data(key, &assets.blocks)?;
+        let block_ticks = native_persistence::generated_ticks::encode_block_ticks(
+            key,
+            snapshot
+                .saved_block_ticks
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            |id| assets.block_ids.contains(id),
+        )?;
+        let fluid_ticks = native_persistence::generated_ticks::encode_fluid_ticks(
+            key,
+            snapshot
+                .saved_fluid_ticks
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )?;
+        let Tag::Compound(generated_maps) = world.terrain.generated_heightmap_data(key)? else {
+            unreachable!()
+        };
+        ensure!(
+            generated_maps
+                .iter()
+                .any(|(name, _)| name.matches("WORLD_SURFACE_WG"))
+                && generated_maps
+                    .iter()
+                    .any(|(name, _)| name.matches("OCEAN_FLOOR_WG")),
+            "generated world-generation heightmaps are missing"
+        );
+        let mut maps = original_maps;
+        maps.extend(generated_maps);
+        let marks = world
+            .terrain
+            .postprocessing_marks_to_date(key)
+            .context("generation postprocessing is missing")?;
+        let marks = native_persistence::postprocessing::encode(&marks);
+        native_persistence::postprocessing::decode(
+            &marks,
+            self.lighting.min_y,
+            self.lighting.height,
+        )?;
+        replace_unique_root_field(&mut document, "sections", sections)?;
+        replace_unique_root_field(&mut document, "Heightmaps", Tag::Compound(maps))?;
+        replace_unique_root_field(&mut document, "PostProcessing", marks)?;
+        replace_unique_root_field(&mut document, "block_entities", block_entities)?;
+        replace_unique_root_field(&mut document, "block_ticks", block_ticks)?;
+        replace_unique_root_field(&mut document, "fluid_ticks", fluid_ticks)?;
+        native_persistence::nbt::write(&document)?;
+        Ok(ResumedFeatureDraft {
+            identity: Arc::clone(&self.identity),
+            revision: Arc::clone(&world.revision),
             source_nbt,
             document,
         })
@@ -623,6 +786,7 @@ impl PreparedExistingGenerator {
             world.treasure_starts.append(&mut structures.starts);
         }
         world.feature_touched.extend(positions);
+        world.revision = Arc::new(());
         Ok(result)
     }
 
@@ -1554,6 +1718,24 @@ fn validate_empty_saved_postprocessing(document: &NamedTag, min_y: i32, height: 
     Ok(())
 }
 
+fn reject_saved_lighting(saved: &native_persistence::world::LoadedChunk) -> Result<()> {
+    ensure!(
+        !saved.block_light_correct()
+            && saved
+                .sections
+                .iter()
+                .all(|section| section.block_light.is_none() && section.sky_light.is_none()),
+        "saved lighting cannot be merged into changed terrain"
+    );
+    if let Some(light) = unique_root_field(&saved.document, "isLightOn")? {
+        ensure!(
+            matches!(light, Tag::Byte(0)),
+            "saved lighting state is unsupported"
+        );
+    }
+    Ok(())
+}
+
 fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) -> Result<()> {
     use native_session::worldgen::schedule::GenerationStage;
     ensure!(
@@ -1948,6 +2130,41 @@ mod tests {
             })
         };
         assert!(validate_empty_biomes_target(&loaded(&document)?).is_ok());
+        assert!(reject_saved_lighting(&loaded(&document)?).is_ok());
+        for (marker, allowed) in [
+            (Tag::Byte(0), true),
+            (Tag::Byte(1), false),
+            (Tag::Byte(2), false),
+            (Tag::Int(0), false),
+        ] {
+            let mut light = document.clone();
+            let Tag::Compound(fields) = &mut light.value else {
+                unreachable!()
+            };
+            fields.push(("isLightOn".into(), marker));
+            assert_eq!(reject_saved_lighting(&loaded(&light)?).is_ok(), allowed);
+        }
+        let mut duplicate = document.clone();
+        let Tag::Compound(fields) = &mut duplicate.value else {
+            unreachable!()
+        };
+        fields.push(("isLightOn".into(), Tag::Byte(0)));
+        fields.push(("isLightOn".into(), Tag::Byte(0)));
+        assert!(reject_saved_lighting(&loaded(&duplicate)?).is_err());
+        for name in ["BlockLight", "SkyLight"] {
+            let mut light = document.clone();
+            let Tag::Compound(fields) = &mut light.value else {
+                unreachable!()
+            };
+            let Tag::List { values, .. } = &mut fields[0].1 else {
+                unreachable!()
+            };
+            let Tag::Compound(section) = &mut values[0] else {
+                unreachable!()
+            };
+            section.push((name.into(), Tag::ByteArray(vec![0; 2048])));
+            assert!(reject_saved_lighting(&loaded(&light)?).is_err());
+        }
         let mut later = loaded(&document)?;
         later.status = Some("minecraft:terrain".into());
         assert!(validate_empty_biomes_target(&later).is_err());
@@ -3269,7 +3486,7 @@ mod tests {
                 .context("vanilla plains biome missing")?,
         )?;
         custom_biome["features"] = json!([[{
-            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
             "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
@@ -3494,7 +3711,7 @@ mod tests {
             native_persistence::nbt::write(&worldgen)?,
         )?;
         custom_biome["features"] = json!([[{
-            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
             "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
@@ -3628,6 +3845,26 @@ mod tests {
         file.write_all(&vec![0; sectors * 4096 - encoded.len() - 5])?;
         file.seek(SeekFrom::Start((3 + 3 * 32) * 4))?;
         file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+        // Extra biome-stage neighbors let the test expand this same capture
+        // after taking a feature snapshot and verify revision invalidation.
+        for z in 1..=5 {
+            let mut neighbor = (**original_document).clone();
+            replace_unique_root_field(&mut neighbor, "xPos", Tag::Int(6))?;
+            replace_unique_root_field(&mut neighbor, "zPos", Tag::Int(z))?;
+            let bytes = native_persistence::nbt::write(&neighbor)?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            let sectors = (bytes.len() + 5).div_ceil(4096);
+            ensure!(
+                offset % 4096 == 0 && sectors < 256 && offset / 4096 < (1 << 24),
+                "invalid test region entry"
+            );
+            file.write_all(&(u32::try_from(bytes.len() + 1)?).to_be_bytes())?;
+            file.write_all(&[3])?;
+            file.write_all(&bytes)?;
+            file.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
+            file.seek(SeekFrom::Start(((6 + z * 32) * 4) as u64))?;
+            file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+        }
         drop(file);
         let session = reader
             .session_guard()
@@ -3635,7 +3872,7 @@ mod tests {
         drop(reader);
         let mut reader =
             WorldReader::open_with_session(root, DimensionId::parse("overworld")?, session)?;
-        let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
+        let positions = (1..=5).flat_map(|z| (1..=6).map(move |x| ChunkPos { x, z }));
         let context = reader.capture_generation_context(positions)?;
         let mut restored = prepare_existing_generator(context, &game)?;
         let decoration = restored.prepare_saved_decoration(saved_center)?;
@@ -3770,6 +4007,145 @@ mod tests {
             String::from_utf8_lossy(&checked.stdout),
             String::from_utf8_lossy(&checked.stderr)
         );
+        let treasure_source = Arc::clone(&treasure.source);
+        let feature = restored.draft_resumed_feature_chunk(&terrain, saved_center)?;
+        assert!(feature.matches_source(&treasure_source)?);
+        assert!(feature.matches_world(&terrain));
+        assert_eq!(
+            feature.document().value.get("Status"),
+            Some(&Tag::String("minecraft:biomes".into()))
+        );
+        assert_eq!(
+            feature.document().value.get("custom_chunk"),
+            Some(&Tag::Int(42))
+        );
+        assert_eq!(
+            feature.document().value.get("structures"),
+            draft.document().value.get("structures")
+        );
+        assert_eq!(
+            feature.document().value.get("PostProcessing"),
+            Some(&terrain.terrain().generated_postprocessing_data(center)?)
+        );
+        assert!(
+            feature
+                .document()
+                .value
+                .get("Heightmaps")
+                .unwrap()
+                .get("example:opaque")
+                .is_some()
+        );
+        let Tag::List {
+            values: block_entities,
+            ..
+        } = feature
+            .document()
+            .value
+            .get("block_entities")
+            .context("block entities missing")?
+        else {
+            panic!()
+        };
+        assert!(block_entities.iter().any(
+            |tag| matches!(tag.get("id"), Some(Tag::String(id)) if id.matches("minecraft:chest"))
+        ));
+        let Tag::List {
+            values: block_ticks,
+            ..
+        } = feature
+            .document()
+            .value
+            .get("block_ticks")
+            .context("block ticks missing")?
+        else {
+            panic!()
+        };
+        assert!(block_ticks.iter().any(|tick| {
+            matches!(tick.get("i"), Some(Tag::String(id)) if id.matches("minecraft:melon"))
+                && tick.get("x") == Some(&Tag::Int(56))
+                && tick.get("y") == Some(&Tag::Int(restored.lighting.min_y + 8))
+                && tick.get("z") == Some(&Tag::Int(56))
+        }));
+        let sections = native_persistence::palette::decode_sections(&feature.document().value)?;
+        let section = sections
+            .iter()
+            .find(|section| i32::from(section.y) == y.div_euclid(16))
+            .context("chest section missing")?;
+        let block = section
+            .blocks
+            .as_ref()
+            .context("chest blocks missing")?
+            .block(
+                x.rem_euclid(16) as usize,
+                y.rem_euclid(16) as usize,
+                z.rem_euclid(16) as usize,
+            )
+            .context("chest block missing")?;
+        assert!(block.name.matches("minecraft:chest"));
+        assert!(
+            restored
+                .run_saved_features(&mut terrain, &decoration, &mut schedule)
+                .is_err()
+        );
+        assert!(feature.matches_world(&terrain));
+        let feature_input = root.join("feature-draft.nbt");
+        let feature_output = root.join("feature-java-roundtrip.nbt");
+        std::fs::write(
+            &feature_input,
+            native_persistence::nbt::write(feature.document())?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedTerrainOracle")
+            .arg(&feature_input)
+            .arg(restored.lighting.min_y.to_string())
+            .arg(restored.lighting.height.to_string())
+            .arg(&feature_output)
+            .arg("features")
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java feature draft validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        for z in 2..=4 {
+            let next = restored.resume_saved_terrain(ChunkPos { x: 5, z }, &[], &mut evaluator)?;
+            terrain.insert(&next)?;
+        }
+        assert!(!feature.matches_world(&terrain));
+        assert!(feature.matches_source(&treasure_source)?);
+        let after_insert = restored.draft_resumed_feature_chunk(&terrain, saved_center)?;
+        assert!(after_insert.matches_world(&terrain));
+        let neighbor = native_world::loaded::ChunkPos { x: 4, z: 3 };
+        schedule.request(neighbor, GenerationStage::Features)?;
+        let added = schedule
+            .requirements()
+            .filter_map(|(position, _)| {
+                let saved = ChunkPos {
+                    x: position.x,
+                    z: position.z,
+                };
+                let stage = if terrain.sources().contains_key(&saved) {
+                    GenerationStage::Terrain
+                } else {
+                    GenerationStage::StructureStarts
+                };
+                (schedule
+                    .completed(position)
+                    .is_some_and(|current| current < stage))
+                .then_some((position, stage))
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(added)?;
+        let neighbor_decoration = restored.prepare_saved_decoration(ChunkPos { x: 4, z: 3 })?;
+        assert_eq!(
+            restored.run_saved_features(&mut terrain, &neighbor_decoration, &mut schedule)?,
+            vec![true]
+        );
+        assert!(!after_insert.matches_world(&terrain));
         Ok(())
     }
 }

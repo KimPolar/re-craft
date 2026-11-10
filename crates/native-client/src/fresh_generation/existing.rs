@@ -20,12 +20,39 @@ pub(crate) struct PreparedExistingGenerator {
     identity: Arc<()>,
     terrain_assets: Option<SavedTerrainAssets>,
     heightmap_tags: Option<native_resources::heightmap_tags::HeightmapTags>,
+    feature_schedule: Option<Arc<native_resources::feature_order::FeatureSchedule>>,
 }
 
 struct SavedTerrainAssets {
     tags: CarverBlockTags,
     blocks: native_resources::block_registry::GeneratedBlockRegistry,
     carvers: native_resources::carver::schedule::CarverCache,
+}
+
+/// Decoration inputs from one captured biome neighborhood and pack snapshot.
+/// This plan does not place features or establish terrain or save readiness.
+pub(crate) struct SavedDecorationContext {
+    identity: Arc<()>,
+    position: native_persistence::world::ChunkPos,
+    schedule: Arc<native_resources::feature_order::FeatureSchedule>,
+    biomes: native_session::worldgen::BiomeNeighborhood,
+}
+
+impl SavedDecorationContext {
+    pub fn plan<'a>(
+        &'a self,
+        generator: &PreparedExistingGenerator,
+    ) -> Result<native_session::worldgen::DecorationPlan<'a>> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &generator.identity),
+            "decoration belongs to another generation capture"
+        );
+        generator.generator.decoration_plan(
+            &self.schedule,
+            &self.biomes,
+            [self.position.x, self.position.z],
+        )
+    }
 }
 
 /// Read-only restoration of captured disk inputs. It does not include unsaved
@@ -168,6 +195,67 @@ impl RestoredSavedTerrain {
 impl PreparedExistingGenerator {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         self.context.inputs()
+    }
+
+    /// Restore Java's biome-dependent decoration plan for a captured chunk.
+    /// Execution still needs complete terrain, structure and light dependencies.
+    pub fn prepare_saved_decoration(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+    ) -> Result<SavedDecorationContext> {
+        let mut positions = Vec::with_capacity(9);
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let position = native_persistence::world::ChunkPos {
+                    x: target
+                        .x
+                        .checked_add(dx)
+                        .context("neighbor chunk X overflow")?,
+                    z: target
+                        .z
+                        .checked_add(dz)
+                        .context("neighbor chunk Z overflow")?,
+                };
+                let saved = self
+                    .context
+                    .inputs()
+                    .sources()
+                    .chunks()
+                    .get(&position)
+                    .and_then(|source| source.terrain.as_ref())
+                    .context("saved biome neighbor is missing")?;
+                reject_saved_blending(&saved.document)?;
+                positions.push(position);
+            }
+        }
+        let restored = self.restore_saved_biomes(positions)?;
+        let mut biomes = self.generator.biome_neighborhood()?;
+        for biome in restored.into_values() {
+            biomes.insert(biome)?;
+        }
+        if self.feature_schedule.is_none() {
+            let registry = self
+                .resources
+                .list_data("worldgen/placed_feature")?
+                .into_iter()
+                .collect();
+            self.feature_schedule = Some(Arc::new(
+                self.generator
+                    .feature_schedule(&mut self.resources, &registry)?,
+            ));
+        }
+        let context = SavedDecorationContext {
+            identity: Arc::clone(&self.identity),
+            position: target,
+            schedule: Arc::clone(
+                self.feature_schedule
+                    .as_ref()
+                    .expect("feature schedule initialized"),
+            ),
+            biomes,
+        };
+        context.plan(self)?;
+        Ok(context)
     }
 
     /// Restore captured biome volumes against this generator's pack registry.
@@ -1289,6 +1377,7 @@ pub(crate) fn prepare_existing_generator(
         identity: Arc::new(()),
         terrain_assets: None,
         heightmap_tags: None,
+        feature_schedule: None,
     })
 }
 
@@ -2197,6 +2286,34 @@ mod tests {
             assert_eq!(result.materials(), expected.materials());
             assert_eq!(result.fluid_updates(), expected.fluid_updates());
             let target = ChunkPos { x: 3, z: 3 };
+            let decoration = actual.prepare_saved_decoration(target)?;
+            let plan = decoration.plan(&actual)?;
+            assert_eq!(plan.origin(), [48, lighting.min_y, 48]);
+            assert!(
+                plan.features()
+                    .windows(2)
+                    .all(|pair| { (pair[0].step, pair[0].index) < (pair[1].step, pair[1].index) })
+            );
+            let present = [
+                ResourceId::parse("minecraft:plains")?,
+                ResourceId::parse("minecraft:forest")?,
+            ];
+            assert_eq!(plan.features(), decoration.schedule.select(&present));
+            if name == "overworld" {
+                assert!(!plan.features().is_empty());
+            }
+            let second_plan = actual.prepare_saved_decoration(ChunkPos { x: 2, z: 3 })?;
+            assert!(Arc::ptr_eq(&decoration.schedule, &second_plan.schedule));
+            assert!(
+                actual
+                    .prepare_saved_decoration(ChunkPos { x: 100, z: 100 })
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .prepare_saved_decoration(ChunkPos { x: i32::MIN, z: 0 })
+                    .is_err()
+            );
             let mut restored_evaluator = native_resources::density::DensityEvaluator::default();
             restored_evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
             let resumed = actual.generate_saved_terrain(target, &[], &mut restored_evaluator)?;
@@ -2447,6 +2564,7 @@ mod tests {
                 let positions = (2..=4).flat_map(|z| (3..=5).map(move |x| ChunkPos { x, z }));
                 let context = reader.capture_generation_context(positions)?;
                 let mut other = prepare_existing_generator(context, &game)?;
+                assert!(decoration.plan(&other).is_err());
                 let alien = other.resume_saved_terrain(
                     ChunkPos { x: 4, z: 3 },
                     &[],

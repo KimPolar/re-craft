@@ -406,7 +406,131 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
     }
 }
 
+/// Reuse all block and fluid handling while providing the same region RNG to
+/// every template mob in a mixed decoration pass.
+struct JigsawRegionWithMobRandom<'r, 'a, 'g, 'm> {
+    inner: JigsawRegion<'r, 'a, 'g>,
+    random: &'m mut native_resources::worldgen_region_random::RegionRandom,
+}
+
+impl JigsawPlacementWorld for JigsawRegionWithMobRandom<'_, '_, '_, '_> {
+    fn block(&mut self, pos: [i32; 3]) -> Result<BlockState> {
+        self.inner.block(pos)
+    }
+    fn world_surface_height(&mut self, x: i32, z: i32) -> Result<i32> {
+        self.inner.world_surface_height(x, z)
+    }
+    fn fluid_at(&mut self, pos: [i32; 3]) -> Result<Option<FluidState>> {
+        self.inner.fluid_at(pos)
+    }
+    fn fluid_of_state(&mut self, state: &BlockState) -> Result<Option<FluidState>> {
+        self.inner.fluid_of_state(state)
+    }
+    fn place_template_block(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        nbt: Option<&Tag>,
+        random: &mut DecorationRandom,
+    ) -> Result<bool> {
+        self.inner.place_template_block(pos, state, nbt, random)
+    }
+    fn is_liquid_container(&mut self, state: &BlockState) -> Result<bool> {
+        self.inner.is_liquid_container(state)
+    }
+    fn place_liquid(
+        &mut self,
+        pos: [i32; 3],
+        state: &BlockState,
+        fluid: Option<FluidState>,
+    ) -> Result<()> {
+        self.inner.place_liquid(pos, state, fluid)
+    }
+    fn mark_block_entity_changed(&mut self, pos: [i32; 3]) -> Result<()> {
+        self.inner.mark_block_entity_changed(pos)
+    }
+    fn place_template_entities(
+        &mut self,
+        entities: &[Tag],
+        origin: [i32; 3],
+        rotation: native_resources::structure_transform::Rotation,
+        clip: BoundingBox,
+    ) -> Result<()> {
+        for entity in entities {
+            let is_villager = matches!(entity.get("nbt").and_then(|data| data.get("id")), Some(Tag::String(id)) if id.matches("minecraft:villager"));
+            let draft = if is_villager {
+                super::super::generated_village_villager::draft_village_template_villager(
+                    entity,
+                    origin,
+                    rotation,
+                    [0; 3],
+                    clip,
+                    self.random,
+                    super::super::fresh_entity_uuid_from_entropy,
+                )?
+            } else {
+                super::super::template_entities::draft_template_entity(
+                    entity,
+                    origin,
+                    rotation,
+                    [0; 3],
+                    clip,
+                    super::super::fresh_entity_uuid_from_entropy,
+                )?
+            };
+            if let Some((position, data)) = draft {
+                self.inner.region.record_generated_entity(
+                    position,
+                    super::super::GeneratedEntityRecord::Saved(data),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DecorationRegion<'_> {
+    /// Like `place_jigsaw_start`, with the independent WorldGenRegion RNG used
+    /// by template mobs. Both RNGs are committed only after the start succeeds.
+    pub fn place_jigsaw_start_with_region_random(
+        &mut self,
+        prepared: &PreparedJigsawPlacement,
+        start: &PreparedStart,
+        registry: &GeneratedBlockRegistry,
+        clip: BoundingBox,
+        random: &mut DecorationRandom,
+        region_random: &mut native_resources::worldgen_region_random::RegionRandom,
+    ) -> Result<usize> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        let mut staged_region_random = region_random.clone();
+        let result = prepared.place_with(start, clip, random, |piece, liquids, next| match piece {
+            JigsawElement::Template(piece) => self.place_rigid_jigsaw_piece_with_region_random(
+                piece,
+                registry,
+                clip,
+                liquids,
+                next,
+                &mut staged_region_random,
+            ),
+            JigsawElement::Feature(feature, origin) => {
+                let (min_y, height) = self
+                    .jigsaw_feature_bounds
+                    .context("jigsaw feature generator bounds are missing")?;
+                self.place_nested(feature, next, origin, min_y, height)
+            }
+        });
+        match result {
+            Ok(placed) => {
+                *region_random = staged_region_random;
+                Ok(placed)
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
     /// Place every intersecting piece of a preflighted start as one staged
     /// operation. A failure prevents publication and preserves the RNG.
     pub fn place_jigsaw_start(
@@ -451,6 +575,35 @@ impl DecorationRegion<'_> {
             &mut JigsawRegion {
                 region: self,
                 registry,
+            },
+            registry,
+            clip,
+            liquids,
+            jigsaw_static_full,
+            random,
+        )?;
+        self.failed = false;
+        Ok(result)
+    }
+
+    fn place_rigid_jigsaw_piece_with_region_random(
+        &mut self,
+        piece: &PreparedTemplatePiece,
+        registry: &GeneratedBlockRegistry,
+        clip: BoundingBox,
+        liquids: LiquidSettings,
+        random: &mut DecorationRandom,
+        region_random: &mut native_resources::worldgen_region_random::RegionRandom,
+    ) -> Result<bool> {
+        ensure!(!self.failed, "generation attempt previously failed");
+        self.failed = true;
+        let result = piece.place(
+            &mut JigsawRegionWithMobRandom {
+                inner: JigsawRegion {
+                    region: self,
+                    registry,
+                },
+                random: region_random,
             },
             registry,
             clip,
@@ -2873,6 +3026,177 @@ mod tests {
                 );
             }
             assert_eq!(random.next_long(), unchanged.next_long());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_villagers_share_region_random_and_rollback_on_failure() -> Result<()> {
+        use super::super::{
+            MixedJigsawPlacementContext, MixedOceanRuinPlacement, MixedPortalPlacementContext,
+        };
+        use native_core::{beardifier::TerrainAdjustment, random::LegacyRandom};
+        use native_persistence::structure_template::StructureTemplate;
+        use native_resources::worldgen_region_random::{RegionRandom, finalize_mob_base};
+        #[derive(Clone)]
+        struct OtherStructure {
+            random: RegionRandom,
+        }
+        impl MixedOceanRuinPlacement for OtherStructure {
+            fn worldgen_region_random(&mut self) -> Option<&mut RegionRandom> {
+                Some(&mut self.random)
+            }
+            fn place(
+                &mut self,
+                _: &mut DecorationRegion<'_>,
+                _: &mut super::super::super::ocean_ruin::PreparedStart,
+                _: BoundingBox,
+                _: &mut DecorationRandom,
+            ) -> Result<()> {
+                anyhow::bail!("unexpected ocean ruin")
+            }
+        }
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let source = StructureTemplate::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:village/plains/villagers/unemployed")?,
+        )?
+        .context("villager template missing")?;
+        let villager = source.entities.first().context("villager missing")?.clone();
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let origin = [1, 8, 1];
+        let start = PreparedStart {
+            chunk: [0, 0],
+            generation_point: origin,
+            terrain_adjustment: TerrainAdjustment::None,
+            liquid_settings: LiquidSettings::IgnoreWaterlogging,
+            pieces: vec![Piece {
+                element: PoolElement::Single {
+                    legacy: false,
+                    location: ResourceId::parse("example:test")?,
+                    processors: HolderValue::Inline(serde_json::json!({"processors":[]})),
+                    projection: Projection::Rigid,
+                    override_liquid_settings: None,
+                },
+                origin,
+                rotation: Rotation::None,
+                bounds: clip,
+                ground_level_delta: 0,
+                junctions: vec![],
+            }],
+        };
+        for (reject, prior_draw) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut entities = vec![villager.clone(), villager.clone()];
+            if reject {
+                let mut unsupported = villager.clone();
+                let Tag::Compound(outer) = &mut unsupported else {
+                    unreachable!()
+                };
+                let (_, Tag::Compound(fields)) = outer
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("nbt"))
+                    .context("villager NBT missing")?
+                else {
+                    unreachable!()
+                };
+                fields.push(("unknown".into(), Tag::Int(1)));
+                entities.push(unsupported);
+            }
+            let prepared = PreparedJigsawPlacement::load(
+                &start,
+                &mut template_with_entities(false, entities)?,
+                &blocks,
+                &registry,
+            )?;
+            let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut decoration_random = DecorationRandom::new(42);
+            let mut original_decoration = decoration_random.clone();
+            let mut region_random = RegionRandom::Legacy(LegacyRandom::new(38));
+            if prior_draw {
+                region_random.next_long();
+            }
+            let mut original_region = region_random.clone();
+            let mut expected_random = region_random.clone();
+            let expected: Vec<_> = (0..2)
+                .map(|_| finalize_mob_base(&mut expected_random, false))
+                .collect();
+            let key = (ResourceId::parse("example:test")?, ChunkPos { x: 0, z: 0 });
+            let mut mixed = MixedJigsawPlacementContext {
+                other: MixedPortalPlacementContext {
+                    other: OtherStructure {
+                        random: region_random,
+                    },
+                    starts: Arc::new(BTreeMap::new()),
+                },
+                registry: &registry,
+                starts: Arc::new(BTreeMap::from([(key.clone(), prepared)])),
+                shipwreck_tags: None,
+            };
+            let mut staged_start = start.clone();
+            let result = mixed.place_jigsaw(
+                &mut region,
+                &key,
+                &mut staged_start,
+                clip,
+                &mut decoration_random,
+            );
+            if reject {
+                assert!(result.is_err());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(
+                    terrain
+                        .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                        .is_empty()
+                );
+                assert_eq!(
+                    mixed.other.other.random.next_long(),
+                    original_region.next_long()
+                );
+            } else {
+                result?;
+                region.finish()?;
+                let recorded = terrain.recorded_generated_entities(ChunkPos { x: 0, z: 0 })?;
+                assert_eq!(recorded.len(), 2);
+                for (entity, initialization) in recorded.iter().zip(expected) {
+                    assert_eq!(
+                        entity.get("LeftHanded"),
+                        Some(&Tag::Byte(i8::from(initialization.left_handed)))
+                    );
+                    let Some(Tag::List {
+                        values: attributes, ..
+                    }) = entity.get("attributes")
+                    else {
+                        anyhow::bail!("attributes missing")
+                    };
+                    let Some(Tag::List {
+                        values: modifiers, ..
+                    }) = attributes[0].get("modifiers")
+                    else {
+                        anyhow::bail!("modifier missing")
+                    };
+                    assert_eq!(
+                        modifiers[0].get("amount"),
+                        initialization.follow_range_bonus.map(Tag::Double).as_ref()
+                    );
+                }
+                assert_eq!(
+                    mixed.other.other.random.next_long(),
+                    expected_random.next_long()
+                );
+            }
+            assert_eq!(
+                decoration_random.next_long(),
+                original_decoration.next_long()
+            );
         }
         Ok(())
     }

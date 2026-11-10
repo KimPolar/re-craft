@@ -47,6 +47,7 @@ mod generated_mineshaft_piece;
 mod generated_potent_sulfur;
 mod generated_sheep;
 mod generated_spawner;
+mod generated_village_villager;
 mod generated_zombie_nautilus;
 pub mod jigsaw;
 mod local_difficulty;
@@ -8310,6 +8311,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_records_vanilla_jigsaw_villager() -> Result<()> {
+        run_fresh_template_batch(35, None)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_ruined_portal() -> Result<()> {
         run_fresh_template_batch(9, None)
     }
@@ -8664,6 +8671,7 @@ mod tests {
             (false, false, "minecraft:oak_planks", 31),
             (false, false, "minecraft:stone_bricks", 32),
             (false, false, "minecraft:stone_bricks", 34),
+            (false, false, "minecraft:stone_bricks", 35),
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
@@ -8671,7 +8679,7 @@ mod tests {
             if entity_anchor.is_some() && *unsupported {
                 false
             } else if portal_kind == 0 {
-                !(9..=29).contains(kind) && !matches!(*kind, 32 | 34)
+                !(9..=29).contains(kind) && !matches!(*kind, 32 | 34 | 35)
             } else if portal_kind == 10 {
                 (10..=29).contains(kind)
             } else {
@@ -8700,7 +8708,7 @@ mod tests {
                     ]),
                 ));
             }
-            let template_entities = if matches!(feature_kind, 32 | 34)
+            let template_entities = if matches!(feature_kind, 32 | 34 | 35)
                 || feature_kind == 30 && entity_anchor == Some(1)
             {
                 let game = native_resources::default_minecraft_dir()
@@ -8710,6 +8718,8 @@ mod tests {
                     &mut resources,
                     &ResourceId::parse(if feature_kind == 34 {
                         "minecraft:village/taiga/houses/taiga_armorer_2"
+                    } else if feature_kind == 35 {
+                        "minecraft:village/plains/villagers/baby"
                     } else {
                         "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1"
                     })?,
@@ -9141,7 +9151,15 @@ mod tests {
                         || feature_kind == 2
                         || (4..=32).contains(&feature_kind)
                         || feature_kind == 34
+                        || feature_kind == 35
                 );
+                if feature_kind == 35 {
+                    let entities = batch.recorded_generated_entities(target)?;
+                    assert_eq!(entities.len(), 1);
+                    assert!(matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:villager")));
+                    assert_eq!(entities[0].get("Age"), Some(&Tag::Int(-21359)));
+                    assert_eq!(entities[0].get("VillagerDataFinalized"), Some(&Tag::Byte(1)));
+                }
                 if feature_kind == 34 {
                     let entities = batch.recorded_generated_entities(target)?;
                     assert_eq!(entities.len(), 1);

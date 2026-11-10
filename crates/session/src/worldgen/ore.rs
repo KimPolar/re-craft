@@ -78,6 +78,13 @@ pub use ruined_portal::{PortalPlacementResources, PreparedPortalPlacement};
 /// World-specific ocean-ruin effects used by a mixed decoration pass. Clones
 /// must isolate mutable state until the entire pass succeeds.
 pub trait MixedOceanRuinPlacement {
+    /// WorldGenRegion random state shared by structure-generated mobs.
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        None
+    }
+
     fn needs_ruin_revisions(&self) -> bool {
         true
     }
@@ -203,6 +210,11 @@ impl<'a, R> MixedPortalPlacementContext<'a, R> {
 }
 
 impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedPortalPlacementContext<'_, R> {
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        self.other.worldgen_region_random()
+    }
     fn needs_ruin_revisions(&self) -> bool {
         self.other.needs_ruin_revisions()
     }
@@ -406,6 +418,11 @@ impl<'a> PreparedJigsawResources<'a> {
 }
 
 impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedJigsawPlacementContext<'_, R> {
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        self.other.worldgen_region_random()
+    }
     fn needs_ruin_revisions(&self) -> bool {
         self.other.needs_ruin_revisions()
     }
@@ -463,7 +480,13 @@ impl<R: MixedOceanRuinPlacement> MixedOceanRuinPlacement for MixedJigsawPlacemen
             .starts
             .get(key)
             .context("jigsaw placement context is missing")?;
-        region.place_jigsaw_start(prepared, start, self.registry, clip, random)?;
+        if let Some(region_random) = self.other.worldgen_region_random() {
+            region.place_jigsaw_start_with_region_random(
+                prepared, start, self.registry, clip, random, region_random,
+            )?;
+        } else {
+            region.place_jigsaw_start(prepared, start, self.registry, clip, random)?;
+        }
         Ok(())
     }
 
@@ -509,6 +532,11 @@ where
     R: MixedOceanRuinPlacement,
     U: Clone + FnMut([f64; 3]) -> Result<Option<[i32; 4]>>,
 {
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        self.other.worldgen_region_random()
+    }
     fn needs_ruin_revisions(&self) -> bool {
         self.other.needs_ruin_revisions()
     }
@@ -624,6 +652,11 @@ where
             &[super::structure_batch::StructurePieceRevision],
         ) -> Result<bool>,
 {
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        Some(&mut self.ocean.region_random)
+    }
     fn needs_ruin_revisions(&self) -> bool {
         self.ocean.needs_ruin_revisions()
     }

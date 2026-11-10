@@ -63,8 +63,15 @@ pub(super) struct MineshaftFeatureCallbacks<'a, U> {
 }
 
 #[derive(Clone)]
-struct NoOceanPlacement;
+struct NoOceanPlacement {
+    region_random: native_resources::worldgen_region_random::RegionRandom,
+}
 impl super::MixedOceanRuinPlacement for NoOceanPlacement {
+    fn worldgen_region_random(
+        &mut self,
+    ) -> Option<&mut native_resources::worldgen_region_random::RegionRandom> {
+        Some(&mut self.region_random)
+    }
     fn place(
         &mut self,
         _: &mut super::DecorationRegion<'_>,
@@ -86,7 +93,7 @@ impl OceanFeatureRunner for JigsawOnlyFeatureRunner {
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
         jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
-        _: &native_resources::worldgen_region_random::RegionRandom,
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
         _: &super::structure_batch::PreparedStructureStages,
         _: &super::BiomeNeighborhood,
@@ -97,7 +104,9 @@ impl OceanFeatureRunner for JigsawOnlyFeatureRunner {
             prepared,
             structures,
             jigsaws,
-            &mut NoOceanPlacement,
+            &mut NoOceanPlacement {
+                region_random: region_random.clone(),
+            },
             lighting,
         )
     }
@@ -118,13 +127,15 @@ where
         structures: &[super::structure_batch::PlannedMixedStructureDecoration<'_>],
         jigsaws: Option<&super::ore::PreparedJigsawResources<'_>>,
         _: &mut BTreeMap<super::structure_batch::TerrainStartKey, super::SavedSwampHutPiece>,
-        _: &native_resources::worldgen_region_random::RegionRandom,
+        region_random: &native_resources::worldgen_region_random::RegionRandom,
         lighting: StructureFeatureLighting<'_>,
         _: &super::structure_batch::PreparedStructureStages,
         _: &super::BiomeNeighborhood,
     ) -> Result<Vec<Vec<super::PreparedStructureStart>>> {
         let mut context = super::MixedMineshaftPlacementContext {
-            other: NoOceanPlacement,
+            other: NoOceanPlacement {
+                region_random: region_random.clone(),
+            },
             blocking_biomes: prepared
                 .mineshaft_blocking_biomes()
                 .context("mineshaft biome tags are not prepared")?,

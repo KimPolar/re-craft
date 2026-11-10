@@ -53,6 +53,9 @@ where
     C: Clone + FnMut() -> Result<Option<super::super::FreshCreatureRandom>>,
     W: super::super::ocean_ruin::DrownedMarkerContext,
 {
+    fn worldgen_region_random(&mut self) -> Option<&mut RegionRandom> {
+        Some(&mut self.region_random)
+    }
     fn needs_ruin_revisions(&self) -> bool {
         self.context.needs_ruin_revisions()
     }

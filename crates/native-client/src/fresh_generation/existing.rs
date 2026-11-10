@@ -144,6 +144,20 @@ pub(crate) struct ResumedFeatureDraft {
     document: NamedTag,
 }
 
+/// Caller-supplied visible lighting tied to one intermediate terrain revision.
+/// Constructing this does not verify the light engine's history or source.
+pub(crate) struct ResumedFeatureLight {
+    identity: Arc<()>,
+    revision: Arc<()>,
+    light: native_world::generation_light::VisibleLightSnapshot,
+}
+
+impl ResumedFeatureLight {
+    fn matches_world(&self, world: &ResumedTerrainWorld) -> bool {
+        Arc::ptr_eq(&self.identity, &world.identity) && Arc::ptr_eq(&self.revision, &world.revision)
+    }
+}
+
 impl ResumedFeatureDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -319,6 +333,30 @@ impl RestoredSavedTerrain {
 }
 
 impl PreparedExistingGenerator {
+    /// Bind an independently captured, fixed initial light-engine revision to
+    /// this intermediate terrain. The caller must establish its provenance,
+    /// completeness and that no light sections have been registered or
+    /// propagated, and that the visible revision stays fixed through the
+    /// feature pass; saved or live lighting cannot be inferred from the chunks.
+    pub fn bind_initial_feature_light(
+        &self,
+        world: &ResumedTerrainWorld,
+        light: native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<ResumedFeatureLight> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity),
+            "terrain belongs to another generation capture"
+        );
+        ensure!(
+            light.has_block_channel() && light.has_sky_channel() == self.lighting.has_skylight,
+            "light channels differ from dimension"
+        );
+        Ok(ResumedFeatureLight {
+            identity: Arc::clone(&self.identity),
+            revision: Arc::clone(&world.revision),
+            light,
+        })
+    }
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         self.context.inputs()
     }
@@ -734,12 +772,40 @@ impl PreparedExistingGenerator {
         context: &SavedDecorationContext,
         schedule: &mut GenerationSchedule,
     ) -> Result<Vec<bool>> {
+        self.run_saved_features_inner(world, context, schedule, None)
+    }
+
+    /// Use a caller-verified initial light snapshot for brightness-dependent
+    /// features. The caller must establish that the visible light is fixed
+    /// throughout execution. The snapshot expires after any terrain or
+    /// successful feature change. This still does not authorize saving.
+    pub fn run_saved_features_with_initial_light(
+        &mut self,
+        world: &mut ResumedTerrainWorld,
+        context: &SavedDecorationContext,
+        schedule: &mut GenerationSchedule,
+        light: &ResumedFeatureLight,
+    ) -> Result<Vec<bool>> {
+        self.run_saved_features_inner(world, context, schedule, Some(light))
+    }
+
+    fn run_saved_features_inner(
+        &mut self,
+        world: &mut ResumedTerrainWorld,
+        context: &SavedDecorationContext,
+        schedule: &mut GenerationSchedule,
+        light: Option<&ResumedFeatureLight>,
+    ) -> Result<Vec<bool>> {
         use native_session::worldgen::schedule::GenerationStage;
         use native_world::loaded::ChunkPos;
         ensure!(
             Arc::ptr_eq(&self.identity, &world.identity)
                 && Arc::ptr_eq(&self.identity, &context.identity),
             "decoration belongs to another generation capture"
+        );
+        ensure!(
+            light.is_none_or(|light| light.matches_world(world)),
+            "feature light belongs to another terrain revision"
         );
         let center = ChunkPos {
             x: context.position.x,
@@ -841,10 +907,32 @@ impl PreparedExistingGenerator {
                         },
                     );
                 }
-                schedule.run_features_with_structure_plan(&mut world.terrain, prepared, &planned)
+                if let Some(light) = light {
+                    schedule.run_features_with_structure_plan_and_visible_light(
+                        &mut world.terrain,
+                        prepared,
+                        &planned,
+                        &light.light,
+                    )
+                } else {
+                    schedule.run_features_with_structure_plan(
+                        &mut world.terrain,
+                        prepared,
+                        &planned,
+                    )
+                }
             } else {
                 Ok((
-                    schedule.run_features(&mut world.terrain, prepared, false, None)?,
+                    if let Some(light) = light {
+                        schedule.run_features_with_visible_light(
+                            &mut world.terrain,
+                            prepared,
+                            false,
+                            &light.light,
+                        )?
+                    } else {
+                        schedule.run_features(&mut world.terrain, prepared, false, None)?
+                    },
                     Vec::new(),
                 ))
             }
@@ -3611,7 +3699,8 @@ mod tests {
         )?;
         custom_biome["features"] = json!([[{
             "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
-            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
+            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8},
+                {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
         std::fs::write(
@@ -3708,6 +3797,8 @@ mod tests {
         )?;
         let draft = actual.draft_resumed_sections(&first)?;
         let mut terrain = first.into_world();
+        let empty_light = native_world::generation_light::VisibleLightSnapshot::new(true, true);
+        let stale_light = actual.bind_initial_feature_light(&terrain, empty_light)?;
         assert!(
             actual
                 .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
@@ -3749,6 +3840,58 @@ mod tests {
             }
         }
         let y = actual.lighting.min_y + 8;
+        let before_light = terrain.terrain().snapshot();
+        assert!(!stale_light.matches_world(&terrain));
+        assert!(
+            actual
+                .run_saved_features_with_initial_light(
+                    &mut terrain,
+                    &custom_decoration,
+                    &mut schedule,
+                    &stale_light
+                )
+                .is_err()
+        );
+        assert!(
+            actual
+                .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before_light, &terrain.terrain().snapshot()));
+        let empty_light = actual.bind_initial_feature_light(
+            &terrain,
+            native_world::generation_light::VisibleLightSnapshot::new(true, true),
+        )?;
+        assert!(
+            actual
+                .run_saved_features_with_initial_light(
+                    &mut terrain,
+                    &custom_decoration,
+                    &mut schedule,
+                    &empty_light
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(&before_light, &terrain.terrain().snapshot()));
+        assert!(
+            actual
+                .bind_initial_feature_light(
+                    &terrain,
+                    native_world::generation_light::VisibleLightSnapshot::new(false, true)
+                )
+                .is_err()
+        );
+        let columns =
+            (2..=4).flat_map(|z| (2..=4).map(move |x| native_world::loaded::ChunkPos { x, z }));
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("light snapshot unavailable")?;
+        let light = actual.bind_initial_feature_light(&terrain, light)?;
         let before_block = terrain
             .terrain()
             .snapshot()
@@ -3758,9 +3901,15 @@ mod tests {
             .clone();
         assert_ne!(before_block, "minecraft:melon");
         assert_eq!(
-            actual.run_saved_features(&mut terrain, &custom_decoration, &mut schedule)?,
+            actual.run_saved_features_with_initial_light(
+                &mut terrain,
+                &custom_decoration,
+                &mut schedule,
+                &light
+            )?,
             vec![true]
         );
+        assert!(!light.matches_world(&terrain));
         assert!(terrain.feature_entity_sources.completed.contains(&center));
         assert!(!terrain.feature_entity_sources.unverified);
         assert!(!terrain.feature_entity_sources.covers(center));
@@ -3839,7 +3988,8 @@ mod tests {
         )?;
         custom_biome["features"] = json!([[{
             "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}, "schedule_tick":true},
-            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
+            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8},
+                {"type":"minecraft:block_predicate_filter", "predicate":{"type":"minecraft:not", "predicate":{"type":"minecraft:would_survive", "state":"minecraft:brown_mushroom"}}}]
         }]]);
         std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
         let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
@@ -3880,8 +4030,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         schedule.restore_imported(restored)?;
+        let columns =
+            (2..=4).flat_map(|z| (2..=4).map(move |x| native_world::loaded::ChunkPos { x, z }));
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("light snapshot unavailable")?;
+        let light = structured.bind_initial_feature_light(&terrain, light)?;
         assert_eq!(
-            structured.run_saved_features(&mut terrain, &decoration, &mut schedule)?,
+            structured.run_saved_features_with_initial_light(
+                &mut terrain,
+                &decoration,
+                &mut schedule,
+                &light
+            )?,
             vec![true]
         );
         assert_eq!(
@@ -4086,8 +4252,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         schedule.restore_imported(imported)?;
+        let columns =
+            (2..=4).flat_map(|z| (2..=4).map(move |x| native_world::loaded::ChunkPos { x, z }));
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("light snapshot unavailable")?;
+        let light = restored.bind_initial_feature_light(&terrain, light)?;
         assert_eq!(
-            restored.run_saved_features(&mut terrain, &decoration, &mut schedule)?,
+            restored.run_saved_features_with_initial_light(
+                &mut terrain,
+                &decoration,
+                &mut schedule,
+                &light
+            )?,
             vec![true]
         );
         let key = (treasure_id.clone(), center);
@@ -4384,8 +4566,24 @@ mod tests {
             .collect::<Vec<_>>();
         schedule.restore_imported(added)?;
         let neighbor_decoration = restored.prepare_saved_decoration(ChunkPos { x: 4, z: 3 })?;
+        let columns =
+            (2..=4).flat_map(|z| (3..=5).map(move |x| native_world::loaded::ChunkPos { x, z }));
+        let light =
+            native_world::generation_light::VisibleLightSnapshot::fresh_after_section_updates(
+                true,
+                true,
+                [],
+                columns,
+            )
+            .context("light snapshot unavailable")?;
+        let light = restored.bind_initial_feature_light(&terrain, light)?;
         assert_eq!(
-            restored.run_saved_features(&mut terrain, &neighbor_decoration, &mut schedule)?,
+            restored.run_saved_features_with_initial_light(
+                &mut terrain,
+                &neighbor_decoration,
+                &mut schedule,
+                &light
+            )?,
             vec![true]
         );
         assert!(!after_insert.matches_world(&terrain));

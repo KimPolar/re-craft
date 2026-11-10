@@ -1853,6 +1853,29 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Apply a complete simple-structure plan against a fixed initial light
+    /// revision. The caller must verify that the engine has not registered or
+    /// propagated any chunks and that the supplied columns are current.
+    pub fn run_features_with_structure_plan_and_visible_light(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+        light: &native_world::generation_light::VisibleLightSnapshot,
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result = prepared.execute_structures_with_visible_light(terrain, structures, light)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Execute FEATURES using an already published staged-light revision.
     pub fn run_features_with_staged_light(
         &mut self,

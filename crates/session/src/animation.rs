@@ -1,6 +1,6 @@
 //! Client-side hand state advanced at the same fixed tick rate as the player.
 //! Custom swing components, item model swap rules and attack-speed modifiers
-//! are not yet resolved; supported basic items use the default 26.3 behavior.
+//! are not yet resolved; basic items use the default 26.3 swing animation.
 
 use std::sync::Arc;
 
@@ -71,7 +71,8 @@ impl HandState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SwingState {
     hand: Option<Hand>,
-    ticks: u8,
+    ticks: i32,
+    duration: i32,
     old_animation: f32,
     animation: f32,
 }
@@ -91,12 +92,17 @@ impl SwingState {
     }
 
     pub fn start(&mut self, hand: Hand) -> bool {
-        if self.hand.is_none() || self.ticks > 3 || self.ticks == 0 {
-            if self.hand != Some(hand) {
+        self.start_with_duration(hand, 6)
+    }
+
+    fn start_with_duration(&mut self, hand: Hand, duration: i32) -> bool {
+        if self.hand.is_none() || self.ticks > self.duration / 2 || self.ticks <= 0 {
+            if self.hand != Some(hand) || self.duration != duration {
                 self.old_animation = 0.0;
                 self.animation = 0.0;
             }
             self.hand = Some(hand);
+            self.duration = duration;
             self.ticks = 0;
             true
         } else {
@@ -107,10 +113,12 @@ impl SwingState {
     fn tick(&mut self) {
         self.old_animation = self.animation;
         if self.hand.is_some() {
-            self.animation = (f32::from(self.ticks) / 6.0).min(1.0);
+            if self.duration > 0 {
+                self.animation = (self.ticks as f32 / self.duration as f32).min(1.0);
+            }
             let previous_ticks = self.ticks;
             self.ticks += 1;
-            if previous_ticks > 6 {
+            if previous_ticks > self.duration {
                 self.hand = None;
                 self.animation = 0.0;
             }
@@ -130,6 +138,29 @@ pub struct FirstPersonState {
 }
 
 impl FirstPersonState {
+    /// Resolve effect modifiers when the swing starts, as LivingEntity does.
+    pub(crate) fn start_swing(
+        &mut self,
+        hand: Hand,
+        effects: &crate::survival::FallEffects,
+        breathing: &crate::survival::BreathingEffects,
+    ) -> bool {
+        let dig_speed = effects
+            .haste
+            .iter()
+            .chain(breathing.conduit_power.iter())
+            .map(|effect| effect.amplifier)
+            .max();
+        let duration = if let Some(amplifier) = dig_speed {
+            6 - (1 + i32::from(amplifier))
+        } else if let Some(effect) = &effects.mining_fatigue {
+            6 + (1 + i32::from(effect.amplifier)) * 2
+        } else {
+            6
+        };
+        self.swing.start_with_duration(hand, duration)
+    }
+
     pub(crate) fn invalidate_inventory(&mut self) {
         self.inventory_revision = None;
     }
@@ -216,6 +247,43 @@ mod tests {
     }
 
     #[test]
+    fn swing_effects_use_strongest_speed_and_capture_duration_at_start() {
+        let effect = |amplifier| crate::survival::EffectDuration {
+            amplifier,
+            duration: 100,
+            ambient: false,
+            visible: true,
+            show_icon: true,
+            hidden: None,
+        };
+        let mut effects = crate::survival::FallEffects {
+            haste: Some(effect(1)),
+            mining_fatigue: Some(effect(255)),
+            ..Default::default()
+        };
+        let breathing = crate::survival::BreathingEffects {
+            conduit_power: Some(effect(3)),
+            ..Default::default()
+        };
+        let mut hands = FirstPersonState::default();
+        assert!(hands.start_swing(Hand::Main, &effects, &breathing));
+        assert_eq!(hands.swing.duration, 2);
+        effects.haste = None;
+        hands.swing.tick();
+        assert!(!hands.start_swing(Hand::Off, &effects, &Default::default()));
+        assert_eq!(hands.swing.duration, 2);
+        hands.swing.tick();
+        assert!(hands.start_swing(Hand::Off, &effects, &Default::default()));
+        assert_eq!(hands.swing.duration, 518);
+        for _ in 0..519 {
+            hands.swing.tick();
+        }
+        assert!(hands.swing.hand().is_some());
+        hands.swing.tick();
+        assert!(hands.swing.hand().is_none());
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn default_swing_and_equip_sequences_match_java() {
         use serde_json::Value;
@@ -231,6 +299,10 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity.SwingState;
 import net.minecraft.world.entity.LivingEntity.SwingDescription;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.core.Holder;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.core.component.DataComponents;
@@ -260,6 +332,16 @@ public class SwingOracle {
     public boolean isHandsBusy() { return false; }
     public float getItemSwapScale(float partial) { return 1f; }
   }
+  static class EffectPlayer extends Player {
+    MobEffectInstance haste, conduit, fatigue;
+    public boolean hasEffect(Holder<MobEffect> effect) { return getEffect(effect)!=null; }
+    public MobEffectInstance getEffect(Holder<MobEffect> effect) {
+      if(effect==MobEffects.HASTE) return haste;
+      if(effect==MobEffects.CONDUIT_POWER) return conduit;
+      if(effect==MobEffects.MINING_FATIGUE) return fatigue;
+      return null;
+    }
+  }
   public static void main(String[] args) throws Exception {
     SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
     for(var item:new net.minecraft.world.item.Item[]{Items.STONE,Items.DIRT})
@@ -279,6 +361,30 @@ public class SwingOracle {
     }
     var unsafeField=Unsafe.class.getDeclaredField("theUnsafe"); unsafeField.setAccessible(true);
     var unsafe=(Unsafe)unsafeField.get(null);
+    var effectPlayer=(EffectPlayer)unsafe.allocateInstance(EffectPlayer.class);
+    var duration=net.minecraft.world.entity.LivingEntity.class.getDeclaredMethod("getModifiedSwingDuration",SwingAnimation.class);
+    duration.setAccessible(true);
+    var modified=new JsonArray();
+    int[] amplifiers={-1,0,1,5,6,255};
+    for(int haste:amplifiers) for(int conduit:amplifiers) for(int fatigue:amplifiers) {
+      var state=new SwingState();
+      var rows=new JsonArray();
+      for(int tick=0;tick<18;tick++) {
+        int h=(tick>=7 && tick<14)?-1:haste;
+        int c=(tick>=7 && tick<14)?-1:conduit;
+        effectPlayer.haste=h<0?null:new MobEffectInstance(MobEffects.HASTE,100,h);
+        effectPlayer.conduit=c<0?null:new MobEffectInstance(MobEffects.CONDUIT_POWER,100,c);
+        effectPlayer.fatigue=fatigue<0?null:new MobEffectInstance(MobEffects.MINING_FATIGUE,100,fatigue);
+        int d=(int)duration.invoke(effectPlayer,SwingAnimation.DEFAULT);
+        int started=-1;
+        if(tick%3==0) started=state.startIfAble(tick%2==0?InteractionHand.MAIN_HAND:InteractionHand.OFF_HAND,SwingAnimation.DEFAULT,d)?1:0;
+        state.tick(); var swing=(SwingDescription)current.get(state);
+        var row=new JsonArray(); row.add(d); row.add(started); row.add(swing==null?0:swing.hand()==InteractionHand.MAIN_HAND?1:2);
+        for(float partial:new float[]{0f,0.25f,0.5f,0.75f,1f}) row.add(state.getAnimation(partial));
+        rows.add(row);
+      }
+      modified.add(rows);
+    }
     var player=(Player)unsafe.allocateInstance(Player.class);
     var game=(Game)unsafe.allocateInstance(Game.class);
     var minecraft=LocalPlayer.class.getDeclaredField("minecraft"); minecraft.setAccessible(true); minecraft.set(player,game);
@@ -312,7 +418,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -408,6 +514,77 @@ public class SwingOracle {
             }
         }
         assert_eq!(index, rows.len());
+        let modified = result["modified"].as_array().unwrap();
+        let effect = |amplifier: i32| {
+            (amplifier >= 0).then(|| crate::survival::EffectDuration {
+                amplifier: amplifier as u8,
+                duration: 100,
+                ambient: false,
+                visible: true,
+                show_icon: true,
+                hidden: None,
+            })
+        };
+        let mut scenario = 0;
+        for haste in [-1, 0, 1, 5, 6, 255] {
+            for conduit in [-1, 0, 1, 5, 6, 255] {
+                for fatigue in [-1, 0, 1, 5, 6, 255] {
+                    let mut hands = FirstPersonState::default();
+                    let rows = modified[scenario].as_array().unwrap();
+                    scenario += 1;
+                    for (tick, row) in rows.iter().enumerate() {
+                        let has_speed = !(7..14).contains(&tick);
+                        let effects = crate::survival::FallEffects {
+                            haste: effect(if has_speed { haste } else { -1 }),
+                            mining_fatigue: effect(fatigue),
+                            ..Default::default()
+                        };
+                        let breathing = crate::survival::BreathingEffects {
+                            conduit_power: effect(if has_speed { conduit } else { -1 }),
+                            ..Default::default()
+                        };
+                        let started = if tick % 3 == 0 {
+                            let hand = if tick % 2 == 0 { Hand::Main } else { Hand::Off };
+                            let started = hands.start_swing(hand, &effects, &breathing);
+                            if started {
+                                assert_eq!(
+                                    i64::from(hands.swing.duration),
+                                    row[0].as_i64().unwrap()
+                                );
+                            }
+                            i64::from(started)
+                        } else {
+                            -1
+                        };
+                        hands.swing.tick();
+                        assert_eq!(
+                            started,
+                            row[1].as_i64().unwrap(),
+                            "scenario={scenario} tick={tick}"
+                        );
+                        let hand = match hands.swing.hand() {
+                            None => 0,
+                            Some(Hand::Main) => 1,
+                            Some(Hand::Off) => 2,
+                        };
+                        assert_eq!(
+                            hand,
+                            row[2].as_i64().unwrap(),
+                            "scenario={scenario} tick={tick}"
+                        );
+                        for (i, partial) in [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().enumerate() {
+                            let actual = hands.swing.progress(partial);
+                            let expected = row[3 + i].as_f64().unwrap() as f32;
+                            assert!(
+                                (actual - expected).abs() < 1e-6,
+                                "scenario={scenario} tick={tick} partial={partial}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(scenario, modified.len());
         let mut inventory = PlayerInventory::default();
         let mut hands = FirstPersonState::default();
         let rows = result["equipment"].as_array().unwrap();

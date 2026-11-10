@@ -13488,7 +13488,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         self.first_person.used(swing);
         true
     }
@@ -13604,7 +13605,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         self.first_person.used(swing);
         true
     }
@@ -13796,7 +13798,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         self.first_person.used(swing);
         true
     }
@@ -13883,7 +13886,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         self.first_person.used(swing);
         true
     }
@@ -13967,7 +13971,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         self.first_person.used(swing);
         true
     }
@@ -14462,7 +14467,8 @@ impl LoadedSession {
         } else {
             crate::animation::Hand::Main
         };
-        self.first_person.swing.start(swing);
+        self.first_person
+            .start_swing(swing, self.fall.effects(), &self.breathing_effects);
         if self.inventory.slot(hand).is_some() {
             self.first_person.used(swing);
         }
@@ -15710,7 +15716,8 @@ impl LoadedSession {
             } else {
                 crate::animation::Hand::Main
             };
-            self.first_person.swing.start(swing);
+            self.first_person
+                .start_swing(swing, self.fall.effects(), &self.breathing_effects);
             if self.inventory.slot(hand).is_some() {
                 self.first_person.used(swing);
             }
@@ -17105,7 +17112,11 @@ impl LoadedSession {
         }
         if self.set_button_power(relative, kind, true) {
             self.schedule_button(relative, kind);
-            self.first_person.swing.start(crate::animation::Hand::Main);
+            self.first_person.start_swing(
+                crate::animation::Hand::Main,
+                self.fall.effects(),
+                &self.breathing_effects,
+            );
             self.push_button_sound(relative, kind, true);
             self.block_action_vibration(relative, true, true);
         }
@@ -17137,7 +17148,11 @@ impl LoadedSession {
             .insert("powered".into(), (!powered).to_string());
         let id = self.intern_block(next);
         if self.set(relative, id) {
-            self.first_person.swing.start(crate::animation::Hand::Main);
+            self.first_person.start_swing(
+                crate::animation::Hand::Main,
+                self.fall.effects(),
+                &self.breathing_effects,
+            );
             if let Some(position) = add(self.origin, relative) {
                 if self.lever_sounds.len() == 4096 {
                     self.lever_sounds.pop_front();
@@ -20506,7 +20521,11 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
-                    self.first_person.swing.start(crate::animation::Hand::Main);
+                    self.first_person.start_swing(
+                        crate::animation::Hand::Main,
+                        self.fall.effects(),
+                        &self.breathing_effects,
+                    );
                     let target = self.mining_target();
                     if let Some(relative) =
                         target.and_then(|target| subtract(target.position, self.origin))
@@ -20529,7 +20548,11 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
-                    self.first_person.swing.start(crate::animation::Hand::Main);
+                    self.first_person.start_swing(
+                        crate::animation::Hand::Main,
+                        self.fall.effects(),
+                        &self.breathing_effects,
+                    );
                 }
                 PlayerCommand::Break => {}
                 PlayerCommand::StopBreak => self.mining.release(),
@@ -20588,7 +20611,11 @@ impl LoadedSession {
                             self.set_redstone_ore_lit(hit.position, true);
                             if !can_place {
                                 handled = true;
-                                self.first_person.swing.start(crate::animation::Hand::Main);
+                                self.first_person.start_swing(
+                                    crate::animation::Hand::Main,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                             }
                         }
                         if !handled {
@@ -20603,7 +20630,11 @@ impl LoadedSession {
                                 if self.try_open_saved_chest(hit.position)
                                     && self.game_mode != GameMode::Spectator
                                 {
-                                    self.first_person.swing.start(crate::animation::Hand::Main);
+                                    self.first_person.start_swing(
+                                        crate::animation::Hand::Main,
+                                        self.fall.effects(),
+                                        &self.breathing_effects,
+                                    );
                                 }
                             } else if table && (self.game_mode == GameMode::Spectator || !bypass) {
                                 handled = true;
@@ -20613,7 +20644,11 @@ impl LoadedSession {
                                         .open_crafting_table(position)
                                     && self.game_mode != GameMode::Spectator
                                 {
-                                    self.first_person.swing.start(crate::animation::Hand::Main);
+                                    self.first_person.start_swing(
+                                        crate::animation::Hand::Main,
+                                        self.fall.effects(),
+                                        &self.breathing_effects,
+                                    );
                                 }
                             } else if self.game_mode != GameMode::Spectator
                                 && !bypass
@@ -20634,7 +20669,11 @@ impl LoadedSession {
                                 } else {
                                     crate::animation::Hand::Main
                                 };
-                                self.first_person.swing.start(swing);
+                                self.first_person.start_swing(
+                                    swing,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                                 self.first_person.used(swing);
                             } else if (self.game_mode.allows_basic_building()
                                 && self.try_make_mud(main_hand, hit))
@@ -20661,7 +20700,11 @@ impl LoadedSession {
                                 } else {
                                     crate::animation::Hand::Main
                                 };
-                                self.first_person.swing.start(swing);
+                                self.first_person.start_swing(
+                                    swing,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                                 self.first_person.used(swing);
                             } else if self.game_mode.allows_basic_building()
                                 && let Some(hand) = self
@@ -20683,7 +20726,11 @@ impl LoadedSession {
                                 } else {
                                     crate::animation::Hand::Main
                                 };
-                                self.first_person.swing.start(swing);
+                                self.first_person.start_swing(
+                                    swing,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                                 if self.game_mode.consumes_placed_item() {
                                     Arc::make_mut(&mut self.inventory).consume_held(hand);
                                 }
@@ -20710,7 +20757,11 @@ impl LoadedSession {
                                 } else {
                                     crate::animation::Hand::Main
                                 };
-                                self.first_person.swing.start(swing_hand);
+                                self.first_person.start_swing(
+                                    swing_hand,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                                 if self.game_mode.consumes_placed_item() {
                                     Arc::make_mut(&mut self.inventory).consume_held(hand);
                                 }
@@ -20787,7 +20838,11 @@ impl LoadedSession {
         {
             let target = self.mining_target();
             if target.is_some() {
-                self.first_person.swing.start(crate::animation::Hand::Main);
+                self.first_person.start_swing(
+                    crate::animation::Hand::Main,
+                    self.fall.effects(),
+                    &self.breathing_effects,
+                );
             }
             let context = self.mining_context();
             let hand = self.inventory.slot(crate::inventory::PlayerSlot::Storage(
@@ -71736,6 +71791,32 @@ pub(crate) mod tests {
             a.snapshot().world.loaded().unwrap()
         ));
         assert!(a.snapshot().player.on_ground);
+    }
+
+    #[test]
+    fn loaded_world_hand_swing_uses_active_haste() {
+        let mut session = session();
+        session.fall.configure(
+            crate::player_data::SavedAttribute::with_base(3.0),
+            crate::player_data::SavedAttribute::with_base(1.0),
+            crate::survival::FallEffects {
+                haste: Some(crate::survival::EffectDuration {
+                    duration: 100,
+                    amplifier: 3,
+                    ambient: false,
+                    visible: true,
+                    show_icon: true,
+                    hidden: None,
+                }),
+                ..Default::default()
+            },
+            Arc::new(OxygenEnchantments::default()),
+        );
+        session.submit_command(PlayerCommand::Break);
+        session.submit_command(PlayerCommand::StopBreak);
+        session.update(TICK);
+        session.update(TICK);
+        assert_eq!(session.snapshot().first_person.swing.progress(1.0), 0.5);
     }
 
     #[test]

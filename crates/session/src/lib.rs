@@ -1394,7 +1394,8 @@ impl LocalSession {
             } else {
                 animation::Hand::Main
             };
-            self.first_person.swing.start(swing);
+            self.first_person
+                .start_swing(swing, self.fall.effects(), &self.breathing_effects);
             if self.inventory.slot(hand).is_some() {
                 self.first_person.used(swing);
             }
@@ -1761,7 +1762,11 @@ impl LocalSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
-                    self.first_person.swing.start(animation::Hand::Main);
+                    self.first_person.start_swing(
+                        animation::Hand::Main,
+                        self.fall.effects(),
+                        &self.breathing_effects,
+                    );
                     let target = self.mining_target();
                     let hand = self
                         .inventory
@@ -1776,7 +1781,11 @@ impl LocalSession {
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
-                    self.first_person.swing.start(animation::Hand::Main);
+                    self.first_person.start_swing(
+                        animation::Hand::Main,
+                        self.fall.effects(),
+                        &self.breathing_effects,
+                    );
                 }
                 PlayerCommand::Break => {}
                 PlayerCommand::StopBreak => self.mining.release(),
@@ -1811,7 +1820,11 @@ impl LocalSession {
                             if Arc::make_mut(&mut self.inventory).open_crafting_table(hit.position)
                                 && self.game_mode != GameMode::Spectator
                             {
-                                self.first_person.swing.start(animation::Hand::Main);
+                                self.first_person.start_swing(
+                                    animation::Hand::Main,
+                                    self.fall.effects(),
+                                    &self.breathing_effects,
+                                );
                             }
                         } else if self.food_use.start_hand(
                             &mut self.inventory,
@@ -1838,7 +1851,11 @@ impl LocalSession {
                             } else {
                                 animation::Hand::Main
                             };
-                            self.first_person.swing.start(swing_hand);
+                            self.first_person.start_swing(
+                                swing_hand,
+                                self.fall.effects(),
+                                &self.breathing_effects,
+                            );
                             if self.game_mode.consumes_placed_item() {
                                 Arc::make_mut(&mut self.inventory).consume_held(hand);
                             }
@@ -1880,7 +1897,11 @@ impl LocalSession {
         {
             let target = self.mining_target();
             if target.is_some() {
-                self.first_person.swing.start(animation::Hand::Main);
+                self.first_person.start_swing(
+                    animation::Hand::Main,
+                    self.fall.effects(),
+                    &self.breathing_effects,
+                );
             }
             let hand = self
                 .inventory
@@ -3241,6 +3262,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hand_swing_uses_active_conduit_power_in_gameplay() {
+        let mut session = LocalSession::demo();
+        session
+            .breathing_effects
+            .add_status(survival::StatusApplication {
+                kind: survival::FoodStatusKind::ConduitPower,
+                duration: 100,
+                amplifier: 3,
+                ambient: false,
+                visible: true,
+                show_icon: true,
+            });
+        session.submit_command(PlayerCommand::Break);
+        session.submit_command(PlayerCommand::StopBreak);
+        session.update(TICK);
+        session.update(TICK);
+        assert_eq!(session.snapshot().first_person.swing.progress(1.0), 0.5);
     }
 
     #[test]

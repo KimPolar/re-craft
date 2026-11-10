@@ -258,6 +258,51 @@ impl PreparedExistingGenerator {
         )
     }
 
+    /// Prepare terrain adaptation from captured starts and references. The
+    /// caller must provide the corresponding Java structure-key order.
+    pub fn restore_saved_beardifier(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+    ) -> Result<native_core::beardifier::Beardifier> {
+        use native_session::worldgen::saved_structure_starts::saved_beardifier_for_chunk;
+        let references = self.restore_saved_structure_references(target)?;
+        ensure!(
+            references.discarded.is_empty(),
+            "saved structure references contain discarded data"
+        );
+        let sources: BTreeSet<_> = references
+            .references
+            .membership()
+            .values()
+            .flatten()
+            .map(|packed| native_persistence::world::ChunkPos {
+                x: *packed as u32 as i32,
+                z: ((*packed as u64) >> 32) as u32 as i32,
+            })
+            .collect();
+        let mut starts = BTreeMap::new();
+        for source in sources {
+            let loaded = self.restore_saved_structure_starts(source)?;
+            starts.insert(
+                native_world::loaded::ChunkPos {
+                    x: source.x,
+                    z: source.z,
+                },
+                loaded,
+            );
+        }
+        saved_beardifier_for_chunk(
+            native_world::loaded::ChunkPos {
+                x: target.x,
+                z: target.z,
+            },
+            &references,
+            structure_order,
+            &starts,
+        )
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -1032,6 +1077,32 @@ mod tests {
                 values: vec![Tag::String("example:unknown".into())],
             };
             region.add(ChunkPos { x: 1, z: 0 }, &unknown, 1)?;
+            let mut clean = saved.clone();
+            let Tag::Compound(fields) = &mut clean.value else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("xPos"))
+                .unwrap()
+                .1 = Tag::Int(3);
+            let Tag::Compound(structures) = &mut fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("structures"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            structures
+                .iter_mut()
+                .find(|(key, _)| key.matches("References"))
+                .unwrap()
+                .1 = Tag::Compound(vec![(
+                "minecraft:buried_treasure".into(),
+                Tag::LongArray(vec![0]),
+            )]);
+            region.add(ChunkPos { x: 3, z: 0 }, &clean, 1)?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .read(true)
@@ -1073,6 +1144,16 @@ mod tests {
                 BTreeSet::from([0, 1])
             );
             assert_eq!(references.discarded.len(), 2);
+            assert!(
+                actual
+                    .restore_saved_beardifier(position, std::slice::from_ref(&treasure))
+                    .is_err()
+            );
+            let clean_target = ChunkPos { x: 3, z: 0 };
+            let beardifier =
+                actual.restore_saved_beardifier(clean_target, std::slice::from_ref(&treasure))?;
+            assert!(beardifier.affected_bounds().is_none());
+            assert!(actual.restore_saved_beardifier(clean_target, &[]).is_err());
             let restored = actual.restore_saved_biomes([position])?;
             let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
             let mut neighborhood = actual.generator.biome_neighborhood()?;

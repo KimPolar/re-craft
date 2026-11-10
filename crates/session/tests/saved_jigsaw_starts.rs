@@ -2,7 +2,9 @@ use native_persistence::nbt::{self, Tag, TagType};
 use native_resources::packs::ResourceId;
 use native_session::worldgen::saved_structure_starts::{
     RestoredStructurePiece, RestoredStructureStart, restore_saved_structure_starts,
+    saved_beardifier_for_chunk,
 };
+use native_session::worldgen::structure_references::restore_saved_structure_references;
 use native_world::loaded::ChunkPos;
 use std::{path::PathBuf, process::Command};
 
@@ -80,7 +82,7 @@ fn restored_jigsaw_starts_use_java_piece_data() {
     let mut count = 0;
     for line in output.lines() {
         let fields: Vec<_> = line.split('\t').collect();
-        let ["T", _, _, _, filename] = fields.as_slice() else {
+        let ["T", kind, _, _, filename] = fields.as_slice() else {
             continue;
         };
         let piece = nbt::read(&std::fs::read(temp.path().join(filename)).unwrap())
@@ -116,6 +118,68 @@ fn restored_jigsaw_starts_use_java_piece_data() {
         let bounds = restored[&id].reference_bounds(&id).unwrap().unwrap().bounds;
         assert_eq!(bounds.min, [-14, -10, -15]);
         assert_eq!(bounds.max, [17, 20, 21]);
+        let terrain = restored[&id].terrain_pieces().unwrap();
+        assert_eq!(terrain.len(), 1);
+        assert_eq!(terrain[0].ground_delta, 4);
+        assert_eq!(
+            terrain[0]
+                .junctions
+                .iter()
+                .map(|j| j.position)
+                .collect::<Vec<_>>(),
+            vec![[12, -5, 7], [-4, 60, 2]]
+        );
+        let projection = if *kind == "0" || *kind == "1" {
+            native_core::beardifier::PieceProjection::Rigid
+        } else {
+            native_core::beardifier::PieceProjection::TerrainMatching
+        };
+        assert_eq!(terrain[0].projection, projection);
+        let target = ChunkPos { x: 0, z: 0 };
+        let refs = Tag::Compound(vec![("example:jigsaw".into(), Tag::LongArray(vec![0]))]);
+        let refs = restore_saved_structure_references(target, Some(&refs), |_| Ok(true)).unwrap();
+        let starts = std::collections::BTreeMap::from([(target, restored)]);
+        let beardifier =
+            saved_beardifier_for_chunk(target, &refs, std::slice::from_ref(&id), &starts).unwrap();
+        let expected = native_core::beardifier::Beardifier::for_chunk(
+            [0, 0],
+            &[native_core::beardifier::StructurePiece {
+                bounds: native_core::beardifier::BoundingBox::new([-2, 2, -3], [5, 8, 9]).unwrap(),
+                adjustment: native_core::beardifier::TerrainAdjustment::BeardThin,
+                ground_delta: 4,
+                projection,
+                junctions: vec![
+                    native_core::beardifier::Junction {
+                        position: [12, -5, 7],
+                    },
+                    native_core::beardifier::Junction {
+                        position: [-4, 60, 2],
+                    },
+                ],
+            }],
+        )
+        .unwrap();
+        assert_eq!(beardifier.affected_bounds(), expected.affected_bounds());
+        for position in [[0, 0, 0], [12, -5, 7], [-4, 60, 2], [3, 5, 3]] {
+            assert_eq!(
+                beardifier
+                    .sample(position[0], position[1], position[2])
+                    .to_bits(),
+                expected
+                    .sample(position[0], position[1], position[2])
+                    .to_bits()
+            );
+        }
+        assert!(saved_beardifier_for_chunk(target, &refs, &[], &starts).is_err());
+        assert!(
+            saved_beardifier_for_chunk(
+                target,
+                &refs,
+                std::slice::from_ref(&id),
+                &Default::default()
+            )
+            .is_err()
+        );
         count += 1;
     }
     assert_eq!(count, 32);

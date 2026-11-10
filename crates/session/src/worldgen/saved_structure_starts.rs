@@ -1,6 +1,8 @@
 //! Restore supported saved structure starts without modifying their NBT.
 use anyhow::{Context, Result, bail, ensure};
-use native_core::beardifier::{BoundingBox, TerrainAdjustment};
+use native_core::beardifier::{
+    Beardifier, BoundingBox, PieceProjection, StructurePiece, TerrainAdjustment,
+};
 use native_persistence::{
     jigsaw_piece::SavedJigsawPiece,
     nbt::{Tag, TagType},
@@ -8,9 +10,12 @@ use native_persistence::{
 use native_resources::{packs::ResourceId, structure_start::decode_terrain_adjustment};
 use native_world::loaded::ChunkPos;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{SavedMineshaftPiece, SavedSwampHutPiece, structure_references::StructureStartBounds};
+use super::{
+    SavedMineshaftPiece, SavedSwampHutPiece,
+    structure_references::{SavedStructureReferences, StructureStartBounds},
+};
 
 #[derive(Clone, Debug)]
 pub enum RestoredStructurePiece {
@@ -45,6 +50,33 @@ pub enum RestoredStructureStart {
 }
 
 impl RestoredStructureStart {
+    /// Restore the piece inputs used for terrain adaptation, preserving the
+    /// original piece and jigsaw junction order. The caller must still resolve
+    /// referenced starts in Java's structure and reference iteration order.
+    pub fn terrain_pieces(&self) -> Result<Vec<StructurePiece>> {
+        let Self::Present {
+            adjustment, pieces, ..
+        } = self
+        else {
+            return Ok(Vec::new());
+        };
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                RestoredStructurePiece::Jigsaw(saved) => {
+                    super::jigsaw::terrain_piece(&saved.piece, *adjustment)
+                }
+                _ => Ok(StructurePiece {
+                    bounds: piece.bounds(),
+                    adjustment: *adjustment,
+                    ground_delta: 0,
+                    projection: PieceProjection::NonPool,
+                    junctions: Vec::new(),
+                }),
+            })
+            .collect()
+    }
+
     /// Empty starts and Java's INVALID sentinel have no reference bounds.
     pub fn reference_bounds(&self, id: &ResourceId) -> Result<Option<StructureStartBounds>> {
         match self {
@@ -62,6 +94,58 @@ impl RestoredStructureStart {
             Self::Present { .. } => Ok(None),
         }
     }
+}
+
+/// Build the terrain adjustment from captured references and their starts.
+/// The caller supplies the Java structure-key order; each key's saved
+/// fastutil reference order is retained. Missing starts or discarded input
+/// fail instead of silently generating terrain with incomplete structures.
+pub fn saved_beardifier_for_chunk(
+    target: ChunkPos,
+    references: &SavedStructureReferences,
+    structure_order: &[ResourceId],
+    starts: &BTreeMap<ChunkPos, BTreeMap<ResourceId, RestoredStructureStart>>,
+) -> Result<Beardifier> {
+    ensure!(
+        references.discarded.is_empty(),
+        "saved structure references contain discarded data"
+    );
+    let keys: BTreeSet<_> = references.references.membership().keys().cloned().collect();
+    let order: BTreeSet<_> = structure_order.iter().cloned().collect();
+    ensure!(
+        order.len() == structure_order.len() && order == keys,
+        "structure order does not cover references exactly"
+    );
+    let mut pieces = Vec::new();
+    for id in structure_order {
+        for &packed in references
+            .references
+            .order(id)
+            .context("missing saved reference order")?
+        {
+            let source = ChunkPos {
+                x: packed as u32 as i32,
+                z: ((packed as u64) >> 32) as u32 as i32,
+            };
+            let start = starts
+                .get(&source)
+                .and_then(|by_id| by_id.get(id))
+                .with_context(|| {
+                    format!(
+                        "missing saved structure start {}:{} at {},{}",
+                        id.namespace, id.path, source.x, source.z
+                    )
+                })?;
+            if let RestoredStructureStart::Present { chunk, .. } = start {
+                ensure!(
+                    *chunk == source,
+                    "saved structure start belongs to another chunk"
+                );
+            }
+            pieces.extend(start.terrain_pieces()?);
+        }
+    }
+    Beardifier::for_chunk([target.x, target.z], &pieces).map_err(anyhow::Error::msg)
 }
 
 fn field<'a>(tag: &'a Tag, key: &str) -> Result<Option<&'a Tag>> {
@@ -356,6 +440,20 @@ mod tests {
                 .reference_bounds(&id)?
                 .is_none()
         );
+        assert!(
+            restored[&ResourceId::parse("example:invalid")?]
+                .terrain_pieces()?
+                .is_empty()
+        );
+        for name in ["treasure", "hut", "mine"] {
+            let terrain =
+                restored[&ResourceId::parse(&format!("example:{name}"))?].terrain_pieces()?;
+            assert_eq!(terrain.len(), 1);
+            assert_eq!(terrain[0].projection, PieceProjection::NonPool);
+            assert_eq!(terrain[0].ground_delta, 0);
+            assert_eq!(terrain[0].adjustment, TerrainAdjustment::BeardThin);
+            assert!(terrain[0].junctions.is_empty());
+        }
         assert!(
             restore_saved_structure_starts(ChunkPos { x: -1, z: 3 }, Some(&data), config).is_err()
         );

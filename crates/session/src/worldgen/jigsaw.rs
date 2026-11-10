@@ -603,36 +603,42 @@ impl PreparedStart {
     pub fn terrain_pieces(&self) -> Result<Vec<StructurePiece>> {
         self.pieces
             .iter()
-            .map(|piece| {
-                let projection = match &piece.element {
-                    PoolElement::Single { projection, .. }
-                    | PoolElement::Feature { projection, .. }
-                    | PoolElement::List { projection, .. } => *projection,
-                    PoolElement::Empty => anyhow::bail!("empty element cannot form a jigsaw piece"),
-                };
-                Ok(StructurePiece {
-                    bounds: piece.bounds,
-                    adjustment: self.terrain_adjustment,
-                    ground_delta: piece.ground_level_delta,
-                    projection: match projection {
-                        Projection::Rigid => PieceProjection::Rigid,
-                        Projection::TerrainMatching => PieceProjection::TerrainMatching,
-                    },
-                    junctions: piece
-                        .junctions
-                        .iter()
-                        .map(|junction| native_core::beardifier::Junction {
-                            position: [
-                                junction.source_x,
-                                junction.source_ground_y,
-                                junction.source_z,
-                            ],
-                        })
-                        .collect(),
-                })
-            })
+            .map(|piece| terrain_piece(piece, self.terrain_adjustment))
             .collect()
     }
+}
+
+/// Convert generated or restored pool pieces without changing junction order.
+pub(super) fn terrain_piece(
+    piece: &native_resources::jigsaw_placement::Piece,
+    adjustment: TerrainAdjustment,
+) -> Result<StructurePiece> {
+    let projection = match &piece.element {
+        PoolElement::Single { projection, .. }
+        | PoolElement::Feature { projection, .. }
+        | PoolElement::List { projection, .. } => *projection,
+        PoolElement::Empty => anyhow::bail!("empty element cannot form a jigsaw piece"),
+    };
+    Ok(StructurePiece {
+        bounds: piece.bounds,
+        adjustment,
+        ground_delta: piece.ground_level_delta,
+        projection: match projection {
+            Projection::Rigid => PieceProjection::Rigid,
+            Projection::TerrainMatching => PieceProjection::TerrainMatching,
+        },
+        junctions: piece
+            .junctions
+            .iter()
+            .map(|junction| native_core::beardifier::Junction {
+                position: [
+                    junction.source_x,
+                    junction.source_ground_y,
+                    junction.source_z,
+                ],
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

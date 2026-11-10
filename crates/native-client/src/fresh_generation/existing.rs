@@ -21,6 +21,8 @@ pub(crate) struct PreparedExistingGenerator {
     terrain_assets: Option<SavedTerrainAssets>,
     heightmap_tags: Option<native_resources::heightmap_tags::HeightmapTags>,
     feature_schedule: Option<Arc<native_resources::feature_order::FeatureSchedule>>,
+    structure_schedule:
+        Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
 }
 
 struct SavedTerrainAssets {
@@ -30,22 +32,30 @@ struct SavedTerrainAssets {
     carvers: native_resources::carver::schedule::CarverCache,
 }
 
-fn require_empty_saved_structure_references(
+fn validate_saved_decoration_references(
     references: &native_session::worldgen::structure_references::SavedStructureReferences,
 ) -> Result<()> {
     ensure!(
         references.discarded.is_empty(),
         "saved structure references contain unsupported data"
     );
-    ensure!(
-        references
-            .references
-            .membership()
-            .values()
-            .all(BTreeSet::is_empty),
-        "saved structure decoration is not available"
-    );
     Ok(())
+}
+
+type SavedStructureKey = (ResourceId, native_world::loaded::ChunkPos);
+
+#[derive(Clone)]
+struct ResumedTreasureStart {
+    source: Arc<NamedTag>,
+    original: Tag,
+    references: i32,
+    placement: native_resources::structure_start::SimpleStructureStart,
+}
+
+struct SavedStructurePlan {
+    schedule: Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
+    starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+    order: Vec<(ResourceId, Vec<SavedStructureKey>)>,
 }
 
 /// Decoration inputs from one captured biome neighborhood and pack snapshot.
@@ -141,6 +151,7 @@ pub(crate) struct ResumedTerrainWorld {
     terrain: native_session::worldgen::CarvedTerrainWorld,
     sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
     feature_touched: BTreeSet<native_world::loaded::ChunkPos>,
+    treasure_starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
 }
 
 impl ResumedSavedTerrain {
@@ -154,6 +165,7 @@ impl ResumedSavedTerrain {
             terrain: native_session::worldgen::CarvedTerrainWorld::new(self.terrain),
             sources: BTreeMap::from([(self.position, self.source)]),
             feature_touched: BTreeSet::new(),
+            treasure_starts: BTreeMap::new(),
         }
     }
 }
@@ -257,9 +269,153 @@ impl PreparedExistingGenerator {
         action(&prepared)
     }
 
+    /// Resolve referenced starts in registry and saved fastutil order. The
+    /// original source remains attached until a coordinated save exists.
+    fn prepare_saved_structure_plan(
+        &mut self,
+        world: &ResumedTerrainWorld,
+        target: native_persistence::world::ChunkPos,
+    ) -> Result<SavedStructurePlan> {
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        use native_session::worldgen::saved_structure_starts::{
+            RestoredStructurePiece, RestoredStructureStart,
+        };
+        let references = self.restore_saved_structure_references(target)?;
+        validate_saved_decoration_references(&references)?;
+        if references
+            .references
+            .membership()
+            .values()
+            .all(BTreeSet::is_empty)
+        {
+            return Ok(SavedStructurePlan {
+                schedule: None,
+                starts: BTreeMap::new(),
+                order: Vec::new(),
+            });
+        }
+        if self.structure_schedule.is_none() {
+            self.structure_schedule = Some(Arc::new(
+                native_resources::structure_decoration::StructureDecorationSchedule::load(
+                    &mut self.resources,
+                )?,
+            ));
+        }
+        let schedule = Arc::clone(
+            self.structure_schedule
+                .as_ref()
+                .expect("structure schedule initialized"),
+        );
+        let registered: BTreeSet<_> = schedule
+            .steps()
+            .iter()
+            .flatten()
+            .map(|entry| &entry.id)
+            .collect();
+        ensure!(
+            references
+                .references
+                .membership()
+                .keys()
+                .all(|id| registered.contains(id)),
+            "structure reference is absent from decoration registry"
+        );
+        let mut loaded = BTreeMap::new();
+        let mut starts = BTreeMap::new();
+        let mut order = Vec::new();
+        for entry in schedule.steps().iter().flatten() {
+            let Some(sources) = references.references.order(&entry.id) else {
+                continue;
+            };
+            let mut keys = Vec::new();
+            for &packed in sources {
+                let source = native_world::loaded::ChunkPos {
+                    x: packed as u32 as i32,
+                    z: ((packed as u64) >> 32) as u32 as i32,
+                };
+                let key = (entry.id.clone(), source);
+                let saved_pos = native_persistence::world::ChunkPos {
+                    x: source.x,
+                    z: source.z,
+                };
+                let captured = Arc::clone(
+                    &self
+                        .context
+                        .inputs()
+                        .sources()
+                        .chunks()
+                        .get(&saved_pos)
+                        .and_then(|chunk| chunk.terrain.as_ref())
+                        .context("referenced structure source missing")?
+                        .document,
+                );
+                let value = if let Some(value) = world.treasure_starts.get(&key) {
+                    ensure!(
+                        Arc::ptr_eq(&value.source, &captured),
+                        "saved structure source differs"
+                    );
+                    value.clone()
+                } else {
+                    if !loaded.contains_key(&source) {
+                        loaded.insert(source, self.restore_saved_structure_starts(saved_pos)?);
+                    }
+                    let saved = loaded[&source]
+                        .get(&entry.id)
+                        .context("referenced structure start missing")?;
+                    let RestoredStructureStart::Present {
+                        chunk,
+                        references,
+                        adjustment,
+                        pieces,
+                        original,
+                    } = saved
+                    else {
+                        continue;
+                    };
+                    ensure!(*chunk == source, "saved structure start source differs");
+                    if pieces.is_empty() {
+                        continue;
+                    }
+                    let [RestoredStructurePiece::BuriedTreasure(bounds)] = pieces.as_slice() else {
+                        bail!("saved structure decoration type is not supported");
+                    };
+                    ResumedTreasureStart {
+                        source: captured,
+                        original: original.clone(),
+                        references: *references,
+                        // The saved piece has no generation point. Placement uses
+                        // only its current bounds; this value is never persisted.
+                        placement: SimpleStructureStart {
+                            kind: SimpleStructureKind::BuriedTreasure,
+                            chunk: [source.x, source.z],
+                            generation_point: bounds.min,
+                            orientation: None,
+                            bounds: *bounds,
+                            terrain_adjustment: *adjustment,
+                        },
+                    }
+                };
+                ensure!(
+                    starts.insert(key.clone(), value).is_none(),
+                    "duplicate saved structure reference"
+                );
+                keys.push(key);
+            }
+            if !keys.is_empty() {
+                order.push((entry.id.clone(), keys));
+            }
+        }
+        Ok(SavedStructurePlan {
+            schedule: Some(schedule),
+            starts,
+            order,
+        })
+    }
+
     /// Run a ready FEATURES step on captured intermediate terrain. The caller
     /// must restore the scheduler from the same verified generation inputs.
-    /// Referenced structure decoration and previously published light are not supported.
+    /// Referenced buried treasure can be resumed; other structure kinds and
+    /// previously published light are not yet supported.
     /// This does not authorize publishing or saving the resulting chunks.
     pub fn run_saved_features(
         &mut self,
@@ -283,10 +439,11 @@ impl PreparedExistingGenerator {
             "features dependencies are incomplete"
         );
         let structures_enabled = self.generate_structures;
-        if structures_enabled {
-            let references = self.restore_saved_structure_references(context.position)?;
-            require_empty_saved_structure_references(&references)?;
-        }
+        let mut structures = if structures_enabled {
+            Some(self.prepare_saved_structure_plan(world, context.position)?)
+        } else {
+            None
+        };
         let mut positions = Vec::with_capacity(9);
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
@@ -340,15 +497,53 @@ impl PreparedExistingGenerator {
                     .initialize_worldgen_heightmaps(position, tags)?;
             }
         }
-        let result = self.with_saved_prepared_decoration(context, |prepared| {
-            if structures_enabled {
-                let (features, _) =
-                    schedule.run_features_with_structure_plan(&mut world.terrain, prepared, &[])?;
-                Ok(features)
+        let (result, updates) = self.with_saved_prepared_decoration(context, |prepared| {
+            if let Some(structures) = &structures {
+                let mut planned = Vec::with_capacity(structures.order.len());
+                for (id, keys) in &structures.order {
+                    let entry = structures
+                        .schedule
+                        .as_ref()
+                        .context("structure schedule is missing")?
+                        .steps()
+                        .iter()
+                        .flatten()
+                        .find(|entry| &entry.id == id)
+                        .context("structure schedule entry disappeared")?;
+                    let starts = keys
+                        .iter()
+                        .map(|key| &structures.starts[key].placement)
+                        .collect();
+                    planned.push(
+                        native_session::worldgen::structure_batch::PlannedStructureDecoration {
+                            entry,
+                            starts,
+                        },
+                    );
+                }
+                schedule.run_features_with_structure_plan(&mut world.terrain, prepared, &planned)
             } else {
-                schedule.run_features(&mut world.terrain, prepared, false, None)
+                Ok((
+                    schedule.run_features(&mut world.terrain, prepared, false, None)?,
+                    Vec::new(),
+                ))
             }
         })?;
+        if let Some(structures) = structures.as_mut() {
+            debug_assert_eq!(structures.order.len(), updates.len());
+            for ((_, keys), updated) in structures.order.iter().zip(updates) {
+                debug_assert_eq!(keys.len(), updated.len());
+                for (key, placement) in keys.iter().zip(updated) {
+                    structures
+                        .starts
+                        .get_mut(key)
+                        .expect("structure start was planned")
+                        .placement = placement;
+                    world.feature_touched.insert(key.1);
+                }
+            }
+            world.treasure_starts.append(&mut structures.starts);
+        }
         world.feature_touched.extend(positions);
         Ok(result)
     }
@@ -1534,6 +1729,7 @@ pub(crate) fn prepare_existing_generator(
         terrain_assets: None,
         heightmap_tags: None,
         feature_schedule: None,
+        structure_schedule: None,
     })
 }
 
@@ -1569,27 +1765,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn only_lossless_empty_structure_references_can_skip_decoration() -> Result<()> {
+    fn saved_decoration_references_reject_discarded_data() -> Result<()> {
         use native_session::worldgen::structure_references::restore_saved_structure_references;
         let center = native_world::loaded::ChunkPos { x: 3, z: 3 };
         let parse = |tag: Option<&Tag>, registered| {
             restore_saved_structure_references(center, tag, |_| Ok(registered))
         };
-        require_empty_saved_structure_references(&parse(None, true)?)?;
+        validate_saved_decoration_references(&parse(None, true)?)?;
         let empty = Tag::Compound(vec![(
             "minecraft:buried_treasure".into(),
             Tag::LongArray(vec![]),
         )]);
-        require_empty_saved_structure_references(&parse(Some(&empty), true)?)?;
+        validate_saved_decoration_references(&parse(Some(&empty), true)?)?;
         let present = Tag::Compound(vec![(
             "minecraft:buried_treasure".into(),
             Tag::LongArray(vec![3 | (3i64 << 32)]),
         )]);
-        assert!(require_empty_saved_structure_references(&parse(Some(&present), true)?).is_err());
-        assert!(require_empty_saved_structure_references(&parse(Some(&present), false)?).is_err());
-        assert!(
-            require_empty_saved_structure_references(&parse(Some(&Tag::Int(1)), true)?).is_err()
-        );
+        validate_saved_decoration_references(&parse(Some(&present), true)?)?;
+        assert!(validate_saved_decoration_references(&parse(Some(&present), false)?).is_err());
+        assert!(validate_saved_decoration_references(&parse(Some(&Tag::Int(1)), true)?).is_err());
         Ok(())
     }
 
@@ -3269,6 +3463,141 @@ mod tests {
                 }
             }
         }
+        // Replace one entry in the disposable region with a saved treasure
+        // start and its self-reference. The original world is never opened.
+        let treasure_id = ResourceId::parse("minecraft:buried_treasure")?;
+        let original_start = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:buried_treasure".into())),
+            ("ChunkX".into(), Tag::Int(3)),
+            ("ChunkZ".into(), Tag::Int(3)),
+            ("references".into(), Tag::Int(2)),
+            ("custom_start".into(), Tag::Int(73)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("id".into(), Tag::String("minecraft:btp".into())),
+                        ("BB".into(), Tag::IntArray(vec![57, 90, 57, 57, 90, 57])),
+                        ("O".into(), Tag::Int(-1)),
+                        ("GD".into(), Tag::Int(0)),
+                    ])],
+                },
+            ),
+        ]);
+        let original_document = &structured.context.inputs().sources().chunks()[&saved_center]
+            .terrain
+            .as_ref()
+            .context("saved center missing")?
+            .document;
+        let mut treasure_document = (**original_document).clone();
+        replace_unique_root_field(
+            &mut treasure_document,
+            "structures",
+            Tag::Compound(vec![
+                (
+                    "starts".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:buried_treasure".into(),
+                        original_start.clone(),
+                    )]),
+                ),
+                (
+                    "References".into(),
+                    Tag::Compound(vec![(
+                        "minecraft:buried_treasure".into(),
+                        Tag::LongArray(vec![3 | (3i64 << 32)]),
+                    )]),
+                ),
+            ]),
+        )?;
+        let encoded = native_persistence::nbt::write(&treasure_document)?;
+        let region = root.join("dimensions/minecraft/overworld/region/r.0.0.mca");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(region)?;
+        let offset = file.seek(SeekFrom::End(0))?;
+        let sectors = (encoded.len() + 5).div_ceil(4096);
+        ensure!(
+            offset % 4096 == 0 && sectors < 256 && offset / 4096 < (1 << 24),
+            "invalid test region entry"
+        );
+        file.write_all(&(u32::try_from(encoded.len() + 1)?).to_be_bytes())?;
+        file.write_all(&[3])?;
+        file.write_all(&encoded)?;
+        file.write_all(&vec![0; sectors * 4096 - encoded.len() - 5])?;
+        file.seek(SeekFrom::Start((3 + 3 * 32) * 4))?;
+        file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+        drop(file);
+        let session = reader
+            .session_guard()
+            .context("test session guard missing")?;
+        drop(reader);
+        let mut reader =
+            WorldReader::open_with_session(root, DimensionId::parse("overworld")?, session)?;
+        let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
+        let context = reader.capture_generation_context(positions)?;
+        let mut restored = prepare_existing_generator(context, &game)?;
+        let decoration = restored.prepare_saved_decoration(saved_center)?;
+        let first = restored.resume_saved_terrain(
+            saved_center,
+            std::slice::from_ref(&treasure_id),
+            &mut native_resources::density::DensityEvaluator::default(),
+        )?;
+        let mut terrain = first.into_world();
+        let mut evaluator = native_resources::density::DensityEvaluator::default();
+        for z in 2..=4 {
+            for x in 2..=4 {
+                if x == 3 && z == 3 {
+                    continue;
+                }
+                let next = restored.resume_saved_terrain(ChunkPos { x, z }, &[], &mut evaluator)?;
+                terrain.insert(&next)?;
+            }
+        }
+        let mut schedule = GenerationSchedule::new();
+        schedule.request(center, GenerationStage::Features)?;
+        let imported = schedule
+            .requirements()
+            .map(|(position, _)| {
+                let stage =
+                    if (position.x - center.x).abs() <= 1 && (position.z - center.z).abs() <= 1 {
+                        GenerationStage::Terrain
+                    } else {
+                        GenerationStage::StructureStarts
+                    };
+                (position, stage)
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(imported)?;
+        assert_eq!(
+            restored.run_saved_features(&mut terrain, &decoration, &mut schedule)?,
+            vec![true]
+        );
+        let key = (treasure_id.clone(), center);
+        let treasure = terrain
+            .treasure_starts
+            .get(&key)
+            .context("saved treasure result missing")?;
+        assert_eq!(treasure.original, original_start);
+        assert_eq!(treasure.references, 2);
+        assert_ne!(treasure.placement.bounds.min[1], 90);
+        let [x, y, z] = treasure.placement.bounds.min;
+        assert_eq!(
+            terrain
+                .terrain()
+                .snapshot()
+                .block(x, y, z)
+                .context("treasure chest missing")?
+                .name,
+            "minecraft:chest"
+        );
+        let refreshed = restored.prepare_saved_structure_plan(&terrain, saved_center)?;
+        assert_eq!(
+            refreshed.starts[&key].placement.bounds,
+            treasure.placement.bounds
+        );
         Ok(())
     }
 }

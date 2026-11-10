@@ -273,7 +273,7 @@ impl GenerationReady {
         )
     }
 
-    /// The caller may cancel at checkpoints; pack copying is one uninterrupted operation.
+    /// The caller may cancel at checkpoints, including during pack copying.
     pub fn stage_structure_initial_world_with_progress(
         &mut self,
         parent: &std::path::Path,
@@ -396,7 +396,10 @@ impl GenerationReady {
         })?;
         progress(InitialWorldStageProgress::InstallingDataPacks)?;
         match (&settings.packs, &self.pack_snapshot) {
-            (Some(_), Some(snapshot)) => stage.install_data_packs(snapshot)?,
+            (Some(_), Some(snapshot)) => stage
+                .install_data_packs_with_checkpoint(snapshot, || {
+                    progress(InitialWorldStageProgress::InstallingDataPacks)
+                })?,
             (None, None) => {}
             _ => anyhow::bail!("generation data pack snapshot does not match level settings"),
         }
@@ -5114,21 +5117,27 @@ mod tests {
             initial_ready.hut_generation.as_ref().unwrap(),
             &generation
         ));
-        for cancel_at_finish in [false, true] {
+        for cancel_at in ["chunk", "packs", "finish"] {
             let parent = tempfile::tempdir()?;
             let mut observed = false;
+            let mut pack_checkpoints = 0;
             let cancelled = initial_ready.stage_structure_initial_world_with_progress(
                 parent.path(),
                 123,
                 1,
                 |event| {
                     let cancel =
-                        if cancel_at_finish {
-                            matches!(event, InitialWorldStageProgress::Finished)
-                        } else {
-                            matches!(event, InitialWorldStageProgress::Saving(
+                        match cancel_at {
+                            "finish" => matches!(event, InitialWorldStageProgress::Finished),
+                            "packs" => {
+                                if matches!(event, InitialWorldStageProgress::InstallingDataPacks) {
+                                    pack_checkpoints += 1;
+                                }
+                                pack_checkpoints == 3
+                            }
+                            _ => matches!(event, InitialWorldStageProgress::Saving(
                             native_persistence::save::FreshWorldStageProgress::WritingChunk { .. }
-                        ))
+                        )),
                         };
                     if cancel {
                         observed = true;

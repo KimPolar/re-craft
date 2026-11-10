@@ -214,9 +214,22 @@ impl FreshWorldStage {
         &mut self,
         snapshot: &native_resources::datapack_snapshot::DataPackSnapshot,
     ) -> Result<()> {
-        self.verify()?;
-        snapshot.copy_into(&self.root)?;
-        let updated = staged_world_manifest(&self.root, false)?;
+        self.install_data_packs_with_checkpoint(snapshot, || Ok(()))
+    }
+
+    /// Check for cancellation during verification, copying and sealing.
+    /// Any failure requires the caller to discard this stage.
+    pub fn install_data_packs_with_checkpoint(
+        &mut self,
+        snapshot: &native_resources::datapack_snapshot::DataPackSnapshot,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            staged_world_manifest_with(&self.root, false, &mut checkpoint)? == self.manifest,
+            "staged world changed before publication"
+        );
+        snapshot.copy_into_with_checkpoint(&self.root, &mut checkpoint)?;
+        let updated = staged_world_manifest_with(&self.root, false, &mut checkpoint)?;
         let previous: BTreeMap<_, _> = updated
             .iter()
             .filter(|(path, _)| !path.starts_with("datapacks"))
@@ -400,7 +413,7 @@ fn staged_world_manifest_with(
                     metadata.is_file(),
                     "staged world contains an unsupported file"
                 );
-                Some(hash_file(&path)?)
+                Some(hash_file_with_checkpoint(&path, checkpoint)?)
             };
             ensure!(
                 output.insert(relative, value).is_none(),
@@ -3994,10 +4007,18 @@ fn copy_sync(source: &Path, destination: &Path) -> Result<()> {
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<[u8; 32]> {
+    hash_file_with_checkpoint(path, &mut || Ok(()))
+}
+
+fn hash_file_with_checkpoint(
+    path: &Path,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<[u8; 32]> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        checkpoint()?;
         let n = file.read(&mut buffer)?;
         if n == 0 {
             break;
@@ -5513,6 +5534,40 @@ mod tests {
             .add_region(DimensionId::parse("overworld").unwrap(), terrain)
             .unwrap();
         draft.stage(parent).unwrap()
+    }
+
+    #[test]
+    fn cancelled_pack_copy_cannot_publish_and_a_new_stage_can_retry() {
+        let saves = test_world();
+        let source = test_world();
+        fs::create_dir(source.path().join("datapacks")).unwrap();
+        let bytes = vec![17; 256 * 1024];
+        fs::write(source.path().join("datapacks/example.zip"), &bytes).unwrap();
+        let snapshot =
+            native_resources::datapack_snapshot::DataPackSnapshot::capture(source.path()).unwrap();
+        let mut stage = stage_with_selected_file_pack(saves.path(), "file/example.zip");
+        let partial = stage.path().join("datapacks/example.zip");
+        let error = stage
+            .install_data_packs_with_checkpoint(&snapshot, || {
+                if fs::metadata(&partial).is_ok_and(|m| m.len() > 0 && m.len() < bytes.len() as u64)
+                {
+                    anyhow::bail!("cancelled during copy");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled during copy"));
+        assert!(stage.verify_ready().is_err());
+        assert!(stage.publish(saves.path(), "World", "New World").is_err());
+        assert!(!saves.path().join("World").exists());
+
+        let mut retry = stage_with_selected_file_pack(saves.path(), "file/example.zip");
+        retry.install_data_packs(&snapshot).unwrap();
+        retry.verify_ready().unwrap();
+        assert_eq!(
+            fs::read(retry.path().join("datapacks/example.zip")).unwrap(),
+            bytes
+        );
     }
 
     #[test]

@@ -77,6 +77,11 @@ impl DataPackSnapshot {
     }
 
     pub fn verify(&self) -> Result<()> {
+        self.verify_with(&mut || Ok(()))
+    }
+
+    fn verify_with(&self, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<()> {
+        checkpoint()?;
         let root = self.directory.path().join("datapacks");
         if self.present {
             let metadata = fs::symlink_metadata(&root).context("data pack snapshot is missing")?;
@@ -85,7 +90,7 @@ impl DataPackSnapshot {
                 "data pack snapshot is not an ordinary directory"
             );
             ensure!(
-                scan(&root, None)? == self.manifest,
+                scan_with(&root, None, checkpoint)? == self.manifest,
                 "data pack snapshot changed during generation"
             );
         } else {
@@ -137,7 +142,17 @@ impl DataPackSnapshot {
 
     /// Copy into a new staged world; on failure the caller must discard it.
     pub fn copy_into(&self, world: &Path) -> Result<()> {
-        self.verify()?;
+        self.copy_into_with_checkpoint(world, || Ok(()))
+    }
+
+    /// Check for cancellation while verifying and copying the snapshot. A
+    /// failed operation can leave a partial tree, which the caller must discard.
+    pub fn copy_into_with_checkpoint(
+        &self,
+        world: &Path,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.verify_with(&mut checkpoint)?;
         let target = world.join("datapacks");
         ensure!(
             matches!(fs::symlink_metadata(&target), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
@@ -145,13 +160,19 @@ impl DataPackSnapshot {
         );
         if self.present {
             fs::create_dir(&target)?;
-            let copied = scan(&self.directory.path().join("datapacks"), Some(&target))?;
+            let copied = scan_with(
+                &self.directory.path().join("datapacks"),
+                Some(&target),
+                &mut checkpoint,
+            )?;
             ensure!(
-                copied == self.manifest && scan(&target, None)? == self.manifest,
+                copied == self.manifest
+                    && scan_with(&target, None, &mut checkpoint)? == self.manifest,
                 "staged data packs differ from the generation snapshot"
             );
-            self.verify()?;
+            self.verify_with(&mut checkpoint)?;
         }
+        checkpoint()?;
         Ok(())
     }
 }
@@ -236,11 +257,20 @@ fn ordinary(metadata: &fs::Metadata) -> bool {
 }
 
 fn scan(root: &Path, target: Option<&Path>) -> Result<BTreeMap<PathBuf, Entry>> {
+    scan_with(root, target, &mut || Ok(()))
+}
+
+fn scan_with(
+    root: &Path,
+    target: Option<&Path>,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+) -> Result<BTreeMap<PathBuf, Entry>> {
     let root = root.canonicalize()?;
     let mut pending = vec![PathBuf::new()];
     let mut manifest = BTreeMap::new();
     while let Some(relative) = pending.pop() {
         for item in fs::read_dir(root.join(&relative))? {
+            checkpoint()?;
             let item = item?;
             let path = relative.join(item.file_name());
             let source = root.join(&path);
@@ -275,6 +305,7 @@ fn scan(root: &Path, target: Option<&Path>) -> Result<BTreeMap<PathBuf, Entry>> 
                 let mut size = 0u64;
                 let mut buffer = [0u8; 64 * 1024];
                 loop {
+                    checkpoint()?;
                     let count = input.read(&mut buffer)?;
                     if count == 0 {
                         break;
@@ -381,6 +412,35 @@ mod tests {
         );
         empty.copy_into(stage.path()).unwrap();
         assert!(!stage.path().join("datapacks").exists());
+    }
+
+    #[test]
+    fn copying_large_pack_can_be_cancelled_and_retried() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("datapacks")).unwrap();
+        let bytes = vec![42; 256 * 1024];
+        fs::write(source.path().join("datapacks/large.zip"), &bytes).unwrap();
+        let snapshot = DataPackSnapshot::capture(source.path()).unwrap();
+        let cancelled = tempfile::tempdir().unwrap();
+        let partial = cancelled.path().join("datapacks/large.zip");
+        let error = snapshot
+            .copy_into_with_checkpoint(cancelled.path(), || {
+                if fs::metadata(&partial).is_ok_and(|m| m.len() > 0 && m.len() < bytes.len() as u64)
+                {
+                    anyhow::bail!("cancelled during copy");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled during copy"));
+        assert!(partial.metadata().unwrap().len() < bytes.len() as u64);
+        snapshot.verify().unwrap();
+        let retry = tempfile::tempdir().unwrap();
+        snapshot.copy_into(retry.path()).unwrap();
+        assert_eq!(
+            fs::read(retry.path().join("datapacks/large.zip")).unwrap(),
+            bytes
+        );
     }
 
     #[cfg(windows)]

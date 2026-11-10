@@ -2175,6 +2175,107 @@ pub fn materialize_carved_terrain(
     })
 }
 impl QuartBiomeChunk {
+    /// Decode all saved quart biomes for the dimension into generation order.
+    /// The caller must validate IDs against the captured active biome registry.
+    /// Missing data or an earlier chunk stage is not silently regenerated.
+    pub fn from_saved_chunk(
+        saved: &native_persistence::world::LoadedChunk,
+        seed: i64,
+        min_y: i32,
+        height: i32,
+        mut validate_biome: impl FnMut(&ResourceId) -> Result<()>,
+    ) -> Result<Self> {
+        ensure!(
+            saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+            "unsupported saved biome data version"
+        );
+        let status = saved
+            .status
+            .as_ref()
+            .context("saved chunk status is missing")?;
+        let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+        let status =
+            schedule::GenerationStage::from_id(&status).context("unknown saved chunk status")?;
+        ensure!(
+            status >= schedule::GenerationStage::Biomes,
+            "saved chunk has not generated biomes"
+        );
+        ensure!(
+            height > 0
+                && height <= 4096
+                && min_y % 16 == 0
+                && height % 16 == 0
+                && min_y.checked_add(height).is_some()
+                && min_y / 16 >= i32::from(i8::MIN)
+                && (min_y + height - 1) / 16 <= i32::from(i8::MAX),
+            "invalid biome height range"
+        );
+        let section_count = usize::try_from(height / 16)?;
+        let volume = section_count
+            .checked_mul(64)
+            .context("biome volume size overflow")?;
+        let mut sections = BTreeMap::new();
+        for section in &saved.sections {
+            ensure!(
+                sections.insert(i32::from(section.y), section).is_none(),
+                "duplicate saved biome section"
+            );
+        }
+        let mut palette = Vec::new();
+        let mut lookup = BTreeMap::new();
+        let mut indices = vec![0; volume];
+        let quart_height = usize::try_from(height / 4)?;
+        for section_index in 0..section_count {
+            let y = min_y / 16 + i32::try_from(section_index)?;
+            let section = sections
+                .get(&y)
+                .with_context(|| format!("missing biome section {y}"))?;
+            let saved_palette = section
+                .biomes
+                .as_ref()
+                .with_context(|| format!("missing biome palette in section {y}"))?;
+            ensure!(
+                saved_palette.indices.len() == 64 && !saved_palette.names.is_empty(),
+                "invalid saved biome palette"
+            );
+            let mut remap = Vec::with_capacity(saved_palette.names.len());
+            for name in &saved_palette.names {
+                let name = String::from_utf16(&name.0).context("invalid saved biome ID")?;
+                let biome = ResourceId::parse(&name)?;
+                let index = if let Some(&index) = lookup.get(&biome) {
+                    index
+                } else {
+                    validate_biome(&biome)?;
+                    let index = palette.len();
+                    lookup.insert(biome.clone(), index);
+                    palette.push(biome);
+                    index
+                };
+                remap.push(index);
+            }
+            for local_y in 0..4 {
+                for z in 0..4 {
+                    for x in 0..4 {
+                        let source = x + z * 4 + local_y * 16;
+                        let biome = *remap
+                            .get(saved_palette.indices[source] as usize)
+                            .context("invalid saved biome palette index")?;
+                        let target = (z * 4 + x) * quart_height + section_index * 4 + local_y;
+                        indices[target] = biome;
+                    }
+                }
+            }
+        }
+        Self::from_palette(
+            [saved.position.x, saved.position.z],
+            seed,
+            min_y,
+            height,
+            palette,
+            indices,
+        )
+    }
+
     /// Construct from decoded saved biome IDs in Z, X, Y order. The caller
     /// supplies the saved world's seed and ensures IDs match its active packs.
     pub fn from_values(
@@ -7596,6 +7697,83 @@ mod tests {
         assert!(
             QuartBiomeChunk::from_palette([0, 0], 0, 0, 16, vec![plains], vec![1; 64]).is_err()
         );
+    }
+
+    #[test]
+    fn saved_biomes_preserve_section_order_and_reject_incomplete_inputs() {
+        use native_persistence::{
+            nbt::{JavaString, NamedTag, Tag},
+            palette::{BiomePalette, ChunkSection},
+            world::{ChunkPos as SavedPos, LoadedChunk, TARGET_DATA_VERSION},
+        };
+        let section = |y: i8| ChunkSection {
+            y,
+            blocks: None,
+            biomes: Some(BiomePalette {
+                names: vec![
+                    "minecraft:plains".into(),
+                    "minecraft:forest".into(),
+                    "example:custom".into(),
+                ],
+                indices: (0..64)
+                    .map(|i| ((i * 7 + usize::from(y == 0)) % 3) as u32)
+                    .collect(),
+            }),
+            block_light: None,
+            sky_light: None,
+        };
+        let mut saved = LoadedChunk {
+            position: SavedPos { x: -2, z: 3 },
+            data_version: TARGET_DATA_VERSION,
+            status: Some("minecraft:full".into()),
+            document: Arc::new(NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![]),
+            }),
+            sections: vec![section(0), section(-1)],
+        };
+        let mut checked = BTreeSet::new();
+        let restored = QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |id| {
+            assert!(
+                checked.insert(id.clone()),
+                "each biome should be validated once"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checked.len(), 3);
+        assert!(restored.expanded.get().is_none());
+        for z in 0..4 {
+            for x in 0..4 {
+                for y in 0..8 {
+                    let expected = saved.biome(-32 + x * 4, -16 + y * 4, 48 + z * 4).unwrap();
+                    let actual = restored.at(IVec3::new(-8 + x, -4 + y, 12 + z)).unwrap();
+                    assert_eq!(
+                        format!("{}:{}", actual.namespace, actual.path),
+                        String::from_utf16(&expected.0).unwrap()
+                    );
+                }
+            }
+        }
+        assert!(restored.expanded.get().is_none());
+        assert!(
+            QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |id| {
+                ensure!(id.namespace != "example", "unknown biome");
+                Ok(())
+            })
+            .is_err()
+        );
+        saved.status = Some("minecraft:structure_references".into());
+        assert!(QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |_| Ok(())).is_err());
+        saved.status = Some(JavaString(vec![0xd800]));
+        assert!(QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |_| Ok(())).is_err());
+        saved.status = Some("minecraft:biomes".into());
+        saved.sections[0].biomes.as_mut().unwrap().indices[0] = 99;
+        assert!(QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |_| Ok(())).is_err());
+        saved.sections[0] = section(0);
+        saved.sections.pop();
+        assert!(QuartBiomeChunk::from_saved_chunk(&saved, 42, -16, 32, |_| Ok(())).is_err());
+        assert!(QuartBiomeChunk::from_saved_chunk(&saved, 42, 0, 4096 * 16, |_| Ok(())).is_err());
     }
 
     #[test]

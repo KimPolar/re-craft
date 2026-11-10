@@ -24,6 +24,58 @@ impl PreparedExistingGenerator {
         self.context.inputs()
     }
 
+    /// Restore captured biome volumes against this generator's pack registry.
+    /// The caller must still restore other stage data before advancing a plan.
+    pub fn restore_saved_biomes(
+        &mut self,
+        positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+    ) -> Result<
+        BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>,
+    > {
+        let registry: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/biome")?
+            .into_iter()
+            .collect();
+        ensure!(!registry.is_empty(), "active biome registry is empty");
+        let mut restored = BTreeMap::new();
+        let sources = self.context.inputs().sources().chunks();
+        for position in positions {
+            let source = sources
+                .get(&position)
+                .context("biome chunk was not captured")?;
+            let source = source
+                .terrain
+                .as_ref()
+                .context("saved biome chunk is missing")?;
+            let chunk = native_session::worldgen::QuartBiomeChunk::from_saved_chunk(
+                source,
+                self.context.inputs().settings().seed(),
+                self.lighting.min_y,
+                self.lighting.height,
+                |biome| {
+                    ensure!(
+                        registry.contains(biome),
+                        "saved biome is not in the active registry: {}:{}",
+                        biome.namespace,
+                        biome.path
+                    );
+                    Ok(())
+                },
+            )?;
+            let position = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            ensure!(
+                restored.insert(position, Arc::new(chunk)).is_none(),
+                "duplicate saved biome chunk"
+            );
+        }
+        ensure!(!restored.is_empty(), "no saved biome chunks requested");
+        Ok(restored)
+    }
+
     /// Bind captured disk and pack inputs; live session state and generation
     /// completeness still require independent checks before saving.
     pub fn add_save_dependencies(
@@ -481,7 +533,62 @@ mod tests {
         gzip.write_all(&native_persistence::nbt::write(&level)?)?;
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
         for name in ["overworld", "the_nether", "the_end"] {
-            std::fs::create_dir_all(root.join(format!("dimensions/minecraft/{name}/region")))?;
+            use native_persistence::save::{FreshRegionDraft, FreshRegionKind};
+            let region_dir = root.join(format!("dimensions/minecraft/{name}/region"));
+            std::fs::create_dir_all(&region_dir)?;
+            let lighting = GeneratedDimensionLighting::load_preset(
+                &mut source,
+                "minecraft:normal",
+                &format!("minecraft:{name}"),
+            )?;
+            let sections = (0..lighting.height / 16)
+                .map(|index| {
+                    let section_y = i8::try_from(lighting.min_y / 16 + index).unwrap();
+                    let biome = if index % 2 == 0 {
+                        "minecraft:plains"
+                    } else {
+                        "minecraft:forest"
+                    };
+                    Tag::Compound(vec![
+                        ("Y".into(), Tag::Byte(section_y)),
+                        (
+                            "biomes".into(),
+                            Tag::Compound(vec![(
+                                "palette".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![Tag::String(biome.into())],
+                                },
+                            )]),
+                        ),
+                    ])
+                })
+                .collect();
+            let saved = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(5023)),
+                    ("xPos".into(), Tag::Int(0)),
+                    ("zPos".into(), Tag::Int(0)),
+                    ("Status".into(), Tag::String("minecraft:full".into())),
+                    (
+                        "sections".into(),
+                        Tag::List {
+                            element_type: TagType::Compound,
+                            values: sections,
+                        },
+                    ),
+                ]),
+            };
+            let mut region = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+            region.add(ChunkPos { x: 0, z: 0 }, &saved, 1)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(region_dir.join("r.0.0.mca"))?;
+            region.write_staged(&mut file)?;
+            drop(file);
             let dimension = DimensionId::parse(name)?;
             let mut reader = WorldReader::open_for_session(root, dimension)?;
             let mut schedule = GenerationSchedule::new();
@@ -497,6 +604,37 @@ mod tests {
             );
             assert!(actual.generate_structures);
             assert_eq!(actual.inputs().settings().seed(), -42);
+            let position = ChunkPos { x: 0, z: 0 };
+            let restored = actual.restore_saved_biomes([position])?;
+            let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
+            let mut neighborhood = actual.generator.biome_neighborhood()?;
+            neighborhood.insert(Arc::clone(chunk))?;
+            assert_eq!(
+                neighborhood.noise_biome_at_block(0, lighting.min_y, 0)?.path,
+                "plains"
+            );
+            let quart_height = (lighting.height / 4) as usize;
+            for xz in 0..16 {
+                for y in 0..quart_height {
+                    let expected = if (y / 4) % 2 == 0 { "plains" } else { "forest" };
+                    assert_eq!(
+                        chunk.values()[xz * quart_height + y].path,
+                        expected,
+                        "{name}"
+                    );
+                }
+            }
+            assert!(actual.restore_saved_biomes([position, position]).is_err());
+            assert!(
+                actual
+                    .restore_saved_biomes([ChunkPos { x: 1, z: 0 }])
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .restore_saved_biomes([ChunkPos { x: 100, z: 100 }])
+                    .is_err()
+            );
             let mut plan = WorldSavePlan::new();
             actual.add_save_dependencies(&mut plan)?;
             assert!(actual.add_save_dependencies(&mut plan).is_err());

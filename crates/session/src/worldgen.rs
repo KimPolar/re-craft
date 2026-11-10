@@ -8310,9 +8310,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25"]
     fn fresh_batch_records_vanilla_jigsaw_villager() -> Result<()> {
-        run_fresh_template_batch(35, None)
+        run_fresh_template_batch(35, None)?;
+        run_fresh_template_batch(36, None)
     }
 
     #[test]
@@ -8407,10 +8408,12 @@ mod tests {
         Ok(())
     }
 
-    fn java_rewrite_generated_cushion_region(
+    fn java_rewrite_generated_entity_region(
         game: &std::path::Path,
         directory: &std::path::Path,
         pos: native_world::loaded::ChunkPos,
+        class: &str,
+        code: &str,
     ) -> Result<()> {
         use std::{path::PathBuf, process::Command};
         let java = std::env::var_os("MINECRAFT_JAVA_HOME")
@@ -8438,11 +8441,8 @@ mod tests {
             }
         }
         let classpath = std::env::join_paths(paths)?;
-        let source = classes.path().join("GeneratedCushionRegionOracle.java");
-        std::fs::write(
-            &source,
-            include_str!("../tests/java/GeneratedCushionRegionOracle.java"),
-        )?;
+        let source = classes.path().join(format!("{class}.java"));
+        std::fs::write(&source, code)?;
         let compiled = Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
@@ -8456,14 +8456,14 @@ mod tests {
         let output = Command::new(java.join("java.exe"))
             .arg("-cp")
             .arg(classpath)
-            .arg("GeneratedCushionRegionOracle")
+            .arg(class)
             .arg(directory)
             .arg(pos.x.to_string())
             .arg(pos.z.to_string())
             .output()?;
         ensure!(
             output.status.success(),
-            "Java cushion region: {}\n{}",
+            "Java entity region: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -8672,6 +8672,7 @@ mod tests {
             (false, false, "minecraft:stone_bricks", 32),
             (false, false, "minecraft:stone_bricks", 34),
             (false, false, "minecraft:stone_bricks", 35),
+            (false, false, "minecraft:stone_bricks", 36),
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
@@ -8679,7 +8680,7 @@ mod tests {
             if entity_anchor.is_some() && *unsupported {
                 false
             } else if portal_kind == 0 {
-                !(9..=29).contains(kind) && !matches!(*kind, 32 | 34 | 35)
+                !(9..=29).contains(kind) && !matches!(*kind, 32 | 34 | 35 | 36)
             } else if portal_kind == 10 {
                 (10..=29).contains(kind)
             } else {
@@ -8708,7 +8709,7 @@ mod tests {
                     ]),
                 ));
             }
-            let template_entities = if matches!(feature_kind, 32 | 34 | 35)
+            let template_entities = if matches!(feature_kind, 32 | 34 | 35 | 36)
                 || feature_kind == 30 && entity_anchor == Some(1)
             {
                 let game = native_resources::default_minecraft_dir()
@@ -8720,6 +8721,8 @@ mod tests {
                         "minecraft:village/taiga/houses/taiga_armorer_2"
                     } else if feature_kind == 35 {
                         "minecraft:village/plains/villagers/baby"
+                    } else if feature_kind == 36 {
+                        "minecraft:village/snowy/villagers/nitwit"
                     } else {
                         "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1"
                     })?,
@@ -8817,7 +8820,7 @@ mod tests {
                 feature_kind,
             };
             let mut terrain_definition = definition();
-            if matches!(feature_kind, 31 | 32) {
+            if matches!(feature_kind, 31 | 32 | 35 | 36) {
                 terrain_definition["settings"]["disable_mob_generation"] = json!(true);
             }
             if (4..=31).contains(&feature_kind) {
@@ -8897,7 +8900,7 @@ mod tests {
                 source
             };
             let save_targets: BTreeSet<_> = [source, target].into_iter().collect();
-            let light_targets: BTreeSet<_> = if matches!(feature_kind, 31 | 32) {
+            let light_targets: BTreeSet<_> = if matches!(feature_kind, 31 | 32 | 35 | 36) {
                 save_targets
                     .iter()
                     .flat_map(|pos| {
@@ -8995,7 +8998,7 @@ mod tests {
             batch.enable_decoration(&mut data, &placed_features, blocks.clone(), &lighting)?;
             batch.enable_light_initialization(registry)?;
             batch.request_features(target)?;
-            if matches!(feature_kind, 31 | 32) {
+            if matches!(feature_kind, 31 | 32 | 35 | 36) {
                 batch.request_light_initialization_many(light_targets.iter().copied())?;
             }
             let mut failed = false;
@@ -9064,7 +9067,7 @@ mod tests {
             if !failed {
                 assert_eq!(
                     batch.schedule().completed(target),
-                    Some(if matches!(feature_kind, 31 | 32) {
+                    Some(if matches!(feature_kind, 31 | 32 | 35 | 36) {
                         schedule::GenerationStage::InitializeLight
                     } else {
                         schedule::GenerationStage::Features
@@ -9152,13 +9155,22 @@ mod tests {
                         || (4..=32).contains(&feature_kind)
                         || feature_kind == 34
                         || feature_kind == 35
+                        || feature_kind == 36
                 );
-                if feature_kind == 35 {
+                if matches!(feature_kind, 35 | 36) {
                     let entities = batch.recorded_generated_entities(target)?;
                     assert_eq!(entities.len(), 1);
-                    assert!(matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:villager")));
-                    assert_eq!(entities[0].get("Age"), Some(&Tag::Int(-21359)));
-                    assert_eq!(entities[0].get("VillagerDataFinalized"), Some(&Tag::Byte(1)));
+                    assert!(
+                        matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:villager"))
+                    );
+                    assert_eq!(
+                        entities[0].get("Age"),
+                        Some(&Tag::Int(if feature_kind == 35 { -21359 } else { 0 }))
+                    );
+                    assert_eq!(
+                        entities[0].get("VillagerDataFinalized"),
+                        Some(&Tag::Byte(1))
+                    );
                 }
                 if feature_kind == 34 {
                     let entities = batch.recorded_generated_entities(target)?;
@@ -9190,16 +9202,18 @@ mod tests {
                         Some(&Tag::IntArray(expected_anchor.to_vec()))
                     );
                 }
-                if feature_kind == 32 {
+                if matches!(feature_kind, 32 | 35 | 36) {
                     let entities = batch.recorded_generated_entities(target)?;
                     assert_eq!(entities.len(), 1);
-                    assert!(
-                        matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion"))
-                    );
-                    assert_eq!(
-                        entities[0].get("block_pos"),
-                        Some(&Tag::IntArray(origin.to_vec()))
-                    );
+                    if feature_kind == 32 {
+                        assert!(
+                            matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion"))
+                        );
+                        assert_eq!(
+                            entities[0].get("block_pos"),
+                            Some(&Tag::IntArray(origin.to_vec()))
+                        );
+                    }
                     let expected = entities.to_vec();
                     batch.seal_for_light_propagation()?;
                     batch.request_light(target)?;
@@ -9237,7 +9251,7 @@ mod tests {
                     let region = prepared
                         .regions
                         .get(&key)
-                        .context("cushion entity region missing")?;
+                        .context("entity region missing")?;
                     let directory = tempfile::tempdir()?;
                     let path = directory.path().join(format!("r.{}.{}.mca", key.1, key.2));
                     let mut file = std::fs::OpenOptions::new()
@@ -9247,10 +9261,23 @@ mod tests {
                         .open(&path)?;
                     assert!(region.write_staged(&mut file)?.is_empty());
                     drop(file);
-                    java_rewrite_generated_cushion_region(&game, directory.path(), target)?;
+                    let (class, code) = if matches!(feature_kind, 35 | 36) {
+                        (
+                            "GeneratedVillagerRegionOracle",
+                            include_str!("../tests/java/GeneratedVillagerRegionOracle.java"),
+                        )
+                    } else {
+                        (
+                            "GeneratedCushionRegionOracle",
+                            include_str!("../tests/java/GeneratedCushionRegionOracle.java"),
+                        )
+                    };
+                    java_rewrite_generated_entity_region(
+                        &game, directory.path(), target, class, code,
+                    )?;
                     let saved = native_persistence::anvil::RegionReader::open(&path)?
                         .read_chunk(target.x, target.z)?
-                        .context("saved cushion chunk missing")?;
+                        .context("saved entity chunk missing")?;
                     assert_eq!(
                         canonical_nbt(saved.value),
                         canonical_nbt(

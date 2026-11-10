@@ -1832,6 +1832,27 @@ impl GenerationSchedule {
         Ok(result)
     }
 
+    /// Run FEATURES with a complete structure plan before lighting is published.
+    /// The caller must supply all references and preserve the returned starts.
+    pub fn run_features_with_structure_plan(
+        &mut self,
+        terrain: &mut super::CarvedTerrainWorld,
+        prepared: &super::PreparedDecoration<'_, '_>,
+        structures: &[super::structure_batch::PlannedStructureDecoration<'_>],
+    ) -> Result<(
+        Vec<bool>,
+        Vec<Vec<native_resources::structure_start::SimpleStructureStart>>,
+    )> {
+        let center = prepared.center_chunk();
+        ensure!(
+            self.ready(center, Features),
+            "features dependencies are incomplete"
+        );
+        let result = prepared.execute_with_structure_plan(terrain, structures)?;
+        self.complete(center, Features)?;
+        Ok(result)
+    }
+
     /// Execute FEATURES using an already published staged-light revision.
     pub fn run_features_with_staged_light(
         &mut self,

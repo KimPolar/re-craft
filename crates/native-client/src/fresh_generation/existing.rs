@@ -30,6 +30,24 @@ struct SavedTerrainAssets {
     carvers: native_resources::carver::schedule::CarverCache,
 }
 
+fn require_empty_saved_structure_references(
+    references: &native_session::worldgen::structure_references::SavedStructureReferences,
+) -> Result<()> {
+    ensure!(
+        references.discarded.is_empty(),
+        "saved structure references contain unsupported data"
+    );
+    ensure!(
+        references
+            .references
+            .membership()
+            .values()
+            .all(BTreeSet::is_empty),
+        "saved structure decoration is not available"
+    );
+    Ok(())
+}
+
 /// Decoration inputs from one captured biome neighborhood and pack snapshot.
 /// This plan does not place features or establish terrain or save readiness.
 pub(crate) struct SavedDecorationContext {
@@ -241,7 +259,7 @@ impl PreparedExistingGenerator {
 
     /// Run a ready FEATURES step on captured intermediate terrain. The caller
     /// must restore the scheduler from the same verified generation inputs.
-    /// Structure decoration and previously published light are not supported.
+    /// Referenced structure decoration and previously published light are not supported.
     /// This does not authorize publishing or saving the resulting chunks.
     pub fn run_saved_features(
         &mut self,
@@ -251,10 +269,6 @@ impl PreparedExistingGenerator {
     ) -> Result<Vec<bool>> {
         use native_session::worldgen::schedule::GenerationStage;
         use native_world::loaded::ChunkPos;
-        ensure!(
-            !self.generate_structures,
-            "saved structure decoration is not available"
-        );
         ensure!(
             Arc::ptr_eq(&self.identity, &world.identity)
                 && Arc::ptr_eq(&self.identity, &context.identity),
@@ -268,6 +282,11 @@ impl PreparedExistingGenerator {
             schedule.ready(center, GenerationStage::Features),
             "features dependencies are incomplete"
         );
+        let structures_enabled = self.generate_structures;
+        if structures_enabled {
+            let references = self.restore_saved_structure_references(context.position)?;
+            require_empty_saved_structure_references(&references)?;
+        }
         let mut positions = Vec::with_capacity(9);
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
@@ -322,7 +341,13 @@ impl PreparedExistingGenerator {
             }
         }
         let result = self.with_saved_prepared_decoration(context, |prepared| {
-            schedule.run_features(&mut world.terrain, prepared, false, None)
+            if structures_enabled {
+                let (features, _) =
+                    schedule.run_features_with_structure_plan(&mut world.terrain, prepared, &[])?;
+                Ok(features)
+            } else {
+                schedule.run_features(&mut world.terrain, prepared, false, None)
+            }
         })?;
         world.feature_touched.extend(positions);
         Ok(result)
@@ -1543,6 +1568,31 @@ mod tests {
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
 
+    #[test]
+    fn only_lossless_empty_structure_references_can_skip_decoration() -> Result<()> {
+        use native_session::worldgen::structure_references::restore_saved_structure_references;
+        let center = native_world::loaded::ChunkPos { x: 3, z: 3 };
+        let parse = |tag: Option<&Tag>, registered| {
+            restore_saved_structure_references(center, tag, |_| Ok(registered))
+        };
+        require_empty_saved_structure_references(&parse(None, true)?)?;
+        let empty = Tag::Compound(vec![(
+            "minecraft:buried_treasure".into(),
+            Tag::LongArray(vec![]),
+        )]);
+        require_empty_saved_structure_references(&parse(Some(&empty), true)?)?;
+        let present = Tag::Compound(vec![(
+            "minecraft:buried_treasure".into(),
+            Tag::LongArray(vec![3 | (3i64 << 32)]),
+        )]);
+        assert!(require_empty_saved_structure_references(&parse(Some(&present), true)?).is_err());
+        assert!(require_empty_saved_structure_references(&parse(Some(&present), false)?).is_err());
+        assert!(
+            require_empty_saved_structure_references(&parse(Some(&Tag::Int(1)), true)?).is_err()
+        );
+        Ok(())
+    }
+
     struct Packs(BTreeMap<String, Vec<u8>>);
     impl ResourceProvider for Packs {
         fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
@@ -2603,8 +2653,8 @@ mod tests {
                         &decoration,
                         &mut GenerationSchedule::new(),
                     )
-                    .expect_err("structure-enabled world must not skip structure placement");
-                assert!(format!("{error:#}").contains("structure decoration"));
+                    .expect_err("an incomplete schedule must not run features");
+                assert!(format!("{error:#}").contains("features dependencies"));
                 assert!(Arc::ptr_eq(&before, &resumed_world.terrain().snapshot()));
             }
             let metadata = actual.draft_resumed_metadata(&mut resumed_world, &draft)?;
@@ -3096,6 +3146,7 @@ mod tests {
                 .run_saved_features(&mut terrain, &custom_decoration, &mut schedule)
                 .is_err()
         );
+        let no_structures_snapshot = terrain.terrain().snapshot();
         let previous = Arc::new(native_core::beardifier::Beardifier::new(
             vec![],
             vec![],
@@ -3143,6 +3194,81 @@ mod tests {
             !called,
             "unsupported feature reached the placement callback"
         );
+        // A structure-enabled world with no references in the center still
+        // runs its feature pass with an explicitly empty structure plan.
+        std::fs::write(
+            root.join("data/minecraft/world_gen_settings.dat"),
+            native_persistence::nbt::write(&worldgen)?,
+        )?;
+        custom_biome["features"] = json!([[{
+            "feature": {"type":"minecraft:simple_block", "to_place":{"id":"minecraft:melon"}},
+            "placement": [{"type":"minecraft:offset", "x":8, "y":8, "z":8}]
+        }]]);
+        std::fs::write(&biome_file, serde_json::to_vec(&custom_biome)?)?;
+        let positions = (1..=5).flat_map(|z| (1..=5).map(move |x| ChunkPos { x, z }));
+        let context = reader.capture_generation_context(positions)?;
+        let mut structured = prepare_existing_generator(context, &game)?;
+        assert!(structured.generate_structures);
+        let decoration = structured.prepare_saved_decoration(saved_center)?;
+        let first = structured.resume_saved_terrain(
+            saved_center,
+            &[],
+            &mut native_resources::density::DensityEvaluator::default(),
+        )?;
+        let mut terrain = first.into_world();
+        let mut evaluator = native_resources::density::DensityEvaluator::default();
+        for z in 2..=4 {
+            for x in 2..=4 {
+                if x == 3 && z == 3 {
+                    continue;
+                }
+                let next =
+                    structured.resume_saved_terrain(ChunkPos { x, z }, &[], &mut evaluator)?;
+                terrain.insert(&next)?;
+            }
+        }
+        let mut schedule = GenerationSchedule::new();
+        use native_session::worldgen::schedule::GenerationStage;
+        schedule.request(center, GenerationStage::Features)?;
+        let restored = schedule
+            .requirements()
+            .map(|(position, _)| {
+                let stage =
+                    if (position.x - center.x).abs() <= 1 && (position.z - center.z).abs() <= 1 {
+                        GenerationStage::Terrain
+                    } else {
+                        GenerationStage::StructureStarts
+                    };
+                (position, stage)
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(restored)?;
+        assert_eq!(
+            structured.run_saved_features(&mut terrain, &decoration, &mut schedule)?,
+            vec![true]
+        );
+        assert_eq!(
+            terrain
+                .terrain()
+                .snapshot()
+                .block(56, structured.lighting.min_y + 8, 56)
+                .context("feature block missing")?
+                .name,
+            "minecraft:melon"
+        );
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
+        let structured_snapshot = terrain.terrain().snapshot();
+        for y in structured.lighting.min_y..structured.lighting.min_y + structured.lighting.height {
+            for z in 32..80 {
+                for x in 32..80 {
+                    assert_eq!(
+                        structured_snapshot.block(x, y, z),
+                        no_structures_snapshot.block(x, y, z),
+                        "empty structure plan changed block {x}, {y}, {z}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

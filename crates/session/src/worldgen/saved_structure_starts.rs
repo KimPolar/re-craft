@@ -199,6 +199,82 @@ fn treasure_piece(tag: &Tag) -> Result<RestoredStructurePiece> {
     Ok(RestoredStructurePiece::BuriedTreasure(bounds))
 }
 
+/// Patch only the moved piece bounds, preserving the original start and all
+/// unknown fields. This is an NBT draft, not permission to write a world.
+pub fn draft_saved_treasure_start(
+    original: &Tag,
+    id: &ResourceId,
+    position: ChunkPos,
+    references: i32,
+    placed: &native_resources::structure_start::SimpleStructureStart,
+) -> Result<Tag> {
+    use native_resources::structure_start::SimpleStructureKind;
+    let expected_id = format!("{}:{}", id.namespace, id.path);
+    ensure!(
+        matches!(field(original, "id")?, Some(Tag::String(value)) if value.matches(&expected_id)),
+        "saved treasure start identity differs"
+    );
+    ensure!(
+        integer(original, "ChunkX")? == position.x && integer(original, "ChunkZ")? == position.z,
+        "saved treasure start source differs"
+    );
+    ensure!(
+        integer(original, "references")? == references,
+        "saved treasure reference count differs"
+    );
+    ensure!(
+        placed.kind == SimpleStructureKind::BuriedTreasure
+            && placed.chunk == [position.x, position.z]
+            && placed.orientation.is_none()
+            && placed.bounds.min == placed.bounds.max,
+        "invalid decorated treasure piece"
+    );
+    let Some(Tag::List {
+        element_type: TagType::Compound,
+        values,
+    }) = field(original, "Children")?
+    else {
+        bail!("saved treasure pieces are missing");
+    };
+    let [piece] = values.as_slice() else {
+        bail!("expected one saved treasure piece")
+    };
+    let RestoredStructurePiece::BuriedTreasure(before) = treasure_piece(piece)? else {
+        unreachable!()
+    };
+    ensure!(
+        before.min[0] == placed.bounds.min[0] && before.min[2] == placed.bounds.min[2],
+        "treasure horizontal position changed"
+    );
+    let mut result = original.clone();
+    let Tag::Compound(fields) = &mut result else {
+        unreachable!()
+    };
+    let (_, Tag::List { values, .. }) = fields
+        .iter_mut()
+        .find(|(name, _)| name.matches("Children"))
+        .expect("children field was validated")
+    else {
+        unreachable!()
+    };
+    let Tag::Compound(piece) = &mut values[0] else {
+        unreachable!()
+    };
+    let (_, bounds) = piece
+        .iter_mut()
+        .find(|(name, _)| name.matches("BB"))
+        .expect("piece bounds were validated");
+    *bounds = Tag::IntArray(
+        placed
+            .bounds
+            .min
+            .into_iter()
+            .chain(placed.bounds.max)
+            .collect(),
+    );
+    Ok(result)
+}
+
 /// Decode starts for one captured chunk using the active structure registry.
 /// Unsupported types and lossy piece encodings fail without publishing partial
 /// results. Retained NBT does not authorize modifying an existing world.
@@ -359,6 +435,65 @@ mod tests {
                 },
             ),
         ])
+    }
+
+    #[test]
+    fn treasure_draft_preserves_original_fields_and_rejects_invalid_changes() -> Result<()> {
+        use native_resources::structure_start::{SimpleStructureKind, SimpleStructureStart};
+        let piece = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:btp".into())),
+            ("BB".into(), Tag::IntArray(vec![-23, 90, 57, -23, 90, 57])),
+            ("O".into(), Tag::Int(-1)),
+            ("GD".into(), Tag::Int(0)),
+        ]);
+        let mut original = start("example:treasure", vec![piece]);
+        let Tag::Compound(fields) = &mut original else {
+            unreachable!()
+        };
+        fields.push(("custom".into(), Tag::String("keep".into())));
+        let untouched = original.clone();
+        let id = ResourceId::parse("example:treasure")?;
+        let pos = ChunkPos { x: -2, z: 3 };
+        let placed = SimpleStructureStart {
+            kind: SimpleStructureKind::BuriedTreasure,
+            chunk: [-2, 3],
+            generation_point: [0, 0, 0],
+            orientation: None,
+            bounds: BoundingBox::new([-23, 64, 57], [-23, 64, 57]).unwrap(),
+            terrain_adjustment: TerrainAdjustment::None,
+        };
+        let draft = draft_saved_treasure_start(&original, &id, pos, 2, &placed)?;
+        let Tag::List { values, .. } = draft.get("Children").unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            values[0].get("BB"),
+            Some(&Tag::IntArray(vec![-23, 64, 57, -23, 64, 57]))
+        );
+        assert_eq!(draft.get("custom"), original.get("custom"));
+        assert_eq!(draft.get("references"), original.get("references"));
+        assert_eq!(original, untouched);
+        assert!(draft_saved_treasure_start(&original, &id, pos, 1, &placed).is_err());
+        assert!(
+            draft_saved_treasure_start(
+                &original,
+                &ResourceId::parse("example:other")?,
+                pos,
+                2,
+                &placed
+            )
+            .is_err()
+        );
+        let mut moved = placed.clone();
+        moved.bounds = BoundingBox::new([-22, 64, 57], [-22, 64, 57]).unwrap();
+        assert!(draft_saved_treasure_start(&original, &id, pos, 2, &moved).is_err());
+        let mut duplicate = original.clone();
+        let Tag::Compound(fields) = &mut duplicate else {
+            unreachable!()
+        };
+        fields.push(("references".into(), Tag::Int(2)));
+        assert!(draft_saved_treasure_start(&duplicate, &id, pos, 2, &placed).is_err());
+        Ok(())
     }
 
     #[test]

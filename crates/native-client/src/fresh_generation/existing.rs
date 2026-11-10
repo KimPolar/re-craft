@@ -126,6 +126,22 @@ pub(crate) struct ResumedMetadataDraft {
     document: NamedTag,
 }
 
+/// Original protochunk with only completed saved structure bounds updated.
+/// Terrain, feature metadata, live state and save dependencies remain separate.
+pub(crate) struct ResumedStructureDraft {
+    source_nbt: Vec<u8>,
+    document: NamedTag,
+}
+
+impl ResumedStructureDraft {
+    pub fn document(&self) -> &NamedTag {
+        &self.document
+    }
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        Ok(native_persistence::nbt::write(source)? == self.source_nbt)
+    }
+}
+
 impl ResumedMetadataDraft {
     pub fn document(&self) -> &NamedTag {
         &self.document
@@ -228,6 +244,68 @@ impl RestoredSavedTerrain {
 impl PreparedExistingGenerator {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         self.context.inputs()
+    }
+
+    /// Build a source-bound partial structure draft. No status, terrain,
+    /// block entities, live changes or disk contents are updated here.
+    pub fn draft_resumed_structure_starts(
+        &self,
+        world: &ResumedTerrainWorld,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<ResumedStructureDraft> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity),
+            "structure belongs to another generation capture"
+        );
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&position)
+            .and_then(|entry| entry.terrain.as_ref())
+            .context("saved structure source missing")?;
+        let source_pos = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        let updates: Vec<_> = world
+            .treasure_starts
+            .iter()
+            .filter(|((_, pos), _)| *pos == source_pos)
+            .collect();
+        ensure!(
+            !updates.is_empty(),
+            "no resumed structure starts for source chunk"
+        );
+        let source_nbt = native_persistence::nbt::write(&source.document)?;
+        let mut document = (*source.document).clone();
+        let structures = unique_compound_field_mut(&mut document.value, "structures")?;
+        let starts = unique_compound_field_mut(structures, "starts")?;
+        for ((id, _), saved) in updates {
+            ensure!(
+                Arc::ptr_eq(&saved.source, &source.document),
+                "saved structure source differs"
+            );
+            let name = format!("{}:{}", id.namespace, id.path);
+            let start = unique_compound_field_mut(starts, &name)?;
+            ensure!(
+                *start == saved.original,
+                "saved structure start differs from captured source"
+            );
+            *start = native_session::worldgen::saved_structure_starts::draft_saved_treasure_start(
+                &saved.original,
+                id,
+                source_pos,
+                saved.references,
+                &saved.placement,
+            )?;
+        }
+        native_persistence::nbt::write(&document)?;
+        Ok(ResumedStructureDraft {
+            source_nbt,
+            document,
+        })
     }
 
     fn ensure_terrain_assets(&mut self) -> Result<()> {
@@ -1403,6 +1481,21 @@ fn unique_root_field<'a>(document: &'a NamedTag, name: &str) -> Result<Option<&'
     Ok(first)
 }
 
+fn unique_compound_field_mut<'a>(tag: &'a mut Tag, name: &str) -> Result<&'a mut Tag> {
+    let Tag::Compound(fields) = tag else {
+        bail!("saved {name} parent is not a compound")
+    };
+    ensure!(
+        fields.iter().filter(|(key, _)| key.matches(name)).count() == 1,
+        "saved {name} is missing or duplicated"
+    );
+    Ok(&mut fields
+        .iter_mut()
+        .find(|(key, _)| key.matches(name))
+        .expect("field was validated")
+        .1)
+}
+
 fn replace_unique_root_field(document: &mut NamedTag, name: &str, value: Tag) -> Result<()> {
     unique_root_field(document, name)?;
     let Tag::Compound(fields) = &mut document.value else {
@@ -2155,10 +2248,16 @@ mod tests {
             &oracle,
             include_str!("../../tests/java/ResumedTerrainOracle.java"),
         )?;
+        let treasure_oracle = root.join("ResumedTreasureDraftOracle.java");
+        std::fs::write(
+            &treasure_oracle,
+            include_str!("../../tests/java/ResumedTreasureDraftOracle.java"),
+        )?;
         let compiled = std::process::Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg(&oracle)
+            .arg(&treasure_oracle)
             .output()?;
         ensure!(
             compiled.status.success(),
@@ -3597,6 +3696,79 @@ mod tests {
         assert_eq!(
             refreshed.starts[&key].placement.bounds,
             treasure.placement.bounds
+        );
+        let draft = restored.draft_resumed_structure_starts(&terrain, saved_center)?;
+        assert!(draft.matches_source(&treasure.source)?);
+        assert_eq!(
+            draft.document().value.get("Status"),
+            treasure.source.value.get("Status")
+        );
+        assert_eq!(
+            draft.document().value.get("custom_chunk"),
+            treasure.source.value.get("custom_chunk")
+        );
+        let original_structures = treasure
+            .source
+            .value
+            .get("structures")
+            .context("source structures missing")?;
+        let draft_structures = draft
+            .document()
+            .value
+            .get("structures")
+            .context("draft structures missing")?;
+        assert_eq!(
+            draft_structures.get("References"),
+            original_structures.get("References")
+        );
+        let drafted_start = draft_structures
+            .get("starts")
+            .and_then(|starts| starts.get("minecraft:buried_treasure"))
+            .context("draft treasure missing")?;
+        let expected =
+            native_session::worldgen::saved_structure_starts::draft_saved_treasure_start(
+                &original_start,
+                &treasure_id,
+                center,
+                2,
+                &treasure.placement,
+            )?;
+        assert_eq!(drafted_start, &expected);
+        assert_eq!(drafted_start.get("custom_start"), Some(&Tag::Int(73)));
+        assert_eq!(drafted_start.get("references"), Some(&Tag::Int(2)));
+        let mut stale = (*treasure.source).clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        fields.push(("changed".into(), Tag::Byte(1)));
+        assert!(!draft.matches_source(&stale)?);
+        assert!(
+            structured
+                .draft_resumed_structure_starts(&terrain, saved_center)
+                .is_err()
+        );
+        assert!(
+            restored
+                .draft_resumed_structure_starts(&terrain, ChunkPos { x: 2, z: 2 })
+                .is_err()
+        );
+        let java_input = root.join("treasure-structure-draft.nbt");
+        std::fs::write(
+            &java_input,
+            native_persistence::nbt::write(draft.document())?,
+        )?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedTreasureDraftOracle")
+            .arg(&java_input)
+            .arg(y.to_string())
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java treasure validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
         );
         Ok(())
     }

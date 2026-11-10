@@ -1762,8 +1762,10 @@ impl LocalSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
-                    self.first_person.start_swing(
+                    self.first_person.start_attack_swing(
                         animation::Hand::Main,
+                        self.inventory
+                            .slot(PlayerSlot::Storage(self.inventory.selected())),
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
@@ -1781,8 +1783,10 @@ impl LocalSession {
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
-                    self.first_person.start_swing(
+                    self.first_person.start_attack_swing(
                         animation::Hand::Main,
+                        self.inventory
+                            .slot(PlayerSlot::Storage(self.inventory.selected())),
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
@@ -1897,8 +1901,10 @@ impl LocalSession {
         {
             let target = self.mining_target();
             if target.is_some() {
-                self.first_person.start_swing(
+                self.first_person.start_attack_swing(
                     animation::Hand::Main,
+                    self.inventory
+                        .slot(PlayerSlot::Storage(self.inventory.selected())),
                     self.fall.effects(),
                     &self.breathing_effects,
                 );
@@ -3262,6 +3268,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attack_uses_held_items_animation_component() {
+        use crate::inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+
+        let mut session = LocalSession::demo();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(
+            PlayerSlot::Storage(0),
+            ItemStack::new(
+                "minecraft:stone".into(),
+                1,
+                64,
+                Tag::Compound(vec![(
+                    "minecraft:attack_animation".into(),
+                    Tag::Compound(vec![
+                        ("type".into(), Tag::String("stab".into())),
+                        ("duration".into(), Tag::Int(10)),
+                    ]),
+                )]),
+            ),
+        );
+        session.set_player_inventory(inventory);
+        session.submit_command(PlayerCommand::Break);
+        session.submit_command(PlayerCommand::StopBreak);
+        session.update(TICK);
+        session.update(TICK);
+        let swing = session.snapshot().first_person.swing;
+        assert_eq!(swing.kind(), Some(animation::SwingKind::Stab));
+        assert_eq!(swing.progress(1.0), 0.1);
     }
 
     #[test]

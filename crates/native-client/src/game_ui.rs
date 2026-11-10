@@ -2918,6 +2918,7 @@ impl GameUi {
             main_equip: hands.main.equip_progress(partial),
             off_equip: hands.off.equip_progress(partial),
             swing_hand: hands.swing.hand(),
+            swing_kind: hands.swing.kind(),
             swing_progress: hands.swing.progress(partial),
             item_use: displayed_item_use(hands, partial),
         });

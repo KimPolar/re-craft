@@ -196,6 +196,7 @@ mod tests {
                     main_equip: 0.0,
                     off_equip: 0.0,
                     swing_hand: None,
+                    swing_kind: None,
                     swing_progress: 0.0,
                     item_use: None,
                 },

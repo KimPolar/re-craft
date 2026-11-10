@@ -1,6 +1,5 @@
 //! Client-side hand state advanced at the same fixed tick rate as the player.
-//! Custom swing components, item model swap rules and attack-speed modifiers
-//! are not yet resolved; basic items use the default 26.3 swing animation.
+//! Item model swap rules and attack-speed modifiers are not yet resolved.
 
 use std::sync::Arc;
 
@@ -10,6 +9,57 @@ use crate::inventory::{ItemStack, PlayerInventory, PlayerSlot};
 pub enum Hand {
     Main,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SwingKind {
+    None,
+    #[default]
+    Whack,
+    Stab,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SwingAnimation {
+    kind: SwingKind,
+    duration: i32,
+}
+
+impl Default for SwingAnimation {
+    fn default() -> Self {
+        Self {
+            kind: SwingKind::Whack,
+            duration: 6,
+        }
+    }
+}
+
+/// Explicit attack components are effective item data. Prototype defaults for
+/// items without an explicit component still need their registry to be loaded.
+fn attack_animation(item: Option<&ItemStack>) -> SwingAnimation {
+    use native_persistence::nbt::Tag;
+    let Some(Tag::Compound(fields)) =
+        item.and_then(|item| item.components().get("minecraft:attack_animation"))
+    else {
+        return SwingAnimation::default();
+    };
+    let mut animation = SwingAnimation::default();
+    for (name, value) in fields {
+        if name.matches("type") {
+            animation.kind = match value {
+                Tag::String(value) if value.matches("none") => SwingKind::None,
+                Tag::String(value) if value.matches("whack") => SwingKind::Whack,
+                Tag::String(value) if value.matches("stab") => SwingKind::Stab,
+                _ => return SwingAnimation::default(),
+            };
+        } else if name.matches("duration") {
+            let Some(duration) = value.as_java_int().filter(|duration| *duration >= 0) else {
+                return SwingAnimation::default();
+            };
+            animation.duration = duration;
+        }
+    }
+    animation
 }
 
 /// Item-use state shared with the renderer after a completed simulation tick.
@@ -67,12 +117,14 @@ impl HandState {
     }
 }
 
-/// The default WHACK swing, six ticks in the absence of status effects.
+/// Current swing animation and its effective duration at the time it started.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SwingState {
     hand: Option<Hand>,
     ticks: i32,
     duration: i32,
+    animation_type: SwingKind,
+    base_duration: i32,
     old_animation: f32,
     animation: f32,
 }
@@ -80,6 +132,10 @@ pub struct SwingState {
 impl SwingState {
     pub fn hand(self) -> Option<Hand> {
         self.hand
+    }
+
+    pub fn kind(self) -> Option<SwingKind> {
+        self.hand.map(|_| self.animation_type)
     }
 
     pub fn progress(self, partial: f32) -> f32 {
@@ -96,13 +152,28 @@ impl SwingState {
     }
 
     fn start_with_duration(&mut self, hand: Hand, duration: i32) -> bool {
+        self.start_with_animation(hand, SwingAnimation::default(), duration)
+    }
+
+    fn start_with_animation(
+        &mut self,
+        hand: Hand,
+        animation: SwingAnimation,
+        duration: i32,
+    ) -> bool {
         if self.hand.is_none() || self.ticks > self.duration / 2 || self.ticks <= 0 {
-            if self.hand != Some(hand) || self.duration != duration {
+            if self.hand != Some(hand)
+                || self.duration != duration
+                || self.animation_type != animation.kind
+                || self.base_duration != animation.duration
+            {
                 self.old_animation = 0.0;
                 self.animation = 0.0;
             }
             self.hand = Some(hand);
             self.duration = duration;
+            self.animation_type = animation.kind;
+            self.base_duration = animation.duration;
             self.ticks = 0;
             true
         } else {
@@ -117,7 +188,7 @@ impl SwingState {
                 self.animation = (self.ticks as f32 / self.duration as f32).min(1.0);
             }
             let previous_ticks = self.ticks;
-            self.ticks += 1;
+            self.ticks = self.ticks.wrapping_add(1);
             if previous_ticks > self.duration {
                 self.hand = None;
                 self.animation = 0.0;
@@ -145,6 +216,26 @@ impl FirstPersonState {
         effects: &crate::survival::FallEffects,
         breathing: &crate::survival::BreathingEffects,
     ) -> bool {
+        self.start_animation(hand, SwingAnimation::default(), effects, breathing)
+    }
+
+    pub(crate) fn start_attack_swing(
+        &mut self,
+        hand: Hand,
+        item: Option<&ItemStack>,
+        effects: &crate::survival::FallEffects,
+        breathing: &crate::survival::BreathingEffects,
+    ) -> bool {
+        self.start_animation(hand, attack_animation(item), effects, breathing)
+    }
+
+    fn start_animation(
+        &mut self,
+        hand: Hand,
+        animation: SwingAnimation,
+        effects: &crate::survival::FallEffects,
+        breathing: &crate::survival::BreathingEffects,
+    ) -> bool {
         let dig_speed = effects
             .haste
             .iter()
@@ -152,13 +243,15 @@ impl FirstPersonState {
             .map(|effect| effect.amplifier)
             .max();
         let duration = if let Some(amplifier) = dig_speed {
-            6 - (1 + i32::from(amplifier))
+            animation.duration.wrapping_sub(1 + i32::from(amplifier))
         } else if let Some(effect) = &effects.mining_fatigue {
-            6 + (1 + i32::from(effect.amplifier)) * 2
+            animation
+                .duration
+                .wrapping_add((1 + i32::from(effect.amplifier)) * 2)
         } else {
-            6
+            animation.duration
         };
-        self.swing.start_with_duration(hand, duration)
+        self.swing.start_with_animation(hand, animation, duration)
     }
 
     pub(crate) fn invalidate_inventory(&mut self) {
@@ -299,6 +392,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity.SwingState;
 import net.minecraft.world.entity.LivingEntity.SwingDescription;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.item.SwingAnimationType;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
@@ -385,6 +479,23 @@ public class SwingOracle {
       }
       modified.add(rows);
     }
+    var custom=new JsonArray();
+    for(var kind:new SwingAnimationType[]{SwingAnimationType.NONE,SwingAnimationType.WHACK,SwingAnimationType.STAB})
+    for(int ticks:new int[]{0,1,6,13,255,Integer.MAX_VALUE}) {
+      var stack=new ItemStack(Items.STONE,1);
+      stack.set(DataComponents.ATTACK_ANIMATION,new SwingAnimation(kind,ticks));
+      var state=new SwingState(); var rows=new JsonArray();
+      for(int tick=0;tick<18;tick++) {
+        var animation=stack.getAttackAnimation();
+        int started=-1;
+        if(tick%3==0) started=state.startIfAble(InteractionHand.MAIN_HAND,animation,animation.duration())?1:0;
+        state.tick(); var swing=(SwingDescription)current.get(state);
+        var row=new JsonArray(); row.add(started); row.add(swing==null?"":swing.animation().type().getSerializedName());
+        for(float partial:new float[]{0f,0.25f,0.5f,0.75f,1f}) row.add(state.getAnimation(partial));
+        rows.add(row);
+      }
+      custom.add(rows);
+    }
     var player=(Player)unsafe.allocateInstance(Player.class);
     var game=(Game)unsafe.allocateInstance(Game.class);
     var minecraft=LocalPlayer.class.getDeclaredField("minecraft"); minecraft.setAccessible(true); minecraft.set(player,game);
@@ -418,7 +529,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -585,6 +696,66 @@ public class SwingOracle {
             }
         }
         assert_eq!(scenario, modified.len());
+        let custom = result["custom"].as_array().unwrap();
+        let mut scenario = 0;
+        for (name, kind) in [
+            ("none", SwingKind::None),
+            ("whack", SwingKind::Whack),
+            ("stab", SwingKind::Stab),
+        ] {
+            for duration in [0, 1, 6, 13, 255, i32::MAX] {
+                let stack = ItemStack::new(
+                    "minecraft:stone".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![(
+                        "minecraft:attack_animation".into(),
+                        Tag::Compound(vec![
+                            ("type".into(), Tag::String(name.into())),
+                            ("duration".into(), Tag::Int(duration)),
+                        ]),
+                    )]),
+                )
+                .unwrap();
+                let mut hands = FirstPersonState::default();
+                for (tick, row) in custom[scenario].as_array().unwrap().iter().enumerate() {
+                    let started = if tick % 3 == 0 {
+                        i64::from(hands.start_attack_swing(
+                            Hand::Main,
+                            Some(&stack),
+                            &Default::default(),
+                            &Default::default(),
+                        ))
+                    } else {
+                        -1
+                    };
+                    hands.swing.tick();
+                    assert_eq!(
+                        started,
+                        row[0].as_i64().unwrap(),
+                        "{name} duration={duration} tick={tick}"
+                    );
+                    assert_eq!(
+                        hands.swing.kind(),
+                        if row[1].as_str().unwrap().is_empty() {
+                            None
+                        } else {
+                            Some(kind)
+                        }
+                    );
+                    for (i, partial) in [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().enumerate() {
+                        let actual = hands.swing.progress(partial);
+                        let expected = row[2 + i].as_f64().unwrap() as f32;
+                        assert!(
+                            (actual - expected).abs() < 1e-6,
+                            "{name} duration={duration} tick={tick} partial={partial}: {actual} != {expected}"
+                        );
+                    }
+                }
+                scenario += 1;
+            }
+        }
+        assert_eq!(scenario, custom.len());
         let mut inventory = PlayerInventory::default();
         let mut hands = FirstPersonState::default();
         let rows = result["equipment"].as_array().unwrap();

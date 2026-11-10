@@ -6,7 +6,7 @@ use std::{collections::VecDeque, sync::Arc};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use image::RgbaImage;
-use native_session::animation::Hand;
+use native_session::animation::{Hand, SwingKind};
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -67,6 +67,7 @@ pub struct FirstPersonInput {
     pub main_equip: f32,
     pub off_equip: f32,
     pub swing_hand: Option<Hand>,
+    pub swing_kind: Option<SwingKind>,
     pub swing_progress: f32,
     pub item_use: Option<ItemUseAnimation>,
 }
@@ -97,6 +98,7 @@ pub struct FirstPersonRenderer {
     main_equip: f32,
     off_equip: f32,
     swing_hand: Option<Hand>,
+    swing_kind: Option<SwingKind>,
     swing_progress: f32,
     item_use: Option<ItemUseAnimation>,
 }
@@ -187,6 +189,54 @@ fn item_transform(left: bool, display: DisplayTransform, equip: f32, swing: Opti
             * Mat4::from_rotation_y((-45.0 * sign).to_radians());
     }
     result * item_display_transform(left, display)
+}
+
+fn swing_item_transform(
+    left: bool,
+    display: DisplayTransform,
+    equip: f32,
+    swing: Option<(SwingKind, f32)>,
+) -> Mat4 {
+    let Some((kind, swing)) = swing else {
+        return item_transform(left, display, equip, None);
+    };
+    match kind {
+        SwingKind::None => item_transform(left, display, equip, None),
+        SwingKind::Whack => item_transform(left, display, equip, Some(swing)),
+        SwingKind::Stab => {
+            let progress = |start: f32, end: f32| ((swing - start) / (end - start)).clamp(0.0, 1.0);
+            let sine = (1.0 - vanilla_cos(std::f32::consts::PI * progress(0.0, 0.05))) / 2.0;
+            let back = progress(0.05, 0.2) - 1.0;
+            let square = back * back;
+            let back = 1.0 + 2.70158 * (square * back) + 1.70158 * square;
+            let expo = progress(0.4, 1.0);
+            let expo = if expo < 0.5 {
+                if expo == 0.0 {
+                    0.0
+                } else {
+                    (2.0_f64.powf(20.0 * f64::from(expo) - 10.0) / 2.0) as f32
+                }
+            } else if expo == 1.0 {
+                1.0
+            } else {
+                ((2.0 - 2.0_f64.powf(-20.0 * f64::from(expo) + 10.0)) / 2.0) as f32
+            };
+            let sign = if left { -1.0 } else { 1.0 };
+            Mat4::from_translation(Vec3::new(sign * 0.56, -0.52 - equip * 0.6, -0.72))
+                * Mat4::from_translation(Vec3::new(
+                    sign * 0.1 * (sine - back),
+                    -0.075 * (sine - expo),
+                    0.65 * (sine - back),
+                ))
+                * joml_rotate_x(-70.0 * (sine - expo))
+                * Mat4::from_translation(Vec3::new(
+                    0.0,
+                    0.0,
+                    (-0.25_f64 * f64::from(expo - back)) as f32,
+                ))
+                * item_display_transform(left, display)
+        }
+    }
 }
 
 /// 26.3 applies the eat motion before its ordinary equip and model transforms.
@@ -445,6 +495,7 @@ impl FirstPersonRenderer {
             main_equip: 0.0,
             off_equip: 0.0,
             swing_hand: None,
+            swing_kind: None,
             swing_progress: 0.0,
             item_use: None,
         }
@@ -602,6 +653,7 @@ impl FirstPersonRenderer {
             main_equip,
             off_equip,
             swing_hand,
+            swing_kind,
             swing_progress,
             item_use,
         } = input;
@@ -641,6 +693,7 @@ impl FirstPersonRenderer {
         self.main_equip = main_equip;
         self.off_equip = off_equip;
         self.swing_hand = swing_hand;
+        self.swing_kind = swing_kind;
         self.swing_progress = swing_progress;
         self.item_use = item_use;
     }
@@ -693,11 +746,14 @@ impl FirstPersonRenderer {
                         item_transform(left, display, equip, None)
                     }
                 } else {
-                    item_transform(
+                    swing_item_transform(
                         left,
                         display,
                         equip,
-                        (self.swing_hand == Some(hand)).then_some(self.swing_progress),
+                        (self.swing_hand == Some(hand))
+                            .then_some(self.swing_kind)
+                            .flatten()
+                            .map(|kind| (kind, self.swing_progress)),
                     )
                 }
             } else if main && !self.main_present {
@@ -1094,6 +1150,7 @@ mod tests {
                         main_equip: if step == 1 { 0.3 } else { 0.0 },
                         off_equip: 0.0,
                         swing_hand: (step == 1).then_some(Hand::Main),
+                        swing_kind: (step == 1).then_some(SwingKind::Whack),
                         swing_progress: if step == 1 { 0.5 } else { 0.0 },
                         item_use: (step == 2).then_some(ItemUseAnimation {
                             hand: Hand::Off,
@@ -1290,6 +1347,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.client.renderer.FirstPersonHandsAndItemsRenderer;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.state.level.PlayerRenderState;
+import net.minecraft.client.model.effects.SpearAnimations;
 import net.minecraft.client.resources.model.cuboid.ItemTransform;
 import net.minecraft.world.entity.HumanoidArm;
 import org.joml.Vector3f;
@@ -1333,6 +1391,20 @@ public class FirstPersonOracle {
         var pose=new PoseStack();
         eat.invoke(renderer,pose,partial,which,(float)remaining,duration);
         apply.invoke(renderer,pose,which,equip);
+        new ItemTransform(new Vector3f(rotations[i]),new Vector3f(translations[i]),new Vector3f(scales[i])).apply(left,pose.last());
+        var values=new JsonArray();
+        for(float[] p:points) { var v=pose.last().pose().transformPosition(new Vector3f(p)); var a=new JsonArray(); a.add(v.x);a.add(v.y);a.add(v.z);values.add(a); }
+        out.add(values);
+      }
+    }
+    for(boolean left:new boolean[]{false,true}) {
+      var which=left?HumanoidArm.LEFT:HumanoidArm.RIGHT;
+      for(float equip:new float[]{0f,0.35f,1f})
+      for(float swing:new float[]{0f,0.01f,0.05f,0.1f,0.2f,0.4f,0.7f,0.9f,1f})
+      for(int i=0;i<rotations.length;i++) {
+        var pose=new PoseStack();
+        apply.invoke(renderer,pose,which,equip);
+        SpearAnimations.firstPersonAttack(swing,pose,left?-1:1,which);
         new ItemTransform(new Vector3f(rotations[i]),new Vector3f(translations[i]),new Vector3f(scales[i])).apply(left,pose.last());
         var values=new JsonArray();
         for(float[] p:points) { var v=pose.last().pose().transformPosition(new Vector3f(p)); var a=new JsonArray(); a.add(v.x);a.add(v.y);a.add(v.z);values.add(a); }
@@ -1470,6 +1542,36 @@ public class FirstPersonOracle {
                                 row += 1;
                             }
                         }
+                    }
+                }
+            }
+        }
+        for left in [false, true] {
+            for equip in [0.0, 0.35, 1.0] {
+                for swing in [0.0, 0.01, 0.05, 0.1, 0.2, 0.4, 0.7, 0.9, 1.0] {
+                    for display in displays {
+                        let transform = swing_item_transform(
+                            left,
+                            display,
+                            equip,
+                            Some((SwingKind::Stab, swing)),
+                        );
+                        for (point_index, point) in points.into_iter().enumerate() {
+                            for (axis, value) in transform
+                                .transform_point3(point)
+                                .to_array()
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let java =
+                                    expected[row][point_index][axis].as_f64().unwrap() as f32;
+                                assert!(
+                                    (value - java).abs() < 0.00005,
+                                    "stab left={left} equip={equip} swing={swing} point={point_index} axis={axis}: {value} != {java}"
+                                );
+                            }
+                        }
+                        row += 1;
                     }
                 }
             }

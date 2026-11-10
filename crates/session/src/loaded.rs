@@ -20521,8 +20521,11 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode.allows_basic_building() && !self.inventory.is_open() =>
                 {
-                    self.first_person.start_swing(
+                    self.first_person.start_attack_swing(
                         crate::animation::Hand::Main,
+                        self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                            self.inventory.selected(),
+                        )),
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
@@ -20548,8 +20551,11 @@ impl LoadedSession {
                 PlayerCommand::Break
                     if self.game_mode != GameMode::Spectator && !self.inventory.is_open() =>
                 {
-                    self.first_person.start_swing(
+                    self.first_person.start_attack_swing(
                         crate::animation::Hand::Main,
+                        self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                            self.inventory.selected(),
+                        )),
                         self.fall.effects(),
                         &self.breathing_effects,
                     );
@@ -20838,8 +20844,11 @@ impl LoadedSession {
         {
             let target = self.mining_target();
             if target.is_some() {
-                self.first_person.start_swing(
+                self.first_person.start_attack_swing(
                     crate::animation::Hand::Main,
+                    self.inventory.slot(crate::inventory::PlayerSlot::Storage(
+                        self.inventory.selected(),
+                    )),
                     self.fall.effects(),
                     &self.breathing_effects,
                 );

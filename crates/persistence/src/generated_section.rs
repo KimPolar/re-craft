@@ -324,6 +324,111 @@ pub fn merge_biome_stage_blocks(source: &Tag, generated: &Tag) -> Result<Tag> {
     })
 }
 
+/// Attach a complete visible column to intermediate sections while preserving
+/// every other section field. This neither advances status nor permits saving.
+/// Existing light is rejected: it cannot be merged with newly propagated data.
+pub fn merge_generated_light_sections(
+    source: &Tag,
+    light: &native_world::generation_light::VisibleLightSnapshot,
+    position: ChunkPos,
+    min_y: i32,
+    height: i32,
+    has_skylight: bool,
+) -> Result<Tag> {
+    ensure!(
+        height > 0 && height % 16 == 0 && min_y % 16 == 0,
+        "invalid light height"
+    );
+    ensure!(
+        light.has_block_channel() && light.has_sky_channel() == has_skylight,
+        "light channels differ from dimension"
+    );
+    let end = min_y.checked_add(height).context("light height overflow")?;
+    let min_section = min_y
+        .div_euclid(16)
+        .checked_sub(1)
+        .context("light section underflow")?;
+    let max_section = end.div_euclid(16);
+    ensure!(
+        i8::try_from(min_section).is_ok() && i8::try_from(max_section).is_ok(),
+        "light section outside NBT byte range"
+    );
+    let column = light
+        .complete_column(position)
+        .context("light column is missing")?;
+    ensure!(
+        column
+            .block_layers()
+            .keys()
+            .chain(column.sky_layers().keys())
+            .all(|y| (min_section..=max_section).contains(y)),
+        "light layer outside generation bounds"
+    );
+    ensure!(
+        has_skylight || column.sky_layers().is_empty(),
+        "unexpected sky light"
+    );
+    let Tag::List {
+        element_type: TagType::Compound,
+        values,
+    } = source
+    else {
+        anyhow::bail!("saved sections must be a compound list")
+    };
+    let mut output = values.clone();
+    let mut indexes = BTreeMap::new();
+    for (index, section) in output.iter().enumerate() {
+        let Tag::Compound(fields) = section else {
+            anyhow::bail!("invalid saved section")
+        };
+        let mut ys = fields.iter().filter(|(key, _)| key.matches("Y"));
+        let Some((_, Tag::Byte(y))) = ys.next() else {
+            anyhow::bail!("saved section Y missing")
+        };
+        ensure!(
+            ys.next().is_none() && indexes.insert(i32::from(*y), index).is_none(),
+            "duplicate saved section Y"
+        );
+        ensure!(
+            fields
+                .iter()
+                .all(|(key, _)| !key.matches("BlockLight") && !key.matches("SkyLight")),
+            "saved light cannot be merged"
+        );
+    }
+    let ys: BTreeSet<_> = column
+        .block_layers()
+        .keys()
+        .chain(column.sky_layers().keys())
+        .copied()
+        .collect();
+    for y in ys {
+        let index = if let Some(&index) = indexes.get(&y) {
+            index
+        } else {
+            let index = output.len();
+            output.push(Tag::Compound(vec![(
+                "Y".into(),
+                Tag::Byte(i8::try_from(y)?),
+            )]));
+            index
+        };
+        let Tag::Compound(fields) = &mut output[index] else {
+            unreachable!()
+        };
+        if let Some(layer) = column.block_layers().get(&y) {
+            fields.push(("BlockLight".into(), Tag::ByteArray(layer.as_ref().to_vec())));
+        }
+        if let Some(layer) = column.sky_layers().get(&y) {
+            fields.push(("SkyLight".into(), Tag::ByteArray(layer.as_ref().to_vec())));
+        }
+    }
+    Ok(Tag::List {
+        element_type: TagType::Compound,
+        values: output,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +467,69 @@ mod tests {
             element_type: TagType::Compound,
             values,
         }
+    }
+
+    #[test]
+    fn light_merge_preserves_sections_and_rejects_ambiguous_input() {
+        use native_world::generation_light::{
+            VisibleLayers, VisibleLightColumn, VisibleLightSnapshot,
+        };
+        use std::sync::Arc;
+        let pos = ChunkPos { x: 3, z: -1 };
+        let source = list(vec![section(
+            0,
+            Some("minecraft:stone"),
+            "minecraft:plains",
+        )]);
+        let mut block = VisibleLayers::new();
+        block.insert(0, Arc::new([0x12; native_world::loaded::LIGHT_BYTES]));
+        let mut sky = VisibleLayers::new();
+        sky.insert(1, Arc::new([0x34; native_world::loaded::LIGHT_BYTES]));
+        let mut light = VisibleLightSnapshot::new(true, true);
+        light.insert_complete_column(pos, VisibleLightColumn::new(block, sky));
+        let merged = merge_generated_light_sections(&source, &light, pos, 0, 16, true).unwrap();
+        let Tag::List { values, .. } = &merged else {
+            panic!()
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("custom"), Some(&Tag::Int(7)));
+        assert_eq!(
+            values[0].get("BlockLight"),
+            Some(&Tag::ByteArray(vec![
+                0x12;
+                native_world::loaded::LIGHT_BYTES
+            ]))
+        );
+        assert_eq!(values[1].get("Y"), Some(&Tag::Byte(1)));
+        assert_eq!(
+            values[1].get("SkyLight"),
+            Some(&Tag::ByteArray(vec![
+                0x34;
+                native_world::loaded::LIGHT_BYTES
+            ]))
+        );
+        assert!(merge_generated_light_sections(&merged, &light, pos, 0, 16, true).is_err());
+        assert!(
+            merge_generated_light_sections(&source, &light, ChunkPos { x: 0, z: 0 }, 0, 16, true)
+                .is_err()
+        );
+        assert!(merge_generated_light_sections(&source, &light, pos, 0, 16, false).is_err());
+        assert!(
+            merge_generated_light_sections(
+                &list(vec![section(0, None, "plains"), section(0, None, "plains")]),
+                &light,
+                pos,
+                0,
+                16,
+                true
+            )
+            .is_err()
+        );
+        let mut outside = VisibleLayers::new();
+        outside.insert(2, Arc::new([0; native_world::loaded::LIGHT_BYTES]));
+        let mut invalid = VisibleLightSnapshot::new(true, true);
+        invalid.insert_complete_column(pos, VisibleLightColumn::new(outside, VisibleLayers::new()));
+        assert!(merge_generated_light_sections(&source, &invalid, pos, 0, 16, true).is_err());
     }
 
     #[test]

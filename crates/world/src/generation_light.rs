@@ -157,6 +157,16 @@ impl VisibleLightColumn {
     pub fn new(block: VisibleLayers, sky: VisibleLayers) -> Self {
         Self { block, sky }
     }
+
+    /// Allocated visible layers, including zero-valued layers and padding.
+    pub fn block_layers(&self) -> &VisibleLayers {
+        &self.block
+    }
+
+    /// Allocated visible sky layers; absent layers remain sparse.
+    pub fn sky_layers(&self) -> &VisibleLayers {
+        &self.sky
+    }
 }
 
 /// Immutable engine data captured at one published revision. The caller must

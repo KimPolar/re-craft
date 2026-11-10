@@ -167,6 +167,31 @@ pub(crate) struct ResumedStagedLight {
     revision: Arc<()>,
     engine: native_session::worldgen::StagedGenerationLightEngine,
     initialized: BTreeSet<native_world::loaded::ChunkPos>,
+    activated: BTreeSet<native_world::loaded::ChunkPos>,
+    light_revision: Arc<()>,
+}
+
+/// Source-preserving intermediate chunk with a single visible light revision.
+/// Its status, entities and other unfinished stages remain unchanged.
+pub(crate) struct ResumedLitDraft {
+    feature: ResumedFeatureDraft,
+    light_revision: Arc<()>,
+}
+
+impl ResumedLitDraft {
+    pub fn document(&self) -> &NamedTag {
+        self.feature.document()
+    }
+
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        self.feature.matches_source(source)
+    }
+
+    pub fn matches_state(&self, world: &ResumedTerrainWorld, light: &ResumedStagedLight) -> bool {
+        self.feature.matches_world(world)
+            && matches_resumed_revision(&light.identity, &light.revision, world)
+            && Arc::ptr_eq(&self.light_revision, &light.light_revision)
+    }
 }
 
 fn matches_resumed_revision(
@@ -466,6 +491,8 @@ impl PreparedExistingGenerator {
             revision: light.revision,
             engine: native_session::worldgen::StagedGenerationLightEngine::new(light.tracker),
             initialized: light.initialized,
+            activated: BTreeSet::new(),
+            light_revision: Arc::new(()),
         })
     }
 
@@ -497,7 +524,56 @@ impl PreparedExistingGenerator {
             .as_ref()
             .context("terrain registry is missing")?
             .blocks;
-        schedule.run_light(&world.terrain, position, &mut light.engine, registry)
+        let visible = schedule.run_light(&world.terrain, position, &mut light.engine, registry)?;
+        light.activated.insert(position);
+        light.light_revision = Arc::new(());
+        Ok(visible)
+    }
+
+    /// Combine a feature draft with a current, activated light column without
+    /// advancing the saved status or authorizing an on-disk write.
+    pub fn draft_resumed_lit_chunk(
+        &mut self,
+        world: &ResumedTerrainWorld,
+        light: &ResumedStagedLight,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<ResumedLitDraft> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && matches_resumed_revision(&light.identity, &light.revision, world),
+            "light belongs to another terrain revision"
+        );
+        let key = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            light.activated.contains(&key),
+            "light chunk has not been propagated"
+        );
+        let mut feature = self.draft_resumed_feature_chunk(world, position)?;
+        let registry = &self
+            .terrain_assets
+            .as_ref()
+            .context("terrain registry is missing")?
+            .blocks;
+        let visible = light.engine.snapshot(&world.terrain, [key], registry)?;
+        let sections = unique_root_field(&feature.document, "sections")?
+            .context("feature sections missing")?;
+        let sections = native_persistence::generated_section::merge_generated_light_sections(
+            sections,
+            &visible,
+            key,
+            self.lighting.min_y,
+            self.lighting.height,
+            self.lighting.has_skylight,
+        )?;
+        replace_unique_root_field(&mut feature.document, "sections", sections)?;
+        native_persistence::nbt::write(&feature.document)?;
+        Ok(ResumedLitDraft {
+            feature,
+            light_revision: Arc::clone(&light.light_revision),
+        })
     }
     /// Bind an independently captured, fixed initial light-engine revision to
     /// this intermediate terrain. The caller must establish its provenance,
@@ -2872,11 +2948,17 @@ mod tests {
             &treasure_oracle,
             include_str!("../../tests/java/ResumedTreasureDraftOracle.java"),
         )?;
+        let light_oracle = root.join("ResumedLightOracle.java");
+        std::fs::write(
+            &light_oracle,
+            include_str!("../../tests/java/ResumedLightOracle.java"),
+        )?;
         let compiled = std::process::Command::new(java.join("javac.exe"))
             .arg("-cp")
             .arg(&classpath)
             .arg(&oracle)
             .arg(&treasure_oracle)
+            .arg(&light_oracle)
             .output()?;
         ensure!(
             compiled.status.success(),
@@ -4188,6 +4270,33 @@ mod tests {
             actual.propagate_resumed_light(&terrain, &mut schedule, &mut staged, center)?;
         assert!(visible.raw_brightness([56, y, 56], 0).is_some());
         assert_eq!(schedule.completed(center), Some(GenerationStage::Light));
+        let lit = actual.draft_resumed_lit_chunk(&terrain, &staged, saved_center)?;
+        assert!(lit.matches_state(&terrain, &staged));
+        assert!(lit.matches_source(&terrain.sources[&saved_center])?);
+        assert_eq!(
+            lit.document().value.get("Status"),
+            Some(&Tag::String("minecraft:biomes".into()))
+        );
+        let light_revision = Arc::clone(&staged.light_revision);
+        staged.light_revision = Arc::new(());
+        assert!(!lit.matches_state(&terrain, &staged));
+        staged.light_revision = light_revision;
+        let light_file = root.join("resumed-light.nbt");
+        std::fs::write(&light_file, native_persistence::nbt::write(lit.document())?)?;
+        let checked = std::process::Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("ResumedLightOracle")
+            .arg(&light_file)
+            .arg(actual.lighting.min_y.to_string())
+            .arg(actual.lighting.height.to_string())
+            .output()?;
+        ensure!(
+            checked.status.success(),
+            "Java light validation failed: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
         assert!(
             actual
                 .propagate_resumed_light(&terrain, &mut schedule, &mut staged, center)

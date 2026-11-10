@@ -569,6 +569,61 @@ impl GeneratedCreatureProbe {
             &std::collections::BTreeMap<native_resources::packs::ResourceId, i64>,
         )>,
     ) -> Result<super::GeneratedEntityAddition> {
+        self.prepare_farm_animal_with(
+            planner,
+            variants,
+            random,
+            group,
+            uuid,
+            chicken_egg_time,
+            |position, random, group| {
+                batch.initialize_farm_animal_with_moon(
+                    position, variants, random, group, false, moon,
+                )
+            },
+        )
+    }
+
+    /// Prepare a farm animal against a caller-verified saved-world context.
+    /// The environment must resolve the actual biome, clock and structures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_farm_animal_in_environment(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        variants: &native_resources::animal_variants::FarmAnimalSpawnVariants,
+        environment: &mut impl native_resources::animal_variants::SpawnVariantEnvironment,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+        chicken_egg_time: Option<i32>,
+    ) -> Result<super::GeneratedEntityAddition> {
+        self.prepare_farm_animal_with(
+            planner,
+            variants,
+            random,
+            group,
+            uuid,
+            chicken_egg_time,
+            |_, random, group| variants.finalize_in_environment(environment, random, group, false),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_farm_animal_with(
+        &mut self,
+        planner: &mut ChunkCreatureSpawner,
+        variants: &native_resources::animal_variants::FarmAnimalSpawnVariants,
+        random: &mut native_resources::worldgen_region_random::RegionRandom,
+        group: &mut native_resources::worldgen_region_random::AnimalGroupData,
+        uuid: [i32; 4],
+        chicken_egg_time: Option<i32>,
+        initialize: impl FnOnce(
+            [i32; 3],
+            &mut native_resources::worldgen_region_random::RegionRandom,
+            &mut native_resources::worldgen_region_random::AnimalGroupData,
+        )
+            -> Result<native_resources::animal_variants::FarmAnimalInitialization>,
+    ) -> Result<super::GeneratedEntityAddition> {
         use native_resources::animal_variants::FarmAnimal;
         let species = match (
             self.attempt.entity.namespace.as_str(),
@@ -599,14 +654,7 @@ impl GeneratedCreatureProbe {
         let position = geometry_block_position(geometry)?.to_array();
         let mut next_random = random.clone();
         let mut next_group = *group;
-        let initialized = batch.initialize_farm_animal_with_moon(
-            position,
-            variants,
-            &mut next_random,
-            &mut next_group,
-            false,
-            moon,
-        )?;
+        let initialized = initialize(position, &mut next_random, &mut next_group)?;
         let tag = super::draft_fresh_farm_animal(
             species,
             uuid,

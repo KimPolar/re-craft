@@ -45,13 +45,14 @@ public class ResumedLightOracle {
         var parsed = SerializableChunkData.parse(height, factory, original);
         if (parsed == null || parsed.chunkStatus() != ChunkStatus.LIGHT) throw new AssertionError("status");
         var rewritten = parsed.write();
-        if (args.length > 3 && args[3].equals("entities")) {
+        if (args.length > 3 && args[3].startsWith("entities:")) {
+            String expectedEntity = "minecraft:" + args[3].substring("entities:".length());
             if (!Objects.equals(original.get("entities"), rewritten.get("entities"))) throw new AssertionError("spawned entities changed");
             var entities = original.getListOrEmpty("entities");
             if (entities.isEmpty()) throw new AssertionError("spawned entities missing");
             for (int i = 0; i < entities.size(); i++) {
                 var entity = entities.getCompoundOrEmpty(i);
-                if (!entity.getStringOr("id", "").equals("minecraft:sheep")) throw new AssertionError("wrong entity");
+                if (!entity.getStringOr("id", "").equals(expectedEntity)) throw new AssertionError("wrong entity");
             }
         }
         var source = original.getListOrEmpty("sections");

@@ -1,3 +1,4 @@
+import com.mojang.authlib.GameProfile;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.Dynamic;
 import com.mojang.serialization.Lifecycle;
@@ -7,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.UUID;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.*;
 import net.minecraft.core.registries.Registries;
@@ -25,9 +27,42 @@ import net.minecraft.world.level.levelgen.WorldGenSettings;
 import net.minecraft.world.level.storage.PrimaryLevelData;
 import net.minecraft.world.entity.ai.village.poi.PoiSection;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.util.ProblemReporter;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.storage.TagValueInput;
+import net.minecraft.world.level.storage.TagValueOutput;
 
 /** Validate a disposable generated world and rewrite all listed chunks with Java. */
 public class GeneratedWorldJavaOracle {
+    private static final class TestLevel extends ClientLevel {
+        TestLevel() { super(null, null, null, null, 0, 0, null, false, 0L, 0); }
+        @Override public int getNextEntityId() { return 1; }
+    }
+    private static final class TestPlayer extends Player {
+        TestPlayer(Level level, UUID uuid) { super(level, new GameProfile(uuid, "Oracle")); }
+        @Override public GameType gameMode() { return GameType.SURVIVAL; }
+    }
+
+    private static void verifyPlayerRoundTrip(CompoundTag saved) throws Exception {
+        var field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        field.setAccessible(true);
+        var level = (TestLevel) ((sun.misc.Unsafe) field.get(null)).allocateInstance(TestLevel.class);
+        var registry = RegistryAccess.fromRegistryOfRegistries(BuiltInRegistries.REGISTRY);
+        var player = new TestPlayer(level, UUIDUtil.uuidFromIntArray(saved.getIntArray("UUID").orElseThrow()));
+        player.load(TagValueInput.create(ProblemReporter.DISCARDING, registry, saved));
+        var output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, registry);
+        player.saveWithoutId(output);
+        var restored = output.buildResult();
+        for (var key : new String[]{"UUID", "Pos", "Motion", "Rotation", "fall_distance", "OnGround", "Air",
+                "Health", "AbsorptionAmount", "foodLevel", "foodTickTimer", "foodSaturationLevel", "foodExhaustionLevel",
+                "XpP", "XpLevel", "XpTotal", "Score"}) {
+            if (saved.get(key) == null || !Objects.equals(saved.get(key), restored.get(key)))
+                throw new AssertionError("generated player field changed on Java load/save: " + key + ": " + saved.get(key) + " != " + restored.get(key));
+        }
+        if (saved.getIntOr("XpSeed", 0) != 0 && !Objects.equals(saved.get("XpSeed"), restored.get("XpSeed")))
+            throw new AssertionError("generated player enchantment seed changed");
+    }
     private static boolean sameLight(DataLayer a, DataLayer b) {
         return a == null ? b == null : b != null && Arrays.equals(a.getData(), b.getData());
     }
@@ -79,6 +114,11 @@ public class GeneratedWorldJavaOracle {
         var out = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        if (args[0].equals("--player")) {
+            verifyPlayerRoundTrip(NbtIo.read(Path.of(args[1])));
+            out.println("PLAYER_OK");
+            return;
+        }
         var world = Path.of(args[0]);
         long seed = Long.parseLong(args[1]);
         var worldSpawn = new BlockPos(Integer.parseInt(args[2]), Integer.parseInt(args[3]), Integer.parseInt(args[4]));
@@ -117,6 +157,7 @@ public class GeneratedWorldJavaOracle {
             pos.getDoubleOr(1, Double.NaN) != playerSpawn.getY() || pos.getDoubleOr(2, Double.NaN) != playerSpawn.getZ() + 0.5)
             throw new AssertionError("player spawn differs: " + pos);
         if (!player.getStringOr("Dimension", "").equals("minecraft:overworld")) throw new AssertionError("player dimension differs");
+        verifyPlayerRoundTrip(player);
 
         var biomes = lookup.lookupOrThrow(Registries.BIOME);
         Holder<Biome> defaultBiome = biomes.getOrThrow(ResourceKey.create(Registries.BIOME, Identifier.parse("minecraft:plains")));

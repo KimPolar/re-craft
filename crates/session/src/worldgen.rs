@@ -3713,6 +3713,24 @@ impl TerrainGenerator {
             .expand_to_dimension(self.min_y(), self.height())
     }
 
+    /// Generate an intermediate noise volume using this chunk's structure
+    /// terrain context, restoring the evaluator context on success or failure.
+    pub fn generate_noise_with_structure_context(
+        &self,
+        evaluator: &mut DensityEvaluator,
+        chunk: [i32; 2],
+        structure: Arc<Beardifier>,
+    ) -> Result<native_resources::noise_stage::NoiseStageChunk> {
+        ensure!(
+            self.structure_context,
+            "generator was compiled without structure context"
+        );
+        let previous = evaluator.replace_structure_terrain_context(Some(structure));
+        let result = self.generate_noise(evaluator, chunk);
+        evaluator.replace_structure_terrain_context(previous);
+        result
+    }
+
     /// The result is an intermediate SURFACE-stage chunk; it must not be saved
     /// or treated as a complete generated chunk.
     pub fn generate_surface(
@@ -7878,6 +7896,37 @@ mod tests {
             vec![],
             Some(BoundingBox::new([-24, -19, -24], [26, 31, 26]).unwrap()),
         ));
+        let plain_noise = generator.generate_noise(&mut evaluator, [0, 0]).unwrap();
+        let structured_noise = generator
+            .generate_noise_with_structure_context(&mut evaluator, [0, 0], Arc::clone(&structure))
+            .unwrap();
+        assert_ne!(plain_noise.materials(), structured_noise.materials());
+        assert!(evaluator.structure_terrain_context().is_none());
+        assert!(
+            without
+                .generate_noise_with_structure_context(
+                    &mut evaluator,
+                    [0, 0],
+                    Arc::clone(&structure),
+                )
+                .is_err()
+        );
+        let previous_noise = Arc::new(Beardifier::new(vec![], vec![], None));
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous_noise)));
+        assert!(
+            generator
+                .generate_noise_with_structure_context(
+                    &mut evaluator,
+                    [i32::MAX, 0],
+                    Arc::clone(&structure),
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &previous_noise,
+            evaluator.structure_terrain_context().unwrap()
+        ));
+        evaluator.replace_structure_terrain_context(None);
         let classify = |v: &Value| -> Result<SurfaceBlockKind> {
             Ok(match v.as_str().unwrap() {
                 "minecraft:air" => SurfaceBlockKind::Air,

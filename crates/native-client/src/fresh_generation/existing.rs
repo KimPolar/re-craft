@@ -303,6 +303,48 @@ impl PreparedExistingGenerator {
         )
     }
 
+    /// Resume noise generation from a captured BIOMES-stage chunk using its
+    /// saved structure references. This intermediate result is not a completed
+    /// chunk: callers must still verify blending, live state, all generation
+    /// dependencies, subsequent stages and save dependencies before use.
+    pub fn generate_saved_structure_noise(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+        evaluator: &mut native_resources::density::DensityEvaluator,
+    ) -> Result<native_resources::noise_stage::NoiseStageChunk> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            self.generate_structures,
+            "generator has no structure context"
+        );
+        let saved = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .context("noise chunk was not captured")?
+            .terrain
+            .as_ref()
+            .context("saved noise chunk is missing")?;
+        let status = saved
+            .status
+            .as_ref()
+            .context("saved chunk status is missing")?;
+        let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+        ensure!(
+            GenerationStage::from_id(&status) == Some(GenerationStage::Biomes),
+            "saved chunk must be at the biomes stage"
+        );
+        let beardifier = Arc::new(self.restore_saved_beardifier(target, structure_order)?);
+        self.generator.generate_noise_with_structure_context(
+            evaluator,
+            [target.x, target.z],
+            beardifier,
+        )
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -866,7 +908,7 @@ mod tests {
             world::{ChunkPos, WorldReader},
             worldgen_settings::{NewWorldOptions, draft_baked_worldgen_settings},
         };
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
         let game = std::env::var_os("MINECRAFT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
@@ -1109,6 +1151,29 @@ mod tests {
                 .create_new(true)
                 .open(region_dir.join("r.0.0.mca"))?;
             region.write_staged(&mut file)?;
+            // FreshRegionDraft deliberately writes only full chunks. Replace
+            // this test fixture's entry with an uncompressed protochunk so the
+            // reader encounters a real BIOMES-stage region record.
+            let Tag::Compound(fields) = &mut clean.value else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("Status"))
+                .unwrap()
+                .1 = Tag::String("minecraft:biomes".into());
+            let bytes = native_persistence::nbt::write(&clean)?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            assert_eq!(offset % 4096, 0);
+            let sectors = (bytes.len() + 5).div_ceil(4096);
+            assert!(sectors < 256 && offset / 4096 < (1 << 24));
+            file.write_all(&(u32::try_from(bytes.len() + 1)?).to_be_bytes())?;
+            file.write_all(&[3])?;
+            file.write_all(&bytes)?;
+            file.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
+            file.seek(SeekFrom::Start(3 * 4))?;
+            file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+            file.flush()?;
             drop(file);
             let dimension = DimensionId::parse(name)?;
             let mut reader = WorldReader::open_for_session(root, dimension)?;
@@ -1154,6 +1219,45 @@ mod tests {
                 actual.restore_saved_beardifier(clean_target, std::slice::from_ref(&treasure))?;
             assert!(beardifier.affected_bounds().is_none());
             assert!(actual.restore_saved_beardifier(clean_target, &[]).is_err());
+            let previous = Arc::new(native_core::beardifier::Beardifier::new(
+                vec![],
+                vec![],
+                None,
+            ));
+            let mut evaluator = native_resources::density::DensityEvaluator::default();
+            evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
+            assert!(
+                actual
+                    .generate_saved_structure_noise(
+                        position,
+                        std::slice::from_ref(&treasure),
+                        &mut evaluator
+                    )
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .generate_saved_structure_noise(clean_target, &[], &mut evaluator)
+                    .is_err()
+            );
+            let result = actual.generate_saved_structure_noise(
+                clean_target,
+                std::slice::from_ref(&treasure),
+                &mut evaluator,
+            )?;
+            assert!(Arc::ptr_eq(
+                &previous,
+                evaluator.structure_terrain_context().unwrap()
+            ));
+            let mut expected_evaluator = native_resources::density::DensityEvaluator::default();
+            let expected = actual.generator.generate_noise_with_structure_context(
+                &mut expected_evaluator,
+                [3, 0],
+                Arc::new(beardifier),
+            )?;
+            assert_eq!(result.chunk_position(), [3, 0]);
+            assert_eq!(result.materials(), expected.materials());
+            assert_eq!(result.fluid_updates(), expected.fluid_updates());
             let restored = actual.restore_saved_biomes([position])?;
             let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
             let mut neighborhood = actual.generator.biome_neighborhood()?;

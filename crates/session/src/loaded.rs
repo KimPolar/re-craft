@@ -4190,10 +4190,14 @@ impl LoadedSession {
         &self,
         original: &native_persistence::nbt::NamedTag,
     ) -> anyhow::Result<crate::player_data::PlayerStateDraft> {
-        anyhow::ensure!(
-            self.game_mode_trace.is_none(),
-            "game mode transitions and abilities are not yet coordinated for saving"
-        );
+        let mode_trace = self.game_mode_trace;
+        if let Some(trace) = mode_trace {
+            anyhow::ensure!(
+                trace.valid && trace.current == self.game_mode,
+                "game mode transition history is incomplete"
+            );
+            self.validate_player_draft_source(original)?;
+        }
         // Sensor step events, listener state, and redstone side effects are
         // not yet captured together, even though their collision is known.
         anyhow::ensure!(
@@ -4415,7 +4419,7 @@ impl LoadedSession {
             yaw,
             pitch,
             dimension: self.world.dimension.clone(),
-            game_mode: self.game_mode,
+            game_mode: mode_trace.map_or(self.game_mode, |trace| trace.initial),
             vitals: self.vitals,
             experience: self.experience,
             score: self.score,
@@ -4430,7 +4434,17 @@ impl LoadedSession {
             };
             draft.set_last_death_location(original, target)?;
         }
-        draft.set_flying(original, self.flight.flying)?;
+        if let Some(trace) = mode_trace {
+            draft.set_game_mode_transition(
+                original,
+                trace.initial,
+                trace.previous,
+                trace.current,
+                self.flight.flying,
+            )?;
+        } else {
+            draft.set_flying(original, self.flight.flying)?;
+        }
         if let Some(effects) = effect_draft {
             draft.set_effects(effects)?;
         }
@@ -25421,7 +25435,7 @@ pub(crate) mod tests {
                 .draft_player_state_inner(&original)
                 .unwrap_err()
                 .to_string()
-                .contains("game mode transitions")
+                .contains("source")
         );
     }
 
@@ -25453,6 +25467,7 @@ pub(crate) mod tests {
         let original = NamedTag {
             name: "".into(),
             value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
                 ("playerGameType".into(), Tag::Int(0)),
                 ("other".into(), Tag::Int(42)),
             ]),
@@ -25476,15 +25491,27 @@ pub(crate) mod tests {
             Some(&Tag::Int(2))
         );
         assert_eq!(draft.value.get("other"), Some(&Tag::Int(42)));
-        assert!(session.draft_player_state_inner(&original).is_err());
+        let combined = session.draft_player_state_inner(&original).unwrap();
+        for field in [
+            "playerGameType",
+            "previousPlayerGameType",
+            "abilities",
+            "other",
+        ] {
+            assert_eq!(combined.document().value.get(field), draft.value.get(field));
+        }
+        assert!(combined.matches_source(&original).unwrap());
         let mut stale = original.clone();
         let Tag::Compound(fields) = &mut stale.value else {
             unreachable!()
         };
         fields.push(("new".into(), Tag::Int(1)));
         assert!(session.draft_changed_game_mode(&stale).is_err());
+        assert!(session.draft_player_state_inner(&stale).is_err());
+        assert!(!combined.matches_source(&stale).unwrap());
         session.set_game_mode(GameMode::Creative);
         assert!(session.draft_changed_game_mode(&original).is_err());
+        assert!(session.draft_player_state_inner(&original).is_err());
         session.submit_command(PlayerCommand::SetGameMode(GameMode::Survival));
         session.update(TICK);
         assert!(session.draft_changed_game_mode(&original).is_err());
@@ -53973,6 +54000,82 @@ pub(crate) mod tests {
             existing.weather_source.as_ref().unwrap().as_ref(),
             Some(&source)
         );
+    }
+
+    #[test]
+    fn combined_draft_includes_tracked_game_mode_and_checks_player_source() {
+        use native_persistence::nbt::{NamedTag, Tag};
+
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("UUID".into(), Tag::IntArray(vec![0, 0, 0, 1])),
+                ("playerGameType".into(), Tag::Int(0)),
+                ("custom".into(), Tag::Int(42)),
+            ]),
+        };
+        let clock = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("data".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let mut session = session();
+        session.set_random_tick_speed(0);
+        session.restore_saved_player_inventory(&player).unwrap();
+        session
+            .restore_saved_world_clocks(&clock, BTreeMap::new(), true)
+            .unwrap();
+        session.set_game_master_permission(true);
+        session.submit_command(PlayerCommand::SetGameMode(GameMode::Spectator));
+        session.update(TICK);
+
+        let partial = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        let document = partial.player_and_terrain().player();
+        assert_eq!(document.value.get("playerGameType"), Some(&Tag::Int(3)));
+        assert_eq!(
+            document.value.get("previousPlayerGameType"),
+            Some(&Tag::Int(0))
+        );
+        assert_eq!(document.value.get("custom"), Some(&Tag::Int(42)));
+        let abilities = document.value.get("abilities").unwrap();
+        assert_eq!(abilities.get("flying"), Some(&Tag::Byte(1)));
+        assert_eq!(abilities.get("mayfly"), Some(&Tag::Byte(1)));
+        assert_eq!(abilities.get("mayBuild"), Some(&Tag::Byte(0)));
+
+        let mut stale = player.clone();
+        let Tag::Compound(fields) = &mut stale.value else {
+            unreachable!()
+        };
+        fields.push(("changed".into(), Tag::Byte(1)));
+        assert!(session.draft_player_state_inner(&stale).is_err());
+        assert!(
+            partial
+                .into_save_plan([0, 0, 0, 1], &stale, &BTreeMap::new(), &clock, 1)
+                .is_err()
+        );
+        let partial = session
+            .draft_player_terrain_entities_and_clocks(
+                &player,
+                &BTreeMap::new(),
+                &clock,
+                &test_heightmap_tags(),
+                |_| unreachable!(),
+            )
+            .unwrap();
+        partial
+            .into_save_plan([0, 0, 0, 1], &player, &BTreeMap::new(), &clock, 1)
+            .unwrap();
     }
 
     #[test]

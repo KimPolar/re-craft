@@ -1185,6 +1185,32 @@ impl PlayerStateDraft {
         self.0.document()
     }
 
+    pub(crate) fn set_game_mode_transition(
+        &mut self,
+        original: &NamedTag,
+        initial: GameMode,
+        previous: GameMode,
+        current: GameMode,
+        flying: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.matches_source(original)?,
+            "player draft source differs"
+        );
+        let transition = draft_game_mode_transition(original, initial, previous, current, flying)?;
+        let mut document = self.0.document.clone();
+        for field in ["playerGameType", "previousPlayerGameType", "abilities"] {
+            set_field(
+                &mut document.value,
+                field,
+                unique_field(&transition.value, field)?.cloned(),
+            )?;
+        }
+        native_persistence::nbt::write(&document).context("player mode draft cannot be encoded")?;
+        self.0.document = document;
+        Ok(())
+    }
+
     pub(crate) fn set_fire(&mut self, original: &NamedTag, ticks: i32) -> Result<()> {
         read_saved_fire_for_preservation(original)?;
         let ticks = i16::try_from(ticks).context("player Fire cannot be saved as a short")?;

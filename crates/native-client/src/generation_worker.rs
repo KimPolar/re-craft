@@ -4374,6 +4374,7 @@ fn generation_step(
 impl Drop for GenerationWorker {
     fn drop(&mut self) {
         self.cancel();
+        crate::generation_staging::discard_receiver(&mut self.result);
     }
 }
 
@@ -4444,6 +4445,63 @@ fn note_step(progress: &Mutex<GenerationProgress>, pos: ChunkPos, stage: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_worker_does_not_wait_for_queued_result_cleanup() {
+        #[derive(Debug)]
+        struct SlowError {
+            entered: mpsc::SyncSender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl std::fmt::Display for SlowError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("slow cleanup")
+            }
+        }
+        impl std::error::Error for SlowError {}
+        impl Drop for SlowError {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self
+                    .resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+            }
+        }
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (resume, resume_rx) = mpsc::sync_channel(1);
+        let (sender, result) = mpsc::channel();
+        sender
+            .send(GenerationResult::Failed(anyhow::Error::new(SlowError {
+                entered,
+                resume: Mutex::new(resume_rx),
+            })))
+            .ok()
+            .unwrap();
+        let worker = GenerationWorker {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(GenerationProgress {
+                phase: GenerationPhase::Failed,
+                completed_steps: 0,
+                last_step: None,
+                spawn_search_resumptions: 0,
+                player_spawn_search_resumptions: 0,
+            })),
+            result,
+        };
+        let (dropped, dropped_rx) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            drop(worker);
+            dropped.send(()).unwrap();
+        });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let returned = dropped_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = resume.send(());
+        thread.join().unwrap();
+        entered.unwrap();
+        returned.expect("worker drop waited for result cleanup");
+    }
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]

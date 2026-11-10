@@ -96,7 +96,7 @@ fn discard_async<T: Send + 'static>(value: T) {
         .spawn(move || drop(value));
 }
 
-fn discard_receiver<T: Send + 'static>(receiver: &mut Receiver<T>) {
+pub(crate) fn discard_receiver<T: Send + 'static>(receiver: &mut Receiver<T>) {
     match receiver.try_recv() {
         Ok(value) => discard_async(value),
         Err(TryRecvError::Empty) => {

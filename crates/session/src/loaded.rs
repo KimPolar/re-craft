@@ -154,6 +154,74 @@ pub enum SavedPoiData {
     Unavailable,
 }
 
+struct GuardedTerrainChunk {
+    chunk: Option<Arc<native_world::loaded::Chunk>>,
+    block_entities: Option<native_world::loaded::SavedBlockEntities>,
+    block_ticks: Option<Vec<native_world::loaded::SavedBlockTick>>,
+    fluid_ticks: Option<Vec<native_world::loaded::SavedFluidTick>>,
+}
+
+/// Captured live terrain inputs, to be rechecked on the simulation thread.
+/// Live block-entity internals, entities, POIs, generation metadata, clocks,
+/// packs and disk dependencies require separate guards.
+pub struct GenerationTerrainGuard {
+    session: Arc<()>,
+    chunks: BTreeMap<ChunkPos, GuardedTerrainChunk>,
+}
+
+fn matching_terrain_chunks(
+    first: &World,
+    a: &native_world::loaded::Chunk,
+    second: &World,
+    b: &native_world::loaded::Chunk,
+) -> bool {
+    if a.position != b.position
+        || a.status != b.status
+        || a.block_light_correct != b.block_light_correct
+        || a.sections.len() != b.sections.len()
+    {
+        return false;
+    }
+    let mut blocks = BTreeSet::new();
+    let mut biomes = BTreeSet::new();
+    for (&y, left) in &a.sections {
+        let Some(right) = b.sections.get(&y) else {
+            return false;
+        };
+        if left.block_light != right.block_light || left.sky_light != right.sky_light {
+            return false;
+        }
+        match (&left.blocks, &right.blocks) {
+            (None, None) => {}
+            (Some(left), Some(right)) => {
+                for (&x, &y) in left.iter().zip(right.iter()) {
+                    if blocks.insert((x, y))
+                        && (first.state(x).is_none() || first.state(x) != second.state(y))
+                    {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        match (&left.biomes, &right.biomes) {
+            (None, None) => {}
+            (Some(left), Some(right)) => {
+                for (&x, &y) in left.iter().zip(right.iter()) {
+                    if biomes.insert((x, y))
+                        && (first.biome_by_id(x).is_none()
+                            || first.biome_by_id(x) != second.biome_by_id(y))
+                    {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 struct IncomingChunk {
     pos: ChunkPos,
     world: Option<World>,
@@ -614,6 +682,7 @@ enum WeatherTickLevel {
 }
 
 pub struct LoadedSession {
+    generation_identity: Arc<()>,
     world: Arc<World>,
     shapes: Vec<Option<Vec<Aabb>>>,
     stair_octants: Vec<Option<u8>>,
@@ -5499,6 +5568,124 @@ impl LoadedSession {
             || matches!(self.inventory.menu(), Some(InventoryMenu::Chest { position: p, other }) if [Some(p), other].into_iter().flatten().any(|p| p.x.div_euclid(16) == position.x && p.z.div_euclid(16) == position.z))
     }
 
+    fn generation_terrain_pending(&self) -> BTreeSet<ChunkPos> {
+        self.incoming
+            .iter()
+            .map(|pending| pending.pos)
+            .chain(self.pending_light.keys().map(|block| block.chunk()))
+            .collect()
+    }
+
+    fn generation_terrain_chunk(&self, position: ChunkPos) -> GuardedTerrainChunk {
+        GuardedTerrainChunk {
+            chunk: self
+                .world
+                .chunks
+                .get(&position)
+                .or_else(|| self.parked_chunks.get(&position))
+                .cloned(),
+            block_entities: self.world.visible_block_entities(&position).cloned(),
+            block_ticks: self.world.saved_block_ticks.get(&position).cloned(),
+            fluid_ticks: self.world.saved_fluid_ticks.get(&position).cloned(),
+        }
+    }
+
+    /// Check a disk-derived terrain view against the live session. Missing
+    /// resident chunks are permitted, but unsaved or pending changes are not.
+    /// This does not guard live block-entity internals, entities, POIs,
+    /// heightmaps, postprocessing, settings, clocks, or disk writes.
+    pub fn capture_generation_terrain(
+        &self,
+        source: &World,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> anyhow::Result<GenerationTerrainGuard> {
+        anyhow::ensure!(
+            source.dimension == self.world.dimension,
+            "generation terrain dimension differs"
+        );
+        anyhow::ensure!(
+            source.block_edits().next().is_none() && source.live_block_entities.is_empty(),
+            "generation terrain source contains live edits"
+        );
+        let pending = self.generation_terrain_pending();
+        let mut chunks = BTreeMap::new();
+        for position in positions {
+            anyhow::ensure!(
+                !chunks.contains_key(&position),
+                "duplicate generation terrain input"
+            );
+            anyhow::ensure!(
+                !self.has_unsaved_chunk_changes(position) && !pending.contains(&position),
+                "generation terrain has unsaved or pending changes at {position:?}"
+            );
+            let live = self.generation_terrain_chunk(position);
+            if let Some(chunk) = &live.chunk {
+                let saved = source.chunks.get(&position).ok_or_else(|| {
+                    anyhow::anyhow!("live terrain is absent from captured input at {position:?}")
+                })?;
+                anyhow::ensure!(
+                    matching_terrain_chunks(&self.world, chunk, source, saved),
+                    "live terrain differs from captured input at {position:?}"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        source.visible_block_entities(&position),
+                        Some(
+                            native_world::loaded::SavedBlockEntities::Empty
+                                | native_world::loaded::SavedBlockEntities::Encoded(_)
+                        )
+                    ),
+                    "captured block entities are unavailable at {position:?}"
+                );
+                anyhow::ensure!(
+                    live.block_entities.as_ref() == source.visible_block_entities(&position),
+                    "live block entities differ from captured input at {position:?}"
+                );
+                anyhow::ensure!(
+                    live.block_ticks.as_ref() == source.saved_block_ticks.get(&position)
+                        && live.fluid_ticks.as_ref() == source.saved_fluid_ticks.get(&position),
+                    "live ticks differ from captured input at {position:?}"
+                );
+            }
+            chunks.insert(position, live);
+        }
+        anyhow::ensure!(!chunks.is_empty(), "no generation terrain inputs");
+        Ok(GenerationTerrainGuard {
+            session: Arc::clone(&self.generation_identity),
+            chunks,
+        })
+    }
+
+    /// Recheck immediately before applying work, while holding the mutable
+    /// session through the corresponding commit or publication operation.
+    pub fn verify_generation_terrain(&self, guard: &GenerationTerrainGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.generation_identity, &guard.session),
+            "generation terrain belongs to another session"
+        );
+        let pending = self.generation_terrain_pending();
+        for (&position, expected) in &guard.chunks {
+            anyhow::ensure!(
+                !self.has_unsaved_chunk_changes(position) && !pending.contains(&position),
+                "generation terrain acquired unsaved or pending changes at {position:?}"
+            );
+            let current = self.generation_terrain_chunk(position);
+            let same_chunk = match (&expected.chunk, &current.chunk) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            anyhow::ensure!(
+                same_chunk
+                    && expected.block_entities == current.block_entities
+                    && expected.block_ticks == current.block_ticks
+                    && expected.fluid_ticks == current.fluid_ticks,
+                "live generation terrain changed at {position:?}"
+            );
+        }
+        Ok(())
+    }
+
     // Activated entity data is the source for drafts even when its terrain is
     // no longer resident. Empty chunks only need retaining when occupied.
     fn retain_entity_chunk(&self, pos: ChunkPos) -> bool {
@@ -6803,6 +6990,7 @@ impl LoadedSession {
         });
         let fast_lava = world.dimension == "minecraft:the_nether";
         let mut session = Self {
+            generation_identity: Arc::new(()),
             world,
             shapes,
             stair_octants,
@@ -25899,6 +26087,116 @@ pub(crate) mod tests {
             ),
         ));
         session
+    }
+
+    #[test]
+    fn generation_terrain_guard_checks_live_inputs_and_pending_updates() {
+        let (mut source, origin, player) = fixture();
+        let bounds = BuildBounds {
+            min_y: 0,
+            max_y: 32,
+        };
+        let pos = ChunkPos {
+            x: 1_000_000,
+            z: -1_000_000,
+        };
+        source
+            .saved_block_entities
+            .insert(pos, native_world::loaded::SavedBlockEntities::Empty);
+        let mut live = LoadedSession::new(source.clone(), origin, bounds, player).unwrap();
+        let absent = ChunkPos {
+            x: pos.x + 1,
+            z: pos.z,
+        };
+        let mut remapped = World::new("minecraft:overworld");
+        remapped.intern_state(state("minecraft:water", &[]));
+        remapped.import_chunk(&source, pos).unwrap();
+        let guard = live
+            .capture_generation_terrain(&remapped, [pos, absent])
+            .unwrap();
+        live.verify_generation_terrain(&guard).unwrap();
+        assert!(
+            live.capture_generation_terrain(&remapped, [pos, pos])
+                .is_err()
+        );
+        assert!(live.capture_generation_terrain(&remapped, []).is_err());
+        let other = LoadedSession::new(source.clone(), origin, bounds, player).unwrap();
+        assert!(other.verify_generation_terrain(&guard).is_err());
+        let mut unavailable = remapped.clone();
+        unavailable
+            .saved_block_entities
+            .insert(pos, native_world::loaded::SavedBlockEntities::Unavailable);
+        assert!(
+            live.capture_generation_terrain(&unavailable, [pos])
+                .is_err()
+        );
+
+        let mut different = remapped.clone();
+        let air = different
+            .states()
+            .find(|(_, block)| block.name == "minecraft:air")
+            .unwrap()
+            .0;
+        let chunk = Arc::make_mut(different.chunks.get_mut(&pos).unwrap());
+        let section = Arc::make_mut(chunk.sections.get_mut(&0).unwrap());
+        section.blocks.as_mut().unwrap()[0] = air;
+        assert!(live.capture_generation_terrain(&different, [pos]).is_err());
+        assert!(
+            live.capture_generation_terrain(&World::new("minecraft:the_nether"), [pos])
+                .is_err()
+        );
+        assert!(
+            live.capture_generation_terrain(&World::new("minecraft:overworld"), [pos])
+                .is_err()
+        );
+
+        // Unrelated registry growth must not invalidate an unchanged chunk.
+        Arc::make_mut(&mut live.world).intern_state(state("minecraft:dirt", &[]));
+        live.verify_generation_terrain(&guard).unwrap();
+        live.queue_streamed_chunk(absent, None, None, None, None, None);
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.incoming.clear();
+        live.verify_generation_terrain(&guard).unwrap();
+        live.pending_light.insert(
+            BlockPosition {
+                x: origin.x,
+                y: 1,
+                z: origin.z,
+            },
+            PendingLight {
+                change: native_world::block_light::LightChange::unknown(),
+                last_attempt: None,
+            },
+        );
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.pending_light.clear();
+        live.verify_generation_terrain(&guard).unwrap();
+        live.dirty_chunks.insert(pos);
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        live.dirty_chunks.remove(&pos);
+        live.verify_generation_terrain(&guard).unwrap();
+
+        let air = live
+            .world
+            .states()
+            .find(|(_, block)| block.name == "minecraft:air")
+            .unwrap()
+            .0;
+        Arc::make_mut(&mut live.world)
+            .set_block_id(origin.x, 0, origin.z, air)
+            .unwrap();
+        assert!(live.verify_generation_terrain(&guard).is_err());
+        assert!(live.capture_generation_terrain(&remapped, [pos]).is_err());
+        let stone = live
+            .world
+            .states()
+            .find(|(_, block)| block.name == "minecraft:stone")
+            .unwrap()
+            .0;
+        Arc::make_mut(&mut live.world)
+            .set_block_id(origin.x, 0, origin.z, stone)
+            .unwrap();
+        assert!(live.verify_generation_terrain(&guard).is_err());
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {

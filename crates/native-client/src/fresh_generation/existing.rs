@@ -17,22 +17,52 @@ pub(crate) struct PreparedExistingGenerator {
     pub generate_structures: bool,
     pub resources: ResourceStack,
     context: GenerationContextSnapshot,
+    identity: Arc<()>,
 }
 
 /// Read-only restoration of captured disk inputs. It does not include unsaved
 /// session changes or prove that the chunks can resume every generation stage.
 pub(crate) struct RestoredSavedTerrain {
-    pub world: native_world::loaded::World,
-    pub biomes:
+    identity: Arc<()>,
+    world: native_world::loaded::World,
+    biomes:
         BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>,
-    pub heightmaps: BTreeMap<
+    heightmaps: BTreeMap<
         native_world::loaded::ChunkPos,
         native_persistence::heightmap::SavedGenerationHeightmaps,
     >,
-    pub postprocessing: BTreeMap<
+    postprocessing: BTreeMap<
         native_world::loaded::ChunkPos,
         Option<native_core::postprocessing::PostProcessing>,
     >,
+}
+
+impl RestoredSavedTerrain {
+    pub fn world(&self) -> &native_world::loaded::World {
+        &self.world
+    }
+    pub fn biomes(
+        &self,
+    ) -> &BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>
+    {
+        &self.biomes
+    }
+    pub fn heightmaps(
+        &self,
+    ) -> &BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_persistence::heightmap::SavedGenerationHeightmaps,
+    > {
+        &self.heightmaps
+    }
+    pub fn postprocessing(
+        &self,
+    ) -> &BTreeMap<
+        native_world::loaded::ChunkPos,
+        Option<native_core::postprocessing::PostProcessing>,
+    > {
+        &self.postprocessing
+    }
 }
 
 impl PreparedExistingGenerator {
@@ -192,11 +222,41 @@ impl PreparedExistingGenerator {
             );
         }
         Ok(RestoredSavedTerrain {
+            identity: Arc::clone(&self.identity),
             world,
             biomes,
             heightmaps,
             postprocessing,
         })
+    }
+
+    /// Bind every captured terrain position to the current live session.
+    /// The returned guard must be checked again on the simulation thread; it
+    /// does not protect live block-entity internals, entities, POIs, generation
+    /// metadata, game clocks, packs, or disk inputs.
+    pub fn capture_live_terrain(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+    ) -> Result<native_session::loaded::GenerationTerrainGuard> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &restored.identity),
+            "restored terrain belongs to another capture"
+        );
+        let sources = self.context.inputs().sources().chunks();
+        for (pos, source) in sources {
+            let key = native_world::loaded::ChunkPos { x: pos.x, z: pos.z };
+            ensure!(
+                source.terrain.is_some() == restored.world.chunks.contains_key(&key),
+                "captured terrain was not fully restored at {key:?}"
+            );
+        }
+        session.capture_generation_terrain(
+            &restored.world,
+            sources
+                .keys()
+                .map(|pos| native_world::loaded::ChunkPos { x: pos.x, z: pos.z }),
+        )
     }
 
     /// Bind captured disk and pack inputs; live session state and generation
@@ -409,6 +469,7 @@ pub(crate) fn prepare_existing_generator(
         generate_structures,
         resources,
         context,
+        identity: Arc::new(()),
     })
 }
 
@@ -848,6 +909,33 @@ mod tests {
                     .restore_saved_terrain([position, ChunkPos { x: 1, z: 0 }])
                     .is_err()
             );
+            let player = native_session::PlayerState {
+                position: glam::Vec3::new(8.5, lighting.min_y as f32 + 2.0, 8.5),
+                yaw: 0.0,
+                pitch: 0.0,
+                vertical_velocity: 0.0,
+                on_ground: false,
+                pose: native_session::PlayerPose::Standing,
+            };
+            let mut live = native_session::loaded::LoadedSession::new(
+                terrain.world().clone(),
+                glam::IVec3::ZERO,
+                native_session::loaded::BuildBounds {
+                    min_y: lighting.min_y,
+                    max_y: lighting.min_y + lighting.height,
+                },
+                player,
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert!(actual.capture_live_terrain(&live, &terrain).is_err());
+            let context = reader.capture_generation_context([position])?;
+            let mut narrow = prepare_existing_generator(context, &game)?;
+            let narrow_terrain = narrow.restore_saved_terrain([position])?;
+            assert!(narrow.capture_live_terrain(&live, &terrain).is_err());
+            let guard = narrow.capture_live_terrain(&live, &narrow_terrain)?;
+            live.verify_generation_terrain(&guard)?;
+            live.queue_streamed_chunk(key, None, None, None, None, None);
+            assert!(live.verify_generation_terrain(&guard).is_err());
             let mut plan = WorldSavePlan::new();
             actual.add_save_dependencies(&mut plan)?;
             assert!(actual.add_save_dependencies(&mut plan).is_err());

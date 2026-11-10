@@ -5239,6 +5239,54 @@ mod tests {
             initial_ready.hut_generation.as_ref().unwrap(),
             &generation
         ));
+        // Cancellation can arrive after staging finishes but before the UI
+        // polls the result. The discarded stage must not consume the input.
+        let late_parent = tempfile::tempdir()?;
+        let late_worker = crate::generation_staging::InitialWorldStagingWorker::start(
+            initial_ready,
+            late_parent.path().to_path_buf(),
+            true,
+            123,
+            1,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match late_worker.progress().phase {
+                crate::generation_staging::StagingPhase::Ready => break,
+                crate::generation_staging::StagingPhase::Failed => {
+                    anyhow::bail!("late cancellation staging failed")
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                _ => anyhow::bail!("late cancellation staging timed out"),
+            }
+        }
+        late_worker.cancel();
+        let initial_ready = loop {
+            match late_worker.try_result()? {
+                Some(crate::generation_staging::StagingResult::Cancelled(generation)) => {
+                    break generation;
+                }
+                Some(crate::generation_staging::StagingResult::Failed { error, .. }) => {
+                    return Err(error);
+                }
+                Some(_) => anyhow::bail!("late cancellation unexpectedly returned a staged world"),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                None => anyhow::bail!("late cancellation result timed out"),
+            }
+        };
+        assert_eq!(
+            late_worker.progress().phase,
+            crate::generation_staging::StagingPhase::Cancelled
+        );
+        assert!(Arc::ptr_eq(
+            initial_ready.hut_generation.as_ref().unwrap(),
+            &generation
+        ));
+        assert_eq!(std::fs::read_dir(late_parent.path())?.count(), 0);
         let stage_worker = crate::generation_staging::InitialWorldStagingWorker::start(
             initial_ready,
             temp.path().to_path_buf(),

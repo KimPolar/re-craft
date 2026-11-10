@@ -91,6 +91,7 @@ pub struct InitialWorldStagingWorker {
     cancelled: Arc<AtomicBool>,
     progress: Arc<Mutex<StagingProgress>>,
     result: Receiver<StagingResult>,
+    original_hut_generation: Option<Arc<crate::fresh_generation::InitialHutGeneration>>,
 }
 
 #[derive(Debug)]
@@ -227,6 +228,7 @@ impl InitialWorldStagingWorker {
         >,
     ) -> std::result::Result<Self, StagingStartError> {
         let cancelled = Arc::new(AtomicBool::new(false));
+        let original_hut_generation = generation.hut_generation.clone();
         let progress = Arc::new(Mutex::new(StagingProgress {
             phase: StagingPhase::Preparing,
             chunks_started: 0,
@@ -298,6 +300,7 @@ impl InitialWorldStagingWorker {
             cancelled,
             progress,
             result,
+            original_hut_generation,
         })
     }
 
@@ -315,6 +318,21 @@ impl InitialWorldStagingWorker {
 
     pub fn try_result(&self) -> Result<Option<StagingResult>> {
         match self.result.try_recv() {
+            Ok(StagingResult::Ready {
+                mut generation,
+                world,
+            }) if self.cancelled.load(Ordering::Acquire) => {
+                // Staging commits the generation context on success. If the
+                // UI cancelled before receiving that success, discard the
+                // unpublished stage and restore the exact retry input.
+                generation.hut_generation = self.original_hut_generation.clone();
+                drop(world);
+                self.progress
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .phase = StagingPhase::Cancelled;
+                Ok(Some(StagingResult::Cancelled(generation)))
+            }
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {

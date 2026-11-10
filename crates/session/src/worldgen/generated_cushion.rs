@@ -2,9 +2,9 @@
 use anyhow::{Context, Result, ensure};
 use native_core::beardifier::BoundingBox;
 use native_persistence::nbt::{Tag, TagType};
-use native_resources::structure_transform::{Mirror, Rotation, transform_entity};
+use native_resources::structure_transform::Rotation;
 
-use super::template_entities::template_entity_anchor;
+use super::template_entities::{template_entity_location, template_entity_yaw};
 
 /// Prepare a known vanilla cushion without consuming the decoration RNG.
 /// Unknown entity data is rejected until its Java load/save behavior is known.
@@ -16,51 +16,10 @@ pub(super) fn draft_template_cushion(
     clip: BoundingBox,
     uuid: impl FnOnce() -> Result<[i32; 4]>,
 ) -> Result<Option<([i32; 3], Tag)>> {
-    ensure!(
-        (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
-        "invalid template entity clipping box"
-    );
-    let anchor = template_entity_anchor(entity, origin, Mirror::None, rotation, pivot)?;
-    if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&anchor[axis])) {
+    let Some((anchor, position)) = template_entity_location(entity, origin, rotation, pivot, clip)?
+    else {
         return Ok(None);
-    }
-    let Tag::Compound(outer) = entity else {
-        anyhow::bail!("invalid template entity");
     };
-    for key in ["pos", "nbt"] {
-        ensure!(
-            outer.iter().filter(|(name, _)| name.matches(key)).count() == 1,
-            "missing or duplicate template entity {key}"
-        );
-    }
-    let local = match entity.get("pos") {
-        Some(Tag::List {
-            element_type: TagType::Double,
-            values,
-        }) => match values.as_slice() {
-            [Tag::Double(x), Tag::Double(y), Tag::Double(z)] => [*x, *y, *z],
-            _ => anyhow::bail!("invalid template entity pos"),
-        },
-        _ => anyhow::bail!("invalid template entity pos"),
-    };
-    ensure!(
-        local.iter().all(|value| value.is_finite()),
-        "nonfinite template entity position"
-    );
-    let transformed = transform_entity(local, Mirror::None, rotation, pivot);
-    let position =
-        std::array::from_fn::<_, 3, _>(|axis| transformed[axis] + f64::from(origin[axis]));
-    ensure!(
-        position.iter().all(|v| v.is_finite())
-            && position[0].abs() <= 30_000_512.0
-            && position[2].abs() <= 30_000_512.0
-            && position[1].abs() <= 20_000_000.0,
-        "template entity position is outside supported bounds"
-    );
-    ensure!(
-        (0..3).all(|axis| position[axis].floor() == f64::from(anchor[axis])),
-        "template cushion position differs from its anchor"
-    );
     let Some(Tag::Compound(fields)) = entity.get("nbt") else {
         anyhow::bail!("template entity NBT is missing");
     };
@@ -149,23 +108,7 @@ pub(super) fn draft_template_cushion(
         "unsupported cushion color"
     );
 
-    // Entity.load applies Java's remainder before rotate/mirror are called.
-    let loaded_yaw = yaw % 360.0;
-    let mut wrapped = loaded_yaw % 360.0;
-    if wrapped >= 180.0 {
-        wrapped -= 360.0;
-    }
-    if wrapped < -180.0 {
-        wrapped += 360.0;
-    }
-    let rotated = wrapped
-        + match rotation {
-            Rotation::None => 0.0,
-            Rotation::Clockwise90 => 90.0,
-            Rotation::Clockwise180 => 180.0,
-            Rotation::Counterclockwise90 => 270.0,
-        };
-    let final_yaw = rotated + (wrapped - loaded_yaw);
+    let final_yaw = template_entity_yaw(yaw, rotation);
     let uuid = uuid()?;
     let mut output = fields.clone();
     for (name, value) in &mut output {

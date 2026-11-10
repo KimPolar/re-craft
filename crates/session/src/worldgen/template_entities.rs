@@ -65,6 +65,108 @@ pub(super) fn template_entity_anchor(
     ))
 }
 
+/// Transform only entities whose integer anchor intersects this placement pass.
+/// Chunk ownership is currently supported when floating and integer positions
+/// resolve to the same block; reject other cases rather than lose an entity.
+pub(super) fn template_entity_location(
+    entity: &Tag,
+    origin: [i32; 3],
+    rotation: Rotation,
+    pivot: [i32; 3],
+    clip: BoundingBox,
+) -> Result<Option<([i32; 3], [f64; 3])>> {
+    ensure!(
+        (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
+        "invalid template entity clipping box"
+    );
+    let anchor = template_entity_anchor(entity, origin, Mirror::None, rotation, pivot)?;
+    if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&anchor[axis])) {
+        return Ok(None);
+    }
+    let Tag::Compound(outer) = entity else {
+        anyhow::bail!("invalid template entity")
+    };
+    for key in ["pos", "nbt"] {
+        ensure!(
+            outer.iter().filter(|(name, _)| name.matches(key)).count() == 1,
+            "missing or duplicate template entity {key}"
+        );
+    }
+    let local = match entity.get("pos") {
+        Some(Tag::List {
+            element_type: TagType::Double,
+            values,
+        }) => match values.as_slice() {
+            [Tag::Double(x), Tag::Double(y), Tag::Double(z)] => [*x, *y, *z],
+            _ => anyhow::bail!("invalid template entity pos"),
+        },
+        _ => anyhow::bail!("invalid template entity pos"),
+    };
+    ensure!(
+        local.iter().all(|value| value.is_finite()),
+        "nonfinite template entity position"
+    );
+    let transformed = native_resources::structure_transform::transform_entity(
+        local,
+        Mirror::None,
+        rotation,
+        pivot,
+    );
+    let position =
+        std::array::from_fn::<_, 3, _>(|axis| transformed[axis] + f64::from(origin[axis]));
+    ensure!(
+        position.iter().all(|v| v.is_finite())
+            && position[0].abs() <= 30_000_512.0
+            && position[2].abs() <= 30_000_512.0
+            && position[1].abs() <= 20_000_000.0,
+        "template entity position is outside supported bounds"
+    );
+    ensure!(
+        (0..3).all(|axis| position[axis].floor() == f64::from(anchor[axis])),
+        "template entity position differs from its anchor"
+    );
+    Ok(Some((anchor, position)))
+}
+
+pub(super) fn template_entity_yaw(yaw: f32, rotation: Rotation) -> f32 {
+    let loaded = yaw % 360.0;
+    let mut wrapped = loaded % 360.0;
+    if wrapped >= 180.0 {
+        wrapped -= 360.0;
+    }
+    if wrapped < -180.0 {
+        wrapped += 360.0;
+    }
+    let rotated = wrapped
+        + match rotation {
+            Rotation::None => 0.0,
+            Rotation::Clockwise90 => 90.0,
+            Rotation::Clockwise180 => 180.0,
+            Rotation::Counterclockwise90 => 270.0,
+        };
+    rotated + (wrapped - loaded)
+}
+
+pub(super) fn draft_template_entity(
+    entity: &Tag,
+    origin: [i32; 3],
+    rotation: Rotation,
+    pivot: [i32; 3],
+    clip: BoundingBox,
+    uuid: impl FnOnce() -> Result<[i32; 4]>,
+) -> Result<Option<([i32; 3], Tag)>> {
+    let is_armor_stand = matches!(entity.get("nbt").and_then(|data| data.get("id")), Some(Tag::String(id)) if id.matches("minecraft:armor_stand"));
+    if is_armor_stand {
+        super::generated_armor_stand::draft_template_armor_stand(
+            entity, origin, rotation, pivot, clip, uuid,
+        )
+    } else {
+        super::generated_cushion::draft_template_cushion(
+            entity, origin, rotation, pivot, clip, uuid,
+        )
+    }
+}
+
 #[cfg(test)]
 mod entity_clip_tests {
     use super::*;

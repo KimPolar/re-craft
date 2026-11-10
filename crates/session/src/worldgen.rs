@@ -30,6 +30,7 @@ use serde_json::Value;
 mod carving;
 pub mod chunk_ticks;
 mod entity_order;
+mod generated_armor_stand;
 mod generated_beehive;
 mod generated_brushable;
 mod generated_chest;
@@ -8303,6 +8304,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_records_vanilla_jigsaw_armor_stand() -> Result<()> {
+        run_fresh_template_batch(34, None)
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
     fn fresh_batch_automatically_decorates_ruined_portal() -> Result<()> {
         run_fresh_template_batch(9, None)
     }
@@ -8656,6 +8663,7 @@ mod tests {
             (true, false, "minecraft:oak_planks", 30),
             (false, false, "minecraft:oak_planks", 31),
             (false, false, "minecraft:stone_bricks", 32),
+            (false, false, "minecraft:stone_bricks", 34),
         ]
         .into_iter()
         .chain((10u8..=29).map(|kind| (false, false, "minecraft:obsidian", kind)))
@@ -8663,7 +8671,7 @@ mod tests {
             if entity_anchor.is_some() && *unsupported {
                 false
             } else if portal_kind == 0 {
-                !(9..=29).contains(kind) && *kind != 32
+                !(9..=29).contains(kind) && !matches!(*kind, 32 | 34)
             } else if portal_kind == 10 {
                 (10..=29).contains(kind)
             } else {
@@ -8692,7 +8700,7 @@ mod tests {
                     ]),
                 ));
             }
-            let template_entities = if feature_kind == 32
+            let template_entities = if matches!(feature_kind, 32 | 34)
                 || feature_kind == 30 && entity_anchor == Some(1)
             {
                 let game = native_resources::default_minecraft_dir()
@@ -8700,18 +8708,20 @@ mod tests {
                 let mut resources = native_resources::packs::ResourceStack::open(&game)?;
                 let source = native_persistence::structure_template::StructureTemplate::load(
                     &mut resources,
-                    &ResourceId::parse(
-                        "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1",
-                    )?,
+                    &ResourceId::parse(if feature_kind == 34 {
+                        "minecraft:village/taiga/houses/taiga_armorer_2"
+                    } else {
+                        "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1"
+                    })?,
                 )?
-                .context("vanilla cushion template missing")?;
+                .context("vanilla entity template missing")?;
                 let mut entity = source
                     .entities
                     .first()
-                    .context("cushion missing")?
+                    .context("template entity missing")?
                     .clone();
                 let Tag::Compound(fields) = &mut entity else {
-                    anyhow::bail!("cushion template entity is not a compound");
+                    anyhow::bail!("template entity is not a compound");
                 };
                 for (name, value) in fields {
                     if name.matches("blockPos") {
@@ -9127,8 +9137,19 @@ mod tests {
                 }
                 assert_eq!(
                     batch.structure_data(target).is_ok(),
-                    feature_kind == 0 || feature_kind == 2 || (4..=32).contains(&feature_kind)
+                    feature_kind == 0
+                        || feature_kind == 2
+                        || (4..=32).contains(&feature_kind)
+                        || feature_kind == 34
                 );
+                if feature_kind == 34 {
+                    let entities = batch.recorded_generated_entities(target)?;
+                    assert_eq!(entities.len(), 1);
+                    assert!(
+                        matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:armor_stand"))
+                    );
+                    assert!(entities[0].get("equipment").is_some());
+                }
                 if feature_kind == 30 && entity_anchor == Some(1) {
                     let start = &batch
                         .shipwreck_starts(source)

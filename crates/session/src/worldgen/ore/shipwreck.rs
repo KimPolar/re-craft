@@ -288,7 +288,7 @@ impl ShipwreckPlacementWorld for ShipwreckRegion<'_, '_, '_> {
         clip: BoundingBox,
     ) -> Result<()> {
         for entity in entities {
-            if let Some((position, data)) = super::super::generated_cushion::draft_template_cushion(
+            if let Some((position, data)) = super::super::template_entities::draft_template_entity(
                 entity,
                 origin,
                 rotation,

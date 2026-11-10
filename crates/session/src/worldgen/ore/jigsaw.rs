@@ -388,7 +388,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
         clip: BoundingBox,
     ) -> Result<()> {
         for entity in entities {
-            if let Some((position, data)) = super::super::generated_cushion::draft_template_cushion(
+            if let Some((position, data)) = super::super::template_entities::draft_template_entity(
                 entity,
                 origin,
                 rotation,
@@ -2766,6 +2766,110 @@ mod tests {
                 assert_ne!(
                     recorded[0].get("UUID"),
                     cushion.get("nbt").and_then(|nbt| nbt.get("UUID"))
+                );
+            }
+            assert_eq!(random.next_long(), unchanged.next_long());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_records_vanilla_armor_stand_and_rolls_back_unsupported_data() -> Result<()> {
+        use native_persistence::structure_template::StructureTemplate;
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let source = StructureTemplate::load(
+            &mut resources,
+            &ResourceId::parse("minecraft:village/taiga/houses/taiga_armorer_2")?,
+        )?
+        .context("armor stand template missing")?;
+        let stand = source
+            .entities
+            .first()
+            .context("armor stand missing")?
+            .clone();
+        let holder = HolderValue::Inline(serde_json::json!({"processors":[]}));
+        let processors = super::super::super::jigsaw::PieceProcessors::Single(Arc::new(
+            PreparedProcessors::load(&holder, &mut resources, &blocks, &registry)?,
+        ));
+        let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
+        let piece = Piece {
+            element: PoolElement::Single {
+                legacy: false,
+                location: ResourceId::parse("example:test")?,
+                processors: holder,
+                projection: Projection::Rigid,
+                override_liquid_settings: None,
+            },
+            origin: [1, 8, 1],
+            rotation: Rotation::None,
+            bounds: clip,
+            ground_level_delta: 0,
+            junctions: vec![],
+        };
+        for reject in [false, true] {
+            let mut entities = vec![stand.clone()];
+            if reject {
+                let mut unknown = stand.clone();
+                let Tag::Compound(outer) = &mut unknown else {
+                    unreachable!()
+                };
+                let (_, Tag::Compound(fields)) = outer
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("nbt"))
+                    .context("stand NBT missing")?
+                else {
+                    unreachable!()
+                };
+                fields.push(("unknown".into(), Tag::Int(1)));
+                entities.push(unknown);
+            }
+            let prepared = PreparedTemplatePiece::load(
+                &piece,
+                &processors,
+                &mut template_with_entities(false, entities)?,
+            )?;
+            let (mut terrain, tags, motion, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            let mut unchanged = random.clone();
+            let result = region.place_rigid_jigsaw_piece(
+                &prepared,
+                &registry,
+                clip,
+                LiquidSettings::IgnoreWaterlogging,
+                &mut random,
+            );
+            if reject {
+                assert!(result.is_err());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(
+                    terrain
+                        .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                        .is_empty()
+                );
+            } else {
+                assert!(result?);
+                region.finish()?;
+                let recorded = terrain.recorded_generated_entities(ChunkPos { x: 0, z: 0 })?;
+                assert_eq!(recorded.len(), 1);
+                assert!(
+                    matches!(recorded[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:armor_stand"))
+                );
+                assert_eq!(
+                    recorded[0].get("equipment"),
+                    stand.get("nbt").and_then(|nbt| nbt.get("equipment"))
+                );
+                assert_ne!(
+                    recorded[0].get("UUID"),
+                    stand.get("nbt").and_then(|nbt| nbt.get("UUID"))
                 );
             }
             assert_eq!(random.next_long(), unchanged.next_long());

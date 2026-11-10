@@ -79,8 +79,14 @@ public class ResumedTerrainOracle {
         for (var key : new String[]{"structures", "PostProcessing"})
             if (!Objects.equals(original.get(key), rewritten.get(key))) throw new AssertionError(key + " changed");
         if (features) {
-            for (var key : new String[]{"block_entities", "block_ticks", "fluid_ticks"})
+            for (var key : new String[]{"block_entities", "block_ticks", "fluid_ticks", "entities"})
                 if (!Objects.equals(original.get(key), rewritten.get(key))) throw new AssertionError(key + " changed");
+            var protoEntities = original.getListOrEmpty("entities");
+            if (protoEntities.size() != 4 || protoEntities.getCompoundOrEmpty(0).getIntOr("n", -1) != 11
+                    || protoEntities.getCompoundOrEmpty(1).getIntOr("n", -1) != 21
+                    || !protoEntities.getCompoundOrEmpty(2).isEmpty()
+                    || protoEntities.getCompoundOrEmpty(3).getIntOr("n", -1) != 22)
+                throw new AssertionError("proto entity order changed");
             boolean chest = false;
             var entities = original.getListOrEmpty("block_entities");
             for (int i = 0; i < entities.size(); i++)

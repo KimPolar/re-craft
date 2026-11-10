@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, path::PathBuf, process::Command, sync::Arc};
 use native_core::postprocessing::PostProcessing;
 use native_persistence::{
     generated_chunk::{
-        FullChunkComponents, SpawnChunkComponents, assemble_entity_chunk, assemble_full_chunk,
-        assemble_full_chunk_with_postprocessing, assemble_spawn_chunk,
+        FullChunkComponents, SpawnChunkComponents, append_proto_entity_records,
+        assemble_entity_chunk, assemble_full_chunk, assemble_full_chunk_with_postprocessing,
+        assemble_spawn_chunk,
     },
     generated_section::encode_generated_sections,
     generated_ticks::{encode_block_ticks, encode_fluid_ticks, encode_level_block_ticks},
@@ -183,6 +184,56 @@ fn entity_records() -> Vec<Tag> {
     };
     fields.push(("CustomMarker".into(), Tag::Int(73)));
     entities
+}
+
+#[test]
+fn proto_entity_append_preserves_existing_records_and_empty_storage() {
+    let saved = Tag::Compound(vec![("custom".into(), Tag::Int(73))]);
+    let original = Tag::List {
+        element_type: TagType::Compound,
+        values: vec![saved.clone()],
+    };
+    let generated = vec![
+        Tag::Compound(vec![]),
+        Tag::Compound(vec![("next".into(), Tag::Int(91))]),
+    ];
+    let combined = append_proto_entity_records(Some(&original), &generated)
+        .unwrap()
+        .unwrap();
+    let Tag::List {
+        element_type,
+        values,
+    } = combined
+    else {
+        panic!()
+    };
+    assert_eq!(element_type, TagType::Compound);
+    assert_eq!(values, [saved, generated[0].clone(), generated[1].clone()]);
+    assert_eq!(
+        append_proto_entity_records(Some(&original), &[]).unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(append_proto_entity_records(None, &[]).unwrap(), None);
+    let empty = Tag::List {
+        element_type: TagType::End,
+        values: vec![],
+    };
+    assert_eq!(
+        append_proto_entity_records(Some(&empty), &[]).unwrap(),
+        Some(empty)
+    );
+    assert!(append_proto_entity_records(Some(&Tag::Int(1)), &generated).is_err());
+    assert!(
+        append_proto_entity_records(
+            Some(&Tag::List {
+                element_type: TagType::Int,
+                values: vec![]
+            }),
+            &[]
+        )
+        .is_err()
+    );
+    assert!(append_proto_entity_records(None, &[Tag::Int(1)]).is_err());
 }
 
 #[test]

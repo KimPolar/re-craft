@@ -138,6 +138,7 @@ pub(crate) struct ResumedFeatureDraft {
     identity: Arc<()>,
     revision: Arc<()>,
     source_nbt: Vec<u8>,
+    entity_sidecar: Option<Arc<NamedTag>>,
     document: NamedTag,
 }
 
@@ -150,6 +151,20 @@ impl ResumedFeatureDraft {
     }
     pub fn matches_world(&self, world: &ResumedTerrainWorld) -> bool {
         Arc::ptr_eq(&self.identity, &world.identity) && Arc::ptr_eq(&self.revision, &world.revision)
+    }
+    /// The independently captured entity-region document, not a merged result.
+    pub fn entity_sidecar_source(&self) -> Option<&NamedTag> {
+        self.entity_sidecar.as_deref()
+    }
+    pub fn matches_entity_sidecar(&self, source: Option<&NamedTag>) -> Result<bool> {
+        Ok(match (&self.entity_sidecar, source) {
+            (None, None) => true,
+            (Some(original), Some(current)) => {
+                native_persistence::nbt::write(original)?
+                    == native_persistence::nbt::write(current)?
+            }
+            _ => false,
+        })
     }
 }
 
@@ -352,14 +367,21 @@ impl PreparedExistingGenerator {
             world.feature_touched.contains(&key),
             "chunk has not been reached by a feature pass"
         );
-        let saved = self
+        let captured = self
             .context
             .inputs()
             .sources()
             .chunks()
             .get(&position)
-            .and_then(|source| source.terrain.as_ref())
+            .context("generation source missing")?;
+        let saved = captured
+            .terrain
+            .as_ref()
             .context("saved terrain source missing")?;
+        let entity_sidecar = captured
+            .entities
+            .as_ref()
+            .map(|saved| Arc::clone(&saved.document));
         validate_empty_biomes_target(saved)?;
         let source = Arc::clone(&saved.document);
         ensure!(
@@ -432,6 +454,10 @@ impl PreparedExistingGenerator {
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         )?;
+        let entities = native_persistence::generated_chunk::append_proto_entity_records(
+            unique_root_field(&source, "entities")?,
+            world.terrain.recorded_generated_entities(key)?,
+        )?;
         let Tag::Compound(generated_maps) = world.terrain.generated_heightmap_data(key)? else {
             unreachable!()
         };
@@ -462,11 +488,15 @@ impl PreparedExistingGenerator {
         replace_unique_root_field(&mut document, "block_entities", block_entities)?;
         replace_unique_root_field(&mut document, "block_ticks", block_ticks)?;
         replace_unique_root_field(&mut document, "fluid_ticks", fluid_ticks)?;
+        if let Some(entities) = entities {
+            replace_unique_root_field(&mut document, "entities", entities)?;
+        }
         native_persistence::nbt::write(&document)?;
         Ok(ResumedFeatureDraft {
             identity: Arc::clone(&self.identity),
             revision: Arc::clone(&world.revision),
             source_nbt,
+            entity_sidecar,
             document,
         })
     }
@@ -3767,6 +3797,10 @@ mod tests {
             "minecraft:melon"
         );
         assert_eq!(schedule.completed(center), Some(GenerationStage::Features));
+        let absent_sidecar = structured.draft_resumed_feature_chunk(&terrain, saved_center)?;
+        assert!(absent_sidecar.entity_sidecar_source().is_none());
+        assert!(absent_sidecar.matches_entity_sidecar(None)?);
+        assert!(absent_sidecar.document().value.get("entities").is_none());
         let structured_snapshot = terrain.terrain().snapshot();
         for y in structured.lighting.min_y..structured.lighting.min_y + structured.lighting.height {
             for z in 32..80 {
@@ -3807,6 +3841,18 @@ mod tests {
             .context("saved center missing")?
             .document;
         let mut treasure_document = (**original_document).clone();
+        let original_proto = Tag::Compound(vec![
+            ("n".into(), Tag::Int(11)),
+            ("opaque".into(), Tag::String("keep".into())),
+        ]);
+        replace_unique_root_field(
+            &mut treasure_document,
+            "entities",
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![original_proto.clone()],
+            },
+        )?;
         replace_unique_root_field(
             &mut treasure_document,
             "structures",
@@ -3866,6 +3912,42 @@ mod tests {
             file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
         }
         drop(file);
+        let sidecar_document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(5023)),
+                ("Position".into(), Tag::IntArray(vec![3, 3])),
+                (
+                    "Entities".into(),
+                    Tag::List {
+                        element_type: TagType::Compound,
+                        values: vec![Tag::Compound(vec![
+                            ("id".into(), Tag::String("minecraft:pig".into())),
+                            ("opaque".into(), Tag::Int(812)),
+                        ])],
+                    },
+                ),
+                ("custom_sidecar".into(), Tag::String("preserve".into())),
+            ]),
+        };
+        let entities_dir = root.join("dimensions/minecraft/overworld/entities");
+        std::fs::create_dir_all(&entities_dir)?;
+        let mut entity_region = native_persistence::save::FreshRegionDraft::new(
+            native_persistence::save::FreshRegionKind::Entities,
+            0,
+            0,
+        );
+        entity_region.add(saved_center, &sidecar_document, 1)?;
+        let mut sidecar_file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(entities_dir.join("r.0.0.mca"))?;
+        ensure!(
+            entity_region.write_staged(&mut sidecar_file)?.is_empty(),
+            "unexpected external entity fixture"
+        );
+        drop(sidecar_file);
         let session = reader
             .session_guard()
             .context("test session guard missing")?;
@@ -4008,9 +4090,72 @@ mod tests {
             String::from_utf8_lossy(&checked.stderr)
         );
         let treasure_source = Arc::clone(&treasure.source);
+        // Exercise the same entity-recording path used by generation, including
+        // passenger suppression and a serializable empty compound.
+        let generated_one = Tag::Compound(vec![("n".into(), Tag::Int(21))]);
+        let generated_empty = Tag::Compound(vec![]);
+        let generated_two = Tag::Compound(vec![("n".into(), Tag::Int(22))]);
+        let block_ids = restored
+            .terrain_assets
+            .as_ref()
+            .context("terrain assets missing")?
+            .block_ids
+            .clone();
+        let tags = native_resources::ore_feature::OreBlockTags::load(
+            &mut restored.resources,
+            &block_ids,
+            &BTreeSet::new(),
+        )?;
+        let motion = restored
+            .heightmap_tags
+            .as_ref()
+            .context("heightmap tags missing")?;
+        let mut region =
+            terrain
+                .terrain
+                .decoration_region(&tags, motion, BTreeSet::from([center]))?;
+        use native_session::worldgen::GeneratedEntityRecord;
+        region.record_generated_entity(
+            [56, y, 56],
+            GeneratedEntityRecord::Saved(generated_one.clone()),
+        )?;
+        region.record_generated_entity([56, y, 56], GeneratedEntityRecord::Passenger)?;
+        region.record_generated_entity(
+            [56, y, 56],
+            GeneratedEntityRecord::Saved(generated_empty.clone()),
+        )?;
+        region.record_generated_entity(
+            [56, y, 56],
+            GeneratedEntityRecord::Saved(generated_two.clone()),
+        )?;
+        region.finish()?;
+        // This fixture invokes the low-level region API directly; production
+        // feature passes update this revision in run_saved_features.
+        terrain.revision = Arc::new(());
         let feature = restored.draft_resumed_feature_chunk(&terrain, saved_center)?;
         assert!(feature.matches_source(&treasure_source)?);
         assert!(feature.matches_world(&terrain));
+        assert_eq!(feature.entity_sidecar_source(), Some(&sidecar_document));
+        assert!(feature.matches_entity_sidecar(Some(&sidecar_document))?);
+        assert!(!feature.matches_entity_sidecar(None)?);
+        let mut stale_sidecar = sidecar_document.clone();
+        let Tag::Compound(fields) = &mut stale_sidecar.value else {
+            unreachable!()
+        };
+        fields.push(("changed".into(), Tag::Byte(1)));
+        assert!(!feature.matches_entity_sidecar(Some(&stale_sidecar))?);
+        assert_eq!(
+            feature.document().value.get("entities"),
+            Some(&Tag::List {
+                element_type: TagType::Compound,
+                values: vec![
+                    original_proto,
+                    generated_one,
+                    generated_empty,
+                    generated_two
+                ],
+            })
+        );
         assert_eq!(
             feature.document().value.get("Status"),
             Some(&Tag::String("minecraft:biomes".into()))

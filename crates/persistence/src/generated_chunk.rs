@@ -75,6 +75,55 @@ pub fn assemble_entity_chunk(position: ChunkPos, records: &[Tag]) -> Result<Name
     Ok(document)
 }
 
+/// Append recorded generation-time entities to a captured protochunk list.
+/// Existing opaque compounds retain their order and absent/empty storage is
+/// unchanged when there are no additions. This is not a completeness or save
+/// guarantee, and does not modify the separate entity-region document.
+pub fn append_proto_entity_records(source: Option<&Tag>, generated: &[Tag]) -> Result<Option<Tag>> {
+    let existing = match source {
+        None => &[][..],
+        Some(Tag::List {
+            element_type,
+            values,
+        }) => {
+            ensure!(
+                *element_type == TagType::Compound
+                    || (*element_type == TagType::End && values.is_empty()),
+                "saved proto entities must be a list of compounds"
+            );
+            ensure!(
+                values.iter().all(|tag| matches!(tag, Tag::Compound(_))),
+                "invalid saved proto entity"
+            );
+            values.as_slice()
+        }
+        Some(_) => bail!("saved proto entities must be a list"),
+    };
+    ensure!(
+        generated.iter().all(|tag| matches!(tag, Tag::Compound(_))),
+        "invalid generated proto entity"
+    );
+    if generated.is_empty() {
+        return Ok(source.cloned());
+    }
+    let capacity = existing
+        .len()
+        .checked_add(generated.len())
+        .context("too many proto entities")?;
+    let mut values = Vec::with_capacity(capacity);
+    values.extend_from_slice(existing);
+    values.extend_from_slice(generated);
+    let combined = Tag::List {
+        element_type: TagType::Compound,
+        values,
+    };
+    nbt::write(&NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![("entities".into(), combined.clone())]),
+    })?;
+    Ok(Some(combined))
+}
+
 fn compound_list(tag: Tag, label: &str) -> Result<Tag> {
     let Tag::List {
         element_type,

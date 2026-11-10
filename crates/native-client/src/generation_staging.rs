@@ -29,6 +29,7 @@ pub enum StagingPhase {
     Sealing,
     InstallingDataPacks,
     Ready,
+    Cancelling,
     Cancelled,
     Failed,
 }
@@ -87,11 +88,33 @@ fn spawn_with_payload<T: Send + 'static>(
     })
 }
 
+// A queued result can own a large temporary directory or generated world.
+// Closing the receiver off-thread avoids freeing either on the event loop.
+fn discard_async<T: Send + 'static>(value: T) {
+    let _ = thread::Builder::new()
+        .name("world-staging-discard".into())
+        .spawn(move || drop(value));
+}
+
+fn discard_receiver<T: Send + 'static>(receiver: &mut Receiver<T>) {
+    match receiver.try_recv() {
+        Ok(value) => discard_async(value),
+        Err(TryRecvError::Empty) => {
+            let (_, replacement) = mpsc::channel();
+            discard_async(std::mem::replace(receiver, replacement));
+        }
+        Err(TryRecvError::Disconnected) => {}
+    }
+}
+
 pub struct InitialWorldStagingWorker {
     cancelled: Arc<AtomicBool>,
     progress: Arc<Mutex<StagingProgress>>,
     result: Receiver<StagingResult>,
     original_hut_generation: Option<Arc<crate::fresh_generation::InitialHutGeneration>>,
+    cleanup: Mutex<Option<Receiver<StagingResult>>>,
+    #[cfg(test)]
+    cleanup_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Debug)]
@@ -301,6 +324,9 @@ impl InitialWorldStagingWorker {
             progress,
             result,
             original_hut_generation,
+            cleanup: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_observer: Mutex::new(None),
         })
     }
 
@@ -316,7 +342,28 @@ impl InitialWorldStagingWorker {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn observe_cleanup(&self, observer: impl FnOnce() + Send + 'static) {
+        *self.cleanup_observer.lock().unwrap() = Some(Box::new(observer));
+    }
+
     pub fn try_result(&self) -> Result<Option<StagingResult>> {
+        let mut cleanup = self
+            .cleanup
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(receiver) = cleanup.as_ref() {
+            return match receiver.try_recv() {
+                Ok(result) => {
+                    *cleanup = None;
+                    Ok(Some(result))
+                }
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Disconnected) => {
+                    anyhow::bail!("world staging cleanup stopped unexpectedly")
+                }
+            };
+        }
         match self.result.try_recv() {
             Ok(StagingResult::Ready {
                 mut generation,
@@ -326,12 +373,49 @@ impl InitialWorldStagingWorker {
                 // UI cancelled before receiving that success, discard the
                 // unpublished stage and restore the exact retry input.
                 generation.hut_generation = self.original_hut_generation.clone();
-                drop(world);
                 self.progress
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .phase = StagingPhase::Cancelled;
-                Ok(Some(StagingResult::Cancelled(generation)))
+                    .phase = StagingPhase::Cancelling;
+                let (sender, receiver) = mpsc::channel();
+                let progress = Arc::clone(&self.progress);
+                #[cfg(test)]
+                let observer = self.cleanup_observer.lock().unwrap().take();
+                let launched = spawn_with_payload(
+                    (generation, world),
+                    move |(generation, world)| {
+                        #[cfg(test)]
+                        if let Some(observer) = observer {
+                            observer();
+                        }
+                        drop(world);
+                        progress
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .phase = StagingPhase::Cancelled;
+                        let _ = sender.send(StagingResult::Cancelled(generation));
+                    },
+                    |task| {
+                        thread::Builder::new()
+                            .name("world-staging-cleanup".into())
+                            .spawn(task)
+                            .map(|_| ())
+                    },
+                );
+                match launched {
+                    Ok(()) => {
+                        *cleanup = Some(receiver);
+                        Ok(None)
+                    }
+                    Err(((generation, world), _)) => {
+                        drop(world);
+                        self.progress
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .phase = StagingPhase::Cancelled;
+                        Ok(Some(StagingResult::Cancelled(generation)))
+                    }
+                }
             }
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -345,12 +429,55 @@ impl InitialWorldStagingWorker {
 impl Drop for InitialWorldStagingWorker {
     fn drop(&mut self) {
         self.cancel();
+        discard_receiver(&mut self.result);
+        if let Some(context) = self.original_hut_generation.take() {
+            discard_async(context);
+        }
+        if let Some(receiver) = self
+            .cleanup
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            discard_async(receiver);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discarding_a_queued_result_does_not_wait_for_cleanup() {
+        #[derive(Debug)]
+        struct SlowDrop {
+            entered: mpsc::SyncSender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (resume, resume_rx) = mpsc::sync_channel(1);
+        let (sender, mut receiver) = mpsc::channel();
+        sender
+            .send(SlowDrop {
+                entered,
+                resume: resume_rx,
+            })
+            .unwrap();
+        discard_receiver(&mut receiver);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        resume.send(()).unwrap();
+    }
 
     #[test]
     fn failed_worker_launch_returns_payload_and_success_transfers_it_once() {

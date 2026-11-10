@@ -5262,7 +5262,32 @@ mod tests {
                 _ => anyhow::bail!("late cancellation staging timed out"),
             }
         }
+        let (cleanup_entered, cleanup_entered_rx) = mpsc::sync_channel(1);
+        let (cleanup_resume, cleanup_resume_rx) = mpsc::sync_channel(1);
+        late_worker.observe_cleanup(move || {
+            cleanup_entered.send(()).unwrap();
+            cleanup_resume_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        });
         late_worker.cancel();
+        loop {
+            assert!(late_worker.try_result()?.is_none());
+            if late_worker.progress().phase == crate::generation_staging::StagingPhase::Cancelling
+            {
+                break;
+            }
+            ensure!(std::time::Instant::now() < deadline, "cleanup did not start");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cleanup_entered_rx.recv_timeout(std::time::Duration::from_secs(30))?;
+        assert_eq!(
+            late_worker.progress().phase,
+            crate::generation_staging::StagingPhase::Cancelling
+        );
+        assert!(late_worker.try_result()?.is_none());
+        assert!(std::fs::read_dir(late_parent.path())?.next().is_some());
+        cleanup_resume.send(())?;
         let initial_ready = loop {
             match late_worker.try_result()? {
                 Some(crate::generation_staging::StagingResult::Cancelled(generation)) => {

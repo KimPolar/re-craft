@@ -111,7 +111,7 @@ pub use postprocessing_world::{
 };
 pub use terrain_batch::{
     FreshBatchLight, FreshTerrainBatch, PostprocessedChunkComponents, PostprocessedChunkDraft,
-    PostprocessingExpansionCheckpoint,
+    PostprocessingExpansionCheckpoint, feature_entity_evidence,
 };
 
 /// Block entities created by a monster-room feature in intermediate terrain.

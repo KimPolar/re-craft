@@ -851,7 +851,12 @@ impl<P: ResourceProvider> EntityFeatureClassifier<'_, P> {
     }
 }
 
-fn feature_entity_evidence(
+/// Classify the active schedule conservatively: `true` means the feature's
+/// complete definition is known not to create entities. Missing or unsupported
+/// definitions are `false`. This says nothing about structures or mob spawning.
+/// The provider and registry must be from the same immutable pack snapshot as
+/// the schedule and the eventual feature execution.
+pub fn feature_entity_evidence(
     provider: &mut impl ResourceProvider,
     schedule: &FeatureSchedule,
     registry: &BTreeSet<ResourceId>,

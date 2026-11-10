@@ -21,6 +21,7 @@ pub(crate) struct PreparedExistingGenerator {
     terrain_assets: Option<SavedTerrainAssets>,
     heightmap_tags: Option<native_resources::heightmap_tags::HeightmapTags>,
     feature_schedule: Option<Arc<native_resources::feature_order::FeatureSchedule>>,
+    feature_entity_evidence: Option<BTreeMap<native_resources::feature_order::FeatureKey, bool>>,
     structure_schedule:
         Option<Arc<native_resources::structure_decoration::StructureDecorationSchedule>>,
 }
@@ -139,6 +140,7 @@ pub(crate) struct ResumedFeatureDraft {
     revision: Arc<()>,
     source_nbt: Vec<u8>,
     entity_sidecar: Option<Arc<NamedTag>>,
+    feature_entity_coverage: bool,
     document: NamedTag,
 }
 
@@ -151,6 +153,12 @@ impl ResumedFeatureDraft {
     }
     pub fn matches_world(&self, world: &ResumedTerrainWorld) -> bool {
         Arc::ptr_eq(&self.identity, &world.identity) && Arc::ptr_eq(&self.revision, &world.revision)
+    }
+    /// Whether nine neighboring feature passes have finished and the selected
+    /// placed features in every completed pass were proven entity-free.
+    /// This does not cover structures, existing entities, spawning or saving.
+    pub fn has_entity_free_feature_coverage(&self) -> bool {
+        self.feature_entity_coverage
     }
     /// The independently captured entity-region document, not a merged result.
     pub fn entity_sidecar_source(&self) -> Option<&NamedTag> {
@@ -203,7 +211,37 @@ pub(crate) struct ResumedTerrainWorld {
     sources: BTreeMap<native_persistence::world::ChunkPos, Arc<NamedTag>>,
     feature_touched: BTreeSet<native_world::loaded::ChunkPos>,
     treasure_starts: BTreeMap<SavedStructureKey, ResumedTreasureStart>,
+    feature_entity_sources: ResumedFeatureEntitySources,
     revision: Arc<()>,
+}
+
+#[derive(Default)]
+struct ResumedFeatureEntitySources {
+    completed: BTreeSet<native_world::loaded::ChunkPos>,
+    unverified: bool,
+}
+
+impl ResumedFeatureEntitySources {
+    fn complete(&mut self, center: native_world::loaded::ChunkPos, entity_free: bool) {
+        self.completed.insert(center);
+        self.unverified |= !entity_free;
+    }
+
+    fn covers(&self, center: native_world::loaded::ChunkPos) -> bool {
+        !self.unverified
+            && (-1i32..=1).all(|dz| {
+                (-1i32..=1).all(|dx| {
+                    center
+                        .x
+                        .checked_add(dx)
+                        .zip(center.z.checked_add(dz))
+                        .is_some_and(|(x, z)| {
+                            self.completed
+                                .contains(&native_world::loaded::ChunkPos { x, z })
+                        })
+                })
+            })
+    }
 }
 
 impl ResumedSavedTerrain {
@@ -218,6 +256,7 @@ impl ResumedSavedTerrain {
             sources: BTreeMap::from([(self.position, self.source)]),
             feature_touched: BTreeSet::new(),
             treasure_starts: BTreeMap::new(),
+            feature_entity_sources: ResumedFeatureEntitySources::default(),
             revision: Arc::new(()),
         }
     }
@@ -497,6 +536,7 @@ impl PreparedExistingGenerator {
             revision: Arc::clone(&world.revision),
             source_nbt,
             entity_sidecar,
+            feature_entity_coverage: world.feature_entity_sources.covers(key),
             document,
         })
     }
@@ -709,6 +749,15 @@ impl PreparedExistingGenerator {
             schedule.ready(center, GenerationStage::Features),
             "features dependencies are incomplete"
         );
+        let evidence = self
+            .feature_entity_evidence
+            .as_ref()
+            .context("feature entity evidence is missing")?;
+        let entity_free = context
+            .plan(self)?
+            .features()
+            .iter()
+            .all(|feature| evidence.get(feature.feature) == Some(&true));
         let structures_enabled = self.generate_structures;
         let mut structures = if structures_enabled {
             Some(self.prepare_saved_structure_plan(world, context.position)?)
@@ -816,6 +865,7 @@ impl PreparedExistingGenerator {
             world.treasure_starts.append(&mut structures.starts);
         }
         world.feature_touched.extend(positions);
+        world.feature_entity_sources.complete(center, entity_free);
         world.revision = Arc::new(());
         Ok(result)
     }
@@ -865,6 +915,20 @@ impl PreparedExistingGenerator {
             self.feature_schedule = Some(Arc::new(
                 self.generator
                     .feature_schedule(&mut self.resources, &registry)?,
+            ));
+        }
+        if self.feature_entity_evidence.is_none() {
+            let registry = self
+                .resources
+                .list_data("worldgen/placed_feature")?
+                .into_iter()
+                .collect();
+            self.feature_entity_evidence = Some(native_session::worldgen::feature_entity_evidence(
+                &mut self.resources,
+                self.feature_schedule
+                    .as_ref()
+                    .expect("feature schedule initialized"),
+                &registry,
             ));
         }
         let context = SavedDecorationContext {
@@ -2034,6 +2098,7 @@ pub(crate) fn prepare_existing_generator(
         terrain_assets: None,
         heightmap_tags: None,
         feature_schedule: None,
+        feature_entity_evidence: None,
         structure_schedule: None,
     })
 }
@@ -2068,6 +2133,35 @@ mod tests {
     use super::*;
     use native_persistence::nbt::{JavaString, TagType};
     use serde_json::json;
+
+    #[test]
+    fn resumed_feature_entity_coverage_requires_all_neighbors_and_no_unknown_passes() {
+        use native_world::loaded::ChunkPos;
+        let center = ChunkPos { x: 5, z: -3 };
+        let mut sources = ResumedFeatureEntitySources::default();
+        assert!(!sources.covers(center));
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if (dx, dz) != (1, 1) {
+                    sources.complete(
+                        ChunkPos {
+                            x: center.x + dx,
+                            z: center.z + dz,
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+        assert!(!sources.covers(center));
+        sources.complete(ChunkPos { x: 6, z: -2 }, true);
+        assert!(sources.covers(center));
+        sources.complete(ChunkPos { x: 100, z: 100 }, false);
+        assert!(!sources.covers(center));
+        sources.complete(ChunkPos { x: 100, z: 100 }, true);
+        assert!(!sources.covers(center));
+        assert!(!ResumedFeatureEntitySources::default().covers(ChunkPos { x: i32::MAX, z: 0 }));
+    }
 
     #[test]
     fn saved_decoration_references_reject_discarded_data() -> Result<()> {
@@ -3667,6 +3761,9 @@ mod tests {
             actual.run_saved_features(&mut terrain, &custom_decoration, &mut schedule)?,
             vec![true]
         );
+        assert!(terrain.feature_entity_sources.completed.contains(&center));
+        assert!(!terrain.feature_entity_sources.unverified);
+        assert!(!terrain.feature_entity_sources.covers(center));
         assert_eq!(
             terrain
                 .terrain()
@@ -4137,6 +4234,7 @@ mod tests {
         assert!(feature.matches_world(&terrain));
         assert_eq!(feature.entity_sidecar_source(), Some(&sidecar_document));
         assert!(feature.matches_entity_sidecar(Some(&sidecar_document))?);
+        assert!(!feature.has_entity_free_feature_coverage());
         assert!(!feature.matches_entity_sidecar(None)?);
         let mut stale_sidecar = sidecar_document.clone();
         let Tag::Compound(fields) = &mut stale_sidecar.value else {

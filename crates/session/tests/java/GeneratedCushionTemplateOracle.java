@@ -82,9 +82,10 @@ public class GeneratedCushionTemplateOracle {
                         var local = source.read("pos", Vec3.CODEC).orElseThrow();
                         var anchor = source.read("blockPos", BlockPos.CODEC).orElseThrow();
                         var origin = new BlockPos(-32, 80, 48);
-                        for (var rotation : Rotation.values()) {
-                            var point = StructureTemplate.transform(local, Mirror.NONE, rotation, BlockPos.ZERO).add(Vec3.atLowerCornerOf(origin));
-                            var block = StructureTemplate.transform(anchor, Mirror.NONE, rotation, BlockPos.ZERO).offset(origin);
+                        for (var rotation : Rotation.values()) for (int pivotIndex = 0; pivotIndex < 2; pivotIndex++) {
+                            var pivot = pivotIndex == 0 ? BlockPos.ZERO : new BlockPos(4, 0, 15);
+                            var point = StructureTemplate.transform(local, Mirror.NONE, rotation, pivot).add(Vec3.atLowerCornerOf(origin));
+                            var block = StructureTemplate.transform(anchor, Mirror.NONE, rotation, pivot).offset(origin);
                             var nbt = sourceNbt.copy();
                             nbt.store("Pos", Vec3.CODEC, point);
                             nbt.remove("UUID");
@@ -96,7 +97,8 @@ public class GeneratedCushionTemplateOracle {
                             cushion.snapTo(point.x, point.y, point.z, yaw, cushion.getXRot());
                             var output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, lookup);
                             if (!cushion.save(output)) throw new AssertionError("cushion was not saved");
-                            NbtIo.write(output.buildResult(), Path.of(args[1]).resolve("vanilla-" + entities + "-" + rotation.ordinal() + ".nbt"));
+                            String prefix = pivotIndex == 0 ? "vanilla-" : "shipwreck-pivot-";
+                            NbtIo.write(output.buildResult(), Path.of(args[1]).resolve(prefix + entities + "-" + rotation.ordinal() + ".nbt"));
                         }
                         entities++;
                     }

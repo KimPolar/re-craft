@@ -12,6 +12,7 @@ pub(super) fn draft_template_cushion(
     entity: &Tag,
     origin: [i32; 3],
     rotation: Rotation,
+    pivot: [i32; 3],
     clip: BoundingBox,
     uuid: impl FnOnce() -> Result<[i32; 4]>,
 ) -> Result<Option<([i32; 3], Tag)>> {
@@ -19,7 +20,7 @@ pub(super) fn draft_template_cushion(
         (0..3).all(|axis| clip.min[axis] <= clip.max[axis]),
         "invalid template entity clipping box"
     );
-    let anchor = template_entity_anchor(entity, origin, Mirror::None, rotation, [0; 3])?;
+    let anchor = template_entity_anchor(entity, origin, Mirror::None, rotation, pivot)?;
     if !(0..3).all(|axis| (clip.min[axis]..=clip.max[axis]).contains(&anchor[axis])) {
         return Ok(None);
     }
@@ -46,7 +47,7 @@ pub(super) fn draft_template_cushion(
         local.iter().all(|value| value.is_finite()),
         "nonfinite template entity position"
     );
-    let transformed = transform_entity(local, Mirror::None, rotation, [0; 3]);
+    let transformed = transform_entity(local, Mirror::None, rotation, pivot);
     let position =
         std::array::from_fn::<_, 3, _>(|axis| transformed[axis] + f64::from(origin[axis]));
     ensure!(
@@ -66,7 +67,7 @@ pub(super) fn draft_template_cushion(
     let data = entity.get("nbt").context("template entity NBT missing")?;
     ensure!(
         matches!(data.get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion")),
-        "jigsaw template entity placement is not yet supported"
+        "structure template entity placement is not yet supported"
     );
     const NAMES: [&str; 13] = [
         "id",
@@ -233,6 +234,7 @@ mod tests {
             &sample(180.0),
             [-32, 80, 48],
             Rotation::Clockwise90,
+            [0; 3],
             clip,
             || Ok([0, 1, 0, 2]),
         )?
@@ -265,8 +267,15 @@ mod tests {
         let clip = BoundingBox::new([0, 0, 0], [15, 15, 15]).map_err(anyhow::Error::msg)?;
         let never = || -> Result<[i32; 4]> { anyhow::bail!("UUID unexpectedly requested") };
         assert!(
-            draft_template_cushion(&sample(0.0), [32, 0, 0], Rotation::None, clip, never)?
-                .is_none()
+            draft_template_cushion(
+                &sample(0.0),
+                [32, 0, 0],
+                Rotation::None,
+                [0; 3],
+                clip,
+                never
+            )?
+            .is_none()
         );
         let mut bad = sample(0.0);
         let Tag::Compound(outer) = &mut bad else {
@@ -280,7 +289,7 @@ mod tests {
             unreachable!()
         };
         fields.push(("custom".into(), Tag::Int(1)));
-        let error = draft_template_cushion(&bad, [0, 0, 0], Rotation::None, clip, never)
+        let error = draft_template_cushion(&bad, [0, 0, 0], Rotation::None, [0; 3], clip, never)
             .err()
             .context("unknown data was accepted")?;
         assert!(format!("{error:#}").contains("unsupported cushion template fields"));
@@ -458,11 +467,15 @@ mod tests {
                             };
                         }
                     }
-                    let (_, actual) =
-                        draft_template_cushion(&entity, [-32, 80, 48], rotation, clip, || {
-                            Ok([0, 1, 0, 2])
-                        })?
-                        .context("cushion clipped")?;
+                    let (_, actual) = draft_template_cushion(
+                        &entity,
+                        [-32, 80, 48],
+                        rotation,
+                        [0; 3],
+                        clip,
+                        || Ok([0, 1, 0, 2]),
+                    )?
+                    .context("cushion clipped")?;
                     let expected = nbt::read(&std::fs::read(
                         temp.path().join(format!("cushion-{index}.nbt")),
                     )?)?
@@ -492,22 +505,28 @@ mod tests {
             )?)?
             .value;
             for (rotation_index, rotation) in rotations.into_iter().enumerate() {
-                let (_, actual) =
-                    draft_template_cushion(&source, [-32, 80, 48], rotation, clip, || {
-                        Ok([0, 1, 0, 2])
-                    })?
+                for (prefix, pivot) in [("vanilla", [0; 3]), ("shipwreck-pivot", [4, 0, 15])] {
+                    let (_, actual) = draft_template_cushion(
+                        &source,
+                        [-32, 80, 48],
+                        rotation,
+                        pivot,
+                        clip,
+                        || Ok([0, 1, 0, 2]),
+                    )?
                     .with_context(|| format!("vanilla cushion {entity_index} was clipped"))?;
-                let expected = nbt::read(&std::fs::read(
-                    temp.path()
-                        .join(format!("vanilla-{entity_index}-{rotation_index}.nbt")),
-                )?)?
-                .value;
-                let actual = canonical(actual);
-                let expected = canonical(expected);
-                assert!(
-                    identical(&actual, &expected),
-                    "vanilla cushion {entity_index}, {rotation:?}: {actual:?} != {expected:?}"
-                );
+                    let expected = nbt::read(&std::fs::read(
+                        temp.path()
+                            .join(format!("{prefix}-{entity_index}-{rotation_index}.nbt")),
+                    )?)?
+                    .value;
+                    let actual = canonical(actual);
+                    let expected = canonical(expected);
+                    assert!(
+                        identical(&actual, &expected),
+                        "{prefix} cushion {entity_index}, {rotation:?}: {actual:?} != {expected:?}"
+                    );
+                }
             }
         }
         Ok(())

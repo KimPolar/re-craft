@@ -644,7 +644,6 @@ impl PreparedStructureStages {
                             && self.ocean_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
                             && self.ruined_portal_starts.get(&source).and_then(|starts| starts.get(id)).is_none()
                             && start.chunk == [source.x, source.z]
-                            && start.template.entities.is_empty()
                             && start.saved_piece_tag().is_ok()
                             && recorded_templates.is_some_and(|keys| keys.contains(&(id.clone(), source)));
                     }

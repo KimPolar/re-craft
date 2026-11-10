@@ -8315,6 +8315,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn fresh_batch_records_shipwreck_template_cushion() -> Result<()> {
+        run_fresh_template_batch(30, Some(1))
+    }
+
+    #[test]
     #[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
     fn fresh_batch_decorates_installed_shipwreck_template() -> Result<()> {
         run_fresh_template_batch(31, None)
@@ -8686,7 +8692,9 @@ mod tests {
                     ]),
                 ));
             }
-            let template_entities = if feature_kind == 32 {
+            let template_entities = if feature_kind == 32
+                || feature_kind == 30 && entity_anchor == Some(1)
+            {
                 let game = native_resources::default_minecraft_dir()
                     .context("Minecraft directory missing")?;
                 let mut resources = native_resources::packs::ResourceStack::open(&game)?;
@@ -8997,7 +9005,7 @@ mod tests {
                         ensure!(
                             format!("{error:#}").contains(
                                 if entity_anchor == Some(0) && feature_kind == 30 {
-                                    "shipwreck template entities are not yet supported"
+                                    "structure template entity placement is not yet supported"
                                 } else if entity_anchor == Some(0) {
                                     "portal template entity placement is unsupported"
                                 } else if feature_kind == 30 {
@@ -9121,6 +9129,28 @@ mod tests {
                     batch.structure_data(target).is_ok(),
                     feature_kind == 0 || feature_kind == 2 || (4..=32).contains(&feature_kind)
                 );
+                if feature_kind == 30 && entity_anchor == Some(1) {
+                    let start = &batch
+                        .shipwreck_starts(source)
+                        .context("missing shipwreck")?[&structure];
+                    let expected_anchor =
+                        native_resources::structure_transform::block_world_position(
+                            [0; 3],
+                            start.piece.position,
+                            native_resources::structure_transform::Mirror::None,
+                            start.piece.rotation,
+                            native_resources::shipwreck::PIVOT,
+                        );
+                    let entities = batch.recorded_generated_entities(target)?;
+                    assert_eq!(entities.len(), 1);
+                    assert!(
+                        matches!(entities[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion"))
+                    );
+                    assert_eq!(
+                        entities[0].get("block_pos"),
+                        Some(&Tag::IntArray(expected_anchor.to_vec()))
+                    );
+                }
                 if feature_kind == 32 {
                     let entities = batch.recorded_generated_entities(target)?;
                     assert_eq!(entities.len(), 1);

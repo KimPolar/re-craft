@@ -278,7 +278,33 @@ impl StructurePlacementWorld for ShipwreckRegion<'_, '_, '_> {
         self.template.finish_jigsaw_markers()
     }
 }
-impl ShipwreckPlacementWorld for ShipwreckRegion<'_, '_, '_> {}
+impl ShipwreckPlacementWorld for ShipwreckRegion<'_, '_, '_> {
+    fn place_shipwreck_entities(
+        &mut self,
+        entities: &[Tag],
+        origin: [i32; 3],
+        rotation: Rotation,
+        pivot: [i32; 3],
+        clip: BoundingBox,
+    ) -> Result<()> {
+        for entity in entities {
+            if let Some((position, data)) = super::super::generated_cushion::draft_template_cushion(
+                entity,
+                origin,
+                rotation,
+                pivot,
+                clip,
+                super::super::fresh_entity_uuid_from_entropy,
+            )? {
+                self.template.inner.region.record_generated_entity(
+                    position,
+                    super::super::GeneratedEntityRecord::Saved(data),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl DecorationRegion<'_> {
     /// Place one start in the caller's unpublished region. A failed attempt
@@ -696,6 +722,86 @@ mod tests {
             matches!(values[0].get("LootTable"),Some(Tag::String(id)) if id.matches("minecraft:chests/shipwreck_map"))
         );
         assert_eq!(values[0].get("LootTableSeed"), Some(&Tag::Long(loot_seed)));
+
+        let cushion_template = StructureTemplate::load(
+            &mut resources,
+            &ResourceId::parse(
+                "minecraft:abandoned_camp/camp/bamboo_jungle/campsite_bamboo_jungle_1",
+            )?,
+        )?
+        .context("cushion template missing")?;
+        let cushion = cushion_template
+            .entities
+            .first()
+            .context("cushion missing")?
+            .clone();
+        for (reject, clipped) in [(false, false), (true, false), (false, true)] {
+            let mut entity_start = start.clone();
+            let mut entities = vec![cushion.clone()];
+            if reject || clipped {
+                let mut unsupported = cushion.clone();
+                let Tag::Compound(outer) = &mut unsupported else {
+                    unreachable!()
+                };
+                if clipped {
+                    let (_, position) = outer
+                        .iter_mut()
+                        .find(|(name, _)| name.matches("blockPos"))
+                        .context("cushion blockPos missing")?;
+                    *position = Tag::IntArray(vec![500, 0, 0]);
+                }
+                let (_, Tag::Compound(fields)) = outer
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("nbt"))
+                    .context("cushion NBT missing")?
+                else {
+                    unreachable!()
+                };
+                let (_, id) = fields
+                    .iter_mut()
+                    .find(|(name, _)| name.matches("id"))
+                    .context("cushion ID missing")?;
+                *id = Tag::String("minecraft:pig".into());
+                entities.push(unsupported);
+            }
+            Arc::make_mut(&mut entity_start.template).entities = entities;
+            let (mut terrain, tags, _, _) = super::super::tests::fixture();
+            let before = terrain.snapshot();
+            let writable = before.chunks.keys().copied().collect();
+            let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+            let mut random = DecorationRandom::new(42);
+            let mut initial_random = random.clone();
+            let result = region.place_shipwreck_start(
+                &mut entity_start,
+                &registry,
+                &update_tags,
+                clip,
+                &mut random,
+            );
+            if reject {
+                assert!(result.is_err());
+                assert!(region.finish().is_err());
+                assert!(Arc::ptr_eq(&before, &terrain.snapshot()));
+                assert!(
+                    terrain
+                        .recorded_generated_entities(ChunkPos { x: 0, z: 0 })?
+                        .is_empty()
+                );
+                assert_eq!(random.next_long(), initial_random.next_long());
+            } else {
+                assert!(result?);
+                region.finish()?;
+                let recorded = terrain.recorded_generated_entities(ChunkPos { x: 0, z: 0 })?;
+                assert_eq!(recorded.len(), 1);
+                assert!(
+                    matches!(recorded[0].get("id"), Some(Tag::String(id)) if id.matches("minecraft:cushion"))
+                );
+                assert_eq!(
+                    recorded[0].get("block_pos"),
+                    Some(&Tag::IntArray(vec![8, 8, 10]))
+                );
+            }
+        }
 
         let (mut wet_terrain, wet_tags, _, _) = super::super::tests::fixture();
         let writable = wet_terrain.snapshot().chunks.keys().copied().collect();

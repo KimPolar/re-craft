@@ -4909,7 +4909,9 @@ impl FreshTerrainBatch {
                                         // A successful portal pass either proves that no
                                         // template entity intersects its clip or rejects it.
                                         super::structure_batch::PlannedStructureStart::RuinedPortal(start) => start.chunk,
-                                        super::structure_batch::PlannedStructureStart::Shipwreck(start) if start.template.entities.is_empty() => start.chunk,
+                                        // A successful shipwreck pass records every supported
+                                        // in-clip entity and rejects unsupported ones.
+                                        super::structure_batch::PlannedStructureStart::Shipwreck(start) => start.chunk,
                                         _ => return None,
                                     };
                                     let key = (
@@ -6418,7 +6420,7 @@ mod entity_source_tests {
     }
 
     #[test]
-    fn shipwreck_entity_evidence_requires_successful_entity_free_pass() -> Result<()> {
+    fn shipwreck_entity_evidence_requires_successful_template_pass() -> Result<()> {
         use crate::worldgen::structure_references::collect_ordered_structure_references;
         use native_core::beardifier::TerrainAdjustment;
         use native_persistence::{
@@ -6495,11 +6497,20 @@ mod entity_source_tests {
         )
         .entities
         .push(Tag::Compound(vec![]));
-        assert!(!stages.only_accounted_structure_references(
+        // Evidence exists only after the placement pass recorded all in-clip
+        // entities or proved that none intersected the clip.
+        assert!(stages.only_accounted_structure_references(
             source,
             &registered,
             false,
             Some(&evidence),
+            None
+        ));
+        assert!(!stages.only_accounted_structure_references(
+            source,
+            &registered,
+            false,
+            None,
             None
         ));
         Ok(())

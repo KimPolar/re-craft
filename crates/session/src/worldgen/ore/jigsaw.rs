@@ -392,6 +392,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 entity,
                 origin,
                 rotation,
+                [0; 3],
                 clip,
                 super::super::fresh_entity_uuid_from_entropy,
             )? {

@@ -169,6 +169,7 @@ pub(crate) struct ResumedStagedLight {
     initialized: BTreeSet<native_world::loaded::ChunkPos>,
     activated: BTreeSet<native_world::loaded::ChunkPos>,
     light_revision: Arc<()>,
+    completed_empty_spawns: BTreeMap<native_world::loaded::ChunkPos, bool>,
 }
 
 /// Source-preserving intermediate chunk with a single visible light revision.
@@ -176,6 +177,33 @@ pub(crate) struct ResumedStagedLight {
 pub(crate) struct ResumedLitDraft {
     feature: ResumedFeatureDraft,
     light_revision: Arc<()>,
+}
+
+/// A point-in-time partial draft after a spawn stage that added no mobs.
+/// Other feature entities and saved entity sidecars can still be incomplete.
+pub(crate) struct ResumedSpawnDraft {
+    lit: ResumedLitDraft,
+    spawn_mobs: bool,
+}
+
+impl ResumedSpawnDraft {
+    pub fn document(&self) -> &NamedTag {
+        self.lit.document()
+    }
+
+    pub fn matches_source(&self, source: &NamedTag) -> Result<bool> {
+        self.lit.matches_source(source)
+    }
+
+    /// The rule must come from the same live session and still be current.
+    pub fn matches_state(
+        &self,
+        world: &ResumedTerrainWorld,
+        light: &ResumedStagedLight,
+        spawn_mobs: bool,
+    ) -> bool {
+        self.spawn_mobs == spawn_mobs && self.lit.matches_state(world, light)
+    }
 }
 
 impl ResumedLitDraft {
@@ -493,6 +521,7 @@ impl PreparedExistingGenerator {
             initialized: light.initialized,
             activated: BTreeSet::new(),
             light_revision: Arc::new(()),
+            completed_empty_spawns: BTreeMap::new(),
         })
     }
 
@@ -573,6 +602,102 @@ impl PreparedExistingGenerator {
         Ok(ResumedLitDraft {
             feature,
             light_revision: Arc::clone(&light.light_revision),
+        })
+    }
+
+    /// Complete SPAWN when Java's generator or current game rule prevents
+    /// original mob spawning. The caller must capture the rule from the same
+    /// session and check live changes before publishing or saving anything.
+    pub fn resume_spawn_without_mobs(
+        &self,
+        world: &ResumedTerrainWorld,
+        schedule: &mut GenerationSchedule,
+        light: &mut ResumedStagedLight,
+        position: native_world::loaded::ChunkPos,
+        spawn_mobs: bool,
+    ) -> Result<()> {
+        use native_session::worldgen::schedule::GenerationStage;
+        ensure!(
+            Arc::ptr_eq(&self.identity, &world.identity)
+                && matches_resumed_revision(&light.identity, &light.revision, world),
+            "spawn belongs to another terrain revision"
+        );
+        ensure!(
+            light.activated.contains(&position),
+            "spawn chunk has not been lit"
+        );
+        let disabled = self
+            .generator
+            .disable_mob_generation()
+            .context("noise settings are missing disable_mob_generation")?;
+        ensure!(
+            disabled || !spawn_mobs,
+            "world-generation mob spawning needs a complete spawn context"
+        );
+        ensure!(
+            schedule.ready(position, GenerationStage::Spawn),
+            "spawn dependencies are incomplete"
+        );
+        for (radius, &needed) in GenerationStage::Spawn
+            .accumulated()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let radius = i32::try_from(radius)?;
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs().max(dz.abs()) != radius {
+                        continue;
+                    }
+                    let neighbor = native_world::loaded::ChunkPos {
+                        x: position
+                            .x
+                            .checked_add(dx)
+                            .context("spawn chunk X overflow")?,
+                        z: position
+                            .z
+                            .checked_add(dz)
+                            .context("spawn chunk Z overflow")?,
+                    };
+                    ensure!(
+                        schedule
+                            .completed(neighbor)
+                            .is_some_and(|stage| stage >= needed),
+                        "spawn dependencies are incomplete"
+                    );
+                }
+            }
+        }
+        ensure!(
+            !light.completed_empty_spawns.contains_key(&position),
+            "spawn already completed"
+        );
+        schedule.complete(position, GenerationStage::Spawn)?;
+        light.completed_empty_spawns.insert(position, spawn_mobs);
+        Ok(())
+    }
+
+    /// Retain the recorded proto entities and light without claiming FULL or
+    /// inferring that all other entity sources are complete.
+    pub fn draft_resumed_empty_spawn(
+        &mut self,
+        world: &ResumedTerrainWorld,
+        light: &ResumedStagedLight,
+        position: native_persistence::world::ChunkPos,
+        spawn_mobs: bool,
+    ) -> Result<ResumedSpawnDraft> {
+        let key = native_world::loaded::ChunkPos {
+            x: position.x,
+            z: position.z,
+        };
+        ensure!(
+            light.completed_empty_spawns.get(&key) == Some(&spawn_mobs),
+            "spawn rule or stage differs"
+        );
+        Ok(ResumedSpawnDraft {
+            lit: self.draft_resumed_lit_chunk(world, light, position)?,
+            spawn_mobs,
         })
     }
     /// Bind an independently captured, fixed initial light-engine revision to
@@ -4300,6 +4425,53 @@ mod tests {
         assert!(
             actual
                 .propagate_resumed_light(&terrain, &mut schedule, &mut staged, center)
+                .is_err()
+        );
+        assert_eq!(actual.generator.disable_mob_generation(), Some(false));
+        assert!(
+            actual
+                .resume_spawn_without_mobs(&terrain, &mut schedule, &mut staged, center, false)
+                .is_err()
+        );
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Light));
+        schedule.request(center, GenerationStage::Spawn)?;
+        let imported = schedule
+            .requirements()
+            .map(|(pos, _)| {
+                let current = schedule.completed(pos).unwrap();
+                let distance = (pos.x - center.x).abs().max((pos.z - center.z).abs());
+                (
+                    pos,
+                    if distance == 3 {
+                        current.max(GenerationStage::Biomes)
+                    } else {
+                        current
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        schedule.restore_imported(imported)?;
+        assert!(
+            actual
+                .resume_spawn_without_mobs(&terrain, &mut schedule, &mut staged, center, true)
+                .is_err()
+        );
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Light));
+        actual.resume_spawn_without_mobs(&terrain, &mut schedule, &mut staged, center, false)?;
+        assert_eq!(schedule.completed(center), Some(GenerationStage::Spawn));
+        let spawn = actual.draft_resumed_empty_spawn(&terrain, &staged, saved_center, false)?;
+        assert!(spawn.matches_state(&terrain, &staged, false));
+        assert!(!spawn.matches_state(&terrain, &staged, true));
+        assert!(spawn.matches_source(&terrain.sources[&saved_center])?);
+        assert_eq!(spawn.document(), lit.document());
+        assert!(
+            actual
+                .draft_resumed_empty_spawn(&terrain, &staged, saved_center, true)
+                .is_err()
+        );
+        assert!(
+            actual
+                .resume_spawn_without_mobs(&terrain, &mut schedule, &mut staged, center, false)
                 .is_err()
         );
         let previous = Arc::new(native_core::beardifier::Beardifier::new(

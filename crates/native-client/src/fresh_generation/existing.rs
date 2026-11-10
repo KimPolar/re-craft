@@ -192,7 +192,8 @@ impl PreparedExistingGenerator {
         >,
     > {
         use native_session::worldgen::{
-            saved_structure_starts::restore_saved_structure_starts, schedule::GenerationStage,
+            saved_structure_starts::restore_saved_structure_starts_with_templates,
+            schedule::GenerationStage,
         };
         let registry: BTreeSet<_> = self
             .resources
@@ -236,7 +237,8 @@ impl PreparedExistingGenerator {
             }
             Some(_) => bail!("structure data is not a compound"),
         };
-        restore_saved_structure_starts(
+        let resources = std::cell::RefCell::new(&mut self.resources);
+        restore_saved_structure_starts_with_templates(
             native_world::loaded::ChunkPos {
                 x: position.x,
                 z: position.z,
@@ -247,13 +249,29 @@ impl PreparedExistingGenerator {
                     return Ok(None);
                 }
                 let path = format!("data/{}/worldgen/structure/{}.json", id.namespace, id.path);
-                let bytes = self
-                    .resources
+                let bytes = resources
+                    .borrow_mut()
                     .read_data(&path)?
                     .with_context(|| format!("missing structure definition {path}"))?;
                 Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
                     format!("invalid structure definition {path}")
                 })?))
+            },
+            |id| {
+                let mut resources = resources.borrow_mut();
+                let template = native_persistence::structure_template::StructureTemplate::load(
+                    &mut **resources,
+                    id,
+                )?;
+                template
+                    .map(|template| {
+                        ensure!(
+                            template.data_version == Some(5023),
+                            "unsupported portal template data version"
+                        );
+                        Ok(template.size)
+                    })
+                    .transpose()
             },
         )
     }
@@ -997,6 +1015,49 @@ mod tests {
                     .unwrap();
             marks.mark(0, lighting.min_y + 1, 0);
             marks.mark(0, lighting.min_y + 1, 0);
+            let template_id = ResourceId::parse("minecraft:ruined_portal/portal_1")?;
+            let template = native_persistence::structure_template::StructureTemplate::load(
+                &mut source,
+                &template_id,
+            )?
+            .context("portal template is missing")?;
+            let selection = native_resources::ruined_portal::InitialSelection {
+                setup_index: 0,
+                air_pocket: false,
+                template: template_id,
+                rotation: native_resources::structure_transform::Rotation::None,
+                mirror: native_resources::structure_transform::Mirror::None,
+            };
+            let setup = native_resources::ruined_portal::Setup {
+                placement: native_resources::ruined_portal::VerticalPlacement::OnLandSurface,
+                air_pocket_probability: 0.0,
+                mossiness: 0.2,
+                overgrown: false,
+                vines: false,
+                can_be_cold: true,
+                replace_with_blackstone: false,
+                weight: 1.0,
+            };
+            let portal_position = [0, lighting.min_y + 8, 0];
+            let pivot = [template.size[0] / 2, 0, template.size[2] / 2];
+            let portal_point = native_resources::ruined_portal::GenerationPoint {
+                position: portal_position,
+                pivot,
+                bounds: native_resources::structure_transform::bounding_box(
+                    template.size,
+                    portal_position,
+                    selection.mirror,
+                    selection.rotation,
+                    pivot,
+                )?,
+            };
+            let portal = native_session::worldgen::ruined_portal::SavedRuinedPortalPiece::capture(
+                &selection,
+                &setup,
+                &portal_point,
+                template.size,
+                false,
+            )?;
             let saved = NamedTag {
                 name: "".into(),
                 value: Tag::Compound(vec![
@@ -1058,6 +1119,25 @@ mod tests {
                                             "id".into(),
                                             Tag::String("INVALID".into()),
                                         )]),
+                                    ),
+                                    (
+                                        "minecraft:ruined_portal".into(),
+                                        Tag::Compound(vec![
+                                            (
+                                                "id".into(),
+                                                Tag::String("minecraft:ruined_portal".into()),
+                                            ),
+                                            ("ChunkX".into(), Tag::Int(0)),
+                                            ("ChunkZ".into(), Tag::Int(0)),
+                                            ("references".into(), Tag::Int(0)),
+                                            (
+                                                "Children".into(),
+                                                Tag::List {
+                                                    element_type: TagType::Compound,
+                                                    values: vec![portal.to_tag()?],
+                                                },
+                                            ),
+                                        ]),
                                     ),
                                 ]),
                             ),
@@ -1194,6 +1274,14 @@ mod tests {
             let references = actual.restore_saved_structure_references(position)?;
             let treasure = ResourceId::parse("minecraft:buried_treasure")?;
             let starts = actual.restore_saved_structure_starts(position)?;
+            let portal_id = ResourceId::parse("minecraft:ruined_portal")?;
+            assert_eq!(
+                starts[&portal_id]
+                    .reference_bounds(&portal_id)?
+                    .unwrap()
+                    .bounds,
+                portal.bounds
+            );
             let bounds = starts[&treasure]
                 .reference_bounds(&treasure)?
                 .unwrap()

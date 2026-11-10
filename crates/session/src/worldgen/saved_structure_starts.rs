@@ -23,6 +23,7 @@ pub enum RestoredStructurePiece {
     SwampHut(SavedSwampHutPiece),
     Mineshaft(SavedMineshaftPiece),
     Jigsaw(SavedJigsawPiece),
+    RuinedPortal(super::ruined_portal::SavedRuinedPortalPiece),
 }
 
 impl RestoredStructurePiece {
@@ -32,6 +33,7 @@ impl RestoredStructurePiece {
             Self::SwampHut(piece) => piece.bounds,
             Self::Mineshaft(piece) => piece.piece.bounds,
             Self::Jigsaw(piece) => piece.piece.bounds,
+            Self::RuinedPortal(piece) => piece.bounds,
         }
     }
 }
@@ -203,7 +205,18 @@ fn treasure_piece(tag: &Tag) -> Result<RestoredStructurePiece> {
 pub fn restore_saved_structure_starts(
     position: ChunkPos,
     starts_field: Option<&Tag>,
+    definition: impl FnMut(&ResourceId) -> Result<Option<Value>>,
+) -> Result<BTreeMap<ResourceId, RestoredStructureStart>> {
+    restore_saved_structure_starts_with_templates(position, starts_field, definition, |_| Ok(None))
+}
+
+/// Like `restore_saved_structure_starts`, resolving template sizes from the
+/// same active resource stack for template-backed pieces.
+pub fn restore_saved_structure_starts_with_templates(
+    position: ChunkPos,
+    starts_field: Option<&Tag>,
     mut definition: impl FnMut(&ResourceId) -> Result<Option<Value>>,
+    mut template_size: impl FnMut(&ResourceId) -> Result<Option<[i32; 3]>>,
 ) -> Result<BTreeMap<ResourceId, RestoredStructureStart>> {
     let mut result = BTreeMap::new();
     let Some(starts_field) = starts_field else {
@@ -268,7 +281,7 @@ pub fn restore_saved_structure_starts(
         ensure!(
             matches!(
                 kind.path.as_str(),
-                "buried_treasure" | "swamp_hut" | "mineshaft" | "jigsaw"
+                "buried_treasure" | "swamp_hut" | "mineshaft" | "jigsaw" | "ruined_portal"
             ),
             "unsupported saved structure type {}",
             kind.path
@@ -285,6 +298,19 @@ pub fn restore_saved_structure_starts(
                     RestoredStructurePiece::Mineshaft(SavedMineshaftPiece::from_tag(value)?)
                 }
                 "jigsaw" => RestoredStructurePiece::Jigsaw(SavedJigsawPiece::from_tag(value)?),
+                "ruined_portal" => {
+                    let Some(Tag::String(name)) = field(value, "Template")? else {
+                        bail!("saved portal template is missing")
+                    };
+                    let name =
+                        String::from_utf16(&name.0).context("invalid saved portal template")?;
+                    let template = ResourceId::parse(&name)?;
+                    let size = template_size(&template)?
+                        .with_context(|| format!("saved portal template {name} is missing"))?;
+                    RestoredStructurePiece::RuinedPortal(
+                        super::ruined_portal::SavedRuinedPortalPiece::from_tag(value, size)?,
+                    )
+                }
                 _ => bail!("unsupported saved structure type {}", kind.path),
             });
         }

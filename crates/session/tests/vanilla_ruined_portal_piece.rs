@@ -95,6 +95,44 @@ fn generated_portal_piece_round_trip_rejects_unpreserved_fields() -> Result<()> 
     };
     properties.push(("future".into(), Tag::Byte(1)));
     assert!(SavedRuinedPortalPiece::from_tag(&Tag::Compound(fields), [7, 4, 5]).is_err());
+    let start = Tag::Compound(vec![
+        ("id".into(), Tag::String("minecraft:ruined_portal".into())),
+        ("ChunkX".into(), Tag::Int(-3)),
+        ("ChunkZ".into(), Tag::Int(3)),
+        ("references".into(), Tag::Int(0)),
+        (
+            "Children".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![pieces[0].to_tag()?],
+            },
+        ),
+    ]);
+    let starts = Tag::Compound(vec![("minecraft:ruined_portal".into(), start)]);
+    let position = native_world::loaded::ChunkPos { x: -3, z: 3 };
+    let config = |_: &ResourceId| Ok(Some(serde_json::json!({"type":"minecraft:ruined_portal"})));
+    use native_session::worldgen::saved_structure_starts::{
+        restore_saved_structure_starts, restore_saved_structure_starts_with_templates,
+    };
+    assert!(restore_saved_structure_starts(position, Some(&starts), config).is_err());
+    assert!(
+        restore_saved_structure_starts_with_templates(position, Some(&starts), config, |_| Ok(
+            None
+        ))
+        .is_err()
+    );
+    assert!(
+        restore_saved_structure_starts_with_templates(position, Some(&starts), config, |_| Ok(
+            Some([6, 4, 5])
+        ))
+        .is_err()
+    );
+    assert!(
+        restore_saved_structure_starts_with_templates(position, Some(&starts), config, |_| Ok(
+            Some([7, 4, 5])
+        ))
+        .is_ok()
+    );
     Ok(())
 }
 
@@ -353,6 +391,45 @@ fn generated_portal_piece_nbt_matches_java() -> Result<()> {
     ensure!(values.len() == pieces.len(), "Java piece count differs");
     for (tag, piece) in values.iter().zip(pieces) {
         assert_eq!(SavedRuinedPortalPiece::from_tag(tag, [7, 4, 5])?, piece);
+        let start = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:ruined_portal".into())),
+            ("ChunkX".into(), Tag::Int(-3)),
+            ("ChunkZ".into(), Tag::Int(3)),
+            ("references".into(), Tag::Int(0)),
+            (
+                "Children".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![tag.clone()],
+                },
+            ),
+        ]);
+        let data = Tag::Compound(vec![("minecraft:ruined_portal".into(), start)]);
+        let id = ResourceId::parse("minecraft:ruined_portal")?;
+        let restored = native_session::worldgen::saved_structure_starts::restore_saved_structure_starts_with_templates(
+            native_world::loaded::ChunkPos { x: -3, z: 3 }, Some(&data),
+            |_| Ok(Some(serde_json::json!({"type":"minecraft:ruined_portal", "terrain_adaptation":"beard_thin"}))),
+            |template| {
+                ensure!(*template == ResourceId::parse("minecraft:ruined_portal/portal_1")?, "unexpected template");
+                Ok(Some([7, 4, 5]))
+            },
+        )?;
+        let native_session::worldgen::saved_structure_starts::RestoredStructureStart::Present {
+            pieces,
+            ..
+        } = &restored[&id]
+        else {
+            anyhow::bail!("portal start missing")
+        };
+        assert!(
+            matches!(&pieces[..], [native_session::worldgen::saved_structure_starts::RestoredStructurePiece::RuinedPortal(saved)] if saved == &piece)
+        );
+        let terrain = restored[&id].terrain_pieces()?;
+        assert_eq!(terrain[0].bounds, piece.bounds);
+        assert_eq!(
+            terrain[0].projection,
+            native_core::beardifier::PieceProjection::NonPool
+        );
     }
     Ok(())
 }

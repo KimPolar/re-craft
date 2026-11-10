@@ -108,6 +108,7 @@ pub mod underwater_magma;
 pub mod vanilla_atlas;
 pub mod vanilla_stitcher;
 pub mod vegetation_patch;
+pub mod villager_type;
 pub mod vines_feature;
 pub mod world_clock;
 pub mod world_presets;

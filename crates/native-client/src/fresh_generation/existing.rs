@@ -180,6 +180,84 @@ impl PreparedExistingGenerator {
         )
     }
 
+    /// Restore supported starts using the captured world's active structure
+    /// definitions. Unknown or incomplete pieces reject the whole result.
+    pub fn restore_saved_structure_starts(
+        &mut self,
+        position: native_persistence::world::ChunkPos,
+    ) -> Result<
+        BTreeMap<
+            ResourceId,
+            native_session::worldgen::saved_structure_starts::RestoredStructureStart,
+        >,
+    > {
+        use native_session::worldgen::{
+            saved_structure_starts::restore_saved_structure_starts, schedule::GenerationStage,
+        };
+        let registry: BTreeSet<_> = self
+            .resources
+            .list_data("worldgen/structure")?
+            .into_iter()
+            .collect();
+        let saved = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&position)
+            .context("structure chunk was not captured")?
+            .terrain
+            .as_ref()
+            .context("saved structure chunk is missing")?;
+        let status = saved
+            .status
+            .as_ref()
+            .context("saved chunk status is missing")?;
+        let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+        ensure!(
+            GenerationStage::from_id(&status)
+                .is_some_and(|stage| stage >= GenerationStage::StructureStarts),
+            "saved chunk has not generated structure starts"
+        );
+        let document = Arc::clone(&saved.document);
+        let Tag::Compound(root) = &document.value else {
+            bail!("saved chunk is not a compound")
+        };
+        let mut entries = root.iter().filter(|(name, _)| name.matches("structures"));
+        let structures = entries.next().map(|(_, tag)| tag);
+        ensure!(entries.next().is_none(), "duplicate structure data");
+        let starts = match structures {
+            None => None,
+            Some(Tag::Compound(fields)) => {
+                let mut entries = fields.iter().filter(|(name, _)| name.matches("starts"));
+                let value = entries.next().map(|(_, tag)| tag);
+                ensure!(entries.next().is_none(), "duplicate structure starts");
+                value
+            }
+            Some(_) => bail!("structure data is not a compound"),
+        };
+        restore_saved_structure_starts(
+            native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            },
+            starts,
+            |id| {
+                if !registry.contains(id) {
+                    return Ok(None);
+                }
+                let path = format!("data/{}/worldgen/structure/{}.json", id.namespace, id.path);
+                let bytes = self
+                    .resources
+                    .read_data(&path)?
+                    .with_context(|| format!("missing structure definition {path}"))?;
+                Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                    format!("invalid structure definition {path}")
+                })?))
+            },
+        )
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -846,16 +924,67 @@ mod tests {
                     ),
                     (
                         "structures".into(),
-                        Tag::Compound(vec![(
-                            "References".into(),
-                            Tag::Compound(vec![
-                                (
-                                    "minecraft:buried_treasure".into(),
-                                    Tag::LongArray(vec![0, 1, 9]),
-                                ),
-                                ("example:unknown".into(), Tag::LongArray(vec![0])),
-                            ]),
-                        )]),
+                        Tag::Compound(vec![
+                            (
+                                "starts".into(),
+                                Tag::Compound(vec![
+                                    (
+                                        "minecraft:buried_treasure".into(),
+                                        Tag::Compound(vec![
+                                            (
+                                                "id".into(),
+                                                Tag::String("minecraft:buried_treasure".into()),
+                                            ),
+                                            ("ChunkX".into(), Tag::Int(0)),
+                                            ("ChunkZ".into(), Tag::Int(0)),
+                                            ("references".into(), Tag::Int(0)),
+                                            (
+                                                "Children".into(),
+                                                Tag::List {
+                                                    element_type: TagType::Compound,
+                                                    values: vec![Tag::Compound(vec![
+                                                        (
+                                                            "id".into(),
+                                                            Tag::String("minecraft:btp".into()),
+                                                        ),
+                                                        (
+                                                            "BB".into(),
+                                                            Tag::IntArray(vec![
+                                                                9,
+                                                                lighting.min_y + 8,
+                                                                9,
+                                                                9,
+                                                                lighting.min_y + 8,
+                                                                9,
+                                                            ]),
+                                                        ),
+                                                        ("O".into(), Tag::Int(-1)),
+                                                        ("GD".into(), Tag::Int(0)),
+                                                    ])],
+                                                },
+                                            ),
+                                        ]),
+                                    ),
+                                    (
+                                        "minecraft:swamp_hut".into(),
+                                        Tag::Compound(vec![(
+                                            "id".into(),
+                                            Tag::String("INVALID".into()),
+                                        )]),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "References".into(),
+                                Tag::Compound(vec![
+                                    (
+                                        "minecraft:buried_treasure".into(),
+                                        Tag::LongArray(vec![0, 1, 9]),
+                                    ),
+                                    ("example:unknown".into(), Tag::LongArray(vec![0])),
+                                ]),
+                            ),
+                        ]),
                     ),
                     (
                         "sections".into(),
@@ -928,6 +1057,17 @@ mod tests {
             let position = ChunkPos { x: 0, z: 0 };
             let references = actual.restore_saved_structure_references(position)?;
             let treasure = ResourceId::parse("minecraft:buried_treasure")?;
+            let starts = actual.restore_saved_structure_starts(position)?;
+            let bounds = starts[&treasure]
+                .reference_bounds(&treasure)?
+                .unwrap()
+                .bounds;
+            assert_eq!(bounds.min, [9, lighting.min_y + 8, 9]);
+            assert!(
+                starts[&ResourceId::parse("minecraft:swamp_hut")?]
+                    .reference_bounds(&treasure)?
+                    .is_none()
+            );
             assert_eq!(
                 references.references.membership()[&treasure],
                 BTreeSet::from([0, 1])

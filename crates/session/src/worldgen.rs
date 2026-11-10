@@ -63,6 +63,7 @@ mod postprocessing_world;
 pub(crate) use postprocessing_world::fence_connection;
 pub mod ruined_portal;
 pub mod schedule;
+pub mod saved_structure_starts;
 pub mod shipwreck;
 pub mod structure_batch;
 mod structure_data;

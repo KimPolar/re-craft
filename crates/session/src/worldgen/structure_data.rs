@@ -1538,10 +1538,26 @@ mod tests {
             pos,
             &SimpleStarts::new(),
             &OceanRuinStarts::new(),
-            &MineshaftStarts::from([(id, start)]),
+            &MineshaftStarts::from([(id.clone(), start.clone())]),
             &refs,
             &BTreeMap::new(),
         )?;
+        let restored = super::super::saved_structure_starts::restore_saved_structure_starts(
+            pos,
+            tag.get("starts"),
+            |_| Ok(Some(serde_json::json!({"type":"minecraft:mineshaft"}))),
+        )?;
+        assert_eq!(
+            restored[&id].reference_bounds(&id)?.unwrap().bounds,
+            start.reference_bounds(id.clone())?.bounds
+        );
+        let super::super::saved_structure_starts::RestoredStructureStart::Present {
+            pieces, ..
+        } = &restored[&id]
+        else {
+            anyhow::bail!("mineshaft start missing")
+        };
+        assert_eq!(pieces.len(), start.pieces.len());
         let input = temp.path().join("mineshaft.nbt");
         std::fs::write(
             &input,
@@ -2056,6 +2072,25 @@ mod tests {
             )
             .unwrap()
             .value;
+            let restored = super::super::saved_structure_starts::restore_saved_structure_starts(
+                pos,
+                expected.get("starts"),
+                |_| {
+                    Ok(Some(
+                        serde_json::json!({"type":"minecraft:buried_treasure"}),
+                    ))
+                },
+            )
+            .unwrap();
+            assert_eq!(restored.len(), usize::from(present));
+            if present {
+                let id = ResourceId::parse("example:treasure").unwrap();
+                let point = [pos.x * 16 + 9, y, pos.z * 16 + 9];
+                assert_eq!(
+                    restored[&id].reference_bounds(&id).unwrap().unwrap().bounds,
+                    BoundingBox::new(point, point).unwrap()
+                );
+            }
             assert_eq!(canonical(actual), canonical(expected), "case {index}");
         }
         run(Command::new(java.join("java.exe"))
@@ -2113,6 +2148,23 @@ mod tests {
                         &BTreeMap::from([((id.clone(), pos), saved)]),
                     )
                     .unwrap();
+                    let restored =
+                        super::super::saved_structure_starts::restore_saved_structure_starts(
+                            pos,
+                            data.get("starts"),
+                            |_| Ok(Some(serde_json::json!({"type":"minecraft:swamp_hut"}))),
+                        )
+                        .unwrap();
+                    let super::super::saved_structure_starts::RestoredStructureStart::Present {
+                        pieces,
+                        ..
+                    } = &restored[&id]
+                    else {
+                        panic!("hut start missing")
+                    };
+                    assert!(
+                        matches!(&pieces[0], super::super::saved_structure_starts::RestoredStructurePiece::SwampHut(piece) if piece == &saved)
+                    );
                     let document = native_persistence::nbt::NamedTag {
                         name: "".into(),
                         value: data,

@@ -19,6 +19,22 @@ pub(crate) struct PreparedExistingGenerator {
     context: GenerationContextSnapshot,
 }
 
+/// Read-only restoration of captured disk inputs. It does not include unsaved
+/// session changes or prove that the chunks can resume every generation stage.
+pub(crate) struct RestoredSavedTerrain {
+    pub world: native_world::loaded::World,
+    pub biomes:
+        BTreeMap<native_world::loaded::ChunkPos, Arc<native_session::worldgen::QuartBiomeChunk>>,
+    pub heightmaps: BTreeMap<
+        native_world::loaded::ChunkPos,
+        native_persistence::heightmap::SavedGenerationHeightmaps,
+    >,
+    pub postprocessing: BTreeMap<
+        native_world::loaded::ChunkPos,
+        Option<native_core::postprocessing::PostProcessing>,
+    >,
+}
+
 impl PreparedExistingGenerator {
     pub fn inputs(&self) -> &GenerationInputSnapshot {
         self.context.inputs()
@@ -74,6 +90,113 @@ impl PreparedExistingGenerator {
         }
         ensure!(!restored.is_empty(), "no saved biome chunks requested");
         Ok(restored)
+    }
+
+    /// Restore captured terrain and recorded generation metadata without
+    /// replacing unknown blocks, priming heightmaps or consuming marks.
+    pub fn restore_saved_terrain(
+        &mut self,
+        positions: impl IntoIterator<Item = native_persistence::world::ChunkPos>,
+    ) -> Result<RestoredSavedTerrain> {
+        use native_persistence::{
+            heightmap::{HeightBounds, SavedGenerationHeightmaps},
+            world::ChunkArea,
+        };
+        use native_session::worldgen::schedule::GenerationStage;
+
+        let mut requested = BTreeSet::new();
+        for position in positions {
+            ensure!(requested.insert(position), "duplicate saved terrain chunk");
+        }
+        ensure!(!requested.is_empty(), "no saved terrain chunks requested");
+        let biomes = self.restore_saved_biomes(requested.iter().copied())?;
+        let block_registry = self.resources.vanilla_generated_block_registry()?;
+        let bounds = HeightBounds {
+            min_y: self.lighting.min_y,
+            max_y: self
+                .lighting
+                .min_y
+                .checked_add(self.lighting.height)
+                .context("dimension height overflow")?,
+        };
+        let mut chunks = BTreeMap::new();
+        let mut heightmaps = BTreeMap::new();
+        let mut postprocessing = BTreeMap::new();
+        for position in requested {
+            let source = self
+                .context
+                .inputs()
+                .sources()
+                .chunks()
+                .get(&position)
+                .context("terrain chunk was not captured")?
+                .terrain
+                .as_ref()
+                .context("saved terrain chunk is missing")?;
+            let status = source
+                .status
+                .as_ref()
+                .context("saved chunk status is missing")?;
+            let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+            ensure!(
+                GenerationStage::from_id(&status)
+                    .is_some_and(|stage| stage >= GenerationStage::Terrain),
+                "saved chunk has not generated terrain"
+            );
+            let key = native_world::loaded::ChunkPos {
+                x: position.x,
+                z: position.z,
+            };
+            heightmaps.insert(
+                key,
+                SavedGenerationHeightmaps::read(&source.document, bounds)?,
+            );
+            let Tag::Compound(fields) = &source.document.value else {
+                bail!("saved chunk is not a compound")
+            };
+            let mut marks = fields
+                .iter()
+                .filter(|(name, _)| name.matches("PostProcessing"));
+            let decoded = marks
+                .next()
+                .map(|(_, tag)| {
+                    native_persistence::postprocessing::decode(
+                        tag,
+                        bounds.min_y,
+                        self.lighting.height,
+                    )
+                })
+                .transpose()?;
+            ensure!(
+                marks.next().is_none(),
+                "duplicate saved postprocessing field"
+            );
+            postprocessing.insert(key, decoded);
+            chunks.insert(position, Arc::new(source.clone()));
+        }
+        let area = ChunkArea {
+            center: *chunks.keys().next().expect("nonempty requested set"),
+            radius: 0,
+            chunks,
+            missing: vec![],
+        };
+        let world = area.materialize_with_defaults(
+            self.context.inputs().sources().dimension(),
+            &block_registry.default_states(),
+        )?;
+        for (_, state) in world.states() {
+            ensure!(
+                block_registry.is_canonical_state(&state.name, &state.properties),
+                "unsupported saved block state: {}",
+                state.name
+            );
+        }
+        Ok(RestoredSavedTerrain {
+            world,
+            biomes,
+            heightmaps,
+            postprocessing,
+        })
     }
 
     /// Bind captured disk and pack inputs; live session state and generation
@@ -552,6 +675,16 @@ mod tests {
                     Tag::Compound(vec![
                         ("Y".into(), Tag::Byte(section_y)),
                         (
+                            "block_states".into(),
+                            Tag::Compound(vec![(
+                                "palette".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![Tag::String("minecraft:stone".into())],
+                                },
+                            )]),
+                        ),
+                        (
                             "biomes".into(),
                             Tag::Compound(vec![(
                                 "palette".into(),
@@ -564,6 +697,22 @@ mod tests {
                     ])
                 })
                 .collect();
+            let saved_height = [lighting.min_y + 7; 256];
+            let maps = native_persistence::heightmap::encode_generated_heightmaps(
+                native_persistence::heightmap::HeightBounds {
+                    min_y: lighting.min_y,
+                    max_y: lighting.min_y + lighting.height,
+                },
+                &native_persistence::heightmap::GeneratedHeightmaps {
+                    world_surface_wg: Some(&saved_height),
+                    ..Default::default()
+                },
+            )?;
+            let mut marks =
+                native_core::postprocessing::PostProcessing::new(lighting.min_y, lighting.height)
+                    .unwrap();
+            marks.mark(0, lighting.min_y + 1, 0);
+            marks.mark(0, lighting.min_y + 1, 0);
             let saved = NamedTag {
                 name: "".into(),
                 value: Tag::Compound(vec![
@@ -571,6 +720,11 @@ mod tests {
                     ("xPos".into(), Tag::Int(0)),
                     ("zPos".into(), Tag::Int(0)),
                     ("Status".into(), Tag::String("minecraft:full".into())),
+                    ("Heightmaps".into(), maps),
+                    (
+                        "PostProcessing".into(),
+                        native_persistence::postprocessing::encode(&marks),
+                    ),
                     (
                         "sections".into(),
                         Tag::List {
@@ -582,6 +736,41 @@ mod tests {
             };
             let mut region = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
             region.add(ChunkPos { x: 0, z: 0 }, &saved, 1)?;
+            let mut unknown = saved.clone();
+            let Tag::Compound(fields) = &mut unknown.value else {
+                unreachable!()
+            };
+            fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("xPos"))
+                .unwrap()
+                .1 = Tag::Int(1);
+            let Tag::List {
+                values: sections, ..
+            } = &mut fields
+                .iter_mut()
+                .find(|(key, _)| key.matches("sections"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            let Tag::Compound(section) = &mut sections[0] else {
+                unreachable!()
+            };
+            let Tag::Compound(states) = &mut section
+                .iter_mut()
+                .find(|(key, _)| key.matches("block_states"))
+                .unwrap()
+                .1
+            else {
+                unreachable!()
+            };
+            states[0].1 = Tag::List {
+                element_type: TagType::String,
+                values: vec![Tag::String("example:unknown".into())],
+            };
+            region.add(ChunkPos { x: 1, z: 0 }, &unknown, 1)?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .read(true)
@@ -610,7 +799,9 @@ mod tests {
             let mut neighborhood = actual.generator.biome_neighborhood()?;
             neighborhood.insert(Arc::clone(chunk))?;
             assert_eq!(
-                neighborhood.noise_biome_at_block(0, lighting.min_y, 0)?.path,
+                neighborhood
+                    .noise_biome_at_block(0, lighting.min_y, 0)?
+                    .path,
                 "plains"
             );
             let quart_height = (lighting.height / 4) as usize;
@@ -627,12 +818,34 @@ mod tests {
             assert!(actual.restore_saved_biomes([position, position]).is_err());
             assert!(
                 actual
-                    .restore_saved_biomes([ChunkPos { x: 1, z: 0 }])
+                    .restore_saved_biomes([ChunkPos { x: 2, z: 0 }])
                     .is_err()
             );
             assert!(
                 actual
                     .restore_saved_biomes([ChunkPos { x: 100, z: 100 }])
+                    .is_err()
+            );
+            let terrain = actual.restore_saved_terrain([position])?;
+            let key = native_world::loaded::ChunkPos { x: 0, z: 0 };
+            assert_eq!(
+                terrain.world.block(0, lighting.min_y, 0).unwrap().name,
+                "minecraft:stone"
+            );
+            assert_eq!(terrain.biomes[&key].values(), chunk.values());
+            assert_eq!(terrain.heightmaps[&key].first_available(native_persistence::heightmap::SavedGenerationHeightmapKind::WorldSurfaceWorldgen, 0, 0), Some(lighting.min_y + 7));
+            assert_eq!(
+                terrain.heightmaps[&key].first_available(
+                    native_persistence::heightmap::SavedGenerationHeightmapKind::WorldSurface,
+                    0,
+                    0
+                ),
+                None
+            );
+            assert_eq!(terrain.postprocessing[&key].as_ref().unwrap(), &marks);
+            assert!(
+                actual
+                    .restore_saved_terrain([position, ChunkPos { x: 1, z: 0 }])
                     .is_err()
             );
             let mut plan = WorldSavePlan::new();

@@ -235,6 +235,143 @@ fn full_conversion_matches_java_level_chunk_constructor() {
 }
 
 #[test]
+#[ignore = "requires installed Minecraft Java Edition 26.3 and Java 25 JDK"]
+fn saved_generation_maps_match_java_protochunk() {
+    use native_persistence::heightmap::{
+        SavedGenerationHeightmapKind as Kind, SavedGenerationHeightmaps,
+    };
+    let game = std::env::var_os("MINECRAFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+    let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+    let temp = tempfile::tempdir().unwrap();
+    let version = game.join("versions/26.3");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+    assert_eq!(manifest["id"], "26.3");
+    let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+    for library in manifest["libraries"].as_array().unwrap() {
+        if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+            let path = game.join("libraries").join(path);
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    let classpath = std::env::join_paths(paths).unwrap();
+    let source = temp.path().join("SavedGenerationHeightmapOracle.java");
+    std::fs::write(
+        &source,
+        include_str!("java/SavedGenerationHeightmapOracle.java"),
+    )
+    .unwrap();
+    let compile = Command::new(java.join("javac.exe"))
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let kinds = [
+        Kind::WorldSurface,
+        Kind::OceanFloor,
+        Kind::MotionBlocking,
+        Kind::MotionBlockingNoLeaves,
+        Kind::WorldSurfaceWorldgen,
+        Kind::OceanFloorWorldgen,
+    ];
+    let mut cases = Vec::new();
+    for (min_y, height) in [(-64, 384), (0, 16), (-2032, 4064)] {
+        for mask in [0u8, 0b101010, 0b111111] {
+            let root = fixture(min_y, height).unwrap();
+            let Tag::Compound(mut fields) = root.value.get("Heightmaps").unwrap().clone() else {
+                unreachable!()
+            };
+            if height == 384
+                && let Tag::LongArray(words) = &mut fields[0].1
+            {
+                words[0] = (words[0] & !511) | 500;
+            }
+            let mut index = 0;
+            fields.retain(|_| {
+                let keep = mask & (1 << index) != 0;
+                index += 1;
+                keep
+            });
+            let source = Tag::Compound(fields);
+            let doc = NamedTag {
+                name: "".into(),
+                value: Tag::Compound(vec![("Heightmaps".into(), source.clone())]),
+            };
+            let maps = SavedGenerationHeightmaps::read(
+                &doc,
+                HeightBounds {
+                    min_y,
+                    max_y: min_y + height,
+                },
+            )
+            .unwrap();
+            let names = [
+                "WORLD_SURFACE",
+                "OCEAN_FLOOR",
+                "MOTION_BLOCKING",
+                "MOTION_BLOCKING_NO_LEAVES",
+                "WORLD_SURFACE_WG",
+                "OCEAN_FLOOR_WG",
+            ];
+            let mut expected = Vec::new();
+            for (kind, name) in kinds.into_iter().zip(names) {
+                if maps.first_available(kind, 0, 0).is_some() {
+                    let values = (0..256)
+                        .map(|column| {
+                            maps.first_available(kind, column % 16, column / 16)
+                                .unwrap()
+                        })
+                        .collect();
+                    expected.push((name.into(), Tag::IntArray(values)));
+                }
+            }
+            cases.push(Tag::Compound(vec![
+                ("min_y".into(), Tag::Int(min_y)),
+                ("height".into(), Tag::Int(height)),
+                ("source".into(), source),
+                ("expected".into(), Tag::Compound(expected)),
+            ]));
+        }
+    }
+    let input = temp.path().join("cases.nbt");
+    let document = NamedTag {
+        name: "".into(),
+        value: Tag::Compound(vec![(
+            "cases".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: cases,
+            },
+        )]),
+    };
+    std::fs::write(&input, nbt::write(&document).unwrap()).unwrap();
+    let output = Command::new(java.join("java.exe"))
+        .arg("-cp")
+        .arg(&classpath)
+        .arg("SavedGenerationHeightmapOracle")
+        .arg(input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn partial_spawn_maps_preserve_existing_values_when_missing_maps_are_primed() {
     use native_persistence::heightmap::BlockHeightFlags;
     let bounds = HeightBounds {

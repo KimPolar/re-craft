@@ -476,6 +476,71 @@ pub struct GeneratedHeightmaps<'a> {
     pub ocean_floor_wg: Option<&'a [i32; 256]>,
 }
 
+/// The six heightmap kinds stored by 26.3 during chunk generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum SavedGenerationHeightmapKind {
+    WorldSurface,
+    OceanFloor,
+    MotionBlocking,
+    MotionBlockingNoLeaves,
+    WorldSurfaceWorldgen,
+    OceanFloorWorldgen,
+}
+
+/// Stored first-available heights. Missing or incorrectly sized arrays stay
+/// absent, while correctly sized values are retained even when stale.
+pub struct SavedGenerationHeightmaps {
+    min_y: i32,
+    maps: [Option<Box<[u32; 256]>>; 6],
+}
+
+impl SavedGenerationHeightmaps {
+    pub fn read(document: &NamedTag, bounds: HeightBounds) -> Result<Self> {
+        let height = bounds.height()?;
+        let parent = unique(&document.value, "Heightmaps")?;
+        let parent = parent.filter(|value| matches!(value, Tag::Compound(_)));
+        let mut maps = std::array::from_fn(|_| None);
+        let bits = 32 - height.leading_zeros();
+        let per_word = 64 / bits as usize;
+        let expected = 256usize.div_ceil(per_word);
+        let mask = (1u64 << bits) - 1;
+        for (index, (name, _)) in KINDS.iter().enumerate() {
+            let Some(parent) = parent else { continue };
+            let Some(Tag::LongArray(words)) = unique(parent, name)? else {
+                continue;
+            };
+            if words.len() != expected {
+                continue;
+            }
+            let mut values = Box::new([0u32; 256]);
+            for (column, value) in values.iter_mut().enumerate() {
+                *value = (((words[column / per_word] as u64)
+                    >> ((column % per_word) * bits as usize))
+                    & mask) as u32;
+            }
+            maps[index] = Some(values);
+        }
+        Ok(Self {
+            min_y: bounds.min_y,
+            maps,
+        })
+    }
+
+    /// Return the stored first-available Y, or None if the map needs priming.
+    pub fn first_available(
+        &self,
+        kind: SavedGenerationHeightmapKind,
+        x: i32,
+        z: i32,
+    ) -> Option<i32> {
+        let column = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as usize;
+        self.maps[kind as usize]
+            .as_ref()
+            .map(|values| self.min_y + values[column] as i32)
+    }
+}
+
 /// Encode only the heightmaps that exist, as SerializableChunkData.copyOf
 /// does for a protochunk. This is a component of a future chunk save.
 pub fn encode_generated_heightmaps(
@@ -1213,6 +1278,88 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn saved_generation_maps_preserve_distinct_stale_and_missing_values() {
+        use SavedGenerationHeightmapKind::*;
+        let bounds = HeightBounds {
+            min_y: -64,
+            max_y: 320,
+        };
+        let names = [
+            "WORLD_SURFACE",
+            "OCEAN_FLOOR",
+            "MOTION_BLOCKING",
+            "MOTION_BLOCKING_NO_LEAVES",
+            "WORLD_SURFACE_WG",
+            "OCEAN_FLOOR_WG",
+        ];
+        let kinds = [
+            WorldSurface,
+            OceanFloor,
+            MotionBlocking,
+            MotionBlockingNoLeaves,
+            WorldSurfaceWorldgen,
+            OceanFloorWorldgen,
+        ];
+        let mut entries = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let mut values = [0u32; 256];
+            for (column, value) in values.iter_mut().enumerate() {
+                *value = ((column * (index + 1) + 31 * index) % 385) as u32;
+            }
+            let mut raw = encode(&values, 384, None).unwrap();
+            if index == 4 {
+                raw[0] = (raw[0] & !511) | 500;
+            }
+            entries.push((name.into(), Tag::LongArray(raw)));
+        }
+        let doc = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![("Heightmaps".into(), Tag::Compound(entries))]),
+        };
+        let original = crate::nbt::write(&doc).unwrap();
+        let maps = SavedGenerationHeightmaps::read(&doc, bounds).unwrap();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            for column in 0..256 {
+                let relative = if index == 4 && column == 0 {
+                    500
+                } else {
+                    (column * (index + 1) + 31 * index) % 385
+                };
+                assert_eq!(
+                    maps.first_available(kind, (column % 16) as i32, (column / 16) as i32),
+                    Some(-64 + relative as i32)
+                );
+            }
+        }
+        assert_eq!(maps.first_available(WorldSurfaceWorldgen, 0, 0), Some(436));
+        assert_eq!(
+            maps.first_available(OceanFloorWorldgen, -1, -1),
+            maps.first_available(OceanFloorWorldgen, 15, 15)
+        );
+        assert_eq!(crate::nbt::write(&doc).unwrap(), original);
+        let mut damaged = doc.clone();
+        let Tag::Compound(root) = &mut damaged.value else {
+            unreachable!()
+        };
+        let Tag::Compound(entries) = &mut root[0].1 else {
+            unreachable!()
+        };
+        entries[0].1 = Tag::LongArray(vec![0]);
+        entries[5].1 = Tag::String("bad".into());
+        let maps = SavedGenerationHeightmaps::read(&damaged, bounds).unwrap();
+        assert_eq!(maps.first_available(WorldSurface, 0, 0), None);
+        assert_eq!(maps.first_available(OceanFloorWorldgen, 0, 0), None);
+        let Tag::Compound(root) = &mut damaged.value else {
+            unreachable!()
+        };
+        let Tag::Compound(entries) = &mut root[0].1 else {
+            unreachable!()
+        };
+        entries.push(("WORLD_SURFACE_WG".into(), Tag::LongArray(vec![])));
+        assert!(SavedGenerationHeightmaps::read(&damaged, bounds).is_err());
     }
 
     #[test]

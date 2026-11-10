@@ -18,6 +18,13 @@ pub(crate) struct PreparedExistingGenerator {
     pub resources: ResourceStack,
     context: GenerationContextSnapshot,
     identity: Arc<()>,
+    terrain_assets: Option<SavedTerrainAssets>,
+}
+
+struct SavedTerrainAssets {
+    tags: CarverBlockTags,
+    blocks: native_resources::block_registry::GeneratedBlockRegistry,
+    carvers: native_resources::carver::schedule::CarverCache,
 }
 
 /// Read-only restoration of captured disk inputs. It does not include unsaved
@@ -363,6 +370,121 @@ impl PreparedExistingGenerator {
         )
     }
 
+    /// Resume a captured BIOMES-stage chunk through terrain, surface and
+    /// carvers using its saved neighbors. This is an intermediate result: live
+    /// state, remaining stages and save dependencies still require validation.
+    pub fn generate_saved_terrain(
+        &mut self,
+        target: native_persistence::world::ChunkPos,
+        structure_order: &[ResourceId],
+        evaluator: &mut native_resources::density::DensityEvaluator,
+    ) -> Result<native_resources::surface_pass::SurfaceStageChunk> {
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .get(&target)
+            .context("terrain target was not captured")?
+            .terrain
+            .as_ref()
+            .context("saved terrain target is missing")?;
+        validate_empty_biomes_target(source)?;
+
+        let mut positions = Vec::with_capacity(9);
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let pos = native_persistence::world::ChunkPos {
+                    x: target
+                        .x
+                        .checked_add(dx)
+                        .context("neighbor chunk X overflow")?,
+                    z: target
+                        .z
+                        .checked_add(dz)
+                        .context("neighbor chunk Z overflow")?,
+                };
+                let saved = self
+                    .context
+                    .inputs()
+                    .sources()
+                    .chunks()
+                    .get(&pos)
+                    .context("biome neighbor was not captured")?
+                    .terrain
+                    .as_ref()
+                    .context("saved biome neighbor is missing")?;
+                reject_saved_blending(&saved.document)?;
+                positions.push(pos);
+            }
+        }
+        let biomes = self.restore_saved_biomes(positions)?;
+        let mut neighborhood = self.generator.biome_neighborhood()?;
+        for biome in biomes.into_values() {
+            neighborhood.insert(biome)?;
+        }
+        let structure = if self.generate_structures {
+            Some(Arc::new(
+                self.restore_saved_beardifier(target, structure_order)?,
+            ))
+        } else {
+            ensure!(structure_order.is_empty(), "structures are disabled");
+            None
+        };
+        if self.terrain_assets.is_none() {
+            let blocks = self.resources.vanilla_block_ids()?;
+            let tags = CarverBlockTags::load(&mut self.resources, &blocks)?;
+            let blocks = self.resources.vanilla_generated_block_registry()?;
+            self.terrain_assets = Some(SavedTerrainAssets {
+                tags,
+                blocks,
+                carvers: native_resources::carver::schedule::CarverCache::default(),
+            });
+        }
+        let assets = self
+            .terrain_assets
+            .as_mut()
+            .expect("terrain assets initialized");
+        let classify = |value: &Value| -> Result<CarverBlockState> {
+            let state = resolve_generated_terrain_state(value, &assets.blocks)?;
+            Ok(CarverBlockState {
+                is_air: matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                ),
+                has_fluid: FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some(),
+            })
+        };
+        if let Some(structure) = structure {
+            self.generator
+                .generate_carved_surface_with_structure_context(
+                    &mut self.resources,
+                    evaluator,
+                    &mut assets.carvers,
+                    [target.x, target.z],
+                    &neighborhood,
+                    &assets.tags,
+                    structure,
+                    classify,
+                )
+        } else {
+            let previous = evaluator.replace_structure_terrain_context(None);
+            let result = self.generator.generate_carved_surface(
+                &mut self.resources,
+                evaluator,
+                &mut assets.carvers,
+                [target.x, target.z],
+                &neighborhood,
+                &assets.tags,
+                classify,
+            );
+            evaluator.replace_structure_terrain_context(previous);
+            result
+        }
+    }
+
     /// Restore captured terrain and recorded generation metadata without
     /// replacing unknown blocks, priming heightmaps or consuming marks.
     pub fn restore_saved_terrain(
@@ -508,6 +630,83 @@ impl PreparedExistingGenerator {
     ) -> Result<()> {
         plan.add_generation_context(&self.context)
     }
+}
+
+fn reject_saved_blending(document: &NamedTag) -> Result<()> {
+    let Tag::Compound(fields) = &document.value else {
+        bail!("saved chunk is not a compound");
+    };
+    ensure!(
+        !fields
+            .iter()
+            .any(|(name, _)| name.matches("blending_data") || name.matches("below_zero_retrogen")),
+        "saved chunk requires unsupported blending or retrogen"
+    );
+    Ok(())
+}
+
+fn validate_empty_biomes_target(saved: &native_persistence::world::LoadedChunk) -> Result<()> {
+    use native_session::worldgen::schedule::GenerationStage;
+    ensure!(
+        saved.data_version == native_persistence::world::TARGET_DATA_VERSION,
+        "unsupported saved biome data version"
+    );
+    let status = saved
+        .status
+        .as_ref()
+        .context("saved chunk status is missing")?;
+    let status = String::from_utf16(&status.0).context("invalid saved chunk status")?;
+    ensure!(
+        GenerationStage::from_id(&status) == Some(GenerationStage::Biomes),
+        "saved chunk must be at the biomes stage"
+    );
+    reject_saved_blending(&saved.document)?;
+    for section in native_persistence::palette::decode_sections(&saved.document.value)? {
+        if let Some(blocks) = section.blocks {
+            ensure!(
+                blocks.indices.iter().all(|&index| {
+                    blocks.states.get(index as usize).is_some_and(|state| {
+                        state.name.matches("minecraft:air") && state.properties.is_empty()
+                    })
+                }),
+                "saved biome-stage chunk contains blocks"
+            );
+        }
+    }
+    let Tag::Compound(fields) = &saved.document.value else {
+        unreachable!()
+    };
+    ensure!(
+        fields
+            .iter()
+            .filter(|(key, _)| key.matches("sections"))
+            .count()
+            <= 1,
+        "duplicate saved sections"
+    );
+    for name in [
+        "block_entities",
+        "block_ticks",
+        "fluid_ticks",
+        "PostProcessing",
+    ] {
+        let values: Vec<_> = fields.iter().filter(|(key, _)| key.matches(name)).collect();
+        ensure!(values.len() <= 1, "duplicate saved {name}");
+        if let Some((_, value)) = values.first() {
+            let empty = match value {
+                Tag::List { values, .. } if values.is_empty() => true,
+                Tag::List {
+                    element_type: native_persistence::nbt::TagType::List,
+                    values,
+                } if name == "PostProcessing" => values
+                    .iter()
+                    .all(|value| matches!(value, Tag::List { values, .. } if values.is_empty())),
+                _ => false,
+            };
+            ensure!(empty, "saved biome-stage chunk contains {name}");
+        }
+    }
+    Ok(())
 }
 
 fn numeric_bool(tag: &Tag) -> Option<bool> {
@@ -711,6 +910,7 @@ pub(crate) fn prepare_existing_generator(
         resources,
         context,
         identity: Arc::new(()),
+        terrain_assets: None,
     })
 }
 
@@ -773,6 +973,114 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn saved_biome_target_refuses_terrain_or_deferred_changes() -> Result<()> {
+        use native_persistence::{
+            palette::decode_sections,
+            world::{ChunkPos, LoadedChunk},
+        };
+        let mut document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "sections".into(),
+                Tag::List {
+                    element_type: TagType::Compound,
+                    values: vec![Tag::Compound(vec![
+                        ("Y".into(), Tag::Byte(0)),
+                        (
+                            "block_states".into(),
+                            Tag::Compound(vec![(
+                                "palette".into(),
+                                Tag::List {
+                                    element_type: TagType::String,
+                                    values: vec![Tag::String("minecraft:air".into())],
+                                },
+                            )]),
+                        ),
+                    ])],
+                },
+            )]),
+        };
+        let loaded = |document: &NamedTag| -> Result<LoadedChunk> {
+            Ok(LoadedChunk {
+                position: ChunkPos { x: 0, z: 0 },
+                data_version: 5023,
+                status: Some("minecraft:biomes".into()),
+                document: Arc::new(document.clone()),
+                sections: decode_sections(&document.value)?,
+            })
+        };
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_ok());
+        let mut later = loaded(&document)?;
+        later.status = Some("minecraft:terrain".into());
+        assert!(validate_empty_biomes_target(&later).is_err());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.push((
+            "PostProcessing".into(),
+            Tag::List {
+                element_type: TagType::List,
+                values: vec![Tag::List {
+                    element_type: TagType::End,
+                    values: vec![],
+                }],
+            },
+        ));
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_ok());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut fields.last_mut().unwrap().1 else {
+            unreachable!()
+        };
+        values[0] = Tag::List {
+            element_type: TagType::Short,
+            values: vec![Tag::Short(1)],
+        };
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_err());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.pop();
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.push(("blending_data".into(), Tag::Compound(vec![])));
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_err());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.pop();
+        fields.push((
+            "block_ticks".into(),
+            Tag::List {
+                element_type: TagType::Compound,
+                values: vec![Tag::Compound(vec![])],
+            },
+        ));
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_err());
+        let Tag::Compound(fields) = &mut document.value else {
+            unreachable!()
+        };
+        fields.pop();
+        let Tag::List { values, .. } = &mut fields[0].1 else {
+            unreachable!()
+        };
+        let Tag::Compound(section) = &mut values[0] else {
+            unreachable!()
+        };
+        let Tag::Compound(states) = &mut section[1].1 else {
+            unreachable!()
+        };
+        let Tag::List { values, .. } = &mut states[0].1 else {
+            unreachable!()
+        };
+        values[0] = Tag::String("minecraft:stone".into());
+        assert!(validate_empty_biomes_target(&loaded(&document)?).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1253,6 +1561,72 @@ mod tests {
             file.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
             file.seek(SeekFrom::Start(3 * 4))?;
             file.write_all(&(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes())?;
+            // Nine real BIOMES-stage region entries exercise resuming terrain
+            // from captured neighbors, including saved biome identities.
+            for z in 2..=4 {
+                for x in 2..=4 {
+                    let mut biome_chunk = saved.clone();
+                    let Tag::Compound(fields) = &mut biome_chunk.value else {
+                        unreachable!()
+                    };
+                    for (key, value) in fields.iter_mut() {
+                        if key.matches("xPos") {
+                            *value = Tag::Int(x);
+                        }
+                        if key.matches("zPos") {
+                            *value = Tag::Int(z);
+                        }
+                        if key.matches("Status") {
+                            *value = Tag::String("minecraft:biomes".into());
+                        }
+                        if key.matches("structures") {
+                            *value = Tag::Compound(vec![
+                                ("starts".into(), Tag::Compound(vec![])),
+                                ("References".into(), Tag::Compound(vec![])),
+                            ]);
+                        }
+                        if key.matches("sections") {
+                            let Tag::List { values, .. } = value else {
+                                unreachable!()
+                            };
+                            for section in values {
+                                let Tag::Compound(section) = section else {
+                                    unreachable!()
+                                };
+                                for (key, value) in section {
+                                    if key.matches("block_states") {
+                                        *value = Tag::Compound(vec![(
+                                            "palette".into(),
+                                            Tag::List {
+                                                element_type: TagType::String,
+                                                values: vec![Tag::String("minecraft:air".into())],
+                                            },
+                                        )]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    fields.retain(|(key, _)| {
+                        !key.matches("Heightmaps") && !key.matches("PostProcessing")
+                    });
+                    let bytes = native_persistence::nbt::write(&biome_chunk)?;
+                    let offset = file.seek(SeekFrom::End(0))?;
+                    let sectors = (bytes.len() + 5).div_ceil(4096);
+                    ensure!(
+                        sectors < 256 && offset % 4096 == 0 && offset / 4096 < (1 << 24),
+                        "invalid test region offset"
+                    );
+                    file.write_all(&(u32::try_from(bytes.len() + 1)?).to_be_bytes())?;
+                    file.write_all(&[3])?;
+                    file.write_all(&bytes)?;
+                    file.write_all(&vec![0; sectors * 4096 - bytes.len() - 5])?;
+                    file.seek(SeekFrom::Start(((x + z * 32) * 4) as u64))?;
+                    file.write_all(
+                        &(((offset / 4096) as u32) << 8 | sectors as u32).to_be_bytes(),
+                    )?;
+                }
+            }
             file.flush()?;
             drop(file);
             let dimension = DimensionId::parse(name)?;
@@ -1346,6 +1720,33 @@ mod tests {
             assert_eq!(result.chunk_position(), [3, 0]);
             assert_eq!(result.materials(), expected.materials());
             assert_eq!(result.fluid_updates(), expected.fluid_updates());
+            let target = ChunkPos { x: 3, z: 3 };
+            let mut restored_evaluator = native_resources::density::DensityEvaluator::default();
+            restored_evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
+            let resumed = actual.generate_saved_terrain(target, &[], &mut restored_evaluator)?;
+            assert_eq!(resumed.chunk_position, [3, 3]);
+            assert_eq!(resumed.states.len(), lighting.height as usize * 256);
+            assert!(resumed.carver_postprocessing.is_some());
+            let repeated = actual.generate_saved_terrain(target, &[], &mut restored_evaluator)?;
+            assert_eq!(repeated.states, resumed.states, "{name} cached terrain");
+            assert_eq!(
+                repeated.fluid_updates, resumed.fluid_updates,
+                "{name} cached fluid marks"
+            );
+            assert!(Arc::ptr_eq(
+                &previous,
+                restored_evaluator.structure_terrain_context().unwrap()
+            ));
+            assert!(
+                actual
+                    .generate_saved_terrain(position, &[], &mut restored_evaluator)
+                    .is_err()
+            );
+            assert!(
+                actual
+                    .generate_saved_terrain(clean_target, &[], &mut restored_evaluator)
+                    .is_err()
+            );
             let restored = actual.restore_saved_biomes([position])?;
             let chunk = &restored[&native_world::loaded::ChunkPos { x: 0, z: 0 }];
             let mut neighborhood = actual.generator.biome_neighborhood()?;
@@ -1446,6 +1847,50 @@ mod tests {
                 lighting.min_y,
                 lighting.height,
             )?;
+            let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
+            let saved_neighbors = actual.restore_saved_biomes(positions)?;
+            let mut expected_biomes = reference.biome_neighborhood()?;
+            for biome in saved_neighbors.into_values() {
+                expected_biomes.insert(biome)?;
+            }
+            let blocks = reference_resources.vanilla_block_ids()?;
+            let tags = CarverBlockTags::load(&mut reference_resources, &blocks)?;
+            let registry = reference_resources.vanilla_generated_block_registry()?;
+            let classify = |value: &Value| -> Result<CarverBlockState> {
+                let state = resolve_generated_terrain_state(value, &registry)?;
+                Ok(CarverBlockState {
+                    is_air: matches!(
+                        state.name.as_str(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    ),
+                    has_fluid: FluidState::from_block(&state)
+                        .map_err(anyhow::Error::msg)?
+                        .is_some(),
+                })
+            };
+            let structure = Arc::new(actual.restore_saved_beardifier(target, &[])?);
+            let expected_terrain = reference.generate_carved_surface_with_structure_context(
+                &mut reference_resources,
+                &mut native_resources::density::DensityEvaluator::default(),
+                &mut native_resources::carver::schedule::CarverCache::default(),
+                [target.x, target.z],
+                &expected_biomes,
+                &tags,
+                structure,
+                classify,
+            )?;
+            assert_eq!(
+                resumed.states, expected_terrain.states,
+                "{name} saved terrain"
+            );
+            assert_eq!(
+                resumed.fluid_updates, expected_terrain.fluid_updates,
+                "{name} saved fluid marks"
+            );
+            assert_eq!(
+                resumed.carver_postprocessing, expected_terrain.carver_postprocessing,
+                "{name} saved postprocessing"
+            );
             assert_eq!(
                 actual.generator.sea_level(),
                 reference.sea_level(),
@@ -1535,17 +1980,42 @@ mod tests {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
         gzip.write_all(&native_persistence::nbt::write(&updated_level)?)?;
         std::fs::write(root.join("level.dat"), gzip.finish()?)?;
-        let context = reader.capture_generation_context([ChunkPos { x: 0, z: 0 }])?;
+        let positions = (2..=4).flat_map(|z| (2..=4).map(move |x| ChunkPos { x, z }));
+        let context = reader.capture_generation_context(positions)?;
         assert_eq!(context.selection().enabled, ["vanilla", "file/custom"]);
         std::fs::write(
             &dimension_file,
             serde_json::to_vec(&custom_stem("minecraft:plains"))?,
         )?;
-        let actual = prepare_existing_generator(context, &game)?;
+        let mut actual = prepare_existing_generator(context, &game)?;
         assert!(!actual.generate_structures);
         assert_eq!(
             actual.generator.possible_biomes(),
             &BTreeSet::from([ResourceId::parse("minecraft:desert")?])
+        );
+        let previous = Arc::new(native_core::beardifier::Beardifier::new(
+            vec![],
+            vec![],
+            None,
+        ));
+        let mut evaluator = native_resources::density::DensityEvaluator::default();
+        evaluator.replace_structure_terrain_context(Some(Arc::clone(&previous)));
+        let resumed =
+            actual.generate_saved_terrain(ChunkPos { x: 3, z: 3 }, &[], &mut evaluator)?;
+        assert_eq!(resumed.chunk_position, [3, 3]);
+        assert!(resumed.carver_postprocessing.is_some());
+        assert!(Arc::ptr_eq(
+            &previous,
+            evaluator.structure_terrain_context().unwrap()
+        ));
+        assert!(
+            actual
+                .generate_saved_terrain(
+                    ChunkPos { x: 3, z: 3 },
+                    &[ResourceId::parse("minecraft:buried_treasure")?],
+                    &mut evaluator
+                )
+                .is_err()
         );
         Ok(())
     }

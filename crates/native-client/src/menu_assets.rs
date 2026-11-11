@@ -109,6 +109,7 @@ pub struct LanguageInfo {
 }
 
 pub struct HudSprites {
+    pub crosshair_attack_full: GuiSprite,
     pub crosshair_attack_background: GuiSprite,
     pub crosshair_attack_progress: GuiSprite,
     pub hotbar_attack_background: GuiSprite,
@@ -174,6 +175,7 @@ impl HudSprites {
             )
         };
         Ok(Self {
+            crosshair_attack_full: sprite("crosshair_attack_indicator_full")?,
             crosshair_attack_background: sprite("crosshair_attack_indicator_background")?,
             crosshair_attack_progress: sprite("crosshair_attack_indicator_progress")?,
             hotbar_attack_background: sprite("hotbar_attack_indicator_background")?,

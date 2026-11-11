@@ -13,11 +13,29 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Display {
     width: Option<u8>,
+    full: bool,
     mode: AttackIndicator,
+}
+
+/// A living target already selected by the game's crosshair picker.
+#[derive(Clone, Copy, Debug)]
+pub struct LivingTarget {
+    pub alive: bool,
+    pub within_item_range: bool,
+    pub attack_delay: f32,
 }
 
 impl Display {
     pub fn new(strength: Option<f32>, mode: GameMode, setting: AttackIndicator) -> Self {
+        Self::with_target(strength, mode, setting, None)
+    }
+
+    pub fn with_target(
+        strength: Option<f32>,
+        mode: GameMode,
+        setting: AttackIndicator,
+        target: Option<LivingTarget>,
+    ) -> Self {
         Self {
             width: strength
                 .filter(|strength| strength.is_finite() && *strength < 1.0)
@@ -26,6 +44,12 @@ impl Display {
                 .map(|strength| match setting {
                     AttackIndicator::Hotbar => ((strength.clamp(0.0, 1.0) * 19.0) as u8).min(18),
                     _ => ((strength.clamp(0.0, 1.0) * 17.0) as u8).min(16),
+                }),
+            full: setting == AttackIndicator::Crosshair
+                && mode != GameMode::Spectator
+                && strength.is_some_and(|strength| strength.is_finite() && strength >= 1.0)
+                && target.is_some_and(|target| {
+                    target.alive && target.within_item_range && target.attack_delay > 5.0
                 }),
             mode: setting,
         }
@@ -42,7 +66,7 @@ pub fn scissor(
     let left = (i64::from(size.0 / 2) - 8) * scale;
     let top = (i64::from(size.1 / 2) + 9) * scale;
     let right = (left + 16 * scale).clamp(0, i64::from(framebuffer.0));
-    let bottom = (top + 4 * scale).clamp(0, i64::from(framebuffer.1));
+    let bottom = (top + 16 * scale).clamp(0, i64::from(framebuffer.1));
     let left = left.clamp(0, i64::from(framebuffer.0));
     let top = top.clamp(0, i64::from(framebuffer.1));
     (right > left && bottom > top).then_some((
@@ -62,6 +86,17 @@ pub fn crosshair_layers(
 ) -> Option<(Canvas, Canvas)> {
     if display.mode != AttackIndicator::Crosshair {
         return None;
+    }
+    if display.full {
+        let mut background = Canvas::new(size.0, size.1);
+        let x = background.width / 2 - 8;
+        let y = background.height / 2 + 9;
+        background.gui_sprite(
+            &sprites.crosshair_attack_full.image,
+            Rect { x, y, w: 16, h: 16 },
+            sprites.crosshair_attack_full.scaling,
+        );
+        return Some((background, Canvas::new(size.0, size.1)));
     }
     layers(
         size,
@@ -214,10 +249,79 @@ mod tests {
     }
 
     #[test]
+    fn full_indicator_requires_a_live_target_delay_and_item_reach() {
+        let target = LivingTarget {
+            alive: true,
+            within_item_range: true,
+            attack_delay: 5.01,
+        };
+        let show = |strength, mode, setting, target| {
+            Display::with_target(strength, mode, setting, target).full
+        };
+        assert!(show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(target)
+        ));
+        assert!(!show(
+            Some(0.999),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(target)
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            None
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(LivingTarget {
+                alive: false,
+                ..target
+            })
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(LivingTarget {
+                within_item_range: false,
+                ..target
+            })
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(LivingTarget {
+                attack_delay: 5.0,
+                ..target
+            })
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Spectator,
+            AttackIndicator::Crosshair,
+            Some(target)
+        ));
+        assert!(!show(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Hotbar,
+            Some(target)
+        ));
+    }
+
+    #[test]
     fn scissor_uses_gui_scale_and_clips_to_the_framebuffer() {
         assert_eq!(
             scissor((427, 240), 3, (1280, 720)),
-            Some((615, 387, 48, 12))
+            Some((615, 387, 48, 48))
         );
         assert_eq!(scissor((8, 4), 1, (8, 4)), None);
         assert_eq!(scissor((10, 20), 1, (10, 20)), Some((0, 19, 10, 1)));
@@ -308,7 +412,7 @@ mod tests {
             .arg("AttackIndicatorHudOracle")
             .arg(&output));
         let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(rows.len(), 36);
         for row in rows {
             let width = row["w"].as_i64().unwrap() as i32;
@@ -336,6 +440,73 @@ mod tests {
                     rect.y + 18 - height,
                     18,
                     height
+                ]));
+            }
+            assert_eq!(serde_json::json!(expected), row["draws"], "{row}");
+        }
+
+        let source = temp.path().join("CrosshairAttackHudOracle.java");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/CrosshairAttackHudOracle.java"),
+        )
+        .unwrap();
+        run(Command::new(java.join("javac.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg(&source));
+        run(Command::new(java.join("java.exe"))
+            .arg("-classpath")
+            .arg(&classpath)
+            .arg("CrosshairAttackHudOracle")
+            .arg(&output));
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 192);
+        for row in rows {
+            let width = row["w"].as_i64().unwrap() as i32;
+            let height = row["h"].as_i64().unwrap() as i32;
+            let strength = row["charge"].as_f64().unwrap() as f32;
+            let selected = row["selected"].as_bool().unwrap();
+            let target = selected.then_some(LivingTarget {
+                alive: row["alive"].as_bool().unwrap(),
+                within_item_range: row["reach"].as_i64().unwrap() != 2,
+                attack_delay: row["delay"].as_f64().unwrap() as f32,
+            });
+            let display = Display::with_target(
+                Some(strength),
+                GameMode::Survival,
+                AttackIndicator::Crosshair,
+                target,
+            );
+            let (x, y) = (width / 2 - 8, height / 2 + 9);
+            let mut expected = Vec::new();
+            if display.full {
+                expected.push(serde_json::json!([
+                    "hud/crosshair_attack_indicator_full",
+                    x,
+                    y,
+                    16,
+                    16
+                ]));
+            } else if let Some(progress) = display.width {
+                expected.push(serde_json::json!([
+                    "hud/crosshair_attack_indicator_background",
+                    x,
+                    y,
+                    16,
+                    4
+                ]));
+                expected.push(serde_json::json!([
+                    "hud/crosshair_attack_indicator_progress",
+                    16,
+                    4,
+                    0,
+                    0,
+                    x,
+                    y,
+                    progress,
+                    4
                 ]));
             }
             assert_eq!(serde_json::json!(expected), row["draws"], "{row}");
@@ -379,6 +550,9 @@ mod tests {
             .path()
             .join("assets/minecraft/textures/gui/sprites/hud");
         std::fs::create_dir_all(&dir).unwrap();
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([12, 34, 56, 255]))
+            .save(dir.join("crosshair_attack_indicator_full.png"))
+            .unwrap();
         image::RgbaImage::from_pixel(16, 4, image::Rgba([20, 30, 40, 255]))
             .save(dir.join("crosshair_attack_indicator_background.png"))
             .unwrap();
@@ -403,6 +577,20 @@ mod tests {
         .unwrap();
         let assets =
             crate::menu_assets::MenuAssets::load(&game, &[pack.path().to_path_buf()]).unwrap();
+        let display = Display::with_target(
+            Some(1.0),
+            GameMode::Survival,
+            AttackIndicator::Crosshair,
+            Some(LivingTarget {
+                alive: true,
+                within_item_range: true,
+                attack_delay: 6.0,
+            }),
+        );
+        let (full, empty) = crosshair_layers((426, 240), &assets.hud, display).unwrap();
+        assert_eq!(full.pixels[(144 * 426 + 220) as usize], 0xff0c_2238);
+        assert_eq!(full.pixels[(145 * 426 + 220) as usize], 0);
+        assert!(empty.pixels.iter().all(|pixel| *pixel == 0));
         let (background, progress) = crosshair_layers(
             (426, 240),
             &assets.hud,

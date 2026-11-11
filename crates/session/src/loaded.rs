@@ -16021,12 +16021,7 @@ impl LoadedSession {
             if button_support_face(&replacement_state, offset) != Some(true) {
                 if !notify
                     || button_support_face(&replacement_state, offset) != Some(false)
-                    || (self.block_drops
-                        && !self.dropped_items.can_drop_block_without_entity(
-                            &ladder.name,
-                            &ladder.properties,
-                            self.loot.as_deref(),
-                        ))
+                    || !self.can_drop_ladder(ladder)
                     || !self.ladder_cascade_safe(neighbor)
                 {
                     return None;
@@ -16073,13 +16068,7 @@ impl LoadedSession {
                 else {
                     continue;
                 };
-                if self.block_drops
-                    && !self.dropped_items.can_drop_block_without_entity(
-                        &ladder.name,
-                        &ladder.properties,
-                        self.loot.as_deref(),
-                    )
-                {
+                if !self.can_drop_ladder(ladder) {
                     return false;
                 }
                 pending.push(neighbor);
@@ -19394,21 +19383,25 @@ impl LoadedSession {
                     else {
                         continue;
                     };
-                    if self.block_drops
-                        && self
-                            .dropped_items
-                            .drop_block_without_entity(
-                                absolute,
-                                &block.name,
-                                &block.properties,
-                                true,
-                                self.loot.as_deref(),
-                            )
-                            .is_err()
-                    {
+                    let Ok((drops, _)) = self.stage_block_loot_without_entity(&block) else {
                         continue;
+                    };
+                    self.dropped_items.drop_block_resources(
+                        absolute,
+                        drops,
+                        None,
+                        self.block_drops,
+                        &mut self.level_random,
+                    );
+                    if self.apply_block_set(neighbor, replacement, true, checked) {
+                        self.dispatch_vibration(
+                            "minecraft:block_destroy",
+                            absolute.as_dvec3() + DVec3::splat(0.5),
+                            None,
+                            None,
+                            Some(&block.name),
+                        );
                     }
-                    self.apply_block_set(neighbor, replacement, true, checked);
                     continue;
                 }
                 if wet && survives == Some(true) {
@@ -19600,6 +19593,51 @@ impl LoadedSession {
         block: &BlockState,
     ) -> anyhow::Result<(Vec<native_resources::loot::Drop>, BlockLootCheckpoint)> {
         self.stage_block_loot(block, None, false)
+    }
+
+    /// Check the entire table and its current random stream before a support
+    /// change can trigger a chain of ladder removals.
+    fn can_drop_ladder(&self, block: &BlockState) -> bool {
+        let Some(tables) = self.loot.as_ref() else {
+            return false;
+        };
+        let tool = native_resources::loot::BasicTool {
+            item: None,
+            count: 0,
+            enchantments: &[],
+        };
+        if !tables.fully_supported_player_block_for_tool(&block.name, tool) {
+            return false;
+        }
+        match tables.random_sequence_for_block(&block.name) {
+            Ok(Some(id)) => {
+                let Some(sequences) = &self.random_sequences else {
+                    return false;
+                };
+                let name = format!("{}:{}", id.namespace, id.path);
+                let Ok(mut random) = sequences.data.get(&name, sequences.world_seed) else {
+                    return false;
+                };
+                tables
+                    .drops_without_entity_at(
+                        &block.name,
+                        Some(&block.properties),
+                        Some(&mut random),
+                    )
+                    .is_ok()
+            }
+            Ok(None) => {
+                let mut random = self.level_random.clone();
+                tables
+                    .drops_without_entity_at(
+                        &block.name,
+                        Some(&block.properties),
+                        Some(&mut random),
+                    )
+                    .is_ok()
+            }
+            Err(_) => false,
+        }
     }
 
     fn stage_block_loot(
@@ -26719,10 +26757,26 @@ pub(crate) mod tests {
         }
     }
 
+    fn test_ladder_loot() -> Arc<BlockLootTables> {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/blocks/ladder.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder"}]}]}"#.to_vec()))
+            }
+        }
+        Arc::new(BlockLootTables::load(&mut Loot).unwrap())
+    }
+
     #[test]
     fn ladders_drop_from_removed_support_and_preserve_water() {
+        let loot = test_ladder_loot();
         for water in [false, true] {
             let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
             session.set_block_drops(false);
             let support = IVec3::new(8, 2, 6);
             let target = support + IVec3::X;
@@ -26748,6 +26802,242 @@ pub(crate) mod tests {
                     "minecraft:air"
                 }
             );
+        }
+    }
+
+    #[test]
+    fn ladder_support_loss_uses_named_loot_and_level_random_with_either_drop_rule() {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(path.ends_with("/blocks/ladder.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:ladder","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:ladder","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
+            }
+        }
+        let loot = Arc::new(BlockLootTables::load(&mut Loot).unwrap());
+        for enabled in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&loot));
+            session.set_block_drops(enabled);
+            session.level_random = native_core::random::LegacyRandom::new(541);
+            let support = IVec3::new(8, 2, 6);
+            let pos = support + IVec3::X;
+            let ladder = session.intern_block(state(
+                "minecraft:ladder",
+                &[("facing", "east"), ("waterlogged", "true")],
+            ));
+            assert!(session.set(pos, ladder));
+            assert!(!session.set(support, session.states[0]));
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            let before = session
+                .random_sequences
+                .as_ref()
+                .unwrap()
+                .data
+                .get("example:ladder", 42)
+                .unwrap()
+                .state();
+            let mut expected_level = session.level_random.clone();
+            let absolute = session.origin + pos;
+            let expected_position = DVec3::new(
+                f64::from(absolute.x) + 0.25 + expected_level.next_double() * 0.5,
+                f64::from(absolute.y) + 0.125 + expected_level.next_double() * 0.5,
+                f64::from(absolute.z) + 0.25 + expected_level.next_double() * 0.5,
+            );
+            assert!(session.set(support, session.states[0]));
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:water"
+            );
+            assert_ne!(
+                before,
+                session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("example:ladder", 42)
+                    .unwrap()
+                    .state()
+            );
+            assert_eq!(session.level_random.next_int(), expected_level.next_int());
+            let items = session.dropped_items.snapshot();
+            assert_eq!(items.len(), usize::from(enabled));
+            if enabled {
+                assert_eq!(items[0].stack.id(), "minecraft:ladder");
+                assert_eq!(items[0].position, expected_position);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn ladder_support_drops_match_java_loot_and_random_streams() {
+        use native_resources::packs::{ResourceProvider, ResourceStack};
+        use std::{path::PathBuf, process::Command};
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = vec![version.join("26.3.jar"), temp.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let cp = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = temp.path().join("LadderDropLootOracle.java");
+        let input = temp.path().join("ladder.json");
+        let output = temp.path().join("output.json");
+        std::fs::write(
+            &source,
+            include_str!("../tests/java/LadderDropLootOracle.java"),
+        )
+        .unwrap();
+        let mut resources = ResourceStack::open(&game).unwrap();
+        std::fs::write(
+            &input,
+            resources
+                .read_builtin_data("data/minecraft/loot_table/blocks/ladder.json")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let compile = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&cp)
+            .arg("LadderDropLootOracle")
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(rows.len(), 40);
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for group in rows.chunks_exact(8) {
+            let seed = group[0]["seed"].as_i64().unwrap();
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session
+                .set_random_sequences(
+                    seed,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            let support = IVec3::new(8, 2, 6);
+            let pos = support + IVec3::X;
+            let absolute = session.origin + pos;
+            let support_absolute = session.origin + support;
+            let stone = session.states[3];
+            for (step, row) in group.iter().enumerate() {
+                assert_eq!(row["step"].as_u64().unwrap() as usize, step);
+                let wet = step % 2 == 0;
+                let enabled = step % 3 != 0;
+                session.set_block_drops(enabled);
+                let ladder = session.intern_block(state(
+                    "minecraft:ladder",
+                    &[
+                        ("facing", "east"),
+                        ("waterlogged", if wet { "true" } else { "false" }),
+                    ],
+                ));
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(
+                        support_absolute.x,
+                        support_absolute.y,
+                        support_absolute.z,
+                        stone,
+                    )
+                    .unwrap();
+                Arc::make_mut(&mut session.world)
+                    .set_block_id(absolute.x, absolute.y, absolute.z, ladder)
+                    .unwrap();
+                let previous = session.dropped_items.snapshot().len();
+                assert!(
+                    session.set(support, session.states[0]),
+                    "seed {seed} step {step}"
+                );
+                let actual: Vec<_> = session.dropped_items.snapshot()[previous..]
+                    .iter()
+                    .map(|item| serde_json::json!([item.stack.id(), item.stack.count()]))
+                    .collect();
+                let expected = if enabled {
+                    row["drops"].as_array().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(actual, expected, "seed {seed} step {step}");
+                assert_eq!(
+                    session
+                        .world
+                        .block(absolute.x, absolute.y, absolute.z)
+                        .unwrap()
+                        .name,
+                    if wet {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:air"
+                    }
+                );
+                assert_eq!(
+                    session.level_random.clone().next_double().to_bits(),
+                    row["levelNext"].as_f64().unwrap().to_bits(),
+                    "seed {seed} step {step}"
+                );
+                let mut random = session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("minecraft:blocks/ladder", seed)
+                    .unwrap();
+                assert_eq!(
+                    random.next_long(),
+                    row["next"].as_i64().unwrap(),
+                    "seed {seed} step {step}"
+                );
+            }
         }
     }
 
@@ -26782,6 +27072,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ladder_neighbor_updates_cover_each_facing_and_changed_side() {
+        let loot = test_ladder_loot();
         let horizontal = [
             ("north", IVec3::Z),
             ("south", IVec3::NEG_Z),
@@ -26801,6 +27092,7 @@ pub(crate) mod tests {
                 for supported in [false, true] {
                     for changed in changes {
                         let mut session = session();
+                        session.set_block_loot(Arc::clone(&loot));
                         session.set_block_drops(false);
                         let pos = IVec3::new(8, 5, 8);
                         if supported {

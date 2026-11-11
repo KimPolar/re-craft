@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::packs::{ResourceId, ResourceProvider};
 
-const BASIC_BLOCKS: [&str; 61] = [
+const BASIC_BLOCKS: [&str; 62] = [
     "grass_block",
     "dirt",
     "sand",
@@ -33,6 +33,7 @@ const BASIC_BLOCKS: [&str; 61] = [
     "lodestone",
     "redstone_lamp",
     "lever",
+    "ladder",
     "coal_ore",
     "deepslate_coal_ore",
     "iron_ore",

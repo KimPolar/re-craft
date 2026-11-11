@@ -303,7 +303,7 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         1,
     )?;
     let directory = tempfile::tempdir()?;
-    let stage = ready.stage_structure_initial_world(directory.path(), 123, 1)?;
+    let mut stage = ready.stage_structure_initial_world(directory.path(), 123, 1)?;
     let dimension = native_persistence::world::DimensionId::parse("minecraft:overworld")?;
     fn copy_metadata(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(target)?;
@@ -384,6 +384,17 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     );
     ensure!(positions.contains(&position), "player chunk is not saved");
     let mut reader = native_persistence::world::WorldReader::open(stage.path(), dimension.clone())?;
+    let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+    let defaults = crate::vanilla_world_block_defaults(&mut resources)?;
+    let materialize = |position, chunk: native_persistence::world::LoadedChunk| {
+        native_persistence::world::ChunkArea {
+            center: position,
+            radius: 0,
+            chunks: BTreeMap::from([(position, Arc::new(chunk))]),
+            missing: Vec::new(),
+        }
+        .materialize_with_defaults(&dimension, &defaults)
+    };
     let mut session_entity_chunks = 0usize;
     for &pos in session_targets.iter() {
         let staged_entities = reader.read_entity_chunk(pos.x, pos.z)?;
@@ -414,6 +425,82 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
         }
     }
     eprintln!("Matched {session_entity_chunks} nonempty entity chunks in the initial session");
+    // The initial player area does not necessarily contain generated entities.
+    // Import a real nonempty staged chunk before the first tick and check that
+    // its entity and POI documents remain intact alongside its terrain.
+    let entity_position = *entity_positions
+        .iter()
+        .next()
+        .context("no generated entity chunk")?;
+    let session_position = native_world::loaded::ChunkPos {
+        x: entity_position.x,
+        z: entity_position.z,
+    };
+    let saved_entities = reader
+        .read_entity_chunk(entity_position.x, entity_position.z)?
+        .context("generated entity chunk missing")?;
+    let saved_entity_document = Arc::clone(&saved_entities.document);
+    let session = &mut stage.initial.session;
+    if !session.initial_spawn_chunk_loaded(session_position) {
+        let chunk = reader
+            .read_chunk(entity_position.x, entity_position.z)?
+            .context("generated entity terrain missing")?;
+        let world = materialize(entity_position, chunk)?;
+        let poi = match reader.read_poi_chunk(entity_position.x, entity_position.z)? {
+            Some(chunk) => native_session::loaded::SavedPoiData::Present(Arc::new(chunk)),
+            None => native_session::loaded::SavedPoiData::Missing,
+        };
+        let expected_poi = match &poi {
+            native_session::loaded::SavedPoiData::Present(chunk) => {
+                Some(Arc::clone(&chunk.document))
+            }
+            native_session::loaded::SavedPoiData::Missing => None,
+            native_session::loaded::SavedPoiData::Unavailable => unreachable!(),
+        };
+        session.import_initial_spawn_chunk(
+            session_position,
+            world,
+            native_session::loaded::SavedEntityData::Present(Arc::new(saved_entities)),
+            poi,
+            None,
+        )?;
+        match (session.saved_poi_chunk(session_position), expected_poi) {
+            (Some(native_session::loaded::SavedPoiData::Present(chunk)), Some(document)) => {
+                ensure!(chunk.document == document, "imported POI differs")
+            }
+            (Some(native_session::loaded::SavedPoiData::Missing), None) => {}
+            _ => anyhow::bail!("imported POI is unavailable"),
+        }
+    } else {
+        match session.saved_entity_chunk(session_position) {
+            Some(native_session::loaded::SavedEntityData::Present(chunk)) => {
+                ensure!(
+                    chunk.document == saved_entity_document,
+                    "loaded generated entities differ"
+                );
+            }
+            None | Some(native_session::loaded::SavedEntityData::Unavailable) => {
+                session.set_initial_entity_chunk(
+                    session_position,
+                    native_session::loaded::SavedEntityData::Present(Arc::new(saved_entities)),
+                )?;
+            }
+            Some(native_session::loaded::SavedEntityData::Empty) => {
+                anyhow::bail!("generated entities were marked empty")
+            }
+        }
+    }
+    match session.saved_entity_chunk(session_position) {
+        Some(native_session::loaded::SavedEntityData::Present(chunk)) => ensure!(
+            chunk.document == saved_entity_document,
+            "imported generated entities differ"
+        ),
+        _ => anyhow::bail!("generated entities were not retained"),
+    }
+    eprintln!(
+        "Imported generated entity chunk {}, {} before the first tick",
+        entity_position.x, entity_position.z
+    );
     let mut before_chunks = BTreeMap::new();
     for &pos in &positions {
         let chunk = reader
@@ -438,17 +525,6 @@ fn generated_world_round_trips_through_java(seed: i64) -> Result<()> {
     let player = reader.read_player()?.context("player data missing")?;
     let clocks = reader.world_clocks()?;
     drop(reader);
-    let mut resources = native_resources::packs::ResourceStack::open(&game)?;
-    let defaults = crate::vanilla_world_block_defaults(&mut resources)?;
-    let materialize = |position, chunk: native_persistence::world::LoadedChunk| {
-        native_persistence::world::ChunkArea {
-            center: position,
-            radius: 0,
-            chunks: BTreeMap::from([(position, Arc::new(chunk))]),
-            missing: Vec::new(),
-        }
-        .materialize_with_defaults(&dimension, &defaults)
-    };
     let version = game.join("versions/26.3");
     let manifest: Value = serde_json::from_slice(&std::fs::read(version.join("26.3.json"))?)?;
     let oracle = tempfile::tempdir()?;

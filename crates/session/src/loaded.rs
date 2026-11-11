@@ -169,6 +169,13 @@ pub struct GenerationTerrainGuard {
     chunks: BTreeMap<ChunkPos, GuardedTerrainChunk>,
 }
 
+/// POI inputs observed in one session. Disk and data-pack snapshots still
+/// need their own validation before generated results can be applied.
+pub struct GenerationPoiGuard {
+    session: Arc<()>,
+    chunks: BTreeMap<ChunkPos, Option<SavedPoiData>>,
+}
+
 fn matching_terrain_chunks(
     first: &World,
     a: &native_world::loaded::Chunk,
@@ -5715,6 +5722,77 @@ impl LoadedSession {
                     && expected.fluid_ticks == current.fluid_ticks,
                 "live generation terrain changed at {position:?}"
             );
+        }
+        Ok(())
+    }
+
+    /// Compare captured disk POIs with every resident source chunk. Missing
+    /// resident POI state and pending or unsaved changes are not assumed empty.
+    pub fn capture_generation_poi(
+        &self,
+        source: &BTreeMap<ChunkPos, Option<Arc<native_persistence::nbt::NamedTag>>>,
+    ) -> anyhow::Result<GenerationPoiGuard> {
+        anyhow::ensure!(!source.is_empty(), "no generation POI inputs");
+        let pending = self.generation_terrain_pending();
+        let mut chunks = BTreeMap::new();
+        for (&position, expected) in source {
+            anyhow::ensure!(
+                !self.has_unsaved_chunk_changes(position)
+                    && !self.poi_edits.contains_key(&position)
+                    && !pending.contains(&position),
+                "generation POI has unsaved or pending changes at {position:?}"
+            );
+            let live = self.poi_chunks.get(&position).cloned();
+            match (&live, expected) {
+                (Some(SavedPoiData::Missing), None) => {}
+                (Some(SavedPoiData::Present(actual)), Some(expected)) => {
+                    anyhow::ensure!(
+                        actual.document.as_ref() == expected.as_ref(),
+                        "live POI differs from captured input at {position:?}"
+                    );
+                }
+                (None, _)
+                    if !self.world.chunks.contains_key(&position)
+                        && !self.parked_chunks.contains_key(&position) => {}
+                _ => anyhow::bail!(
+                    "live POI is unavailable or differs from captured input at {position:?}"
+                ),
+            }
+            chunks.insert(position, live);
+        }
+        Ok(GenerationPoiGuard {
+            session: Arc::clone(&self.generation_identity),
+            chunks,
+        })
+    }
+
+    /// Recheck on the simulation thread and keep exclusive session access
+    /// through the operation that installs the generated result.
+    pub fn verify_generation_poi(&self, guard: &GenerationPoiGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.generation_identity, &guard.session),
+            "generation POI belongs to another session"
+        );
+        let pending = self.generation_terrain_pending();
+        for (&position, expected) in &guard.chunks {
+            anyhow::ensure!(
+                !self.has_unsaved_chunk_changes(position)
+                    && !self.poi_edits.contains_key(&position)
+                    && !pending.contains(&position),
+                "generation POI acquired unsaved or pending changes at {position:?}"
+            );
+            let same = match (expected, self.poi_chunks.get(&position)) {
+                (None, None) => {
+                    !self.world.chunks.contains_key(&position)
+                        && !self.parked_chunks.contains_key(&position)
+                }
+                (Some(SavedPoiData::Missing), Some(SavedPoiData::Missing)) => true,
+                (Some(SavedPoiData::Present(a)), Some(SavedPoiData::Present(b))) => {
+                    Arc::ptr_eq(a, b)
+                }
+                _ => false,
+            };
+            anyhow::ensure!(same, "live generation POI changed at {position:?}");
         }
         Ok(())
     }
@@ -27865,6 +27943,72 @@ pub(crate) mod tests {
             .set_block_id(origin.x, 0, origin.z, stone)
             .unwrap();
         assert!(live.verify_generation_terrain(&guard).is_err());
+    }
+
+    #[test]
+    fn generation_poi_guard_checks_live_sidecars_and_pending_updates() {
+        use native_persistence::nbt::{NamedTag, Tag};
+        let (world, origin, player) = fixture();
+        let bounds = BuildBounds {
+            min_y: 0,
+            max_y: 32,
+        };
+        let pos = ChunkPos {
+            x: 1_000_000,
+            z: -1_000_000,
+        };
+        let absent = ChunkPos {
+            x: pos.x + 1,
+            z: pos.z,
+        };
+        let mut session = LoadedSession::new(world.clone(), origin, bounds, player).unwrap();
+        let sources = BTreeMap::from([(pos, None), (absent, None)]);
+        assert!(session.capture_generation_poi(&BTreeMap::new()).is_err());
+        assert!(session.capture_generation_poi(&sources).is_err());
+        session
+            .set_initial_poi_chunk(pos, SavedPoiData::Missing)
+            .unwrap();
+        let guard = session.capture_generation_poi(&sources).unwrap();
+        session.verify_generation_poi(&guard).unwrap();
+        let other = LoadedSession::new(world, origin, bounds, player).unwrap();
+        assert!(other.verify_generation_poi(&guard).is_err());
+        session.queue_poi_chunk(pos, SavedPoiData::Missing);
+        assert!(session.verify_generation_poi(&guard).is_err());
+        session.incoming.clear();
+        session.poi_edits.insert(pos, Vec::new());
+        assert!(session.verify_generation_poi(&guard).is_err());
+        session.poi_edits.remove(&pos);
+        session.verify_generation_poi(&guard).unwrap();
+
+        let document = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                (
+                    "DataVersion".into(),
+                    Tag::Int(native_persistence::world::TARGET_DATA_VERSION),
+                ),
+                ("Sections".into(), Tag::Compound(vec![])),
+            ]),
+        };
+        let saved = native_persistence::world::SavedPoiChunk::from_document(
+            document.clone(),
+            native_persistence::world::ChunkPos { x: pos.x, z: pos.z },
+        )
+        .unwrap();
+        session
+            .poi_chunks
+            .insert(pos, SavedPoiData::Present(Arc::new(saved.clone())));
+        assert!(session.verify_generation_poi(&guard).is_err());
+        assert!(session.capture_generation_poi(&sources).is_err());
+        let captured = BTreeMap::from([(pos, Some(Arc::new(document)))]);
+        let present = session.capture_generation_poi(&captured).unwrap();
+        session.verify_generation_poi(&present).unwrap();
+        session
+            .poi_chunks
+            .insert(pos, SavedPoiData::Present(Arc::new(saved)));
+        assert!(session.verify_generation_poi(&present).is_err());
+        session.poi_chunks.insert(pos, SavedPoiData::Unavailable);
+        assert!(session.capture_generation_poi(&captured).is_err());
     }
 
     fn crop_test_session(position: IVec3, crop: &str, age: u8, light: bool) -> LoadedSession {

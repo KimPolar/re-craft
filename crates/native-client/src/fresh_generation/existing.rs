@@ -191,6 +191,14 @@ pub(crate) struct RestoredSavedTerrain {
     >,
 }
 
+/// Live terrain and POI evidence bound to one captured generator. Other live
+/// state and the captured disk and pack dependencies still need verification.
+pub(crate) struct LiveGenerationInputs {
+    identity: Arc<()>,
+    terrain: native_session::loaded::GenerationTerrainGuard,
+    poi: native_session::loaded::GenerationPoiGuard,
+}
+
 /// One regenerated TERRAIN-stage chunk, tied to the captured source and packs.
 /// It is not a FULL chunk and cannot be installed into a running session yet.
 pub(crate) struct ResumedSavedTerrain {
@@ -3107,6 +3115,58 @@ impl PreparedExistingGenerator {
         )
     }
 
+    /// Bind the POI sidecars from the same disk capture to the live session.
+    /// Terrain, entities, block-entity internals, clocks, packs and disk
+    /// dependencies still require independent validation.
+    pub fn capture_live_poi(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+    ) -> Result<native_session::loaded::GenerationPoiGuard> {
+        let source = self
+            .context
+            .inputs()
+            .sources()
+            .chunks()
+            .iter()
+            .map(|(pos, chunk)| {
+                (
+                    native_world::loaded::ChunkPos { x: pos.x, z: pos.z },
+                    chunk.poi.as_ref().map(|poi| Arc::clone(&poi.document)),
+                )
+            })
+            .collect();
+        session.capture_generation_poi(&source)
+    }
+
+    /// Capture both live dependencies without allowing a guard from a
+    /// different disk capture to be reused for this generator.
+    pub fn capture_live_inputs(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        restored: &RestoredSavedTerrain,
+    ) -> Result<LiveGenerationInputs> {
+        Ok(LiveGenerationInputs {
+            identity: Arc::clone(&self.identity),
+            terrain: self.capture_live_terrain(session, restored)?,
+            poi: self.capture_live_poi(session)?,
+        })
+    }
+
+    /// Verify while retaining exclusive access to the session until the
+    /// corresponding generation result is committed or discarded.
+    pub fn verify_live_inputs(
+        &self,
+        session: &native_session::loaded::LoadedSession,
+        inputs: &LiveGenerationInputs,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.identity, &inputs.identity),
+            "live generation inputs belong to another capture"
+        );
+        session.verify_generation_terrain(&inputs.terrain)?;
+        session.verify_generation_poi(&inputs.poi)
+    }
+
     /// Bind captured disk and pack inputs; live session state and generation
     /// completeness still require independent checks before saving.
     pub fn add_save_dependencies(
@@ -5007,8 +5067,17 @@ mod tests {
             assert!(narrow.capture_live_terrain(&live, &terrain).is_err());
             let guard = narrow.capture_live_terrain(&live, &narrow_terrain)?;
             live.verify_generation_terrain(&guard)?;
+            assert!(narrow.capture_live_poi(&live).is_err());
+            live.set_initial_poi_chunk(key, native_session::loaded::SavedPoiData::Missing)?;
+            let poi_guard = narrow.capture_live_poi(&live)?;
+            live.verify_generation_poi(&poi_guard)?;
+            let live_inputs = narrow.capture_live_inputs(&live, &narrow_terrain)?;
+            narrow.verify_live_inputs(&live, &live_inputs)?;
+            assert!(actual.verify_live_inputs(&live, &live_inputs).is_err());
             live.queue_streamed_chunk(key, None, None, None, None, None);
             assert!(live.verify_generation_terrain(&guard).is_err());
+            assert!(live.verify_generation_poi(&poi_guard).is_err());
+            assert!(narrow.verify_live_inputs(&live, &live_inputs).is_err());
             let mut plan = WorldSavePlan::new();
             actual.add_save_dependencies(&mut plan)?;
             assert!(actual.add_save_dependencies(&mut plan).is_err());

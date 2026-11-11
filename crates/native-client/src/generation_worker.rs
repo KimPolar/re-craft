@@ -780,8 +780,7 @@ impl GenerationReady {
                 .and_then(|processed| processed.initial_bonus_chest.as_ref())
             {
                 ensure!(
-                    drops.operations() == 0
-                        && bonus.level_random.state() == drops.level_random().state(),
+                    bonus.level_random.state() == drops.level_random().state(),
                     "bonus chest and generated drop random streams differ"
                 );
             }
@@ -3137,6 +3136,16 @@ where
         .batch
         .begin_generated_postprocessing(targets.iter().copied(), 0, 0)?;
     stage.set_water_source_conversion(water_source_conversion)?;
+    let uses_drop_checkpoint = if let Some(settings) = &ready.level_settings {
+        stage.set_block_drops(ready.batch.fresh_postprocessing_drops_with_level_random(
+            settings.session.seed,
+            settings.game_rules.block_drops,
+            level_random.clone(),
+        )?)?;
+        true
+    } else {
+        false
+    };
     set_phase(progress, GenerationPhase::Postprocessing);
     for &pos in &targets {
         loop {
@@ -3155,7 +3164,12 @@ where
             return Ok(None);
         }
         let Some(feature) = &feature else { break None };
-        match stage.try_place_initial_bonus_chest(feature, &mut level_random, origin.to_array())? {
+        let attempt = if uses_drop_checkpoint {
+            stage.try_place_initial_bonus_chest_with_drops(feature, origin.to_array())?
+        } else {
+            stage.try_place_initial_bonus_chest(feature, &mut level_random, origin.to_array())?
+        };
+        match attempt {
             InitialBonusChestAttempt::Complete(pos) => break pos.map(IVec3::from_array),
             InitialBonusChestAttempt::NeedsChunk(needed) => {
                 ensure!(
@@ -3241,6 +3255,9 @@ where
         }
     };
     let region = stage.finish()?;
+    if let Some(drops) = region.block_drops() {
+        level_random = drops.level_random().clone();
+    }
     ensure!(
         targets.is_subset(&region.chunks),
         "bonus postprocessing is missing a target"
@@ -3636,6 +3653,11 @@ where
                 .batch
                 .converted_chunk_drafts(&mut draft_stage, converted)?;
             let region = stage.finish()?;
+            if let (Some(bonus), Some(drops)) =
+                (&mut processed.initial_bonus_chest, region.block_drops())
+            {
+                bonus.level_random = drops.level_random().clone();
+            }
             let targets = expanded
                 .mesh
                 .targets
@@ -7499,6 +7521,20 @@ mod tests {
             .postprocessed
             .as_ref()
             .context("bonus postprocessing missing")?;
+        assert_eq!(
+            processed
+                .region
+                .block_drops()
+                .context("bonus drop checkpoint missing")?
+                .level_random()
+                .state(),
+            processed
+                .initial_bonus_chest
+                .as_ref()
+                .unwrap()
+                .level_random
+                .state()
+        );
         let chest = processed
             .initial_bonus_chest_position()
             .flatten()

@@ -1372,6 +1372,20 @@ impl FreshTerrainBatch {
         world_seed: i64,
         enabled: bool,
     ) -> Result<super::postprocessing_drops::GeneratedBlockDrops> {
+        self.fresh_postprocessing_drops_with_level_random(
+            world_seed,
+            enabled,
+            crate::fresh_level_random(),
+        )
+    }
+
+    /// Start the checkpoint with the level stream selected before spawn setup.
+    pub fn fresh_postprocessing_drops_with_level_random(
+        &self,
+        world_seed: i64,
+        enabled: bool,
+        level_random: native_core::random::LegacyRandom,
+    ) -> Result<super::postprocessing_drops::GeneratedBlockDrops> {
         ensure!(
             world_seed == self.generator.seed,
             "generated drop world seed differs"
@@ -1387,7 +1401,7 @@ impl FreshTerrainBatch {
             Arc::clone(&content.block_loot),
             world_seed,
             native_persistence::random_sequences::RandomSequences::read(None)?,
-            crate::fresh_level_random(),
+            level_random,
             native_core::random::XoroshiroRandom::new(i64::from_ne_bytes(entity_seed)),
             enabled,
         ))

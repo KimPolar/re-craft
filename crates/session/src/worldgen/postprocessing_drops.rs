@@ -163,6 +163,9 @@ impl GeneratedBlockDrops {
     pub fn level_random(&self) -> &LegacyRandom {
         &self.level_random
     }
+    pub(super) fn set_level_random(&mut self, random: LegacyRandom) {
+        self.level_random = random;
+    }
     pub fn random_sequences(&self) -> &RandomSequences {
         &self.sequences
     }

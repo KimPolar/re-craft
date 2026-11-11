@@ -414,6 +414,41 @@ impl GeneratedPostprocessing {
         }
     }
 
+    /// Use the postprocessing checkpoint's level stream for bonus placement.
+    /// A missing chunk or unsupported callback leaves the entire stage intact.
+    pub fn try_place_initial_bonus_chest_with_drops(
+        &mut self,
+        feature: &native_resources::bonus_chest::BonusChestFeature,
+        origin: [i32; 3],
+    ) -> Result<InitialBonusChestAttempt> {
+        let drops = self
+            .block_drops
+            .as_ref()
+            .context("block drop checkpoint is missing")?;
+        let operations = drops.operations();
+        let mut random = drops.level_random().clone();
+        let mut attempt = self.clone();
+        match attempt.place_initial_bonus_chest_impl(feature, &mut random, origin) {
+            Ok(pos) => {
+                let drops = attempt
+                    .block_drops
+                    .as_mut()
+                    .context("block drop checkpoint is missing")?;
+                ensure!(
+                    drops.operations() == operations,
+                    "bonus chest callbacks consumed the block drop stream"
+                );
+                drops.set_level_random(random);
+                *self = attempt;
+                Ok(InitialBonusChestAttempt::Complete(pos))
+            }
+            Err(error) => match error.downcast_ref::<MissingPostprocessingChunk>() {
+                Some(missing) => Ok(InitialBonusChestAttempt::NeedsChunk(missing.0)),
+                None => Err(error),
+            },
+        }
+    }
+
     pub(super) fn new(
         world: Arc<World>,
         min_y: i32,
@@ -871,6 +906,21 @@ impl GeneratedPostprocessing {
     /// first player-spawn collision search. Its clone must have independent
     /// state so an unsuccessful attempt cannot advance the original stream.
     pub fn place_initial_bonus_chest<R: native_resources::bonus_chest::BonusChestRandom + Clone>(
+        &mut self,
+        feature: &native_resources::bonus_chest::BonusChestFeature,
+        random: &mut R,
+        origin: [i32; 3],
+    ) -> Result<Option<[i32; 3]>> {
+        ensure!(
+            self.block_drops.is_none(),
+            "bonus chest requires the shared block drop random stream"
+        );
+        self.place_initial_bonus_chest_impl(feature, random, origin)
+    }
+
+    fn place_initial_bonus_chest_impl<
+        R: native_resources::bonus_chest::BonusChestRandom + Clone,
+    >(
         &mut self,
         feature: &native_resources::bonus_chest::BonusChestFeature,
         random: &mut R,
@@ -4876,6 +4926,127 @@ mod tests {
         );
         assert!(matches!(values[0].get("LootTableSeed"), Some(Tag::Long(_))));
         assert_eq!(values[0].get("keepPacked"), Some(&Tag::Byte(0)));
+    }
+
+    #[test]
+    fn bonus_chest_checkpoint_retries_without_consuming_level_random() {
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_resources::packs::ResourceProvider;
+        struct EmptyLoot;
+        impl ResourceProvider for EmptyLoot {
+            fn read_asset(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+        }
+        let center = ChunkPos { x: 0, z: 0 };
+        let east = ChunkPos { x: 1, z: 0 };
+        let (mut stage, _) = bonus_chest_fixture();
+        let center_task = stage.region.tasks.remove(&center).unwrap();
+        let east_task = stage.region.tasks.remove(&east).unwrap();
+        let center_ticks = stage.region.ticks.chunk(center).unwrap().clone();
+        let east_ticks = stage.region.ticks.chunk(east).unwrap().clone();
+        let east_entities = stage.block_entities.remove(&east).unwrap();
+        let east_maps = stage.heightmaps.remove(&east).unwrap();
+        stage.region.tasks = BTreeMap::from([(center, center_task)]);
+        stage.required = BTreeSet::from([center]);
+        stage.region.ticks =
+            RegionTicks::new(BTreeMap::from([(center, center_ticks)]), 0, 0).unwrap();
+        stage.block_entities.retain(|pos, _| *pos == center);
+        stage.heightmaps.retain(|pos, _| *pos == center);
+        stage
+            .set_block_drops(
+                super::super::postprocessing_drops::GeneratedBlockDrops::new(
+                    Arc::new(
+                        native_resources::loot::BlockLootTables::load(&mut EmptyLoot).unwrap(),
+                    ),
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                    LegacyRandom::new(4),
+                    XoroshiroRandom::new(77),
+                    true,
+                ),
+            )
+            .unwrap();
+        while !stage.poll(center, 10).unwrap() {}
+        let before = stage.block_drops.as_ref().unwrap().level_random().state();
+        let world = Arc::clone(&stage.world);
+        assert!(
+            stage
+                .try_place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut LegacyRandom::new(4),
+                    [0, 8, 0]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            stage
+                .try_place_initial_bonus_chest_with_drops(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    [0, 8, 0]
+                )
+                .unwrap(),
+            InitialBonusChestAttempt::NeedsChunk(east)
+        );
+        assert!(Arc::ptr_eq(&world, &stage.world));
+        assert_eq!(
+            stage.block_drops.as_ref().unwrap().level_random().state(),
+            before
+        );
+        stage
+            .register_converted_chunk(
+                east,
+                super::super::postprocessing::ConvertedChunkPostprocessing {
+                    task: east_task,
+                    ticks: east_ticks,
+                },
+                east_entities,
+                east_maps,
+                None,
+            )
+            .unwrap();
+        while !stage.poll(east, 10).unwrap() {}
+        assert_eq!(
+            stage
+                .try_place_initial_bonus_chest_with_drops(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    [0, 8, 0]
+                )
+                .unwrap(),
+            InitialBonusChestAttempt::Complete(Some([14, 8, 7]))
+        );
+        let processed = stage.finish().unwrap();
+        let (mut baseline, _) = bonus_chest_fixture();
+        let chunks: Vec<_> = baseline.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !baseline.poll(chunk, 10).unwrap() {}
+        }
+        let mut random = LegacyRandom::new(4);
+        assert_eq!(
+            baseline
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut random,
+                    [0, 8, 0]
+                )
+                .unwrap(),
+            Some([14, 8, 7])
+        );
+        assert_eq!(
+            processed.block_drops().unwrap().level_random().state(),
+            random.state()
+        );
+        assert_eq!(
+            processed.block_entity_data(center).unwrap(),
+            baseline
+                .finish()
+                .unwrap()
+                .block_entity_data(center)
+                .unwrap()
+        );
     }
 
     #[test]

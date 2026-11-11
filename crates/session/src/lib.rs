@@ -1805,6 +1805,7 @@ impl LocalSession {
                     if self.food_use.is_active() || self.mining.is_destroying() => {}
                 PlayerCommand::Place if !self.inventory.is_open() => {
                     self.use_repeat.used();
+                    self.first_person.begin_interaction(&self.inventory);
                     let main_hand = PlayerSlot::Storage(self.inventory.selected());
                     let mut handled = false;
                     if let Some(hit) =
@@ -1883,6 +1884,7 @@ impl LocalSession {
                             self.game_mode,
                         );
                     }
+                    self.first_person.end_interaction();
                 }
                 PlayerCommand::Place => {}
             }
@@ -3267,6 +3269,47 @@ mod tests {
                     assert_eq!(session.vitals.health, if fall_damage { 16.0 } else { 19.0 });
                 }
             }
+        }
+    }
+
+    #[test]
+    fn placed_last_item_keeps_its_interaction_animation_for_either_hand() {
+        use crate::inventory::ItemStack;
+        use native_persistence::nbt::Tag;
+
+        for (slot, hand) in [
+            (PlayerSlot::Storage(0), animation::Hand::Main),
+            (PlayerSlot::Offhand, animation::Hand::Off),
+        ] {
+            let mut world = World::demo();
+            world.set_block(IVec3::new(0, 4, 3), Block::Stone);
+            let mut session = LocalSession::new(world);
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                slot,
+                ItemStack::new(
+                    "minecraft:dirt".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![(
+                        "minecraft:interact_animation".into(),
+                        Tag::Compound(vec![
+                            ("type".into(), Tag::String("stab".into())),
+                            ("duration".into(), Tag::Int(10)),
+                        ])
+                    )]),
+                )
+            ));
+            session.set_player_inventory(inventory);
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            assert_eq!(session.world.block(IVec3::new(0, 4, 4)), Block::Dirt);
+            assert!(session.inventory.slot(slot).is_none());
+            session.update(TICK);
+            let swing = session.snapshot().first_person.swing;
+            assert_eq!(swing.hand(), Some(hand));
+            assert_eq!(swing.kind(), Some(animation::SwingKind::Stab));
+            assert_eq!(swing.progress(1.0), 0.1);
         }
     }
 

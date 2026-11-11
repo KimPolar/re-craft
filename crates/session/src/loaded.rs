@@ -20574,6 +20574,7 @@ impl LoadedSession {
                     if self.food_use.is_active() || self.mining.is_destroying() => {}
                 PlayerCommand::Place if !self.inventory.is_open() => {
                     self.use_repeat.used();
+                    self.first_person.begin_interaction(&self.inventory);
                     let main_hand =
                         crate::inventory::PlayerSlot::Storage(self.inventory.selected());
                     let mut handled = false;
@@ -20826,6 +20827,7 @@ impl LoadedSession {
                             );
                         }
                     }
+                    self.first_person.end_interaction();
                 }
                 PlayerCommand::Place => {}
             }
@@ -26806,6 +26808,62 @@ pub(crate) mod tests {
             session.set_player_inventory(inventory);
             assert!(!session.use_crop_item(hand, hit));
             assert_eq!(session.inventory.slot(hand).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn crop_use_keeps_consumed_items_interaction_animation_for_either_hand() {
+        use crate::inventory::{ItemStack, PlayerSlot};
+        use native_persistence::nbt::Tag;
+        let pos = IVec3::new(8, 2, 7);
+        for (slot, hand) in [
+            (PlayerSlot::Storage(0), crate::animation::Hand::Main),
+            (PlayerSlot::Offhand, crate::animation::Hand::Off),
+        ] {
+            let mut session = crop_test_session_with(pos, "minecraft:wheat", 0, true, false);
+            let mut inventory = PlayerInventory::default();
+            assert!(inventory.set_slot(
+                slot,
+                ItemStack::new(
+                    "minecraft:wheat_seeds".into(),
+                    1,
+                    64,
+                    Tag::Compound(vec![(
+                        "minecraft:interact_animation".into(),
+                        Tag::Compound(vec![
+                            ("type".into(), Tag::String("stab".into())),
+                            ("duration".into(), Tag::Int(10)),
+                        ])
+                    )]),
+                )
+            ));
+            session.set_player_inventory(inventory);
+            session.player.pitch = (-140..0)
+                .map(|value| value as f32 / 100.0)
+                .find(|&pitch| {
+                    session.player.pitch = pitch;
+                    session
+                        .ray_hit()
+                        .is_some_and(|hit| hit.position == pos - IVec3::Y && hit.face == IVec3::Y)
+                })
+                .expect("farmland is visible");
+            session.submit_command(PlayerCommand::Place);
+            session.update(TICK);
+            let absolute = add(session.origin, pos).unwrap();
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:wheat"
+            );
+            assert!(session.inventory.slot(slot).is_none());
+            session.update(TICK);
+            let swing = session.snapshot().first_person.swing;
+            assert_eq!(swing.hand(), Some(hand));
+            assert_eq!(swing.kind(), Some(crate::animation::SwingKind::Stab));
+            assert_eq!(swing.progress(1.0), 0.1);
         }
     }
 

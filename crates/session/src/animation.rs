@@ -34,32 +34,46 @@ impl Default for SwingAnimation {
     }
 }
 
-/// Explicit attack components are effective item data. Prototype defaults for
-/// items without an explicit component still need their registry to be loaded.
-fn attack_animation(item: Option<&ItemStack>) -> SwingAnimation {
+/// Explicit components are effective item data. Prototype defaults for items
+/// without an explicit component still need their registry to be loaded.
+fn item_swing_animation(item: Option<&ItemStack>, component: &str) -> SwingAnimation {
+    item.and_then(|item| item.components().get(component))
+        .and_then(decode_swing_animation)
+        .unwrap_or_default()
+}
+
+fn decode_swing_animation(value: &native_persistence::nbt::Tag) -> Option<SwingAnimation> {
     use native_persistence::nbt::Tag;
-    let Some(Tag::Compound(fields)) =
-        item.and_then(|item| item.components().get("minecraft:attack_animation"))
-    else {
-        return SwingAnimation::default();
+    let Tag::Compound(fields) = value else {
+        return None;
     };
     let mut animation = SwingAnimation::default();
+    let (mut seen_type, mut seen_duration) = (false, false);
     for (name, value) in fields {
         if name.matches("type") {
+            if seen_type {
+                return None;
+            }
+            seen_type = true;
             animation.kind = match value {
                 Tag::String(value) if value.matches("none") => SwingKind::None,
                 Tag::String(value) if value.matches("whack") => SwingKind::Whack,
                 Tag::String(value) if value.matches("stab") => SwingKind::Stab,
-                _ => return SwingAnimation::default(),
+                _ => return None,
             };
         } else if name.matches("duration") {
-            let Some(duration) = value.as_java_int().filter(|duration| *duration >= 0) else {
-                return SwingAnimation::default();
-            };
-            animation.duration = duration;
+            if seen_duration {
+                return None;
+            }
+            seen_duration = true;
+            animation.duration = value.as_java_int().filter(|duration| *duration >= 0)?;
         }
     }
-    animation
+    Some(animation)
+}
+
+pub(crate) fn valid_swing_component(value: &native_persistence::nbt::Tag) -> bool {
+    decode_swing_animation(value).is_some()
 }
 
 /// Item-use state shared with the renderer after a completed simulation tick.
@@ -206,9 +220,28 @@ pub struct FirstPersonState {
     pub swing: SwingState,
     pub item_use: Option<ItemUseState>,
     inventory_revision: Option<u64>,
+    interaction_animations: Option<[SwingAnimation; 2]>,
 }
 
 impl FirstPersonState {
+    /// Capture both hands before an interaction can consume or replace an item.
+    pub(crate) fn begin_interaction(&mut self, inventory: &PlayerInventory) {
+        self.interaction_animations = Some([
+            item_swing_animation(
+                inventory.slot(PlayerSlot::Storage(inventory.selected())),
+                "minecraft:interact_animation",
+            ),
+            item_swing_animation(
+                inventory.slot(PlayerSlot::Offhand),
+                "minecraft:interact_animation",
+            ),
+        ]);
+    }
+
+    pub(crate) fn end_interaction(&mut self) {
+        self.interaction_animations = None;
+    }
+
     /// Resolve effect modifiers when the swing starts, as LivingEntity does.
     pub(crate) fn start_swing(
         &mut self,
@@ -216,7 +249,15 @@ impl FirstPersonState {
         effects: &crate::survival::FallEffects,
         breathing: &crate::survival::BreathingEffects,
     ) -> bool {
-        self.start_animation(hand, SwingAnimation::default(), effects, breathing)
+        let animation =
+            self.interaction_animations
+                .map_or_else(SwingAnimation::default, |values| {
+                    values[match hand {
+                        Hand::Main => 0,
+                        Hand::Off => 1,
+                    }]
+                });
+        self.start_animation(hand, animation, effects, breathing)
     }
 
     pub(crate) fn start_attack_swing(
@@ -226,7 +267,12 @@ impl FirstPersonState {
         effects: &crate::survival::FallEffects,
         breathing: &crate::survival::BreathingEffects,
     ) -> bool {
-        self.start_animation(hand, attack_animation(item), effects, breathing)
+        self.start_animation(
+            hand,
+            item_swing_animation(item, "minecraft:attack_animation"),
+            effects,
+            breathing,
+        )
     }
 
     fn start_animation(
@@ -377,6 +423,48 @@ mod tests {
     }
 
     #[test]
+    fn swing_components_keep_ordinary_items_usable_without_accepting_invalid_patches() {
+        let component = |name: &str, value: Tag| Tag::Compound(vec![(name.into(), value)]);
+        for name in ["minecraft:attack_animation", "minecraft:interact_animation"] {
+            for kind in ["none", "whack", "stab"] {
+                let value = Tag::Compound(vec![
+                    ("type".into(), Tag::String(kind.into())),
+                    ("duration".into(), Tag::Int(12)),
+                ]);
+                assert_eq!(
+                    crate::inventory::saved_item_max("minecraft:dirt", &component(name, value)),
+                    Some(64)
+                );
+            }
+            for invalid in [
+                Tag::Int(1),
+                Tag::Compound(vec![("type".into(), Tag::String("unknown".into()))]),
+                Tag::Compound(vec![("duration".into(), Tag::Int(-1))]),
+                Tag::Compound(vec![
+                    ("duration".into(), Tag::Int(1)),
+                    ("duration".into(), Tag::Int(2)),
+                ]),
+            ] {
+                assert_eq!(
+                    crate::inventory::saved_item_max("minecraft:dirt", &component(name, invalid)),
+                    None
+                );
+            }
+            let removed = format!("!{name}");
+            assert_eq!(
+                crate::inventory::saved_item_max(
+                    "minecraft:dirt",
+                    &Tag::Compound(vec![
+                        (name.into(), Tag::Compound(vec![])),
+                        (removed.as_str().into(), Tag::Compound(vec![])),
+                    ])
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
     fn default_swing_and_equip_sequences_match_java() {
         use serde_json::Value;
@@ -496,6 +584,26 @@ public class SwingOracle {
       }
       custom.add(rows);
     }
+    var interact=new JsonArray();
+    for(var kind:new SwingAnimationType[]{SwingAnimationType.NONE,SwingAnimationType.WHACK,SwingAnimationType.STAB})
+    for(int ticks:new int[]{0,1,6,13,255,Integer.MAX_VALUE})
+    for(var hand:new InteractionHand[]{InteractionHand.MAIN_HAND,InteractionHand.OFF_HAND}) {
+      var stack=new ItemStack(Items.STONE,1);
+      stack.set(DataComponents.ATTACK_ANIMATION,new SwingAnimation(SwingAnimationType.WHACK,3));
+      stack.set(DataComponents.INTERACT_ANIMATION,new SwingAnimation(kind,ticks));
+      var selected=stack.getInteractAnimation();
+      stack.shrink(1);
+      var state=new SwingState(); var rows=new JsonArray();
+      for(int tick=0;tick<18;tick++) {
+        int started=-1;
+        if(tick%3==0) started=state.startIfAble(hand,selected,selected.duration())?1:0;
+        state.tick(); var swing=(SwingDescription)current.get(state);
+        var row=new JsonArray(); row.add(started); row.add(swing==null?"":swing.animation().type().getSerializedName());
+        for(float partial:new float[]{0f,0.25f,0.5f,0.75f,1f}) row.add(state.getAnimation(partial));
+        rows.add(row);
+      }
+      interact.add(rows);
+    }
     var player=(Player)unsafe.allocateInstance(Player.class);
     var game=(Game)unsafe.allocateInstance(Game.class);
     var minecraft=LocalPlayer.class.getDeclaredField("minecraft"); minecraft.setAccessible(true); minecraft.set(player,game);
@@ -529,7 +637,7 @@ public class SwingOracle {
       }
       equipment.add(row);
     }
-    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom);
+    var result=new JsonObject(); result.add("swings",out); result.add("equipment",equipment); result.add("modified",modified); result.add("custom",custom); result.add("interact",interact);
     Files.writeString(Path.of(args[0]),new Gson().toJson(result));
   }
 }
@@ -756,6 +864,83 @@ public class SwingOracle {
             }
         }
         assert_eq!(scenario, custom.len());
+        let interact = result["interact"].as_array().unwrap();
+        let mut scenario = 0;
+        for (name, kind) in [
+            ("none", SwingKind::None),
+            ("whack", SwingKind::Whack),
+            ("stab", SwingKind::Stab),
+        ] {
+            for duration in [0, 1, 6, 13, 255, i32::MAX] {
+                for hand in [Hand::Main, Hand::Off] {
+                    let slot = if hand == Hand::Main {
+                        PlayerSlot::Storage(0)
+                    } else {
+                        PlayerSlot::Offhand
+                    };
+                    let stack = ItemStack::new(
+                        "minecraft:stone".into(),
+                        1,
+                        64,
+                        Tag::Compound(vec![
+                            (
+                                "minecraft:attack_animation".into(),
+                                Tag::Compound(vec![("duration".into(), Tag::Int(3))]),
+                            ),
+                            (
+                                "minecraft:interact_animation".into(),
+                                Tag::Compound(vec![
+                                    ("type".into(), Tag::String(name.into())),
+                                    ("duration".into(), Tag::Int(duration)),
+                                ]),
+                            ),
+                        ]),
+                    )
+                    .unwrap();
+                    let mut inventory = PlayerInventory::default();
+                    inventory.set_slot(slot, Some(stack));
+                    let mut hands = FirstPersonState::default();
+                    hands.begin_interaction(&inventory);
+                    inventory.set_slot(slot, None);
+                    for (tick, row) in interact[scenario].as_array().unwrap().iter().enumerate() {
+                        let started = if tick % 3 == 0 {
+                            i64::from(hands.start_swing(
+                                hand,
+                                &Default::default(),
+                                &Default::default(),
+                            ))
+                        } else {
+                            -1
+                        };
+                        hands.swing.tick();
+                        assert_eq!(
+                            started,
+                            row[0].as_i64().unwrap(),
+                            "{name} duration={duration} hand={hand:?} tick={tick}"
+                        );
+                        assert_eq!(
+                            hands.swing.kind(),
+                            if row[1].as_str().unwrap().is_empty() {
+                                None
+                            } else {
+                                Some(kind)
+                            }
+                        );
+                        for (i, partial) in [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().enumerate() {
+                            let actual = hands.swing.progress(partial);
+                            let expected = row[2 + i].as_f64().unwrap() as f32;
+                            assert!(
+                                (actual - expected).abs() < 1e-6,
+                                "{name} duration={duration} hand={hand:?} tick={tick} partial={partial}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                    hands.end_interaction();
+                    scenario += 1;
+                }
+            }
+        }
+        assert_eq!(scenario, interact.len());
         let mut inventory = PlayerInventory::default();
         let mut hands = FirstPersonState::default();
         let rows = result["equipment"].as_array().unwrap();

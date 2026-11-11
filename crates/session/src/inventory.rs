@@ -3329,6 +3329,26 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
                 return None;
             }
             67108864
+        } else if name.matches("minecraft:attack_animation") {
+            if !crate::animation::valid_swing_component(value) {
+                return None;
+            }
+            134217728
+        } else if name.matches("!minecraft:attack_animation") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            268435456
+        } else if name.matches("minecraft:interact_animation") {
+            if !crate::animation::valid_swing_component(value) {
+                return None;
+            }
+            536870912
+        } else if name.matches("!minecraft:interact_animation") {
+            if !matches!(value, Tag::Compound(fields) if fields.is_empty()) {
+                return None;
+            }
+            1073741824
         } else if name.matches("minecraft:dyed_color") {
             value.as_java_int()?;
             131072
@@ -3442,6 +3462,11 @@ pub fn saved_item_max(id: &str, components: &Tag) -> Option<u32> {
         return None;
     }
     if seen & (33554432 | 67108864) == (33554432 | 67108864) {
+        return None;
+    }
+    if seen & (134217728 | 268435456) == (134217728 | 268435456)
+        || seen & (536870912 | 1073741824) == (536870912 | 1073741824)
+    {
         return None;
     }
     if seen & 3072 == 3072 || seen & 12288 == 12288 || seen & 49152 == 49152 {

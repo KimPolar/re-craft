@@ -192,6 +192,7 @@ pub struct FreshWorldDraft {
     player_chunk: crate::world::ChunkPos,
     clocks: BTreeMap<DimensionId, crate::world::SavedClock>,
     game_rules: Option<crate::world::FluidGameRules>,
+    random_sequences: Option<nbt::NamedTag>,
     regions: BTreeMap<(DimensionId, FreshRegionKind, i32, i32), FreshRegionDraft>,
 }
 
@@ -835,6 +836,7 @@ impl FreshWorldDraft {
             player_chunk,
             clocks,
             game_rules: None,
+            random_sequences: None,
             regions: BTreeMap::new(),
         })
     }
@@ -856,6 +858,28 @@ impl FreshWorldDraft {
     pub fn set_game_rules(&mut self, rules: crate::world::FluidGameRules) -> Result<()> {
         rules.new_world_document()?;
         self.game_rules = Some(rules);
+        Ok(())
+    }
+
+    /// Capture newly consumed named random streams for this new world.
+    /// Existing-world data is not accepted by the fresh-world transaction.
+    pub fn set_random_sequences(
+        &mut self,
+        sequences: &crate::random_sequences::RandomSequences,
+    ) -> Result<()> {
+        ensure!(
+            self.random_sequences.is_none(),
+            "random sequences are already set"
+        );
+        ensure!(
+            sequences.source().is_none(),
+            "fresh random sequences have an existing source"
+        );
+        ensure!(sequences.is_dirty(), "random sequences have not changed");
+        let document = sequences.draft()?;
+        crate::random_sequences::RandomSequences::read(Some(document.clone()))?;
+        nbt::write(&document)?;
+        self.random_sequences = Some(document);
         Ok(())
     }
 
@@ -932,6 +956,10 @@ impl FreshWorldDraft {
                 &root.join("data/minecraft/game_rules.dat"),
                 &rules.new_world_document()?,
             )?;
+        }
+        if let Some(sequences) = &self.random_sequences {
+            progress(FreshWorldStageProgress::WritingMetadata)?;
+            write_new_gzip(&root.join("data/minecraft/random_sequences.dat"), sequences)?;
         }
         progress(FreshWorldStageProgress::WritingMetadata)?;
         write_new_gzip(
@@ -1015,6 +1043,12 @@ impl FreshWorldDraft {
             ensure!(
                 reader.fluid_game_rules()? == rules,
                 "staged game rules did not round-trip"
+            );
+        }
+        if let Some(expected) = &self.random_sequences {
+            ensure!(
+                reader.random_sequences()?.source() == Some(expected),
+                "staged random sequences did not round-trip"
             );
         }
         let enabled_file_packs = reader
@@ -5108,6 +5142,32 @@ mod tests {
             ..Default::default()
         };
         draft.set_game_rules(rules).unwrap();
+        let mut sequences = crate::random_sequences::RandomSequences::read(None).unwrap();
+        assert!(draft.set_random_sequences(&sequences).is_err());
+        let mut random = sequences.get("example:terrain", 42).unwrap();
+        random.next_long();
+        sequences.set("example:terrain", &random).unwrap();
+        let expected_sequences = sequences.draft().unwrap();
+        let mut existing =
+            crate::random_sequences::RandomSequences::read(Some(expected_sequences.clone()))
+                .unwrap();
+        let mut existing_random = existing.get("example:terrain", 42).unwrap();
+        existing_random.next_long();
+        existing.set("example:terrain", &existing_random).unwrap();
+        let mut other_draft = FreshWorldDraft::new(
+            level.clone(),
+            worldgen.clone(),
+            player.clone(),
+            uuid,
+            42,
+            clocks.clone(),
+        )
+        .unwrap();
+        assert!(other_draft.set_random_sequences(&existing).is_err());
+        draft.set_random_sequences(&sequences).unwrap();
+        assert!(draft.set_random_sequences(&sequences).is_err());
+        random.next_long();
+        sequences.set("example:terrain", &random).unwrap();
         assert!(
             draft
                 .set_game_rules(crate::world::FluidGameRules {
@@ -5138,12 +5198,155 @@ mod tests {
         assert_eq!(reader.read_player().unwrap(), Some(player));
         assert_eq!(reader.world_clocks().unwrap(), clocks);
         assert_eq!(reader.fluid_game_rules().unwrap(), rules);
+        assert_eq!(
+            reader.random_sequences().unwrap().source(),
+            Some(&expected_sequences)
+        );
         assert!(reader.read_chunk(0, 0).unwrap().is_some());
         assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
         drop(reader);
         drop(stage);
         assert!(!staged_path.exists());
         assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fresh_world_publishes_named_random_sequences_and_rejects_tampering() {
+        let parent = test_world();
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(crate::world::ChunkPos { x: 0, z: 0 }, &chunk(0, "stage"), 1)
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        let mut sequences = crate::random_sequences::RandomSequences::read(None).unwrap();
+        let mut random = sequences.get("minecraft:blocks/ladder", 42).unwrap();
+        random.next_long();
+        sequences.set("minecraft:blocks/ladder", &random).unwrap();
+        let expected = sequences.draft().unwrap();
+        draft.set_random_sequences(&sequences).unwrap();
+
+        let stage = draft.stage(parent.path()).unwrap();
+        fs::write(
+            stage.path().join("data/minecraft/random_sequences.dat"),
+            b"changed",
+        )
+        .unwrap();
+        assert!(
+            stage
+                .publish(parent.path(), "Changed", "New World")
+                .is_err()
+        );
+        assert!(!parent.path().join("Changed").exists());
+
+        let stage = draft.stage(parent.path()).unwrap();
+        let published = stage.publish(parent.path(), "World", "New World").unwrap();
+        let reader = crate::world::WorldReader::open_with_session(
+            &published.path,
+            DimensionId::parse("overworld").unwrap(),
+            published.session().clone(),
+        )
+        .unwrap();
+        let saved = reader.random_sequences().unwrap();
+        assert_eq!(saved.source(), Some(&expected));
+        assert_eq!(
+            saved
+                .get("minecraft:blocks/ladder", 42)
+                .unwrap()
+                .next_long(),
+            random.next_long()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Minecraft 26.3 and Java 25 JDK"]
+    fn fresh_world_random_sequences_are_decoded_by_java() {
+        use std::process::Command;
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let version = game.join("versions/26.3");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(version.join("26.3.json")).unwrap()).unwrap();
+        let parent = test_world();
+        let mut paths = vec![version.join("26.3.jar"), parent.path().to_path_buf()];
+        for library in metadata["libraries"].as_array().unwrap() {
+            if let Some(path) = library["downloads"]["artifact"]["path"].as_str() {
+                let path = game.join("libraries").join(path);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        let classpath = std::env::join_paths(paths).unwrap();
+        let java = std::env::var_os("MINECRAFT_JAVA_HOME").or_else(|| std::env::var_os("JAVA_HOME"))
+            .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+                .join("AppData/Local/Packages/Microsoft.4297127D64EC6_8wekyb3d8bbwe/LocalCache/Local/runtime/java-runtime-epsilon/windows-x64/java-runtime-epsilon")).join("bin");
+        let source = parent.path().join("FreshRandomSequencesOracle.java");
+        fs::write(
+            &source,
+            include_str!("../tests/java/FreshRandomSequencesOracle.java"),
+        )
+        .unwrap();
+        let output = Command::new(java.join("javac.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (level, worldgen, player, uuid) = fresh_world_metadata();
+        let mut draft =
+            FreshWorldDraft::new(level, worldgen, player, uuid, 42, BTreeMap::new()).unwrap();
+        let mut terrain = FreshRegionDraft::new(FreshRegionKind::Terrain, 0, 0);
+        terrain
+            .add(crate::world::ChunkPos { x: 0, z: 0 }, &chunk(0, "stage"), 1)
+            .unwrap();
+        draft
+            .add_region(DimensionId::parse("overworld").unwrap(), terrain)
+            .unwrap();
+        let mut sequences = crate::random_sequences::RandomSequences::read(None).unwrap();
+        let mut random = sequences.get("minecraft:blocks/ladder", 42).unwrap();
+        for _ in 0..7 {
+            random.next_long();
+        }
+        sequences.set("minecraft:blocks/ladder", &random).unwrap();
+        draft.set_random_sequences(&sequences).unwrap();
+        let stage = draft.stage(parent.path()).unwrap();
+        let result = Command::new(java.join("java.exe"))
+            .arg("-cp")
+            .arg(&classpath)
+            .arg("FreshRandomSequencesOracle")
+            .arg(stage.path().join("data/minecraft/random_sequences.dat"))
+            .arg("minecraft:blocks/ladder")
+            .arg("42")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stdout = String::from_utf8(result.stdout).unwrap();
+        let actual: i64 = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("RESULT "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(actual, random.next_long());
     }
 
     #[test]

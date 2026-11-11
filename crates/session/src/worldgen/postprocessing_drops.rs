@@ -22,6 +22,7 @@ pub struct GeneratedBlockDestroyEvent {
     pub state: BlockState,
     world: Arc<World>,
     registered_chunks: Arc<[ChunkPos]>,
+    block_entities: Arc<BTreeMap<ChunkPos, Vec<Tag>>>,
 }
 
 impl GeneratedBlockDestroyEvent {
@@ -35,6 +36,12 @@ impl GeneratedBlockDestroyEvent {
     pub fn registered_chunks(&self) -> &[ChunkPos] {
         &self.registered_chunks
     }
+
+    /// Materialized block entities in registered chunks and sections within
+    /// the event radius. This is not an active-listener registry.
+    pub fn block_entities(&self) -> &BTreeMap<ChunkPos, Vec<Tag>> {
+        &self.block_entities
+    }
 }
 
 impl PartialEq for GeneratedBlockDestroyEvent {
@@ -42,6 +49,7 @@ impl PartialEq for GeneratedBlockDestroyEvent {
         self.position == other.position
             && self.state == other.state
             && self.registered_chunks == other.registered_chunks
+            && self.block_entities == other.block_entities
             && Arc::ptr_eq(&self.world, &other.world)
     }
 }
@@ -227,6 +235,7 @@ impl GeneratedBlockDrops {
         state: &BlockState,
         world: Arc<World>,
         registered_chunks: &[ChunkPos],
+        block_entities: BTreeMap<ChunkPos, Vec<Tag>>,
     ) {
         let registered_chunks = self
             .destroy_events
@@ -234,11 +243,18 @@ impl GeneratedBlockDrops {
             .filter(|event| event.registered_chunks.as_ref() == registered_chunks)
             .map(|event| Arc::clone(&event.registered_chunks))
             .unwrap_or_else(|| registered_chunks.into());
+        let block_entities = self
+            .destroy_events
+            .last()
+            .filter(|event| event.block_entities.as_ref() == &block_entities)
+            .map(|event| Arc::clone(&event.block_entities))
+            .unwrap_or_else(|| Arc::new(block_entities));
         Arc::make_mut(&mut self.destroy_events).push(GeneratedBlockDestroyEvent {
             position,
             state: state.clone(),
             world,
             registered_chunks,
+            block_entities,
         });
     }
 
@@ -377,13 +393,19 @@ mod tests {
         let chunk = ChunkPos { x: -1, z: 0 };
         let mut world = Arc::new(World::new("minecraft:overworld"));
         let mut registered = vec![chunk];
-        drops.record_destroy_event([-1, 5, 0], &ladder(), Arc::clone(&world), &registered);
+        drops.record_destroy_event(
+            [-1, 5, 0],
+            &ladder(),
+            Arc::clone(&world),
+            &registered,
+            BTreeMap::new(),
+        );
         let earlier = drops.clone();
         Arc::make_mut(&mut world).dimension = "example:later".into();
         registered.push(ChunkPos { x: 0, z: 0 });
-        drops.record_destroy_event([0, 5, 0], &ladder(), world, &registered);
+        drops.record_destroy_event([0, 5, 0], &ladder(), world, &registered, BTreeMap::new());
         let world = Arc::clone(drops.destroy_events()[1].world());
-        drops.record_destroy_event([1, 5, 0], &ladder(), world, &registered);
+        drops.record_destroy_event([1, 5, 0], &ladder(), world, &registered, BTreeMap::new());
         assert_eq!(earlier.destroy_events().len(), 1);
         assert_eq!(
             earlier.destroy_events()[0].world().dimension,
@@ -396,6 +418,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &drops.destroy_events()[1].registered_chunks,
             &drops.destroy_events()[2].registered_chunks,
+        ));
+        assert!(Arc::ptr_eq(
+            &drops.destroy_events()[1].block_entities,
+            &drops.destroy_events()[2].block_entities,
         ));
     }
 

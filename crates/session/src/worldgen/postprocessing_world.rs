@@ -863,12 +863,14 @@ impl GeneratedPostprocessing {
             .context("chunk is not in the converted region")?;
         self.active = Some(pos);
         self.failed = true;
+        let mut entities = self
+            .block_entities
+            .remove(&pos)
+            .context("converted block entities are missing")?;
         let mut view = GeneratedBlockView {
             chunk: pos,
-            block_entities: self
-                .block_entities
-                .get_mut(&pos)
-                .context("converted block entities are missing")?,
+            block_entities: &mut entities,
+            other_block_entities: &self.block_entities,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
@@ -891,7 +893,9 @@ impl GeneratedPostprocessing {
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
         };
-        let done = task.poll(&mut view, budget)?;
+        let result = task.poll(&mut view, budget);
+        self.block_entities.insert(pos, entities);
+        let done = result?;
         if done {
             self.completed.insert(pos);
             self.active = None;
@@ -946,12 +950,14 @@ impl GeneratedPostprocessing {
         );
         let mut staged_random = random.clone();
         self.failed = true;
+        let mut entities = self
+            .block_entities
+            .remove(&pos)
+            .context("converted block entities are missing")?;
         let mut view = GeneratedBlockView {
             chunk: pos,
-            block_entities: self
-                .block_entities
-                .get_mut(&pos)
-                .context("converted block entities are missing")?,
+            block_entities: &mut entities,
+            other_block_entities: &self.block_entities,
             block_entity_edits: &mut self.block_entity_edits,
             world: &mut self.world,
             read_chunks: &self.read_chunks,
@@ -974,7 +980,9 @@ impl GeneratedPostprocessing {
             heightmaps: &mut self.heightmaps,
             heightmap_tags: self.heightmap_tags.as_deref(),
         };
-        let placed = feature.place(&mut view, &mut staged_random, origin)?;
+        let result = feature.place(&mut view, &mut staged_random, origin);
+        self.block_entities.insert(pos, entities);
+        let placed = result?;
         *random = staged_random;
         self.bonus_chest_attempted = true;
         self.failed = false;
@@ -1028,6 +1036,7 @@ impl GeneratedPostprocessing {
 struct GeneratedBlockView<'a> {
     chunk: ChunkPos,
     block_entities: &'a mut ConvertedBlockEntities,
+    other_block_entities: &'a BTreeMap<ChunkPos, ConvertedBlockEntities>,
     block_entity_edits: &'a mut BTreeMap<BlockPosition, (BlockState, BlockState)>,
     world: &'a mut Arc<World>,
     read_chunks: &'a RefCell<BTreeSet<ChunkPos>>,
@@ -1049,6 +1058,61 @@ struct GeneratedBlockView<'a> {
     light_checks: &'a mut Vec<BlockPosition>,
     heightmaps: &'a mut BTreeMap<ChunkPos, native_persistence::heightmap::FullHeightmaps>,
     heightmap_tags: Option<&'a native_resources::heightmap_tags::HeightmapTags>,
+}
+
+/// Capture materialized block entities in the sections visited by Java's
+/// BLOCK_DESTROY dispatcher. Pending protochunk entities are not listeners.
+fn event_block_entities(
+    position: [i32; 3],
+    registered: &[ChunkPos],
+    current_chunk: ChunkPos,
+    current: &ConvertedBlockEntities,
+    others: &BTreeMap<ChunkPos, ConvertedBlockEntities>,
+) -> Result<BTreeMap<ChunkPos, Vec<native_persistence::nbt::Tag>>> {
+    const RADIUS: i64 = 16;
+    let section_range = |value: i32| {
+        let value = i64::from(value);
+        (
+            (value - RADIUS).div_euclid(16),
+            (value + RADIUS).div_euclid(16),
+        )
+    };
+    let (min_x, max_x) = section_range(position[0]);
+    let (min_y, max_y) = section_range(position[1]);
+    let (min_z, max_z) = section_range(position[2]);
+    let mut result = BTreeMap::new();
+    for &chunk in registered {
+        if !(min_x..=max_x).contains(&i64::from(chunk.x))
+            || !(min_z..=max_z).contains(&i64::from(chunk.z))
+        {
+            continue;
+        }
+        let entities = if chunk == current_chunk {
+            current
+        } else {
+            others
+                .get(&chunk)
+                .context("event block entity chunk is missing")?
+        };
+        let mut records = Vec::new();
+        for (&pos, record) in &entities.records {
+            if entities.pending.members().contains(&pos) {
+                continue;
+            }
+            ensure!(
+                pos[0].div_euclid(16) == chunk.x && pos[2].div_euclid(16) == chunk.z,
+                "event block entity belongs to another chunk"
+            );
+            if (min_y..=max_y).contains(&i64::from(pos[1]).div_euclid(16)) {
+                records.push(record.clone());
+            }
+        }
+        ensure!(
+            result.insert(chunk, records).is_none(),
+            "duplicate event chunk"
+        );
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy)]
@@ -2064,6 +2128,13 @@ impl GeneratedBlockView<'_> {
             &replacement,
             depth,
         )?;
+        let block_entities = event_block_entities(
+            pos,
+            self.ticks.registration_order(),
+            self.chunk,
+            self.block_entities,
+            self.other_block_entities,
+        )?;
         self.block_drops
             .as_mut()
             .context("ladder destruction requires block drops")?
@@ -2072,6 +2143,7 @@ impl GeneratedBlockView<'_> {
                 state,
                 Arc::clone(self.world),
                 self.ticks.registration_order(),
+                block_entities,
             );
         Ok(())
     }
@@ -3209,6 +3281,74 @@ mod tests {
     use native_core::postprocessing::PostProcessing;
     use native_world::loaded::{BLOCK_COUNT, Chunk, Section};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn destroy_event_captures_only_materialized_entities_in_dispatch_sections() {
+        use native_persistence::nbt::Tag;
+        let current_pos = ChunkPos { x: -1, z: 0 };
+        let west = ChunkPos { x: -2, z: 0 };
+        let distant = ChunkPos { x: 1, z: 0 };
+        let tag = |id: &str| Tag::Compound(vec![("id".into(), Tag::String(id.into()))]);
+        let mut current = ConvertedBlockEntities::default();
+        current.records.insert([-1, 1, 1], tag("live"));
+        current.live.insert([-1, 1, 1]);
+        current.records.insert([-2, 1, 1], tag("pending"));
+        current.pending.insert([-2, 1, 1]);
+        current.records.insert([-1, 32, 1], tag("above"));
+        current.live.insert([-1, 32, 1]);
+        let mut neighbor = ConvertedBlockEntities::default();
+        neighbor.records.insert([-17, 1, 1], tag("neighbor"));
+        neighbor.live.insert([-17, 1, 1]);
+        let others = BTreeMap::from([(west, neighbor)]);
+        let captured = event_block_entities(
+            [-1, 0, 0],
+            &[west, current_pos, distant],
+            current_pos,
+            &current,
+            &others,
+        )
+        .unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[&current_pos], vec![tag("live")]);
+        assert_eq!(captured[&west], vec![tag("neighbor")]);
+        current.records.insert([-1, 1, 1], tag("later"));
+        assert_eq!(captured[&current_pos], vec![tag("live")]);
+        assert!(
+            event_block_entities(
+                [-1, 0, 0],
+                &[current_pos, ChunkPos { x: 0, z: 0 }],
+                current_pos,
+                &current,
+                &others,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_block_entity_storage_invalidates_direct_postprocessing() {
+        let (mut stage, _, chunk) = fixture(false);
+        stage.block_entities.remove(&chunk);
+        assert!(stage.poll(chunk, 1).is_err());
+        assert!(stage.finish().is_err());
+
+        let (mut stage, _) = bonus_chest_fixture();
+        let chunks: Vec<_> = stage.region.tasks.keys().copied().collect();
+        for chunk in chunks {
+            while !stage.poll(chunk, 10).unwrap() {}
+        }
+        stage.block_entities.remove(&ChunkPos { x: 0, z: 0 });
+        assert!(
+            stage
+                .place_initial_bonus_chest(
+                    &native_resources::bonus_chest::BonusChestFeature,
+                    &mut native_core::random::LegacyRandom::new(4),
+                    [0, 8, 0],
+                )
+                .is_err()
+        );
+        assert!(stage.finish().is_err());
+    }
 
     fn snowy_test_tags(tagged: bool) -> Arc<native_resources::ore_feature::OreBlockTags> {
         use native_resources::{
@@ -7354,6 +7494,7 @@ mod tests {
             if case == "ladder_break_neighbor_failure_on" {
                 let mut probe = stage.clone();
                 assert!(probe.poll(chunk, 1).is_err());
+                assert!(probe.block_entities.contains_key(&chunk));
                 let attempted = probe.block_drops.as_ref().unwrap();
                 assert_eq!(attempted.operations(), 1);
                 assert_eq!(attempted.records(chunk).len(), 1);
@@ -7419,6 +7560,7 @@ mod tests {
             assert_eq!(event.position, [10, 8, 8]);
             assert_eq!(event.state, source.block(10, 8, 8).unwrap().clone());
             assert_eq!(event.registered_chunks(), &[chunk]);
+            assert_eq!(event.block_entities().get(&chunk), Some(&Vec::new()));
             assert_eq!(
                 event.world().block(10, 8, 8).unwrap().name,
                 if case.contains("_wet_") {

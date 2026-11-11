@@ -27009,6 +27009,7 @@ pub(crate) mod tests {
             &ladder,
             Arc::clone(&session.world),
             &[chunk],
+            BTreeMap::new(),
         );
         let previous_level = session.level_random.state();
         let error = session
@@ -27109,6 +27110,7 @@ pub(crate) mod tests {
             ),
             Arc::clone(&session.world),
             &[],
+            BTreeMap::new(),
         );
         assert!(session.install_initial_generated_drops(&pending).is_err());
         assert!(!session.generated_drops_installed);

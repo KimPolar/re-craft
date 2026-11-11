@@ -7,6 +7,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.*;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.levelgen.structure.templatesystem.*;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate.StructureBlockInfo;
 
@@ -58,6 +59,35 @@ public class BlockAgeProcessorOracle {
                         var result = processor.processBlock(null, pos, pos, pos, info, new StructurePlaceSettings());
                         out.printf("B\t%d\t%d\t%d\t%d\t%d\t%s\t%s%n", category, m, pos.getX(), pos.getY(), pos.getZ(), key(state), key(result.state()));
                     }
+            }
+        }
+        // Verify the property identity assumption across the whole Java block
+        // registry, then exercise both waterlogged values on eligible blocks.
+        var excluded = List.of(Set.of("facing", "half", "shape"), Set.of("type"),
+                Set.of("north", "east", "south", "west", "up"));
+        for (var block : BuiltInRegistries.BLOCK) {
+            var properties = block.getStateDefinition().getProperties();
+            for (var property : properties)
+                if (property.getName().equals("waterlogged") && property != BlockStateProperties.WATERLOGGED)
+                    throw new AssertionError("different waterlogged identity: " + block);
+            var base = block.defaultBlockState();
+            if (!base.hasProperty(BlockStateProperties.WATERLOGGED)) continue;
+            for (int category = 0; category < tags.size(); category++) {
+                final int c = category;
+                if (properties.stream().anyMatch(p -> excluded.get(c).contains(p.getName()))) continue;
+                bind.invoke(block.builtInRegistryHolder(), List.of(tags.get(category)));
+                for (int m = 0; m < mossiness.length; m++) {
+                    var processor = new BlockAgeProcessor(mossiness[m]);
+                    for (boolean wet : new boolean[] {false, true}) {
+                        var state = base.setValue(BlockStateProperties.WATERLOGGED, wet);
+                        for (int i = 0; i < 7; i++) {
+                            var pos = new BlockPos(i * 17 - 95, i * 29 - 64, 113 - i * 23);
+                            var info = new StructureBlockInfo(pos, state, null);
+                            var result = processor.processBlock(null, pos, pos, pos, info, new StructurePlaceSettings());
+                            out.printf("C\t%d\t%d\t%d\t%d\t%d\t%s\t%s%n", category, m, pos.getX(), pos.getY(), pos.getZ(), key(state), key(result.state()));
+                        }
+                    }
+                }
             }
         }
     }

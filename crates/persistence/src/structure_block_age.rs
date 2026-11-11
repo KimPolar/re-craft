@@ -132,23 +132,40 @@ fn random_stairs(name: &str, random: &mut LegacyRandom) -> BlockState {
     }
 }
 
+// WATERLOGGED is the same Java property object on every registered 26.3
+// block that has it. Other similarly named properties can have different
+// identities, so leave those cases to the schema-specific checks below.
+fn copy_only_waterlogged(source: &BlockState, mut target: BlockState) -> Result<BlockState> {
+    if let Some(value) = source.properties.get("waterlogged") {
+        ensure!(
+            matches!(value.as_str(), "true" | "false"),
+            "invalid waterlogged state"
+        );
+        target
+            .properties
+            .insert("waterlogged".into(), value.clone());
+    }
+    Ok(target)
+}
+
 fn copy_stairs(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
-    // Java copies properties by identity. If there are no matching names,
-    // none can be shared; otherwise unknown property identities stay guarded.
-    if ["facing", "half", "shape", "waterlogged"]
+    if ["facing", "half", "shape"]
         .into_iter()
         .all(|name| !p.contains_key(name))
     {
-        return Ok(BlockState {
-            name: "minecraft:mossy_stone_brick_stairs".into(),
-            properties: BTreeMap::from([
-                ("facing".into(), "north".into()),
-                ("half".into(), "bottom".into()),
-                ("shape".into(), "straight".into()),
-                ("waterlogged".into(), "false".into()),
-            ]),
-        });
+        return copy_only_waterlogged(
+            source,
+            BlockState {
+                name: "minecraft:mossy_stone_brick_stairs".into(),
+                properties: BTreeMap::from([
+                    ("facing".into(), "north".into()),
+                    ("half".into(), "bottom".into()),
+                    ("shape".into(), "straight".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            },
+        );
     }
     ensure!(
         p.len() == 4
@@ -174,11 +191,8 @@ fn copy_stairs(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_slab(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
-    if ["type", "waterlogged"]
-        .into_iter()
-        .all(|name| !p.contains_key(name))
-    {
-        return Ok(slab("mossy_stone_brick_slab"));
+    if ["type"].into_iter().all(|name| !p.contains_key(name)) {
+        return copy_only_waterlogged(source, slab("mossy_stone_brick_slab"));
     }
     ensure!(
         p.len() == 2
@@ -199,21 +213,24 @@ fn copy_slab(source: &BlockState) -> Result<BlockState> {
 }
 fn copy_wall(source: &BlockState) -> Result<BlockState> {
     let p = &source.properties;
-    if ["north", "east", "south", "west", "up", "waterlogged"]
+    if ["north", "east", "south", "west", "up"]
         .into_iter()
         .all(|name| !p.contains_key(name))
     {
-        return Ok(BlockState {
-            name: "minecraft:mossy_stone_brick_wall".into(),
-            properties: BTreeMap::from([
-                ("north".into(), "none".into()),
-                ("east".into(), "none".into()),
-                ("south".into(), "none".into()),
-                ("west".into(), "none".into()),
-                ("up".into(), "true".into()),
-                ("waterlogged".into(), "false".into()),
-            ]),
-        });
+        return copy_only_waterlogged(
+            source,
+            BlockState {
+                name: "minecraft:mossy_stone_brick_wall".into(),
+                properties: BTreeMap::from([
+                    ("north".into(), "none".into()),
+                    ("east".into(), "none".into()),
+                    ("south".into(), "none".into()),
+                    ("west".into(), "none".into()),
+                    ("up".into(), "true".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            },
+        );
     }
     ensure!(
         p.len() == 6
@@ -237,6 +254,32 @@ fn copy_wall(source: &BlockState) -> Result<BlockState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagged_waterlogged_blocks_copy_only_the_shared_property() {
+        let state = BlockState {
+            name: "minecraft:iron_chain".into(),
+            properties: BTreeMap::from([
+                ("axis".into(), "x".into()),
+                ("waterlogged".into(), "true".into()),
+            ]),
+        };
+        for result in [copy_stairs(&state), copy_slab(&state), copy_wall(&state)] {
+            let result = result.unwrap();
+            assert_eq!(
+                result.properties.get("waterlogged").map(String::as_str),
+                Some("true")
+            );
+            assert!(!result.properties.contains_key("axis"));
+        }
+        let invalid = BlockState {
+            properties: BTreeMap::from([("waterlogged".into(), "invalid".into())]),
+            ..state
+        };
+        assert!(copy_stairs(&invalid).is_err());
+        assert!(copy_slab(&invalid).is_err());
+        assert!(copy_wall(&invalid).is_err());
+    }
 
     #[test]
     fn rejects_unsupported_states_in_custom_tags() {

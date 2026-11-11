@@ -151,6 +151,54 @@ fn block_age_processor_matches_java() -> Result<()> {
     }
     assert_eq!(tagged_count, 3_588, "unexpected tagged-block case count");
 
+    let mut waterlogged_count = 0;
+    let mut waterlogged_replacements = [0_usize; 3];
+    for line in text.lines().filter(|line| line.starts_with("C\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        ensure!(fields.len() == 8, "invalid waterlogged-block output");
+        let category: usize = fields[1].parse()?;
+        let mode: usize = fields[2].parse()?;
+        let position = [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+        let state = parse_state(fields[6])?;
+        let member = BTreeSet::from([state.name.clone()]);
+        let empty = BTreeSet::new();
+        let tags = match category {
+            0 => {
+                native_persistence::structure_block_age::AgeTags::new(member, empty.clone(), empty)
+            }
+            1 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), member, empty)
+            }
+            2 => {
+                native_persistence::structure_block_age::AgeTags::new(empty.clone(), empty, member)
+            }
+            _ => anyhow::bail!("invalid category"),
+        };
+        let mut random = native_core::random::LegacyRandom::new(
+            native_resources::blockstates::positional_seed(position[0], position[1], position[2]),
+        );
+        let actual = tags.process(&state, [0.0_f32, 0.2, 0.8, 1.0][mode], &mut random)?;
+        assert_eq!(actual, parse_state(fields[7])?, "{line}");
+        if actual.name != state.name
+            && state
+                .properties
+                .get("waterlogged")
+                .is_some_and(|v| v == "true")
+            && actual
+                .properties
+                .get("waterlogged")
+                .is_some_and(|v| v == "true")
+        {
+            waterlogged_replacements[category] += 1;
+        }
+        waterlogged_count += 1;
+    }
+    assert!(
+        waterlogged_count > 1_000,
+        "too few waterlogged cases: {waterlogged_count}"
+    );
+    assert!(waterlogged_replacements.into_iter().all(|count| count > 0));
+
     // Exercise the same states through the real data-pack tag loader and the
     // processor list used by structure generation.
     let world = temp.path().join("tagged-world");
@@ -161,14 +209,17 @@ fn block_age_processor_matches_java() -> Result<()> {
         pack.join("pack.mcmeta"),
         br#"{"pack":{"description":"test","min_format":121,"max_format":121}}"#,
     )?;
-    for (name, value) in [
-        ("stairs", "minecraft:dirt"),
-        ("slabs", "minecraft:oak_log"),
-        ("walls", "minecraft:redstone_ore"),
+    for (name, values) in [
+        ("stairs", ["minecraft:dirt", "minecraft:iron_chain"]),
+        ("slabs", ["minecraft:oak_log", "minecraft:barrier"]),
+        (
+            "walls",
+            ["minecraft:redstone_ore", "minecraft:hanging_roots"],
+        ),
     ] {
         std::fs::write(
             tags_dir.join(format!("{name}.json")),
-            serde_json::to_vec(&json!({"values":[value]}))?,
+            serde_json::to_vec(&json!({"values":values}))?,
         )?;
     }
     let selection = native_resources::datapacks::DataPackSettings {
@@ -222,5 +273,36 @@ fn block_age_processor_matches_java() -> Result<()> {
         loaded_count += 1;
     }
     assert_eq!(loaded_count, 312);
+    let mut loaded_waterlogged = [0_usize; 3];
+    for line in text.lines().filter(|line| line.starts_with("C\t")) {
+        let fields: Vec<_> = line.split('\t').collect();
+        let category: usize = fields[1].parse()?;
+        let state = parse_state(fields[6])?;
+        if state.name
+            != [
+                "minecraft:iron_chain",
+                "minecraft:barrier",
+                "minecraft:hanging_roots",
+            ][category]
+        {
+            continue;
+        }
+        let mode: usize = fields[2].parse()?;
+        let position = [fields[3].parse()?, fields[4].parse()?, fields[5].parse()?];
+        let result = processors[mode]
+            .process(
+                PlacementBlock {
+                    position,
+                    state,
+                    nbt: Some(marker.clone()),
+                },
+                &mut |_| anyhow::bail!("age processor requested world state"),
+            )?
+            .context("age processor unexpectedly removed block")?;
+        assert_eq!(result.state, parse_state(fields[7])?, "{line}");
+        assert_eq!(result.nbt, Some(marker.clone()));
+        loaded_waterlogged[category] += 1;
+    }
+    assert!(loaded_waterlogged.into_iter().all(|count| count > 0));
     Ok(())
 }

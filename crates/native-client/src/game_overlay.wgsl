@@ -53,3 +53,12 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     return color;
 }
+
+@fragment
+fn inverted_fragment(input: VertexOutput) -> @location(0) vec4<f32> {
+    let dimensions = textureDimensions(overlay);
+    let pixel = min(vec2<u32>(input.position.xy / gui.x), dimensions - vec2<u32>(1u));
+    let color = textureLoad(overlay, vec2<i32>(pixel), 0);
+    if color.a < 0.1 { discard; }
+    return color;
+}

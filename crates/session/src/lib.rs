@@ -2305,6 +2305,7 @@ impl LocalSession {
         ) {
             eprintln!("player attack speed equipment: {error:#}");
         }
+        self.first_person.attack_strength = self.attack_charge.attack_strength();
         self.first_person.item_use = self.food_use.visual_state();
         self.first_person
             .tick_with_swap(&self.inventory, self.attack_charge.item_swap_scale(1.0));

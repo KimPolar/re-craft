@@ -55,4 +55,8 @@ impl GuiScaleBinding {
             self.scale = scale;
         }
     }
+
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
 }

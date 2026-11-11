@@ -243,6 +243,8 @@ pub struct FirstPersonState {
     pub off: HandState,
     pub swing: SwingState,
     pub item_use: Option<ItemUseState>,
+    /// HUD charge at the end of the last player tick, absent if unresolved.
+    pub attack_strength: Option<f32>,
     inventory_revision: Option<u64>,
     interaction_animations: Option<[SwingAnimation; 2]>,
 }
@@ -694,7 +696,7 @@ public class SwingOracle {
       chargePlayer.speed=speed; ticker.setInt(chargePlayer,ticks);
       var stack=new ItemStack(Items.STONE,1); stack.set(DataComponents.MINIMUM_ATTACK_CHARGE,minimum);
       var row=new JsonArray(); row.add(speed); row.add(minimum); row.add(ticks);
-      row.add(chargePlayer.cannotAttackWithItem(stack,0)); charges.add(row);
+      row.add(chargePlayer.cannotAttackWithItem(stack,0)); row.add(chargePlayer.getAttackStrengthScale(0f)); charges.add(row);
     }
     var attackPlayer=(AttackPlayer)unsafe.allocateInstance(AttackPlayer.class);
     var attackMode=(AttackMode)unsafe.allocateInstance(AttackMode.class);
@@ -953,6 +955,10 @@ public class SwingOracle {
                 !crate::combat::AttackCharge::for_test(ticks, speed).can_attack(Some(&stack)),
                 row[3].as_bool().unwrap(),
                 "{speed} {minimum} {ticks}"
+            );
+            assert_eq!(
+                crate::combat::AttackCharge::for_test(ticks, speed).attack_strength(),
+                Some(row[4].as_f64().unwrap() as f32)
             );
         }
         let patches = result["prototypePatches"].as_array().unwrap();

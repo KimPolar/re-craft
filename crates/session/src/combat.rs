@@ -118,6 +118,13 @@ impl AttackCharge {
         !((self.ticks as f32 / delay) < minimum)
     }
 
+    /// Player.getAttackStrengthScale(0) as used by Java's HUD.
+    pub(crate) fn attack_strength(&self) -> Option<f32> {
+        let speed = self.speed?;
+        let delay = ((1.0 / speed) * 20.0) as f32;
+        Some((self.ticks as f32 / delay).clamp(0.0, 1.0))
+    }
+
     /// Player.getItemSwapScale uses the same attack-speed delay, but its own
     /// ticker: a piercing attack resets attack charge without resetting this.
     pub(crate) fn item_swap_scale(&self, partial: f32) -> f32 {

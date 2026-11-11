@@ -250,6 +250,7 @@ pub struct Renderer {
     first_person: FirstPersonRenderer,
     crosshair_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
+    inverted_overlay_pipeline: wgpu::RenderPipeline,
     gui_scale: crate::gui_gpu::GuiScaleBinding,
     overlay_layout: wgpu::BindGroupLayout,
     overlay_sampler: wgpu::Sampler,
@@ -263,6 +264,9 @@ pub struct Renderer {
     hand_glint_last: GlintUniform,
     overlay_has_glint: bool,
     pre_blur_overlay: PreBlurOverlay,
+    attack_background: PreBlurOverlay,
+    attack_progress: PreBlurOverlay,
+    attack_indicator_visible: bool,
     overlay_glint_started: Instant,
     overlay_glint_available: bool,
     overlay_bind_group: Option<wgpu::BindGroup>,
@@ -1360,6 +1364,44 @@ impl Renderer {
             cache: None,
         });
 
+        let inverted_overlay_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("crosshair indicator pipeline"),
+                layout: Some(&overlay_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("inverted_fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDst,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::Zero,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
         let first_person = FirstPersonRenderer::new(
             &device,
             config.format,
@@ -1441,6 +1483,7 @@ impl Renderer {
             first_person,
             crosshair_pipeline,
             overlay_pipeline,
+            inverted_overlay_pipeline,
             gui_scale,
             overlay_layout,
             overlay_sampler,
@@ -1454,6 +1497,9 @@ impl Renderer {
             hand_glint_last: glint_uniform(0, 0.5, 0.75, false),
             overlay_has_glint: false,
             pre_blur_overlay: PreBlurOverlay::default(),
+            attack_background: PreBlurOverlay::default(),
+            attack_progress: PreBlurOverlay::default(),
+            attack_indicator_visible: false,
             overlay_glint_started: Instant::now(),
             overlay_glint_available: glint_texture.is_some(),
             overlay_bind_group: None,
@@ -1770,6 +1816,41 @@ impl Renderer {
         self.hide_crosshair = old_hide_crosshair;
         self.pre_blur_overlay = previous;
         result
+    }
+
+    /// Upload the two inverse-blended indicator sprites independently.
+    pub fn update_attack_indicator(&mut self, layers: Option<&(Canvas, Canvas)>) -> Result<()> {
+        self.attack_indicator_visible = layers.is_some();
+        let Some((background, progress)) = layers else {
+            return Ok(());
+        };
+        let old_hide_crosshair = self.hide_crosshair;
+        for (index, canvas) in [background, progress].into_iter().enumerate() {
+            let mut previous = if index == 0 {
+                std::mem::take(&mut self.attack_background)
+            } else {
+                std::mem::take(&mut self.attack_progress)
+            };
+            std::mem::swap(&mut self.overlay_texture, &mut previous.texture);
+            std::mem::swap(&mut self.overlay_glint_mask, &mut previous.mask);
+            std::mem::swap(&mut self.overlay_bind_group, &mut previous.binding);
+            std::mem::swap(&mut self.overlay_size, &mut previous.size);
+            std::mem::swap(&mut self.overlay_has_glint, &mut previous.has_glint);
+            let result = self.update_overlay(canvas, old_hide_crosshair);
+            std::mem::swap(&mut self.overlay_texture, &mut previous.texture);
+            std::mem::swap(&mut self.overlay_glint_mask, &mut previous.mask);
+            std::mem::swap(&mut self.overlay_bind_group, &mut previous.binding);
+            std::mem::swap(&mut self.overlay_size, &mut previous.size);
+            std::mem::swap(&mut self.overlay_has_glint, &mut previous.has_glint);
+            self.hide_crosshair = old_hide_crosshair;
+            if index == 0 {
+                self.attack_background = previous;
+            } else {
+                self.attack_progress = previous;
+            }
+            result?;
+        }
+        Ok(())
     }
 
     pub fn update_gui_glint(&mut self, speed: f64, strength: f32) {
@@ -2531,6 +2612,45 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..12, 0..1);
         }
+        if !self.hide_crosshair
+            && !self.hud_hidden
+            && self.attack_indicator_visible
+            && let Some((x, y, w, h)) = crate::attack_hud::scissor(
+                self.attack_background.size,
+                self.gui_scale.scale(),
+                (self.config.width, self.config.height),
+            )
+        {
+            for binding in [
+                self.attack_background.binding.as_ref(),
+                self.attack_progress.binding.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("crosshair attack indicator pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.inverted_overlay_pipeline);
+                pass.set_scissor_rect(x, y, w, h);
+                pass.set_bind_group(0, binding, &[]);
+                pass.set_bind_group(1, &self.gui_scale.bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        }
         if self.screen_blur_radius > 0 {
             if let Some(binding) = &self.pre_blur_overlay.binding {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3040,10 +3160,17 @@ mod tests {
             window::{Window, WindowId},
         };
 
+        #[derive(Clone, Copy)]
+        enum Layer {
+            Main,
+            PreBlur,
+            Attack,
+        }
+
         fn render(
             renderer: &super::Renderer,
             uniform: super::GlintUniform,
-            pre_blur: bool,
+            layer: Layer,
         ) -> Vec<u8> {
             let size = wgpu::Extent3d {
                 width: 64,
@@ -3083,7 +3210,16 @@ mod tests {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(if matches!(layer, Layer::Attack) {
+                                wgpu::Color {
+                                    r: 0.25,
+                                    g: 0.25,
+                                    b: 0.25,
+                                    a: 1.0,
+                                }
+                            } else {
+                                wgpu::Color::BLACK
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -3092,16 +3228,30 @@ mod tests {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&renderer.overlay_pipeline);
-                let binding = if pre_blur {
-                    renderer.pre_blur_overlay.binding.as_ref()
-                } else {
-                    renderer.overlay_bind_group.as_ref()
-                }
-                .unwrap();
-                pass.set_bind_group(0, binding, &[]);
                 pass.set_bind_group(1, &renderer.gui_scale.bind_group, &[]);
-                pass.draw(0..6, 0..1);
+                match layer {
+                    Layer::Main | Layer::PreBlur => {
+                        pass.set_pipeline(&renderer.overlay_pipeline);
+                        let binding = if matches!(layer, Layer::PreBlur) {
+                            renderer.pre_blur_overlay.binding.as_ref()
+                        } else {
+                            renderer.overlay_bind_group.as_ref()
+                        }
+                        .unwrap();
+                        pass.set_bind_group(0, binding, &[]);
+                        pass.draw(0..6, 0..1);
+                    }
+                    Layer::Attack => {
+                        pass.set_pipeline(&renderer.inverted_overlay_pipeline);
+                        for binding in [
+                            &renderer.attack_background.binding,
+                            &renderer.attack_progress.binding,
+                        ] {
+                            pass.set_bind_group(0, binding.as_ref().unwrap(), &[]);
+                            pass.draw(0..6, 0..1);
+                        }
+                    }
+                }
             }
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -3198,12 +3348,20 @@ mod tests {
                 ]; 256];
                 canvas.mark_item_glint_with_mapping(&icon, atlas_rect, None, Some(&mapped));
                 renderer.update_overlay(&canvas, false).unwrap();
-                let still = render(&renderer, super::glint_uniform(0, 0.5, 0.0, true), false);
-                let first = render(&renderer, super::glint_uniform(0, 0.5, 0.75, true), false);
+                let still = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, true),
+                    Layer::Main,
+                );
+                let first = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.75, true),
+                    Layer::Main,
+                );
                 let second = render(
                     &renderer,
                     super::glint_uniform(12_000, 0.5, 0.75, true),
-                    false,
+                    Layer::Main,
                 );
                 assert_ne!(
                     &still[0..64],
@@ -3247,18 +3405,40 @@ mod tests {
                     [80, 80, 80, 255],
                 );
                 renderer.update_overlay(&plain, false).unwrap();
-                let plain_off = render(&renderer, super::glint_uniform(0, 0.5, 0.0, true), false);
-                let plain_on = render(&renderer, super::glint_uniform(0, 0.5, 0.75, true), false);
+                let plain_off = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, true),
+                    Layer::Main,
+                );
+                let plain_on = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.75, true),
+                    Layer::Main,
+                );
                 assert_eq!(plain_on, plain_off, "old screen glint mask must be cleared");
-                let hud_off = render(&renderer, super::glint_uniform(0, 0.5, 0.0, true), true);
-                let hud_on = render(&renderer, super::glint_uniform(0, 0.5, 0.75, true), true);
+                let hud_off = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, true),
+                    Layer::PreBlur,
+                );
+                let hud_on = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.75, true),
+                    Layer::PreBlur,
+                );
                 assert_ne!(hud_on, hud_off, "HUD glint must remain active");
                 renderer.update_pre_blur_overlay(&plain).unwrap();
                 renderer.update_overlay(&canvas, false).unwrap();
-                let hud_plain_off =
-                    render(&renderer, super::glint_uniform(0, 0.5, 0.0, true), true);
-                let hud_plain_on =
-                    render(&renderer, super::glint_uniform(0, 0.5, 0.75, true), true);
+                let hud_plain_off = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, true),
+                    Layer::PreBlur,
+                );
+                let hud_plain_on = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.75, true),
+                    Layer::PreBlur,
+                );
                 assert_eq!(
                     hud_plain_on, hud_plain_off,
                     "old HUD glint mask must be cleared"
@@ -3273,7 +3453,11 @@ mod tests {
                 }
                 renderer.set_gui_scale(3);
                 renderer.update_overlay(&partial, false).unwrap();
-                let pixels = render(&renderer, super::glint_uniform(0, 0.5, 0.0, false), false);
+                let pixels = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, false),
+                    Layer::Main,
+                );
                 let pixel = |x: usize, y: usize| &pixels[y * 256 + x * 4..y * 256 + x * 4 + 4];
                 for y in 0..16 {
                     for x in 0..64 {
@@ -3286,6 +3470,50 @@ mod tests {
                         }
                     }
                 }
+                renderer.set_gui_scale(1);
+                let mut background = Canvas::new(64, 16);
+                let mut foreground = Canvas::new(64, 16);
+                background.fill(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 8,
+                        h: 16,
+                    },
+                    [255, 255, 255, 255],
+                );
+                foreground.fill(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        w: 4,
+                        h: 16,
+                    },
+                    [255, 255, 255, 255],
+                );
+                renderer
+                    .update_attack_indicator(Some(&(background, foreground)))
+                    .unwrap();
+                let inverted = render(
+                    &renderer,
+                    super::glint_uniform(0, 0.5, 0.0, false),
+                    Layer::Attack,
+                );
+                let pixel = |x: usize| &inverted[x * 4..x * 4 + 4];
+                assert!(
+                    pixel(0)
+                        .iter()
+                        .zip(pixel(10))
+                        .all(|(a, b)| a.abs_diff(*b) <= 2),
+                    "two inversions must restore the original color within quantization error"
+                );
+                assert_ne!(
+                    pixel(6),
+                    pixel(10),
+                    "one inversion must change the background"
+                );
+                renderer.update_attack_indicator(None).unwrap();
+                assert!(!renderer.attack_indicator_visible);
                 event_loop.exit();
             }
             fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}

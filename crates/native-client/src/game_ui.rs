@@ -149,6 +149,7 @@ struct DrawKey {
     hud: HudDisplay,
     effects: crate::status_effect_ui::Frame,
     experience: crate::experience_hud::Display,
+    attack_indicator: crate::attack_hud::Display,
     hud_tick: Option<u64>,
     chat: Option<crate::chat_hud::DisplayKey>,
     chat_input_tick: Option<u64>,
@@ -250,6 +251,8 @@ pub struct GameUi {
     effect_source: Arc<[native_session::survival::DisplayEffect]>,
     effects: crate::status_effect_ui::Frame,
     experience: crate::experience_hud::Display,
+    attack_indicator: crate::attack_hud::Display,
+    attack_indicator_upload: Option<(crate::attack_hud::Display, u32, u32)>,
     death: Option<DeathScreen>,
     system_messages: Arc<[native_session::SystemMessage]>,
     locked_chest_message: Option<Arc<native_session::LockedChestMessage>>,
@@ -417,6 +420,8 @@ impl GameUi {
                 Default::default(),
                 native_session::GameMode::Survival,
             ),
+            attack_indicator: crate::attack_hud::Display::default(),
+            attack_indicator_upload: None,
             death: None,
             system_messages: Arc::from([]),
             locked_chest_message: None,
@@ -1218,6 +1223,7 @@ impl GameUi {
                     self.update_cursor_scale();
                 }
                 self.assets = Arc::new(assets);
+                self.attack_indicator_upload = None;
                 self.video_error = None;
             }
             Err(error) => self.video_error = Some(format!("{error:#}")),
@@ -2626,6 +2632,20 @@ impl GameUi {
             if let Some(hud) = self.pre_blur_hud.take() {
                 renderer.update_pre_blur_overlay(&hud)?;
             }
+            let indicator_key = (
+                self.attack_indicator,
+                canvas.width as u32,
+                canvas.height as u32,
+            );
+            if self.attack_indicator_upload != Some(indicator_key) {
+                let layers = crate::attack_hud::crosshair_layers(
+                    (canvas.width as u32, canvas.height as u32),
+                    &self.assets.hud,
+                    self.attack_indicator,
+                );
+                renderer.update_attack_indicator(layers.as_ref())?;
+                self.attack_indicator_upload = Some(indicator_key);
+            }
             renderer.update_overlay(&canvas, self.paused || inventory.is_open())?;
         }
         if self.held_models.poll() {
@@ -2945,6 +2965,10 @@ impl GameUi {
                 .with_poison_effect(snapshot.poison_effect);
         self.experience =
             crate::experience_hud::Display::new(snapshot.experience, snapshot.game_mode);
+        self.attack_indicator = crate::attack_hud::Display::new(
+            snapshot.first_person.attack_strength,
+            snapshot.game_mode,
+        );
     }
 
     fn compose(
@@ -3077,6 +3101,7 @@ impl GameUi {
                 self.effects.hud_key()
             },
             experience: self.experience,
+            attack_indicator: self.attack_indicator,
             hud_tick: self.hud.animation_key(tick),
             chat: crate::chat_hud::display_key(
                 &self.assets.chat,

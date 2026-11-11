@@ -109,6 +109,8 @@ pub struct LanguageInfo {
 }
 
 pub struct HudSprites {
+    pub crosshair_attack_background: GuiSprite,
+    pub crosshair_attack_progress: GuiSprite,
     pub effect_background: GuiSprite,
     pub effect_background_ambient: GuiSprite,
     pub effect_icons: Vec<GuiSprite>,
@@ -170,6 +172,8 @@ impl HudSprites {
             )
         };
         Ok(Self {
+            crosshair_attack_background: sprite("crosshair_attack_indicator_background")?,
+            crosshair_attack_progress: sprite("crosshair_attack_indicator_progress")?,
             effect_background: sprite("effect_background")?,
             effect_background_ambient: sprite("effect_background_ambient")?,
             effect_icons,

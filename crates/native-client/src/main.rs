@@ -3,6 +3,7 @@
 mod accessibility_ui;
 mod action_bar;
 mod ambient_bubbles;
+mod attack_hud;
 mod attribute_tooltip;
 mod audio;
 mod banner_item;

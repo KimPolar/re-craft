@@ -5439,7 +5439,12 @@ mod tests {
                 {
                     self.first_rendered = Some(self.start.elapsed());
                 }
-                if self.start.elapsed() >= Duration::from_secs(7) {
+                let duration = if std::env::var_os("NATIVE_MENU_TEST_LONG").is_some() {
+                    Duration::from_secs(14)
+                } else {
+                    Duration::from_secs(7)
+                };
+                if self.start.elapsed() >= duration {
                     event_loop.exit();
                 }
             }
@@ -5451,6 +5456,9 @@ mod tests {
         let mut state = State::new(game, Vec::new());
         state.asset_load = None;
         state.assets = Some(assets);
+        if std::env::var_os("NATIVE_MENU_TEST_NO_VSYNC").is_some() {
+            state.video.vsync = false;
+        }
         state.screen = if std::env::var_os("NATIVE_MENU_TEST_OPTIONS").is_some() {
             Screen::Options
         } else {

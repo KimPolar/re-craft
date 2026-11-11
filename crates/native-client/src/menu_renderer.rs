@@ -222,6 +222,12 @@ impl MenuRenderer {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| anyhow!("menu surface has no compatible configuration"))?;
+        #[cfg(test)]
+        if let Ok(value) = std::env::var("NATIVE_MENU_TEST_FRAME_LATENCY")
+            && let Ok(value) = value.parse::<u32>()
+        {
+            config.desired_maximum_frame_latency = value;
+        }
         let capabilities = surface.get_capabilities(&adapter);
         let screenshot_surface_copy = capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if screenshot_surface_copy {

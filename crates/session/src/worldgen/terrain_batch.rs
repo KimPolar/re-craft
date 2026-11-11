@@ -1365,6 +1365,34 @@ impl FreshTerrainBatch {
         Ok(())
     }
 
+    /// Create the initial postprocessing checkpoint from the same frozen
+    /// block loot tables used by the generated session.
+    pub fn fresh_postprocessing_drops(
+        &self,
+        world_seed: i64,
+        enabled: bool,
+    ) -> Result<super::postprocessing_drops::GeneratedBlockDrops> {
+        ensure!(
+            world_seed == self.generator.seed,
+            "generated drop world seed differs"
+        );
+        let content = self
+            .session_content
+            .as_ref()
+            .context("generated session content is missing")?;
+        let mut entity_seed = [0_u8; 8];
+        getrandom::fill(&mut entity_seed)
+            .map_err(|error| anyhow::anyhow!("cannot seed generated items: {error}"))?;
+        Ok(super::postprocessing_drops::GeneratedBlockDrops::new(
+            Arc::clone(&content.block_loot),
+            world_seed,
+            native_persistence::random_sequences::RandomSequences::read(None)?,
+            crate::fresh_level_random(),
+            native_core::random::XoroshiroRandom::new(i64::from_ne_bytes(entity_seed)),
+            enabled,
+        ))
+    }
+
     /// Initialize a new, unadvanced generated player's gameplay data.
     pub fn apply_session_content(
         &self,

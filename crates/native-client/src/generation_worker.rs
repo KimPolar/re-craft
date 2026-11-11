@@ -2932,6 +2932,16 @@ where
     let targets = checked_spawn_targets(&mut ready)?;
     let mut converted_order: Vec<_> = targets.iter().copied().collect();
     let required_neighbors = initialized_neighbors(&targets)?;
+    let initial_drops = ready
+        .level_settings
+        .as_ref()
+        .map(|settings| {
+            ready.batch.fresh_postprocessing_drops(
+                settings.session.seed,
+                settings.game_rules.block_drops,
+            )
+        })
+        .transpose()?;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(None);
@@ -2952,6 +2962,9 @@ where
                 0,
             )?;
             stage.set_water_source_conversion(water_source_conversion)?;
+            if let Some(drops) = &initial_drops {
+                stage.set_block_drops(drops.clone())?;
+            }
             set_phase(progress, GenerationPhase::Postprocessing);
             'chunks: for &pos in &targets {
                 loop {
@@ -8063,6 +8076,13 @@ mod tests {
                 };
                 if !spawn_mobs {
                     let previous = ready.postprocessed.take().context("postprocessing missing")?;
+                    let initial = previous
+                        .region
+                        .block_drops()
+                        .context("drop checkpoint missing")?;
+                    assert_eq!(initial.world_seed(), 42);
+                    assert!(initial.block_drops_enabled());
+                    assert_eq!(initial.operations(), 0);
                     let converted = previous.region.ticks().registration_order().to_vec();
                     let mut resources =
                         native_resources::packs::ResourceStack::open(&game_for_drop_test)?;

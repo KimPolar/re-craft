@@ -14913,13 +14913,9 @@ impl LoadedSession {
                     value >> 4
                 };
                 crate::snow::melts_in_block_light(light)
-                    && *loot_by_state.entry(id.0).or_insert_with(|| {
-                        self.dropped_items.can_drop_block_without_entity(
-                            "minecraft:snow",
-                            &state.properties,
-                            self.loot.as_deref(),
-                        )
-                    })
+                    && *loot_by_state
+                        .entry(id.0)
+                        .or_insert_with(|| self.preview_block_loot_without_entity(state))
             })
         })
     }
@@ -14937,10 +14933,10 @@ impl LoadedSession {
         ) else {
             return false;
         };
-        let Some(state) = self.world.state(id) else {
+        let Some(state) = self.world.state(id).cloned() else {
             return false;
         };
-        if native_world::collision::snow_layers(state).is_none() {
+        if native_world::collision::snow_layers(&state).is_none() {
             return false;
         }
         let chunk = ChunkPos {
@@ -14959,20 +14955,28 @@ impl LoadedSession {
         {
             return false;
         }
-        if self
-            .dropped_items
-            .drop_block_without_entity(
-                absolute,
-                "minecraft:snow",
-                &state.properties,
-                self.block_drops,
-                self.loot.as_deref(),
-            )
-            .is_err()
-        {
+        let Some(checked) = self.check_block_set(relative, self.states[0], true, false) else {
             return false;
-        }
-        self.set(relative, self.states[0])
+        };
+        let Ok((drops, _)) = self.stage_block_loot_without_entity(&state) else {
+            return false;
+        };
+        self.dropped_items.drop_block_resources(
+            absolute,
+            drops,
+            None,
+            self.block_drops,
+            &mut self.level_random,
+        );
+        assert!(self.apply_block_set(relative, self.states[0], true, checked));
+        self.dispatch_vibration(
+            "minecraft:block_destroy",
+            absolute.as_dvec3() + DVec3::splat(0.5),
+            None,
+            None,
+            Some(&state.name),
+        );
+        true
     }
 
     fn mining_target(&self) -> Option<mining::Candidate> {
@@ -16021,7 +16025,7 @@ impl LoadedSession {
             if button_support_face(&replacement_state, offset) != Some(true) {
                 if !notify
                     || button_support_face(&replacement_state, offset) != Some(false)
-                    || !self.can_drop_ladder(ladder)
+                    || !self.can_stage_block_loot_without_entity(ladder)
                     || !self.ladder_cascade_safe(neighbor)
                 {
                     return None;
@@ -16068,7 +16072,7 @@ impl LoadedSession {
                 else {
                     continue;
                 };
-                if !self.can_drop_ladder(ladder) {
+                if !self.can_stage_block_loot_without_entity(ladder) {
                     return false;
                 }
                 pending.push(neighbor);
@@ -19595,9 +19599,9 @@ impl LoadedSession {
         self.stage_block_loot(block, None, false)
     }
 
-    /// Check the entire table and its current random stream before a support
-    /// change can trigger a chain of ladder removals.
-    fn can_drop_ladder(&self, block: &BlockState) -> bool {
+    /// Check all table branches and the current random stream before a block
+    /// change can trigger non-entity drops.
+    fn can_stage_block_loot_without_entity(&self, block: &BlockState) -> bool {
         let Some(tables) = self.loot.as_ref() else {
             return false;
         };
@@ -19609,6 +19613,15 @@ impl LoadedSession {
         if !tables.fully_supported_player_block_for_tool(&block.name, tool) {
             return false;
         }
+        self.preview_block_loot_without_entity(block)
+    }
+
+    /// Preview only the actual branch for an independent block tick. Unlike
+    /// a support cascade, the tick rechecks this immediately before mutation.
+    fn preview_block_loot_without_entity(&self, block: &BlockState) -> bool {
+        let Some(tables) = self.loot.as_ref() else {
+            return false;
+        };
         match tables.random_sequence_for_block(&block.name) {
             Ok(Some(id)) => {
                 let Some(sequences) = &self.random_sequences else {
@@ -67583,6 +67596,173 @@ pub(crate) mod tests {
                     assert_eq!(item.stack.count(), 2);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn snow_melting_uses_named_loot_and_level_random_for_both_drop_rules() {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/snow.json").then(|| br#"{"type":"minecraft:block","random_sequence":"example:snow","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:stick","condition":{"type":"minecraft:random_chance","chance":1.0}}]}]}"#.to_vec()))
+            }
+        }
+        let tables = Arc::new(BlockLootTables::load(&mut Loot).unwrap());
+        for enabled in [false, true] {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session.set_block_drops(enabled);
+            session.level_random = native_core::random::LegacyRandom::new(9182);
+            let pos = IVec3::new(8, 5, 8);
+            let absolute = session.origin + pos;
+            let snow = session.intern_block(state("minecraft:snow", &[("layers", "1")]));
+            assert!(session.set(pos, snow));
+            session.pending_light.clear();
+            let home = session.player_chunk().unwrap();
+            let chunk = Arc::make_mut(
+                Arc::make_mut(&mut session.world)
+                    .chunks
+                    .get_mut(&home)
+                    .unwrap(),
+            );
+            chunk.block_light_correct = true;
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).block_light =
+                Some(Box::new([0xff; LIGHT_BYTES]));
+            assert!(!session.melt_snow_at(pos, absolute));
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:snow"
+            );
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            let before = session
+                .random_sequences
+                .as_ref()
+                .unwrap()
+                .data
+                .get("example:snow", 42)
+                .unwrap()
+                .state();
+            let mut expected = session.level_random.clone();
+            let expected_pos = DVec3::new(
+                f64::from(absolute.x) + 0.25 + expected.next_double() * 0.5,
+                f64::from(absolute.y) + 0.125 + expected.next_double() * 0.5,
+                f64::from(absolute.z) + 0.25 + expected.next_double() * 0.5,
+            );
+            let index = pos.x as usize + pos.z as usize * 16 + pos.y as usize * 256;
+            assert!(session.snow_can_melt_in_section(home, 0, &[index]));
+            assert_eq!(
+                before,
+                session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("example:snow", 42)
+                    .unwrap()
+                    .state()
+            );
+            assert!(session.melt_snow_at(pos, absolute));
+            assert_eq!(
+                session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap()
+                    .name,
+                "minecraft:air"
+            );
+            assert_ne!(
+                before,
+                session
+                    .random_sequences
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .get("example:snow", 42)
+                    .unwrap()
+                    .state()
+            );
+            assert_eq!(session.level_random.next_int(), expected.next_int());
+            let items = session.dropped_items.snapshot();
+            assert_eq!(items.len(), usize::from(enabled));
+            if enabled {
+                assert_eq!(items[0].stack.id(), "minecraft:stick");
+                assert_eq!(items[0].position, expected_pos);
+            }
+        }
+    }
+
+    #[test]
+    fn snow_loot_preview_skips_unreachable_unsupported_branches() {
+        use native_resources::packs::ResourceProvider;
+        struct Loot;
+        impl ResourceProvider for Loot {
+            fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn read_data(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+                Ok((path == "data/minecraft/loot_table/blocks/snow.json").then(|| br#"{"type":"minecraft:block","pools":[{"rolls":1,"condition":{"type":"minecraft:entity_properties","entity":"this","predicate":{}},"entries":[{"type":"example:unsupported"}]}]}"#.to_vec()))
+            }
+        }
+        let mut session = session();
+        session.set_block_loot(Arc::new(BlockLootTables::load(&mut Loot).unwrap()));
+        let snow = state("minecraft:snow", &[("layers", "1")]);
+        assert!(!session.can_stage_block_loot_without_entity(&snow));
+        assert!(session.preview_block_loot_without_entity(&snow));
+    }
+
+    #[test]
+    #[ignore = "requires the locally installed Minecraft 26.3 assets"]
+    fn vanilla_snow_melting_accepts_the_original_loot_table() {
+        let game = std::env::var_os("MINECRAFT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| native_resources::default_minecraft_dir().unwrap());
+        let mut resources = native_resources::packs::ResourceStack::open(&game).unwrap();
+        let tables = Arc::new(BlockLootTables::load(&mut resources).unwrap());
+        for layers in 1..=8 {
+            let mut session = session();
+            session.set_block_loot(Arc::clone(&tables));
+            session
+                .set_random_sequences(
+                    42,
+                    native_persistence::random_sequences::RandomSequences::read(None).unwrap(),
+                )
+                .unwrap();
+            let pos = IVec3::new(8, 5, 8);
+            let absolute = session.origin + pos;
+            let snow =
+                session.intern_block(state("minecraft:snow", &[("layers", &layers.to_string())]));
+            assert!(session.set(pos, snow));
+            session.pending_light.clear();
+            let home = session.player_chunk().unwrap();
+            let chunk = Arc::make_mut(
+                Arc::make_mut(&mut session.world)
+                    .chunks
+                    .get_mut(&home)
+                    .unwrap(),
+            );
+            chunk.block_light_correct = true;
+            Arc::make_mut(chunk.sections.get_mut(&0).unwrap()).block_light =
+                Some(Box::new([0xff; LIGHT_BYTES]));
+            let index = pos.x as usize + pos.z as usize * 16 + pos.y as usize * 256;
+            assert!(
+                session.snow_can_melt_in_section(home, 0, &[index]),
+                "layers {layers}"
+            );
+            assert!(session.melt_snow_at(pos, absolute), "layers {layers}");
+            assert!(session.dropped_items.snapshot().is_empty());
         }
     }
 

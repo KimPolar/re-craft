@@ -4551,6 +4551,58 @@ impl FreshTerrainBatch {
         self.terrain.as_mut().unwrap().final_heightmaps.remove(&pos);
     }
 
+    #[cfg(test)]
+    pub(super) fn inject_water_ladder_fixture(&mut self, pos: ChunkPos) -> Result<()> {
+        ensure!(
+            self.is_complete() && self.light_tracker.is_none() && self.light_engine.is_none(),
+            "fixture requires an unlit completed batch"
+        );
+        ensure!(
+            self.schedule.completed(pos) == Some(GenerationStage::Features),
+            "fixture requires completed features"
+        );
+        let terrain = self.terrain.as_mut().context("fixture terrain missing")?;
+        let x = pos.x.checked_mul(16).context("fixture X overflow")?;
+        let z = pos.z.checked_mul(16).context("fixture Z overflow")?;
+        let world = Arc::make_mut(&mut terrain.world);
+        for (dx, name, properties) in [
+            (
+                8,
+                "minecraft:water",
+                BTreeMap::from([("level".into(), "0".into())]),
+            ),
+            (9, "minecraft:air", BTreeMap::new()),
+            (
+                10,
+                "minecraft:ladder",
+                BTreeMap::from([
+                    ("facing".into(), "east".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]),
+            ),
+        ] {
+            let id = world.intern_state(BlockState {
+                name: name.into(),
+                properties,
+            });
+            world
+                .set_block_id(x + dx, 8, z + 8, id)
+                .map_err(|error| anyhow::anyhow!("fixture block: {error:?}"))?;
+        }
+        let marks = terrain
+            .feature_postprocessing
+            .entry(pos)
+            .or_insert_with(|| {
+                Arc::new(
+                    native_core::postprocessing::PostProcessing::new(terrain.min_y, terrain.height)
+                        .unwrap(),
+                )
+            });
+        Arc::make_mut(marks).mark(x + 8, 8, z + 8);
+        self.lit_cache = None;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Option<Arc<World>> {
         self.terrain.as_ref().map(CarvedTerrainWorld::snapshot)
     }

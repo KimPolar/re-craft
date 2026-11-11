@@ -6939,6 +6939,247 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn generated_ladder_drop_proves_inert_and_round_trips_world() -> Result<()> {
+        use native_core::random::{LegacyRandom, XoroshiroRandom};
+        use native_persistence::{
+            nbt::{NamedTag, Tag, TagType},
+            save::FreshWorldDraft,
+            world::{DimensionId, SavedClock, TARGET_DATA_VERSION, WorldReader},
+        };
+        use native_resources::{
+            carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,
+        };
+        use native_world::loaded::{BlockState, ChunkPos};
+        struct FixtureData(native_resources::packs::ResourceStack);
+        impl ResourceProvider for FixtureData {
+            fn read_asset(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                self.0.read_asset(path)
+            }
+            fn read_data(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+                if path.starts_with("data/minecraft/worldgen/biome/") {
+                    return Ok(Some(br#"{"has_precipitation":true,"temperature":0.8,"carvers":[],"features":[]}"#.to_vec()));
+                }
+                self.0.read_data(path)
+            }
+            fn list_data(&mut self, folder: &str) -> Result<Vec<ResourceId>> {
+                if folder == "worldgen/biome" {
+                    Data.list_data(folder)
+                } else {
+                    self.0.list_data(folder)
+                }
+            }
+        }
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let ids = resources.vanilla_block_ids()?;
+        let mut data = FixtureData(resources);
+        let tags = CarverBlockTags::load(&mut data, &ids)?;
+        let mut settings = definition();
+        settings["settings"]["disable_mob_generation"] = json!(true);
+        let generator =
+            TerrainGenerator::without_terrain_adjustments(&mut data, &settings, 42, 0, 16)?;
+        let mut batch =
+            FreshTerrainBatch::new_without_structures(generator, tags, "minecraft:overworld")?;
+        batch.enable_decoration(
+            &mut data,
+            &BTreeSet::new(),
+            ids,
+            &GeneratedDimensionLighting {
+                dimension: ResourceId::parse("minecraft:overworld")?,
+                dimension_type: None,
+                inline_dimension_type: None,
+                min_y: 0,
+                height: 16,
+                has_skylight: true,
+                ambient_light: Some(0.0),
+            },
+        )?;
+        batch.enable_light_initialization(registry)?;
+        let light: Vec<_> = (-2..=2)
+            .flat_map(|x| (-2..=2).map(move |z| ChunkPos { x, z }))
+            .collect();
+        let converted: Vec<_> = (-1..=1)
+            .flat_map(|x| (-1..=1).map(move |z| ChunkPos { x, z }))
+            .collect();
+        for &pos in &light {
+            batch.request_features(pos)?;
+        }
+        let mut classify = |v: &Value| -> Result<CarverBlockState> {
+            let id = v
+                .as_str()
+                .or_else(|| v.get("id").and_then(Value::as_str))
+                .context("state ID")?;
+            Ok(CarverBlockState {
+                is_air: id == "minecraft:air",
+                has_fluid: matches!(id, "minecraft:water" | "minecraft:lava"),
+            })
+        };
+        let mut resolve = |v: &Value| -> Result<BlockState> {
+            Ok(BlockState {
+                name: v
+                    .as_str()
+                    .or_else(|| v.get("id").and_then(Value::as_str))
+                    .context("state ID")?
+                    .into(),
+                properties: BTreeMap::new(),
+            })
+        };
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)?
+            .is_some()
+        {}
+        let center = ChunkPos { x: 0, z: 0 };
+        batch.inject_water_ladder_fixture(center)?;
+        batch.request_light_initialization_many(light.iter().copied())?;
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)?
+            .is_some()
+        {}
+        batch.seal_for_light_propagation()?;
+        for &pos in &converted {
+            batch.request_light(pos)?;
+        }
+        while batch
+            .step(&mut data, &mut classify, &mut resolve)?
+            .is_some()
+        {}
+        for &pos in &converted {
+            batch.request_spawn_without_mobs(pos, false)?;
+            while batch
+                .step(&mut data, &mut classify, &mut resolve)?
+                .is_some()
+            {}
+        }
+        let mut stage = batch.begin_generated_postprocessing_with_neighbors(
+            [center],
+            converted.iter().copied(),
+            0,
+            0,
+        )?;
+        stage.set_water_source_conversion(false)?;
+        stage.set_block_drops(postprocessing_drops::GeneratedBlockDrops::new(
+            Arc::new(native_resources::loot::BlockLootTables::load(&mut data)?),
+            42,
+            native_persistence::random_sequences::RandomSequences::read(None)?,
+            LegacyRandom::new(42),
+            XoroshiroRandom::new(77),
+            true,
+        ))?;
+        while !stage.poll(center, 256)? {}
+        let processed = stage.finish()?;
+        let drops = processed.block_drops().context("drop checkpoint missing")?;
+        assert_eq!(drops.operations(), 1);
+        assert_eq!(drops.destroy_events().len(), 1);
+        assert_eq!(drops.records(center).len(), 1);
+        assert!(drops.random_sequences().is_dirty());
+        let proof = batch.certify_inert_destroy_events(&processed)?;
+        assert!(batch.converted_region_drafts(&processed, 1).is_err());
+        let regions = batch.converted_region_drafts_with_inert_events(&processed, 1, &proof)?;
+        let directory = tempfile::tempdir()?;
+        let uuid = [1, -2, 3, 4];
+        let dimension = DimensionId::parse("minecraft:overworld")?;
+        let level = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![(
+                "Data".into(),
+                Tag::Compound(vec![
+                    ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                    ("Time".into(), Tag::Long(0)),
+                    ("singleplayer_uuid".into(), Tag::IntArray(uuid.to_vec())),
+                    (
+                        "spawn".into(),
+                        Tag::Compound(vec![
+                            (
+                                "dimension".into(),
+                                Tag::String("minecraft:overworld".into()),
+                            ),
+                            ("pos".into(), Tag::IntArray(vec![0, 8, 0])),
+                            ("yaw".into(), Tag::Float(0.0)),
+                            ("pitch".into(), Tag::Float(0.0)),
+                        ]),
+                    ),
+                ]),
+            )]),
+        };
+        let worldgen = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                (
+                    "data".into(),
+                    Tag::Compound(vec![
+                        ("seed".into(), Tag::Long(42)),
+                        (
+                            "dimensions".into(),
+                            Tag::Compound(vec![(
+                                "minecraft:overworld".into(),
+                                Tag::Compound(vec![
+                                    ("type".into(), Tag::String("minecraft:overworld".into())),
+                                    (
+                                        "generator".into(),
+                                        Tag::Compound(vec![(
+                                            "type".into(),
+                                            Tag::String("minecraft:noise".into()),
+                                        )]),
+                                    ),
+                                ]),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+        let player = NamedTag {
+            name: "".into(),
+            value: Tag::Compound(vec![
+                ("DataVersion".into(), Tag::Int(TARGET_DATA_VERSION)),
+                ("UUID".into(), Tag::IntArray(uuid.to_vec())),
+                (
+                    "Dimension".into(),
+                    Tag::String("minecraft:overworld".into()),
+                ),
+                (
+                    "Pos".into(),
+                    Tag::List {
+                        element_type: TagType::Double,
+                        values: vec![Tag::Double(0.5), Tag::Double(8.0), Tag::Double(0.5)],
+                    },
+                ),
+            ]),
+        };
+        let mut draft = FreshWorldDraft::new(
+            level,
+            worldgen,
+            player,
+            uuid,
+            42,
+            BTreeMap::from([(dimension.clone(), SavedClock::default())]),
+        )?;
+        draft.set_random_sequences(drops.random_sequences())?;
+        for (_, region) in regions {
+            draft.add_region(dimension.clone(), region)?;
+        }
+        let stage = draft.stage(directory.path())?;
+        let mut reader = WorldReader::open(stage.path(), dimension)?;
+        assert_eq!(
+            reader.random_sequences()?.source(),
+            Some(&drops.random_sequences().draft()?)
+        );
+        assert_eq!(
+            reader
+                .read_entity_chunk(0, 0)?
+                .context("entity chunk missing")?
+                .entities(),
+            drops.records(center)
+        );
+        assert!(reader.read_chunk(0, 0)?.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn fresh_batch_executes_features_with_initial_light_and_rolls_back_failures() {
         use native_resources::{
             carver::tags::CarverBlockTags, dimension_lighting::GeneratedDimensionLighting,

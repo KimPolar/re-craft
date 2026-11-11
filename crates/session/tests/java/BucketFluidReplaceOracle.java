@@ -44,6 +44,7 @@ public class BucketFluidReplaceOracle {
     if(state.is(Blocks.WATER)) return "water_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.LAVA)) return "lava_"+state.getValue(LiquidBlock.LEVEL);
     if(state.is(Blocks.STONE_SLAB)) return "slab_"+state.getValue(SlabBlock.WATERLOGGED);
+    if(state.is(Blocks.LADDER)) return "ladder_"+state.getValue(LadderBlock.WATERLOGGED);
     if(state.is(Blocks.OAK_FENCE) || state.is(Blocks.NETHER_BRICK_FENCE)) return (state.is(Blocks.OAK_FENCE)?"oak_fence_":"nether_brick_fence_")+state.getValue(BlockStateProperties.WATERLOGGED);
     if(state.is(Blocks.SHORT_GRASS)) return "short_grass";
     if(state.is(Blocks.FERN)) return "fern";
@@ -56,9 +57,10 @@ public class BucketFluidReplaceOracle {
     boolean slab=initial.startsWith("slab_");
     boolean chest=initial.startsWith("chest_") || initial.startsWith("trapped_chest_");
     boolean fence=initial.startsWith("oak_fence_") || initial.startsWith("nether_brick_fence_");
-    BlockState clicked=slab?Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(SlabBlock.WATERLOGGED,initial.equals("slab_wet")):chest?(initial.startsWith("trapped_")?Blocks.TRAPPED_CHEST:Blocks.CHEST).defaultBlockState().setValue(ChestBlock.TYPE,new ChestType[]{ChestType.SINGLE,ChestType.LEFT,ChestType.RIGHT}[level]).setValue(ChestBlock.WATERLOGGED,initial.endsWith("_wet")):fence?(initial.startsWith("oak_")?Blocks.OAK_FENCE:Blocks.NETHER_BRICK_FENCE).defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,initial.endsWith("_wet")):Blocks.STONE.defaultBlockState();
+    boolean ladder=initial.startsWith("ladder_");
+    BlockState clicked=ladder?Blocks.LADDER.defaultBlockState().setValue(LadderBlock.FACING,Direction.SOUTH).setValue(LadderBlock.WATERLOGGED,initial.endsWith("_wet")):slab?Blocks.STONE_SLAB.defaultBlockState().setValue(SlabBlock.TYPE,SlabType.TOP).setValue(SlabBlock.WATERLOGGED,initial.equals("slab_wet")):chest?(initial.startsWith("trapped_")?Blocks.TRAPPED_CHEST:Blocks.CHEST).defaultBlockState().setValue(ChestBlock.TYPE,new ChestType[]{ChestType.SINGLE,ChestType.LEFT,ChestType.RIGHT}[level]).setValue(ChestBlock.WATERLOGGED,initial.endsWith("_wet")):fence?(initial.startsWith("oak_")?Blocks.OAK_FENCE:Blocks.NETHER_BRICK_FENCE).defaultBlockState().setValue(BlockStateProperties.WATERLOGGED,initial.endsWith("_wet")):Blocks.STONE.defaultBlockState();
     world.blocks.put(CLICKED,clicked);
-    if(!slab && !chest && !fence) world.blocks.put(ADJACENT,switch(initial) { case "short_grass" -> Blocks.SHORT_GRASS.defaultBlockState(); case "fern" -> Blocks.FERN.defaultBlockState(); case "dead_bush" -> Blocks.DEAD_BUSH.defaultBlockState(); default -> (initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level); });
+    if(!slab && !chest && !fence && !ladder) world.blocks.put(ADJACENT,switch(initial) { case "short_grass" -> Blocks.SHORT_GRASS.defaultBlockState(); case "fern" -> Blocks.FERN.defaultBlockState(); case "dead_bush" -> Blocks.DEAD_BUSH.defaultBlockState(); default -> (initial.equals("water")?Blocks.WATER:Blocks.LAVA).defaultBlockState().setValue(LiquidBlock.LEVEL,level); });
     world.environment=EnvironmentAttributeSystem.builder().addConstantLayer(EnvironmentAttributes.WATER_EVAPORATES, base -> evaporates).build();
     var bucket=(BucketItem)(lava?Items.LAVA_BUCKET:Items.WATER_BUCKET);
     var hit=new BlockHitResult(new Vec3(0.5,0.75,1.0),Direction.SOUTH,CLICKED,false);
@@ -85,6 +87,8 @@ public class BucketFluidReplaceOracle {
     for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"slab_dry","slab_wet"})
       run(out,world,player,false,evaporates,sneak,initial,0);
     for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"oak_fence_dry","oak_fence_wet","nether_brick_fence_dry","nether_brick_fence_wet"})
+      run(out,world,player,false,evaporates,sneak,initial,0);
+    for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"ladder_dry","ladder_wet"})
       run(out,world,player,false,evaporates,sneak,initial,0);
     for(boolean evaporates:new boolean[]{false,true}) for(boolean sneak:new boolean[]{false,true}) for(String initial:new String[]{"chest_dry","chest_wet","trapped_chest_dry","trapped_chest_wet"}) for(int type=0;type<3;type++)
       run(out,world,player,false,evaporates,sneak,initial,type);

@@ -13420,12 +13420,8 @@ impl LoadedSession {
         let Some(clicked) = self.world.state(clicked) else {
             return false;
         };
-        let clicked_waterloggable = fluid == "minecraft:water"
-            && bucket_waterloggable(clicked) == Some(true)
-            && clicked
-                .properties
-                .get("waterlogged")
-                .is_some_and(|value| value == "false");
+        let clicked_waterloggable =
+            fluid == "minecraft:water" && bucket_waterloggable(clicked) == Some(true);
         if fluid == "minecraft:water"
             && clicked.properties.contains_key("waterlogged")
             && bucket_waterloggable(clicked).is_none()
@@ -13451,12 +13447,7 @@ impl LoadedSession {
         let Some(block) = self.world.state(existing) else {
             return false;
         };
-        let waterloggable = fluid == "minecraft:water"
-            && bucket_waterloggable(block) == Some(true)
-            && block
-                .properties
-                .get("waterlogged")
-                .is_some_and(|value| value == "false");
+        let waterloggable = fluid == "minecraft:water" && bucket_waterloggable(block) == Some(true);
         let replaceable_plant = matches!(
             block.name.as_str(),
             "minecraft:short_grass" | "minecraft:fern" | "minecraft:dead_bush"
@@ -32970,42 +32961,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn water_bucket_waterlogs_ladder_or_places_next_to_a_wet_one() {
+    fn water_bucket_handles_dry_and_wet_ladders_with_sneaking() {
         use crate::inventory::{ItemStack, PlayerSlot};
         use native_persistence::nbt::Tag;
         for wet in [false, true] {
-            let mut session = session();
-            session.set_water_evaporation_environment(bucket_environment(false));
-            let pos = IVec3::new(8, 2, 6);
-            assert!(session.set(pos + IVec3::NEG_Z, session.states[3]));
-            let id = session.intern_block(state(
-                "minecraft:ladder",
-                &[
-                    ("facing", "south"),
-                    ("waterlogged", if wet { "true" } else { "false" }),
-                ],
-            ));
-            assert!(session.set_with_notify(pos, id, false));
-            let mut inventory = PlayerInventory::default();
-            inventory.set_slot(
-                PlayerSlot::Storage(0),
-                ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
-            );
-            session.set_player_inventory(inventory);
-            assert!(
-                session.try_empty_bucket(PlayerSlot::Storage(0)),
-                "wet={wet}"
-            );
-            let absolute = session.origin + pos;
-            let ladder = session
-                .world
-                .block(absolute.x, absolute.y, absolute.z)
-                .unwrap();
-            assert_eq!(
-                native_world::collision::ladder_state(ladder),
-                Some(("south", true))
-            );
-            if wet {
+            for sneak in [false, true] {
+                let mut session = session();
+                session.sneak = sneak;
+                session.set_water_evaporation_environment(bucket_environment(false));
+                let pos = IVec3::new(8, 2, 6);
+                assert!(session.set(pos + IVec3::NEG_Z, session.states[3]));
+                let id = session.intern_block(state(
+                    "minecraft:ladder",
+                    &[
+                        ("facing", "south"),
+                        ("waterlogged", if wet { "true" } else { "false" }),
+                    ],
+                ));
+                assert!(session.set_with_notify(pos, id, false));
+                let mut inventory = PlayerInventory::default();
+                inventory.set_slot(
+                    PlayerSlot::Storage(0),
+                    ItemStack::new("minecraft:water_bucket".into(), 1, 1, Tag::Compound(vec![])),
+                );
+                session.set_player_inventory(inventory);
+                assert!(
+                    session.try_empty_bucket(PlayerSlot::Storage(0)),
+                    "wet={wet} sneak={sneak}"
+                );
+                let absolute = session.origin + pos;
+                let ladder = session
+                    .world
+                    .block(absolute.x, absolute.y, absolute.z)
+                    .unwrap();
+                assert_eq!(
+                    native_world::collision::ladder_state(ladder),
+                    Some(("south", wet || !sneak))
+                );
                 let adjacent = absolute + IVec3::Z;
                 assert_eq!(
                     session
@@ -33013,13 +33005,18 @@ pub(crate) mod tests {
                         .block(adjacent.x, adjacent.y, adjacent.z)
                         .unwrap()
                         .name,
-                    "minecraft:water"
+                    if sneak {
+                        "minecraft:water"
+                    } else {
+                        "minecraft:air"
+                    }
                 );
-            } else {
-                assert!(session.fluid_pending.iter().any(|tick| tick.x == absolute.x
-                    && tick.y == absolute.y
-                    && tick.z == absolute.z
-                    && tick.kind == FluidKind::Water));
+                if !wet && !sneak {
+                    assert!(session.fluid_pending.iter().any(|tick| tick.x == absolute.x
+                        && tick.y == absolute.y
+                        && tick.z == absolute.z
+                        && tick.kind == FluidKind::Water));
+                }
             }
         }
     }
@@ -34414,7 +34411,7 @@ pub(crate) mod tests {
         }
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
-        assert_eq!(rows.len(), 352);
+        assert_eq!(rows.len(), 360);
         struct PlantLoot;
         impl native_resources::packs::ResourceProvider for PlantLoot {
             fn read_asset(&mut self, _: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -34444,7 +34441,19 @@ pub(crate) mod tests {
                     "{row}"
                 );
             }
-            if initial.starts_with("slab_") {
+            if initial.starts_with("ladder_") {
+                assert!(session.set_with_notify(clicked + IVec3::NEG_Z, session.states[3], false));
+                let wet = if initial.ends_with("_wet") {
+                    "true"
+                } else {
+                    "false"
+                };
+                let id = session.intern_block(state(
+                    "minecraft:ladder",
+                    &[("facing", "south"), ("waterlogged", wet)],
+                ));
+                assert!(session.set_with_notify(clicked, id, false));
+            } else if initial.starts_with("slab_") {
                 let wet = if initial == "slab_wet" {
                     "true"
                 } else {
@@ -34540,6 +34549,7 @@ pub(crate) mod tests {
                     "minecraft:water" => format!("water_{}", block.properties["level"]),
                     "minecraft:lava" => format!("lava_{}", block.properties["level"]),
                     "minecraft:stone_slab" => format!("slab_{}", block.properties["waterlogged"]),
+                    "minecraft:ladder" => format!("ladder_{}", block.properties["waterlogged"]),
                     "minecraft:oak_fence" | "minecraft:nether_brick_fence" => format!(
                         "{}_{}",
                         block.name.strip_prefix("minecraft:").unwrap(),

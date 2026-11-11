@@ -7921,7 +7921,8 @@ impl OreVeinWorld for DecorationRegion<'_> {
                             || native_world::collision::full_glass(state)
                             || native_world::collision::full_terracotta(state)
                             || native_world::collision::pane_waterlogged(state).is_some()
-                            || jigsaw::jigsaw_torch(state))
+                            || jigsaw::jigsaw_torch(state)
+                            || jigsaw::jigsaw_lantern(state))
                         && native_world::block_light::same_light_behavior(&old, state).is_some();
                     let jigsaw_water = old.name == "minecraft:water"
                         && old.properties.len() == 1
@@ -12646,6 +12647,19 @@ mod tests {
         ]);
     }
 
+    #[test]
+    #[ignore = "requires Minecraft Java Edition 26.3 and Java 25 JDK"]
+    fn staged_jigsaw_lanterns_match_java_light_across_25_columns() {
+        check_staged_light_modes(&[
+            "vine_active_jigsaw_lantern",
+            "vine_active_self_jigsaw_soul_lantern",
+            "vine_active_empty_jigsaw_lantern",
+            "vine_active_self_empty_jigsaw_soul_lantern",
+            "vine_active_jigsaw_wet_lantern",
+            "vine_active_self_jigsaw_wet_soul_lantern",
+        ]);
+    }
+
     fn check_staged_light_modes(modes: &[&str]) {
         use std::{path::PathBuf, process::Command};
         let game = std::env::var_os("MINECRAFT_DIR")
@@ -13033,6 +13047,10 @@ mod tests {
                         "wall_torch"
                     } else if mode.ends_with("_torch") {
                         "torch"
+                    } else if mode.ends_with("_soul_lantern") {
+                        "soul_lantern"
+                    } else if mode.ends_with("_lantern") {
+                        "lantern"
                     } else if mode.ends_with("_pane") {
                         "glass_pane"
                     } else if mode.ends_with("_glass") {
@@ -13090,6 +13108,11 @@ mod tests {
                         ]);
                     } else if mode.ends_with("_walltorch") {
                         block.properties = BTreeMap::from([("facing".into(), "north".into())]);
+                    } else if mode.ends_with("_lantern") {
+                        block.properties = BTreeMap::from([
+                            ("hanging".into(), "false".into()),
+                            ("waterlogged".into(), "false".into()),
+                        ]);
                     } else if mode.ends_with("_pane") {
                         block.properties = ["north", "east", "south", "west", "waterlogged"]
                             .into_iter()

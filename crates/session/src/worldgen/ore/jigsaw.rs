@@ -61,6 +61,14 @@ pub(super) fn jigsaw_torch(state: &BlockState) -> bool {
     }
 }
 
+pub(super) fn jigsaw_lantern(state: &BlockState) -> bool {
+    matches!(
+        state.name.as_str(),
+        "minecraft:lantern" | "minecraft:soul_lantern"
+    ) && native_world::collision::block_shape(state).is_some()
+        && native_world::block_light::same_light_behavior(state, state).is_some()
+}
+
 pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if native_world::wall::Wall::from_state(state).is_some() {
         return Ok(false);
@@ -68,7 +76,7 @@ pub(super) fn jigsaw_static_full(state: &BlockState) -> Result<bool> {
     if jigsaw_wood(state) {
         return Ok(true);
     }
-    if jigsaw_torch(state) {
+    if jigsaw_torch(state) || jigsaw_lantern(state) {
         return Ok(false);
     }
     if native_world::collision::full_glass(state) {
@@ -293,7 +301,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::collision::full_glass(state)
                 || native_world::collision::full_terracotta(state)
                 || native_world::collision::pane_waterlogged(state).is_some()
-                || jigsaw_torch(state);
+                || jigsaw_torch(state)
+                || jigsaw_lantern(state);
             let result = self.region.set_proto_block(pos, state);
             self.region.jigsaw_block_write = false;
             result?;
@@ -308,6 +317,7 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                 || native_world::wall::Wall::from_state(state).is_some()
                 || native_world::collision::pane_waterlogged(state).is_some()
                 || native_world::collision::trapdoor_state(state).is_some()
+                || jigsaw_lantern(state)
                 || state.name == "minecraft:chest")
             && self
                 .registry
@@ -342,7 +352,8 @@ impl JigsawPlacementWorld for JigsawRegion<'_, '_, '_> {
                     || native_world::wall::Wall::from_state(state).is_some()
                     || native_world::collision::fence_waterlogged(state).is_some()
                     || native_world::collision::trapdoor_state(state).is_some()
-                    || native_world::collision::pane_waterlogged(state).is_some();
+                    || native_world::collision::pane_waterlogged(state).is_some()
+                    || jigsaw_lantern(state);
                 let result = self.region.set_proto_block(pos, &wet);
                 self.region.jigsaw_block_write = false;
                 result?;
@@ -1062,6 +1073,63 @@ mod tests {
             states_checked += 1;
         }
         assert_eq!(states_checked, 288);
+        let mut lanterns_checked = 0;
+        for line in output.lines().filter(|line| line.starts_with("LANTERN\t")) {
+            let fields: Vec<_> = line.split('\t').collect();
+            let [
+                _,
+                name,
+                hanging,
+                wet,
+                mirror,
+                rotation,
+                expected_hanging,
+                expected_wet,
+                emission,
+            ] = fields.as_slice()
+            else {
+                bail!("invalid Java lantern result")
+            };
+            let mirror = match *mirror {
+                "NONE" => native_resources::structure_transform::Mirror::None,
+                "LEFT_RIGHT" => native_resources::structure_transform::Mirror::LeftRight,
+                "FRONT_BACK" => native_resources::structure_transform::Mirror::FrontBack,
+                _ => bail!("unknown Java mirror"),
+            };
+            let rotation = match *rotation {
+                "NONE" => Rotation::None,
+                "CLOCKWISE_90" => Rotation::Clockwise90,
+                "CLOCKWISE_180" => Rotation::Clockwise180,
+                "COUNTERCLOCKWISE_90" => Rotation::Counterclockwise90,
+                _ => bail!("unknown Java rotation"),
+            };
+            let id = format!("minecraft:{name}");
+            let properties = BTreeMap::from([
+                ("hanging".into(), (*hanging).into()),
+                ("waterlogged".into(), (*wet).into()),
+            ]);
+            let state = BlockState {
+                name: id.clone(),
+                properties: properties.clone(),
+            };
+            assert!(registry.is_canonical_state(&id, &properties));
+            assert_eq!(registry.has_block_entity(&id), Some(false));
+            assert!(jigsaw_lantern(&state));
+            assert!(!jigsaw_static_full(&state)?);
+            let transformed =
+                registry.transform_template_state(&id, &properties, mirror, rotation)?;
+            assert_eq!(transformed["hanging"], *expected_hanging);
+            assert_eq!(transformed["waterlogged"], *expected_wet);
+            assert_eq!(
+                FluidState::from_block(&state)
+                    .map_err(anyhow::Error::msg)?
+                    .is_some_and(|fluid| fluid.source),
+                *wet == "true"
+            );
+            assert_eq!(*emission, if *name == "lantern" { "15" } else { "10" });
+            lanterns_checked += 1;
+        }
+        assert_eq!(lanterns_checked, 96);
         let mut stones_checked = 0;
         for line in output.lines().filter(|line| line.starts_with("STONE\t")) {
             let fields: Vec<_> = line.split('\t').collect();
@@ -2060,6 +2128,73 @@ mod tests {
         assert_eq!(ticks[0].position, pos);
         assert_eq!(ticks[0].fluid, "minecraft:water");
         assert_eq!(ticks[0].delay, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires installed Minecraft Java Edition 26.3"]
+    fn jigsaw_lanterns_waterlog_only_from_source_water() -> Result<()> {
+        let game =
+            native_resources::default_minecraft_dir().context("Minecraft directory missing")?;
+        let mut resources = native_resources::packs::ResourceStack::open(&game)?;
+        let blocks = resources.vanilla_block_ids()?;
+        let registry = resources.vanilla_generated_block_registry()?;
+        let motion = HeightmapTags::load(&mut resources, &blocks)?;
+        for name in ["lantern", "soul_lantern"] {
+            for hanging in [false, true] {
+                for source in [false, true] {
+                    let (mut terrain, tags, _, _) = super::super::tests::fixture();
+                    let writable = terrain.snapshot().chunks.keys().copied().collect();
+                    let mut region = terrain.decoration_region(&tags, &motion, writable)?;
+                    let state = BlockState {
+                        name: format!("minecraft:{name}"),
+                        properties: BTreeMap::from([
+                            ("hanging".into(), hanging.to_string()),
+                            ("waterlogged".into(), "false".into()),
+                        ]),
+                    };
+                    let pos = [1, 8, 1];
+                    let mut random = DecorationRandom::new(42);
+                    let mut expected_random = random.clone();
+                    {
+                        let mut draft = JigsawRegion {
+                            region: &mut region,
+                            registry: &registry,
+                        };
+                        assert!(draft.place_template_block(pos, &state, None, &mut random)?);
+                        assert!(draft.is_liquid_container(&state)?);
+                        draft.place_liquid(
+                            pos,
+                            &state,
+                            Some(FluidState {
+                                kind: FluidKind::Water,
+                                source,
+                                falling: false,
+                                amount: if source { 8 } else { 7 },
+                            }),
+                        )?;
+                    }
+                    region.finish()?;
+                    assert_eq!(random.next_long(), expected_random.next_long());
+                    let snapshot = terrain.snapshot();
+                    let placed = snapshot
+                        .block(pos[0], pos[1], pos[2])
+                        .context("missing lantern")?;
+                    assert_eq!(placed.properties["hanging"], hanging.to_string());
+                    assert_eq!(placed.properties["waterlogged"], source.to_string());
+                    let ticks = snapshot.saved_fluid_ticks.get(&ChunkPos { x: 0, z: 0 });
+                    if source {
+                        let ticks = ticks.context("waterlogged lantern tick missing")?;
+                        assert_eq!(ticks.len(), 1);
+                        assert_eq!(ticks[0].position, pos);
+                        assert_eq!(ticks[0].fluid, "minecraft:water");
+                        assert_eq!(ticks[0].delay, 0);
+                    } else {
+                        assert!(ticks.is_none_or(|ticks| ticks.is_empty()));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

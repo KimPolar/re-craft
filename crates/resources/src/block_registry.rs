@@ -57,6 +57,7 @@ enum StateSchema {
     Chest,
     Jigsaw,
     Waterlogged,
+    Lantern,
     Bed,
     Rail,
     PoweredRail,
@@ -173,6 +174,12 @@ impl StateSchema {
             Self::HorizontalFacing => return BTreeMap::from([("facing".into(), "north".into())]),
             Self::Jigsaw => return BTreeMap::from([("orientation".into(), "north_up".into())]),
             Self::Waterlogged => return BTreeMap::from([("waterlogged".into(), "false".into())]),
+            Self::Lantern => {
+                return BTreeMap::from([
+                    ("hanging".into(), "false".into()),
+                    ("waterlogged".into(), "false".into()),
+                ]);
+            }
             Self::SulfurSpike => {
                 return BTreeMap::from([
                     ("thickness".into(), "tip".into()),
@@ -283,6 +290,12 @@ impl StateSchema {
                 Some(value.to_owned())
             }
             Self::Waterlogged if name == "waterlogged" && matches!(value, "true" | "false") => {
+                Some(value.to_owned())
+            }
+            Self::Lantern
+                if matches!(name, "hanging" | "waterlogged")
+                    && matches!(value, "true" | "false") =>
+            {
                 Some(value.to_owned())
             }
             Self::Jigsaw
@@ -852,6 +865,7 @@ impl GeneratedBlockRegistry {
                 "net/minecraft/world/level/block/BeehiveBlock" => Some(StateSchema::Beehive),
                 "net/minecraft/world/level/block/JigsawBlock" => Some(StateSchema::Jigsaw),
                 "net/minecraft/world/level/block/BarrierBlock" => Some(StateSchema::Waterlogged),
+                "net/minecraft/world/level/block/LanternBlock" => Some(StateSchema::Lantern),
                 "net/minecraft/world/level/block/ChestBlock"
                 | "net/minecraft/world/level/block/TrappedChestBlock" => Some(StateSchema::Chest),
                 "net/minecraft/world/level/block/FenceBlock"
@@ -1039,6 +1053,7 @@ impl GeneratedBlockRegistry {
                 | StateSchema::Dusted
                 | StateSchema::Slab
                 | StateSchema::Waterlogged
+                | StateSchema::Lantern
                 | StateSchema::Liquid
                 | StateSchema::PotentSulfur
                 | StateSchema::SulfurSpike

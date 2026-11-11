@@ -158,6 +158,23 @@ public class JigsawChestOracle {
                         facing.getSerializedName(), type.getSerializedName(), wet, mirror.name(), rotation.name(),
                         state.getValue(ChestBlock.FACING).getSerializedName(), state.getValue(ChestBlock.TYPE).getSerializedName(), state.getValue(ChestBlock.WATERLOGGED));
                 }
+        for (var block : new net.minecraft.world.level.block.Block[]{Blocks.LANTERN, Blocks.SOUL_LANTERN})
+            for (boolean hanging : new boolean[]{false, true}) for (boolean wet : new boolean[]{false, true}) {
+                var state = block.defaultBlockState().setValue(BlockStateProperties.HANGING, hanging)
+                        .setValue(BlockStateProperties.WATERLOGGED, wet);
+                if (state.hasBlockEntity() || net.minecraft.world.entity.ai.village.poi.PoiTypes.hasPoi(state)
+                        || state.getPostProcessPos(null, BlockPos.ZERO) != null
+                        || state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)
+                        || state.getFluidState().isSource() != wet)
+                    throw new AssertionError("unexpected lantern effects: " + state);
+                for (var mirror : Mirror.values()) for (var rotation : Rotation.values()) {
+                    var transformed = state.mirror(mirror).rotate(rotation);
+                    out.printf("LANTERN\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d%n",
+                        BuiltInRegistries.BLOCK.getKey(block).getPath(), hanging, wet, mirror.name(), rotation.name(),
+                        transformed.getValue(BlockStateProperties.HANGING), transformed.getValue(BlockStateProperties.WATERLOGGED),
+                        state.getLightEmission());
+                }
+            }
         String[] stones = {"stone", "deepslate", "cobbled_deepslate", "polished_deepslate", "deepslate_bricks",
             "cracked_deepslate_bricks", "deepslate_tiles", "cracked_deepslate_tiles", "chiseled_deepslate",
             "reinforced_deepslate", "basalt", "polished_basalt", "smooth_basalt",
